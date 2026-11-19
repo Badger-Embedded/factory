@@ -5,7 +5,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use factory_core::{AgentResult, Ask, Event, PlannedPr, Question, Stage, Task, Turn};
+use factory_core::{
+    AgentResult, Ask, Event, PlannedPr, PrDescription, Question, Stage, Task, Turn,
+};
 use factory_server::{Projects, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -474,4 +476,46 @@ async fn bad_settings_are_rejected_and_not_saved() {
         assert!(reply.status.is_client_error(), "{form}: {}", reply.status);
     }
     assert_eq!(dashboard.store.settings().unwrap(), before);
+}
+
+fn ready() -> PrDescription {
+    PrDescription {
+        title: "maestrod: add a reboot endpoint".into(),
+        body: "## Why\n\nThe device page needs it.".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_pull_request_in_review_waits_for_the_user() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![PlannedPr {
+            title: "maestrod: add a reboot endpoint".into(),
+            summary: "POST /reboot".into(),
+            number: None,
+            description: None,
+        }])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("factory working"));
+    assert!(!page.body.contains("in review"));
+
+    dashboard.apply(id, Event::Published { number: 15 });
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("class=\"badge you\">in review"));
+    assert!(
+        page.body
+            .contains("#15 waits for CI and your review on GitHub")
+    );
+    assert!(!page.body.contains("factory working"));
+
+    let index = dashboard.get("/").await;
+    assert!(!index.body.contains("Nothing needs you right now."));
 }
