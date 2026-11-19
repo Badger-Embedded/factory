@@ -54,7 +54,7 @@ requested → clarifying → spec ✋ → plan ✋ → implementing → verifyin
 - **implementing.** One worker session per pull request. The worker commits in the job workspace and stops when the commits are ready.
 - **verifying.** The factory runs the project's checks in the worker and the comment review. Failures go back to the session.
 - **pr-open.** The factory pushes the branch and opens the pull request as moonthebot.
-- **ci-and-review.** The factory polls CI and review comments, and feeds failures and your comments back into a resumed session until CI is green and you merge.
+- **ci-and-review.** The factory polls CI and review comments, and feeds failures and your comments back into a resumed session until CI is green and you merge. When the pull request no longer merges cleanly, the factory fetches the newest base branch into the checkout, since workers have no GitHub credentials, and the agent rebases onto it. A conflict counts toward the job's limit of 5 failed rounds per pull request, so an agent that cannot resolve one stops.
 
 The state machine is pure logic with no I/O, so it can be tested without podman or GitHub. Every step must be safe to retry, because a container or the factory can die in the middle of one.
 

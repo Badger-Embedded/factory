@@ -65,6 +65,10 @@ pub struct Comment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrStatus {
     pub state: PrState,
+    /// GitHub reports that the pull request does not merge cleanly into its
+    /// base. GitHub works this out after each push, and while it does, the
+    /// pull request does not count as conflicting.
+    pub conflicting: bool,
     pub ci: Ci,
     pub comments: Vec<Comment>,
 }
@@ -74,6 +78,7 @@ pub struct PrStatus {
 pub enum Observation {
     Merged,
     Closed,
+    Conflicted,
     CiFailed(Vec<FailedCheck>),
     /// Comments newer than the watermark, and the new watermark.
     Comments {
@@ -89,6 +94,8 @@ pub enum Observation {
 #[serde(rename_all = "camelCase")]
 struct ViewJson {
     state: String,
+    #[serde(default)]
+    mergeable: String,
     #[serde(default)]
     status_check_rollup: Vec<CheckJson>,
     #[serde(default)]
@@ -148,7 +155,7 @@ const FAILED_CONCLUSIONS: [&str; 5] = [
     "STARTUP_FAILURE",
 ];
 
-/// Parses `gh pr view --json state,statusCheckRollup,comments,reviews` and
+/// Parses `gh pr view --json state,mergeable,statusCheckRollup,comments,reviews` and
 /// the review comments API as one JSON object per line. Comments by
 /// `bot_login` or by GitHub apps are left out.
 ///
@@ -242,13 +249,15 @@ pub fn parse_status(view: &str, inline: &str, bot_login: &str) -> Result<PrStatu
     comments.sort_by(|a, b| a.at.cmp(&b.at));
     Ok(PrStatus {
         state,
+        conflicting: view.mergeable == "CONFLICTING",
         ci,
         comments,
     })
 }
 
-/// Decides what to tell the job. A merge or close comes first, then a CI
-/// failure, then comments newer than `seen_until`. Without any of those, a
+/// Decides what to tell the job. A merge or close comes first, then a merge
+/// conflict, because GitHub does not run pull request CI on a conflicting
+/// pull request, then a CI failure, then comments newer than `seen_until`. Without any of those, a
 /// pull request whose checks all passed is [`Observation::Ready`].
 #[must_use]
 pub fn observe(status: &PrStatus, seen_until: Option<&str>) -> Observation {
@@ -256,6 +265,9 @@ pub fn observe(status: &PrStatus, seen_until: Option<&str>) -> Observation {
         PrState::Merged => return Observation::Merged,
         PrState::Closed => return Observation::Closed,
         PrState::Open => {}
+    }
+    if status.conflicting {
+        return Observation::Conflicted;
     }
     if let Ci::Failed(checks) = &status.ci {
         return Observation::CiFailed(checks.clone());
@@ -416,7 +428,7 @@ impl GitHub {
                     "--repo",
                     repo,
                     "--json",
-                    "state,statusCheckRollup,comments,reviews",
+                    "state,mergeable,statusCheckRollup,comments,reviews",
                 ],
                 None,
             )

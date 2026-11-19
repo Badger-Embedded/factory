@@ -415,5 +415,6 @@ fn task_label(task: &Task) -> &'static str {
         Task::FixChecks { .. } => "fixing failed checks",
         Task::FixCi { .. } => "fixing the CI failure",
         Task::AddressReview { .. } => "addressing review comments",
+        Task::Rebase { .. } => "rebasing onto the newest base branch to resolve a conflict",
     }
 }

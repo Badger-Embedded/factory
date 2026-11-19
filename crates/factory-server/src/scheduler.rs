@@ -60,6 +60,8 @@ pub struct PublishRequest {
 pub struct WatchRequest {
     pub job_id: i64,
     pub repo: String,
+    /// The branch the pull request targets.
+    pub base: String,
     pub number: u64,
     /// The time of the newest comment the agent already has.
     pub seen_until: Option<String>,
@@ -253,6 +255,7 @@ impl<E: Executor> Scheduler<E> {
                     let request = WatchRequest {
                         job_id: row.id,
                         repo: project.repo.clone(),
+                        base: project.base.clone(),
                         number,
                         seen_until: self.store.pr_watermark(row.id, pr)?,
                         auto_merge: settings.auto_merge,

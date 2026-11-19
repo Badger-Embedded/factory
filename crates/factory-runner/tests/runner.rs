@@ -473,3 +473,16 @@ async fn remove_container_runs_podman_rm_and_reports_errors() {
         .unwrap_err();
     assert!(err.contains("cannot connect"), "{err}");
 }
+
+#[test]
+fn the_rebase_prompt_names_the_fetched_base() {
+    let text = prompt(
+        &Task::Rebase {
+            base: "main".into(),
+        },
+        Expect::Commits,
+    );
+    assert!(text.contains("origin/main"));
+    assert!(text.contains("Do not push"));
+    assert!(text.contains("\"commits_ready\""));
+}

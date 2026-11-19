@@ -327,3 +327,26 @@ async fn merge_squashes_and_deletes_the_branch() {
         "pr merge 15 --repo o/r --squash --delete-branch\n"
     );
 }
+
+#[test]
+fn a_conflict_comes_before_ci_and_comments() {
+    let conflicting = VIEW.replacen(
+        "\"state\": \"OPEN\",",
+        "\"state\": \"OPEN\", \"mergeable\": \"CONFLICTING\",",
+        1,
+    );
+    let status = parse_status(&conflicting, INLINE, "moonthebot").unwrap();
+    assert!(status.conflicting);
+    assert_eq!(observe(&status, None), Observation::Conflicted);
+
+    for mergeable in ["MERGEABLE", "UNKNOWN"] {
+        let view = VIEW.replacen(
+            "\"state\": \"OPEN\",",
+            &format!("\"state\": \"OPEN\", \"mergeable\": \"{mergeable}\","),
+            1,
+        );
+        let status = parse_status(&view, INLINE, "moonthebot").unwrap();
+        assert!(!status.conflicting, "{mergeable}");
+        assert!(matches!(observe(&status, None), Observation::CiFailed(_)));
+    }
+}
