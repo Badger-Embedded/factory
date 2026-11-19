@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use factory_runner::{RunReport, SessionRun, WorkerConfig, WorkerRun, remove_container, run};
+use factory_core::Event;
+use factory_runner::{Git, RunReport, SessionRun, WorkerConfig, WorkerRun, remove_container, run};
 
 use crate::scheduler::{AgentRequest, Executor, LogSink};
 use crate::settings::Settings;
@@ -15,7 +16,18 @@ pub struct PodmanExecutor {
     /// The podman binary, secret and plugin directory. The image and limits
     /// come from [`Settings`] on each run.
     pub base: WorkerConfig,
+    /// Prepares each job's checkout. It holds the GitHub token, which never
+    /// reaches the worker.
+    pub git: Git,
     pub data_dir: PathBuf,
+}
+
+fn failed(reason: String) -> RunReport {
+    RunReport {
+        event: Event::AgentFailed { reason },
+        session_id: None,
+        cost_usd: None,
+    }
 }
 
 impl PodmanExecutor {
@@ -44,16 +56,20 @@ impl Executor for PodmanExecutor {
         let job_dir = self.job_dir(request.job_id);
         let workspace = job_dir.join("work");
         let claude_dir = job_dir.join("claude");
-        for dir in [&workspace, &claude_dir] {
-            if let Err(err) = fs::create_dir_all(dir) {
-                return RunReport {
-                    event: factory_core::Event::AgentFailed {
-                        reason: format!("could not create {}: {err}", dir.display()),
-                    },
-                    session_id: None,
-                    cost_usd: None,
-                };
-            }
+        if let Err(err) = fs::create_dir_all(&claude_dir) {
+            return failed(format!("could not create {}: {err}", claude_dir.display()));
+        }
+        if let Err(err) = self
+            .git
+            .prepare(
+                &workspace,
+                &request.repo,
+                &request.base,
+                request.branch.as_deref(),
+            )
+            .await
+        {
+            return failed(format!("could not prepare the checkout: {err}"));
         }
 
         let name = Self::container(request.job_id);

@@ -42,6 +42,12 @@ impl fmt::Display for ProjectsError {
 
 impl std::error::Error for ProjectsError {}
 
+impl FromIterator<(String, Project)> for Projects {
+    fn from_iter<I: IntoIterator<Item = (String, Project)>>(iter: I) -> Self {
+        Projects(iter.into_iter().collect())
+    }
+}
+
 impl Projects {
     /// Reads every `<dir>/<name>/project.toml`. A subdirectory without a
     /// `project.toml` is skipped.

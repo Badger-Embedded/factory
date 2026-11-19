@@ -21,6 +21,8 @@ Then open <http://127.0.0.1:8080>. Without `tailscale serve` in front, the dashb
 | `FACTORY_WORKERS` | unset | `podman` runs jobs in podman workers. Unset, jobs wait in `requested`. |
 | `FACTORY_PODMAN` | `podman` | The podman binary. Set `CONTAINER_HOST` to use a remote podman service. |
 | `FACTORY_PLUGIN_DIR` | unset | The factory plugin, mounted read-only into workers |
+| `GH_TOKEN` | unset | GitHub token the factory clones and pushes with. Workers never get it. |
+| `FACTORY_GIT_NAME`, `FACTORY_GIT_EMAIL` | `moonthebot` and its noreply address | Identity on the agent's commits |
 
 The worker limit, image, memory and CPUs are settings stored in the database. The job loop reads them on every pass.
 

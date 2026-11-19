@@ -3,12 +3,22 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use factory_runner::WorkerConfig;
+use factory_runner::{Git, WorkerConfig};
 use factory_server::{PodmanExecutor, Projects, Scheduler, Store, app};
 use tokio::sync::Notify;
 
 fn path_var(name: &str, default: &str) -> PathBuf {
     env::var_os(name).map_or_else(|| PathBuf::from(default), PathBuf::from)
+}
+
+fn git_config() -> Git {
+    let default = Git::default();
+    Git {
+        token: env::var("GH_TOKEN").ok().filter(|token| !token.is_empty()),
+        user_name: env::var("FACTORY_GIT_NAME").unwrap_or(default.user_name.clone()),
+        user_email: env::var("FACTORY_GIT_EMAIL").unwrap_or(default.user_email.clone()),
+        ..default
+    }
 }
 
 #[tokio::main]
@@ -18,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listen = env::var("FACTORY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let data_dir = path_var("FACTORY_DATA", "data");
     let db = env::var_os("FACTORY_DB").map_or_else(|| data_dir.join("factory.db"), PathBuf::from);
-    let projects = Projects::load(&path_var("FACTORY_PROJECTS", "projects"))?;
+    let projects = Arc::new(Projects::load(&path_var("FACTORY_PROJECTS", "projects"))?);
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(Store::open(&db)?);
@@ -31,9 +41,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 plugin_dir: env::var_os("FACTORY_PLUGIN_DIR").map(PathBuf::from),
                 ..WorkerConfig::default()
             },
+            git: git_config(),
             data_dir: data_dir.clone(),
         };
-        let scheduler = Scheduler::new(Arc::clone(&store), Arc::new(executor), Arc::clone(&wake));
+        let scheduler = Scheduler::new(
+            Arc::clone(&store),
+            Arc::clone(&projects),
+            Arc::new(executor),
+            Arc::clone(&wake),
+        );
         tokio::spawn(scheduler.run());
         tracing::info!("running jobs in podman workers");
     } else {
@@ -42,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
-    axum::serve(listener, app(store, Arc::new(projects), wake))
+    axum::serve(listener, app(store, projects, wake))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
