@@ -1,9 +1,11 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Check or CI failures a job may hit on one pull request before it fails.
 pub const MAX_FAILED_ROUNDS: u32 = 5;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     request: String,
     stage: Stage,
@@ -13,7 +15,7 @@ pub struct Job {
     failed_rounds: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stage {
     Requested,
     Clarifying,
@@ -29,7 +31,7 @@ pub enum Stage {
 }
 
 /// Who the job is waiting for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Turn {
     Agent(Task),
     Factory,
@@ -37,19 +39,19 @@ pub enum Turn {
     Done,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ask {
     Answers { questions: Vec<Question> },
     SpecApproval,
     PlanApproval,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedPr {
     pub title: String,
     pub summary: String,
@@ -58,7 +60,7 @@ pub struct PlannedPr {
 }
 
 /// The input for one agent run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Task {
     Clarify {
         request: String,
@@ -88,13 +90,13 @@ pub enum Task {
 
 /// The agent session a run continues. Clarifying, spec and plan share one
 /// session, and each planned pull request gets its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Session {
     Planning,
     Pr(usize),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     RunAgent {
         session: Session,
@@ -114,7 +116,7 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentResult {
     Questions(Vec<Question>),
     Clarified,
@@ -123,7 +125,7 @@ pub enum AgentResult {
     CommitsReady,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Start,
     Agent(AgentResult),
