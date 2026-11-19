@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use factory_core::{AgentResult, Event, Question, Stage, Turn};
 use factory_runner::{Expect, LogLine, RunReport};
-use factory_server::{AgentRequest, Executor, LogSink, Scheduler, Settings, Store};
+use factory_server::{
+    AgentRequest, Executor, LogSink, Project, Projects, Scheduler, Settings, Store,
+};
 use tokio::sync::{Notify, Semaphore};
 
 type Respond = Box<dyn Fn(&AgentRequest) -> Event + Send + Sync>;
@@ -69,8 +71,18 @@ fn setup(
 ) -> (Arc<Store>, Arc<FakeExecutor>, Arc<Scheduler<FakeExecutor>>) {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let executor = FakeExecutor::new(respond);
+    let projects: Projects = [(
+        "maestro".to_owned(),
+        Project {
+            repo: "Badger-Embedded/maestro".into(),
+            base: "main".into(),
+        },
+    )]
+    .into_iter()
+    .collect();
     let scheduler = Scheduler::new(
         Arc::clone(&store),
+        Arc::new(projects),
         Arc::clone(&executor),
         Arc::new(Notify::new()),
     );
@@ -229,6 +241,16 @@ async fn answers_continue_the_session_and_a_pull_request_gets_its_own() {
         ]
     );
     assert!(requests[1].prompt.contains("A: rpi5"));
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.repo == "Badger-Embedded/maestro" && r.base == "main")
+    );
+    assert!(requests[..4].iter().all(|r| r.branch.is_none()));
+    assert_eq!(
+        requests[4].branch.as_deref(),
+        Some(format!("factory/job-{id}-pr-1").as_str())
+    );
     let planning = &requests[0].session_id;
     assert!(requests[..4].iter().all(|r| &r.session_id == planning));
     assert_ne!(&requests[4].session_id, planning);
@@ -301,4 +323,17 @@ async fn a_job_waiting_for_the_user_takes_no_worker() {
     ));
     executor.release(1);
     wait_idle(&scheduler).await;
+}
+
+#[tokio::test]
+async fn a_job_for_an_unknown_project_fails() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let id = store.create("gone", "alice", "x").unwrap();
+    scheduler.tick().await.unwrap();
+
+    assert_eq!(executor.requests().len(), 0);
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { reason } if reason.contains("\"gone\"")
+    ));
 }

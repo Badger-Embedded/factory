@@ -3,21 +3,36 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use factory_core::{Command, Event, Stage};
+use factory_core::{Command, Event, Session, Stage};
 use factory_runner::{Expect, LogLine, RunReport, prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use crate::projects::Projects;
 use crate::settings::Settings;
 use crate::store::{Store, StoreError};
 
 /// How often the loop looks at the jobs when nothing wakes it.
 const POLL: Duration = Duration::from_secs(5);
 
+/// The branch the factory pushes planned pull request `pr` of job `job_id`
+/// from.
+#[must_use]
+pub fn branch_name(job_id: i64, pr: usize) -> String {
+    format!("factory/job-{job_id}-pr-{}", pr + 1)
+}
+
 /// One agent run for the executor to carry out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRequest {
     pub job_id: i64,
+    /// The GitHub repository as `owner/name`.
+    pub repo: String,
+    /// The branch pull requests target.
+    pub base: String,
+    /// The pull request branch, or `None` for a planning run, which reads
+    /// the base branch.
+    pub branch: Option<String>,
     /// The Claude Code session UUID.
     pub session_id: String,
     pub expect: Expect,
@@ -49,15 +64,22 @@ pub trait Executor: Send + Sync + 'static {
 /// scheduler picks up every job where it was.
 pub struct Scheduler<E> {
     store: Arc<Store>,
+    projects: Arc<Projects>,
     executor: Arc<E>,
     wake: Arc<Notify>,
     running: Mutex<HashMap<i64, JoinHandle<()>>>,
 }
 
 impl<E: Executor> Scheduler<E> {
-    pub fn new(store: Arc<Store>, executor: Arc<E>, wake: Arc<Notify>) -> Arc<Self> {
+    pub fn new(
+        store: Arc<Store>,
+        projects: Arc<Projects>,
+        executor: Arc<E>,
+        wake: Arc<Notify>,
+    ) -> Arc<Self> {
         Arc::new(Scheduler {
             store,
+            projects,
             executor,
             wake,
             running: Mutex::new(HashMap::new()),
@@ -136,8 +158,24 @@ impl<E: Executor> Scheduler<E> {
             if let Some(Command::RunAgent { session, task }) = job.next_command()
                 && let Some(expect) = Expect::for_stage(job.stage())
             {
+                let Some(project) = self.projects.get(&row.project) else {
+                    self.store.apply(
+                        row.id,
+                        Event::AgentFailed {
+                            reason: format!("project {:?} is not configured", row.project),
+                        },
+                    )?;
+                    continue;
+                };
+                let branch = match session {
+                    Session::Planning => None,
+                    Session::Pr(pr) => Some(branch_name(row.id, pr)),
+                };
                 let request = AgentRequest {
                     job_id: row.id,
+                    repo: project.repo.clone(),
+                    base: project.base.clone(),
+                    branch,
                     session_id: self.store.session_uuid(row.id, session)?,
                     expect,
                     prompt: prompt(&task, expect),
