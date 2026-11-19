@@ -427,6 +427,33 @@ async fn the_job_page_shows_the_log_and_reloads_while_the_agent_works() {
     assert!(!page.body.contains("http-equiv=\"refresh\""));
 }
 
+#[tokio::test]
+async fn the_job_page_keeps_the_log_scrolled_only_where_the_log_is_shown() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(!page.body.contains("<script"));
+
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .append_log(
+            id,
+            &factory_runner::LogLine::Tool {
+                name: "Bash".into(),
+                summary: "cargo test".into(),
+            },
+        )
+        .unwrap();
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert_eq!(page.body.matches("<script>").count(), 1);
+    assert!(page.body.contains("sessionStorage"));
+    assert!(page.body.contains("http-equiv=\"refresh\" content=\"5\""));
+
+    assert!(!dashboard.get("/").await.body.contains("<script"));
+}
+
 fn to_spec_approval_from_clarifying(dashboard: &Dashboard, id: i64) {
     dashboard.apply(id, Event::Agent(AgentResult::Clarified));
     dashboard.apply(id, Event::Agent(AgentResult::Spec("spec".into())));
