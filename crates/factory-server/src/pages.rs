@@ -2,7 +2,7 @@ use axum::http::StatusCode;
 use factory_core::{Ask, Command, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, html};
 
-use crate::projects::Projects;
+use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry};
 
@@ -177,8 +177,15 @@ fn job_list(rows: &[&JobRow], settings: &Settings, empty: &str) -> Markup {
     }
 }
 
-pub fn job(user: &str, row: &JobRow, settings: &Settings, logs: &[LogEntry]) -> Markup {
+pub fn job(
+    user: &str,
+    row: &JobRow,
+    project: Option<&Project>,
+    settings: &Settings,
+    logs: &[LogEntry],
+) -> Markup {
     let job = &row.job;
+    let repo_url = project.map(|project| format!("https://github.com/{}", project.repo));
     let id = row.id;
     page(
         user,
@@ -187,7 +194,12 @@ pub fn job(user: &str, row: &JobRow, settings: &Settings, logs: &[LogEntry]) -> 
         &html! {
             h1 { "#" (id) " " (first_line(job.request())) }
             p.meta {
-                (row.project) " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
+                @if let Some(url) = &repo_url {
+                    a href=(url) { (row.project) }
+                } @else {
+                    (row.project)
+                }
+                " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
             }
             (steps(job))
             (status_card(id, job, settings))
@@ -208,7 +220,14 @@ pub fn job(user: &str, row: &JobRow, settings: &Settings, logs: &[LogEntry]) -> 
                         @for pr in job.plan() {
                             li {
                                 strong { (pr.title) }
-                                @if let Some(number) = pr.number { " · #" (number) }
+                                @if let Some(number) = pr.number {
+                                    " · "
+                                    @if let Some(url) = &repo_url {
+                                        a href={ (url) "/pull/" (number) } { "#" (number) }
+                                    } @else {
+                                        "#" (number)
+                                    }
+                                }
                                 div.summary { (pr.summary) }
                             }
                         }

@@ -144,7 +144,8 @@ async fn show_job(
     let row = state.store.get(id)?;
     let logs = state.store.logs(id, LOG_LINES)?;
     let settings = state.store.settings()?;
-    Ok(pages::job(&user(&headers), &row, &settings, &logs))
+    let project = state.projects.get(&row.project);
+    Ok(pages::job(&user(&headers), &row, project, &settings, &logs))
 }
 
 async fn answer(
