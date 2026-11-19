@@ -68,20 +68,21 @@ The state machine is pure logic with no I/O, so it can be tested without podman 
 - The target repository's own `CLAUDE.md` and project skills still load. maestro has its own `no-comments` and `open-pr` skills, so the factory's plugin namespaces its versions as `factory:no-comments` and `factory:open-pr`.
 - Claude Code hooks run under whatever shell the container has, without the nix devShell. Write hook scripts for plain bash and test them that way.
 
-## Planned layout
+## Layout
 
 ```text
 crates/
   factory-core/      job state machine, pure, no I/O
-  factory-server/    axum dashboard, SQLite, SSE
-  factory-runner/    starts podman workers, parses stream-json, resumes sessions
+  factory-server/    axum dashboard, SQLite, job loop, settings
+  factory-runner/    podman workers, stream-json, git checkouts, gh
 containers/
   factory/Containerfile
   worker/Containerfile
-deploy/              Quadlet units, tailscale serve config
-plugin/              factory skills and agents: unslop, no-comments + comment-reviewer, spec interview, plan/split, open-pr
-projects/maestro/project.toml
+deploy/              Quadlet unit, deploy.sh and install.sh
+projects/            factory and maestro
 ```
+
+Not built yet: `plugin/` with the factory skills and agents (unslop, no-comments and comment-reviewer, spec interview, plan and split, open-pr), the comment review in `verifying`, and the live log over server-sent events. The job page reloads every 5 seconds while the agent works.
 
 `open-pr` changes from maestro's version: the worker stops when its commits are ready, and the factory pushes and opens the pull request.
 
@@ -93,13 +94,15 @@ One maestro job from start to end: a request typed in the dashboard ends as a gr
 
 ## Prerequisites
 
-| Step | Who | Status on 2026-11-19 |
+| Step | Who | Status on 2026-11-20 |
 | --- | --- | --- |
 | `sudo apt install podman` on moon (5.7 is in the archive) | You, needs sudo | Done |
 | `systemctl --user enable --now podman.socket` on moon | You | Done |
 | `claude setup-token`, then `podman secret create claude-token -` on moon | You | Done |
 | Add `moonthebot` to maestro as a Write collaborator | You | Not done. moonthebot has Read. |
 | Create `Badger-Embedded/factory`, private | Claude | Done |
+| Add `moonthebot` to factory as a Write collaborator, so the factory can work on itself | You | Done |
+| `just deploy` | Claude | Done. The dashboard is on `https://moon.rex-mimosa.ts.net`. |
 
 ## Open questions
 
