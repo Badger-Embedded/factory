@@ -16,3 +16,7 @@ check-tests base="origin/main":
 # Check a PR title and description: just check-pr "area: summary" body.md
 check-pr title body_file base="origin/main":
     PR_TITLE={{quote(title)}} PR_BODY="$(cat {{quote(body_file)}})" lint/scripts/check-pr-message.sh {{base}}
+
+# Deploy a git ref to moon.local: build the images there and restart the factory
+deploy ref="origin/main":
+    deploy/deploy.sh {{ref}}

@@ -1,0 +1,28 @@
+# Quadlet unit for the factory, installed by deploy/install.sh into
+# ~/.config/containers/systemd/ of the user that runs it.
+[Unit]
+Description=factory dashboard and job loop
+Requires=podman.socket
+After=podman.socket network-online.target
+
+[Container]
+Image=localhost/factory:latest
+ContainerName=factory
+PublishPort=127.0.0.1:8080:8080
+SecurityLabelDisable=true
+# The factory hands host paths to podman when it starts workers, so its data
+# directory has the same path inside the container as on the host.
+Volume=%h/.local/share/factory:%h/.local/share/factory
+Volume=%t/podman/podman.sock:/run/podman/podman.sock
+Environment=FACTORY_DATA=%h/.local/share/factory
+Environment=CONTAINER_HOST=unix:///run/podman/podman.sock
+Environment=FACTORY_WORKER_VOLUMES=factory-nix:/nix
+Environment=RUST_LOG=info
+Secret=gh-token,type=env,target=GH_TOKEN
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
