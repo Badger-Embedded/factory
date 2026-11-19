@@ -11,10 +11,19 @@ fn path_var(name: &str, default: &str) -> PathBuf {
     env::var_os(name).map_or_else(|| PathBuf::from(default), PathBuf::from)
 }
 
+/// `GH_TOKEN` without surrounding whitespace, or `None` when unset or
+/// empty. A token read from a file or a secret often ends in a newline.
+fn gh_token() -> Option<String> {
+    env::var("GH_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
 fn git_config() -> Git {
     let default = Git::default();
     Git {
-        token: env::var("GH_TOKEN").ok().filter(|token| !token.is_empty()),
+        token: gh_token(),
         user_name: env::var("FACTORY_GIT_NAME").unwrap_or(default.user_name.clone()),
         user_email: env::var("FACTORY_GIT_EMAIL").unwrap_or(default.user_email.clone()),
         ..default
@@ -49,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             git: git_config(),
             github: GitHub {
                 gh: path_var("FACTORY_GH", "gh"),
-                token: env::var("GH_TOKEN").ok().filter(|token| !token.is_empty()),
+                token: gh_token(),
                 ..GitHub::default()
             },
             data_dir: data_dir.clone(),

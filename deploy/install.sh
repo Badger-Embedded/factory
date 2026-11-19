@@ -6,14 +6,32 @@ set -euo pipefail
 src=${1:?usage: install.sh SOURCE_DIR}
 cd "$src"
 
+# strip_newline NAME: rewrites secret NAME without its trailing newline.
+# `podman secret create NAME -` stores stdin as it is, and a token piped from
+# a command or typed into a terminal ends in one, which breaks the
+# Authorization header built from it.
+# `podman secret inspect --format` prints its own newline after the value, so
+# a value that ends in a newline ends in two in its output.
+strip_newline() {
+    local value last
+    last=$(podman secret inspect --showsecret --format '{{.SecretData}}' "$1" | tail -c 2 | od -An -c | tr -d ' ')
+    if [[ $last == '\n\n' ]]; then
+        value=$(podman secret inspect --showsecret --format '{{.SecretData}}' "$1")
+        printf '%s' "$value" | podman secret create --replace "$1" - >/dev/null
+        echo "Removed the trailing newline from the $1 secret."
+    fi
+}
+
 if ! podman secret exists gh-token; then
-    gh auth token | podman secret create gh-token -
+    gh auth token | tr -d '\n' | podman secret create gh-token - >/dev/null
 fi
 if ! podman secret exists claude-token; then
     echo "The podman secret claude-token is missing." >&2
     echo "Run 'claude setup-token' and pipe the token into 'podman secret create claude-token -'." >&2
     exit 1
 fi
+strip_newline gh-token
+strip_newline claude-token
 
 podman build --tag localhost/factory-worker:latest --build-arg "UID=$(id -u)" containers/worker
 podman build --tag localhost/factory:latest --file containers/factory/Containerfile .
