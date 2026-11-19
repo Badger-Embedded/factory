@@ -1,0 +1,50 @@
+id: core-no-io
+snapshots:
+  "fn load() { let s = std::fs::read_to_string(\"/etc/factory.toml\"); }":
+    labels:
+    - source: std::fs::read_to_string
+      style: primary
+      start: 20
+      end: 43
+  "fn run() { std::process::Command::new(\"podman\").status(); }":
+    labels:
+    - source: std::process::Command::new
+      style: primary
+      start: 11
+      end: 37
+  "fn token() { std::env::var(\"GH_TOKEN\"); }":
+    labels:
+    - source: std::env::var
+      style: primary
+      start: 13
+      end: 26
+  "pub(crate) use std::process::Command;":
+    labels:
+    - source: pub(crate) use std::process::Command;
+      style: primary
+      start: 0
+      end: 37
+  "use std::fs;":
+    labels:
+    - source: use std::fs;
+      style: primary
+      start: 0
+      end: 12
+  "use std::io::Read;":
+    labels:
+    - source: use std::io::Read;
+      style: primary
+      start: 0
+      end: 18
+  "use std::time::SystemTime;":
+    labels:
+    - source: use std::time::SystemTime;
+      style: primary
+      start: 0
+      end: 26
+  "use std::{collections::BTreeMap, net::TcpStream};":
+    labels:
+    - source: use std::{collections::BTreeMap, net::TcpStream};
+      style: primary
+      start: 0
+      end: 49

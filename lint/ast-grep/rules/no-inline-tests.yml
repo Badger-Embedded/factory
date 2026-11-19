@@ -1,0 +1,29 @@
+id: no-inline-tests
+language: Rust
+severity: error
+message: Test inside src/. Write the test in the crate's tests/ directory instead.
+note: |
+  factory tests behaviour through each crate's public API. Put the test under
+  the crate's tests/ directory. If a test truly needs private items, put this on
+  the line above the attribute, with the reason:
+
+    // ast-grep-ignore: no-inline-tests -- <why the public API cannot cover it>
+files:
+  - crates/*/src/**/*.rs
+utils:
+  cfg-test:
+    kind: attribute_item
+    regex: '^#\[\s*cfg\s*\(.*\btest\b'
+    not:
+      regex: '^#\[\s*cfg\s*\(\s*not\s*\(\s*test\s*\)\s*\)\s*\]$'
+rule:
+  any:
+    - matches: cfg-test
+    - kind: attribute_item
+      regex: '^#\[\s*([A-Za-z_][A-Za-z0-9_]*::)*test\s*\]$'
+      not:
+        inside:
+          kind: mod_item
+          stopBy: end
+          follows:
+            matches: cfg-test
