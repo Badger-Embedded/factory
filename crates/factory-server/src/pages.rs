@@ -65,8 +65,11 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
     )
 }
 
-pub fn index(user: &str, projects: &Projects, jobs: &[JobRow]) -> Markup {
-    let waiting: Vec<&JobRow> = jobs.iter().filter(|row| needs_user(&row.job)).collect();
+pub fn index(user: &str, projects: &Projects, settings: &Settings, jobs: &[JobRow]) -> Markup {
+    let waiting: Vec<&JobRow> = jobs
+        .iter()
+        .filter(|row| needs_user(&row.job, settings))
+        .collect();
     let all: Vec<&JobRow> = jobs.iter().collect();
     layout(
         user,
@@ -88,9 +91,9 @@ pub fn index(user: &str, projects: &Projects, jobs: &[JobRow]) -> Markup {
                 button.primary { "Request" }
             }
             h2.section-title { "Waiting for you" }
-            (job_list(&waiting, "Nothing needs you right now."))
+            (job_list(&waiting, settings, "Nothing needs you right now."))
             h2.section-title { "All jobs" }
-            (job_list(&all, "No jobs yet."))
+            (job_list(&all, settings, "No jobs yet."))
         },
     )
 }
@@ -133,6 +136,13 @@ pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup
                 }
                 h2 { "GitHub" }
                 div.field {
+                    label.check {
+                        input type="checkbox" name="auto_merge" value="on" checked[settings.auto_merge];
+                        " Merge pull requests when their checks pass"
+                    }
+                    p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
+                }
+                div.field {
                     label for="poll_seconds" { "Seconds between looks at a pull request" }
                     input #poll_seconds type="number" name="poll_seconds" min="10" required
                         value=(settings.poll_seconds);
@@ -144,7 +154,7 @@ pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup
     )
 }
 
-fn job_list(rows: &[&JobRow], empty: &str) -> Markup {
+fn job_list(rows: &[&JobRow], settings: &Settings, empty: &str) -> Markup {
     html! {
         @if rows.is_empty() {
             div.card { p.empty { (empty) } }
@@ -155,7 +165,7 @@ fn job_list(rows: &[&JobRow], empty: &str) -> Markup {
                         li {
                             span.id { "#" (row.id) }
                             a.title href={ "/jobs/" (row.id) } { (first_line(row.job.request())) }
-                            (turn_badge(&row.job))
+                            (turn_badge(&row.job, settings))
                             span.sub {
                                 (row.project) " · " (stage_label(&row.job)) " · " (row.requested_by)
                             }
@@ -167,7 +177,7 @@ fn job_list(rows: &[&JobRow], empty: &str) -> Markup {
     }
 }
 
-pub fn job(user: &str, row: &JobRow, logs: &[LogEntry]) -> Markup {
+pub fn job(user: &str, row: &JobRow, settings: &Settings, logs: &[LogEntry]) -> Markup {
     let job = &row.job;
     let id = row.id;
     page(
@@ -180,7 +190,7 @@ pub fn job(user: &str, row: &JobRow, logs: &[LogEntry]) -> Markup {
                 (row.project) " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
             }
             (steps(job))
-            (status_card(id, job))
+            (status_card(id, job, settings))
             div.card {
                 h2 { "Request" }
                 pre.doc { (job.request()) }
@@ -257,7 +267,7 @@ fn steps(job: &Job) -> Markup {
     }
 }
 
-fn status_card(id: i64, job: &Job) -> Markup {
+fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
     match (job.stage(), job.turn()) {
         (_, Turn::User(Ask::Answers { questions })) => html! {
             form.card.needs-you method="post" action={ "/jobs/" (id) "/answers" } {
@@ -301,29 +311,31 @@ fn status_card(id: i64, job: &Job) -> Markup {
         },
         _ => html! {
             div.card {
-                (turn_badge(job)) " " (turn_detail(job))
+                (turn_badge(job, settings)) " " (turn_detail(job, settings))
             }
         },
     }
 }
 
 /// Whether the job waits for the user: an answer or approval on the
-/// dashboard, or a review of its open pull request on GitHub.
-fn needs_user(job: &Job) -> bool {
-    matches!(job.turn(), Turn::User(_)) || in_review(job)
+/// dashboard, or, without auto-merge, a review of its open pull request on
+/// GitHub.
+fn needs_user(job: &Job, settings: &Settings) -> bool {
+    matches!(job.turn(), Turn::User(_)) || (in_review(job) && !settings.auto_merge)
 }
 
 fn in_review(job: &Job) -> bool {
     matches!(job.next_command(), Some(Command::WatchPr { .. }))
 }
 
-fn turn_badge(job: &Job) -> Markup {
+fn turn_badge(job: &Job, settings: &Settings) -> Markup {
     let (class, text) = match (job.stage(), job.turn()) {
         (Stage::Merged, _) => ("ok", "merged"),
         (Stage::Failed { .. }, _) => ("bad", "failed"),
         (Stage::Cancelled, _) => ("factory", "cancelled"),
         (Stage::Requested, _) => ("factory", "queued"),
         (_, Turn::User(_)) => ("you", "needs you"),
+        _ if in_review(job) && settings.auto_merge => ("factory", "merges when green"),
         _ if in_review(job) => ("you", "in review"),
         (_, Turn::Agent(_)) => ("agent", "agent working"),
         (_, Turn::Factory | Turn::Done) => ("factory", "factory working"),
@@ -358,7 +370,7 @@ fn stage_label(job: &Job) -> String {
     }
 }
 
-fn turn_detail(job: &Job) -> String {
+fn turn_detail(job: &Job, settings: &Settings) -> String {
     match job.turn() {
         Turn::Agent(task) => format!("The agent is {}.", task_label(task)),
         Turn::Factory => match job.next_command() {
@@ -368,11 +380,18 @@ fn turn_detail(job: &Job) -> String {
             Some(Command::Publish { .. }) => {
                 "The factory is pushing the branch and opening the pull request.".into()
             }
+            Some(Command::WatchPr { number, .. }) if settings.auto_merge => format!(
+                "Auto-merge is on. The factory merges pull request #{number} once all its \
+                 checks pass, unless review comments come first, which go to the agent. It \
+                 looks every {} seconds.",
+                settings.poll_seconds
+            ),
             Some(Command::WatchPr { number, .. }) => {
                 format!(
                     "Pull request #{number} waits for CI and your review on GitHub. Merge it \
                      when it is ready, or leave review comments and the agent addresses them. \
-                     The factory looks at it every minute."
+                     The factory looks every {} seconds.",
+                    settings.poll_seconds
                 )
             }
             Some(Command::RunAgent { .. }) | None => "Waiting for a free worker.".into(),

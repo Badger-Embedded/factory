@@ -63,6 +63,8 @@ pub struct WatchRequest {
     pub number: u64,
     /// The time of the newest comment the agent already has.
     pub seen_until: Option<String>,
+    /// Merge the pull request when it is ready.
+    pub auto_merge: bool,
 }
 
 /// What a look at a pull request found.
@@ -72,6 +74,9 @@ pub struct WatchReport {
     pub event: Option<Event>,
     /// The new comment watermark, when `event` delivers comments.
     pub seen_until: Option<String>,
+    /// The executor merged the pull request because it was ready and
+    /// auto-merge is on.
+    pub merged_by_factory: bool,
 }
 
 pub type LogSink = Box<dyn FnMut(LogLine) + Send>;
@@ -250,6 +255,7 @@ impl<E: Executor> Scheduler<E> {
                         repo: project.repo.clone(),
                         number,
                         seen_until: self.store.pr_watermark(row.id, pr)?,
+                        auto_merge: settings.auto_merge,
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
@@ -414,12 +420,20 @@ impl<E: Executor> Scheduler<E> {
 
     async fn watch(&self, settings: &Settings, pr: usize, request: WatchRequest) {
         let job_id = request.job_id;
+        let number = request.number;
         self.wait(settings, job_id);
         match self.executor.watch(request).await {
             Ok(WatchReport {
                 event: Some(event),
                 seen_until,
+                merged_by_factory,
             }) => {
+                if merged_by_factory {
+                    self.note(
+                        job_id,
+                        &format!("Merged #{number}: its checks passed and auto-merge is on."),
+                    );
+                }
                 let result = match &seen_until {
                     Some(seen) => self.store.apply_with_watermark(job_id, pr, event, seen),
                     None => self.store.apply(job_id, event),

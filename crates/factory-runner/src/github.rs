@@ -43,6 +43,9 @@ pub struct FailedCheck {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ci {
+    /// No check reported yet, such as in the seconds after a push before
+    /// GitHub starts the workflows, or in a repository without CI.
+    NoChecks,
     Pending,
     Passed,
     Failed(Vec<FailedCheck>),
@@ -77,6 +80,8 @@ pub enum Observation {
         text: String,
         seen_until: String,
     },
+    /// Open, every check passed and no comment is waiting for the agent.
+    Ready,
     Nothing,
 }
 
@@ -168,6 +173,7 @@ pub fn parse_status(view: &str, inline: &str, bot_login: &str) -> Result<PrStatu
 
     let mut failed = Vec::new();
     let mut pending = false;
+    let any_checks = !view.status_check_rollup.is_empty();
     for check in view.status_check_rollup {
         let name = check.name.or(check.context).unwrap_or_default();
         let url = check.details_url.or(check.target_url);
@@ -187,8 +193,10 @@ pub fn parse_status(view: &str, inline: &str, bot_login: &str) -> Result<PrStatu
         Ci::Failed(failed)
     } else if pending {
         Ci::Pending
-    } else {
+    } else if any_checks {
         Ci::Passed
+    } else {
+        Ci::NoChecks
     };
 
     let human = |login: &Option<Login>| -> Option<String> {
@@ -240,7 +248,8 @@ pub fn parse_status(view: &str, inline: &str, bot_login: &str) -> Result<PrStatu
 }
 
 /// Decides what to tell the job. A merge or close comes first, then a CI
-/// failure, then comments newer than `seen_until`.
+/// failure, then comments newer than `seen_until`. Without any of those, a
+/// pull request whose checks all passed is [`Observation::Ready`].
 #[must_use]
 pub fn observe(status: &PrStatus, seen_until: Option<&str>) -> Observation {
     match status.state {
@@ -257,7 +266,11 @@ pub fn observe(status: &PrStatus, seen_until: Option<&str>) -> Observation {
         .filter(|comment| seen_until.is_none_or(|seen| comment.at.as_str() > seen))
         .collect();
     let Some(last) = new.last() else {
-        return Observation::Nothing;
+        return if status.ci == Ci::Passed {
+            Observation::Ready
+        } else {
+            Observation::Nothing
+        };
     };
     let mut text = String::new();
     for comment in &new {
@@ -363,6 +376,30 @@ impl GitHub {
             .next()
             .and_then(|tail| tail.parse().ok())
             .ok_or_else(|| format!("gh pr create printed no pull request URL: {url}"))
+    }
+
+    /// Squash-merges the pull request and deletes its branch. GitHub builds
+    /// the commit message from the repository's squash merge settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message, such as when a ruleset blocks the merge.
+    pub async fn merge(&self, repo: &str, number: u64) -> Result<(), String> {
+        let number_text = number.to_string();
+        self.run(
+            &[
+                "pr",
+                "merge",
+                &number_text,
+                "--repo",
+                repo,
+                "--squash",
+                "--delete-branch",
+            ],
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// # Errors

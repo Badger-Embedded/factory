@@ -100,7 +100,13 @@ async fn stylesheet() -> impl IntoResponse {
 
 async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {
     let jobs = state.store.list()?;
-    Ok(pages::index(&user(&headers), &state.projects, &jobs))
+    let settings = state.store.settings()?;
+    Ok(pages::index(
+        &user(&headers),
+        &state.projects,
+        &settings,
+        &jobs,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -137,7 +143,8 @@ async fn show_job(
 ) -> Result<Markup, AppError> {
     let row = state.store.get(id)?;
     let logs = state.store.logs(id, LOG_LINES)?;
-    Ok(pages::job(&user(&headers), &row, &logs))
+    let settings = state.store.settings()?;
+    Ok(pages::job(&user(&headers), &row, &settings, &logs))
 }
 
 async fn answer(
@@ -194,6 +201,8 @@ struct SettingsForm {
     worker_image: String,
     worker_memory: String,
     worker_cpus: String,
+    /// A checkbox: present when ticked.
+    auto_merge: Option<String>,
 }
 
 async fn save_settings(
@@ -220,6 +229,7 @@ async fn save_settings(
         worker_image: text(form.worker_image, "the worker image")?,
         worker_memory: text(form.worker_memory, "the worker memory")?,
         worker_cpus: text(form.worker_cpus, "the worker CPUs")?,
+        auto_merge: form.auto_merge.is_some(),
     };
     state.store.save_settings(&settings)?;
     state.wake.notify_one();

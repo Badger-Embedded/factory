@@ -459,8 +459,19 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
             worker_image: "localhost/w:2".into(),
             worker_memory: "6g".into(),
             worker_cpus: "6".into(),
+            auto_merge: false,
         }
     );
+    assert!(page.body.contains("name=\"auto_merge\""));
+
+    dashboard
+        .post(
+            "/settings",
+            "max_workers=2&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4&auto_merge=on",
+        )
+        .await;
+    assert!(dashboard.store.settings().unwrap().auto_merge);
+    assert!(dashboard.get("/settings").await.body.contains("checked"));
 }
 
 #[tokio::test]
@@ -518,4 +529,17 @@ async fn a_pull_request_in_review_waits_for_the_user() {
 
     let index = dashboard.get("/").await;
     assert!(!index.body.contains("Nothing needs you right now."));
+
+    dashboard
+        .store
+        .save_settings(&factory_server::Settings {
+            auto_merge: true,
+            ..factory_server::Settings::default()
+        })
+        .unwrap();
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("merges when green"));
+    assert!(page.body.contains("Auto-merge is on"));
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("Nothing needs you right now."));
 }

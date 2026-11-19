@@ -127,7 +127,13 @@ impl Executor for PodmanExecutor {
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
         let status = self.github.status(&request.repo, request.number).await?;
+        let mut merged_by_factory = false;
         let (event, seen_until) = match observe(&status, request.seen_until.as_deref()) {
+            Observation::Ready if request.auto_merge => {
+                self.github.merge(&request.repo, request.number).await?;
+                merged_by_factory = true;
+                (Some(Event::Merged), None)
+            }
             Observation::Merged => (Some(Event::Merged), None),
             Observation::Closed => (Some(Event::ClosedUnmerged), None),
             Observation::CiFailed(checks) => {
@@ -138,9 +144,13 @@ impl Executor for PodmanExecutor {
                 Some(Event::ReviewComments { comments: text }),
                 Some(seen_until),
             ),
-            Observation::Nothing => (None, None),
+            Observation::Ready | Observation::Nothing => (None, None),
         };
-        Ok(WatchReport { event, seen_until })
+        Ok(WatchReport {
+            event,
+            seen_until,
+            merged_by_factory,
+        })
     }
 
     async fn stop(&self, job_id: i64) {
