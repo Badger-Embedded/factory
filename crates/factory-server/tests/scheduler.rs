@@ -106,6 +106,7 @@ impl Executor for FakeExecutor {
             .unwrap_or(Ok(WatchReport {
                 event: None,
                 seen_until: None,
+                merged_by_factory: false,
             }))
     }
 
@@ -482,6 +483,7 @@ async fn commits_go_through_checks_and_publish_to_a_watched_pull_request() {
     executor.watches.lock().unwrap().push_back(Ok(WatchReport {
         event: Some(Event::Merged),
         seen_until: None,
+        merged_by_factory: false,
     }));
     step(&scheduler).await;
     assert_eq!(executor.watched.lock().unwrap()[0].number, 12);
@@ -615,6 +617,7 @@ async fn review_comments_reach_the_agent_once() {
             comments: "talhahavadar:\nNeeds a test.".into(),
         }),
         seen_until: Some("2026-11-19T12:05:00Z".into()),
+        merged_by_factory: false,
     }));
 
     step(&scheduler).await;
@@ -652,4 +655,43 @@ async fn an_open_pull_request_is_watched_once_per_interval() {
     step(&scheduler).await;
     step(&scheduler).await;
     assert_eq!(executor.watched.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn auto_merge_reaches_the_executor_and_a_factory_merge_is_logged() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    store
+        .save_settings(&Settings {
+            poll_seconds: 0,
+            auto_merge: true,
+            ..Settings::default()
+        })
+        .unwrap();
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::Merged),
+        seen_until: None,
+        merged_by_factory: true,
+    }));
+
+    step(&scheduler).await;
+    assert!(executor.watched.lock().unwrap()[0].auto_merge);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Implementing { pr: 1 }
+    );
+    let texts: Vec<String> = store
+        .logs(id, 20)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "Merged #12: its checks passed and auto-merge is on."),
+        "{texts:?}"
+    );
 }

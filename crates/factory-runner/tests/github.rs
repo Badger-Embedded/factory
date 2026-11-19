@@ -122,7 +122,7 @@ fn only_comments_newer_than_the_watermark_are_delivered() {
     assert!(text.contains("talhahavadar on src/main.rs:42:\nUse a constant here."));
     assert!(text.contains("Needs a test."));
 
-    assert_eq!(observe(&status, Some(&seen_until)), Observation::Nothing);
+    assert_eq!(observe(&status, Some(&seen_until)), Observation::Ready);
 }
 
 #[test]
@@ -278,4 +278,52 @@ async fn check_results_become_events_and_podman_errors_are_retried() {
     assert!(report.contains("clippy: unused variable"));
     let err = run(125, "Error: image not known").await.unwrap_err();
     assert!(err.contains("image not known"), "{err}");
+}
+
+#[test]
+fn a_green_pull_request_without_new_comments_is_ready() {
+    let mut status = parse_status(VIEW, INLINE, "moonthebot").unwrap();
+    status.ci = Ci::Passed;
+    assert_eq!(
+        observe(&status, Some("2026-11-19T12:05:00Z")),
+        Observation::Ready
+    );
+
+    status.ci = Ci::Pending;
+    assert_eq!(
+        observe(&status, Some("2026-11-19T12:05:00Z")),
+        Observation::Nothing
+    );
+}
+
+#[test]
+fn a_pull_request_without_any_checks_is_not_ready() {
+    let status = parse_status(
+        r#"{"state": "OPEN", "statusCheckRollup": []}"#,
+        "",
+        "moonthebot",
+    )
+    .unwrap();
+    assert_eq!(status.ci, Ci::NoChecks);
+    assert_eq!(observe(&status, None), Observation::Nothing);
+}
+
+#[tokio::test]
+async fn merge_squashes_and_deletes_the_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let gh = script(
+        dir.path(),
+        "gh",
+        &format!("echo \"$@\" >> '{}'", calls.display()),
+    );
+    let github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+    github.merge("o/r", 15).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr merge 15 --repo o/r --squash --delete-branch\n"
+    );
 }

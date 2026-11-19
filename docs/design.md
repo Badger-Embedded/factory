@@ -18,7 +18,7 @@ These decisions were made on 2026-11-19 while brainstorming in the maestro repos
 | GitHub identity | The bot account `moonthebot`, logged in with `gh` on moon (scope `repo`). It must be a **Write** collaborator on each target repository, not Admin, so a ruleset's Admin bypass does not apply to it. |
 | Credentials | Only the factory holds the GitHub token. Workers get no GitHub credentials. |
 | Claude auth | The subscription token from `claude setup-token`, stored as a podman secret and given only to workers. Its usage limits are shared with interactive use. Switch to an API key if the factory hits them often. |
-| Approval gates | Spec and plan. Everything after the plan runs without stopping, apart from questions the agent asks. You merge on GitHub. |
+| Approval gates | Spec and plan. Everything after the plan runs without stopping, apart from questions the agent asks. You merge on GitHub, unless the auto-merge setting is on: then the factory squash-merges a pull request once every check passed and no review comment waits for the agent. A pull request with no checks reported yet is not merged, so a push is never merged before GitHub starts its CI. |
 | Notifications | The dashboard inbox only. |
 | Project registry | `projects/<name>/project.toml` files in this repository. Adding a project is a pull request. |
 | Capacity | At most 2 worker containers at a time. Each worker gets `--memory 3g --cpus 4`. A job waiting for you holds no worker. The limit, image, memory and CPUs are settings stored in SQLite, read by the job loop on every pass, so a settings page can change them without a restart. |
