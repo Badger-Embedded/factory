@@ -3,7 +3,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use factory_runner::{Git, WorkerConfig};
+use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{PodmanExecutor, Projects, Scheduler, Store, app};
 use tokio::sync::Notify;
 
@@ -42,6 +42,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ..WorkerConfig::default()
             },
             git: git_config(),
+            github: GitHub {
+                gh: path_var("FACTORY_GH", "gh"),
+                token: env::var("GH_TOKEN").ok().filter(|token| !token.is_empty()),
+                ..GitHub::default()
+            },
             data_dir: data_dir.clone(),
         };
         let scheduler = Scheduler::new(

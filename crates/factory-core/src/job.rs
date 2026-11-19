@@ -57,6 +57,17 @@ pub struct PlannedPr {
     pub summary: String,
     /// The GitHub pull request number, once the factory has opened it.
     pub number: Option<u64>,
+    /// The title and description the agent wrote with its latest commits.
+    #[serde(default)]
+    pub description: Option<PrDescription>,
+}
+
+/// A pull request's title and description, written by the agent to the
+/// target repository's rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDescription {
+    pub title: String,
+    pub body: String,
 }
 
 /// The input for one agent run.
@@ -122,7 +133,7 @@ pub enum AgentResult {
     Clarified,
     Spec(String),
     Plan(Vec<PlannedPr>),
-    CommitsReady,
+    CommitsReady(PrDescription),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,8 +348,12 @@ impl Job {
             (
                 S::Implementing { pr } | S::Verifying { pr } | S::CiAndReview { pr },
                 Turn::Agent(_),
-                E::Agent(AgentResult::CommitsReady),
-            ) => (S::Verifying { pr: *pr }, Turn::Factory),
+                E::Agent(AgentResult::CommitsReady(description)),
+            ) => {
+                let pr = *pr;
+                self.plan[pr].description = Some(description);
+                (S::Verifying { pr }, Turn::Factory)
+            }
 
             (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => {
                 (S::PrOpen { pr: *pr }, Turn::Factory)

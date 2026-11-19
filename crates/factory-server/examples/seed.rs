@@ -10,8 +10,15 @@ use std::env;
 use std::error::Error;
 use std::path::PathBuf;
 
-use factory_core::{AgentResult, Event, PlannedPr, Question};
+use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question};
 use factory_server::Store;
+
+fn ready() -> PrDescription {
+    PrDescription {
+        title: "maestrod: add a reboot endpoint".into(),
+        body: "## Why\n\nThe device page needs it.".into(),
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let db =
@@ -27,11 +34,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             title: "maestrod: add a reboot endpoint".into(),
             summary: "POST /devices/{id}/reboot power-cycles the DUT through the relay.".into(),
             number: None,
+            description: None,
         },
         PlannedPr {
             title: "web: add a reboot button to the device page".into(),
             summary: "Calls the new endpoint and shows the result.".into(),
             number: None,
+            description: None,
         },
     ];
     let to_spec = vec![
@@ -48,7 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let to_watching = [
         to_implementing.clone(),
         vec![
-            Event::Agent(AgentResult::CommitsReady),
+            Event::Agent(AgentResult::CommitsReady(ready())),
             Event::ChecksPassed,
             Event::Published { number: 12 },
         ],
@@ -58,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         to_watching.clone(),
         vec![
             Event::Merged,
-            Event::Agent(AgentResult::CommitsReady),
+            Event::Agent(AgentResult::CommitsReady(ready())),
             Event::ChecksPassed,
             Event::Published { number: 13 },
             Event::Merged,

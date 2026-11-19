@@ -2,12 +2,19 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use factory_core::{AgentResult, Event, PlannedPr, Question, Stage, Task};
+use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question, Stage, Task};
 use factory_runner::{
     Expect, LogLine, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
     event_from_result, parse_line, podman_args, prompt, remove_container, run,
 };
 use serde_json::{Value, json};
+
+fn ready() -> PrDescription {
+    PrDescription {
+        title: "maestrod: add a reboot endpoint".into(),
+        body: "## Why\n\nThe device page needs it.".into(),
+    }
+}
 
 const SESSION: &str = "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10";
 
@@ -146,6 +153,10 @@ fn the_schema_allows_questions_and_the_stage_outcome() {
     assert_eq!(schema["required"], json!(["outcome"]));
     assert!(schema["properties"]["plan"].is_object());
     assert!(Expect::Commits.schema()["properties"].get("plan").is_none());
+    assert_eq!(
+        Expect::Commits.schema()["properties"]["pull_request"]["required"],
+        json!(["title", "body"])
+    );
 }
 
 #[test]
@@ -175,12 +186,16 @@ fn structured_outputs_become_agent_results() {
                 title: "a: b".into(),
                 summary: "c".into(),
                 number: None,
+                description: None,
             }]),
         ),
         (
             Expect::Commits,
-            json!({"outcome": "commits_ready"}),
-            AgentResult::CommitsReady,
+            json!({"outcome": "commits_ready", "pull_request": {
+                "title": "maestrod: add a reboot endpoint",
+                "body": "## Why\n\nThe device page needs it."
+            }}),
+            AgentResult::CommitsReady(ready()),
         ),
     ];
     for (expect, output, want) in cases {
@@ -207,6 +222,11 @@ fn incomplete_outputs_fail_the_run() {
         (Expect::Spec, json!({"outcome": "spec"})),
         (Expect::Spec, json!({"outcome": "spec", "spec": "  "})),
         (Expect::Spec, json!({"spec": "no outcome"})),
+        (Expect::Commits, json!({"outcome": "commits_ready"})),
+        (
+            Expect::Commits,
+            json!({"outcome": "commits_ready", "pull_request": {"title": "x", "body": " "}}),
+        ),
     ] {
         let event = event_from_result(expect, &result(Some(output.clone())));
         assert!(
@@ -258,6 +278,7 @@ fn every_prompt_names_the_outcome_that_ends_the_task() {
         title: "maestrod: add a reboot endpoint".into(),
         summary: "POST /reboot".into(),
         number: None,
+        description: None,
     };
     let text = prompt(&Task::Implement { pr }, Expect::Commits);
     assert!(text.contains("maestrod: add a reboot endpoint"));

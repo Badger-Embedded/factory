@@ -1,4 +1,4 @@
-use factory_core::{AgentResult, Event, PlannedPr, Question, Stage};
+use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question, Stage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -73,7 +73,19 @@ impl Expect {
                     }
                 });
             }
-            Expect::Clarify | Expect::Commits => {}
+            Expect::Commits => {
+                properties["pull_request"] = json!({
+                    "type": "object",
+                    "description": "With outcome commits_ready: the pull request's title and description, following the repository's CONTRIBUTING.md.",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "body": { "type": "string" }
+                    },
+                    "required": ["title", "body"],
+                    "additionalProperties": false
+                });
+            }
+            Expect::Clarify => {}
         }
         json!({
             "type": "object",
@@ -91,6 +103,7 @@ struct Output {
     questions: Vec<String>,
     spec: Option<String>,
     plan: Option<Vec<PlanEntry>>,
+    pull_request: Option<PrDescription>,
 }
 
 #[derive(Deserialize)]
@@ -157,10 +170,19 @@ fn agent_result(expect: Expect, result: &ResultMessage) -> Result<AgentResult, S
                     title: entry.title,
                     summary: entry.summary,
                     number: None,
+                    description: None,
                 })
                 .collect(),
         )),
-        (Expect::Commits, "commits_ready") => Ok(AgentResult::CommitsReady),
+        (Expect::Commits, "commits_ready") => match output.pull_request {
+            Some(pr) if !pr.title.trim().is_empty() && !pr.body.trim().is_empty() => {
+                Ok(AgentResult::CommitsReady(pr))
+            }
+            _ => Err(
+                "the agent ended with outcome commits_ready but wrote no pull request title and description"
+                    .into(),
+            ),
+        },
         (_, other) => Err(format!(
             "the agent ended with outcome {other:?}, expected one of {:?}",
             expect.outcomes()

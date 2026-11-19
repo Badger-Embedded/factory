@@ -1,12 +1,21 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use factory_core::{AgentResult, Event, Question, Stage, Turn};
+use factory_core::{AgentResult, Event, PrDescription, Question, Stage, Turn};
 use factory_runner::{Expect, LogLine, RunReport};
 use factory_server::{
-    AgentRequest, Executor, LogSink, Project, Projects, Scheduler, Settings, Store,
+    AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Scheduler,
+    Settings, Store, WatchReport, WatchRequest,
 };
 use tokio::sync::{Notify, Semaphore};
+
+fn ready() -> PrDescription {
+    PrDescription {
+        title: "maestrod: add a reboot endpoint".into(),
+        body: "## Why\n\nThe device page needs it.".into(),
+    }
+}
 
 type Respond = Box<dyn Fn(&AgentRequest) -> Event + Send + Sync>;
 
@@ -17,6 +26,12 @@ struct FakeExecutor {
     respond: Respond,
     requests: Mutex<Vec<AgentRequest>>,
     stopped: Mutex<Vec<i64>>,
+    checks: Mutex<VecDeque<Result<Event, String>>>,
+    checks_run: Mutex<Vec<ChecksRequest>>,
+    publishes: Mutex<VecDeque<Result<u64, String>>>,
+    published: Mutex<Vec<PublishRequest>>,
+    watches: Mutex<VecDeque<Result<WatchReport, String>>>,
+    watched: Mutex<Vec<WatchRequest>>,
 }
 
 impl FakeExecutor {
@@ -26,6 +41,12 @@ impl FakeExecutor {
             respond: Box::new(respond),
             requests: Mutex::new(Vec::new()),
             stopped: Mutex::new(Vec::new()),
+            checks: Mutex::new(VecDeque::new()),
+            checks_run: Mutex::new(Vec::new()),
+            publishes: Mutex::new(VecDeque::new()),
+            published: Mutex::new(Vec::new()),
+            watches: Mutex::new(VecDeque::new()),
+            watched: Mutex::new(Vec::new()),
         })
     }
 
@@ -55,6 +76,39 @@ impl Executor for FakeExecutor {
         }
     }
 
+    async fn run_checks(
+        &self,
+        _settings: &Settings,
+        request: ChecksRequest,
+    ) -> Result<Event, String> {
+        tokio::task::yield_now().await;
+        self.checks_run.lock().unwrap().push(request);
+        self.checks
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(Event::ChecksPassed))
+    }
+
+    async fn publish(&self, request: PublishRequest) -> Result<u64, String> {
+        tokio::task::yield_now().await;
+        self.published.lock().unwrap().push(request);
+        self.publishes.lock().unwrap().pop_front().unwrap_or(Ok(12))
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
+        tokio::task::yield_now().await;
+        self.watched.lock().unwrap().push(request);
+        self.watches
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(WatchReport {
+                event: None,
+                seen_until: None,
+            }))
+    }
+
     async fn stop(&self, job_id: i64) {
         self.stopped.lock().unwrap().push(job_id);
     }
@@ -76,6 +130,7 @@ fn setup(
         Project {
             repo: "Badger-Embedded/maestro".into(),
             base: "main".into(),
+            checks: Some("just lint".into()),
         },
     )]
     .into_iter()
@@ -206,8 +261,9 @@ async fn answers_continue_the_session_and_a_pull_request_gets_its_own() {
             title: "a: b".into(),
             summary: "c".into(),
             number: None,
+            description: None,
         }])),
-        Expect::Commits => Event::Agent(AgentResult::CommitsReady),
+        Expect::Commits => Event::Agent(AgentResult::CommitsReady(ready())),
     });
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -276,7 +332,11 @@ async fn cancelling_a_job_stops_its_run() {
     assert_eq!(*executor.stopped.lock().unwrap(), [id]);
     assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Cancelled);
     let last = store.logs(id, 1).unwrap().pop().unwrap();
-    assert!(last.text.contains("Stopped the agent run"), "{}", last.text);
+    assert!(
+        last.text.contains("Stopped the running step"),
+        "{}",
+        last.text
+    );
 }
 
 #[tokio::test]
@@ -336,4 +396,260 @@ async fn a_job_for_an_unknown_project_fails() {
         store.get(id).unwrap().job.stage(),
         Stage::Failed { reason } if reason.contains("\"gone\"")
     ));
+}
+
+/// Runs the job until its first pull request's commits are ready.
+async fn to_commits_ready(
+    store: &Store,
+    executor: &FakeExecutor,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+) -> i64 {
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    store
+        .apply(
+            id,
+            Event::Agent(AgentResult::Plan(vec![
+                factory_core::PlannedPr {
+                    title: "maestrod: add a reboot endpoint".into(),
+                    summary: "POST /reboot".into(),
+                    number: None,
+                    description: None,
+                },
+                factory_core::PlannedPr {
+                    title: "web: add a reboot button".into(),
+                    summary: "Calls it.".into(),
+                    number: None,
+                    description: None,
+                },
+            ])),
+        )
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    executor.release(1);
+    scheduler.tick().await.unwrap();
+    wait_idle(scheduler).await;
+    id
+}
+
+fn quick_polls(store: &Store) {
+    store
+        .save_settings(&Settings {
+            poll_seconds: 0,
+            ..Settings::default()
+        })
+        .unwrap();
+}
+
+async fn step(scheduler: &Arc<Scheduler<FakeExecutor>>) {
+    scheduler.tick().await.unwrap();
+    wait_idle(scheduler).await;
+}
+
+#[tokio::test]
+async fn commits_go_through_checks_and_publish_to_a_watched_pull_request() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Verifying { pr: 0 }
+    );
+
+    step(&scheduler).await;
+    assert_eq!(executor.checks_run.lock().unwrap()[0].command, "just lint");
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
+
+    step(&scheduler).await;
+    let published = executor.published.lock().unwrap()[0].clone();
+    assert_eq!(published.branch, format!("factory/job-{id}-pr-1"));
+    assert_eq!(published.description, ready());
+    assert_eq!(published.repo, "Badger-Embedded/maestro");
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::Merged),
+        seen_until: None,
+    }));
+    step(&scheduler).await;
+    assert_eq!(executor.watched.lock().unwrap()[0].number, 12);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Implementing { pr: 1 }
+    );
+}
+
+#[tokio::test]
+async fn failed_checks_go_back_to_the_agent() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    executor
+        .checks
+        .lock()
+        .unwrap()
+        .push_back(Ok(Event::ChecksFailed {
+            report: "clippy: unused variable".into(),
+        }));
+
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::FixChecks { report }) if report.contains("clippy")
+    ));
+}
+
+#[tokio::test]
+async fn a_project_without_checks_publishes_unchecked() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let id = store.create("bare", "alice", "x").unwrap();
+    let projects: Projects = [(
+        "bare".to_owned(),
+        Project {
+            repo: "o/bare".into(),
+            base: "main".into(),
+            checks: None,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let scheduler2 = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+    );
+    drop(scheduler);
+    for event in [
+        Event::Start,
+        Event::Agent(AgentResult::Clarified),
+        Event::Agent(AgentResult::Spec("s".into())),
+        Event::Approve,
+        Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+            title: "t".into(),
+            summary: "s".into(),
+            number: None,
+            description: None,
+        }])),
+        Event::Approve,
+        Event::Agent(AgentResult::CommitsReady(ready())),
+    ] {
+        store.apply(id, event).unwrap();
+    }
+
+    scheduler2.tick().await.unwrap();
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
+    assert_eq!(executor.checks_run.lock().unwrap().len(), 0);
+    let last = store.logs(id, 1).unwrap().pop().unwrap();
+    assert!(last.text.contains("no checks"), "{}", last.text);
+}
+
+#[tokio::test]
+async fn a_failed_publish_waits_before_it_is_tried_again() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Err("gh pr create failed: HTTP 502".into()));
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(executor.published.lock().unwrap().len(), 1);
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
+    let last = store.logs(id, 1).unwrap().pop().unwrap();
+    assert!(last.text.contains("HTTP 502"), "{}", last.text);
+    assert!(
+        last.text.contains("tries again in 60 seconds"),
+        "{}",
+        last.text
+    );
+
+    let fresh = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(
+            [(
+                "maestro".to_owned(),
+                Project {
+                    repo: "Badger-Embedded/maestro".into(),
+                    base: "main".into(),
+                    checks: Some("just lint".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+    );
+    step(&fresh).await;
+    assert_eq!(executor.published.lock().unwrap().len(), 2);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn review_comments_reach_the_agent_once() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::ReviewComments {
+            comments: "talhahavadar:\nNeeds a test.".into(),
+        }),
+        seen_until: Some("2026-11-19T12:05:00Z".into()),
+    }));
+
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::AddressReview { .. })
+    ));
+    assert_eq!(
+        store.pr_watermark(id, 0).unwrap().as_deref(),
+        Some("2026-11-19T12:05:00Z")
+    );
+
+    executor.release(1);
+    for _ in 0..4 {
+        step(&scheduler).await;
+    }
+    let watched = executor.watched.lock().unwrap().clone();
+    assert_eq!(watched[0].seen_until, None);
+    assert_eq!(
+        watched.last().unwrap().seen_until.as_deref(),
+        Some("2026-11-19T12:05:00Z")
+    );
+}
+
+#[tokio::test]
+async fn an_open_pull_request_is_watched_once_per_interval() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let _id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    store.save_settings(&Settings::default()).unwrap();
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(executor.watched.lock().unwrap().len(), 1);
 }
