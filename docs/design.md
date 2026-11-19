@@ -48,7 +48,7 @@ Each job moves through these states. Each ✋ is an approval gate.
 requested → clarifying → spec ✋ → plan ✋ → implementing → verifying → pr-open → ci-and-review → merged
 ```
 
-- **clarifying.** The agent reads the repository and asks questions. A headless run cannot wait for answers, so the run ends by writing its questions as JSON. The dashboard shows them, and the next run resumes the same session with your answers.
+- **clarifying.** The agent reads the repository and asks questions. A headless run cannot wait for answers, so the run ends with its questions as structured output. The dashboard shows them, and the next run resumes the same session with your answers.
 - **spec.** The agent writes the goal, scope, what is out of scope, and acceptance criteria.
 - **plan.** The agent splits the work into pull requests. A large refactor gets its own pull request first, as maestro's `CONTRIBUTING.md` requires.
 - **implementing.** One worker session per pull request. The worker commits in the job workspace and stops when the commits are ready.
@@ -60,7 +60,10 @@ The state machine is pure logic with no I/O, so it can be tested without podman 
 
 ## Running Claude Code in a worker
 
-- One `claude -p` run per stage, with `--output-format stream-json` for the live log and `--resume <session-id>` to continue a job's session.
+- One `claude -p` run per stage, with `--output-format stream-json` for the live log. The factory picks the session's UUID and passes it with `--session-id` on the first run, so it knows the ID even if it dies during the run. Later runs pass `--resume <session-id>`.
+- Every run ends with `--json-schema` structured output: an `outcome` and the questions, spec or plan that go with it. Each stage allows `questions` and one outcome of its own: `clarified`, `spec`, `plan` or `commits_ready`. Claude Code puts the output in `structured_output` on the final `result` line. A run without it, or with an outcome its stage does not allow, fails the job.
+- The worker is started with `--rm`, so each job gets a Claude Code config directory on the host, mounted at `CLAUDE_CONFIG_DIR`. It keeps the session files that `--resume` reads.
+- The token reaches the worker as `--secret claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN`.
 - The factory's rules come in through `--plugin-dir` (skills and agents) and `--settings` (hooks). A headless run in an untrusted folder ignores a repository's `extraKnownMarketplaces` without any message, so the factory must not depend on the target repository's plugin settings.
 - The target repository's own `CLAUDE.md` and project skills still load. maestro has its own `no-comments` and `open-pr` skills, so the factory's plugin namespaces its versions as `factory:no-comments` and `factory:open-pr`.
 - Claude Code hooks run under whatever shell the container has, without the nix devShell. Write hook scripts for plain bash and test them that way.
