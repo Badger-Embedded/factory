@@ -431,3 +431,47 @@ fn to_spec_approval_from_clarifying(dashboard: &Dashboard, id: i64) {
     dashboard.apply(id, Event::Agent(AgentResult::Clarified));
     dashboard.apply(id, Event::Agent(AgentResult::Spec("spec".into())));
 }
+
+#[tokio::test]
+async fn the_settings_page_shows_and_saves_the_stored_settings() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/settings").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("name=\"max_workers\""));
+    assert!(page.body.contains("value=\"2\""));
+    assert!(dashboard.get("/").await.body.contains("href=\"/settings\""));
+
+    let reply = dashboard
+        .post(
+            "/settings",
+            "max_workers=4&poll_seconds=30&worker_image=localhost%2Fw%3A2&worker_memory=6g&worker_cpus=6",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    assert_eq!(
+        dashboard.store.settings().unwrap(),
+        factory_server::Settings {
+            max_workers: 4,
+            poll_seconds: 30,
+            worker_image: "localhost/w:2".into(),
+            worker_memory: "6g".into(),
+            worker_cpus: "6".into(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn bad_settings_are_rejected_and_not_saved() {
+    let dashboard = dashboard();
+    let before = dashboard.store.settings().unwrap();
+    for form in [
+        "max_workers=2&poll_seconds=5&worker_image=i&worker_memory=3g&worker_cpus=4",
+        "max_workers=2&poll_seconds=60&worker_image=+&worker_memory=3g&worker_cpus=4",
+        "max_workers=-1&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4",
+    ] {
+        let reply = dashboard.post("/settings", form).await;
+        assert!(reply.status.is_client_error(), "{form}: {}", reply.status);
+    }
+    assert_eq!(dashboard.store.settings().unwrap(), before);
+}

@@ -255,3 +255,11 @@ button:hover { filter: brightness(0.96); }
 .log-tool .log-text { color: var(--agent); }
 .log-factory .log-text { color: var(--muted); font-style: italic; }
 .log-other .log-text { color: var(--muted); }
+
+.topbar-end { display: flex; align-items: center; gap: 14px; }
+.nav { color: var(--muted); text-decoration: none; font-size: 14px; }
+.nav:hover { color: var(--text); }
+input.wide { width: 100%; }
+input[type="number"] { width: 8rem; }
+.hint { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
+.card.saved { border-color: var(--ok); color: var(--ok); }
