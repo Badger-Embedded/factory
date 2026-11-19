@@ -151,12 +151,36 @@ async fn the_index_lists_jobs_and_those_waiting_for_the_user() {
     let id = dashboard.new_job().await;
     let page = dashboard.get("/").await;
     assert!(page.body.contains(&format!("href=\"/jobs/{id}\"")));
-    assert!(page.body.contains("Nothing."));
+    assert!(page.body.contains("Nothing needs you right now."));
 
     to_spec_approval(&dashboard, id);
     let page = dashboard.get("/").await;
-    assert!(!page.body.contains("Nothing."));
-    assert!(page.body.contains("you, spec approval"));
+    assert!(!page.body.contains("Nothing needs you right now."));
+    assert!(page.body.contains("class=\"badge you\""));
+}
+
+#[tokio::test]
+async fn the_stylesheet_is_served_as_css() {
+    let dashboard = dashboard();
+    assert!(
+        dashboard
+            .get("/")
+            .await
+            .body
+            .contains("href=\"/style.css\"")
+    );
+
+    let response = dashboard
+        .router
+        .clone()
+        .oneshot(Request::get("/style.css").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/css; charset=utf-8"
+    );
 }
 
 #[tokio::test]

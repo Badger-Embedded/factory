@@ -1,24 +1,23 @@
 use axum::http::StatusCode;
-use factory_core::{Ask, Command, Job, Session, Stage, Task, Turn};
+use factory_core::{Ask, Command, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, html};
 
 use crate::projects::Projects;
 use crate::store::JobRow;
 
-const STYLE: &str = "
-body { font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 0 auto; padding: 1rem;
-       color: #1d1d1f; background: #fff; }
-@media (prefers-color-scheme: dark) { body { color: #e8e8ea; background: #161618; } }
-header { display: flex; justify-content: space-between; align-items: baseline; }
-header a { color: inherit; text-decoration: none; font-weight: 600; }
-table { border-collapse: collapse; width: 100%; }
-td, th { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8884; }
-textarea { width: 100%; box-sizing: border-box; min-height: 5rem; font: inherit; }
-pre { white-space: pre-wrap; background: #8881; padding: .75rem; border-radius: 4px; }
-.muted { color: #888; }
-.actions { display: flex; gap: .5rem; flex-wrap: wrap; align-items: flex-start; }
-form { margin: .5rem 0; }
-";
+pub const STYLESHEET: &str = include_str!("../static/style.css");
+
+const STEPS: [&str; 9] = [
+    "requested",
+    "clarifying",
+    "spec",
+    "plan",
+    "implementing",
+    "verifying",
+    "pr-open",
+    "ci-and-review",
+    "merged",
+];
 
 fn layout(user: &str, title: &str, body: &Markup) -> Markup {
     html! {
@@ -28,14 +27,16 @@ fn layout(user: &str, title: &str, body: &Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · factory" }
-                style { (STYLE) }
+                link rel="stylesheet" href="/style.css";
             }
             body {
-                header {
-                    a href="/" { "factory" }
-                    span.muted { (user) }
+                div.topbar {
+                    div.topbar-inner {
+                        a.brand href="/" { "factory" }
+                        @if !user.is_empty() { span.user { (user) } }
+                    }
                 }
-                (body)
+                main { (body) }
             }
         }
     }
@@ -46,9 +47,11 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
         "",
         status.as_str(),
         &html! {
-            h1 { (status) }
-            p { (message) }
-            p { a href="javascript:history.back()" { "Back" } }
+            div.card.failed {
+                h1 { (status) }
+                p { (message) }
+                a href="/" { "Back to jobs" }
+            }
         },
     )
 }
@@ -58,48 +61,51 @@ pub fn index(user: &str, projects: &Projects, jobs: &[JobRow]) -> Markup {
         .iter()
         .filter(|row| matches!(row.job.turn(), Turn::User(_)))
         .collect();
+    let all: Vec<&JobRow> = jobs.iter().collect();
     layout(
         user,
         "Jobs",
         &html! {
-            h2 { "New request" }
-            form method="post" action="/jobs" {
-                p {
-                    label { "Project " }
-                    select name="project" {
+            form.card method="post" action="/jobs" {
+                h2 { "New request" }
+                div.field {
+                    label for="project" { "Project" }
+                    select #project name="project" {
                         @for name in projects.names() { option { (name) } }
                     }
                 }
-                textarea name="request" required placeholder="Describe the change you want" {}
-                p { button { "Request" } }
+                div.field {
+                    label for="request" { "What should change?" }
+                    textarea #request name="request" required
+                        placeholder="Add a reboot button to the device page" {}
+                }
+                button.primary { "Request" }
             }
-            h2 { "Waiting for you" }
-            @if waiting.is_empty() {
-                p.muted { "Nothing." }
-            } @else {
-                (job_table(&waiting))
-            }
-            h2 { "All jobs" }
-            @if jobs.is_empty() {
-                p.muted { "No jobs yet." }
-            } @else {
-                (job_table(&jobs.iter().collect::<Vec<_>>()))
-            }
+            h2.section-title { "Waiting for you" }
+            (job_list(&waiting, "Nothing needs you right now."))
+            h2.section-title { "All jobs" }
+            (job_list(&all, "No jobs yet."))
         },
     )
 }
 
-fn job_table(rows: &[&JobRow]) -> Markup {
+fn job_list(rows: &[&JobRow], empty: &str) -> Markup {
     html! {
-        table {
-            tr { th { "Job" } th { "Project" } th { "Request" } th { "Stage" } th { "Waiting on" } }
-            @for row in rows {
-                tr {
-                    td { a href={ "/jobs/" (row.id) } { "#" (row.id) } }
-                    td { (row.project) }
-                    td { (first_line(row.job.request())) }
-                    td { (stage_label(&row.job)) }
-                    td { (turn_label(&row.job)) }
+        @if rows.is_empty() {
+            div.card { p.empty { (empty) } }
+        } @else {
+            div.card.list-card {
+                ul.jobs {
+                    @for row in rows {
+                        li {
+                            span.id { "#" (row.id) }
+                            a.title href={ "/jobs/" (row.id) } { (first_line(row.job.request())) }
+                            (turn_badge(&row.job))
+                            span.sub {
+                                (row.project) " · " (stage_label(&row.job)) " · " (row.requested_by)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -114,71 +120,135 @@ pub fn job(user: &str, row: &JobRow) -> Markup {
         &format!("Job #{id}"),
         &html! {
             h1 { "#" (id) " " (first_line(job.request())) }
-            p.muted {
+            p.meta {
                 (row.project) " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
             }
-            p { b { "Stage: " } (stage_label(job)) " · " b { "Waiting on: " } (turn_label(job)) }
-            h2 { "Request" }
-            pre { (job.request()) }
-            (pending(id, job))
+            (steps(job))
+            (status_card(id, job))
+            div.card {
+                h2 { "Request" }
+                pre.doc { (job.request()) }
+            }
             @if let Some(spec) = job.spec() {
-                h2 { "Spec" }
-                pre { (spec) }
+                div.card {
+                    h2 { "Spec" }
+                    pre.doc { (spec) }
+                }
             }
             @if !job.plan().is_empty() {
-                h2 { "Plan" }
-                ol {
-                    @for pr in job.plan() {
-                        li {
-                            b { (pr.title) }
-                            @if let Some(number) = pr.number { " · #" (number) }
-                            br; (pr.summary)
+                div.card {
+                    h2 { "Plan" }
+                    ol.plan {
+                        @for pr in job.plan() {
+                            li {
+                                strong { (pr.title) }
+                                @if let Some(number) = pr.number { " · #" (number) }
+                                div.summary { (pr.summary) }
+                            }
                         }
                     }
                 }
             }
             @if *job.turn() != Turn::Done {
-                form method="post" action={ "/jobs/" (id) "/cancel" } {
-                    button { "Cancel job" }
+                form.footer-actions method="post" action={ "/jobs/" (id) "/cancel" } {
+                    button.danger { "Cancel job" }
                 }
             }
         },
     )
 }
 
-fn pending(id: i64, job: &Job) -> Markup {
-    match job.turn() {
-        Turn::User(Ask::Answers { questions }) => html! {
-            h2 { "Questions" }
-            form method="post" action={ "/jobs/" (id) "/answers" } {
+fn step_index(stage: &Stage) -> Option<usize> {
+    Some(match stage {
+        Stage::Requested => 0,
+        Stage::Clarifying => 1,
+        Stage::Spec => 2,
+        Stage::Plan => 3,
+        Stage::Implementing { .. } => 4,
+        Stage::Verifying { .. } => 5,
+        Stage::PrOpen { .. } => 6,
+        Stage::CiAndReview { .. } => 7,
+        Stage::Merged => 8,
+        Stage::Cancelled | Stage::Failed { .. } => return None,
+    })
+}
+
+fn steps(job: &Job) -> Markup {
+    let Some(current) = step_index(job.stage()) else {
+        return html! {};
+    };
+    let merged = *job.stage() == Stage::Merged;
+    html! {
+        ol.steps aria-label="Job stages" {
+            @for (i, step) in STEPS.iter().enumerate() {
+                @let class = if i < current || merged { "done" } else if i == current { "current" } else { "" };
+                li class=(class) aria-current=[(i == current).then_some("step")] { (step) }
+            }
+        }
+    }
+}
+
+fn status_card(id: i64, job: &Job) -> Markup {
+    match (job.stage(), job.turn()) {
+        (_, Turn::User(Ask::Answers { questions })) => html! {
+            form.card.needs-you method="post" action={ "/jobs/" (id) "/answers" } {
+                h2 { "The agent has questions" }
                 @for (i, question) in questions.iter().enumerate() {
-                    p { label for={ "answer_" (i) } { (question.text) } }
-                    textarea id={ "answer_" (i) } name={ "answer_" (i) } required {}
+                    div.question {
+                        label for={ "answer_" (i) } { (question.text) }
+                        textarea id={ "answer_" (i) } name={ "answer_" (i) } required {}
+                    }
                 }
-                p { button { "Send answers" } }
+                button.primary { "Send answers" }
             }
         },
-        Turn::User(ask @ (Ask::SpecApproval | Ask::PlanApproval)) => {
+        (_, Turn::User(ask @ (Ask::SpecApproval | Ask::PlanApproval))) => {
             let what = if *ask == Ask::SpecApproval {
                 "spec"
             } else {
                 "plan"
             };
             html! {
-                h2 { "Approve the " (what) }
-                div.actions {
-                    form method="post" action={ "/jobs/" (id) "/approve" } {
-                        button { "Approve " (what) }
-                    }
-                    form method="post" action={ "/jobs/" (id) "/changes" } style="flex: 1" {
-                        textarea name="feedback" required placeholder="What should change" {}
-                        button { "Request changes" }
+                div.card.needs-you {
+                    h2 { "Review the " (what) " below" }
+                    div.row {
+                        form method="post" action={ "/jobs/" (id) "/approve" } {
+                            button.primary { "Approve " (what) }
+                        }
+                        form.grow method="post" action={ "/jobs/" (id) "/changes" } {
+                            textarea name="feedback" required aria-label="What should change"
+                                placeholder="Or say what should change" {}
+                            p { button { "Request changes" } }
+                        }
                     }
                 }
             }
         }
-        _ => html! {},
+        (Stage::Failed { reason }, _) => html! {
+            div.card.failed {
+                h2 { "Failed" }
+                p.empty { (reason) }
+            }
+        },
+        _ => html! {
+            div.card {
+                (turn_badge(job)) " " (turn_detail(job))
+            }
+        },
     }
+}
+
+fn turn_badge(job: &Job) -> Markup {
+    let (class, text) = match (job.stage(), job.turn()) {
+        (Stage::Merged, _) => ("ok", "merged"),
+        (Stage::Failed { .. }, _) => ("bad", "failed"),
+        (Stage::Cancelled, _) => ("factory", "cancelled"),
+        (Stage::Requested, _) => ("factory", "queued"),
+        (_, Turn::User(_)) => ("you", "needs you"),
+        (_, Turn::Agent(_)) => ("agent", "agent working"),
+        (_, Turn::Factory | Turn::Done) => ("factory", "factory working"),
+    };
+    html! { span class={ "badge " (class) } { (text) } }
 }
 
 fn first_line(text: &str) -> String {
@@ -192,41 +262,42 @@ fn first_line(text: &str) -> String {
 }
 
 fn stage_label(job: &Job) -> String {
-    let of = |pr: usize| format!("{}/{}", pr + 1, job.plan().len());
+    let of = |pr: usize| format!("PR {} of {}", pr + 1, job.plan().len());
     match job.stage() {
         Stage::Requested => "requested".into(),
         Stage::Clarifying => "clarifying".into(),
         Stage::Spec => "spec".into(),
         Stage::Plan => "plan".into(),
-        Stage::Implementing { pr } => format!("implementing {}", of(*pr)),
-        Stage::Verifying { pr } => format!("verifying {}", of(*pr)),
-        Stage::PrOpen { pr } => format!("pr-open {}", of(*pr)),
-        Stage::CiAndReview { pr } => format!("ci-and-review {}", of(*pr)),
+        Stage::Implementing { pr } => format!("implementing, {}", of(*pr)),
+        Stage::Verifying { pr } => format!("verifying, {}", of(*pr)),
+        Stage::PrOpen { pr } => format!("pr-open, {}", of(*pr)),
+        Stage::CiAndReview { pr } => format!("ci-and-review, {}", of(*pr)),
         Stage::Merged => "merged".into(),
         Stage::Cancelled => "cancelled".into(),
-        Stage::Failed { reason } => format!("failed: {reason}"),
+        Stage::Failed { .. } => "failed".into(),
     }
 }
 
-fn turn_label(job: &Job) -> String {
+fn turn_detail(job: &Job) -> String {
     match job.turn() {
-        Turn::Agent(task) => format!("agent, {}", task_label(task)),
-        Turn::User(Ask::Answers { questions }) => {
-            format!("you, {} question(s)", questions.len())
-        }
-        Turn::User(Ask::SpecApproval) => "you, spec approval".into(),
-        Turn::User(Ask::PlanApproval) => "you, plan approval".into(),
+        Turn::Agent(task) => format!("The agent is {}.", task_label(task)),
         Turn::Factory => match job.next_command() {
-            Some(Command::RunChecks { .. }) => "factory, running checks".into(),
-            Some(Command::Publish { .. }) => "factory, opening the pull request".into(),
-            Some(Command::WatchPr { number, .. }) => format!("factory, watching #{number}"),
-            Some(Command::RunAgent { session, .. }) => match session {
-                Session::Planning => "factory, planning session".into(),
-                Session::Pr(pr) => format!("factory, session for pull request {}", pr + 1),
-            },
-            None => "factory, a free worker".into(),
+            Some(Command::RunChecks { .. }) => {
+                "The factory is running the project's checks.".into()
+            }
+            Some(Command::Publish { .. }) => {
+                "The factory is pushing the branch and opening the pull request.".into()
+            }
+            Some(Command::WatchPr { number, .. }) => {
+                format!("The factory is watching CI and review comments on #{number}.")
+            }
+            Some(Command::RunAgent { .. }) | None => "Waiting for a free worker.".into(),
         },
-        Turn::Done => "nobody".into(),
+        Turn::User(_) => "Waiting for you.".into(),
+        Turn::Done => match job.stage() {
+            Stage::Merged => "Every planned pull request is merged.".into(),
+            _ => "This job is cancelled.".into(),
+        },
     }
 }
 
@@ -235,11 +306,11 @@ fn task_label(task: &Task) -> &'static str {
         Task::Clarify { .. } => "reading the repository",
         Task::WriteSpec => "writing the spec",
         Task::WritePlan => "writing the plan",
-        Task::Implement { .. } => "implementing",
+        Task::Implement { .. } => "implementing the pull request",
         Task::Answer { .. } => "reading your answers",
-        Task::Revise { .. } => "revising",
+        Task::Revise { .. } => "revising after your feedback",
         Task::FixChecks { .. } => "fixing failed checks",
-        Task::FixCi { .. } => "fixing CI",
+        Task::FixCi { .. } => "fixing the CI failure",
         Task::AddressReview { .. } => "addressing review comments",
     }
 }
