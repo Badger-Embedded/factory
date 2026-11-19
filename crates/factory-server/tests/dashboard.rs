@@ -25,11 +25,15 @@ struct Reply {
 }
 
 fn dashboard() -> Dashboard {
+    dashboard_for("Badger-Embedded/maestro")
+}
+
+fn dashboard_for(repo: &str) -> Dashboard {
     let dir = tempfile::tempdir().unwrap();
     write_project(
         dir.path(),
         "maestro",
-        "repo = \"Badger-Embedded/maestro\"\nbase = \"main\"\n",
+        &format!("repo = \"{repo}\"\nbase = \"main\"\n"),
     );
     let projects = Arc::new(Projects::load(dir.path()).unwrap());
     let store = Arc::new(Store::open_in_memory().unwrap());
@@ -542,4 +546,98 @@ async fn a_pull_request_in_review_waits_for_the_user() {
     assert!(page.body.contains("Auto-merge is on"));
     let index = dashboard.get("/").await;
     assert!(index.body.contains("Nothing needs you right now."));
+}
+
+fn planned(title: &str, number: Option<u64>) -> PlannedPr {
+    PlannedPr {
+        title: title.into(),
+        summary: "summary".into(),
+        number,
+        description: None,
+    }
+}
+
+async fn with_plan(dashboard: &Dashboard, plan: Vec<PlannedPr>) -> i64 {
+    let id = dashboard.new_job().await;
+    to_spec_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::Plan(plan)));
+    id
+}
+
+#[tokio::test]
+async fn the_job_page_links_the_project_to_its_repository() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains(r#"<a href="https://github.com/Badger-Embedded/maestro">maestro</a>"#)
+    );
+}
+
+#[tokio::test]
+async fn the_job_page_links_a_numbered_pull_request() {
+    let dashboard = dashboard();
+    let id = with_plan(&dashboard, vec![planned("add a reboot endpoint", Some(7))]).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains(r#"<a href="https://github.com/Badger-Embedded/maestro/pull/7">#7</a>"#)
+    );
+}
+
+#[tokio::test]
+async fn only_numbered_pull_requests_in_a_plan_get_links() {
+    let dashboard = dashboard();
+    let id = with_plan(
+        &dashboard,
+        vec![planned("first", Some(7)), planned("second", None)],
+    )
+    .await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert_eq!(page.body.matches("/pull/").count(), 1);
+    assert!(page.body.contains("second"));
+}
+
+#[tokio::test]
+async fn a_job_whose_project_is_gone_renders_without_links() {
+    let dashboard = dashboard();
+    let id = with_plan(&dashboard, vec![planned("first", Some(7))]).await;
+    let router = app(
+        dashboard.store.clone(),
+        Arc::new(Projects::default()),
+        Arc::new(Notify::new()),
+    );
+    let page = Dashboard {
+        store: dashboard.store.clone(),
+        router,
+    }
+    .get(&format!("/jobs/{id}"))
+    .await;
+
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("maestro"));
+    assert!(page.body.contains("#7"));
+    assert!(!page.body.contains("github.com"));
+}
+
+#[tokio::test]
+async fn links_use_the_repository_from_the_project_file() {
+    let dashboard = dashboard_for("someone-else/widgets");
+    let id = with_plan(&dashboard, vec![planned("first", Some(3))]).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains(r#"href="https://github.com/someone-else/widgets""#)
+    );
+    assert!(
+        page.body
+            .contains(r#"href="https://github.com/someone-else/widgets/pull/3""#)
+    );
+    assert!(!page.body.contains("Badger-Embedded"));
 }
