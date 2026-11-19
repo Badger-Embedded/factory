@@ -290,6 +290,7 @@ fn every_prompt_names_the_outcome_that_ends_the_task() {
 fn podman_args_give_the_worker_its_token_limits_and_mounts() {
     let config = WorkerConfig {
         plugin_dir: Some(PathBuf::from("/srv/factory/plugin")),
+        volumes: vec!["factory-nix:/nix".into()],
         ..WorkerConfig::default()
     };
     let args = strings(&podman_args(
@@ -309,6 +310,7 @@ fn podman_args_give_the_worker_its_token_limits_and_mounts() {
         "/jobs/7/work:/work",
         "/jobs/7/claude:/claude",
         "/srv/factory/plugin:/factory-plugin:ro",
+        "factory-nix:/nix",
     ] {
         assert!(args.iter().any(|arg| arg == volume), "missing {volume}");
     }

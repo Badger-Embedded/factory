@@ -21,6 +21,7 @@ Then open <http://127.0.0.1:8080>. Without `tailscale serve` in front, the dashb
 | `FACTORY_WORKERS` | unset | `podman` runs jobs in podman workers. Unset, jobs wait in `requested`. |
 | `FACTORY_PODMAN` | `podman` | The podman binary. Set `CONTAINER_HOST` to use a remote podman service. |
 | `FACTORY_PLUGIN_DIR` | unset | The factory plugin, mounted read-only into workers |
+| `FACTORY_WORKER_VOLUMES` | unset | Space-separated `--volume` values for every worker, such as `factory-nix:/nix` |
 | `GH_TOKEN` | unset | GitHub token the factory clones, pushes and opens pull requests with. Workers never get it. |
 | `FACTORY_GH` | `gh` | The GitHub CLI |
 | `FACTORY_GIT_NAME`, `FACTORY_GIT_EMAIL` | `moonthebot` and its noreply address | Identity on the agent's commits |
@@ -32,3 +33,14 @@ Without `FACTORY_WORKERS=podman`, a new job waits in `requested`. To see the pag
 ```sh
 nix develop -c cargo run -p factory-server --example seed
 ```
+
+## Deploy to moon
+
+```sh
+just deploy            # origin/main
+just deploy my-branch  # any git ref
+```
+
+`deploy/deploy.sh` copies the ref's source to `~/factory-src` on `moon.local` and runs `deploy/install.sh` there. That script builds the worker and factory images, installs the Quadlet unit `deploy/factory.container`, restarts `factory.service` and publishes the dashboard on the tailnet with `tailscale serve`. It creates the `gh-token` podman secret from moonthebot's `gh` login when the secret is missing. The `claude-token` secret has to exist already.
+
+On moon, the factory keeps its database and job directories in `~/.local/share/factory`. Follow its log with `journalctl --user -u factory -f`.

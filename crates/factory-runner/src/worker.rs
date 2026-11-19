@@ -32,6 +32,9 @@ pub struct WorkerConfig {
     pub token_secret: String,
     /// The factory plugin on the host, mounted read-only.
     pub plugin_dir: Option<PathBuf>,
+    /// More `--volume` values for every worker, such as a named volume for
+    /// the nix store that all workers share.
+    pub volumes: Vec<String>,
 }
 
 impl Default for WorkerConfig {
@@ -43,6 +46,7 @@ impl Default for WorkerConfig {
             cpus: "4".into(),
             token_secret: "claude-token".into(),
             plugin_dir: None,
+            volumes: Vec::new(),
         }
     }
 }
@@ -166,6 +170,10 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     mount(&run.claude_dir, CLAUDE_DIR, "");
     if let Some(plugin) = &config.plugin_dir {
         mount(plugin, PLUGIN_DIR, ":ro");
+    }
+    for volume in &config.volumes {
+        args.push("--volume".into());
+        args.push(volume.into());
     }
 
     let (session_flag, session_id) = match &run.session {

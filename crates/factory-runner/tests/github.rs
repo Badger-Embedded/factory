@@ -227,8 +227,12 @@ async fn the_failure_report_has_each_failed_jobs_log() {
 
 #[test]
 fn checks_run_with_bash_in_the_checkout_without_tokens() {
+    let config = WorkerConfig {
+        volumes: vec!["factory-nix:/nix".into()],
+        ..WorkerConfig::default()
+    };
     let args: Vec<String> = checks_args(
-        &WorkerConfig::default(),
+        &config,
         "factory-job-7",
         Path::new("/jobs/7/work"),
         "just lint",
@@ -237,6 +241,7 @@ fn checks_run_with_bash_in_the_checkout_without_tokens() {
     .map(|arg| arg.to_string_lossy().into_owned())
     .collect();
     assert!(args.iter().any(|arg| arg == "/jobs/7/work:/work"));
+    assert!(args.iter().any(|arg| arg == "factory-nix:/nix"));
     assert_eq!(args[args.len() - 3..], ["bash", "-lc", "just lint"]);
     assert!(!args.iter().any(|arg| arg.contains("secret")));
 }

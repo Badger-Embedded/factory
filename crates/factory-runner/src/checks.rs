@@ -41,6 +41,10 @@ pub fn checks_args(
     .map(OsString::from)
     .collect();
     args.push(volume);
+    for volume in &config.volumes {
+        args.push("--volume".into());
+        args.push(volume.into());
+    }
     for arg in [config.image.as_str(), "bash", "-lc", command] {
         args.push(arg.into());
     }
