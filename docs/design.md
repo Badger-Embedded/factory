@@ -82,7 +82,7 @@ projects/maestro/project.toml
 
 `open-pr` changes from maestro's version: the worker stops when its commits are ready, and the factory pushes and opens the pull request.
 
-This repository follows the same standards as maestro: `CONTRIBUTING.md`, a check on pull request titles and descriptions, prek hooks, and a ruleset on `main`.
+This repository follows the same standards as maestro: `CONTRIBUTING.md`, a check on pull request titles and descriptions, and prek hooks. It has no ruleset on `main`. GitHub allows rulesets on a private repository only on a paid plan, and the factory stays private for now. Nothing on GitHub blocks a direct push or a merge with failing checks, so the reviewer merges only after CI passes. Merges are squash only, and GitHub deletes the branch after a merge.
 
 ## First milestone
 
@@ -92,10 +92,10 @@ One maestro job from start to end: a request typed in the dashboard ends as a gr
 
 | Step | Who | Status on 2026-11-19 |
 | --- | --- | --- |
-| `sudo apt install podman` on moon (5.7 is in the archive) | You, needs sudo | Not done |
-| `systemctl --user enable --now podman.socket` on moon | You | Not done |
-| `claude setup-token`, then `podman secret create claude-token -` on moon | You | Not done |
-| Add `moonthebot` to maestro as a Write collaborator | You | Not done |
+| `sudo apt install podman` on moon (5.7 is in the archive) | You, needs sudo | Done |
+| `systemctl --user enable --now podman.socket` on moon | You | Done |
+| `claude setup-token`, then `podman secret create claude-token -` on moon | You | Done |
+| Add `moonthebot` to maestro as a Write collaborator | You | Not done. moonthebot has Read. |
 | Create `Badger-Embedded/factory`, private | Claude | Done |
 
 ## Open questions
