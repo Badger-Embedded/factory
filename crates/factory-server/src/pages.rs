@@ -3,7 +3,7 @@ use factory_core::{Ask, Command, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, html};
 
 use crate::projects::Projects;
-use crate::store::JobRow;
+use crate::store::{JobRow, LogEntry};
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
 
@@ -20,6 +20,10 @@ const STEPS: [&str; 9] = [
 ];
 
 fn layout(user: &str, title: &str, body: &Markup) -> Markup {
+    page(user, title, false, body)
+}
+
+fn page(user: &str, title: &str, refresh: bool, body: &Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -27,6 +31,7 @@ fn layout(user: &str, title: &str, body: &Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · factory" }
+                @if refresh { meta http-equiv="refresh" content="5"; }
                 link rel="stylesheet" href="/style.css";
             }
             body {
@@ -112,12 +117,13 @@ fn job_list(rows: &[&JobRow], empty: &str) -> Markup {
     }
 }
 
-pub fn job(user: &str, row: &JobRow) -> Markup {
+pub fn job(user: &str, row: &JobRow, logs: &[LogEntry]) -> Markup {
     let job = &row.job;
     let id = row.id;
-    layout(
+    page(
         user,
         &format!("Job #{id}"),
+        matches!(job.turn(), Turn::Agent(_)),
         &html! {
             h1 { "#" (id) " " (first_line(job.request())) }
             p.meta {
@@ -144,6 +150,19 @@ pub fn job(user: &str, row: &JobRow) -> Markup {
                                 strong { (pr.title) }
                                 @if let Some(number) = pr.number { " · #" (number) }
                                 div.summary { (pr.summary) }
+                            }
+                        }
+                    }
+                }
+            }
+            @if !logs.is_empty() {
+                div.card {
+                    h2 { "Log" }
+                    ol.log {
+                        @for entry in logs {
+                            li class={ "log-" (entry.kind) } {
+                                span.log-at { (entry.at.get(11..).unwrap_or(&entry.at)) }
+                                span.log-text { (entry.text) }
                             }
                         }
                     }

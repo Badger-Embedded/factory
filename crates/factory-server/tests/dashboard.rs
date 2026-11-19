@@ -8,6 +8,7 @@ use axum::http::{Request, StatusCode, header};
 use factory_core::{AgentResult, Ask, Event, PlannedPr, Question, Stage, Task, Turn};
 use factory_server::{Projects, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 
 struct Dashboard {
@@ -31,7 +32,7 @@ fn dashboard() -> Dashboard {
     let projects = Arc::new(Projects::load(dir.path()).unwrap());
     let store = Arc::new(Store::open_in_memory().unwrap());
     Dashboard {
-        router: app(store.clone(), projects),
+        router: app(store.clone(), projects, Arc::new(Notify::new())),
         store,
     }
 }
@@ -383,4 +384,49 @@ fn a_project_file_with_an_unknown_key_fails_to_load() {
     );
     let err = Projects::load(dir.path()).unwrap_err();
     assert!(err.to_string().contains("project.toml"));
+}
+
+#[test]
+fn settings_default_until_saved() {
+    let store = Store::open_in_memory().unwrap();
+    let settings = store.settings().unwrap();
+    assert_eq!(settings.max_workers, 2);
+    assert_eq!(settings.worker_memory, "3g");
+
+    let changed = factory_server::Settings {
+        max_workers: 4,
+        ..settings
+    };
+    store.save_settings(&changed).unwrap();
+    assert_eq!(store.settings().unwrap(), changed);
+}
+
+#[tokio::test]
+async fn the_job_page_shows_the_log_and_reloads_while_the_agent_works() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .append_log(
+            id,
+            &factory_runner::LogLine::Tool {
+                name: "Bash".into(),
+                summary: "cargo test".into(),
+            },
+        )
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("Bash: cargo test"));
+    assert!(page.body.contains("http-equiv=\"refresh\""));
+
+    to_spec_approval_from_clarifying(&dashboard, id);
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(!page.body.contains("http-equiv=\"refresh\""));
+}
+
+fn to_spec_approval_from_clarifying(dashboard: &Dashboard, id: i64) {
+    dashboard.apply(id, Event::Agent(AgentResult::Clarified));
+    dashboard.apply(id, Event::Agent(AgentResult::Spec("spec".into())));
 }

@@ -21,7 +21,7 @@ These decisions were made on 2026-11-19 while brainstorming in the maestro repos
 | Approval gates | Spec and plan. Everything after the plan runs without stopping, apart from questions the agent asks. You merge on GitHub. |
 | Notifications | The dashboard inbox only. |
 | Project registry | `projects/<name>/project.toml` files in this repository. Adding a project is a pull request. |
-| Capacity | At most 2 jobs at a time. Each worker gets `--memory 3g --cpus 4`. |
+| Capacity | At most 2 worker containers at a time. Each worker gets `--memory 3g --cpus 4`. A job waiting for you holds no worker. The limit, image, memory and CPUs are settings stored in SQLite, read by the job loop on every pass, so a settings page can change them without a restart. |
 
 ## Architecture
 
@@ -104,6 +104,7 @@ One maestro job from start to end: a request typed in the dashboard ends as a gr
 ## Open questions
 
 - **Sign-off on factory pull requests.** maestro's `CONTRIBUTING.md` asks for a `Signed-off-by` line in the pull request description, and its `open-pr` skill signs with the git identity. A pull request from moonthebot needs a decision: no sign-off, or yours added when you approve the plan.
+- **Configurable approval gates.** The gates are fixed in `factory-core` today: spec and plan. To let a settings page add gates, such as approving before the factory pushes, a job would carry its set of gates, copied from the settings when the job is created. A job then keeps the gates it started with when the settings change. The state machine stops at a gate only when the job's set includes it.
 - **Overlap with maestro's skills.** Once the factory works, decide whether maestro keeps its own `no-comments` and `open-pr` skills for interactive sessions or drops them.
 
 ## Lessons from building maestro's checks

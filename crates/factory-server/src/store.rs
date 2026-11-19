@@ -2,8 +2,11 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use factory_core::{Event, Job, Rejected};
+use factory_core::{Event, Job, Rejected, Session};
+use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::settings::Settings;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS jobs (
@@ -13,7 +16,35 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     job TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    settings TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    job_id INTEGER NOT NULL REFERENCES jobs (id),
+    session TEXT NOT NULL,
+    uuid TEXT NOT NULL,
+    PRIMARY KEY (job_id, session)
+);
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs (id),
+    at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS logs_by_job ON logs (job_id, id);
 ";
+
+/// One line of a job's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    /// UTC, as SQLite's `CURRENT_TIMESTAMP` writes it.
+    pub at: String,
+    /// `text`, `tool`, `other` for agent output, or `factory`.
+    pub kind: String,
+    pub text: String,
+}
 
 /// The jobs, kept in SQLite. Each job is stored as JSON in one row.
 pub struct Store {
@@ -149,6 +180,112 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(row)
+    }
+
+    /// The stored settings, or the defaults when none are stored.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or stored settings that do not parse.
+    pub fn settings(&self) -> Result<Settings, StoreError> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row("SELECT settings FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(match stored {
+            Some(json) => serde_json::from_str(&json)?,
+            None => Settings::default(),
+        })
+    }
+
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_settings(&self, settings: &Settings) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO settings (id, settings) VALUES (1, ?1)
+             ON CONFLICT (id) DO UPDATE SET settings = excluded.settings",
+            [serde_json::to_string(settings)?],
+        )?;
+        Ok(())
+    }
+
+    /// The Claude Code session UUID for `session` of job `job_id`, created
+    /// on first use.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn session_uuid(&self, job_id: i64, session: Session) -> Result<String, StoreError> {
+        let key = match session {
+            Session::Planning => "planning".to_owned(),
+            Session::Pr(pr) => format!("pr-{pr}"),
+        };
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (job_id, session, uuid) VALUES (?1, ?2, ?3)",
+            params![job_id, key, uuid::Uuid::new_v4().to_string()],
+        )?;
+        Ok(conn.query_row(
+            "SELECT uuid FROM sessions WHERE job_id = ?1 AND session = ?2",
+            params![job_id, key],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn append_log(&self, job_id: i64, line: &LogLine) -> Result<(), StoreError> {
+        let (kind, text) = match line {
+            LogLine::Text(text) => ("text", text.clone()),
+            LogLine::Tool { name, summary } if summary.is_empty() => ("tool", name.clone()),
+            LogLine::Tool { name, summary } => ("tool", format!("{name}: {summary}")),
+            LogLine::Other(text) => ("other", text.clone()),
+        };
+        self.append_log_entry(job_id, kind, &text)
+    }
+
+    /// A line from the factory itself, such as a run starting.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn append_factory_log(&self, job_id: i64, text: &str) -> Result<(), StoreError> {
+        self.append_log_entry(job_id, "factory", text)
+    }
+
+    fn append_log_entry(&self, job_id: i64, kind: &str, text: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO logs (job_id, kind, text) VALUES (?1, ?2, ?3)",
+            params![job_id, kind, text],
+        )?;
+        Ok(())
+    }
+
+    /// The last `limit` log lines of job `job_id`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn logs(&self, job_id: i64, limit: usize) -> Result<Vec<LogEntry>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT at, kind, text FROM
+               (SELECT id, at, kind, text FROM logs WHERE job_id = ?1 ORDER BY id DESC LIMIT ?2)
+             ORDER BY id",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![job_id, limit], |row| {
+            Ok(LogEntry {
+                at: row.get(0)?,
+                kind: row.get(1)?,
+                text: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     fn load(conn: &Connection, id: i64) -> Result<JobRow, StoreError> {
