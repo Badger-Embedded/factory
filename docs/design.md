@@ -82,7 +82,7 @@ deploy/              Quadlet unit, deploy.sh and install.sh
 projects/            factory and maestro
 ```
 
-Not built yet: `plugin/` with the factory skills and agents (unslop, no-comments and comment-reviewer, spec interview, plan and split, open-pr), the comment review in `verifying`, and the live log over server-sent events. The job page reloads every 5 seconds while the agent works.
+Not built yet: `plugin/` with the factory skills and agents (unslop, no-comments and comment-reviewer, spec interview, plan and split, open-pr), the comment review in `verifying`, and the live log over server-sent events. The job page reloads every 5 seconds while the agent works. A small inline script, `static/log-scroll.js`, keeps the log position across each reload: it saves in `sessionStorage` whether the reader was at the bottom or how far up they had scrolled, and restores that after the reload. Server-sent events will replace the reload and the script.
 
 `open-pr` changes from maestro's version: the worker stops when its commits are ready, and the factory pushes and opens the pull request.
 

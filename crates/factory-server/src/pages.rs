@@ -1,12 +1,13 @@
 use axum::http::StatusCode;
 use factory_core::{Ask, Command, Job, Stage, Task, Turn};
-use maud::{DOCTYPE, Markup, html};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry};
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
+const LOG_SCROLL: &str = include_str!("../static/log-scroll.js");
 
 const STEPS: [&str; 9] = [
     "requested",
@@ -245,6 +246,7 @@ pub fn job(
                             }
                         }
                     }
+                    script { (PreEscaped(LOG_SCROLL)) }
                 }
             }
             @if *job.turn() != Turn::Done {
