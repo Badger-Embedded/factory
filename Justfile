@@ -6,6 +6,9 @@ lint:
 hooks:
     prek install
 
+test:
+    cargo test --workspace --locked
+
 # Check that committed changes since BASE come with tests (CI runs this on PRs)
 check-tests base="origin/main":
     prek run --hook-stage manual tests-accompany-changes --from-ref {{base}} --to-ref HEAD

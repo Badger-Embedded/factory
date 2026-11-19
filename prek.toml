@@ -16,6 +16,22 @@ hooks = [
 repo = "local"
 
 [[repos.hooks]]
+id = "rustfmt"
+name = "rustfmt"
+language = "system"
+entry = "cargo fmt --all -- --check"
+files = '\.rs$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "clippy"
+name = "clippy"
+language = "system"
+entry = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+files = '(\.rs|Cargo\.(toml|lock))$'
+pass_filenames = false
+
+[[repos.hooks]]
 id = "ast-grep-scan"
 name = "ast-grep project rules"
 language = "system"

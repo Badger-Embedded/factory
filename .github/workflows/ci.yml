@@ -22,6 +22,7 @@ jobs:
           # Full history so the PR's commits and the base branch are both present.
           fetch-depth: 0
       - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
       - name: Lint (all prek hooks)
         run: nix develop -c just lint
       - name: Code changes come with tests
@@ -29,3 +30,5 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: nix develop -c just check-tests "origin/$BASE_REF"
+      - name: Test
+        run: nix develop -c just test
