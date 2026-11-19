@@ -423,3 +423,54 @@ fn cancel_ends_the_job_and_later_events_are_rejected() {
     assert!(job.apply(Event::Agent(AgentResult::Clarified)).is_err());
     assert!(job.apply(Event::Cancel).is_err());
 }
+
+#[test]
+fn a_conflict_sends_the_agent_to_rebase_and_counts_as_a_failed_round() {
+    let mut job = watching(7);
+    apply(
+        &mut job,
+        Event::Conflicted {
+            base: "main".into(),
+        },
+    );
+    assert_runs(
+        &job,
+        Session::Pr(0),
+        Task::Rebase {
+            base: "main".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    assert_eq!(job.next_command(), Some(Command::RunChecks { pr: 0 }));
+
+    let mut job = watching(7);
+    for _ in 1..MAX_FAILED_ROUNDS {
+        apply(
+            &mut job,
+            Event::Conflicted {
+                base: "main".into(),
+            },
+        );
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(&mut job, Event::ChecksPassed);
+        apply(&mut job, Event::Published { number: 7 });
+    }
+    apply(
+        &mut job,
+        Event::Conflicted {
+            base: "main".into(),
+        },
+    );
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+}
+
+#[test]
+fn a_conflict_is_only_taken_while_the_factory_watches_the_pull_request() {
+    let mut job = implementing(&["only"]);
+    assert!(
+        job.apply(Event::Conflicted {
+            base: "main".into()
+        })
+        .is_err()
+    );
+}

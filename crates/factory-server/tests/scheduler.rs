@@ -695,3 +695,35 @@ async fn auto_merge_reaches_the_executor_and_a_factory_merge_is_logged() {
         "{texts:?}"
     );
 }
+
+#[tokio::test]
+async fn a_conflict_sends_the_agent_to_rebase_on_the_pull_request_branch() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::Conflicted {
+            base: "main".into(),
+        }),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+
+    step(&scheduler).await;
+    assert_eq!(executor.watched.lock().unwrap()[0].base, "main");
+    executor.release(1);
+    step(&scheduler).await;
+
+    let rebase = executor.requests().last().unwrap().clone();
+    assert!(rebase.prompt.contains("origin/main"), "{}", rebase.prompt);
+    assert_eq!(
+        rebase.branch.as_deref(),
+        Some(format!("factory/job-{id}-pr-1").as_str())
+    );
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Verifying { pr: 0 }
+    );
+}

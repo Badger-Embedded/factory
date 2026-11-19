@@ -189,3 +189,27 @@ async fn a_missing_repository_fails_with_gits_message() {
         .unwrap_err();
     assert!(err.starts_with("git clone failed:"), "{err}");
 }
+
+#[tokio::test]
+async fn every_pull_request_run_fetches_the_newest_base() {
+    let remote = Remote::new();
+    let work = remote.work();
+    let git_ = remote.git();
+    let branch = "factory/job-7-pr-1";
+    git_.prepare(&work, "owner/repo", "main", Some(branch))
+        .await
+        .unwrap();
+    commit(&work, "feature", "agent work");
+
+    commit(&remote.upstream(), "other", "merged meanwhile");
+    git(&remote.upstream(), &["push", "-q", "origin", "main"]);
+    git_.prepare(&work, "owner/repo", "main", Some(branch))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        git(&work, &["log", "-1", "--format=%s", "origin/main"]),
+        "merged meanwhile"
+    );
+    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "agent work");
+}

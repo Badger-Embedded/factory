@@ -63,6 +63,7 @@ impl Git {
         let Some(branch) = branch else {
             return Ok(());
         };
+        self.run(work, &["fetch", "origin", base], true).await?;
         let local = format!("refs/heads/{branch}");
         if self
             .run(work, &["rev-parse", "--verify", "--quiet", &local], false)
@@ -71,7 +72,6 @@ impl Git {
         {
             self.run(work, &["checkout", branch], false).await?;
         } else {
-            self.run(work, &["fetch", "origin", base], true).await?;
             let start = format!("origin/{base}");
             self.run(work, &["checkout", "-b", branch, &start], false)
                 .await?;

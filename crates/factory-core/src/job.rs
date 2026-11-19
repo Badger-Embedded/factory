@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Check or CI failures a job may hit on one pull request before it fails.
+/// Check failures, CI failures and merge conflicts a job may hit on one
+/// pull request before it fails. A conflict counts, so an agent that cannot
+/// resolve one does not rebase forever.
 pub const MAX_FAILED_ROUNDS: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +99,11 @@ pub enum Task {
     AddressReview {
         comments: String,
     },
+    /// Rebase the pull request's branch onto the newest `origin/<base>`,
+    /// which the factory fetched before the run.
+    Rebase {
+        base: String,
+    },
 }
 
 /// The agent session a run continues. Clarifying, spec and plan share one
@@ -140,15 +147,31 @@ pub enum AgentResult {
 pub enum Event {
     Start,
     Agent(AgentResult),
-    AgentFailed { reason: String },
+    AgentFailed {
+        reason: String,
+    },
     Answer(Vec<String>),
     Approve,
-    RequestChanges { feedback: String },
+    RequestChanges {
+        feedback: String,
+    },
     ChecksPassed,
-    ChecksFailed { report: String },
-    Published { number: u64 },
-    CiFailed { log: String },
-    ReviewComments { comments: String },
+    ChecksFailed {
+        report: String,
+    },
+    Published {
+        number: u64,
+    },
+    CiFailed {
+        log: String,
+    },
+    /// The pull request no longer merges cleanly into `base`.
+    Conflicted {
+        base: String,
+    },
+    ReviewComments {
+        comments: String,
+    },
     Merged,
     ClosedUnmerged,
     Cancel,
@@ -372,6 +395,10 @@ impl Job {
             (S::CiAndReview { pr }, Turn::Factory, E::CiFailed { log }) => {
                 let pr = *pr;
                 self.fail_round(S::CiAndReview { pr }, Task::FixCi { log })
+            }
+            (S::CiAndReview { pr }, Turn::Factory, E::Conflicted { base }) => {
+                let pr = *pr;
+                self.fail_round(S::CiAndReview { pr }, Task::Rebase { base })
             }
             (S::CiAndReview { pr }, Turn::Factory, E::ReviewComments { comments }) => (
                 S::CiAndReview { pr: *pr },

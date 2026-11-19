@@ -136,6 +136,12 @@ impl Executor for PodmanExecutor {
             }
             Observation::Merged => (Some(Event::Merged), None),
             Observation::Closed => (Some(Event::ClosedUnmerged), None),
+            Observation::Conflicted => (
+                Some(Event::Conflicted {
+                    base: request.base.clone(),
+                }),
+                None,
+            ),
             Observation::CiFailed(checks) => {
                 let log = self.github.failure_report(&request.repo, &checks).await;
                 (Some(Event::CiFailed { log }), None)

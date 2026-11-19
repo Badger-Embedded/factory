@@ -52,6 +52,13 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
         Task::FixCi { log } => {
             format!("CI failed on the pull request:\n\n{log}\n\nFix the failure and commit.")
         }
+        Task::Rebase { base } => format!(
+            "The pull request no longer merges cleanly into {base}. The factory fetched \
+             the newest origin/{base} into this checkout. Rebase the branch onto \
+             origin/{base} and resolve the conflicts so that both your change and the \
+             changes on {base} keep working. Run the tests. Do not push. Update the pull \
+             request title and description if the rebase changed what they describe."
+        ),
         Task::AddressReview { comments } => format!(
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
