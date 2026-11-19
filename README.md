@@ -18,4 +18,8 @@ Then open <http://127.0.0.1:8080>. Without `tailscale serve` in front, the dashb
 | `FACTORY_DB` | `factory.db` | SQLite database file |
 | `FACTORY_PROJECTS` | `projects` | Directory of `<name>/project.toml` files |
 
-No worker runs yet, so a new job waits in `requested`.
+No worker runs yet, so a new job waits in `requested`. To see the pages for the later stages, fill the database with demo jobs in every stage first:
+
+```sh
+nix develop -c cargo run -p factory-server --example seed
+```

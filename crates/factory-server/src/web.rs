@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Form, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use factory_core::Event;
@@ -28,6 +28,7 @@ struct AppState {
 pub fn app(store: Arc<Store>, projects: Arc<Projects>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/style.css", get(stylesheet))
         .route("/jobs", post(create_job))
         .route("/jobs/{id}", get(show_job))
         .route("/jobs/{id}/answers", post(answer))
@@ -74,6 +75,13 @@ impl IntoResponse for AppError {
         };
         (status, pages::error(status, &message)).into_response()
     }
+}
+
+async fn stylesheet() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        pages::STYLESHEET,
+    )
 }
 
 async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {
