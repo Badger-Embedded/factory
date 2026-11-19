@@ -1,0 +1,24 @@
+id: core-no-io
+language: Rust
+severity: error
+message: factory-core must not do I/O.
+note: |
+  factory-core holds the job state machine only, so it can be tested without
+  podman, GitHub or a database. Put file, network, process and clock access in
+  factory-server or factory-runner, and pass the results into factory-core as
+  plain values.
+files:
+  - crates/factory-core/**/*.rs
+rule:
+  any:
+    - kind: use_declaration
+      regex: '^(pub(\([^)]*\))?\s+)?use\s+(::)?std::[^;]*\b(fs|net|process|io|env|thread|time)\b'
+    - kind: scoped_identifier
+      regex: '^(::)?std::(fs|net|process|io|env|thread|time)(::|$)'
+      not:
+        any:
+          - inside:
+              kind: scoped_identifier
+          - inside:
+              kind: use_declaration
+              stopBy: end
