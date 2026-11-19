@@ -33,8 +33,10 @@ fi
 strip_newline gh-token
 strip_newline claude-token
 
-podman build --tag localhost/factory-worker:latest --build-arg "UID=$(id -u)" containers/worker
-podman build --tag localhost/factory:latest --file containers/factory/Containerfile .
+# The docker format keeps the Containerfiles' SHELL, which sets pipefail for
+# their curl | sh steps. The OCI format ignores it.
+podman build --format docker --tag localhost/factory-worker:latest --build-arg "UID=$(id -u)" containers/worker
+podman build --format docker --tag localhost/factory:latest --file containers/factory/Containerfile .
 
 mkdir -p ~/.local/share/factory ~/.config/containers/systemd
 cp deploy/factory.container ~/.config/containers/systemd/factory.container

@@ -11,9 +11,13 @@ host=${FACTORY_HOST:-moon@moon.local}
 src=factory-src
 
 cd "$(git rev-parse --show-toplevel)"
-git fetch --quiet origin
+# BatchMode makes a fetch that needs a passphrase or a key touch fail at once
+# instead of waiting for input that a non-interactive shell never gets.
+if ! GIT_SSH_COMMAND="ssh -o BatchMode=yes" git fetch --quiet origin; then
+    echo "warning: could not fetch origin, deploying $ref as it is locally" >&2
+fi
 commit=$(git rev-parse --verify "$ref^{commit}")
-echo "Deploying $(git log -1 --format='%h %s' "$commit") to $host"
+echo "Deploying $(git log -1 --no-show-signature --format='%h %s' "$commit") to $host"
 
 # $src is expanded here on purpose: it is a fixed directory name.
 # shellcheck disable=SC2029
