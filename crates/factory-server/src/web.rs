@@ -9,6 +9,7 @@ use axum::routing::{get, post};
 use factory_core::Event;
 use maud::Markup;
 use serde::Deserialize;
+use tokio::sync::Notify;
 
 use crate::pages;
 use crate::projects::Projects;
@@ -18,14 +19,18 @@ use crate::store::{Store, StoreError};
 pub const USER_HEADER: &str = "Tailscale-User-Login";
 
 const LOCAL_USER: &str = "local";
+const LOG_LINES: usize = 300;
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
     projects: Arc<Projects>,
+    wake: Arc<Notify>,
 }
 
-pub fn app(store: Arc<Store>, projects: Arc<Projects>) -> Router {
+/// The dashboard. Every change it makes to a job notifies `wake`, so the
+/// job loop looks at the job right away.
+pub fn app(store: Arc<Store>, projects: Arc<Projects>, wake: Arc<Notify>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/style.css", get(stylesheet))
@@ -35,7 +40,11 @@ pub fn app(store: Arc<Store>, projects: Arc<Projects>) -> Router {
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
-        .with_state(AppState { store, projects })
+        .with_state(AppState {
+            store,
+            projects,
+            wake,
+        })
 }
 
 fn user(headers: &HeaderMap) -> String {
@@ -122,7 +131,8 @@ async fn show_job(
     Path(id): Path<i64>,
 ) -> Result<Markup, AppError> {
     let row = state.store.get(id)?;
-    Ok(pages::job(&user(&headers), &row))
+    let logs = state.store.logs(id, LOG_LINES)?;
+    Ok(pages::job(&user(&headers), &row, &logs))
 }
 
 async fn answer(
@@ -170,6 +180,7 @@ async fn cancel(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Re
 
 fn apply(state: &AppState, id: i64, event: Event) -> Result<Redirect, AppError> {
     state.store.apply(id, event)?;
+    state.wake.notify_one();
     Ok(job_redirect(id))
 }
 

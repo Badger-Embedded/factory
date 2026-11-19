@@ -3,23 +3,46 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use factory_server::{Projects, Store, app};
+use factory_runner::WorkerConfig;
+use factory_server::{PodmanExecutor, Projects, Scheduler, Store, app};
+use tokio::sync::Notify;
+
+fn path_var(name: &str, default: &str) -> PathBuf {
+    env::var_os(name).map_or_else(|| PathBuf::from(default), PathBuf::from)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
     let listen = env::var("FACTORY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let db = env::var_os("FACTORY_DB").map_or_else(|| PathBuf::from("factory.db"), PathBuf::from);
-    let projects_dir =
-        env::var_os("FACTORY_PROJECTS").map_or_else(|| PathBuf::from("projects"), PathBuf::from);
+    let data_dir = path_var("FACTORY_DATA", "data");
+    let db = env::var_os("FACTORY_DB").map_or_else(|| data_dir.join("factory.db"), PathBuf::from);
+    let projects = Projects::load(&path_var("FACTORY_PROJECTS", "projects"))?;
 
-    let projects = Projects::load(&projects_dir)?;
-    let store = Store::open(&db)?;
+    std::fs::create_dir_all(&data_dir)?;
+    let store = Arc::new(Store::open(&db)?);
+    let wake = Arc::new(Notify::new());
+
+    if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {
+        let executor = PodmanExecutor {
+            base: WorkerConfig {
+                podman: path_var("FACTORY_PODMAN", "podman"),
+                plugin_dir: env::var_os("FACTORY_PLUGIN_DIR").map(PathBuf::from),
+                ..WorkerConfig::default()
+            },
+            data_dir: data_dir.clone(),
+        };
+        let scheduler = Scheduler::new(Arc::clone(&store), Arc::new(executor), Arc::clone(&wake));
+        tokio::spawn(scheduler.run());
+        tracing::info!("running jobs in podman workers");
+    } else {
+        tracing::info!("workers are off, set FACTORY_WORKERS=podman to run jobs");
+    }
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
-
-    axum::serve(listener, app(Arc::new(store), Arc::new(projects)))
+    axum::serve(listener, app(store, Arc::new(projects), wake))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

@@ -1,5 +1,6 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use factory_core::Event;
@@ -53,6 +54,55 @@ pub enum SessionRun {
     /// so it is known even if the factory dies during the run.
     Start(String),
     Resume(String),
+}
+
+impl SessionRun {
+    /// Resumes session `id` when Claude Code already wrote its transcript
+    /// under `claude_dir`, and starts it otherwise. A run that died before
+    /// Claude Code wrote anything can then start again with the same ID.
+    #[must_use]
+    pub fn for_session(claude_dir: &Path, id: &str) -> Self {
+        let transcript = format!("{id}.jsonl");
+        if contains_file(&claude_dir.join("projects"), &transcript) {
+            SessionRun::Resume(id.to_owned())
+        } else {
+            SessionRun::Start(id.to_owned())
+        }
+    }
+}
+
+fn contains_file(dir: &Path, name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            contains_file(&path, name)
+        } else {
+            entry.file_name() == name
+        }
+    })
+}
+
+/// Removes container `name` if it exists, such as a worker that outlived
+/// a factory crash.
+///
+/// # Errors
+///
+/// Fails when podman cannot run or reports an error.
+pub async fn remove_container(config: &WorkerConfig, name: &str) -> Result<(), String> {
+    let output = Command::new(&config.podman)
+        .args(["rm", "--force", "--ignore", name])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|err| format!("could not start {}: {err}", config.podman.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 /// One agent run.

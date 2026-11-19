@@ -14,7 +14,11 @@ use factory_core::{AgentResult, Event, PlannedPr, Question};
 use factory_server::Store;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let db = env::var_os("FACTORY_DB").map_or_else(|| PathBuf::from("factory.db"), PathBuf::from);
+    let db =
+        env::var_os("FACTORY_DB").map_or_else(|| PathBuf::from("data/factory.db"), PathBuf::from);
+    if let Some(dir) = db.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let store = Store::open(&db)?;
 
     let spec = "Goal: reboot the device under test from its page.\n\nScope:\n- A Reboot button on the device page.\n- POST /devices/{id}/reboot in maestrod.\n\nOut of scope: scheduled reboots.\n\nAcceptance:\n- The button power-cycles the DUT and the page shows it coming back.";

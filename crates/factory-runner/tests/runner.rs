@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use factory_core::{AgentResult, Event, PlannedPr, Question, Stage, Task};
 use factory_runner::{
     Expect, LogLine, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
-    event_from_result, parse_line, podman_args, prompt, run,
+    event_from_result, parse_line, podman_args, prompt, remove_container, run,
 };
 use serde_json::{Value, json};
 
@@ -401,4 +401,52 @@ async fn a_missing_podman_binary_fails_the_run() {
     )
     .await;
     assert!(failure_reason(report.event).contains("could not start"));
+}
+
+#[test]
+fn a_session_resumes_once_claude_code_wrote_its_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        SessionRun::for_session(dir.path(), SESSION),
+        SessionRun::Start(SESSION.into())
+    );
+
+    let project = dir.path().join("projects/-work");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("another-session.jsonl"), "").unwrap();
+    assert_eq!(
+        SessionRun::for_session(dir.path(), SESSION),
+        SessionRun::Start(SESSION.into())
+    );
+
+    fs::write(project.join(format!("{SESSION}.jsonl")), "").unwrap();
+    assert_eq!(
+        SessionRun::for_session(dir.path(), SESSION),
+        SessionRun::Resume(SESSION.into())
+    );
+}
+
+#[tokio::test]
+async fn remove_container_runs_podman_rm_and_reports_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    fs::write(&empty, "").unwrap();
+    let ok = WorkerConfig {
+        podman: fake_podman(dir.path(), &empty, "", 0),
+        ..WorkerConfig::default()
+    };
+    remove_container(&ok, "factory-job-7").await.unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("args")).unwrap(),
+        "rm\n--force\n--ignore\nfactory-job-7\n"
+    );
+
+    let failing = WorkerConfig {
+        podman: fake_podman(dir.path(), &empty, "Error: cannot connect", 125),
+        ..WorkerConfig::default()
+    };
+    let err = remove_container(&failing, "factory-job-7")
+        .await
+        .unwrap_err();
+    assert!(err.contains("cannot connect"), "{err}");
 }
