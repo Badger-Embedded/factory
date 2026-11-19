@@ -66,10 +66,7 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
 }
 
 pub fn index(user: &str, projects: &Projects, jobs: &[JobRow]) -> Markup {
-    let waiting: Vec<&JobRow> = jobs
-        .iter()
-        .filter(|row| matches!(row.job.turn(), Turn::User(_)))
-        .collect();
+    let waiting: Vec<&JobRow> = jobs.iter().filter(|row| needs_user(&row.job)).collect();
     let all: Vec<&JobRow> = jobs.iter().collect();
     layout(
         user,
@@ -310,6 +307,16 @@ fn status_card(id: i64, job: &Job) -> Markup {
     }
 }
 
+/// Whether the job waits for the user: an answer or approval on the
+/// dashboard, or a review of its open pull request on GitHub.
+fn needs_user(job: &Job) -> bool {
+    matches!(job.turn(), Turn::User(_)) || in_review(job)
+}
+
+fn in_review(job: &Job) -> bool {
+    matches!(job.next_command(), Some(Command::WatchPr { .. }))
+}
+
 fn turn_badge(job: &Job) -> Markup {
     let (class, text) = match (job.stage(), job.turn()) {
         (Stage::Merged, _) => ("ok", "merged"),
@@ -317,6 +324,7 @@ fn turn_badge(job: &Job) -> Markup {
         (Stage::Cancelled, _) => ("factory", "cancelled"),
         (Stage::Requested, _) => ("factory", "queued"),
         (_, Turn::User(_)) => ("you", "needs you"),
+        _ if in_review(job) => ("you", "in review"),
         (_, Turn::Agent(_)) => ("agent", "agent working"),
         (_, Turn::Factory | Turn::Done) => ("factory", "factory working"),
     };
@@ -361,7 +369,11 @@ fn turn_detail(job: &Job) -> String {
                 "The factory is pushing the branch and opening the pull request.".into()
             }
             Some(Command::WatchPr { number, .. }) => {
-                format!("The factory is watching CI and review comments on #{number}.")
+                format!(
+                    "Pull request #{number} waits for CI and your review on GitHub. Merge it \
+                     when it is ready, or leave review comments and the agent addresses them. \
+                     The factory looks at it every minute."
+                )
             }
             Some(Command::RunAgent { .. }) | None => "Waiting for a free worker.".into(),
         },
