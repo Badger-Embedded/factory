@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 
 use crate::pages;
 use crate::projects::Projects;
+use crate::settings::Settings;
 use crate::store::{Store, StoreError};
 
 /// The header `tailscale serve` sets to the logged-in user's login name.
@@ -20,6 +21,9 @@ pub const USER_HEADER: &str = "Tailscale-User-Login";
 
 const LOCAL_USER: &str = "local";
 const LOG_LINES: usize = 300;
+/// GitHub allows 5000 API calls an hour, and each look at a pull request
+/// takes two.
+const MIN_POLL_SECONDS: u64 = 10;
 
 #[derive(Clone)]
 struct AppState {
@@ -40,6 +44,7 @@ pub fn app(store: Arc<Store>, projects: Arc<Projects>, wake: Arc<Notify>) -> Rou
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
+        .route("/settings", get(show_settings).post(save_settings))
         .with_state(AppState {
             store,
             projects,
@@ -172,6 +177,53 @@ async fn request_changes(
             feedback: feedback.to_owned(),
         },
     )
+}
+
+async fn show_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    let settings = state.store.settings()?;
+    Ok(pages::settings(&user(&headers), &settings, None))
+}
+
+#[derive(Deserialize)]
+struct SettingsForm {
+    max_workers: usize,
+    poll_seconds: u64,
+    worker_image: String,
+    worker_memory: String,
+    worker_cpus: String,
+}
+
+async fn save_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SettingsForm>,
+) -> Result<Markup, AppError> {
+    let text = |value: String, name: &str| {
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            Err(AppError::BadRequest(format!("{name} is empty")))
+        } else {
+            Ok(value)
+        }
+    };
+    if form.poll_seconds < MIN_POLL_SECONDS {
+        return Err(AppError::BadRequest(format!(
+            "the poll interval must be at least {MIN_POLL_SECONDS} seconds"
+        )));
+    }
+    let settings = Settings {
+        max_workers: form.max_workers,
+        poll_seconds: form.poll_seconds,
+        worker_image: text(form.worker_image, "the worker image")?,
+        worker_memory: text(form.worker_memory, "the worker memory")?,
+        worker_cpus: text(form.worker_cpus, "the worker CPUs")?,
+    };
+    state.store.save_settings(&settings)?;
+    state.wake.notify_one();
+    Ok(pages::settings(&user(&headers), &settings, Some("Saved.")))
 }
 
 async fn cancel(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Redirect, AppError> {

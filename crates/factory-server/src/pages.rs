@@ -3,6 +3,7 @@ use factory_core::{Ask, Command, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, html};
 
 use crate::projects::Projects;
+use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry};
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
@@ -38,7 +39,10 @@ fn page(user: &str, title: &str, refresh: bool, body: &Markup) -> Markup {
                 div.topbar {
                     div.topbar-inner {
                         a.brand href="/" { "factory" }
-                        @if !user.is_empty() { span.user { (user) } }
+                        div.topbar-end {
+                            a.nav href="/settings" { "Settings" }
+                            @if !user.is_empty() { span.user { (user) } }
+                        }
                     }
                 }
                 main { (body) }
@@ -90,6 +94,55 @@ pub fn index(user: &str, projects: &Projects, jobs: &[JobRow]) -> Markup {
             (job_list(&waiting, "Nothing needs you right now."))
             h2.section-title { "All jobs" }
             (job_list(&all, "No jobs yet."))
+        },
+    )
+}
+
+pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup {
+    layout(
+        user,
+        "Settings",
+        &html! {
+            h1 { "Settings" }
+            p.meta { "The job loop reads these on every pass. A run that already started keeps the values it started with." }
+            @if let Some(notice) = notice {
+                div.card.saved { (notice) }
+            }
+            form.card method="post" action="/settings" {
+                h2 { "Workers" }
+                div.field {
+                    label for="max_workers" { "Workers at a time" }
+                    input #max_workers type="number" name="max_workers" min="0" required
+                        value=(settings.max_workers);
+                    p.hint { "Agent runs and check runs each take one. 0 pauses new runs." }
+                }
+                div.field {
+                    label for="worker_image" { "Image" }
+                    input #worker_image.wide type="text" name="worker_image" required
+                        value=(settings.worker_image);
+                }
+                div.row {
+                    div.field {
+                        label for="worker_memory" { "Memory" }
+                        input #worker_memory type="text" name="worker_memory" required
+                            value=(settings.worker_memory);
+                        p.hint { "As podman's --memory takes it, such as 3g." }
+                    }
+                    div.field {
+                        label for="worker_cpus" { "CPUs" }
+                        input #worker_cpus type="text" name="worker_cpus" required
+                            value=(settings.worker_cpus);
+                    }
+                }
+                h2 { "GitHub" }
+                div.field {
+                    label for="poll_seconds" { "Seconds between looks at a pull request" }
+                    input #poll_seconds type="number" name="poll_seconds" min="10" required
+                        value=(settings.poll_seconds);
+                    p.hint { "Also the wait before retrying a failed push or GitHub call." }
+                }
+                button.primary { "Save" }
+            }
         },
     )
 }
