@@ -275,6 +275,7 @@ async fn the_plan_page_lists_the_planned_pull_requests() {
             title: "maestrod: add a reboot endpoint".into(),
             summary: "POST /reboot".into(),
             number: None,
+            description: None,
         }])),
     );
 

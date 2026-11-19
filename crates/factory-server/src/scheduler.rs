@@ -3,14 +3,15 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use factory_core::{Command, Event, Session, Stage};
+use factory_core::{Command, Event, Job, PrDescription, Session, Stage};
 use factory_runner::{Expect, LogLine, RunReport, prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
-use crate::projects::Projects;
+use crate::projects::{Project, Projects};
 use crate::settings::Settings;
-use crate::store::{Store, StoreError};
+use crate::store::{JobRow, Store, StoreError};
 
 /// How often the loop looks at the jobs when nothing wakes it.
 const POLL: Duration = Duration::from_secs(5);
@@ -39,9 +40,47 @@ pub struct AgentRequest {
     pub prompt: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksRequest {
+    pub job_id: i64,
+    /// The project's `checks` command.
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRequest {
+    pub job_id: i64,
+    pub repo: String,
+    pub base: String,
+    pub branch: String,
+    pub description: PrDescription,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchRequest {
+    pub job_id: i64,
+    pub repo: String,
+    pub number: u64,
+    /// The time of the newest comment the agent already has.
+    pub seen_until: Option<String>,
+}
+
+/// What a look at a pull request found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchReport {
+    /// `None` while CI runs and nobody commented.
+    pub event: Option<Event>,
+    /// The new comment watermark, when `event` delivers comments.
+    pub seen_until: Option<String>,
+}
+
 pub type LogSink = Box<dyn FnMut(LogLine) + Send>;
 
-/// Carries out commands that need a worker.
+/// Carries out the commands of [`factory_core::Command`].
+///
+/// An `Err` from a method means the factory could not do the step, such as
+/// GitHub being unreachable. The job stays where it is and the scheduler
+/// tries again after [`Settings::poll_seconds`].
 pub trait Executor: Send + Sync + 'static {
     /// Runs the agent to the end. Every failure comes back as
     /// [`Event::AgentFailed`] in the report.
@@ -52,13 +91,42 @@ pub trait Executor: Send + Sync + 'static {
         log: LogSink,
     ) -> impl Future<Output = RunReport> + Send;
 
+    /// Runs the project's checks in a worker.
+    fn run_checks(
+        &self,
+        settings: &Settings,
+        request: ChecksRequest,
+    ) -> impl Future<Output = Result<Event, String>> + Send;
+
+    /// Pushes the branch and opens or updates its pull request. Returns the
+    /// pull request number.
+    fn publish(&self, request: PublishRequest) -> impl Future<Output = Result<u64, String>> + Send;
+
+    fn watch(
+        &self,
+        request: WatchRequest,
+    ) -> impl Future<Output = Result<WatchReport, String>> + Send;
+
     /// Stops whatever runs for job `job_id`. Called when the job no longer
     /// wants the run, such as after a cancel.
     fn stop(&self, job_id: i64) -> impl Future<Output = ()> + Send;
 }
 
-/// Starts queued jobs and runs each job's next command, with at most
-/// [`Settings::max_workers`] runs at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Holds one of the [`Settings::max_workers`] worker slots.
+    Worker,
+    /// Runs in the factory process.
+    Factory,
+}
+
+struct Task {
+    kind: Kind,
+    handle: JoinHandle<()>,
+}
+
+/// Starts queued jobs and carries out each job's next command, with at
+/// most [`Settings::max_workers`] workers at a time.
 ///
 /// What runs follows from the stored jobs alone, so after a restart the
 /// scheduler picks up every job where it was.
@@ -67,7 +135,10 @@ pub struct Scheduler<E> {
     projects: Arc<Projects>,
     executor: Arc<E>,
     wake: Arc<Notify>,
-    running: Mutex<HashMap<i64, JoinHandle<()>>>,
+    tasks: Mutex<HashMap<i64, Task>>,
+    /// Jobs whose factory step waits until the given time: the next look at
+    /// a pull request, or a retry after a failed step.
+    not_before: Mutex<HashMap<i64, Instant>>,
 }
 
 impl<E: Executor> Scheduler<E> {
@@ -82,7 +153,8 @@ impl<E: Executor> Scheduler<E> {
             projects,
             executor,
             wake,
-            running: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            not_before: Mutex::new(HashMap::new()),
         })
     }
 
@@ -100,13 +172,13 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
-    /// The jobs with a run in progress.
+    /// The jobs with a step in progress.
     #[must_use]
     pub fn running(&self) -> Vec<i64> {
         let mut ids: Vec<i64> = self
-            .lock()
+            .tasks()
             .iter()
-            .filter(|(_, handle)| !handle.is_finished())
+            .filter(|(_, task)| !task.handle.is_finished())
             .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();
@@ -122,15 +194,85 @@ impl<E: Executor> Scheduler<E> {
         let settings = self.store.settings()?;
         let mut rows = self.store.list()?;
         rows.reverse();
+        self.stop_unwanted(&rows).await?;
 
+        for row in rows {
+            if self.tasks().contains_key(&row.id) {
+                continue;
+            }
+            let mut job = row.job.clone();
+            let workers_free = self.workers_free(&settings);
+            if *job.stage() == Stage::Requested {
+                if !workers_free {
+                    continue;
+                }
+                job = self.store.apply(row.id, Event::Start)?.job;
+            }
+            let Some(command) = job.next_command() else {
+                continue;
+            };
+            let Some(project) = self.projects.get(&row.project).cloned() else {
+                self.fail_unknown_project(&row, &job)?;
+                continue;
+            };
+            match command {
+                Command::RunAgent { session, task } if workers_free => {
+                    let Some(expect) = Expect::for_stage(job.stage()) else {
+                        continue;
+                    };
+                    let request = AgentRequest {
+                        job_id: row.id,
+                        repo: project.repo.clone(),
+                        base: project.base.clone(),
+                        branch: match session {
+                            Session::Planning => None,
+                            Session::Pr(pr) => Some(branch_name(row.id, pr)),
+                        },
+                        session_id: self.store.session_uuid(row.id, session)?,
+                        expect,
+                        prompt: prompt(&task, expect),
+                    };
+                    let scheduler = Arc::clone(self);
+                    let settings = settings.clone();
+                    self.spawn(row.id, Kind::Worker, async move {
+                        scheduler.agent(&settings, request).await;
+                    });
+                }
+                Command::RunChecks { .. } => {
+                    self.checks(row.id, &project, &settings, workers_free)?;
+                }
+                Command::Publish { pr } if self.due(row.id) => {
+                    self.publish(row.id, pr, &job, &project, &settings)?;
+                }
+                Command::WatchPr { pr, number } if self.due(row.id) => {
+                    let request = WatchRequest {
+                        job_id: row.id,
+                        repo: project.repo.clone(),
+                        number,
+                        seen_until: self.store.pr_watermark(row.id, pr)?,
+                    };
+                    let scheduler = Arc::clone(self);
+                    let settings = settings.clone();
+                    self.spawn(row.id, Kind::Factory, async move {
+                        scheduler.watch(&settings, pr, request).await;
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn stop_unwanted(&self, rows: &[JobRow]) -> Result<(), StoreError> {
         let mut unwanted = Vec::new();
         {
-            let mut running = self.lock();
-            running.retain(|_, handle| !handle.is_finished());
-            for row in &rows {
-                let wants_agent = matches!(row.job.next_command(), Some(Command::RunAgent { .. }));
-                if !wants_agent && let Some(handle) = running.remove(&row.id) {
-                    handle.abort();
+            let mut tasks = self.tasks();
+            tasks.retain(|_, task| !task.handle.is_finished());
+            for row in rows {
+                if row.job.next_command().is_none()
+                    && let Some(task) = tasks.remove(&row.id)
+                {
+                    task.handle.abort();
                     unwanted.push(row.id);
                 }
             }
@@ -139,78 +281,123 @@ impl<E: Executor> Scheduler<E> {
             self.executor.stop(id).await;
             self.store.append_factory_log(
                 id,
-                "Stopped the agent run because the job no longer needs it.",
+                "Stopped the running step because the job no longer needs it.",
             )?;
-        }
-
-        for row in rows {
-            let free = settings.max_workers.saturating_sub(self.lock().len());
-            if free == 0 {
-                break;
-            }
-            if self.lock().contains_key(&row.id) {
-                continue;
-            }
-            let mut job = row.job;
-            if *job.stage() == Stage::Requested {
-                job = self.store.apply(row.id, Event::Start)?.job;
-            }
-            if let Some(Command::RunAgent { session, task }) = job.next_command()
-                && let Some(expect) = Expect::for_stage(job.stage())
-            {
-                let Some(project) = self.projects.get(&row.project) else {
-                    self.store.apply(
-                        row.id,
-                        Event::AgentFailed {
-                            reason: format!("project {:?} is not configured", row.project),
-                        },
-                    )?;
-                    continue;
-                };
-                let branch = match session {
-                    Session::Planning => None,
-                    Session::Pr(pr) => Some(branch_name(row.id, pr)),
-                };
-                let request = AgentRequest {
-                    job_id: row.id,
-                    repo: project.repo.clone(),
-                    base: project.base.clone(),
-                    branch,
-                    session_id: self.store.session_uuid(row.id, session)?,
-                    expect,
-                    prompt: prompt(&task, expect),
-                };
-                self.spawn(settings.clone(), request);
-            }
         }
         Ok(())
     }
 
-    fn spawn(self: &Arc<Self>, settings: Settings, request: AgentRequest) {
-        let job_id = request.job_id;
-        let scheduler = Arc::clone(self);
-        let mut running = self.lock();
-        let handle = tokio::spawn(async move {
-            scheduler.carry_out(&settings, request).await;
-            scheduler.lock().remove(&job_id);
-            scheduler.wake.notify_one();
-        });
-        running.insert(job_id, handle);
+    fn workers_free(&self, settings: &Settings) -> bool {
+        let busy = self
+            .tasks()
+            .values()
+            .filter(|task| task.kind == Kind::Worker && !task.handle.is_finished())
+            .count();
+        busy < settings.max_workers
     }
 
-    async fn carry_out(&self, settings: &Settings, request: AgentRequest) {
-        let job_id = request.job_id;
-        let store = Arc::clone(&self.store);
-        let note = |text: &str| {
-            if let Err(err) = store.append_factory_log(job_id, text) {
-                tracing::error!("job {job_id}: {err}");
-            }
-        };
-        note(&format!(
-            "Agent run started in session {}.",
-            request.session_id
-        ));
+    fn fail_unknown_project(&self, row: &JobRow, job: &Job) -> Result<(), StoreError> {
+        let reason = format!("project {:?} is not configured", row.project);
+        if matches!(job.next_command(), Some(Command::RunAgent { .. })) {
+            self.store.apply(row.id, Event::AgentFailed { reason })?;
+        } else {
+            self.store.append_factory_log(row.id, &reason)?;
+        }
+        Ok(())
+    }
 
+    fn checks(
+        self: &Arc<Self>,
+        job_id: i64,
+        project: &Project,
+        settings: &Settings,
+        workers_free: bool,
+    ) -> Result<(), StoreError> {
+        let Some(command) = project.checks.clone() else {
+            self.store.append_factory_log(
+                job_id,
+                "The project configures no checks, so the factory pushes without running any.",
+            )?;
+            self.store.apply(job_id, Event::ChecksPassed)?;
+            self.wake.notify_one();
+            return Ok(());
+        };
+        if !workers_free || !self.due(job_id) {
+            return Ok(());
+        }
+        let scheduler = Arc::clone(self);
+        let settings = settings.clone();
+        self.spawn(job_id, Kind::Worker, async move {
+            scheduler.note(job_id, &format!("Running the checks: {command}"));
+            let result = scheduler
+                .executor
+                .run_checks(&settings, ChecksRequest { job_id, command })
+                .await;
+            match result {
+                Ok(event) => {
+                    let passed = event == Event::ChecksPassed;
+                    scheduler.note(
+                        job_id,
+                        if passed {
+                            "The checks passed."
+                        } else {
+                            "The checks failed."
+                        },
+                    );
+                    scheduler.apply(job_id, event);
+                }
+                Err(err) => scheduler.retry_later(&settings, job_id, &err),
+            }
+        });
+        Ok(())
+    }
+
+    fn publish(
+        self: &Arc<Self>,
+        job_id: i64,
+        pr: usize,
+        job: &Job,
+        project: &Project,
+        settings: &Settings,
+    ) -> Result<(), StoreError> {
+        let Some(description) = job.plan()[pr].description.clone() else {
+            self.store.append_factory_log(
+                job_id,
+                "The agent wrote no pull request description, so there is nothing to publish.",
+            )?;
+            return Ok(());
+        };
+        let request = PublishRequest {
+            job_id,
+            repo: project.repo.clone(),
+            base: project.base.clone(),
+            branch: branch_name(job_id, pr),
+            description,
+        };
+        let scheduler = Arc::clone(self);
+        let settings = settings.clone();
+        self.spawn(job_id, Kind::Factory, async move {
+            scheduler.note(
+                job_id,
+                &format!("Pushing {} to {}.", request.branch, request.repo),
+            );
+            match scheduler.executor.publish(request).await {
+                Ok(number) => {
+                    scheduler.note(job_id, &format!("Pull request #{number} is up to date."));
+                    scheduler.apply(job_id, Event::Published { number });
+                }
+                Err(err) => scheduler.retry_later(&settings, job_id, &err),
+            }
+        });
+        Ok(())
+    }
+
+    async fn agent(&self, settings: &Settings, request: AgentRequest) {
+        let job_id = request.job_id;
+        self.note(
+            job_id,
+            &format!("Agent run started in session {}.", request.session_id),
+        );
         let sink_store = Arc::clone(&self.store);
         let sink: LogSink = Box::new(move |line| {
             if let Err(err) = sink_store.append_log(job_id, &line) {
@@ -218,23 +405,100 @@ impl<E: Executor> Scheduler<E> {
             }
         });
         let report = self.executor.run_agent(settings, request, sink).await;
-
         let cost = report
             .cost_usd
             .map_or(String::new(), |cost| format!(", ${cost:.2} at API prices"));
-        note(&format!("Agent run finished{cost}."));
-        match self.store.apply(job_id, report.event) {
-            Ok(_) => {}
+        self.note(job_id, &format!("Agent run finished{cost}."));
+        self.apply(job_id, report.event);
+    }
+
+    async fn watch(&self, settings: &Settings, pr: usize, request: WatchRequest) {
+        let job_id = request.job_id;
+        self.wait(settings, job_id);
+        match self.executor.watch(request).await {
+            Ok(WatchReport {
+                event: Some(event),
+                seen_until,
+            }) => {
+                let result = match &seen_until {
+                    Some(seen) => self.store.apply_with_watermark(job_id, pr, event, seen),
+                    None => self.store.apply(job_id, event),
+                };
+                self.report(job_id, result.map(|_| ()));
+            }
+            Ok(WatchReport { event: None, .. }) => {}
+            Err(err) => self.retry_later(settings, job_id, &err),
+        }
+    }
+
+    fn apply(&self, job_id: i64, event: Event) {
+        let result = self.store.apply(job_id, event).map(|_| ());
+        self.report(job_id, result);
+    }
+
+    fn report(&self, job_id: i64, result: Result<(), StoreError>) {
+        match result {
+            Ok(()) => {}
             Err(StoreError::Rejected(rejected)) => {
-                note(&format!(
-                    "The job did not take the run's result: {rejected}."
-                ));
+                self.note(
+                    job_id,
+                    &format!("The job did not take the result: {rejected}."),
+                );
             }
             Err(err) => tracing::error!("job {job_id}: {err}"),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<i64, JoinHandle<()>>> {
-        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    fn retry_later(&self, settings: &Settings, job_id: i64, err: &str) {
+        self.wait(settings, job_id);
+        self.note(
+            job_id,
+            &format!(
+                "{err}. The factory tries again in {} seconds.",
+                settings.poll_seconds
+            ),
+        );
+    }
+
+    fn wait(&self, settings: &Settings, job_id: i64) {
+        let until = Instant::now() + Duration::from_secs(settings.poll_seconds);
+        self.not_before
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_id, until);
+    }
+
+    fn due(&self, job_id: i64) -> bool {
+        self.not_before
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&job_id)
+            .is_none_or(|until| Instant::now() >= *until)
+    }
+
+    fn note(&self, job_id: i64, text: &str) {
+        if let Err(err) = self.store.append_factory_log(job_id, text) {
+            tracing::error!("job {job_id}: {err}");
+        }
+    }
+
+    fn spawn(
+        self: &Arc<Self>,
+        job_id: i64,
+        kind: Kind,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) {
+        let scheduler = Arc::clone(self);
+        let mut tasks = self.tasks();
+        let handle = tokio::spawn(async move {
+            work.await;
+            scheduler.tasks().remove(&job_id);
+            scheduler.wake.notify_one();
+        });
+        tasks.insert(job_id, Task { kind, handle });
+    }
+
+    fn tasks(&self) -> MutexGuard<'_, HashMap<i64, Task>> {
+        self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }

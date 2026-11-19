@@ -14,6 +14,10 @@ pub struct Project {
     pub repo: String,
     /// The branch pull requests target.
     pub base: String,
+    /// The command the factory runs with bash in a worker, in the job's
+    /// checkout, before it pushes. Without it, the factory pushes unchecked.
+    #[serde(default)]
+    pub checks: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

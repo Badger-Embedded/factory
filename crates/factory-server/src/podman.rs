@@ -2,9 +2,14 @@ use std::fs;
 use std::path::PathBuf;
 
 use factory_core::Event;
-use factory_runner::{Git, RunReport, SessionRun, WorkerConfig, WorkerRun, remove_container, run};
+use factory_runner::{
+    Git, GitHub, Observation, RunReport, SessionRun, WorkerConfig, WorkerRun, observe,
+    remove_container, run, run_checks,
+};
 
-use crate::scheduler::{AgentRequest, Executor, LogSink};
+use crate::scheduler::{
+    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, WatchReport, WatchRequest,
+};
 use crate::settings::Settings;
 
 /// Runs agents in podman worker containers.
@@ -19,6 +24,8 @@ pub struct PodmanExecutor {
     /// Prepares each job's checkout. It holds the GitHub token, which never
     /// reaches the worker.
     pub git: Git,
+    /// Opens pull requests and reads their state with the same token.
+    pub github: GitHub,
     pub data_dir: PathBuf,
 }
 
@@ -38,6 +45,15 @@ impl PodmanExecutor {
     fn job_dir(&self, job_id: i64) -> PathBuf {
         self.data_dir.join("jobs").join(job_id.to_string())
     }
+
+    fn worker_config(&self, settings: &Settings) -> WorkerConfig {
+        WorkerConfig {
+            image: settings.worker_image.clone(),
+            memory: settings.worker_memory.clone(),
+            cpus: settings.worker_cpus.clone(),
+            ..self.base.clone()
+        }
+    }
 }
 
 impl Executor for PodmanExecutor {
@@ -47,12 +63,7 @@ impl Executor for PodmanExecutor {
         request: AgentRequest,
         log: LogSink,
     ) -> RunReport {
-        let config = WorkerConfig {
-            image: settings.worker_image.clone(),
-            memory: settings.worker_memory.clone(),
-            cpus: settings.worker_cpus.clone(),
-            ..self.base.clone()
-        };
+        let config = self.worker_config(settings);
         let job_dir = self.job_dir(request.job_id);
         let workspace = job_dir.join("work");
         let claude_dir = job_dir.join("claude");
@@ -85,6 +96,51 @@ impl Executor for PodmanExecutor {
             prompt: request.prompt,
         };
         run(&config, &worker, log).await
+    }
+
+    async fn run_checks(
+        &self,
+        settings: &Settings,
+        request: ChecksRequest,
+    ) -> Result<Event, String> {
+        let config = self.worker_config(settings);
+        let name = Self::container(request.job_id);
+        if let Err(err) = remove_container(&config, &name).await {
+            tracing::warn!("removing {name}: {err}");
+        }
+        let workspace = self.job_dir(request.job_id).join("work");
+        run_checks(&config, &name, &workspace, &request.command).await
+    }
+
+    async fn publish(&self, request: PublishRequest) -> Result<u64, String> {
+        let workspace = self.job_dir(request.job_id).join("work");
+        self.git.push(&workspace, &request.branch).await?;
+        self.github
+            .open_pr(
+                &request.repo,
+                &request.base,
+                &request.branch,
+                &request.description,
+            )
+            .await
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
+        let status = self.github.status(&request.repo, request.number).await?;
+        let (event, seen_until) = match observe(&status, request.seen_until.as_deref()) {
+            Observation::Merged => (Some(Event::Merged), None),
+            Observation::Closed => (Some(Event::ClosedUnmerged), None),
+            Observation::CiFailed(checks) => {
+                let log = self.github.failure_report(&request.repo, &checks).await;
+                (Some(Event::CiFailed { log }), None)
+            }
+            Observation::Comments { text, seen_until } => (
+                Some(Event::ReviewComments { comments: text }),
+                Some(seen_until),
+            ),
+            Observation::Nothing => (None, None),
+        };
+        Ok(WatchReport { event, seen_until })
     }
 
     async fn stop(&self, job_id: i64) {

@@ -30,7 +30,8 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
              {}\n\n{}\n\n\
              Follow the repository's CLAUDE.md and CONTRIBUTING.md, tests included. Commit \
              your work on the current branch. Do not push or open a pull request. The \
-             factory does that.",
+             factory does that with the title and description you return, so write them \
+             the way CONTRIBUTING.md asks.",
             pr.title, pr.summary
         ),
         Task::Answer { questions, answers } => {

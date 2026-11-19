@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS logs (
     text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS logs_by_job ON logs (job_id, id);
+CREATE TABLE IF NOT EXISTS pr_watermarks (
+    job_id INTEGER NOT NULL REFERENCES jobs (id),
+    pr INTEGER NOT NULL,
+    seen_until TEXT NOT NULL,
+    PRIMARY KEY (job_id, pr)
+);
 ";
 
 /// One line of a job's log.
@@ -233,6 +239,53 @@ impl Store {
             params![job_id, key],
             |row| row.get(0),
         )?)
+    }
+
+    /// The time of the newest pull request comment already given to the
+    /// agent.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn pr_watermark(&self, job_id: i64, pr: usize) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT seen_until FROM pr_watermarks WHERE job_id = ?1 AND pr = ?2",
+                params![job_id, i64::try_from(pr).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Applies `event` to job `job_id` and records `seen_until` as the
+    /// watermark of pull request `pr`, in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Store::apply`], and then records nothing.
+    pub fn apply_with_watermark(
+        &self,
+        job_id: i64,
+        pr: usize,
+        event: Event,
+        seen_until: &str,
+    ) -> Result<JobRow, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, job_id)?;
+        row.job.apply(event).map_err(StoreError::Rejected)?;
+        tx.execute(
+            "UPDATE jobs SET job = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&row.job)?, job_id],
+        )?;
+        tx.execute(
+            "INSERT INTO pr_watermarks (job_id, pr, seen_until) VALUES (?1, ?2, ?3)
+             ON CONFLICT (job_id, pr) DO UPDATE SET seen_until = excluded.seen_until",
+            params![job_id, i64::try_from(pr).unwrap_or(i64::MAX), seen_until],
+        )?;
+        tx.commit()?;
+        Ok(row)
     }
 
     /// # Errors

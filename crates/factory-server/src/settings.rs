@@ -13,6 +13,9 @@ pub struct Settings {
     pub worker_memory: String,
     /// Passed to `podman run --cpus`.
     pub worker_cpus: String,
+    /// Seconds between looks at an open pull request, and before retrying a
+    /// failed push or GitHub call.
+    pub poll_seconds: u64,
 }
 
 impl Default for Settings {
@@ -22,6 +25,7 @@ impl Default for Settings {
             worker_image: "localhost/factory-worker:latest".into(),
             worker_memory: "3g".into(),
             worker_cpus: "4".into(),
+            poll_seconds: 60,
         }
     }
 }
