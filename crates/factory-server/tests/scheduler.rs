@@ -332,7 +332,11 @@ async fn cancelling_a_job_stops_its_run() {
     assert_eq!(*executor.stopped.lock().unwrap(), [id]);
     assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Cancelled);
     let last = store.logs(id, 1).unwrap().pop().unwrap();
-    assert!(last.text.contains("Stopped the running step"), "{}", last.text);
+    assert!(
+        last.text.contains("Stopped the running step"),
+        "{}",
+        last.text
+    );
 }
 
 #[tokio::test]
