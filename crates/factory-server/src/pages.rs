@@ -414,6 +414,7 @@ pub fn settings(
     servers: &[McpServer],
     projects: &[ProjectSettings],
     secrets_available: bool,
+    claude_token_set: bool,
     notice: Option<&str>,
 ) -> Markup {
     layout(
@@ -476,6 +477,7 @@ pub fn settings(
                 }
                 button.primary { "Save" }
             }
+            (claude_token_card(claude_token_set, secrets_available))
             (mcp_servers(servers, secrets_available))
             @for project in projects {
                 (project_form(project, secrets_available))
@@ -518,6 +520,38 @@ fn header_row(value: &str) -> Markup {
                 title="Only the header name, with no colon or value."
                 value=(value);
             button.remove-header type="button" { "Remove" }
+        }
+    }
+}
+
+/// The account-wide "Claude token" card in the global section, outside the
+/// per-project forms. It shows only whether a token is stored, never the value:
+/// the input carries no `value`, so the token is never in the page source. A
+/// non-empty save replaces the token, an empty save keeps it, and the Clear
+/// button removes it. When the secret store is unavailable the input and Save
+/// are disabled with a message, the way MCP header values are, and the factory
+/// falls back to `CLAUDE_CODE_OAUTH_TOKEN`. Clear stays enabled, so a stranded
+/// token can still be removed after the master key is lost.
+fn claude_token_card(claude_token_set: bool, secrets_available: bool) -> Markup {
+    html! {
+        form.card method="post" action="/settings/claude-token" {
+            h2 { "Claude token" }
+            p.hint { "The subscription token from " code { "claude setup-token" } ", used for every agent run and the plan usage tile. Stored encrypted and never shown." }
+            @if !secrets_available {
+                p.hint.bad { "The master key is missing, so the token cannot be changed here. The factory falls back to " code { "CLAUDE_CODE_OAUTH_TOKEN" } " from its environment." }
+            }
+            div.field {
+                label for="claude-token" { "Token" }
+                input #claude-token.wide type="password" name="claude_token"
+                    autocomplete="off" placeholder=(if claude_token_set { "set" } else { "not set" })
+                    disabled[!secrets_available];
+                p.hint {
+                    @if claude_token_set { "A token is stored. " } @else { "No token is stored. " }
+                    "Type a new token to replace it. An empty field keeps it."
+                }
+            }
+            button.primary disabled[!secrets_available] { "Save token" }
+            button.danger formaction="/settings/claude-token/clear" formnovalidate { "Clear token" }
         }
     }
 }
