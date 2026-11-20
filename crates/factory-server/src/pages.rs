@@ -8,6 +8,7 @@ use crate::store::{JobRow, LogEntry};
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
+const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const LOG_SCROLL: &str = include_str!("../static/log-scroll.js");
 
 const STEPS: [&str; 9] = [
@@ -104,8 +105,10 @@ pub fn index(
                         label for="images" { "Images (optional)" }
                         input #images type="file" name="images" multiple
                             accept="image/png,image/jpeg,image/gif,image/webp";
+                        ul #pasted-images.pasted-images {}
                     }
                     button.primary { "Request" }
+                    script { (PreEscaped(PASTE_IMAGES)) }
                 }
             } @else {
                 div.card { p.empty { "No projects are configured." } }
@@ -250,6 +253,7 @@ pub fn job(
     project: Option<&Project>,
     settings: &Settings,
     logs: &[LogEntry],
+    images: &[String],
 ) -> Markup {
     let job = &row.job;
     let repo_url = project.map(|project| format!("https://github.com/{}", project.repo));
@@ -275,6 +279,17 @@ pub fn job(
             div.card {
                 h2 { "Request" }
                 pre.doc { (job.request()) }
+                @if !images.is_empty() {
+                    ul.request-images {
+                        @for name in images {
+                            li {
+                                a href={ "/jobs/" (id) "/images/" (name) } {
+                                    img src={ "/jobs/" (id) "/images/" (name) } alt=(name);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             @if let Some(spec) = job.spec() {
                 div.card {
