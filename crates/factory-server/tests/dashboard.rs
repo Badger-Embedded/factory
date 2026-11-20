@@ -2708,6 +2708,159 @@ fn a_database_from_before_the_effort_table_opens_and_reads_medium() {
     assert_eq!(store.project_efforts("maestro").unwrap(), saved);
 }
 
+#[tokio::test]
+async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_effective_value() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/settings").await;
+    // A select named "<stage>_effort" sits beside each stage's model field.
+    for stage in ["clarify", "spec", "plan", "implement", "review"] {
+        assert!(
+            page.body.contains(&format!("name=\"{stage}_effort\"")),
+            "missing the {stage} effort selector",
+        );
+    }
+    // The selector offers only the allowed levels.
+    for level in ["low", "medium", "high", "xhigh", "max"] {
+        assert!(page.body.contains(&format!("value=\"{level}\"")));
+    }
+    // With nothing saved, every stage preselects the medium default, so the
+    // selected option appears once per stage.
+    assert_eq!(page.body.matches("value=\"medium\" selected").count(), 5);
+
+    // A saved level preselects in place of the default.
+    dashboard
+        .store
+        .save_project_efforts("maestro", &efforts("low", "medium", "high", "xhigh", "max"))
+        .unwrap();
+    let page = dashboard.get("/settings").await;
+    assert!(page.body.contains("value=\"low\" selected"));
+    assert!(page.body.contains("value=\"high\" selected"));
+    assert!(page.body.contains("value=\"xhigh\" selected"));
+    assert!(page.body.contains("value=\"max\" selected"));
+}
+
+#[tokio::test]
+async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    store
+        .create_project("tool", "Badger-Embedded/tool", "main", None)
+        .unwrap();
+    let dashboard = dashboard_with(Arc::clone(&store));
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=opus&spec=sonnet&plan=haiku&implement=opus&review=sonnet&\
+             clarify_effort=low&spec_effort=medium&plan_effort=high&\
+             implement_effort=xhigh&review_effort=max",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    // Reopen the database: both the models and the efforts survived, as the
+    // review model does.
+    drop(dashboard);
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store
+            .project_models("maestro", &StageModels::default())
+            .unwrap(),
+        StageModels {
+            clarify: Some("opus".into()),
+            spec: Some("sonnet".into()),
+            plan: Some("haiku".into()),
+            implement: Some("opus".into()),
+            review: Some("sonnet".into()),
+        }
+    );
+    assert_eq!(
+        store.project_efforts("maestro").unwrap(),
+        efforts("low", "medium", "high", "xhigh", "max")
+    );
+    // Saving maestro wrote no row for tool: it still reads every default.
+    assert_eq!(
+        store
+            .project_models("tool", &StageModels::default())
+            .unwrap(),
+        StageModels::default()
+    );
+    assert_eq!(
+        store.project_efforts("tool").unwrap(),
+        StageEfforts::default()
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_effort_submission_is_rejected_and_stores_nothing() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=opus&spec=&plan=&implement=&review=&\
+             clarify_effort=medium&spec_effort=turbo&plan_effort=medium&\
+             implement_effort=medium&review_effort=medium",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    // Efforts are saved first, so the model submitted alongside the bad level
+    // is not stored either: the project still reads every default.
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap(),
+        StageModels::default()
+    );
+    assert_eq!(
+        dashboard.store.project_efforts("maestro").unwrap(),
+        StageEfforts::default()
+    );
+}
+
+/// The text inside the agent badge of a timeline step, between its span tags.
+fn agent_badge(step: &str) -> &str {
+    let at = step.find("class=\"step-tag agent\"").unwrap();
+    let open = at + step[at..].find('>').unwrap() + 1;
+    let close = open + step[open..].find("</span>").unwrap();
+    &step[open..close]
+}
+
+#[tokio::test]
+async fn the_running_step_badge_shows_the_effort_and_stays_compact() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_models("maestro", &models(Some("claude-opus-4-5-20251101"), None))
+        .unwrap();
+    dashboard
+        .store
+        .save_project_efforts(
+            "maestro",
+            &efforts("xhigh", "medium", "medium", "medium", "medium"),
+        )
+        .unwrap();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let clarifying = timeline_step(&page.body, "clarifying");
+    let badge = agent_badge(clarifying);
+    // The badge joins the model and the stage's effort with a middot.
+    assert_eq!(badge, "claude-opus-4-5-20251101 · xhigh");
+    // The effort adds only a short suffix, so the badge stays a compact tag
+    // that wraps rather than overflows on a narrow screen.
+    assert!(
+        badge.chars().count() <= 40,
+        "badge too long for a narrow screen: {badge:?}",
+    );
+}
+
 #[test]
 fn project_auto_merge_defaults_off_and_a_saved_row_wins() {
     let dir = tempfile::tempdir().unwrap();
@@ -2989,7 +3142,8 @@ async fn the_timeline_marks_the_running_step_with_its_model_and_task() {
     let clarifying = timeline_step(&page.body, "clarifying");
     assert!(clarifying.contains("class=\"current\""));
     assert!(clarifying.contains("aria-current=\"step\""));
-    assert!(clarifying.contains(">opus</span>"));
+    // The badge shows the model and, after it, the effort for the stage.
+    assert!(clarifying.contains(">opus · medium</span>"));
     assert!(clarifying.contains("reading the repository"));
     assert!(clarifying.contains("since "));
     assert!(timeline_step(&page.body, "requested").contains("class=\"done\""));
@@ -3019,7 +3173,7 @@ async fn the_running_step_shows_the_full_model_name() {
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     let implementing = timeline_step(&page.body, "implementing");
-    assert!(implementing.contains(">claude-opus-4-5-20251101</span>"));
+    assert!(implementing.contains(">claude-opus-4-5-20251101 · medium</span>"));
     assert!(implementing.contains("implementing the pull request"));
 }
 
