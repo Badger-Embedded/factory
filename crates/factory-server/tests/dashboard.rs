@@ -392,6 +392,38 @@ async fn a_cancelled_job_offers_no_cancel_button() {
 }
 
 #[tokio::test]
+async fn the_job_page_shows_the_cost_summed_over_runs() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 0.5).unwrap();
+    dashboard.store.add_cost(id, 0.75).unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains(" UTC · $1.25</p>"));
+}
+
+#[tokio::test]
+async fn a_job_without_cost_shows_a_dash() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains(" UTC · –</p>"));
+}
+
+#[tokio::test]
+async fn a_cancelled_job_still_shows_its_cost() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 2.0).unwrap();
+    dashboard.post(&format!("/jobs/{id}/cancel"), "").await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("cancelled"));
+    assert!(page.body.contains(" UTC · $2.00</p>"));
+}
+
+#[tokio::test]
 async fn an_unknown_job_is_not_found() {
     let dashboard = dashboard();
     assert_eq!(

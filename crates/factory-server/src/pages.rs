@@ -2,6 +2,7 @@ use axum::http::StatusCode;
 use factory_core::{Ask, BranchSummary, Command, Gates, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::cost::format_cost;
 use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry};
@@ -317,6 +318,14 @@ fn gate_name(job: &Job) -> Option<&'static str> {
     }
 }
 
+fn cost_label(usd: f64) -> String {
+    if usd > 0.0 {
+        format_cost(usd)
+    } else {
+        "–".to_owned()
+    }
+}
+
 pub fn job(
     user: &str,
     row: &JobRow,
@@ -324,6 +333,7 @@ pub fn job(
     settings: &Settings,
     logs: &[LogEntry],
     images: &[String],
+    cost_usd: f64,
 ) -> Markup {
     let job = &row.job;
     let repo_url = project.map(|project| format!("https://github.com/{}", project.repo));
@@ -342,6 +352,7 @@ pub fn job(
                     (row.project)
                 }
                 " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
+                " · " (cost_label(cost_usd))
             }
             (steps(job))
             (status_card(id, job, settings))

@@ -283,6 +283,7 @@ async fn show_job(
     let settings = state.store.settings()?;
     let project = state.projects.get(&row.project);
     let images = state.store.images(id)?;
+    let cost_usd = state.store.cost_usd(id)?;
     Ok(pages::job(
         &user(&headers),
         &row,
@@ -290,6 +291,7 @@ async fn show_job(
         &settings,
         &logs,
         &images,
+        cost_usd,
     ))
 }
 
