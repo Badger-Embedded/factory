@@ -311,7 +311,7 @@ button:hover { filter: brightness(0.96); }
 }
 .job-sub .cost { margin-left: auto; font-variant-numeric: tabular-nums; }
 
-.jobs .approve { margin: 0; }
+.jobs .approve, .jobs .retry { margin: 0; }
 
 .list-card { padding: 0; }
 
@@ -352,6 +352,8 @@ button:hover { filter: brightness(0.96); }
 .lane-you { border-top: var(--lane-bar) solid var(--you); }
 .lane-agent { border-top: var(--lane-bar) solid var(--agent); }
 .lane-factory { border-top: var(--lane-bar) solid var(--factory); }
+.lane-failed { border-top: var(--lane-bar) solid var(--bad); background: var(--bad-bg); }
+.lane-failed .count { color: var(--bad); }
 .lane-done { border-top: var(--lane-bar) solid var(--border); }
 
 .steps {

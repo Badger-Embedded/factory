@@ -156,7 +156,7 @@ pub fn index(
 fn lane_counts(rows: &[&JobRow], settings: &Settings) -> Markup {
     let counts: Vec<(Lane, usize)> = Lane::ALL
         .into_iter()
-        .filter(|lane| *lane != Lane::Done)
+        .filter(|lane| matches!(lane, Lane::You | Lane::Agent | Lane::Factory))
         .map(|lane| {
             let count = rows
                 .iter()
@@ -382,17 +382,25 @@ enum Lane {
     You,
     Agent,
     Factory,
+    Failed,
     Done,
 }
 
 impl Lane {
-    const ALL: [Lane; 4] = [Lane::You, Lane::Agent, Lane::Factory, Lane::Done];
+    const ALL: [Lane; 5] = [
+        Lane::You,
+        Lane::Agent,
+        Lane::Factory,
+        Lane::Failed,
+        Lane::Done,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Lane::You => "You",
             Lane::Agent => "Agent",
             Lane::Factory => "Factory",
+            Lane::Failed => "Failed",
             Lane::Done => "Done",
         }
     }
@@ -402,6 +410,7 @@ impl Lane {
             Lane::You => "you",
             Lane::Agent => "agent",
             Lane::Factory => "factory",
+            Lane::Failed => "failed",
             Lane::Done => "done",
         }
     }
@@ -411,6 +420,7 @@ impl Lane {
             Lane::You => "lane lane-you",
             Lane::Agent => "lane lane-agent",
             Lane::Factory => "lane lane-factory",
+            Lane::Failed => "lane lane-failed",
             Lane::Done => "lane lane-done",
         }
     }
@@ -420,6 +430,7 @@ impl Lane {
             Lane::You => "Nothing needs you right now.",
             Lane::Agent => "No agent is working.",
             Lane::Factory => "The factory has nothing to do.",
+            Lane::Failed => "No failed jobs.",
             Lane::Done => "No finished jobs.",
         }
     }
@@ -434,15 +445,21 @@ fn board(rows: &[&JobRow], costs: &HashMap<i64, f64>, settings: &Settings) -> Ma
                     .copied()
                     .filter(|row| status(&row.job, settings).lane == lane)
                     .collect();
-                @if lane == Lane::Done {
-                    details class=(lane.class()) {
-                        summary { (lane.title()) " " span.count { (cards.len()) } }
-                        (lane_cards(&cards, costs, settings, lane))
+                @match lane {
+                    Lane::Done => {
+                        details class=(lane.class()) {
+                            summary { (lane.title()) " " span.count { (cards.len()) } }
+                            (lane_cards(&cards, costs, settings, lane))
+                        }
                     }
-                } @else {
-                    section class=(lane.class()) {
-                        h2 { (lane.title()) " " span.count { (cards.len()) } }
-                        (lane_cards(&cards, costs, settings, lane))
+                    // The Failed lane appears only when a job has failed, and
+                    // shows no empty message.
+                    Lane::Failed if cards.is_empty() => {}
+                    _ => {
+                        section class=(lane.class()) {
+                            h2 { (lane.title()) " " span.count { (cards.len()) } }
+                            (lane_cards(&cards, costs, settings, lane))
+                        }
                     }
                 }
             }
@@ -481,6 +498,12 @@ fn lane_cards(
                                     input type="hidden" name="project" value=(row.project);
                                     button.primary { "Approve " (gate) }
                                 }
+                            }
+                        }
+                        @if lane == Lane::Failed && row.job.can_retry() {
+                            form.retry method="post" action={ "/jobs/" (row.id) "/retry" } {
+                                input type="hidden" name="project" value=(row.project);
+                                button.primary { "Retry" }
                             }
                         }
                     }
@@ -753,7 +776,7 @@ struct Status {
 fn status(job: &Job, settings: &Settings) -> Status {
     let (lane, class, text) = match (job.stage(), job.turn()) {
         (Stage::Merged, _) => (Lane::Done, "ok", "merged"),
-        (Stage::Failed { .. }, _) => (Lane::Done, "bad", "failed"),
+        (Stage::Failed { .. }, _) => (Lane::Failed, "bad", "failed"),
         (Stage::Cancelled, _) => (Lane::Done, "factory", "cancelled"),
         (Stage::Requested, _) => (Lane::Factory, "factory", "queued"),
         (_, Turn::User(_)) if !collecting(job) => (Lane::You, "you", "needs you"),

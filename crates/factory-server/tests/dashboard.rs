@@ -1375,13 +1375,22 @@ fn lane_html<'a>(body: &'a str, class: &str) -> &'a str {
     &rest[..rest.find("class=\"lane ").unwrap_or(rest.len())]
 }
 
-/// The lanes that list job `id`.
+/// The lanes that list job `id`. The Failed lane renders only when a job has
+/// failed, so a class the board left out is skipped before `lane_html` reads
+/// it.
 fn lanes_of(body: &str, id: i64) -> Vec<&'static str> {
     let link = format!("href=\"/jobs/{id}\"");
-    ["lane-you", "lane-agent", "lane-factory", "lane-done"]
-        .into_iter()
-        .filter(|class| lane_html(body, class).contains(&link))
-        .collect()
+    [
+        "lane-you",
+        "lane-agent",
+        "lane-factory",
+        "lane-failed",
+        "lane-done",
+    ]
+    .into_iter()
+    .filter(|class| body.contains(&format!("class=\"lane {class}\"")))
+    .filter(|class| lane_html(body, class).contains(&link))
+    .collect()
 }
 
 async fn assert_lane(dashboard: &Dashboard, id: i64, lane: &str) {
@@ -1442,7 +1451,7 @@ async fn every_stage_and_turn_lands_in_exactly_one_lane() {
 }
 
 #[tokio::test]
-async fn failed_and_cancelled_jobs_land_in_done() {
+async fn a_failed_job_lands_in_the_failed_lane_and_cancelled_in_done() {
     let dashboard = dashboard();
     let failed = dashboard.new_job().await;
     dashboard.apply(failed, Event::Start);
@@ -1454,7 +1463,7 @@ async fn failed_and_cancelled_jobs_land_in_done() {
     );
     let cancelled = dashboard.new_job().await;
     dashboard.apply(cancelled, Event::Cancel);
-    assert_lane(&dashboard, failed, "lane-done").await;
+    assert_lane(&dashboard, failed, "lane-failed").await;
     assert_lane(&dashboard, cancelled, "lane-done").await;
 }
 
@@ -2170,4 +2179,123 @@ async fn an_agent_failure_offers_no_retry_button_and_rejects_retry() {
 
     let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
+}
+
+/// A failed job that is not retryable: an agent error during implementing.
+async fn failed_without_retry(dashboard: &Dashboard) -> i64 {
+    let id = dashboard.new_job().await;
+    to_spec_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+    id
+}
+
+#[tokio::test]
+async fn a_failed_job_sits_in_its_own_expanded_lane_above_done() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("<section class=\"lane lane-failed\">"));
+    assert!(body.contains("Failed <span class=\"count\">1</span>"));
+    assert_eq!(lanes_of(&body, id), ["lane-failed"]);
+    // The Failed lane comes before the collapsed Done lane.
+    assert!(
+        body.find("class=\"lane lane-failed\"").unwrap()
+            < body.find("class=\"lane lane-done\"").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn the_failed_lane_is_hidden_with_no_empty_message_when_nothing_failed() {
+    let dashboard = dashboard();
+    dashboard.new_job().await;
+    let body = dashboard.get("/").await.body;
+    assert!(!body.contains("lane-failed"));
+    assert!(!body.contains("No failed jobs."));
+    assert!(!body.contains("Failed <span"));
+}
+
+#[tokio::test]
+async fn done_counts_merged_and_cancelled_but_not_failed_jobs() {
+    let dashboard = dashboard();
+    let merged = dashboard.new_job().await;
+    merge(&dashboard, merged);
+    let cancelled = dashboard.new_job().await;
+    dashboard.apply(cancelled, Event::Cancel);
+    failed_out_of_rounds(&dashboard).await;
+
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("Done <span class=\"count\">2</span>"));
+    assert!(body.contains("Failed <span class=\"count\">1</span>"));
+    assert_eq!(lanes_of(&body, merged), ["lane-done"]);
+    assert_eq!(lanes_of(&body, cancelled), ["lane-done"]);
+}
+
+#[tokio::test]
+async fn a_failed_card_shows_a_retry_button_that_returns_to_the_board() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let body = dashboard.get("/").await.body;
+    let lane = lane_html(&body, "lane-failed");
+    assert!(lane.contains(&format!("action=\"/jobs/{id}/retry\"")));
+    assert!(lane.contains("name=\"project\" value=\"maestro\""));
+    assert!(lane.contains(">Retry</button>"));
+
+    let reply = dashboard
+        .post(&format!("/jobs/{id}/retry"), "project=maestro")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/?project=maestro"));
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn a_failed_card_without_a_retry_target_shows_no_button() {
+    let dashboard = dashboard();
+    let id = failed_without_retry(&dashboard).await;
+
+    let body = dashboard.get("/").await.body;
+    let lane = lane_html(&body, "lane-failed");
+    assert!(lane.contains(&format!("href=\"/jobs/{id}\"")));
+    assert!(!lane.contains("/retry"));
+    assert!(!lane.contains("Retry"));
+}
+
+#[tokio::test]
+async fn the_live_panel_has_no_bar_for_the_failed_lane() {
+    let dashboard = dashboard();
+    failed_out_of_rounds(&dashboard).await;
+    dashboard.new_job().await;
+
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("Live jobs by lane"));
+    assert!(body.contains(&bar("you", 0, "0.0%")));
+    assert!(body.contains(&bar("agent", 0, "0.0%")));
+    assert!(body.contains(&bar("factory", 1, "100.0%")));
+    assert!(!body.contains("bar-failed"));
+}
+
+#[tokio::test]
+async fn a_failed_job_still_counts_as_finished_for_the_30_day_expiry() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+    // The Failed lane only changes where the board shows the job. The expiry
+    // loop deletes it once it is 30 days old, because it is still finished.
+    assert!(dashboard.store.get(id).unwrap().job.is_finished());
+    assert_lane(&dashboard, id, "lane-failed").await;
 }
