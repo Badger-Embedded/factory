@@ -620,6 +620,94 @@ fn a_job_with_two_pull_requests_counts_as_merged_once() {
     assert_eq!(store.project_totals("maestro").unwrap().jobs_merged, 1);
 }
 
+fn history(store: &Store, id: i64) -> Vec<(String, String, Option<usize>, String)> {
+    store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.event, e.stage, e.pr, e.turn))
+        .collect()
+}
+
+fn entry(
+    event: &str,
+    stage: &str,
+    pr: Option<usize>,
+    turn: &str,
+) -> (String, String, Option<usize>, String) {
+    (event.into(), stage.into(), pr, turn.into())
+}
+
+#[test]
+fn the_history_records_each_event_with_the_stage_and_turn_it_left() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    for event in [
+        Event::Start,
+        Event::Agent(AgentResult::Clarified),
+        Event::Agent(AgentResult::Spec("s".into())),
+        Event::Approve,
+        Event::Agent(AgentResult::Plan(vec![planned_pr("a"), planned_pr("b")])),
+        Event::Approve,
+        Event::ChecksFailed { report: "r".into() },
+    ] {
+        let _ = store.apply(id, event);
+    }
+    assert_eq!(
+        history(&store, id),
+        vec![
+            entry("created", "requested", None, "factory"),
+            entry("start", "clarifying", None, "agent:clarify"),
+            entry("agent:clarified", "spec", None, "agent:write-spec"),
+            entry("agent:spec", "spec", None, "user:spec-approval"),
+            entry("approve", "plan", None, "agent:write-plan"),
+            entry("agent:plan", "plan", None, "user:plan-approval"),
+            entry("approve", "implementing", Some(0), "agent:implement"),
+        ],
+        "a rejected event adds nothing"
+    );
+    for entry in store.events(id).unwrap() {
+        assert_eq!(entry.at.len(), "2026-11-20 12:01:38".len());
+    }
+}
+
+#[test]
+fn the_history_keeps_failure_reasons_and_run_costs() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store.add_cost(id, 0.75).unwrap();
+    store
+        .apply(
+            id,
+            Event::AgentFailed {
+                reason: "usage limit".into(),
+            },
+        )
+        .unwrap();
+
+    let events = store.events(id).unwrap();
+    let cost = &events[2];
+    assert_eq!(
+        (cost.event.as_str(), cost.stage.as_str()),
+        ("cost", "clarifying")
+    );
+    assert_eq!(cost.usd, Some(0.75));
+    let failed = &events[3];
+    assert_eq!(
+        (failed.event.as_str(), failed.stage.as_str()),
+        ("agent-failed", "failed")
+    );
+    assert_eq!(failed.detail.as_deref(), Some("usage limit"));
+    assert_eq!(failed.usd, None);
+}
+
+#[test]
+fn a_job_with_no_history_reads_an_empty_one() {
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.events(42).unwrap(), Vec::new());
+}
+
 #[test]
 fn cancelled_and_failed_jobs_count_as_created_only() {
     let store = Store::open_in_memory().unwrap();
@@ -1497,6 +1585,8 @@ mod purge {
             assert_eq!(f.rows(table, old), 0, "{table}");
             assert_eq!(f.rows(table, other), 1, "{table}");
         }
+        assert_eq!(f.rows("job_events", old), 0);
+        assert!(f.rows("job_events", other) > 0);
         assert!(!f.dir(old).exists());
         assert!(f.dir(other).join("images/image-1.png").exists());
         assert_eq!(f.store.images(old).unwrap(), Vec::<String>::new());

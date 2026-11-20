@@ -6,6 +6,7 @@
 //! Every [`Command`] must therefore be safe to run twice.
 
 mod job;
+mod names;
 mod usage;
 
 pub use job::{

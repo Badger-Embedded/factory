@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use factory_core::{Event, Job, Rejected, Session, Stage};
+use factory_core::{AgentResult, Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -64,6 +64,18 @@ CREATE TABLE IF NOT EXISTS project_totals (
     jobs_created INTEGER NOT NULL DEFAULT 0,
     jobs_merged INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS job_events (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs (id),
+    at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    event TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    pr INTEGER,
+    turn TEXT NOT NULL,
+    detail TEXT,
+    usd REAL
+);
+CREATE INDEX IF NOT EXISTS job_events_by_job ON job_events (job_id, id);
 CREATE TABLE IF NOT EXISTS pr_watermarks (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     pr INTEGER NOT NULL,
@@ -80,6 +92,27 @@ pub struct LogEntry {
     /// `text`, `tool`, `other` for agent output, or `factory`.
     pub kind: String,
     pub text: String,
+}
+
+/// One entry of a job's history: something that happened to the job, and
+/// the stage and turn it left the job in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobEvent {
+    /// UTC, as SQLite's `CURRENT_TIMESTAMP` writes it.
+    pub at: String,
+    /// [`Event::name`], `created` when the job was stored, or `cost` when an
+    /// agent run reported its cost.
+    pub event: String,
+    /// [`Stage::name`].
+    pub stage: String,
+    /// [`Stage::pr`].
+    pub pr: Option<usize>,
+    /// [`factory_core::Turn::name`].
+    pub turn: String,
+    /// The reason of a failed agent or reviewer run, or of a CI rerun.
+    pub detail: Option<String>,
+    /// The cost of an agent run, on `cost` entries.
+    pub usd: Option<f64>,
 }
 
 /// What a project has used since the totals were introduced. Deleting a job
@@ -208,7 +241,8 @@ impl Store {
         request: &str,
     ) -> Result<i64, StoreError> {
         let gates = self.settings()?.gates;
-        let job = serde_json::to_string(&Job::new(request, gates))?;
+        let new = Job::new(request, gates);
+        let job = serde_json::to_string(&new)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
@@ -216,6 +250,7 @@ impl Store {
             params![project, requested_by, job],
         )?;
         let id = tx.last_insert_rowid();
+        Self::record(&tx, id, "created", &new, None, None)?;
         tx.execute(
             "INSERT INTO project_totals (project, jobs_created) VALUES (?1, 1)
              ON CONFLICT (project) DO UPDATE SET jobs_created = jobs_created + 1",
@@ -281,6 +316,7 @@ impl Store {
         for table in [
             "job_images",
             "job_costs",
+            "job_events",
             "pr_watermarks",
             "logs",
             "sessions",
@@ -306,11 +342,19 @@ impl Store {
         Ok(row)
     }
 
-    /// Applies `event` to `row`, saves the job and counts a first arrival at
-    /// `Merged` in the project totals.
+    /// Applies `event` to `row`, saves the job, adds the event to its history
+    /// and counts a first arrival at `Merged` in the project totals.
     fn apply_in(tx: &Transaction<'_>, row: &mut JobRow, event: Event) -> Result<(), StoreError> {
         let was_merged = *row.job.stage() == Stage::Merged;
+        let name = event.name();
+        let detail = match &event {
+            Event::AgentFailed { reason }
+            | Event::ReviewFailed { reason }
+            | Event::Agent(AgentResult::RerunCi { reason }) => Some(reason.clone()),
+            _ => None,
+        };
         row.job.apply(event).map_err(StoreError::Rejected)?;
+        Self::record(tx, row.id, name, &row.job, detail.as_deref(), None)?;
         tx.execute(
             "UPDATE jobs SET job = ?1 WHERE id = ?2",
             params![serde_json::to_string(&row.job)?, row.id],
@@ -354,6 +398,7 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let row = Self::load(&tx, id)?;
+        Self::record(&tx, id, "cost", &row.job, None, Some(usd))?;
         tx.execute(
             "INSERT INTO job_costs (job_id, usd) VALUES (?1, ?2)
              ON CONFLICT (job_id) DO UPDATE SET usd = usd + excluded.usd",
@@ -365,6 +410,58 @@ impl Store {
             params![row.project, usd],
         )?;
         Ok(tx.commit()?)
+    }
+
+    fn record(
+        tx: &Transaction<'_>,
+        id: i64,
+        event: &str,
+        job: &Job,
+        detail: Option<&str>,
+        usd: Option<f64>,
+    ) -> Result<(), StoreError> {
+        let stage = job.stage();
+        tx.execute(
+            "INSERT INTO job_events (job_id, event, stage, pr, turn, detail, usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                event,
+                stage.name(),
+                stage.pr().map(|pr| i64::try_from(pr).unwrap_or(i64::MAX)),
+                job.turn().name(),
+                detail,
+                usd
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The history of job `id`, oldest first. A job stored before the
+    /// history existed has entries only for what happened since.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn events(&self, id: i64) -> Result<Vec<JobEvent>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT at, event, stage, pr, turn, detail, usd FROM job_events
+             WHERE job_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([id], |row| {
+            let pr: Option<i64> = row.get(3)?;
+            Ok(JobEvent {
+                at: row.get(0)?,
+                event: row.get(1)?,
+                stage: row.get(2)?,
+                pr: pr.and_then(|pr| usize::try_from(pr).ok()),
+                turn: row.get(4)?,
+                detail: row.get(5)?,
+                usd: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// The totals of `project`. A project with no jobs since the totals were
