@@ -13,6 +13,9 @@ use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry, ProjectTotals};
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
+/// htmx 2.0.4, vendored so the dashboard loads no script from a CDN. The
+/// tailnet host it runs on cannot reach one.
+pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const LOG_SCROLL: &str = include_str!("../static/log-scroll.js");
@@ -63,6 +66,7 @@ fn page(user: &str, title: &str, refresh: bool, nav: &Markup, body: &Markup) -> 
                 title { (title) " · factory" }
                 @if refresh { meta http-equiv="refresh" content="5"; }
                 link rel="stylesheet" href="/style.css";
+                script defer src="/htmx.min.js" {}
             }
             body {
                 div.topbar {
