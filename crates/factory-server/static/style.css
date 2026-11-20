@@ -179,6 +179,8 @@ button:hover { filter: brightness(0.96); }
 .jobs .title:hover { color: var(--accent); }
 .jobs .sub { grid-column: 2 / 4; color: var(--muted); font-size: 13px; }
 
+.jobs .approve { grid-column: 2 / 4; margin: 0; }
+
 .list-card { padding: 0; }
 
 .board {

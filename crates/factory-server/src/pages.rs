@@ -294,10 +294,26 @@ fn lane_cards(cards: &[&JobRow], settings: &Settings, lane: Lane) -> Markup {
                         span.sub {
                             (row.project) " · " (stage_label(&row.job)) " · " (row.requested_by)
                         }
+                        @if lane == Lane::You {
+                            @if let Some(gate) = gate_name(&row.job) {
+                                form.approve method="post" action={ "/jobs/" (row.id) "/approve" } {
+                                    input type="hidden" name="project" value=(row.project);
+                                    button.primary { "Approve " (gate) }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+fn gate_name(job: &Job) -> Option<&'static str> {
+    match job.turn() {
+        Turn::User(Ask::SpecApproval) => Some("spec"),
+        Turn::User(Ask::PlanApproval) => Some("plan"),
+        _ => None,
     }
 }
 

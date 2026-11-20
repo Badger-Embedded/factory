@@ -339,8 +339,37 @@ async fn answer(
     apply(&state, id, Event::Answer(answers))
 }
 
-async fn approve(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Redirect, AppError> {
-    apply(&state, id, Event::Approve)
+#[derive(Deserialize)]
+struct ApproveForm {
+    /// Set by the job board, so the redirect returns to that project's board.
+    project: Option<String>,
+}
+
+async fn approve(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(form): Form<ApproveForm>,
+) -> Result<Redirect, AppError> {
+    let redirect = apply(&state, id, Event::Approve)?;
+    match form
+        .project
+        .filter(|name| state.projects.get(name).is_some())
+    {
+        Some(name) => Ok(Redirect::to(&format!("/?project={}", query_escape(&name)))),
+        None => Ok(redirect),
+    }
+}
+
+fn query_escape(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
