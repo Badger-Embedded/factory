@@ -6,8 +6,9 @@ use std::sync::Arc;
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
     CurlUsageSource, GhRepos, LocalSecrets, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor,
-    Projects, RepoChecker, Scheduler, SecretStore, Store, UnavailableSecrets, WorkerSlots, app,
-    import_tomls, master_key_from_env, refresh_forever,
+    Projects, ProxyWarning, RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams,
+    UnavailableSecrets, Upstreams, WarnFn, WorkerSlots, app, import_tomls, master_key_from_env,
+    proxy_app, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -35,6 +36,37 @@ fn trimmed_var(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Starts the MCP proxy on its own listener and returns the run-token registry
+/// it honours. The proxy keeps a server credential out of a worker: a worker
+/// reaches a server through it with a per-run token, and the proxy swaps the
+/// token for the project's stored headers. A proxy-side failure to reach a
+/// server logs a warning.
+async fn start_mcp_proxy(
+    listen: &str,
+    store: Arc<Store>,
+    secrets: Arc<dyn SecretStore>,
+) -> Result<Arc<RunTokens>, Box<dyn Error>> {
+    let run_tokens = Arc::new(RunTokens::new());
+    let upstreams: Arc<dyn Upstreams> = Arc::new(StoreUpstreams::new(store, secrets));
+    let warn: WarnFn = Arc::new(|warning: ProxyWarning| {
+        tracing::warn!(
+            job = warning.job,
+            server = warning.server,
+            "MCP server unavailable: {}",
+            warning.reason
+        );
+    });
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    tracing::info!("MCP proxy listening on http://{listen}");
+    let app = proxy_app(Arc::clone(&run_tokens), upstreams, warn);
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            tracing::error!("the MCP proxy stopped: {err}");
+        }
+    });
+    Ok(run_tokens)
+}
+
 fn git_config() -> Git {
     let default = Git::default();
     Git {
@@ -50,6 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
     let listen = env::var("FACTORY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let proxy_listen = env::var("FACTORY_PROXY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8081".into());
     let data_dir = path_var("FACTORY_DATA", "data");
     let db = env::var_os("FACTORY_DB").map_or_else(|| data_dir.join("factory.db"), PathBuf::from);
 
@@ -75,6 +108,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::warn!("factory-master-key is missing or invalid, MCP header secrets are off");
         Arc::new(UnavailableSecrets::new(Arc::clone(&store)))
     };
+
+    // The MCP proxy stands between a worker and a remote MCP server, so a
+    // credential never enters a worker. It listens on its own port, separate
+    // from the dashboard, and honours per-run tokens held only in memory. No
+    // token exists until a run issues one, so every request before that is 401.
+    let _run_tokens =
+        start_mcp_proxy(&proxy_listen, Arc::clone(&store), Arc::clone(&secrets)).await?;
 
     // Without podman workers no job takes a slot, so the board shows every
     // slot idle.

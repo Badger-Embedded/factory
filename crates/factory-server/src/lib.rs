@@ -6,6 +6,7 @@ mod mcp;
 mod pages;
 mod podman;
 mod projects;
+mod proxy;
 mod scheduler;
 mod secrets;
 mod settings;
@@ -23,6 +24,7 @@ pub use github::{
 pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, import_tomls};
+pub use proxy::{ProxyWarning, RunTokens, StoreUpstreams, Upstream, Upstreams, WarnFn, proxy_app};
 pub use scheduler::{
     AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, PublishRequest, Published,
     ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest, branch_name,
