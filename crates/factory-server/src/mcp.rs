@@ -39,6 +39,38 @@ pub struct McpServer {
     pub headers: Vec<String>,
 }
 
+/// The stages a server may run in for a project: the same five as the project
+/// models. A project picks a subset for each server it enables. `false`
+/// everywhere, which [`Default`] gives, means no stage is picked.
+// One bool per stage mirrors the five model stages; a bitset would read worse.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpStages {
+    pub clarify: bool,
+    pub spec: bool,
+    pub plan: bool,
+    pub implement: bool,
+    pub review: bool,
+}
+
+impl McpStages {
+    /// Whether any stage is picked. An enabled server with none is rejected.
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.clarify || self.spec || self.plan || self.implement || self.review
+    }
+}
+
+/// A project's settings for one MCP server: whether it is on and the stages it
+/// runs in. [`Default`] is off with no stage, the state a project reads for a
+/// server it has no stored row for, so a new server and a newly onboarded
+/// project both start off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpProjectSettings {
+    pub enabled: bool,
+    pub stages: McpStages,
+}
+
 /// A failure validating or storing an MCP server. The validation variants map
 /// to a 400 in the dashboard; [`McpError::NotFound`] maps to a 404.
 #[derive(Debug)]
@@ -55,6 +87,8 @@ pub enum McpError {
     BadHeader(String),
     /// A header name is one the factory sets itself or the protocol owns.
     ReservedHeader(String),
+    /// A project enabled a server without picking a stage for it.
+    NoStage(String),
     Store(StoreError),
 }
 
@@ -74,6 +108,10 @@ impl fmt::Display for McpError {
             McpError::ReservedHeader(header) => write!(
                 f,
                 "the header {header:?} is reserved by the factory or the protocol and cannot be declared"
+            ),
+            McpError::NoStage(server) => write!(
+                f,
+                "the server {server:?} is enabled but no stage is checked; pick at least one or turn it off"
             ),
             McpError::Store(err) => write!(f, "{err}"),
         }

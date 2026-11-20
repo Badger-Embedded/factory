@@ -589,6 +589,9 @@ button:hover { filter: brightness(0.96); }
 input.wide { width: 100%; }
 input[type="number"] { width: 8rem; }
 .hint { color: var(--muted); font-size: var(--font-size-sm); margin: var(--space-4) 0 0; }
+.hint.bad { color: var(--bad); }
+fieldset.mcp-project { border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-12); margin: var(--space-12) 0 0; }
+fieldset.mcp-project legend { padding: 0 var(--space-8); font-weight: var(--weight-semibold); }
 .card.saved { border-color: var(--ok); color: var(--ok); }
 label.check { display: flex; gap: var(--space-8); align-items: center; font-weight: var(--weight-semibold); }
 label.check input { width: auto; }

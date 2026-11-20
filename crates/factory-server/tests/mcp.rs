@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use factory_server::{
-    LocalSecrets, MASTER_KEY_LEN, McpError, McpServer, SecretRef, SecretStore, Store,
+    LocalSecrets, MASTER_KEY_LEN, McpError, McpProjectSettings, McpServer, McpStages, SecretRef,
+    SecretStore, Store,
 };
 
 fn store() -> Arc<Store> {
@@ -344,4 +345,150 @@ fn deleting_a_server_removes_it_and_its_secrets() {
     );
     // Deleting a server that is not there is fine.
     store.delete_mcp_server("context7").expect("delete again");
+}
+
+fn only(stage: &str) -> McpStages {
+    McpStages {
+        clarify: stage == "clarify",
+        spec: stage == "spec",
+        plan: stage == "plan",
+        implement: stage == "implement",
+        review: stage == "review",
+    }
+}
+
+#[test]
+fn a_project_with_no_row_reads_a_server_off() {
+    let store = store();
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .expect("create");
+    // A newly added server is off for a project with no stored row, with no
+    // stage picked.
+    assert_eq!(
+        store.project_mcp("maestro", "context7").expect("read"),
+        McpProjectSettings::default(),
+    );
+    // A server that was never added reads the same default.
+    assert_eq!(
+        store.project_mcp("maestro", "absent").expect("read"),
+        McpProjectSettings::default(),
+    );
+}
+
+#[test]
+fn enabling_a_server_stores_its_stages() {
+    let store = store();
+    let settings = McpProjectSettings {
+        enabled: true,
+        stages: only("clarify"),
+    };
+    store
+        .save_project_mcp("maestro", "context7", &settings)
+        .expect("save");
+    assert_eq!(
+        store.project_mcp("maestro", "context7").expect("read"),
+        settings,
+    );
+}
+
+#[test]
+fn enabling_a_server_with_no_stage_is_rejected_and_not_stored() {
+    let store = store();
+    let bad = McpProjectSettings {
+        enabled: true,
+        stages: McpStages::default(),
+    };
+    let err = store
+        .save_project_mcp("maestro", "context7", &bad)
+        .expect_err("no stage");
+    assert!(
+        matches!(&err, McpError::NoStage(name) if name == "context7"),
+        "{err:?}"
+    );
+    // Nothing was written, so the project still reads the default.
+    assert_eq!(
+        store.project_mcp("maestro", "context7").expect("read"),
+        McpProjectSettings::default(),
+    );
+}
+
+#[test]
+fn a_disabled_server_may_keep_no_stage() {
+    let store = store();
+    // Off with no stage is the resting state and must save, so turning a server
+    // off does not trip the no-stage rule.
+    store
+        .save_project_mcp("maestro", "context7", &McpProjectSettings::default())
+        .expect("save off");
+    assert_eq!(
+        store.project_mcp("maestro", "context7").expect("read"),
+        McpProjectSettings::default(),
+    );
+}
+
+#[test]
+fn saving_one_projects_mcp_leaves_other_projects_alone() {
+    let store = store();
+    let maestro = McpProjectSettings {
+        enabled: true,
+        stages: only("review"),
+    };
+    let tool = McpProjectSettings {
+        enabled: true,
+        stages: only("plan"),
+    };
+    store
+        .save_project_mcp("maestro", "context7", &maestro)
+        .expect("save maestro");
+    store
+        .save_project_mcp("tool", "context7", &tool)
+        .expect("save tool");
+    // Rewriting maestro does not touch tool.
+    store
+        .save_project_mcp("maestro", "context7", &maestro)
+        .expect("save maestro again");
+    assert_eq!(store.project_mcp("tool", "context7").expect("read"), tool);
+    assert_eq!(
+        store.project_mcp("maestro", "context7").expect("read"),
+        maestro,
+    );
+}
+
+#[test]
+fn deleting_a_server_removes_its_project_settings() {
+    let store = store();
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .expect("create");
+    store
+        .save_project_mcp(
+            "maestro",
+            "context7",
+            &McpProjectSettings {
+                enabled: true,
+                stages: only("clarify"),
+            },
+        )
+        .expect("enable");
+
+    store.delete_mcp_server("context7").expect("delete");
+
+    // The project's row for the server is gone, so it reads the default again.
+    assert_eq!(
+        store.project_mcp("maestro", "context7").expect("read"),
+        McpProjectSettings::default(),
+    );
+}
+
+#[test]
+fn has_secret_reports_a_stored_value_without_the_value() {
+    let store = store();
+    let at = secret_at("maestro", "context7", "Authorization");
+    assert!(!store.has_secret(at).expect("absent"));
+    let secrets = LocalSecrets::new(&key(), Arc::clone(&store));
+    secrets.put(at, "Bearer sk-x").expect("store");
+    assert!(store.has_secret(at).expect("present"));
+    secrets.delete(at).expect("clear");
+    assert!(!store.has_secret(at).expect("cleared"));
 }

@@ -85,6 +85,14 @@ impl From<StoreError> for SecretError {
 /// Put, get and delete are the whole surface; the dashboard and the proxy use
 /// a `&dyn SecretStore`, so the backend can change without touching them.
 pub trait SecretStore: Send + Sync {
+    /// Whether values can be read and written. [`LocalSecrets`] returns `true`;
+    /// [`UnavailableSecrets`], used when no usable master key is present,
+    /// returns `false`. The settings page reads this to report the store state
+    /// and to refuse saving a header value.
+    fn available(&self) -> bool {
+        true
+    }
+
     /// Stores `value` for `at`, replacing any value already there.
     ///
     /// # Errors
@@ -174,6 +182,43 @@ impl SecretStore for LocalSecrets {
             .map_err(|_| SecretError::Decrypt)?;
         let value = String::from_utf8(plaintext).map_err(|_| SecretError::Decrypt)?;
         Ok(Some(value))
+    }
+
+    fn delete(&self, at: SecretRef<'_>) -> Result<(), SecretError> {
+        self.store.delete_secret(at)?;
+        Ok(())
+    }
+}
+
+/// The backend used in place of [`LocalSecrets`] when no usable master key is
+/// present. It cannot encrypt or decrypt, so `put` and `get` return
+/// [`SecretError::Unavailable`], but `delete` still removes a stored row, so a
+/// value can be cleared after the key is lost. The dashboard and the proxy
+/// always hold a `SecretStore`, so they read [`available`](SecretStore::available)
+/// rather than an `Option`.
+pub struct UnavailableSecrets {
+    store: Arc<Store>,
+}
+
+impl UnavailableSecrets {
+    /// Builds the backend from the store that holds the `secrets` table.
+    #[must_use]
+    pub fn new(store: Arc<Store>) -> Self {
+        UnavailableSecrets { store }
+    }
+}
+
+impl SecretStore for UnavailableSecrets {
+    fn available(&self) -> bool {
+        false
+    }
+
+    fn put(&self, _at: SecretRef<'_>, _value: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn get(&self, _at: SecretRef<'_>) -> Result<Option<String>, SecretError> {
+        Err(SecretError::Unavailable)
     }
 
     fn delete(&self, at: SecretRef<'_>) -> Result<(), SecretError> {

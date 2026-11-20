@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    CurlUsageSource, GhRepos, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects,
-    RepoChecker, Scheduler, Store, WorkerSlots, app, import_tomls, master_key_from_env,
-    refresh_forever,
+    CurlUsageSource, GhRepos, LocalSecrets, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor,
+    Projects, RepoChecker, Scheduler, SecretStore, Store, UnavailableSecrets, WorkerSlots, app,
+    import_tomls, master_key_from_env, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -66,14 +66,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Per-project MCP header values are encrypted under the `factory-master-key`
     // secret. A missing or malformed key leaves the secret store unavailable
-    // rather than stopping the factory, so the dashboard still runs and reports
-    // secrets as off. The dashboard and the proxy build the store from the key
-    // in later changes.
-    if master_key_from_env().is_some() {
+    // rather than stopping the factory, so the dashboard still runs, reports
+    // secrets as off and refuses to save a header value.
+    let secrets: Arc<dyn SecretStore> = if let Some(key) = master_key_from_env() {
         tracing::info!("MCP secret store is ready");
+        Arc::new(LocalSecrets::new(&key, Arc::clone(&store)))
     } else {
         tracing::warn!("factory-master-key is missing or invalid, MCP header secrets are off");
-    }
+        Arc::new(UnavailableSecrets::new(Arc::clone(&store)))
+    };
 
     // Without podman workers no job takes a slot, so the board shows every
     // slot idle.
@@ -135,7 +136,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!("listening on http://{listen}, database {}", db.display());
     axum::serve(
         listener,
-        app(store, projects, wake, data_dir, plan_usage, github, slots),
+        app(
+            store, projects, wake, data_dir, plan_usage, github, slots, secrets,
+        ),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
