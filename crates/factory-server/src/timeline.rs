@@ -150,7 +150,18 @@ fn note(step: &mut Step, event: &JobEvent) {
         Some(reason) => format!("Failed: {reason}"),
         None => "Failed".to_owned(),
     });
-    for text in text.map(str::to_owned).into_iter().chain(failure) {
+    // The detail holds "<server>: <reason>", so the note reads as the server
+    // and why its tools were missing, under the step the run was in.
+    let unavailable = (event.event == "mcp-unavailable").then(|| match &event.detail {
+        Some(detail) => format!("MCP server unavailable: {detail}"),
+        None => "MCP server unavailable".to_owned(),
+    });
+    for text in text
+        .map(str::to_owned)
+        .into_iter()
+        .chain(failure)
+        .chain(unavailable)
+    {
         step.notes.push(Note {
             at: event.at.clone(),
             text,

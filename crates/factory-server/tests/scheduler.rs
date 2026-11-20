@@ -7,12 +7,12 @@ use factory_core::{
     AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PrDescription, Question, ReviewState, Stage, Turn,
 };
-use factory_runner::{Expect, LogLine, Rerun, RunReport};
+use factory_runner::{Expect, LogLine, McpUnavailable, Rerun, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, LogSink, McpProjectSettings, McpRuntime, McpStages,
-    Project, Projects, PublishRequest, Published, ReadyAction, RerunRequest, RunTokens, Scheduler,
-    SecretStore, Settings, StageEfforts, Store, SummaryRequest, UnavailableSecrets, WatchReport,
-    WatchRequest, format_cost, ready_action,
+    McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction, RerunRequest,
+    RunTokens, Scheduler, SecretRef, SecretStore, Settings, StageEfforts, Store, SummaryRequest,
+    UnavailableSecrets, WatchReport, WatchRequest, format_cost, ready_action,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -32,6 +32,8 @@ struct FakeExecutor {
     respond: Respond,
     requests: Mutex<Vec<AgentRequest>>,
     costs: Mutex<VecDeque<Option<f64>>>,
+    /// The MCP servers each run reports as not connected in its init line.
+    unavailable: Mutex<VecDeque<Vec<McpUnavailable>>>,
     stopped: Mutex<Vec<i64>>,
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
@@ -51,6 +53,7 @@ impl FakeExecutor {
             respond: Box::new(respond),
             requests: Mutex::new(Vec::new()),
             costs: Mutex::new(VecDeque::new()),
+            unavailable: Mutex::new(VecDeque::new()),
             stopped: Mutex::new(Vec::new()),
             checks: Mutex::new(VecDeque::new()),
             checks_run: Mutex::new(Vec::new()),
@@ -66,6 +69,12 @@ impl FakeExecutor {
 
     fn release(&self, runs: usize) {
         self.gate.add_permits(runs);
+    }
+
+    /// Makes the next run report `servers` as not connected in its init line,
+    /// the way a worker's stream-json `init` line does.
+    fn report_unavailable(&self, servers: Vec<McpUnavailable>) {
+        self.unavailable.lock().unwrap().push_back(servers);
     }
 
     fn requests(&self) -> Vec<AgentRequest> {
@@ -87,6 +96,12 @@ impl Executor for FakeExecutor {
             event: (self.respond)(&request),
             session_id: Some(request.session_id),
             cost_usd: self.costs.lock().unwrap().pop_front().unwrap_or(Some(0.12)),
+            mcp_unavailable: self
+                .unavailable
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default(),
         }
     }
 
@@ -198,6 +213,7 @@ fn mcp_runtime(store: &Arc<Store>) -> (McpRuntime, Arc<RunTokens>) {
         tokens: Arc::clone(&tokens),
         secrets,
         proxy_url: "http://factory:8081".into(),
+        warnings: Arc::new(McpWarnings::new(Arc::clone(store))),
     };
     (runtime, tokens)
 }
@@ -2549,6 +2565,111 @@ async fn mcp_servers_reach_only_the_runs_of_their_checked_stages() {
     assert!(!mcp_stage(&implement).contains(&"off".to_string()));
     assert!(!mcp_stage(&review).contains(&"off".to_string()));
     let _ = id;
+}
+
+#[tokio::test]
+async fn an_init_line_failure_records_one_warning_and_the_run_goes_on() {
+    let (store, executor, scheduler, _tokens) = setup_mcp(|_| questions());
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    store
+        .save_project_mcp(
+            "maestro",
+            "context7",
+            &enabled(McpStages {
+                clarify: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    executor.report_unavailable(vec![McpUnavailable {
+        server: "context7".into(),
+        reason: "the agent reported it as failed".into(),
+    }]);
+
+    scheduler.tick().await.unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+
+    let rows: Vec<_> = store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event == "mcp-unavailable")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].detail.as_deref(),
+        Some("context7: the agent reported it as failed")
+    );
+    // The run did not fail: it reached the clarify questions, so the warning is
+    // only a note.
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Clarifying
+    ));
+}
+
+#[tokio::test]
+async fn a_server_whose_secret_cannot_be_decrypted_is_skipped_with_a_warning() {
+    // setup_mcp uses an unavailable secret store, so a stored header value never
+    // decrypts. The server is then left out of the run and warned about.
+    let (store, executor, scheduler, _tokens) = setup_mcp(|_| questions());
+    store
+        .create_mcp_server(
+            "acme",
+            "https://mcp.acme.test/mcp",
+            &["Authorization".into()],
+        )
+        .unwrap();
+    store
+        .save_project_mcp(
+            "maestro",
+            "acme",
+            &enabled(McpStages {
+                clarify: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    // A stored value exists, but the secret store cannot read it.
+    store
+        .put_secret(
+            SecretRef {
+                project: "maestro",
+                server: "acme",
+                header: "Authorization",
+            },
+            "local",
+            b"ciphertext",
+        )
+        .unwrap();
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+    // The server was skipped, so the run carries no MCP config.
+    assert!(executor.requests()[0].mcp.is_none());
+    executor.release(1);
+    wait_idle(&scheduler).await;
+
+    let rows: Vec<_> = store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event == "mcp-unavailable")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].detail.as_deref(),
+        Some("acme: a stored header value could not be decrypted")
+    );
 }
 
 #[tokio::test]

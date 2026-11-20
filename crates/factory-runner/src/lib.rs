@@ -20,8 +20,8 @@ pub use github::{
 pub use images::{place_images, show_images};
 pub use outcome::{Expect, event_from_result};
 pub use prompt::{job_prompt, prompt};
-pub use stream::{LogLine, ResultMessage, StreamItem, parse_line};
+pub use stream::{LogLine, McpServerStatus, ResultMessage, StreamItem, parse_line};
 pub use worker::{
-    AGENT_SETTINGS, McpConfig, RunReport, SessionRun, WorkerConfig, WorkerRun, podman_args,
-    remove_container, run,
+    AGENT_SETTINGS, McpConfig, McpUnavailable, RunReport, SessionRun, WorkerConfig, WorkerRun,
+    podman_args, remove_container, run,
 };

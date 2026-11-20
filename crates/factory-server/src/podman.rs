@@ -35,6 +35,7 @@ fn failed(reason: String) -> RunReport {
         event: Event::AgentFailed { reason },
         session_id: None,
         cost_usd: None,
+        mcp_unavailable: Vec::new(),
     }
 }
 

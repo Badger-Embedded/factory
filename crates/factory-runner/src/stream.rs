@@ -7,6 +7,20 @@ use serde_json::Value;
 pub enum StreamItem {
     Log(LogLine),
     Result(ResultMessage),
+    /// The `system`/`init` line, which lists the MCP servers Claude Code tried
+    /// to connect to and their status. The factory warns about each active
+    /// server that is not `connected`.
+    Init(Vec<McpServerStatus>),
+}
+
+/// One entry of the `mcp_servers` array in the `system`/`init` line: the server
+/// name, which is the key the factory set in the run's MCP config, and the
+/// connection status Claude Code reported, such as `connected` or `failed`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    #[serde(default)]
+    pub status: String,
 }
 
 /// A line for the job's live log.
@@ -89,6 +103,16 @@ pub fn parse_line(line: &str) -> Vec<StreamItem> {
             Ok(result) => vec![StreamItem::Result(result)],
             Err(_) => vec![StreamItem::Log(LogLine::Other(line.to_owned()))],
         };
+    }
+    if value.get("type").and_then(Value::as_str) == Some("system") {
+        if value.get("subtype").and_then(Value::as_str) == Some("init") {
+            let servers = value
+                .get("mcp_servers")
+                .and_then(|servers| serde_json::from_value(servers.clone()).ok())
+                .unwrap_or_default();
+            return vec![StreamItem::Init(servers)];
+        }
+        return Vec::new();
     }
     let Ok(parsed) = serde_json::from_value::<Line>(value) else {
         return Vec::new();

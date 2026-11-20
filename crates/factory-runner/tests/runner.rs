@@ -7,9 +7,9 @@ use factory_core::{
     Task,
 };
 use factory_runner::{
-    Expect, LogLine, McpConfig, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
-    event_from_result, job_prompt, parse_line, place_images, podman_args, prompt, remove_container,
-    run, show_images,
+    Expect, LogLine, McpConfig, McpServerStatus, ResultMessage, SessionRun, StreamItem,
+    WorkerConfig, WorkerRun, event_from_result, job_prompt, parse_line, place_images, podman_args,
+    prompt, remove_container, run, show_images,
 };
 use serde_json::{Value, json};
 
@@ -107,7 +107,14 @@ fn assistant_text_and_tool_calls_become_log_lines() {
 
 #[test]
 fn other_messages_give_no_log_lines_and_plain_text_is_kept() {
-    assert_eq!(parse_line(r#"{"type":"system","subtype":"init"}"#), vec![]);
+    assert_eq!(
+        parse_line(r#"{"type":"system","subtype":"init"}"#),
+        vec![StreamItem::Init(vec![])]
+    );
+    assert_eq!(
+        parse_line(r#"{"type":"system","subtype":"compact_boundary"}"#),
+        vec![]
+    );
     assert_eq!(
         parse_line(r#"{"type":"user","message":{"content":[]}}"#),
         vec![]
@@ -118,6 +125,24 @@ fn other_messages_give_no_log_lines_and_plain_text_is_kept() {
         vec![StreamItem::Log(LogLine::Other(
             "Trying to pull localhost/factory-worker:latest...".into()
         ))]
+    );
+}
+
+#[test]
+fn the_init_line_reports_each_mcp_server_status() {
+    let line = r#"{"type":"system","subtype":"init","session_id":"s","mcp_servers":[{"name":"context7","status":"connected"},{"name":"acme","status":"failed"}]}"#;
+    assert_eq!(
+        parse_line(line),
+        vec![StreamItem::Init(vec![
+            McpServerStatus {
+                name: "context7".into(),
+                status: "connected".into(),
+            },
+            McpServerStatus {
+                name: "acme".into(),
+                status: "failed".into(),
+            },
+        ])]
     );
 }
 
@@ -392,6 +417,32 @@ async fn a_finished_run_reports_its_event_session_cost_and_log() {
     );
     let recorded = fs::read_to_string(dir.path().join("args")).unwrap();
     assert!(recorded.starts_with("run\n"));
+}
+
+#[tokio::test]
+async fn a_run_reports_each_mcp_server_the_init_line_shows_as_not_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &fixture("mcp-unavailable-run.jsonl"), "", 0),
+        ..WorkerConfig::default()
+    };
+
+    let report = run(
+        &config,
+        &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
+        |_| {},
+    )
+    .await;
+
+    // The connected server causes no warning; the failed one does, with a
+    // reason and no credential.
+    assert_eq!(report.mcp_unavailable.len(), 1);
+    assert_eq!(report.mcp_unavailable[0].server, "acme");
+    assert!(
+        report.mcp_unavailable[0].reason.contains("failed"),
+        "{}",
+        report.mcp_unavailable[0].reason
+    );
 }
 
 #[tokio::test]
