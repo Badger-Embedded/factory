@@ -638,7 +638,7 @@ async fn auto_merge_is_a_per_project_setting() {
     dashboard
         .post(
             "/settings/projects/maestro",
-            "clarify=&spec=&plan=&implement=&auto_merge=on",
+            "clarify=&spec=&plan=&implement=&review=&auto_merge=on",
         )
         .await;
     assert!(
@@ -653,7 +653,7 @@ async fn auto_merge_is_a_per_project_setting() {
     dashboard
         .post(
             "/settings/projects/maestro",
-            "clarify=&spec=&plan=&implement=",
+            "clarify=&spec=&plan=&implement=&review=",
         )
         .await;
     assert!(!dashboard.store.project_auto_merge("maestro", true).unwrap());
@@ -1952,6 +1952,7 @@ fn models(clarify: Option<&str>, implement: Option<&str>) -> StageModels {
         spec: None,
         plan: None,
         implement: implement.map(str::to_owned),
+        review: None,
     }
 }
 
@@ -1990,6 +1991,84 @@ fn a_project_file_sets_default_models_and_saved_models_win() {
     let saved = models(None, Some("sonnet"));
     store.save_project_models("x", &saved).unwrap();
     assert_eq!(store.project_models("x", &defaults).unwrap(), saved);
+}
+
+#[test]
+fn the_review_model_is_stored_and_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let none = StageModels::default();
+    let saved = StageModels {
+        review: Some("opus".into()),
+        ..StageModels::default()
+    };
+    {
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.project_models("maestro", &none).unwrap().review, None);
+        store.save_project_models("maestro", &saved).unwrap();
+    }
+    // The review model survives a reopen alongside the other stages.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.project_models("maestro", &none).unwrap(), saved);
+    // Clearing it saves an empty review again.
+    store.save_project_models("maestro", &none).unwrap();
+    assert_eq!(store.project_models("maestro", &saved).unwrap(), none);
+}
+
+#[test]
+fn a_project_file_sets_a_default_review_model() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(
+        dir.path(),
+        "x",
+        "repo = \"a/b\"\nbase = \"main\"\n[models]\nreview = \"opus\"\n",
+    );
+    let projects = Projects::load(dir.path()).unwrap();
+    let defaults = projects.get("x").unwrap().models.clone();
+    assert_eq!(defaults.review.as_deref(), Some("opus"));
+
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.project_models("x", &defaults).unwrap(), defaults);
+    // A saved row replaces the toml default, so an empty review clears it.
+    let saved = StageModels::default();
+    store.save_project_models("x", &saved).unwrap();
+    assert_eq!(store.project_models("x", &defaults).unwrap().review, None);
+}
+
+#[test]
+fn an_old_project_models_table_gains_the_review_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    // A `project_models` table as it was before `review` joined the stages,
+    // with a saved row for one project.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project_models (
+                project TEXT PRIMARY KEY,
+                clarify TEXT,
+                spec TEXT,
+                plan TEXT,
+                implement TEXT
+            );
+            INSERT INTO project_models (project, clarify) VALUES ('maestro', 'opus');",
+        )
+        .unwrap();
+    }
+    // Opening the store adds the column, so the old row reads with no review
+    // and a new review can be saved.
+    let store = Store::open(&path).unwrap();
+    let none = StageModels::default();
+    let reloaded = store.project_models("maestro", &none).unwrap();
+    assert_eq!(reloaded.clarify.as_deref(), Some("opus"));
+    assert_eq!(reloaded.review, None);
+    let with_review = StageModels {
+        clarify: Some("opus".into()),
+        review: Some("sonnet".into()),
+        ..StageModels::default()
+    };
+    store.save_project_models("maestro", &with_review).unwrap();
+    assert_eq!(store.project_models("maestro", &none).unwrap(), with_review);
 }
 
 #[test]
@@ -2119,14 +2198,14 @@ async fn the_settings_page_edits_the_models_of_each_project() {
     let dashboard = dashboard();
     let page = dashboard.get("/settings").await.body;
     assert!(page.contains("action=\"/settings/projects/maestro\""));
-    for stage in ["clarify", "spec", "plan", "implement"] {
+    for stage in ["clarify", "spec", "plan", "implement", "review"] {
         assert!(page.contains(&format!("name=\"{stage}\"")), "{stage}");
     }
 
     let reply = dashboard
         .post(
             "/settings/projects/maestro",
-            "clarify=+opus+&spec=&plan=&implement=sonnet",
+            "clarify=+opus+&spec=&plan=&implement=sonnet&review=",
         )
         .await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -2143,7 +2222,7 @@ async fn the_settings_page_edits_the_models_of_each_project() {
     dashboard
         .post(
             "/settings/projects/maestro",
-            "clarify=&spec=&plan=&implement=",
+            "clarify=&spec=&plan=&implement=&review=",
         )
         .await;
     assert_eq!(
@@ -2156,12 +2235,49 @@ async fn the_settings_page_edits_the_models_of_each_project() {
 }
 
 #[tokio::test]
+async fn the_settings_page_saves_a_review_model() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=+opus+",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap()
+            .review
+            .as_deref(),
+        Some("opus")
+    );
+
+    // Saving an empty review clears it.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=",
+        )
+        .await;
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap()
+            .review,
+        None
+    );
+}
+
+#[tokio::test]
 async fn models_for_an_unknown_project_are_not_saved() {
     let dashboard = dashboard();
     let reply = dashboard
         .post(
             "/settings/projects/nope",
-            "clarify=a&spec=&plan=&implement=",
+            "clarify=a&spec=&plan=&implement=&review=",
         )
         .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);

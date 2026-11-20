@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS project_models (
     clarify TEXT,
     spec TEXT,
     plan TEXT,
-    implement TEXT
+    implement TEXT,
+    review TEXT
 );
 CREATE TABLE IF NOT EXISTS project_settings (
     project TEXT PRIMARY KEY,
@@ -162,6 +163,17 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA)?;
+        // `review` joined the model stages after the table shipped, so add it to
+        // a `project_models` table that predates it. A fresh database already
+        // has the column from SCHEMA, so this skips it.
+        let has_review: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('project_models') WHERE name = 'review'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_review == 0 {
+            conn.execute("ALTER TABLE project_models ADD COLUMN review TEXT", [])?;
+        }
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -457,7 +469,7 @@ impl Store {
         let stored = self
             .conn()
             .query_row(
-                "SELECT clarify, spec, plan, implement FROM project_models WHERE project = ?1",
+                "SELECT clarify, spec, plan, implement, review FROM project_models WHERE project = ?1",
                 [project],
                 |row| {
                     Ok(StageModels {
@@ -465,6 +477,7 @@ impl Store {
                         spec: row.get(1)?,
                         plan: row.get(2)?,
                         implement: row.get(3)?,
+                        review: row.get(4)?,
                     })
                 },
             )
@@ -481,16 +494,18 @@ impl Store {
         models: &StageModels,
     ) -> Result<(), StoreError> {
         self.conn().execute(
-            "INSERT INTO project_models (project, clarify, spec, plan, implement)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO project_models (project, clarify, spec, plan, implement, review)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (project) DO UPDATE SET clarify = excluded.clarify,
-                spec = excluded.spec, plan = excluded.plan, implement = excluded.implement",
+                spec = excluded.spec, plan = excluded.plan,
+                implement = excluded.implement, review = excluded.review",
             params![
                 project,
                 models.clarify,
                 models.spec,
                 models.plan,
-                models.implement
+                models.implement,
+                models.review
             ],
         )?;
         Ok(())

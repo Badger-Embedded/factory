@@ -1274,6 +1274,7 @@ fn models(clarify: &str, spec: &str, plan: &str, implement: &str) -> factory_ser
         spec: some(spec),
         plan: some(plan),
         implement: some(implement),
+        review: None,
     }
 }
 

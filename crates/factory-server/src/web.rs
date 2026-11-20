@@ -507,6 +507,7 @@ struct ModelsForm {
     spec: String,
     plan: String,
     implement: String,
+    review: String,
     /// A checkbox: present when ticked.
     auto_merge: Option<String>,
 }
@@ -526,6 +527,7 @@ async fn save_project_models(
         spec: model(form.spec),
         plan: model(form.plan),
         implement: model(form.implement),
+        review: model(form.review),
     };
     state.store.save_project_models(&name, &models)?;
     state
