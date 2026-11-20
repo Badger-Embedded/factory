@@ -17,7 +17,8 @@ pub struct Settings {
     /// Seconds between looks at an open pull request, and before retrying a
     /// failed push or GitHub call.
     pub poll_seconds: u64,
-    /// The gates a new job starts with. A job keeps its own copy.
+    /// The default gates. Onboarding a project copies them into the project's
+    /// own gates, and a job copies its project's gates when it is created.
     pub gates: Gates,
 }
 

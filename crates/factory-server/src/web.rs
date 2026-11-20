@@ -710,6 +710,7 @@ fn settings_page(
             let efforts = state.store.project_efforts(&name)?;
             let auto_merge = state.store.project_auto_merge(&name, project.auto_merge)?;
             let llm_review = state.store.project_llm_review(&name, project.llm_review)?;
+            let gates = state.store.project_gates(&name)?;
             let project_servers = servers
                 .iter()
                 .map(|server| {
@@ -744,6 +745,7 @@ fn settings_page(
                 efforts,
                 auto_merge,
                 llm_review,
+                gates,
                 servers: project_servers,
             })
         })
@@ -799,6 +801,24 @@ impl ProjectForm {
     fn effort(&self, key: &str) -> String {
         self.get(key).map_or_else(default_effort, str::to_owned)
     }
+}
+
+/// Saves the gate checkboxes of a project form. The form posts a hidden
+/// `gates` field with them. A form without it, such as one rendered before the
+/// checkboxes existed, leaves the project's gates as they are instead of
+/// turning them all off.
+fn save_posted_gates(store: &Store, project: &str, form: &ProjectForm) -> Result<(), StoreError> {
+    if !form.ticked("gates") {
+        return Ok(());
+    }
+    store.save_project_gates(
+        project,
+        Gates {
+            spec: form.ticked("gate_spec"),
+            plan: form.ticked("gate_plan"),
+            publish: form.ticked("gate_publish"),
+        },
+    )
 }
 
 async fn save_project_models(
@@ -882,6 +902,7 @@ async fn save_project_models(
         form.ticked("auto_merge"),
         form.ticked("llm_review"),
     )?;
+    save_posted_gates(&state.store, &name, &form)?;
     for (server, settings, tools) in &saves {
         state
             .store
