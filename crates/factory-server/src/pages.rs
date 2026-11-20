@@ -529,7 +529,10 @@ pub fn job(
         matches!(job.turn(), Turn::Agent(_)),
         &html! {},
         &html! {
-            h1 { "#" (id) " " (first_line(job.request())) }
+            div.title-row {
+                h1 { "#" (id) " " (first_line(job.request())) }
+                span.badge.cost { (cost_label(cost_usd)) }
+            }
             p.meta {
                 @if let Some(url) = &repo_url {
                     a href=(url) { (row.project) }
@@ -537,7 +540,6 @@ pub fn job(
                     (row.project)
                 }
                 " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
-                " · " (cost_label(cost_usd))
             }
             (steps(job, models))
             (status_card(id, job, settings))
