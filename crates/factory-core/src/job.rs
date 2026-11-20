@@ -18,6 +18,12 @@ pub const MAX_REVIEW_ROUNDS: u32 = 5;
 /// request. See [`Job::can_retry`].
 const LEGACY_ROUNDS_REASON: &str = "5 failed check or CI rounds on one pull request";
 
+/// How the reason of a failed agent run starts, such as a run stopped by the
+/// plan's usage limit. A failed job with this prefix and no retry target
+/// failed before agent failures recorded one, and is retryable at its
+/// highest-numbered pull request like a [`LEGACY_ROUNDS_REASON`] job.
+const LEGACY_AGENT_REASON: &str = "the agent run ended with";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     request: String,
@@ -131,22 +137,27 @@ pub enum Stage {
     Failed {
         reason: String,
         /// Where a retry resumes the job, set when the job ran out of failed
-        /// rounds. A job that failed another way, or one stored before this
-        /// field existed, has `None`. See [`Job::can_retry`].
+        /// rounds or an agent run failed. A job that failed another way, or
+        /// one stored before this field existed, has `None`. See
+        /// [`Job::can_retry`].
         #[serde(default)]
         retry: Option<RetryTarget>,
     },
 }
 
-/// The pull request stage a retried job resumes at. A job that used up its
-/// failed rounds keeps one, so a retry returns it to the pull request it
-/// failed on.
+/// Where a retried job resumes. A job that used up its failed rounds returns
+/// to the pull request it failed on. A job whose agent run failed runs the
+/// same task again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetryTarget {
     /// Rerun the project's checks on the pull request.
     Verifying { pr: usize },
     /// Watch the pull request's CI and review again.
     CiAndReview { pr: usize },
+    /// Run `task` again in `stage`, the stage the failed run belonged to.
+    /// The stage picks the session, so the run resumes the session that
+    /// failed, in the same checkout.
+    Agent { stage: Box<Stage>, task: Box<Task> },
 }
 
 /// Who the job is waiting for.
@@ -364,8 +375,8 @@ pub enum Event {
     Merged,
     ClosedUnmerged,
     Cancel,
-    /// Resume a job that failed because it used up its failed rounds. See
-    /// [`Job::can_retry`].
+    /// Resume a job that failed because it used up its failed rounds or an
+    /// agent run failed. See [`Job::can_retry`].
     Retry,
 }
 
@@ -525,10 +536,12 @@ impl Job {
         use Stage as S;
 
         if let E::Retry = event {
-            return match self.retry_stage() {
-                Some(stage) => {
-                    self.failed_rounds = 0;
-                    Ok((stage, Turn::Factory))
+            return match self.retry_step() {
+                Some((stage, turn)) => {
+                    if !matches!(turn, Turn::Agent(_)) {
+                        self.failed_rounds = 0;
+                    }
+                    Ok((stage, turn))
                 }
                 None => Err(self.unexpected(E::Retry)),
             };
@@ -551,10 +564,13 @@ impl Job {
             (stage, Turn::Agent(_), E::Agent(AgentResult::Questions(questions))) => {
                 (stage.clone(), Turn::User(Ask::Answers { questions }))
             }
-            (_, Turn::Agent(_), E::AgentFailed { reason }) => (
+            (stage, Turn::Agent(task), E::AgentFailed { reason }) => (
                 S::Failed {
                     reason,
-                    retry: None,
+                    retry: Some(RetryTarget::Agent {
+                        stage: Box::new(stage.clone()),
+                        task: Box::new(task.clone()),
+                    }),
                 },
                 Turn::Done,
             ),
@@ -864,32 +880,43 @@ impl Job {
     }
 
     /// Whether a [`Event::Retry`] would resume the job. True for a job that
-    /// failed because it used up its failed rounds: one with a retry target,
-    /// or a legacy job recognised by its exact reason that still has an open
-    /// pull request. False for every other failure, and for a legacy job with
-    /// no pull request number.
+    /// failed because it used up its failed rounds or an agent run failed:
+    /// one with a retry target, or a legacy job recognised by its reason that
+    /// has a pull request number. False for every other failure, and for a
+    /// legacy job with no pull request number.
     #[must_use]
     pub fn can_retry(&self) -> bool {
-        self.retry_stage().is_some()
+        self.retry_step().is_some()
     }
 
-    /// The stage a retry resumes at, or `None` when the job cannot be retried.
-    fn retry_stage(&self) -> Option<Stage> {
+    /// The stage and turn a retry resumes at, or `None` when the job cannot
+    /// be retried.
+    fn retry_step(&self) -> Option<(Stage, Turn)> {
         let Stage::Failed { reason, retry } = &self.stage else {
             return None;
         };
         match retry {
-            Some(RetryTarget::Verifying { pr }) => Some(Stage::Verifying { pr: *pr }),
-            Some(RetryTarget::CiAndReview { pr }) => Some(Stage::CiAndReview { pr: *pr }),
-            // A legacy job did not record a target. It ran out of rounds on
-            // one pull request, so resume at the highest-numbered one.
-            None if reason == LEGACY_ROUNDS_REASON => self
-                .plan
-                .iter()
-                .enumerate()
-                .filter(|(_, pr)| pr.number.is_some())
-                .max_by_key(|(_, pr)| pr.number)
-                .map(|(pr, _)| Stage::CiAndReview { pr }),
+            Some(RetryTarget::Verifying { pr }) => {
+                Some((Stage::Verifying { pr: *pr }, Turn::Factory))
+            }
+            Some(RetryTarget::CiAndReview { pr }) => {
+                Some((Stage::CiAndReview { pr: *pr }, Turn::Factory))
+            }
+            Some(RetryTarget::Agent { stage, task }) => {
+                Some(((**stage).clone(), Turn::Agent((**task).clone())))
+            }
+            // A legacy job did not record a target or the stage it failed
+            // in. Resume at the highest-numbered pull request: watching it
+            // either finds work for the agent or, when it was merged, moves
+            // on to the next one.
+            None if reason == LEGACY_ROUNDS_REASON || reason.starts_with(LEGACY_AGENT_REASON) => {
+                self.plan
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, pr)| pr.number.is_some())
+                    .max_by_key(|(_, pr)| pr.number)
+                    .map(|(pr, _)| (Stage::CiAndReview { pr }, Turn::Factory))
+            }
             None => None,
         }
     }

@@ -2734,7 +2734,7 @@ async fn the_failure_card_shows_a_retry_button_for_a_retryable_job() {
 }
 
 #[tokio::test]
-async fn an_agent_failure_offers_no_retry_button_and_rejects_retry() {
+async fn a_retry_reruns_a_failed_agent_run() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     to_spec_approval(&dashboard, id);
@@ -2753,13 +2753,31 @@ async fn an_agent_failure_offers_no_retry_button_and_rejects_retry() {
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("The job failed"));
+    assert!(page.body.contains(&format!("/jobs/{id}/retry")));
+
+    let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Implementing { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn a_closed_unmerged_job_offers_no_retry_button_and_rejects_retry() {
+    let dashboard = dashboard();
+    let id = failed_without_retry(&dashboard).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The job failed"));
     assert!(!page.body.contains(&format!("/jobs/{id}/retry")));
 
     let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
 }
 
-/// A failed job that is not retryable: an agent error during implementing.
+/// A failed job that is not retryable: its pull request was closed without
+/// merging.
 async fn failed_without_retry(dashboard: &Dashboard) -> i64 {
     let id = dashboard.new_job().await;
     to_spec_approval(dashboard, id);
@@ -2769,12 +2787,10 @@ async fn failed_without_retry(dashboard: &Dashboard) -> i64 {
         Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(
-        id,
-        Event::AgentFailed {
-            reason: "usage limit".into(),
-        },
-    );
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 7 });
+    dashboard.apply(id, Event::ClosedUnmerged);
     id
 }
 

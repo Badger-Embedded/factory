@@ -1,7 +1,7 @@
 use factory_core::{
     AgentResult, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
-    MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, ReviewPass, ReviewState,
-    Session, Stage, Task, Turn, Verdict,
+    MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, RetryTarget, ReviewPass,
+    ReviewState, Session, Stage, Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -410,7 +410,7 @@ fn closing_the_pull_request_unmerged_fails_the_job() {
 }
 
 #[test]
-fn an_agent_failure_fails_the_job() {
+fn an_agent_failure_fails_the_job_with_the_failed_task_to_retry() {
     let mut job = implementing(&["only"]);
     apply(
         &mut job,
@@ -422,10 +422,15 @@ fn an_agent_failure_fails_the_job() {
         job.stage(),
         &Stage::Failed {
             reason: "usage limit".into(),
-            retry: None,
+            retry: Some(RetryTarget::Agent {
+                stage: Box::new(Stage::Implementing { pr: 0 }),
+                task: Box::new(Task::Implement {
+                    pr: planned("only")
+                }),
+            }),
         }
     );
-    assert!(!job.can_retry());
+    assert!(job.can_retry());
 }
 
 #[test]
@@ -1036,8 +1041,91 @@ fn a_retried_job_fails_again_after_five_more_rounds_and_retries_again() {
 }
 
 #[test]
+fn a_retry_reruns_a_failed_agent_run_in_its_session() {
+    let mut job = implementing(&["only"]);
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 0 });
+    assert_runs(
+        &job,
+        Session::Pr(0),
+        Task::Implement {
+            pr: planned("only"),
+        },
+    );
+}
+
+#[test]
+fn a_retry_reruns_a_failed_planning_run() {
+    let mut job = Job::new("add a reboot button", Gates::default());
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+    assert!(job.can_retry());
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Spec);
+    assert_runs(&job, Session::Spec, Task::WriteSpec);
+}
+
+#[test]
+fn a_retried_agent_run_keeps_the_failed_rounds() {
+    // Four failed rounds, the fourth a conflict. The rebase run fails, and
+    // its retry hands out no fresh rounds, so the next failure is the fifth.
+    let mut job = watching(7);
+    for _ in 1..MAX_FAILED_ROUNDS - 1 {
+        apply(&mut job, Event::CiFailed { log: "fail".into() });
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(&mut job, Event::ChecksPassed);
+        apply(&mut job, Event::Published { number: 7 });
+    }
+    apply(
+        &mut job,
+        Event::Conflicted {
+            base: "main".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_runs(
+        &job,
+        Session::Pr(0),
+        Task::Rebase {
+            base: "main".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    apply(
+        &mut job,
+        Event::CiFailed {
+            log: "fifth".into(),
+        },
+    );
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+}
+
+#[test]
 fn retry_is_rejected_for_a_failure_that_cannot_resume() {
-    for mut job in [closed_unmerged_job(), agent_failed_job(), cancelled_job()] {
+    for mut job in [closed_unmerged_job(), cancelled_job()] {
         assert!(!job.can_retry());
         let before = job.clone();
         assert!(matches!(
@@ -1069,17 +1157,6 @@ fn retry_is_rejected_while_the_job_still_runs() {
 fn closed_unmerged_job() -> Job {
     let mut job = watching(9);
     apply(&mut job, Event::ClosedUnmerged);
-    job
-}
-
-fn agent_failed_job() -> Job {
-    let mut job = implementing(&["only"]);
-    apply(
-        &mut job,
-        Event::AgentFailed {
-            reason: "usage limit".into(),
-        },
-    );
     job
 }
 
@@ -1122,6 +1199,83 @@ fn a_legacy_failed_job_retries_at_its_highest_numbered_pull_request() {
         legacy.next_command(),
         Some(Command::WatchPr { pr: 1, number: 11 })
     );
+}
+
+/// The reason a run stopped by the plan's usage limit fails with.
+const USAGE_LIMIT: &str = "the agent run ended with success: You've hit your 5-hour limit";
+
+#[test]
+fn a_legacy_agent_failure_mid_rebase_retries_at_its_pull_request() {
+    let mut job = watching(75);
+    apply(
+        &mut job,
+        Event::Conflicted {
+            base: "main".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: USAGE_LIMIT.into(),
+        },
+    );
+
+    let mut legacy = without_retry_target(&job);
+    assert!(legacy.can_retry());
+    apply(&mut legacy, Event::Retry);
+    assert_eq!(legacy.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(
+        legacy.next_command(),
+        Some(Command::WatchPr { pr: 0, number: 75 })
+    );
+}
+
+#[test]
+fn a_legacy_agent_failure_on_an_unopened_pull_request_moves_past_the_merged_one() {
+    let mut job = implementing(&["first", "second"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 74 });
+    apply(&mut job, Event::Merged);
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: USAGE_LIMIT.into(),
+        },
+    );
+
+    let mut legacy = without_retry_target(&job);
+    assert!(legacy.can_retry());
+    apply(&mut legacy, Event::Retry);
+    assert_eq!(legacy.stage(), &Stage::CiAndReview { pr: 0 });
+    // Watching finds #74 merged, so the job goes on to implement the second.
+    apply(&mut legacy, Event::Merged);
+    assert_runs(
+        &legacy,
+        Session::Pr(1),
+        Task::Implement {
+            pr: planned("second"),
+        },
+    );
+}
+
+#[test]
+fn a_legacy_failure_with_another_reason_is_not_retryable() {
+    let mut job = watching(9);
+    apply(
+        &mut job,
+        Event::Conflicted {
+            base: "main".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "could not prepare the checkout: boom".into(),
+        },
+    );
+    let legacy = without_retry_target(&job);
+    assert!(!legacy.can_retry());
 }
 
 #[test]
