@@ -1683,3 +1683,80 @@ async fn approving_from_the_job_page_still_redirects_to_the_job() {
         .await;
     assert_eq!(reply.location, Some(format!("/jobs/{id}")));
 }
+
+fn merge(dashboard: &Dashboard, id: i64) {
+    to_spec_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![planned("maestrod: reboot", None)])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 15 });
+    dashboard.apply(id, Event::Merged);
+    assert_eq!(dashboard.store.get(id).unwrap().job.stage(), &Stage::Merged);
+}
+
+fn tile(value: &str, label: &str) -> String {
+    format!("<div class=\"stat-value\">{value}</div><div class=\"stat-label\">{label}</div>")
+}
+
+#[tokio::test]
+async fn the_stats_strip_shows_the_stored_totals() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    dashboard.new_job().await;
+    dashboard.new_job().await;
+    merge(&dashboard, first);
+    merge(&dashboard, second);
+    dashboard.store.add_cost(first, 1.0).unwrap();
+    dashboard.store.add_cost(second, 2.5).unwrap();
+
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains(&tile("$3.50", "Total API cost")));
+    assert!(body.contains(&tile("4", "Jobs created")));
+    assert!(body.contains(&tile("2", "Jobs merged")));
+    assert!(body.contains(&tile("50%", "Merge rate")));
+    assert!(body.contains(&tile("$1.75", "Cost per merged job")));
+}
+
+#[tokio::test]
+async fn the_stats_strip_shows_dashes_for_a_project_without_jobs() {
+    let body = dashboard().get("/").await.body;
+    assert!(body.contains(&tile("$0.00", "Total API cost")));
+    assert!(body.contains(&tile("–", "Jobs created")));
+    assert!(body.contains(&tile("–", "Jobs merged")));
+    assert!(body.contains(&tile("–", "Merge rate")));
+    assert!(body.contains(&tile("–", "Cost per merged job")));
+    assert!(!body.contains("NaN"));
+    assert!(!body.contains("inf"));
+}
+
+#[tokio::test]
+async fn jobs_without_a_merge_show_dashes_for_the_ratios() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 2.0).unwrap();
+
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains(&tile("$2.00", "Total API cost")));
+    assert!(body.contains(&tile("1", "Jobs created")));
+    assert!(body.contains(&tile("–", "Jobs merged")));
+    assert!(body.contains(&tile("0%", "Merge rate")));
+    assert!(body.contains(&tile("–", "Cost per merged job")));
+    assert!(!body.contains("NaN"));
+}
+
+#[tokio::test]
+async fn the_stats_strip_follows_the_selected_project() {
+    let dashboard = two_projects();
+    dashboard.new_job().await;
+
+    let tool = dashboard.get("/?project=tool").await.body;
+    assert!(tool.contains(&tile("–", "Jobs created")));
+    let maestro = dashboard.get("/?project=maestro").await.body;
+    assert!(maestro.contains(&tile("1", "Jobs created")));
+}

@@ -69,7 +69,7 @@ pub struct LogEntry {
 
 /// What a project has used since the totals were introduced. Deleting a job
 /// does not lower them.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ProjectTotals {
     /// API cost of all agent runs, in USD.
     pub usd: f64,
