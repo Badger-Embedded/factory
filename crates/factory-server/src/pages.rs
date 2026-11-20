@@ -833,6 +833,11 @@ fn check_outcome_line(outcome: &CheckOutcome) -> Markup {
                 }
             }
         },
+        CheckOutcome::RpcError { code, message } => html! {
+            p.hint.bad {
+                "The server rejected the handshake with JSON-RPC error " (code) ": " (message)
+            }
+        },
         CheckOutcome::NotMcp => html! {
             p.hint.bad {
                 "The server answered, but not with an MCP reply. Check that the URL is the streamable-HTTP endpoint."
