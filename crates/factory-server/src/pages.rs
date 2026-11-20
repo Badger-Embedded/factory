@@ -43,6 +43,17 @@ const STEPS: [(&str, Who); 9] = [
     ("merged", Who::Factory),
 ];
 
+/// Each board region polls its own fragment on this interval, so a state
+/// change on the board shows without a reload.
+const POLL_TRIGGER: &str = "every 5s";
+
+fn fragment_url(region: &str, project: &str) -> String {
+    format!(
+        "/fragments/{region}?project={}",
+        crate::web::query_escape(project)
+    )
+}
+
 fn has_gate(step: &str, gates: Gates) -> bool {
     match step {
         "spec" => gates.spec,
@@ -124,9 +135,7 @@ pub fn index(
         false,
         &nav,
         &html! {
-            @if let Some(plan_usage) = plan_usage {
-                (plan_usage_panel(plan_usage))
-            }
+            (plan_usage_region(plan_usage))
             @if let Some(selected) = selected {
                 form.card method="post" action="/jobs" enctype="multipart/form-data" {
                     h2.form-title { "New request for " (selected) }
@@ -150,16 +159,14 @@ pub fn index(
                     div.form-actions { button.primary { "Request" } }
                     script { (PreEscaped(PASTE_IMAGES)) }
                 }
+                div.overview {
+                    (stats(totals, selected))
+                    (lane_counts(&all, auto_merge, selected))
+                }
+                (board(&all, costs, auto_merge, selected))
             } @else {
                 div.card { p.empty { "No projects are configured." } }
             }
-            @if selected.is_some() {
-                div.overview {
-                    (stats(totals))
-                    (lane_counts(&all, auto_merge))
-                }
-            }
-            (board(&all, costs, auto_merge))
         },
     )
 }
@@ -167,7 +174,7 @@ pub fn index(
 /// A bar list of the live jobs per lane. Done jobs are not live. The longest
 /// bar is the lane with the most jobs, and the others scale against it.
 #[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
-fn lane_counts(rows: &[&JobRow], auto_merge: bool) -> Markup {
+pub fn lane_counts(rows: &[&JobRow], auto_merge: bool, project: &str) -> Markup {
     let counts: Vec<(Lane, usize)> = Lane::ALL
         .into_iter()
         .filter(|lane| matches!(lane, Lane::You | Lane::Agent | Lane::Factory))
@@ -181,7 +188,8 @@ fn lane_counts(rows: &[&JobRow], auto_merge: bool) -> Markup {
         .collect();
     let longest = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
     html! {
-        section.card.lane-counts {
+        section.card.lane-counts #lanes hx-get=(fragment_url("lanes", project))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
             h2 { "Live jobs by lane" }
             @if longest == 0 {
                 p.empty { "No live jobs." }
@@ -207,7 +215,7 @@ const NO_VALUE: &str = "–";
 /// for the merge rate. A figure that is zero or would divide by zero shows a
 /// dash.
 #[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
-fn stats(totals: ProjectTotals) -> Markup {
+pub fn stats(totals: ProjectTotals, project: &str) -> Markup {
     let created = totals.jobs_created;
     let merged = totals.jobs_merged;
     let average = (merged > 0).then(|| format_cost(totals.usd / merged as f64));
@@ -221,7 +229,8 @@ fn stats(totals: ProjectTotals) -> Markup {
         ),
     ];
     html! {
-        div.stats {
+        div.stats #stats hx-get=(fragment_url("stats", project))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
             @for (label, value) in tiles {
                 div.card.stat {
                     div.stat-value { (value) }
@@ -256,11 +265,31 @@ fn merge_gauge(created: i64, merged: i64) -> Markup {
     }
 }
 
+/// The plan usage tile sits in a wrapper that polls on its own interval, so
+/// the tile hides when the cache is empty, stale or errored and returns on a
+/// later poll once it is fresh. htmx swaps the wrapper's contents, so an empty
+/// response removes the tile while the wrapper keeps polling.
+fn plan_usage_region(usage: Option<&PlanUsage>) -> Markup {
+    html! {
+        div #usage hx-get="/fragments/plan-usage" hx-trigger=(POLL_TRIGGER) {
+            (plan_usage(usage))
+        }
+    }
+}
+
+/// The plan usage tile, or nothing when the handler passes `None`.
+pub fn plan_usage(usage: Option<&PlanUsage>) -> Markup {
+    html! {
+        @if let Some(usage) = usage {
+            (plan_usage_panel(usage))
+        }
+    }
+}
+
 /// The account-wide panel of Claude subscription limits: the 5-hour window,
 /// the weekly window, and each per-model window the plan reports, such as
 /// Fable. It reads the same for every project, because the limits belong to
-/// the account. The handler passes `None` when the cache is empty, stale or
-/// errored, and then nothing here renders.
+/// the account.
 fn plan_usage_panel(usage: &PlanUsage) -> Markup {
     html! {
         section.card.plan-usage {
@@ -517,9 +546,15 @@ impl Lane {
     }
 }
 
-fn board(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Markup {
+pub fn board(
+    rows: &[&JobRow],
+    costs: &HashMap<i64, f64>,
+    auto_merge: bool,
+    project: &str,
+) -> Markup {
     html! {
-        div.board {
+        div.board #board hx-get=(fragment_url("board", project))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
             @for lane in Lane::ALL {
                 @let cards: Vec<&JobRow> = rows
                     .iter()

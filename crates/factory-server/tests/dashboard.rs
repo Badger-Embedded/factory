@@ -2890,3 +2890,117 @@ async fn the_tile_is_the_same_whatever_project_is_selected() {
     assert_eq!(maestro_tile, tool_tile);
     assert!(maestro_tile.contains("Fable"));
 }
+
+/// The plan usage wrapper on the board, from its id back to the `div` that
+/// opens it and forward to the `div` that closes it.
+fn usage_wrapper(body: &str) -> &str {
+    let id = body.find("id=\"usage\"").unwrap();
+    let open = body[..id].rfind("<div").unwrap();
+    let rest = &body[open..];
+    &rest[..rest.find("</div>").unwrap() + "</div>".len()]
+}
+
+#[tokio::test]
+async fn each_board_region_polls_its_fragment_every_five_seconds() {
+    let dashboard = dashboard();
+    let body = dashboard.get("/").await.body;
+    for url in [
+        "/fragments/plan-usage",
+        "/fragments/stats?project=maestro",
+        "/fragments/lanes?project=maestro",
+        "/fragments/board?project=maestro",
+    ] {
+        assert!(body.contains(&format!("hx-get=\"{url}\"")), "{url}");
+    }
+    // One trigger per region: the tile, the KPI strip, the lane panel and the
+    // job cards.
+    assert_eq!(body.matches("hx-trigger=\"every 5s\"").count(), 4);
+}
+
+#[tokio::test]
+async fn the_new_request_form_is_outside_every_swapped_region() {
+    let dashboard = dashboard();
+    let body = dashboard.get("/").await.body;
+    let form = body.find("action=\"/jobs\"").unwrap();
+    // The KPI strip, the lane panel and the job cards all come after the form,
+    // so a poll that swaps one never touches the form.
+    for id in ["id=\"stats\"", "id=\"lanes\"", "id=\"board\""] {
+        assert!(body.find(id).unwrap() > form, "{id} is not after the form");
+    }
+    // The plan usage wrapper above the form holds the tile, not the form.
+    assert!(!usage_wrapper(&body).contains("<form"));
+}
+
+#[tokio::test]
+async fn a_board_fragment_is_a_plain_get_of_only_that_region() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let reply = dashboard.get("/fragments/board?project=maestro").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // Only the board region: no page chrome and no new-request form.
+    assert!(reply.body.trim_start().starts_with("<div class=\"board\""));
+    assert!(!reply.body.contains("<html"));
+    assert!(!reply.body.contains("<head"));
+    assert!(!reply.body.contains("action=\"/jobs\""));
+    assert!(reply.body.contains(&format!("href=\"/jobs/{id}\"")));
+    // The returned region carries its own polling attributes, so the swap
+    // keeps it polling.
+    assert!(
+        reply
+            .body
+            .contains("hx-get=\"/fragments/board?project=maestro\"")
+    );
+}
+
+#[tokio::test]
+async fn a_new_job_shows_up_in_the_board_fragment() {
+    let dashboard = dashboard();
+    let before = dashboard.get("/fragments/board?project=maestro").await.body;
+    assert!(!before.contains("Add a reboot button"));
+
+    let id = dashboard.new_job().await;
+    let after = dashboard.get("/fragments/board?project=maestro").await.body;
+    assert!(after.contains(&format!("href=\"/jobs/{id}\"")));
+    assert!(after.contains("Add a reboot button"));
+}
+
+#[tokio::test]
+async fn a_lane_change_shows_up_in_the_board_and_lane_fragments() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    // Queued, so the job is in the Factory lane and its bar leads.
+    let board = dashboard.get("/fragments/board?project=maestro").await.body;
+    assert_eq!(lanes_of(&board, id), ["lane-factory"]);
+    let lanes = dashboard.get("/fragments/lanes?project=maestro").await.body;
+    assert!(lanes.contains(&bar("factory", 1, "100.0%")));
+
+    to_spec_approval(&dashboard, id);
+    // The spec is ready, so the same job moves to the You lane.
+    let board = dashboard.get("/fragments/board?project=maestro").await.body;
+    assert_eq!(lanes_of(&board, id), ["lane-you"]);
+    let lanes = dashboard.get("/fragments/lanes?project=maestro").await.body;
+    assert!(lanes.contains(&bar("you", 1, "100.0%")));
+    assert!(lanes.contains(&bar("factory", 0, "0.0%")));
+}
+
+#[tokio::test]
+async fn the_plan_usage_fragment_hides_and_reappears_with_the_cache() {
+    let dashboard = dashboard();
+    // An empty cache: the fragment is empty, so a swap removes the tile.
+    let empty = dashboard.get("/fragments/plan-usage").await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(!empty.body.contains("Claude plan usage"));
+
+    dashboard
+        .usage
+        .record_success(usage(USAGE_WITH_FABLE), now());
+    let fresh = dashboard.get("/fragments/plan-usage").await.body;
+    assert!(fresh.contains("<section class=\"card plan-usage\">"));
+    assert!(fresh.contains("Claude plan usage"));
+    assert!(fresh.contains("Fable"));
+
+    dashboard.usage.record_error();
+    let errored = dashboard.get("/fragments/plan-usage").await.body;
+    assert!(!errored.contains("Claude plan usage"));
+}
