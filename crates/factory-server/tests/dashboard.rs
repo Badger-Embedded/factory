@@ -1,4 +1,5 @@
 use std::fs;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,10 +10,55 @@ use factory_core::{
     AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlanUsage,
     PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
-use factory_server::{PlanUsageCache, Projects, StageModels, Store, StoreError, USER_HEADER, app};
+use factory_server::{
+    BranchInfo, GitHubRepos, Permission, PlanUsageCache, Projects, RepoChecker, RepoInfo,
+    StageModels, Store, StoreError, USER_HEADER, app,
+};
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
 use tower::ServiceExt;
+
+/// A fake GitHub the onboarding wizard checks against, so tests need no network.
+/// The default passes every check; a test mutates one field to fail one.
+#[derive(Clone)]
+struct FakeRepos {
+    repo: Option<RepoInfo>,
+    branch: Option<BranchInfo>,
+    ci: bool,
+}
+
+impl FakeRepos {
+    /// A repository that passes every required check and raises no warning.
+    fn fit() -> Self {
+        FakeRepos {
+            repo: Some(RepoInfo {
+                permission: Permission::Write,
+                allow_squash_merge: true,
+                delete_branch_on_merge: true,
+            }),
+            branch: Some(BranchInfo { protected: true }),
+            ci: true,
+        }
+    }
+}
+
+impl GitHubRepos for FakeRepos {
+    fn repo(&self, _repo: &str) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send {
+        std::future::ready(Ok(self.repo.clone()))
+    }
+
+    fn branch(
+        &self,
+        _repo: &str,
+        _branch: &str,
+    ) -> impl Future<Output = Result<Option<BranchInfo>, String>> + Send {
+        std::future::ready(Ok(self.branch.clone()))
+    }
+
+    fn has_ci(&self, _repo: &str) -> impl Future<Output = Result<bool, String>> + Send {
+        std::future::ready(Ok(self.ci))
+    }
+}
 
 struct Dashboard {
     store: Arc<Store>,
@@ -47,8 +93,15 @@ fn dashboard_for(repo: &str) -> Dashboard {
 }
 
 /// A dashboard reading projects from `store`, so a project onboarded in the
-/// store is visible on the next request.
+/// store is visible on the next request. Its onboarding checks see a fit
+/// repository.
 fn dashboard_with(store: Arc<Store>) -> Dashboard {
+    dashboard_with_github(store, Arc::new(FakeRepos::fit()))
+}
+
+/// As [`dashboard_with`], with the onboarding checks answered by `github`, so a
+/// test can fail one check.
+fn dashboard_with_github(store: Arc<Store>, github: Arc<dyn RepoChecker>) -> Dashboard {
     let projects = Arc::new(Projects::from_store(Arc::clone(&store)));
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
@@ -59,6 +112,7 @@ fn dashboard_with(store: Arc<Store>) -> Dashboard {
             Arc::new(Notify::new()),
             data.path().to_owned(),
             Arc::clone(&usage),
+            github,
         ),
         store,
         data,
@@ -1315,6 +1369,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(Notify::new()),
         dashboard.data.path().to_owned(),
         Arc::new(PlanUsageCache::new()),
+        Arc::new(FakeRepos::fit()),
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
@@ -3450,4 +3505,323 @@ async fn the_plan_usage_fragment_hides_and_reappears_with_the_cache() {
     dashboard.usage.record_error();
     let errored = dashboard.get("/fragments/plan-usage").await.body;
     assert!(!errored.contains("Claude plan usage"));
+}
+
+// --- Onboarding wizard ---
+
+/// A dashboard with no projects yet, its onboarding checks answered by `github`.
+fn empty_dashboard(github: Arc<dyn RepoChecker>) -> (Arc<Store>, Dashboard) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let dashboard = dashboard_with_github(Arc::clone(&store), github);
+    (store, dashboard)
+}
+
+#[tokio::test]
+async fn the_onboard_page_is_linked_and_shows_step_one() {
+    let dashboard = dashboard();
+    assert!(dashboard.get("/").await.body.contains("href=\"/onboard\""));
+    assert!(
+        dashboard
+            .get("/settings")
+            .await
+            .body
+            .contains("href=\"/onboard\"")
+    );
+
+    let page = dashboard.get("/onboard").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Onboard a project"));
+    assert!(page.body.contains("name=\"repo\""));
+    // The base branch defaults to main, and only step 1 shows before a check.
+    assert!(page.body.contains("value=\"main\""));
+    assert!(page.body.contains("Run checks"));
+    assert!(!page.body.contains("Create project"));
+}
+
+#[tokio::test]
+async fn skipping_step_two_creates_a_project_with_defaults() {
+    let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
+    let reply = dashboard
+        .post("/onboard", "repo=acme%2Fwidgets&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/?project=widgets"));
+
+    // The name defaults to the repository name and the base to main, with no
+    // models or flag rows.
+    let project = store.project("widgets").unwrap().unwrap();
+    assert_eq!(project.repo, "acme/widgets");
+    assert_eq!(project.base, "main");
+    assert_eq!(project.checks, None);
+    let none = StageModels::default();
+    assert_eq!(store.project_models("widgets", &none).unwrap(), none);
+    assert!(!store.project_auto_merge("widgets", false).unwrap());
+    assert!(!store.project_llm_review("widgets", false).unwrap());
+
+    // It shows on the board, the settings page and the new-job form, and a job
+    // can be created against it, with no restart.
+    assert!(
+        dashboard
+            .get("/?project=widgets")
+            .await
+            .body
+            .contains("widgets")
+    );
+    assert!(dashboard.get("/settings").await.body.contains("widgets"));
+    let created = dashboard.post_job("widgets", "A widget change", &[]).await;
+    assert_eq!(created.status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn step_two_values_are_stored_and_shown_on_the_settings_page() {
+    let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
+    let reply = dashboard
+        .post(
+            "/onboard",
+            "repo=acme%2Fwidgets&name=widgets&base=main&plan=opus&auto_merge=on&llm_review=on&action=create",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+
+    assert_eq!(
+        store
+            .project_models("widgets", &StageModels::default())
+            .unwrap()
+            .plan
+            .as_deref(),
+        Some("opus")
+    );
+    assert!(store.project_auto_merge("widgets", false).unwrap());
+    assert!(store.project_llm_review("widgets", false).unwrap());
+
+    let settings = dashboard.get("/settings").await.body;
+    assert!(settings.contains("value=\"opus\""));
+    assert!(settings.contains("checked"));
+}
+
+#[tokio::test]
+async fn an_optional_checks_command_is_stored() {
+    let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
+    let reply = dashboard
+        .post(
+            "/onboard",
+            "repo=acme%2Fwidgets&checks=just+lint+%26%26+just+test&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        store.project("widgets").unwrap().unwrap().checks.as_deref(),
+        Some("just lint && just test")
+    );
+}
+
+#[tokio::test]
+async fn warnings_do_not_block_creation() {
+    // Admin, an unprotected base, no CI and no branch auto-delete are all
+    // warnings.
+    let github = Arc::new(FakeRepos {
+        repo: Some(RepoInfo {
+            permission: Permission::Admin,
+            allow_squash_merge: true,
+            delete_branch_on_merge: false,
+        }),
+        branch: Some(BranchInfo { protected: false }),
+        ci: false,
+    });
+    let (store, dashboard) = empty_dashboard(github);
+
+    // The check step shows the warnings and still offers step 2.
+    let checked = dashboard
+        .post("/onboard", "repo=acme%2Fwidgets&action=check")
+        .await;
+    assert_eq!(checked.status, StatusCode::OK);
+    assert!(checked.body.contains("Admin"));
+    assert!(checked.body.contains("no CI"));
+    assert!(checked.body.contains("Create project"));
+
+    // Creating anyway works and writes the row.
+    let reply = dashboard
+        .post("/onboard", "repo=acme%2Fwidgets&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert!(store.project("widgets").unwrap().is_some());
+}
+
+/// Posts an onboard create that must be rejected, and asserts the page shows
+/// `needle` and no row was written.
+async fn rejected(github: Arc<dyn RepoChecker>, store: Arc<Store>, form: &str, needle: &str) {
+    let before = store.list_projects().unwrap().len();
+    let dashboard = dashboard_with_github(Arc::clone(&store), github);
+    let reply = dashboard.post("/onboard", form).await;
+    assert_eq!(reply.status, StatusCode::OK, "{needle}: expected a redraw");
+    assert!(
+        reply.body.contains(needle),
+        "{needle:?} missing from the page"
+    );
+    assert_eq!(
+        store.list_projects().unwrap().len(),
+        before,
+        "{needle}: a row was written"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_repo_is_rejected_with_no_row() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    rejected(
+        Arc::new(FakeRepos::fit()),
+        store,
+        "repo=widgets&action=create",
+        "owner/name",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_missing_repo_is_rejected_with_no_row() {
+    let github = Arc::new(FakeRepos {
+        repo: None,
+        ..FakeRepos::fit()
+    });
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    rejected(
+        github,
+        store,
+        "repo=acme%2Fghost&action=create",
+        "does not exist or is not visible",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_missing_base_branch_is_rejected_with_no_row() {
+    let github = Arc::new(FakeRepos {
+        branch: None,
+        ..FakeRepos::fit()
+    });
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    rejected(
+        github,
+        store,
+        "repo=acme%2Fwidgets&base=trunk&action=create",
+        "base branch",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_bot_without_push_is_rejected_with_no_row() {
+    let github = Arc::new(FakeRepos {
+        repo: Some(RepoInfo {
+            permission: Permission::Read,
+            allow_squash_merge: true,
+            delete_branch_on_merge: true,
+        }),
+        ..FakeRepos::fit()
+    });
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    rejected(
+        github,
+        store,
+        "repo=acme%2Fwidgets&action=create",
+        "no push access",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn squash_merge_disabled_is_rejected_with_no_row() {
+    let github = Arc::new(FakeRepos {
+        repo: Some(RepoInfo {
+            permission: Permission::Write,
+            allow_squash_merge: false,
+            delete_branch_on_merge: true,
+        }),
+        ..FakeRepos::fit()
+    });
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    rejected(
+        github,
+        store,
+        "repo=acme%2Fwidgets&action=create",
+        "squash merges",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_duplicate_name_is_rejected_with_no_row() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project("widgets", "acme/old", "main", None)
+        .unwrap();
+    rejected(
+        Arc::new(FakeRepos::fit()),
+        store,
+        "repo=acme%2Fwidgets&name=widgets&action=create",
+        "already exists",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_duplicate_repo_is_rejected_with_no_row() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project("other", "acme/widgets", "main", None)
+        .unwrap();
+    rejected(
+        Arc::new(FakeRepos::fit()),
+        store,
+        "repo=acme%2Fwidgets&name=widgets&action=create",
+        "already onboarded",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_github_call_that_cannot_run_blocks_with_a_message() {
+    // A fake whose calls fail stands in for gh being unreachable.
+    #[derive(Clone)]
+    struct Broken;
+    impl GitHubRepos for Broken {
+        fn repo(
+            &self,
+            _repo: &str,
+        ) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send {
+            std::future::ready(Err("gh api repos/acme/widgets failed: HTTP 500".into()))
+        }
+        fn branch(
+            &self,
+            _repo: &str,
+            _branch: &str,
+        ) -> impl Future<Output = Result<Option<BranchInfo>, String>> + Send {
+            std::future::ready(Err("unreachable".into()))
+        }
+        fn has_ci(&self, _repo: &str) -> impl Future<Output = Result<bool, String>> + Send {
+            std::future::ready(Err("unreachable".into()))
+        }
+    }
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    rejected(
+        Arc::new(Broken),
+        store,
+        "repo=acme%2Fwidgets&action=create",
+        "could not run",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_project_onboarded_through_the_wizard_reaches_the_scheduler() {
+    // A job created against a wizard-onboarded project is picked up like any
+    // other: it starts in the requested stage the scheduler watches.
+    let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
+    dashboard
+        .post("/onboard", "repo=acme%2Fwidgets&action=skip")
+        .await;
+    let reply = dashboard.post_job("widgets", "A widget change", &[]).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let id = job_id(&reply);
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Requested);
 }

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, Scheduler,
-    Store, app, import_tomls, refresh_forever,
+    CurlUsageSource, GhRepos, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects,
+    RepoChecker, Scheduler, Store, app, import_tomls, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -108,12 +108,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!("no Claude token, the plan usage tile is off");
     }
 
+    // The onboarding wizard runs its repository checks as the bot, with the
+    // same `gh` and token the factory uses for pull requests.
+    let github: Arc<dyn RepoChecker> = Arc::new(GhRepos {
+        gh: path_var("FACTORY_GH", "gh"),
+        token: gh_token(),
+    });
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
-    axum::serve(listener, app(store, projects, wake, data_dir, plan_usage))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app(store, projects, wake, data_dir, plan_usage, github),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }
