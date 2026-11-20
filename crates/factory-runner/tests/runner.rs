@@ -3,13 +3,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    AgentResult, Command, EFFORTS, Event, Gates, Job, PlannedPr, PrDescription, Question, Stage,
-    Task,
+    Agent, AgentResult, Command, EFFORTS, Event, Gates, Job, PlannedPr, PrDescription, Question,
+    Stage, Task,
 };
 use factory_runner::{
     Expect, LogLine, McpConfig, McpServerStatus, PlacedFile, ResultMessage, SessionRun, StreamItem,
-    WorkerConfig, WorkerRun, event_from_result, job_prompt, parse_line, place_files, place_images,
-    podman_args, prompt, remove_container, run, show_files, show_images,
+    WorkerConfig, WorkerRun, backend, event_from_result, job_prompt, parse_line, place_files,
+    place_images, podman_args, prompt, remove_container, run, show_files, show_images,
 };
 use serde_json::{Value, json};
 
@@ -44,8 +44,9 @@ fn failure_reason(event: Event) -> String {
 fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
     WorkerRun {
         name: "factory-job-7-run-3".into(),
+        agent: Agent::Claude,
         workspace: dir.join("work"),
-        claude_dir: dir.join("claude"),
+        config_dir: dir.join("claude"),
         session,
         token: "sk-ant-oat01-token".into(),
         expect: Expect::Spec,
@@ -524,9 +525,10 @@ async fn a_missing_podman_binary_fails_the_run() {
 
 #[test]
 fn a_session_resumes_once_claude_code_wrote_its_transcript() {
+    let claude = backend(Agent::Claude).unwrap();
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(
-        SessionRun::for_session(dir.path(), SESSION),
+        claude.session_for(dir.path(), SESSION),
         SessionRun::Start(SESSION.into())
     );
 
@@ -534,13 +536,13 @@ fn a_session_resumes_once_claude_code_wrote_its_transcript() {
     fs::create_dir_all(&project).unwrap();
     fs::write(project.join("another-session.jsonl"), "").unwrap();
     assert_eq!(
-        SessionRun::for_session(dir.path(), SESSION),
+        claude.session_for(dir.path(), SESSION),
         SessionRun::Start(SESSION.into())
     );
 
     fs::write(project.join(format!("{SESSION}.jsonl")), "").unwrap();
     assert_eq!(
-        SessionRun::for_session(dir.path(), SESSION),
+        claude.session_for(dir.path(), SESSION),
         SessionRun::Resume(SESSION.into())
     );
 }

@@ -10,7 +10,7 @@ These decisions were made on 2026-11-19 while brainstorming in the maestro repos
 
 | Topic | Decision |
 | --- | --- |
-| Agent runtime | The Claude Code CLI in rootless podman worker containers. Claude Managed Agents was considered and rejected in favor of local Claude Code on our own hardware. |
+| Agent runtime | Agents run in rootless podman worker containers. Everything agent-specific sits behind one agent interface in `factory-runner`, the `AgentBackend` trait: the command after the image, the credential and config-directory environment variable names, the session-resume check, and the parser that turns the agent's stdout into the generic items the worker consumes. `worker.rs` keeps the generic `podman run` flags and names no one agent. Claude Code is the first agent and the only one that runs; see "Running Claude Code in a worker" for its implementation. Claude Managed Agents was considered and rejected in favor of local Claude Code on our own hardware. |
 | Host | `moon.local` (`ssh moon@moon.local`): Ubuntu 26.04, x86_64, 8 cores, 7.2 GB RAM, 74 GB free disk, systemd linger on for user `moon`. Tailscale is up at `100.77.68.75`. |
 | Factory process | A Rust binary in its own container, run as a Quadlet systemd user service. It starts worker containers through the user's `podman.socket`. |
 | Factory stack | axum, SQLite, server-rendered pages with htmx, and server-sent events for live logs. No frontend build step. |
@@ -117,6 +117,8 @@ requested → clarifying → spec ✋ → plan ✋ → implementing → verifyin
 The state machine is pure logic with no I/O, so it can be tested without podman or GitHub. Every step must be safe to retry, because a container or the factory can die in the middle of one.
 
 ## Running Claude Code in a worker
+
+This is the Claude agent's implementation of the `AgentBackend` interface, see "Agent runtime". It holds every Claude-specific detail below: the `claude -p` command line, the `CLAUDE_CODE_OAUTH_TOKEN` credential, the `CLAUDE_CONFIG_DIR` config directory, the session-resume check, and the stream-json parser.
 
 - One `claude -p` run per stage, with `--output-format stream-json` for the live log. The factory picks the session's UUID and passes it with `--session-id` on the first run, so it knows the ID even if it dies during the run. Later runs pass `--resume <session-id>`.
 - **Fresh sessions.** The clarify, spec, plan and implement runs each start their own session, one for clarifying, one for the spec, one for the plan and one per planned pull request. Each prompt is self-contained, because the session has seen none of the earlier stages. The job stores the request, the answers, the approved spec and the plan for this. Only a gate revision, a check fix, a CI fix, a review fix or a rebase resumes the session of its own stage. Each stage can then use its own model, because no resumed session switches models. A job created before this rule has no stored answers and keeps one planning session for clarifying, spec and plan, so its spec and plan runs resume it with the short prompts.

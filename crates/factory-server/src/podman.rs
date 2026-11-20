@@ -2,10 +2,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_core::Event;
+use factory_core::{Agent, Event};
 use factory_runner::{
     BranchSummary, Git, GitHub, Observation, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
-    observe, place_files, place_images, remove_container, run, run_checks, show_files, show_images,
+    backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
+    show_images,
 };
 
 use crate::scheduler::{
@@ -111,12 +112,14 @@ impl Executor for PodmanExecutor {
         let Some(token) = self.token.resolve() else {
             return failed("no Claude token is set".into());
         };
+        let agent = Agent::Claude;
+        let backend = backend(agent).expect("the run's agent has a worker backend");
         let config = self.worker_config(settings);
         let job_dir = self.job_dir(request.job_id);
         let workspace = job_dir.join("work");
-        let claude_dir = job_dir.join("claude");
-        if let Err(err) = fs::create_dir_all(&claude_dir) {
-            return failed(format!("could not create {}: {err}", claude_dir.display()));
+        let config_dir = job_dir.join(backend.host_config_dir());
+        if let Err(err) = fs::create_dir_all(&config_dir) {
+            return failed(format!("could not create {}: {err}", config_dir.display()));
         }
         if let Err(err) = self
             .git
@@ -135,7 +138,7 @@ impl Executor for PodmanExecutor {
         if let Err(err) = remove_container(&config, &name).await {
             tracing::warn!("removing {name}: {err}");
         }
-        let session = SessionRun::for_session(&claude_dir, &request.session_id);
+        let session = backend.session_for(&config_dir, &request.session_id);
         let mut prompt = request.prompt;
         if matches!(session, SessionRun::Start(_)) {
             match place_images(&workspace, &job_images(&job_dir)) {
@@ -153,9 +156,10 @@ impl Executor for PodmanExecutor {
         }
         let worker = WorkerRun {
             name,
+            agent,
             session,
             workspace,
-            claude_dir,
+            config_dir,
             token,
             expect: request.expect,
             prompt,
