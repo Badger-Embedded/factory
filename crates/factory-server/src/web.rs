@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::pages;
-use crate::projects::{Projects, StageModels};
+use crate::projects::{Project, Projects, ProjectsError, StageModels};
 use crate::settings::Settings;
 use crate::store::{JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
@@ -110,6 +110,12 @@ impl From<StoreError> for AppError {
     }
 }
 
+impl From<ProjectsError> for AppError {
+    fn from(err: ProjectsError) -> Self {
+        AppError::Io(format!("cannot read projects: {err}"))
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -153,21 +159,10 @@ struct IndexQuery {
     project: Option<String>,
 }
 
-/// The project's auto-merge default from its project file, false when the
-/// project is unknown. A saved row in `project_settings` replaces it.
-fn toml_auto_merge(state: &AppState, project: &str) -> bool {
-    state.projects.get(project).is_some_and(|p| p.auto_merge)
-}
-
-/// The project's LLM-review default from its project file, false when the
-/// project is unknown. A saved row in `project_settings` replaces it.
-fn toml_llm_review(state: &AppState, project: &str) -> bool {
-    state.projects.get(project).is_some_and(|p| p.llm_review)
-}
-
 /// The store data the board and its fragments render from. Loading it in one
 /// place keeps a fragment and the full page on the same data.
 struct BoardData {
+    names: Vec<String>,
     selected: Option<String>,
     jobs: Vec<JobRow>,
     costs: HashMap<i64, f64>,
@@ -190,25 +185,28 @@ impl BoardData {
 }
 
 fn load_board(state: &AppState, project: Option<String>) -> Result<BoardData, AppError> {
+    let names = state.projects.names()?;
     let selected = match project {
-        Some(name) if state.projects.get(&name).is_none() => {
+        Some(name) if !names.iter().any(|known| known == &name) => {
             return Err(AppError::BadRequest(format!("unknown project {name:?}")));
         }
         Some(name) => Some(name),
-        None => state.projects.names().next().map(str::to_owned),
+        None => names.first().cloned(),
     };
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
     let (totals, auto_merge) = match &selected {
-        Some(name) => (
-            state.store.project_totals(name)?,
-            state
-                .store
-                .project_auto_merge(name, toml_auto_merge(state, name))?,
-        ),
+        Some(name) => {
+            let default = state.projects.lookup(name)?.is_some_and(|p| p.auto_merge);
+            (
+                state.store.project_totals(name)?,
+                state.store.project_auto_merge(name, default)?,
+            )
+        }
         None => (ProjectTotals::default(), false),
     };
     Ok(BoardData {
+        names,
         selected,
         jobs,
         costs,
@@ -226,7 +224,7 @@ async fn index(
     let plan_usage = state.plan_usage.visible(now_secs());
     Ok(pages::index(
         &user(&headers),
-        &state.projects,
+        &data.names,
         data.selected.as_deref(),
         &data.jobs,
         &data.costs,
@@ -372,7 +370,7 @@ async fn create_job(
         }
     }
     let project = project.unwrap_or_default();
-    if state.projects.get(&project).is_none() {
+    if state.projects.lookup(&project)?.is_none() {
         return Err(AppError::BadRequest(format!("unknown project {project:?}")));
     }
     let request = request.unwrap_or_default();
@@ -414,6 +412,7 @@ fn save_images(state: &AppState, id: i64, uploads: &[Upload]) -> Result<(), AppE
 /// place so the fragment a poll swaps in cannot disagree with the page.
 struct JobData {
     row: JobRow,
+    project: Option<Project>,
     settings: Settings,
     logs: Vec<crate::store::LogEntry>,
     cost_usd: f64,
@@ -423,20 +422,22 @@ struct JobData {
 
 fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
     let row = state.store.get(id)?;
+    let project = state.projects.lookup(&row.project)?;
     let settings = state.store.settings()?;
     let logs = state.store.logs(id, LOG_LINES)?;
     let cost_usd = state.store.cost_usd(id)?;
-    let defaults = state
-        .projects
-        .get(&row.project)
+    let defaults = project
+        .as_ref()
         .map(|project| project.models.clone())
         .unwrap_or_default();
     let models = state.store.project_models(&row.project, &defaults)?;
+    let default_auto_merge = project.as_ref().is_some_and(|p| p.auto_merge);
     let auto_merge = state
         .store
-        .project_auto_merge(&row.project, toml_auto_merge(state, &row.project))?;
+        .project_auto_merge(&row.project, default_auto_merge)?;
     Ok(JobData {
         row,
+        project,
         settings,
         logs,
         cost_usd,
@@ -451,12 +452,11 @@ async fn show_job(
     Path(id): Path<i64>,
 ) -> Result<Markup, AppError> {
     let data = load_job(&state, id)?;
-    let project = state.projects.get(&data.row.project);
     let images = state.store.images(id)?;
     Ok(pages::job(
         &user(&headers),
         &data.row,
-        project,
+        data.project.as_ref(),
         &data.settings,
         &data.logs,
         &images,
@@ -474,10 +474,9 @@ async fn job_fragment(
     Path(id): Path<i64>,
 ) -> Result<Markup, AppError> {
     let data = load_job(&state, id)?;
-    let project = state.projects.get(&data.row.project);
     Ok(pages::job_fragment(
         &data.row,
-        project,
+        data.project.as_ref(),
         &data.settings,
         &data.logs,
         data.cost_usd,
@@ -544,13 +543,7 @@ async fn approve(
     Form(form): Form<ApproveForm>,
 ) -> Result<Redirect, AppError> {
     let redirect = apply(&state, id, Event::Approve)?;
-    match form
-        .project
-        .filter(|name| state.projects.get(name).is_some())
-    {
-        Some(name) => Ok(Redirect::to(&format!("/?project={}", query_escape(&name)))),
-        None => Ok(redirect),
-    }
+    board_redirect(&state, form.project, redirect)
 }
 
 async fn retry(
@@ -562,12 +555,24 @@ async fn retry(
     state
         .store
         .append_factory_log(id, "Retried the job from the dashboard.")?;
-    match form
-        .project
-        .filter(|name| state.projects.get(name).is_some())
-    {
+    board_redirect(&state, form.project, redirect)
+}
+
+/// Redirects to the project's board when the form names a known project, as
+/// the board's own approve and retry buttons do. Otherwise it keeps the job
+/// page redirect.
+fn board_redirect(
+    state: &AppState,
+    project: Option<String>,
+    fallback: Redirect,
+) -> Result<Redirect, AppError> {
+    let known = match project {
+        Some(name) => state.projects.lookup(&name)?.is_some().then_some(name),
+        None => None,
+    };
+    match known {
         Some(name) => Ok(Redirect::to(&format!("/?project={}", query_escape(&name)))),
-        None => Ok(redirect),
+        None => Ok(fallback),
     }
 }
 
@@ -621,23 +626,13 @@ fn settings_page(
     let settings = state.store.settings()?;
     let projects = state
         .projects
-        .names()
-        .map(|name| {
-            let defaults = state
-                .projects
-                .get(name)
-                .map(|project| project.models.clone())
-                .unwrap_or_default();
-            Ok((
-                name.to_owned(),
-                state.store.project_models(name, &defaults)?,
-                state
-                    .store
-                    .project_auto_merge(name, toml_auto_merge(state, name))?,
-                state
-                    .store
-                    .project_llm_review(name, toml_llm_review(state, name))?,
-            ))
+        .list()?
+        .into_iter()
+        .map(|(name, project)| {
+            let models = state.store.project_models(&name, &project.models)?;
+            let auto_merge = state.store.project_auto_merge(&name, project.auto_merge)?;
+            let llm_review = state.store.project_llm_review(&name, project.llm_review)?;
+            Ok((name, models, auto_merge, llm_review))
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
     Ok(pages::settings(
@@ -666,7 +661,7 @@ async fn save_project_models(
     Path(name): Path<String>,
     Form(form): Form<ModelsForm>,
 ) -> Result<Markup, AppError> {
-    if state.projects.get(&name).is_none() {
+    if state.projects.lookup(&name)?.is_none() {
         return Err(AppError::UnknownProject(name));
     }
     let model = |value: String| Some(value.trim().to_owned()).filter(|value| !value.is_empty());

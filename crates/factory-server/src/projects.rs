@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -49,8 +50,19 @@ pub struct Project {
     pub llm_review: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Projects(BTreeMap<String, Project>);
+/// A handle that resolves project metadata on each `lookup` or `list`, rather
+/// than holding a snapshot taken once at startup. A project file edited while
+/// the service runs takes effect on the next call.
+#[derive(Debug, Clone)]
+pub struct Projects(Source);
+
+#[derive(Debug, Clone)]
+enum Source {
+    /// Reads `<dir>/<name>/project.toml` on each call.
+    Dir(PathBuf),
+    /// Holds the projects in memory. Used by tests.
+    Memory(Arc<BTreeMap<String, Project>>),
+}
 
 #[derive(Debug)]
 pub enum ProjectsError {
@@ -75,47 +87,96 @@ impl fmt::Display for ProjectsError {
 
 impl std::error::Error for ProjectsError {}
 
+impl Default for Projects {
+    fn default() -> Self {
+        Projects(Source::Memory(Arc::new(BTreeMap::new())))
+    }
+}
+
 impl FromIterator<(String, Project)> for Projects {
     fn from_iter<I: IntoIterator<Item = (String, Project)>>(iter: I) -> Self {
-        Projects(iter.into_iter().collect())
+        Projects(Source::Memory(Arc::new(iter.into_iter().collect())))
     }
 }
 
 impl Projects {
-    /// Reads every `<dir>/<name>/project.toml`. A subdirectory without a
-    /// `project.toml` is skipped.
+    /// A handle backed by `<dir>/<name>/project.toml`. It reads the files on
+    /// each call, not at construction, so the next lookup sees an edit.
+    #[must_use]
+    pub fn from_dir(dir: PathBuf) -> Self {
+        Projects(Source::Dir(dir))
+    }
+
+    /// The project named `name`, or `None` when none is onboarded under it.
     ///
     /// # Errors
     ///
-    /// Fails when `dir` cannot be read or a `project.toml` does not parse.
-    pub fn load(dir: &Path) -> Result<Self, ProjectsError> {
-        let read_err = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source| ProjectsError::Read { path, source }
-        };
-        let mut projects = BTreeMap::new();
-        for entry in fs::read_dir(dir).map_err(read_err(dir))? {
-            let entry = entry.map_err(read_err(dir))?;
-            let path = entry.path().join("project.toml");
-            if !path.is_file() {
-                continue;
-            }
-            let text = fs::read_to_string(&path).map_err(read_err(&path))?;
-            let project = toml::from_str(&text).map_err(|source| ProjectsError::Parse {
-                path: path.clone(),
+    /// Fails when the backing store cannot be read or a `project.toml` does
+    /// not parse.
+    pub fn lookup(&self, name: &str) -> Result<Option<Project>, ProjectsError> {
+        match &self.0 {
+            Source::Memory(map) => Ok(map.get(name).cloned()),
+            Source::Dir(dir) => read_project(&dir.join(name).join("project.toml")),
+        }
+    }
+
+    /// Every project with its name, in name order.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the backing store cannot be read or a `project.toml` does
+    /// not parse.
+    pub fn list(&self) -> Result<Vec<(String, Project)>, ProjectsError> {
+        match &self.0 {
+            Source::Memory(map) => Ok(map
+                .iter()
+                .map(|(name, project)| (name.clone(), project.clone()))
+                .collect()),
+            Source::Dir(dir) => read_dir(dir),
+        }
+    }
+
+    /// Every project name, in name order.
+    ///
+    /// # Errors
+    ///
+    /// As [`Projects::list`].
+    pub fn names(&self) -> Result<Vec<String>, ProjectsError> {
+        Ok(self.list()?.into_iter().map(|(name, _)| name).collect())
+    }
+}
+
+/// Reads one `project.toml`. A missing file is `None`, so a subdirectory
+/// without one is not a project.
+fn read_project(path: &Path) -> Result<Option<Project>, ProjectsError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ProjectsError::Read {
+                path: path.to_path_buf(),
                 source,
-            })?;
+            });
+        }
+    };
+    let project = toml::from_str(&text).map_err(|source| ProjectsError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(Some(project))
+}
+
+fn read_dir(dir: &Path) -> Result<Vec<(String, Project)>, ProjectsError> {
+    let read_err = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| ProjectsError::Read { path, source }
+    };
+    let mut projects = BTreeMap::new();
+    for entry in fs::read_dir(dir).map_err(read_err(dir))? {
+        let entry = entry.map_err(read_err(dir))?;
+        if let Some(project) = read_project(&entry.path().join("project.toml"))? {
             projects.insert(entry.file_name().to_string_lossy().into_owned(), project);
         }
-        Ok(Projects(projects))
     }
-
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<&Project> {
-        self.0.get(name)
-    }
-
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.0.keys().map(String::as_str)
-    }
+    Ok(projects.into_iter().collect())
 }

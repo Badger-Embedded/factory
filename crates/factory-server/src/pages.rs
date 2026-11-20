@@ -7,8 +7,8 @@ use factory_core::{
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::cost::{format_cost, merge_fraction};
+use crate::projects::Project;
 use crate::projects::StageModels;
-use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry, ProjectTotals};
 
@@ -118,7 +118,7 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
 )]
 pub fn index(
     user: &str,
-    projects: &Projects,
+    project_names: &[String],
     selected: Option<&str>,
     jobs: &[JobRow],
     costs: &HashMap<i64, f64>,
@@ -130,7 +130,10 @@ pub fn index(
         .iter()
         .filter(|row| Some(row.project.as_str()) == selected)
         .collect();
-    let nav = selected.map_or_else(|| html! {}, |selected| project_selector(projects, selected));
+    let nav = selected.map_or_else(
+        || html! {},
+        |selected| project_selector(project_names, selected),
+    );
     page(
         user,
         "Jobs",
@@ -353,13 +356,13 @@ fn count_or_dash(count: i64) -> String {
     }
 }
 
-fn project_selector(projects: &Projects, selected: &str) -> Markup {
+fn project_selector(names: &[String], selected: &str) -> Markup {
     html! {
         form.project-picker method="get" action="/" {
             label.visually-hidden for="project" { "Project" }
             select #project name="project" {
-                @for name in projects.names() {
-                    option selected[name == selected] { (name) }
+                @for name in names {
+                    option selected[name.as_str() == selected] { (name) }
                 }
             }
             noscript { button { "Go" } }

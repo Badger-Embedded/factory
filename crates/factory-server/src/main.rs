@@ -51,11 +51,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listen = env::var("FACTORY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let data_dir = path_var("FACTORY_DATA", "data");
     let db = env::var_os("FACTORY_DB").map_or_else(|| data_dir.join("factory.db"), PathBuf::from);
-    let projects = Arc::new(Projects::load(&path_var("FACTORY_PROJECTS", "projects"))?);
+    let projects = Arc::new(Projects::from_dir(path_var("FACTORY_PROJECTS", "projects")));
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(Store::open(&db)?);
-    store.migrate_global_auto_merge(&projects.names().collect::<Vec<_>>())?;
+    let names = projects.names()?;
+    store.migrate_global_auto_merge(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
     let wake = Arc::new(Notify::new());
 
     if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {

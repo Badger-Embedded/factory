@@ -19,6 +19,9 @@ struct Dashboard {
     router: Router,
     data: tempfile::TempDir,
     usage: Arc<PlanUsageCache>,
+    /// The project files the router reads on each request. Held so the
+    /// directory outlives the dashboard.
+    _projects: tempfile::TempDir,
 }
 
 struct Reply {
@@ -47,7 +50,7 @@ fn dashboard_for(repo: &str) -> Dashboard {
         "maestro",
         &format!("repo = \"{repo}\"\nbase = \"main\"\n"),
     );
-    let projects = Arc::new(Projects::load(dir.path()).unwrap());
+    let projects = Arc::new(Projects::from_dir(dir.path().to_owned()));
     let store = Arc::new(Store::open_in_memory().unwrap());
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
@@ -62,6 +65,7 @@ fn dashboard_for(repo: &str) -> Dashboard {
         store,
         data,
         usage,
+        _projects: dir,
     }
 }
 
@@ -534,9 +538,9 @@ fn a_rejected_event_is_not_saved() {
 #[test]
 fn the_repository_project_files_load() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../projects");
-    let projects = Projects::load(&dir).unwrap();
+    let projects = Projects::from_dir(dir);
     assert_eq!(
-        projects.get("maestro").unwrap().repo,
+        projects.lookup("maestro").unwrap().unwrap().repo,
         "Badger-Embedded/maestro"
     );
 }
@@ -549,7 +553,9 @@ fn a_project_file_with_an_unknown_key_fails_to_load() {
         "x",
         "repo = \"a/b\"\nbase = \"main\"\nbranch = \"dev\"\n",
     );
-    let err = Projects::load(dir.path()).unwrap_err();
+    let err = Projects::from_dir(dir.path().to_owned())
+        .lookup("x")
+        .unwrap_err();
     assert!(err.to_string().contains("project.toml"));
 }
 
@@ -1033,6 +1039,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         router,
         data: tempfile::tempdir().unwrap(),
         usage: Arc::new(PlanUsageCache::new()),
+        _projects: tempfile::tempdir().unwrap(),
     }
     .get(&format!("/jobs/{id}"))
     .await;
@@ -1065,7 +1072,7 @@ fn two_projects() -> Dashboard {
     for name in ["maestro", "tool"] {
         write_project(dir.path(), name, "repo = \"o/r\"\nbase = \"main\"\n");
     }
-    let projects = Arc::new(Projects::load(dir.path()).unwrap());
+    let projects = Arc::new(Projects::from_dir(dir.path().to_owned()));
     let store = Arc::new(Store::open_in_memory().unwrap());
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
@@ -1080,6 +1087,7 @@ fn two_projects() -> Dashboard {
         store,
         data,
         usage,
+        _projects: dir,
     }
 }
 
@@ -2214,8 +2222,8 @@ fn a_project_file_sets_default_models_and_saved_models_win() {
         "x",
         "repo = \"a/b\"\nbase = \"main\"\n[models]\nclarify = \"haiku\"\nplan = \"opus\"\n",
     );
-    let projects = Projects::load(dir.path()).unwrap();
-    let defaults = projects.get("x").unwrap().models.clone();
+    let projects = Projects::from_dir(dir.path().to_owned());
+    let defaults = projects.lookup("x").unwrap().unwrap().models;
     assert_eq!(defaults.clarify.as_deref(), Some("haiku"));
     assert_eq!(defaults.plan.as_deref(), Some("opus"));
     assert_eq!(defaults.spec, None);
@@ -2257,8 +2265,8 @@ fn a_project_file_sets_a_default_review_model() {
         "x",
         "repo = \"a/b\"\nbase = \"main\"\n[models]\nreview = \"opus\"\n",
     );
-    let projects = Projects::load(dir.path()).unwrap();
-    let defaults = projects.get("x").unwrap().models.clone();
+    let projects = Projects::from_dir(dir.path().to_owned());
+    let defaults = projects.lookup("x").unwrap().unwrap().models;
     assert_eq!(defaults.review.as_deref(), Some("opus"));
 
     let store = Store::open_in_memory().unwrap();
@@ -2333,8 +2341,8 @@ fn a_project_file_sets_the_auto_merge_default() {
         "x",
         "repo = \"a/b\"\nbase = \"main\"\nauto_merge = true\n",
     );
-    let projects = Projects::load(dir.path()).unwrap();
-    assert!(projects.get("x").unwrap().auto_merge);
+    let projects = Projects::from_dir(dir.path().to_owned());
+    assert!(projects.lookup("x").unwrap().unwrap().auto_merge);
 
     let store = Store::open_in_memory().unwrap();
     assert!(store.project_auto_merge("x", true).unwrap());
@@ -2384,8 +2392,8 @@ fn a_project_file_sets_the_llm_review_default() {
         "x",
         "repo = \"a/b\"\nbase = \"main\"\nllm_review = true\n",
     );
-    let projects = Projects::load(dir.path()).unwrap();
-    assert!(projects.get("x").unwrap().llm_review);
+    let projects = Projects::from_dir(dir.path().to_owned());
+    assert!(projects.lookup("x").unwrap().unwrap().llm_review);
 
     let store = Store::open_in_memory().unwrap();
     assert!(store.project_llm_review("x", true).unwrap());
