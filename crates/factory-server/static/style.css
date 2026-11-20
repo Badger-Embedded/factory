@@ -175,7 +175,38 @@ h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
 
 /* The board: the usage meters, the request bar, the sections and the
    totals line, in one column. */
-.plan-usage { margin-bottom: var(--space-16); }
+.status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-12) var(--space-24);
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: var(--space-16);
+}
+.status-row > * { min-width: 0; }
+.worker-slots { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-8); }
+.worker {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: var(--space-2) var(--space-12);
+  align-items: baseline;
+  min-width: 12rem;
+  max-width: 100%;
+  padding: var(--space-8) var(--space-12);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  font-size: var(--font-size-sm);
+}
+.worker.busy { border-color: var(--agent); box-shadow: inset 3px 0 0 var(--agent); }
+.worker.idle { border-style: dashed; background: transparent; color: var(--muted); }
+.worker-name { font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.worker-time { color: var(--muted); font-size: var(--font-size-xs); text-align: right; font-variant-numeric: tabular-nums; }
+.worker-job { grid-column: 1 / -1; grid-row: 2; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); text-decoration: none; }
+.worker.idle .worker-job { color: var(--muted); }
+a.worker-job:hover { color: var(--accent); }
+.worker-time { grid-column: 2; grid-row: 1; }
+.plan-usage { margin: 0; }
 .plan-usage h2 { margin: 0 0 var(--space-6); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
 .usage-windows { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-6) var(--space-24); }
 .usage-window { display: flex; align-items: center; gap: var(--space-8); font-size: var(--font-size-sm); }

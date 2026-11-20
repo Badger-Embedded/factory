@@ -12,7 +12,8 @@ use factory_core::{
 };
 use factory_server::{
     BranchInfo, GitHubRepos, Permission, PlanUsageCache, Projects, Protection, RepoChecker,
-    RepoInfo, StageEfforts, StageModels, Store, StoreError, USER_HEADER, app,
+    RepoInfo, Settings, StageEfforts, StageModels, Store, StoreError, USER_HEADER, WorkerSlots,
+    app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -67,6 +68,7 @@ struct Dashboard {
     router: Router,
     data: tempfile::TempDir,
     usage: Arc<PlanUsageCache>,
+    slots: Arc<WorkerSlots>,
 }
 
 struct Reply {
@@ -107,6 +109,7 @@ fn dashboard_with_github(store: Arc<Store>, github: Arc<dyn RepoChecker>) -> Das
     let projects = Arc::new(Projects::from_store(Arc::clone(&store)));
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
+    let slots = Arc::new(WorkerSlots::new());
     Dashboard {
         router: app(
             store.clone(),
@@ -115,10 +118,12 @@ fn dashboard_with_github(store: Arc<Store>, github: Arc<dyn RepoChecker>) -> Das
             data.path().to_owned(),
             Arc::clone(&usage),
             github,
+            Arc::clone(&slots),
         ),
         store,
         data,
         usage,
+        slots,
     }
 }
 
@@ -1372,12 +1377,14 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         dashboard.data.path().to_owned(),
         Arc::new(PlanUsageCache::new()),
         Arc::new(FakeRepos::fit()),
+        Arc::new(WorkerSlots::new()),
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
         router,
         data: tempfile::tempdir().unwrap(),
         usage: Arc::new(PlanUsageCache::new()),
+        slots: Arc::new(WorkerSlots::new()),
     }
     .get(&format!("/jobs/{id}"))
     .await;
@@ -3708,13 +3715,104 @@ async fn each_board_region_polls_its_fragment_every_five_seconds() {
         "/fragments/plan-usage",
         "/fragments/stats?project=maestro",
         "/fragments/board?project=maestro",
+        "/fragments/workers?project=maestro",
     ] {
         assert!(body.contains(&format!("hx-get=\"{url}\"")), "{url}");
     }
-    // One trigger per region: the usage meters, the totals line and the job
-    // rows.
-    assert_eq!(body.matches("hx-trigger=\"every 5s\"").count(), 3);
+    // One trigger per region: the worker tiles, the usage meters, the job
+    // rows and the totals line.
+    assert_eq!(body.matches("hx-trigger=\"every 5s\"").count(), 4);
     assert!(!body.contains("/fragments/lanes"));
+}
+
+/// The worker tiles on a page, from the section that holds them to its end.
+fn worker_tiles(body: &str) -> &str {
+    let start = body.find("<section class=\"workers\"").unwrap();
+    let rest = &body[start..];
+    &rest[..rest.find("</section>").unwrap()]
+}
+
+#[tokio::test]
+async fn the_board_shows_one_idle_tile_per_worker_slot() {
+    let body = dashboard().get("/").await.body;
+    let tiles = worker_tiles(&body);
+    assert!(tiles.contains("hx-get=\"/fragments/workers?project=maestro\""));
+    assert_eq!(tiles.matches("<li class=\"worker idle\">").count(), 2);
+    assert!(tiles.contains("Worker 1"));
+    assert!(tiles.contains("Worker 2"));
+    assert!(!tiles.contains("Worker 3"));
+}
+
+#[tokio::test]
+async fn the_tile_count_follows_the_worker_limit_setting() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_settings(&Settings {
+            max_workers: 3,
+            ..Settings::default()
+        })
+        .unwrap();
+    let body = dashboard.get("/").await.body;
+    assert_eq!(
+        worker_tiles(&body).matches("class=\"worker idle\"").count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn a_busy_tile_names_the_job_its_stage_and_how_long_it_has_run() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard.slots.take(id, now() - 34 * 60 - 5);
+
+    let body = dashboard.get("/").await.body;
+    let tiles = worker_tiles(&body);
+    assert_eq!(tiles.matches("class=\"worker busy\"").count(), 1);
+    assert_eq!(tiles.matches("class=\"worker idle\"").count(), 1);
+    assert!(tiles.contains(&format!("href=\"/jobs/{id}\"")));
+    assert!(tiles.contains(&format!("#{id} · clarifying")));
+    assert!(tiles.contains("34 min"));
+    // Worker 1 is busy and comes before the idle Worker 2.
+    assert!(tiles.find("worker busy").unwrap() < tiles.find("worker idle").unwrap());
+}
+
+#[tokio::test]
+async fn a_long_run_shows_hours_and_a_new_one_under_a_minute() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    dashboard.slots.take(first, now() - (2 * 60 + 5) * 60);
+    dashboard.slots.take(second, now());
+    let tiles = dashboard
+        .get("/fragments/workers?project=maestro")
+        .await
+        .body;
+    assert!(tiles.contains("2 h 5 min"));
+    assert!(tiles.contains("under a minute"));
+}
+
+#[tokio::test]
+async fn a_tile_for_another_projects_job_names_that_project() {
+    let dashboard = two_projects();
+    dashboard.post_job("tool", "Tool change", &[]).await;
+    dashboard.slots.take(1, now());
+
+    let tool = dashboard.get("/?project=tool").await.body;
+    assert!(worker_tiles(&tool).contains("#1 · requested"));
+    let maestro = dashboard.get("/?project=maestro").await.body;
+    assert!(worker_tiles(&maestro).contains("#1 tool · requested"));
+}
+
+#[tokio::test]
+async fn the_workers_fragment_is_only_the_tiles_and_keeps_polling() {
+    let dashboard = dashboard();
+    let reply = dashboard.get("/fragments/workers?project=maestro").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.starts_with("<section class=\"workers\""));
+    assert!(reply.body.contains("hx-trigger=\"every 5s\""));
+    assert!(!reply.body.contains("action=\"/jobs\""));
 }
 
 #[tokio::test]
@@ -3733,6 +3831,8 @@ async fn the_new_request_form_is_outside_every_swapped_region() {
     for id in ["id=\"stats\"", "id=\"board\""] {
         assert!(body.find(id).unwrap() > form, "{id} is not after the form");
     }
+    // The worker tiles sit above the form and do not hold it.
+    assert!(!worker_tiles(&body).contains("<form"));
     // The plan usage wrapper above the form holds the tile, not the form.
     assert!(!usage_wrapper(&body).contains("<form"));
 }

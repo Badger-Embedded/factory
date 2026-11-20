@@ -13,6 +13,7 @@ mod store;
 mod timeline;
 mod usage;
 mod web;
+mod workers;
 
 pub use cost::{format_cost, merge_fraction};
 pub use github::{
@@ -37,3 +38,4 @@ pub use usage::{
     CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, UsageSource, refresh_forever, refresh_once,
 };
 pub use web::{MAX_IMAGE_BYTES, MAX_IMAGES, USER_HEADER, app};
+pub use workers::{Slot, WorkerSlots};

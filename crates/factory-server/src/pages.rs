@@ -15,6 +15,7 @@ use crate::projects::{StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{JobEvent, JobRow, LogEntry, ProjectTotals};
 use crate::timeline::timeline;
+use crate::workers::Slot;
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
 /// htmx 2.0.4, vendored so the dashboard loads no script from a CDN. The
@@ -98,6 +99,7 @@ pub fn index(
     totals: ProjectTotals,
     plan_usage: Option<&PlanUsage>,
     auto_merge: bool,
+    workers: &Workers,
 ) -> Markup {
     let all: Vec<&JobRow> = jobs
         .iter()
@@ -112,12 +114,16 @@ pub fn index(
         "Jobs",
         &nav,
         &html! {
-            (plan_usage_region(plan_usage))
             @if let Some(selected) = selected {
+                div.status-row {
+                    (self::workers(workers, jobs, selected))
+                    (plan_usage_region(plan_usage))
+                }
                 (composer(selected))
                 (board(&all, costs, auto_merge, selected))
                 (stats(totals, selected))
             } @else {
+                (plan_usage_region(plan_usage))
                 div.card {
                     p.empty { "No projects are configured." }
                     p { a.nav href="/onboard" { "Onboard a project" } }
@@ -125,6 +131,78 @@ pub fn index(
             }
         },
     )
+}
+
+/// The worker slots at render time: the limit from the settings, the slots
+/// the scheduler filled, and the time to measure how long each job has held
+/// its slot.
+pub struct Workers {
+    pub limit: usize,
+    pub busy: Vec<Slot>,
+    pub now: i64,
+}
+
+/// One tile per worker slot. A busy tile names the job, its stage and how
+/// long it has held the slot. Slots are account-wide, so a job of another
+/// project shows that project's name. A job waiting for you holds no slot,
+/// so a full row of busy tiles is why a new job has not started.
+pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Markup {
+    let count = workers.limit.max(
+        workers
+            .busy
+            .iter()
+            .map(|slot| slot.number)
+            .max()
+            .unwrap_or(0),
+    );
+    html! {
+        section.workers #workers hx-get=(fragment_url("workers", project))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
+            h2.visually-hidden { "Workers" }
+            ul.worker-slots {
+                @for number in 1..=count {
+                    @let slot = workers.busy.iter().find(|slot| slot.number == number);
+                    @let row = slot.and_then(|slot| jobs.iter().find(|row| row.id == slot.job_id));
+                    @match (slot, row) {
+                        (Some(slot), Some(row)) => {
+                            li.worker.busy {
+                                span.worker-name { "Worker " (number) }
+                                a.worker-job href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
+                                    "#" (row.id)
+                                    @if row.project != project { " " (row.project) }
+                                    " · " (stage_label(&row.job))
+                                }
+                                span.worker-time { (held_for(workers.now - slot.since)) }
+                            }
+                        }
+                        (Some(slot), None) => {
+                            li.worker.busy {
+                                span.worker-name { "Worker " (number) }
+                                span.worker-job { "#" (slot.job_id) }
+                                span.worker-time { (held_for(workers.now - slot.since)) }
+                            }
+                        }
+                        (None, _) => {
+                            li.worker.idle {
+                                span.worker-name { "Worker " (number) }
+                                span.worker-job { "idle" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `seconds` as "under a minute", "12 min" or "2 h 5 min".
+fn held_for(seconds: i64) -> String {
+    let minutes = seconds.max(0) / 60;
+    match minutes {
+        0 => "under a minute".into(),
+        1..60 => format!("{minutes} min"),
+        _ => format!("{} h {} min", minutes / 60, minutes % 60),
+    }
 }
 
 /// The new-request form as a one-line bar. It grows, and shows the image
