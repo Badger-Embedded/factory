@@ -1538,7 +1538,7 @@ async fn each_lane_lists_the_newest_job_first() {
 }
 
 #[tokio::test]
-async fn cards_keep_the_content_of_the_old_rows() {
+async fn cards_show_the_id_title_badge_stage_and_requester() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     let body = dashboard.get("/").await.body;
@@ -1546,7 +1546,8 @@ async fn cards_keep_the_content_of_the_old_rows() {
     assert!(lane.contains(&format!("#{id}")));
     assert!(lane.contains("Add a reboot button</a>"));
     assert!(lane.contains("class=\"badge factory\">queued"));
-    assert!(lane.contains("maestro · "));
+    assert!(lane.contains("<span>requested</span>"));
+    assert!(!lane.contains("maestro"));
     assert!(lane.contains("alice@example.com"));
 }
 
@@ -1759,4 +1760,52 @@ async fn the_stats_strip_follows_the_selected_project() {
     assert!(tool.contains(&tile("–", "Jobs created")));
     let maestro = dashboard.get("/?project=maestro").await.body;
     assert!(maestro.contains(&tile("1", "Jobs created")));
+}
+
+#[tokio::test]
+async fn a_board_card_shows_the_job_cost() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 0.5).unwrap();
+    dashboard.store.add_cost(id, 0.75).unwrap();
+
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("<span class=\"cost\">$1.25</span>"));
+}
+
+#[tokio::test]
+async fn a_board_card_without_cost_shows_a_dash() {
+    let dashboard = dashboard();
+    dashboard.new_job().await;
+
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("<span class=\"cost\">–</span>"));
+}
+
+#[tokio::test]
+async fn a_board_card_does_not_repeat_the_project_name() {
+    let dashboard = dashboard();
+    dashboard.new_job().await;
+
+    let index = dashboard.get("/").await;
+    assert!(!index.body.contains("maestro · "));
+}
+
+#[tokio::test]
+async fn the_approve_button_on_a_card_still_posts() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.store.add_cost(id, 1.0).unwrap();
+
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("<span class=\"cost\">$1.00</span>"));
+    assert!(index.body.contains("method=\"post\""));
+    assert!(index.body.contains("Approve spec"));
+
+    let reply = dashboard
+        .post(&format!("/jobs/{id}/approve"), "project=maestro")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert!(matches!(dashboard.turn(id), Turn::Agent(_)));
 }
