@@ -6,6 +6,7 @@ mod pages;
 mod podman;
 mod projects;
 mod scheduler;
+mod secrets;
 mod settings;
 mod store;
 mod timeline;
@@ -23,6 +24,10 @@ pub use scheduler::{
     AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, PublishRequest, Published,
     ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest, branch_name,
     ready_action,
+};
+pub use secrets::{
+    LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore,
+    master_key_from_env,
 };
 pub use settings::Settings;
 pub use store::{JobEvent, JobRow, LogEntry, ProjectTotals, Store, StoreError};

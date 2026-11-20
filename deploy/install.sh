@@ -25,6 +25,14 @@ strip_newline() {
 if ! podman secret exists gh-token; then
     gh auth token | tr -d '\n' | podman secret create gh-token - >/dev/null
 fi
+# The master key that encrypts per-project MCP header values. 32 random bytes
+# as 64 hex characters, generated once when missing so no step is manual, and
+# left alone on a later run so stored values stay readable. It is never
+# regenerated here: losing it makes those values unreadable.
+if ! podman secret exists factory-master-key; then
+    head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n' \
+        | podman secret create factory-master-key - >/dev/null
+fi
 if ! podman secret exists claude-token; then
     echo "The podman secret claude-token is missing." >&2
     echo "Run 'claude setup-token' and pipe the token into 'podman secret create claude-token -'." >&2
