@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 /// resolve one does not rebase forever.
 pub const MAX_FAILED_ROUNDS: u32 = 5;
 
+/// Changes-requested LLM review passes a job may take on one pull request
+/// before it stops and waits for the user. Separate from
+/// [`MAX_FAILED_ROUNDS`], so a job can spend both on the same pull request.
+pub const MAX_REVIEW_ROUNDS: u32 = 5;
+
 /// The failure reason a job carried, before the retry target existed, when
 /// it used up its failed rounds. A failed job with this exact reason and no
 /// retry target is a legacy job, retryable at its highest-numbered pull
@@ -31,6 +36,47 @@ pub struct Job {
     /// with `false` and keeps resuming its planning session.
     #[serde(default)]
     fresh_sessions: bool,
+    /// Changes-requested LLM review passes on the current pull request. Reset
+    /// with the failed rounds when a pull request starts. Caps at
+    /// [`MAX_REVIEW_ROUNDS`].
+    #[serde(default)]
+    review_rounds: u32,
+    /// Whether the reviewer has approved the pull request's current head. Set
+    /// to [`ReviewState::Pending`] again on every push, so each head is
+    /// reviewed afresh.
+    #[serde(default)]
+    review: ReviewState,
+    /// One record per review pass, in order, kept for the job page.
+    #[serde(default)]
+    reviews: Vec<ReviewPass>,
+}
+
+/// Whether the reviewer has approved the current head of a pull request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewState {
+    /// The current head has not been reviewed, or a push replaced the head the
+    /// reviewer approved.
+    #[default]
+    Pending,
+    /// The reviewer approved the current head.
+    Approved,
+}
+
+/// One LLM review pass on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPass {
+    /// The pass number, counting every pass on the job from one.
+    pub number: u32,
+    pub verdict: Verdict,
+    /// The reviewer's feedback, set when it asked for changes.
+    pub feedback: Option<String>,
+}
+
+/// What a review pass decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    Approve,
+    Changes,
 }
 
 /// A question the agent asked and the requester's answer.
@@ -129,6 +175,12 @@ pub enum Ask {
     PublishApproval {
         summary: Option<BranchSummary>,
     },
+    /// The review stopped without an approval: it used up its rounds or a
+    /// reviewer run failed. `reason` says which. The job does not merge and
+    /// waits for the user.
+    ReviewStopped {
+        reason: String,
+    },
 }
 
 /// What a pull request branch would add to its base branch.
@@ -196,6 +248,9 @@ pub enum Task {
     Rebase {
         base: String,
     },
+    /// Review the pull request's diff and end with `approve` or `changes`. The
+    /// worker gets no GitHub token and reads the diff from the checkout.
+    Review,
 }
 
 /// The agent session a run uses. Clarifying has one, the spec has one, and
@@ -208,6 +263,10 @@ pub enum Session {
     Spec,
     Plan,
     Pr(usize),
+    /// The LLM review of a pull request. Separate from the implement session,
+    /// so the reviewer reads the diff without the author's context. It resumes
+    /// across passes, so a later pass sees only the commits since the last one.
+    Review(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +347,20 @@ pub enum Event {
     ReviewComments {
         comments: String,
     },
+    /// CI is green and the project has LLM review on, so the reviewer should
+    /// run before the factory merges.
+    StartReview,
+    /// The reviewer approved the pull request's current head.
+    ReviewApproved,
+    /// The reviewer asked for changes and gave `feedback`.
+    ReviewChanges {
+        feedback: String,
+    },
+    /// The reviewer run failed: it crashed, timed out, or returned no valid
+    /// result. The job fails closed and does not merge.
+    ReviewFailed {
+        reason: String,
+    },
     Merged,
     ClosedUnmerged,
     Cancel,
@@ -340,6 +413,9 @@ impl Job {
             gates,
             answers: Vec::new(),
             fresh_sessions: true,
+            review_rounds: 0,
+            review: ReviewState::Pending,
+            reviews: Vec::new(),
         }
     }
 
@@ -385,6 +461,20 @@ impl Job {
         &self.plan
     }
 
+    /// Whether the reviewer has approved the current head. The scheduler reads
+    /// it to decide, once CI is green, whether to start a review or go on to
+    /// the merge.
+    #[must_use]
+    pub fn review_state(&self) -> ReviewState {
+        self.review
+    }
+
+    /// The review passes so far, oldest first.
+    #[must_use]
+    pub fn reviews(&self) -> &[ReviewPass] {
+        &self.reviews
+    }
+
     /// The command the factory runs next, or `None` while the job waits for
     /// the user or for capacity, or has ended.
     #[must_use]
@@ -423,6 +513,7 @@ impl Job {
         let (stage, turn) = self.transition(event)?;
         if let Stage::Implementing { .. } = stage {
             self.failed_rounds = 0;
+            self.review_rounds = 0;
         }
         self.stage = stage;
         self.turn = turn;
@@ -468,23 +559,9 @@ impl Job {
                 Turn::Done,
             ),
 
-            (stage, Turn::User(Ask::Answers { questions }), E::Answer(answers)) => {
-                if answers.len() != questions.len() {
-                    return Err(Rejected::AnswerCount {
-                        expected: questions.len(),
-                        got: answers.len(),
-                    });
-                }
+            (_, Turn::User(Ask::Answers { questions }), E::Answer(answers)) => {
                 let questions = questions.clone();
-                self.answers
-                    .extend(questions.iter().zip(&answers).map(|(q, a)| Answered {
-                        question: q.text.clone(),
-                        answer: a.clone(),
-                    }));
-                (
-                    stage.clone(),
-                    Turn::Agent(Task::Answer { questions, answers }),
-                )
+                return self.record_answers(questions, answers);
             }
 
             (S::Clarifying, Turn::Agent(_), E::Agent(AgentResult::Clarified)) => {
@@ -521,6 +598,15 @@ impl Job {
                 Turn::User(Ask::SpecApproval | Ask::PlanApproval),
                 E::RequestChanges { feedback },
             ) => (stage.clone(), Turn::Agent(Task::Revise { feedback })),
+
+            (
+                S::CiAndReview { .. },
+                _,
+                event @ (E::StartReview
+                | E::ReviewApproved
+                | E::ReviewChanges { .. }
+                | E::ReviewFailed { .. }),
+            ) => return self.deliver_review(event),
 
             (
                 S::Implementing { .. }
@@ -593,17 +679,16 @@ impl Job {
             (S::PrOpen { pr }, Turn::Factory, E::Published { number }) => {
                 let pr = *pr;
                 self.plan[pr].number = Some(number);
+                self.review = ReviewState::Pending;
                 (S::CiAndReview { pr }, Turn::Factory)
             }
-
             (S::CiAndReview { pr }, Turn::Factory, E::CiFailed { log }) => {
-                let pr = *pr;
-                self.fail_round(S::CiAndReview { pr }, Turn::Agent(Task::FixCi { log }))
+                self.fail_round(S::CiAndReview { pr: *pr }, Turn::Agent(Task::FixCi { log }))
             }
-            (S::CiAndReview { pr }, Turn::Factory, E::Conflicted { base }) => {
-                let pr = *pr;
-                self.fail_round(S::CiAndReview { pr }, Turn::Agent(Task::Rebase { base }))
-            }
+            (S::CiAndReview { pr }, Turn::Factory, E::Conflicted { base }) => self.fail_round(
+                S::CiAndReview { pr: *pr },
+                Turn::Agent(Task::Rebase { base }),
+            ),
             (
                 S::CiAndReview { pr },
                 Turn::Agent(Task::FixCi { .. }),
@@ -648,6 +733,9 @@ impl Job {
     }
 
     fn session(&self) -> Session {
+        if let (Stage::CiAndReview { pr }, Turn::Agent(Task::Review)) = (&self.stage, &self.turn) {
+            return Session::Review(*pr);
+        }
         match &self.stage {
             Stage::Implementing { pr }
             | Stage::Verifying { pr }
@@ -682,6 +770,87 @@ impl Job {
         } else {
             (stage, next)
         }
+    }
+
+    /// Handles the LLM review events in `ci-and-review`. The review starts
+    /// once CI is green, records each pass, and loops a changes verdict back
+    /// to the implement session until the review cap, where it stops for the
+    /// user. A reviewer failure stops it the same way, so the job never merges
+    /// without an approval.
+    fn deliver_review(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
+        use Event as E;
+        use Stage as S;
+
+        let next = match (&self.stage, &self.turn, event) {
+            (S::CiAndReview { pr }, Turn::Factory, E::StartReview)
+                if self.review == ReviewState::Pending =>
+            {
+                (S::CiAndReview { pr: *pr }, Turn::Agent(Task::Review))
+            }
+            (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewApproved) => {
+                let pr = *pr;
+                self.record_review(Verdict::Approve, None);
+                self.review = ReviewState::Approved;
+                (S::CiAndReview { pr }, Turn::Factory)
+            }
+            (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewChanges { feedback }) => {
+                let pr = *pr;
+                self.record_review(Verdict::Changes, Some(feedback.clone()));
+                self.review_rounds += 1;
+                if self.review_rounds >= MAX_REVIEW_ROUNDS {
+                    let reason = format!("{MAX_REVIEW_ROUNDS} review rounds on one pull request");
+                    (
+                        S::CiAndReview { pr },
+                        Turn::User(Ask::ReviewStopped { reason }),
+                    )
+                } else {
+                    (
+                        S::CiAndReview { pr },
+                        Turn::Agent(Task::AddressReview { comments: feedback }),
+                    )
+                }
+            }
+            (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewFailed { reason }) => (
+                S::CiAndReview { pr: *pr },
+                Turn::User(Ask::ReviewStopped { reason }),
+            ),
+            (_, _, event) => return Err(self.unexpected(event)),
+        };
+        Ok(next)
+    }
+
+    /// Records the answers to the agent's questions and resumes its session.
+    fn record_answers(
+        &mut self,
+        questions: Vec<Question>,
+        answers: Vec<String>,
+    ) -> Result<(Stage, Turn), Rejected> {
+        if answers.len() != questions.len() {
+            return Err(Rejected::AnswerCount {
+                expected: questions.len(),
+                got: answers.len(),
+            });
+        }
+        self.answers
+            .extend(questions.iter().zip(&answers).map(|(q, a)| Answered {
+                question: q.text.clone(),
+                answer: a.clone(),
+            }));
+        Ok((
+            self.stage.clone(),
+            Turn::Agent(Task::Answer { questions, answers }),
+        ))
+    }
+
+    fn record_review(&mut self, verdict: Verdict, feedback: Option<String>) {
+        let number = u32::try_from(self.reviews.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        self.reviews.push(ReviewPass {
+            number,
+            verdict,
+            feedback,
+        });
     }
 
     fn current_pr(&self) -> Option<usize> {

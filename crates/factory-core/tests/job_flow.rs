@@ -1,6 +1,7 @@
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS, PlannedPr,
-    PrDescription, Question, Rejected, Session, Stage, Task, Turn,
+    AgentResult, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
+    MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, ReviewPass, ReviewState,
+    Session, Stage, Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -1141,4 +1142,289 @@ fn a_legacy_failed_job_with_no_pull_request_number_is_not_retryable() {
     assert!(matches!(legacy.stage(), Stage::Failed { .. }));
     assert!(!legacy.can_retry());
     assert!(legacy.apply(Event::Retry).is_err());
+}
+
+/// Runs one changes-requested review round on the watched pull request
+/// `number`: the reviewer asks for changes, the agent fixes and pushes, and
+/// the checks pass, so the head is ready for the next review.
+fn review_changes_round(job: &mut Job, number: u64) {
+    apply(job, Event::StartReview);
+    apply(
+        job,
+        Event::ReviewChanges {
+            feedback: "tighten the error path".into(),
+        },
+    );
+    apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(job, Event::ChecksPassed);
+    apply(job, Event::Published { number });
+}
+
+/// Runs one failed-CI round on the watched pull request `number`.
+fn ci_fail_round(job: &mut Job, number: u64) {
+    apply(job, Event::CiFailed { log: "fail".into() });
+    apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(job, Event::ChecksPassed);
+    apply(job, Event::Published { number });
+}
+
+#[test]
+fn an_approved_review_records_the_pass_and_returns_to_watching() {
+    let mut job = watching(7);
+    assert_eq!(job.review_state(), ReviewState::Pending);
+
+    apply(&mut job, Event::StartReview);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_runs(&job, Session::Review(0), Task::Review);
+
+    apply(&mut job, Event::ReviewApproved);
+    assert_eq!(job.review_state(), ReviewState::Approved);
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(
+        job.reviews(),
+        [ReviewPass {
+            number: 1,
+            verdict: Verdict::Approve,
+            feedback: None,
+        }]
+    );
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr { pr: 0, number: 7 })
+    );
+
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+}
+
+#[test]
+fn requested_changes_go_to_the_implement_session_and_re_review_after_the_push() {
+    let mut job = watching(7);
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "rename the field".into(),
+        },
+    );
+    assert_runs(
+        &job,
+        Session::Pr(0),
+        Task::AddressReview {
+            comments: "rename the field".into(),
+        },
+    );
+    assert_eq!(job.review_state(), ReviewState::Pending);
+    assert_eq!(
+        job.reviews(),
+        [ReviewPass {
+            number: 1,
+            verdict: Verdict::Changes,
+            feedback: Some("rename the field".into()),
+        }]
+    );
+
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    assert_eq!(job.review_state(), ReviewState::Pending);
+
+    apply(&mut job, Event::StartReview);
+    apply(&mut job, Event::ReviewApproved);
+    assert_eq!(
+        job.reviews().iter().map(|r| r.number).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(job.reviews()[1].verdict, Verdict::Approve);
+}
+
+#[test]
+fn start_review_runs_only_once_until_a_new_push() {
+    let mut job = watching(7);
+    apply(&mut job, Event::StartReview);
+    apply(&mut job, Event::ReviewApproved);
+    assert_eq!(job.review_state(), ReviewState::Approved);
+
+    let before = job.clone();
+    assert!(matches!(
+        job.apply(Event::StartReview),
+        Err(Rejected::Unexpected { .. })
+    ));
+    assert_eq!(job, before);
+}
+
+#[test]
+fn review_events_apply_only_in_a_review_turn() {
+    let mut job = watching(7);
+    assert!(job.apply(Event::ReviewApproved).is_err());
+    assert!(
+        job.apply(Event::ReviewChanges {
+            feedback: "x".into()
+        })
+        .is_err()
+    );
+    assert!(
+        job.apply(Event::ReviewFailed { reason: "x".into() })
+            .is_err()
+    );
+
+    let mut implementing = implementing(&["only"]);
+    assert!(implementing.apply(Event::StartReview).is_err());
+}
+
+#[test]
+fn the_review_cap_stops_the_job_without_merging() {
+    let mut job = watching(7);
+    for _ in 1..MAX_REVIEW_ROUNDS {
+        review_changes_round(&mut job, 7);
+    }
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "again".into(),
+        },
+    );
+
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(
+        job.turn(),
+        &Turn::User(Ask::ReviewStopped {
+            reason: "5 review rounds on one pull request".into(),
+        })
+    );
+    assert_eq!(job.next_command(), None);
+    assert_eq!(job.reviews().len(), MAX_REVIEW_ROUNDS as usize);
+    assert!(!job.is_finished());
+}
+
+#[test]
+fn a_reviewer_failure_stops_the_job_without_merging() {
+    let mut job = watching(7);
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "reviewer timed out".into(),
+        },
+    );
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(
+        job.turn(),
+        &Turn::User(Ask::ReviewStopped {
+            reason: "reviewer timed out".into(),
+        })
+    );
+    assert_eq!(job.next_command(), None);
+
+    // The factory never merges on its own, but the user can still merge on
+    // GitHub, and the factory then moves the job on.
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+}
+
+#[test]
+fn the_review_cap_and_the_failed_round_cap_are_independent() {
+    // Spend four of each cap on the same pull request. Neither counter moves
+    // the other, so the job is still running.
+    let mut ci_capped = watching(7);
+    for _ in 1..MAX_FAILED_ROUNDS {
+        ci_fail_round(&mut ci_capped, 7);
+    }
+    for _ in 1..MAX_REVIEW_ROUNDS {
+        review_changes_round(&mut ci_capped, 7);
+    }
+    assert_eq!(ci_capped.stage(), &Stage::CiAndReview { pr: 0 });
+
+    // The next CI failure is the fifth failed round, so the job fails. The
+    // four review rounds did not count toward it.
+    let mut review_capped = ci_capped.clone();
+    apply(&mut ci_capped, Event::CiFailed { log: "fail".into() });
+    assert!(matches!(ci_capped.stage(), Stage::Failed { .. }));
+
+    // The next changes verdict is the fifth review round, so the job stops.
+    // The four failed rounds did not count toward it.
+    apply(&mut review_capped, Event::StartReview);
+    apply(
+        &mut review_capped,
+        Event::ReviewChanges {
+            feedback: "again".into(),
+        },
+    );
+    assert_eq!(
+        review_capped.turn(),
+        &Turn::User(Ask::ReviewStopped {
+            reason: "5 review rounds on one pull request".into(),
+        })
+    );
+}
+
+#[test]
+fn the_review_cap_starts_over_for_the_next_pull_request() {
+    let mut job = implementing(&["first", "second"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 1 });
+    for _ in 1..MAX_REVIEW_ROUNDS {
+        review_changes_round(&mut job, 1);
+    }
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 1 });
+
+    // The second pull request gets its own five review rounds.
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 2 });
+    for _ in 1..MAX_REVIEW_ROUNDS {
+        review_changes_round(&mut job, 2);
+    }
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 1 });
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "again".into(),
+        },
+    );
+    assert!(matches!(job.turn(), Turn::User(Ask::ReviewStopped { .. })));
+}
+
+#[test]
+fn a_human_merge_moves_a_job_on_while_the_reviewer_runs() {
+    let mut job = watching(7);
+    apply(&mut job, Event::StartReview);
+    assert_runs(&job, Session::Review(0), Task::Review);
+
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+}
+
+#[test]
+fn a_review_pass_survives_a_round_trip_through_json() {
+    let mut job = watching(7);
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "split the function".into(),
+        },
+    );
+    let json = serde_json::to_string(&job).unwrap();
+    let back: Job = serde_json::from_str(&json).unwrap();
+    assert_eq!(job, back);
+}
+
+#[test]
+fn a_stored_job_without_review_fields_loads_with_no_reviews() {
+    let mut stored =
+        serde_json::to_value(Job::new("add a reboot button", Gates::default())).unwrap();
+    let fields = stored.as_object_mut().unwrap();
+    fields.remove("review_rounds").unwrap();
+    fields.remove("review").unwrap();
+    fields.remove("reviews").unwrap();
+
+    let job: Job = serde_json::from_value(stored).unwrap();
+    assert_eq!(job, Job::new("add a reboot button", Gates::default()));
+    assert_eq!(job.review_state(), ReviewState::Pending);
+    assert_eq!(job.reviews(), []);
 }

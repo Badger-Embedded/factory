@@ -586,6 +586,7 @@ impl Store {
             Session::Spec => "spec".to_owned(),
             Session::Plan => "plan".to_owned(),
             Session::Pr(pr) => format!("pr-{pr}"),
+            Session::Review(pr) => format!("review-{pr}"),
         };
         let conn = self.conn();
         conn.execute(
