@@ -80,11 +80,6 @@ pub fn index(
         .iter()
         .filter(|row| Some(row.project.as_str()) == selected)
         .collect();
-    let waiting: Vec<&JobRow> = all
-        .iter()
-        .copied()
-        .filter(|row| needs_user(&row.job, settings))
-        .collect();
     let nav = selected.map_or_else(|| html! {}, |selected| project_selector(projects, selected));
     page(
         user,
@@ -113,10 +108,7 @@ pub fn index(
             } @else {
                 div.card { p.empty { "No projects are configured." } }
             }
-            h2.section-title { "Waiting for you" }
-            (job_list(&waiting, settings, "Nothing needs you right now."))
-            h2.section-title { "All jobs" }
-            (job_list(&all, settings, "No jobs yet."))
+            (board(&all, settings))
         },
     )
 }
@@ -224,21 +216,83 @@ fn gates_line(gates: Gates) -> String {
     }
 }
 
-fn job_list(rows: &[&JobRow], settings: &Settings, empty: &str) -> Markup {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    You,
+    Agent,
+    Factory,
+    Done,
+}
+
+impl Lane {
+    const ALL: [Lane; 4] = [Lane::You, Lane::Agent, Lane::Factory, Lane::Done];
+
+    fn title(self) -> &'static str {
+        match self {
+            Lane::You => "You",
+            Lane::Agent => "Agent",
+            Lane::Factory => "Factory",
+            Lane::Done => "Done",
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Lane::You => "lane lane-you",
+            Lane::Agent => "lane lane-agent",
+            Lane::Factory => "lane lane-factory",
+            Lane::Done => "lane lane-done",
+        }
+    }
+
+    fn empty(self) -> &'static str {
+        match self {
+            Lane::You => "Nothing needs you right now.",
+            Lane::Agent => "No agent is working.",
+            Lane::Factory => "The factory has nothing to do.",
+            Lane::Done => "No finished jobs.",
+        }
+    }
+}
+
+fn board(rows: &[&JobRow], settings: &Settings) -> Markup {
     html! {
-        @if rows.is_empty() {
-            div.card { p.empty { (empty) } }
+        div.board {
+            @for lane in Lane::ALL {
+                @let cards: Vec<&JobRow> = rows
+                    .iter()
+                    .copied()
+                    .filter(|row| status(&row.job, settings).lane == lane)
+                    .collect();
+                @if lane == Lane::Done {
+                    details class=(lane.class()) {
+                        summary { (lane.title()) " " span.count { (cards.len()) } }
+                        (lane_cards(&cards, settings, lane))
+                    }
+                } @else {
+                    section class=(lane.class()) {
+                        h2 { (lane.title()) " " span.count { (cards.len()) } }
+                        (lane_cards(&cards, settings, lane))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn lane_cards(cards: &[&JobRow], settings: &Settings, lane: Lane) -> Markup {
+    html! {
+        @if cards.is_empty() {
+            p.empty { (lane.empty()) }
         } @else {
-            div.card.list-card {
-                ul.jobs {
-                    @for row in rows {
-                        li {
-                            span.id { "#" (row.id) }
-                            a.title href={ "/jobs/" (row.id) } { (first_line(row.job.request())) }
-                            (turn_badge(&row.job, settings))
-                            span.sub {
-                                (row.project) " · " (stage_label(&row.job)) " · " (row.requested_by)
-                            }
+            ul.jobs {
+                @for row in cards {
+                    li {
+                        span.id { "#" (row.id) }
+                        a.title href={ "/jobs/" (row.id) } { (first_line(row.job.request())) }
+                        (turn_badge(&row.job, settings))
+                        span.sub {
+                            (row.project) " · " (stage_label(&row.job)) " · " (row.requested_by)
                         }
                     }
                 }
@@ -427,14 +481,6 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
     }
 }
 
-/// Whether the job waits for the user: an answer or approval on the
-/// dashboard, or, without auto-merge, a review of its open pull request on
-/// GitHub.
-fn needs_user(job: &Job, settings: &Settings) -> bool {
-    (matches!(job.turn(), Turn::User(_)) && !collecting(job))
-        || (in_review(job) && !settings.auto_merge)
-}
-
 /// Whether the job waits for the factory to collect what the publish
 /// approval shows.
 fn collecting(job: &Job) -> bool {
@@ -445,18 +491,34 @@ fn in_review(job: &Job) -> bool {
     matches!(job.next_command(), Some(Command::WatchPr { .. }))
 }
 
-fn turn_badge(job: &Job, settings: &Settings) -> Markup {
-    let (class, text) = match (job.stage(), job.turn()) {
-        (Stage::Merged, _) => ("ok", "merged"),
-        (Stage::Failed { .. }, _) => ("bad", "failed"),
-        (Stage::Cancelled, _) => ("factory", "cancelled"),
-        (Stage::Requested, _) => ("factory", "queued"),
-        (_, Turn::User(_)) if !collecting(job) => ("you", "needs you"),
-        _ if in_review(job) && settings.auto_merge => ("factory", "merges when green"),
-        _ if in_review(job) => ("you", "in review"),
-        (_, Turn::Agent(_)) => ("agent", "agent working"),
-        (_, Turn::User(_) | Turn::Factory | Turn::Done) => ("factory", "factory working"),
+struct Status {
+    lane: Lane,
+    class: &'static str,
+    text: &'static str,
+}
+
+/// One match decides the lane and the badge, so they cannot disagree.
+fn status(job: &Job, settings: &Settings) -> Status {
+    let (lane, class, text) = match (job.stage(), job.turn()) {
+        (Stage::Merged, _) => (Lane::Done, "ok", "merged"),
+        (Stage::Failed { .. }, _) => (Lane::Done, "bad", "failed"),
+        (Stage::Cancelled, _) => (Lane::Done, "factory", "cancelled"),
+        (Stage::Requested, _) => (Lane::Factory, "factory", "queued"),
+        (_, Turn::User(_)) if !collecting(job) => (Lane::You, "you", "needs you"),
+        _ if in_review(job) && settings.auto_merge => {
+            (Lane::Factory, "factory", "merges when green")
+        }
+        _ if in_review(job) => (Lane::You, "you", "in review"),
+        (_, Turn::Agent(_)) => (Lane::Agent, "agent", "agent working"),
+        (_, Turn::User(_) | Turn::Factory | Turn::Done) => {
+            (Lane::Factory, "factory", "factory working")
+        }
     };
+    Status { lane, class, text }
+}
+
+fn turn_badge(job: &Job, settings: &Settings) -> Markup {
+    let Status { class, text, .. } = status(job, settings);
     html! { span class={ "badge " (class) } { (text) } }
 }
 
