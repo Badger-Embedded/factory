@@ -6,10 +6,10 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, PlannedPr, PrDescription,
-    Question, Stage, Task, Turn,
+    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, PlanUsage, PlannedPr,
+    PrDescription, Question, Stage, Task, Turn,
 };
-use factory_server::{Projects, StageModels, Store, StoreError, USER_HEADER, app};
+use factory_server::{PlanUsageCache, Projects, StageModels, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -18,6 +18,7 @@ struct Dashboard {
     store: Arc<Store>,
     router: Router,
     data: tempfile::TempDir,
+    usage: Arc<PlanUsageCache>,
 }
 
 struct Reply {
@@ -49,15 +50,18 @@ fn dashboard_for(repo: &str) -> Dashboard {
     let projects = Arc::new(Projects::load(dir.path()).unwrap());
     let store = Arc::new(Store::open_in_memory().unwrap());
     let data = tempfile::tempdir().unwrap();
+    let usage = Arc::new(PlanUsageCache::new());
     Dashboard {
         router: app(
             store.clone(),
             projects,
             Arc::new(Notify::new()),
             data.path().to_owned(),
+            Arc::clone(&usage),
         ),
         store,
         data,
+        usage,
     }
 }
 
@@ -764,11 +768,13 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(Projects::default()),
         Arc::new(Notify::new()),
         dashboard.data.path().to_owned(),
+        Arc::new(PlanUsageCache::new()),
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
         router,
         data: tempfile::tempdir().unwrap(),
+        usage: Arc::new(PlanUsageCache::new()),
     }
     .get(&format!("/jobs/{id}"))
     .await;
@@ -804,15 +810,18 @@ fn two_projects() -> Dashboard {
     let projects = Arc::new(Projects::load(dir.path()).unwrap());
     let store = Arc::new(Store::open_in_memory().unwrap());
     let data = tempfile::tempdir().unwrap();
+    let usage = Arc::new(PlanUsageCache::new());
     Dashboard {
         router: app(
             store.clone(),
             projects,
             Arc::new(Notify::new()),
             data.path().to_owned(),
+            Arc::clone(&usage),
         ),
         store,
         data,
+        usage,
     }
 }
 
@@ -2298,4 +2307,127 @@ async fn a_failed_job_still_counts_as_finished_for_the_30_day_expiry() {
     // loop deletes it once it is 30 days old, because it is still finished.
     assert!(dashboard.store.get(id).unwrap().job.is_finished());
     assert_lane(&dashboard, id, "lane-failed").await;
+}
+
+/// A `?skip_spend=1` body with Fable in `model_scoped`, using Unix timestamps
+/// whose UTC dates the tile tests assert.
+const USAGE_WITH_FABLE: &str = r#"{
+    "five_hour": { "utilization": 0.42, "resets_at": 1700000000 },
+    "seven_day": { "utilization": 0.73, "resets_at": 1701000000 },
+    "model_scoped": [
+        { "display_name": "Fable", "utilization": 0.1, "resets_at": 1701000000 }
+    ]
+}"#;
+
+/// The same body with no `model_scoped`, so the plan reports no Fable window.
+const USAGE_NO_FABLE: &str = r#"{
+    "five_hour": { "utilization": 0.42, "resets_at": 1700000000 },
+    "seven_day": { "utilization": 0.73, "resets_at": 1701000000 }
+}"#;
+
+fn usage(body: &str) -> PlanUsage {
+    PlanUsage::parse(body).unwrap()
+}
+
+fn now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+/// The plan usage panel on the page, or `None` when the tile is hidden.
+fn usage_tile(body: &str) -> Option<&str> {
+    let marker = "<section class=\"card plan-usage\">";
+    let start = body.find(marker)?;
+    let rest = &body[start..];
+    Some(&rest[..rest.find("</section>").unwrap() + "</section>".len()])
+}
+
+#[tokio::test]
+async fn the_board_shows_the_plan_usage_tile_with_fable() {
+    let dashboard = dashboard();
+    dashboard
+        .usage
+        .record_success(usage(USAGE_WITH_FABLE), now());
+
+    let body = dashboard.get("/").await.body;
+    let tile = usage_tile(&body).expect("the tile shows after a fresh success");
+    assert!(tile.contains("Claude plan usage"));
+    assert!(tile.contains("5-hour"));
+    assert!(tile.contains("Weekly"));
+    assert!(tile.contains("Fable"));
+    assert!(tile.contains("42% used"));
+    assert!(tile.contains("73% used"));
+    assert!(tile.contains("resets 2023-11-14 22:13 UTC"));
+    assert!(tile.contains("resets 2023-11-26 12:00 UTC"));
+}
+
+#[tokio::test]
+async fn the_tile_shows_the_two_windows_when_the_plan_reports_no_fable() {
+    let dashboard = dashboard();
+    dashboard.usage.record_success(usage(USAGE_NO_FABLE), now());
+
+    let body = dashboard.get("/").await.body;
+    let tile = usage_tile(&body).expect("the tile shows without a Fable window");
+    assert!(tile.contains("5-hour"));
+    assert!(tile.contains("Weekly"));
+    assert!(!tile.contains("Fable"));
+}
+
+#[tokio::test]
+async fn an_empty_cache_hides_the_tile_and_renders_the_rest() {
+    let dashboard = dashboard();
+    dashboard.new_job().await;
+
+    let body = dashboard.get("/").await.body;
+    assert!(usage_tile(&body).is_none());
+    assert!(!body.contains("Claude plan usage"));
+    // The rest of the board renders.
+    assert!(body.contains("Add a reboot button"));
+    assert!(body.contains("Live jobs by lane"));
+}
+
+#[tokio::test]
+async fn a_stale_success_hides_the_tile() {
+    let dashboard = dashboard();
+    let stale = now() - factory_core::PLAN_USAGE_STALE_AFTER_SECS - 1;
+    dashboard
+        .usage
+        .record_success(usage(USAGE_WITH_FABLE), stale);
+
+    let body = dashboard.get("/").await.body;
+    assert!(usage_tile(&body).is_none());
+    assert!(body.contains("Live jobs by lane"));
+}
+
+#[tokio::test]
+async fn an_errored_fetch_hides_the_tile() {
+    let dashboard = dashboard();
+    dashboard
+        .usage
+        .record_success(usage(USAGE_WITH_FABLE), now());
+    dashboard.usage.record_error();
+
+    let body = dashboard.get("/").await.body;
+    assert!(usage_tile(&body).is_none());
+    assert!(body.contains("Live jobs by lane"));
+}
+
+#[tokio::test]
+async fn the_tile_is_the_same_whatever_project_is_selected() {
+    let dashboard = two_projects();
+    dashboard
+        .usage
+        .record_success(usage(USAGE_WITH_FABLE), now());
+
+    let maestro = dashboard.get("/?project=maestro").await.body;
+    let tool = dashboard.get("/?project=tool").await.body;
+    let maestro_tile = usage_tile(&maestro).expect("the tile shows for maestro");
+    let tool_tile = usage_tile(&tool).expect("the tile shows for tool");
+    assert_eq!(maestro_tile, tool_tile);
+    assert!(maestro_tile.contains("Fable"));
 }

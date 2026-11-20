@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use axum::http::StatusCode;
-use factory_core::{Ask, BranchSummary, Command, Gates, Job, Stage, Task, Turn};
+use factory_core::{
+    Ask, BranchSummary, Command, Gates, Job, PlanUsage, Stage, Task, Turn, UsageWindow,
+};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::cost::{format_cost, merge_fraction};
@@ -93,6 +95,10 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the page takes each value its handler read"
+)]
 pub fn index(
     user: &str,
     projects: &Projects,
@@ -101,6 +107,7 @@ pub fn index(
     jobs: &[JobRow],
     costs: &HashMap<i64, f64>,
     totals: ProjectTotals,
+    plan_usage: Option<&PlanUsage>,
 ) -> Markup {
     let all: Vec<&JobRow> = jobs
         .iter()
@@ -113,6 +120,9 @@ pub fn index(
         false,
         &nav,
         &html! {
+            @if let Some(plan_usage) = plan_usage {
+                (plan_usage_panel(plan_usage))
+            }
             @if let Some(selected) = selected {
                 form.card method="post" action="/jobs" enctype="multipart/form-data" {
                     h2.form-title { "New request for " (selected) }
@@ -240,6 +250,65 @@ fn merge_gauge(created: i64, merged: i64) -> Markup {
             div.stat-label { "Merge rate" }
         }
     }
+}
+
+/// The account-wide panel of Claude subscription limits: the 5-hour window,
+/// the weekly window, and each per-model window the plan reports, such as
+/// Fable. It reads the same for every project, because the limits belong to
+/// the account. The handler passes `None` when the cache is empty, stale or
+/// errored, and then nothing here renders.
+fn plan_usage_panel(usage: &PlanUsage) -> Markup {
+    html! {
+        section.card.plan-usage {
+            h2 { "Claude plan usage" }
+            ul.usage-windows {
+                (usage_window("5-hour", &usage.five_hour))
+                (usage_window("Weekly", &usage.seven_day))
+                @for model in &usage.model_scoped {
+                    (usage_window(&model.display_name, &model.window))
+                }
+            }
+        }
+    }
+}
+
+fn usage_window(label: &str, window: &UsageWindow) -> Markup {
+    let percent = window.percent_used();
+    let fill = format!("{:.1}%", percent.clamp(0.0, 100.0));
+    html! {
+        li.usage-window {
+            span.usage-name { (label) }
+            span.usage-percent { (format!("{percent:.0}% used")) }
+            span.usage-reset { "resets " (format_reset(window.resets_at)) }
+            span.usage-track { span.usage-fill style={ "width: " (fill) } {} }
+        }
+    }
+}
+
+/// `unix`, a Unix timestamp in seconds, as `YYYY-MM-DD HH:MM UTC`.
+fn format_reset(unix: i64) -> String {
+    let (year, month, day) = civil_from_days(unix.div_euclid(86_400));
+    let secs = unix.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
+/// The civil date (year, month 1 to 12, day 1 to 31) for `days` days after
+/// 1970-01-01, by Howard Hinnant's `civil_from_days`.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn count_or_dash(count: i64) -> String {

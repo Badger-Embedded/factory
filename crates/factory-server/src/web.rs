@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::multipart::{Field, Multipart, MultipartError};
@@ -17,6 +18,7 @@ use crate::pages;
 use crate::projects::{Projects, StageModels};
 use crate::settings::Settings;
 use crate::store::{ProjectTotals, Store, StoreError};
+use crate::usage::PlanUsageCache;
 
 /// The header `tailscale serve` sets to the logged-in user's login name.
 pub const USER_HEADER: &str = "Tailscale-User-Login";
@@ -41,16 +43,19 @@ struct AppState {
     projects: Arc<Projects>,
     wake: Arc<Notify>,
     data_dir: PathBuf,
+    plan_usage: Arc<PlanUsageCache>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
 /// job loop looks at the job right away. Uploaded images go under
-/// `<data_dir>/jobs/<id>/images/`.
+/// `<data_dir>/jobs/<id>/images/`. The index page reads `plan_usage` from the
+/// cache the refresh task fills, so it makes no live call to the usage source.
 pub fn app(
     store: Arc<Store>,
     projects: Arc<Projects>,
     wake: Arc<Notify>,
     data_dir: PathBuf,
+    plan_usage: Arc<PlanUsageCache>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -73,6 +78,7 @@ pub fn app(
             projects,
             wake,
             data_dir,
+            plan_usage,
         })
 }
 
@@ -153,6 +159,7 @@ async fn index(
         Some(name) => state.store.project_totals(name)?,
         None => ProjectTotals::default(),
     };
+    let plan_usage = state.plan_usage.visible(now_secs());
     Ok(pages::index(
         &user(&headers),
         &state.projects,
@@ -161,7 +168,17 @@ async fn index(
         &jobs,
         &costs,
         totals,
+        plan_usage.as_ref(),
     ))
+}
+
+/// The current Unix time in seconds, or 0 before the epoch.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 struct Upload {
