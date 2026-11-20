@@ -142,8 +142,11 @@ impl From<serde_json::Error> for McpError {
 ///
 /// The "Add a server" form carries the same rule as an HTML `pattern` on
 /// `#mcp-new-name` in pages.rs, so the browser blocks a bad name before
-/// submit. Change both together. This check stays the authority: a name from
-/// curl or a stale page that skips the browser still gets rejected here.
+/// submit. Change both together. A browser compiles that `pattern` with the
+/// `v` flag, where `-` and `|` are syntax inside a `[...]` class and must be
+/// escaped; an invalid pattern is silently ignored, so the form writes the
+/// trailing `-` as `\-`. This check stays the authority: a name from curl or a
+/// stale page that skips the browser still gets rejected here.
 ///
 /// # Errors
 ///
