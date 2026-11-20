@@ -338,6 +338,34 @@ pub fn actions_job_id(url: &str) -> Option<&str> {
 }
 
 impl GitHub {
+    /// The number of the merged pull request for `branch`, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails.
+    pub async fn merged_pr(&self, repo: &str, branch: &str) -> Result<Option<u64>, String> {
+        let merged = self
+            .run(
+                &[
+                    "pr",
+                    "list",
+                    "--repo",
+                    repo,
+                    "--head",
+                    branch,
+                    "--state",
+                    "merged",
+                    "--json",
+                    "number",
+                    "--jq",
+                    ".[0].number",
+                ],
+                None,
+            )
+            .await?;
+        Ok(merged.trim().parse().ok())
+    }
+
     /// Opens the pull request for `branch`, or updates the title and
     /// description of the open one, and returns its number.
     ///

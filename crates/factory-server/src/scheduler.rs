@@ -73,6 +73,16 @@ pub struct PublishRequest {
     pub description: PrDescription,
 }
 
+/// What a publish found on GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Published {
+    /// The branch was pushed and this open pull request has its description.
+    Open(u64),
+    /// This pull request for the branch was merged before the push, so the
+    /// factory pushed nothing.
+    AlreadyMerged(u64),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchRequest {
     pub job_id: i64,
@@ -128,9 +138,13 @@ pub trait Executor: Send + Sync + 'static {
         request: SummaryRequest,
     ) -> impl Future<Output = Result<BranchSummary, String>> + Send;
 
-    /// Pushes the branch and opens or updates its pull request. Returns the
-    /// pull request number.
-    fn publish(&self, request: PublishRequest) -> impl Future<Output = Result<u64, String>> + Send;
+    /// Pushes the branch and opens or updates its pull request. When a pull
+    /// request for the branch is already merged, it pushes nothing and
+    /// reports that pull request instead.
+    fn publish(
+        &self,
+        request: PublishRequest,
+    ) -> impl Future<Output = Result<Published, String>> + Send;
 
     fn watch(
         &self,
@@ -469,9 +483,17 @@ impl<E: Executor> Scheduler<E> {
                 &format!("Pushing {} to {}.", request.branch, request.repo),
             );
             match scheduler.executor.publish(request).await {
-                Ok(number) => {
+                Ok(Published::Open(number)) => {
                     scheduler.note(job_id, &format!("Pull request #{number} is up to date."));
                     scheduler.apply(job_id, Event::Published { number });
+                }
+                Ok(Published::AlreadyMerged(number)) => {
+                    scheduler.note(
+                        job_id,
+                        &format!("Pull request #{number} was merged before the push, so the factory pushed nothing."),
+                    );
+                    scheduler.apply(job_id, Event::Published { number });
+                    scheduler.apply(job_id, Event::Merged);
                 }
                 Err(err) => scheduler.retry_later(&settings, job_id, &err),
             }
