@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use factory_core::{Ask, BranchSummary, Command, Gates, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use crate::cost::format_cost;
+use crate::cost::{format_cost, merge_fraction};
 use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry, ProjectTotals};
@@ -123,19 +123,18 @@ pub fn index(
 
 const NO_VALUE: &str = "–";
 
-/// The stats strip, one tile per figure of the project's totals. A figure
-/// that is zero or would divide by zero shows a dash.
+/// The KPI strip: large-number tiles for the project's totals and a gauge
+/// for the merge rate. A figure that is zero or would divide by zero shows a
+/// dash.
 #[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
 fn stats(totals: ProjectTotals) -> Markup {
     let created = totals.jobs_created;
     let merged = totals.jobs_merged;
-    let rate = (created > 0).then(|| format!("{:.0}%", merged as f64 * 100.0 / created as f64));
     let average = (merged > 0).then(|| format_cost(totals.usd / merged as f64));
     let tiles = [
         ("Total API cost", format_cost(totals.usd)),
         ("Jobs created", count_or_dash(created)),
         ("Jobs merged", count_or_dash(merged)),
-        ("Merge rate", rate.unwrap_or_else(|| NO_VALUE.to_owned())),
         (
             "Cost per merged job",
             average.unwrap_or_else(|| NO_VALUE.to_owned()),
@@ -149,6 +148,30 @@ fn stats(totals: ProjectTotals) -> Markup {
                     div.stat-label { (label) }
                 }
             }
+            (merge_gauge(created, merged))
+        }
+    }
+}
+
+/// A half-circle gauge filled to the merge rate. The arc has `pathLength` 100,
+/// so the dash length is the percentage.
+fn merge_gauge(created: i64, merged: i64) -> Markup {
+    let fraction = merge_fraction(created, merged);
+    let label = if created > 0 {
+        format!("{:.0}%", fraction * 100.0)
+    } else {
+        NO_VALUE.to_owned()
+    };
+    let fill = format!("{:.1} 100", fraction * 100.0);
+    html! {
+        div.card.stat.gauge {
+            svg.gauge-arc viewBox="0 0 100 56" role="img" aria-label=(format!("Merge rate {label}")) {
+                path.gauge-track d="M 10 50 A 40 40 0 0 1 90 50" pathLength="100" {}
+                path.gauge-fill d="M 10 50 A 40 40 0 0 1 90 50" pathLength="100"
+                    stroke-dasharray=(fill) {}
+            }
+            div.stat-value { (label) }
+            div.stat-label { "Merge rate" }
         }
     }
 }

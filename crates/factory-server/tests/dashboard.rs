@@ -1721,6 +1721,7 @@ async fn the_stats_strip_shows_the_stored_totals() {
     assert!(body.contains(&tile("4", "Jobs created")));
     assert!(body.contains(&tile("2", "Jobs merged")));
     assert!(body.contains(&tile("50%", "Merge rate")));
+    assert!(body.contains("stroke-dasharray=\"50.0 100\""));
     assert!(body.contains(&tile("$1.75", "Cost per merged job")));
 }
 
@@ -1733,6 +1734,7 @@ async fn the_stats_strip_shows_dashes_for_a_project_without_jobs() {
     assert!(body.contains(&tile("–", "Merge rate")));
     assert!(body.contains(&tile("–", "Cost per merged job")));
     assert!(!body.contains("NaN"));
+    assert!(body.contains("stroke-dasharray=\"0.0 100\""));
     assert!(!body.contains("inf"));
 }
 
@@ -1747,6 +1749,7 @@ async fn jobs_without_a_merge_show_dashes_for_the_ratios() {
     assert!(body.contains(&tile("1", "Jobs created")));
     assert!(body.contains(&tile("–", "Jobs merged")));
     assert!(body.contains(&tile("0%", "Merge rate")));
+    assert!(body.contains("stroke-dasharray=\"0.0 100\""));
     assert!(body.contains(&tile("–", "Cost per merged job")));
     assert!(!body.contains("NaN"));
 }
@@ -1808,4 +1811,19 @@ async fn the_approve_button_on_a_card_still_posts() {
         .await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert!(matches!(dashboard.turn(id), Turn::Agent(_)));
+}
+
+#[test]
+fn merge_fraction_is_the_merged_share_of_created() {
+    assert!((factory_server::merge_fraction(4, 1) - 0.25).abs() < f64::EPSILON);
+    assert!((factory_server::merge_fraction(3, 3) - 1.0).abs() < f64::EPSILON);
+    assert!(factory_server::merge_fraction(5, 0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn merge_fraction_is_zero_without_created_jobs() {
+    let fraction = factory_server::merge_fraction(0, 0);
+    assert!(!fraction.is_nan());
+    assert!(fraction.abs() < f64::EPSILON);
+    assert!(factory_server::merge_fraction(0, 2).abs() < f64::EPSILON);
 }
