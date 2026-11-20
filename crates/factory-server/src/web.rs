@@ -8,7 +8,7 @@ use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use factory_core::Event;
+use factory_core::{Event, Gates};
 use maud::Markup;
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -340,6 +340,10 @@ struct SettingsForm {
     worker_cpus: String,
     /// A checkbox: present when ticked.
     auto_merge: Option<String>,
+    /// Checkboxes: present when ticked.
+    gate_spec: Option<String>,
+    gate_plan: Option<String>,
+    gate_publish: Option<String>,
 }
 
 async fn save_settings(
@@ -367,6 +371,11 @@ async fn save_settings(
         worker_memory: text(form.worker_memory, "the worker memory")?,
         worker_cpus: text(form.worker_cpus, "the worker CPUs")?,
         auto_merge: form.auto_merge.is_some(),
+        gates: Gates {
+            spec: form.gate_spec.is_some(),
+            plan: form.gate_plan.is_some(),
+            publish: form.gate_publish.is_some(),
+        },
     };
     state.store.save_settings(&settings)?;
     state.wake.notify_one();

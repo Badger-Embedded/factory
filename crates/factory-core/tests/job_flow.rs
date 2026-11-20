@@ -602,3 +602,13 @@ fn a_stored_job_without_gates_loads_with_spec_and_plan_on() {
     let with_gates: Job = serde_json::from_value(stored).unwrap();
     assert_eq!(with_gates, Job::new("add a reboot button", SKIP_BOTH));
 }
+
+#[test]
+fn a_job_reports_the_gates_it_was_created_with() {
+    let gates = Gates {
+        spec: false,
+        plan: true,
+        publish: true,
+    };
+    assert_eq!(Job::new("x", gates).gates(), gates);
+}

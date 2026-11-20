@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use factory_core::{Ask, Command, Job, Stage, Task, Turn};
+use factory_core::{Ask, Command, Gates, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::projects::{Project, Projects};
@@ -169,6 +169,22 @@ pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup
                             value=(settings.worker_cpus);
                     }
                 }
+                h2 { "Approval gates" }
+                div.field {
+                    label.check {
+                        input type="checkbox" name="gate_spec" value="on" checked[settings.gates.spec];
+                        " Approve the spec"
+                    }
+                    label.check {
+                        input type="checkbox" name="gate_plan" value="on" checked[settings.gates.plan];
+                        " Approve the plan"
+                    }
+                    label.check {
+                        input type="checkbox" name="gate_publish" value="on" checked[settings.gates.publish];
+                        " Approve before pushing"
+                    }
+                    p.hint { "Applies to jobs created after you save. A job keeps the gates it started with. The publish gate has no effect yet." }
+                }
                 h2 { "GitHub" }
                 div.field {
                     label.check {
@@ -187,6 +203,22 @@ pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup
             }
         },
     )
+}
+
+fn gates_line(gates: Gates) -> String {
+    let on: Vec<&str> = [
+        (gates.spec, "spec"),
+        (gates.plan, "plan"),
+        (gates.publish, "publish"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if on.is_empty() {
+        "none".into()
+    } else {
+        on.join(", ")
+    }
 }
 
 fn job_list(rows: &[&JobRow], settings: &Settings, empty: &str) -> Markup {
@@ -239,6 +271,7 @@ pub fn job(
             }
             (steps(job))
             (status_card(id, job, settings))
+            p.meta { "Approval gates: " (gates_line(job.gates())) }
             div.card {
                 h2 { "Request" }
                 pre.doc { (job.request()) }
