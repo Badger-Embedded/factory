@@ -4094,3 +4094,73 @@ async fn a_project_onboarded_through_the_wizard_reaches_the_scheduler() {
     let id = job_id(&reply);
     assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Requested);
 }
+
+#[tokio::test]
+async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
+    let dashboard = dashboard();
+
+    // The empty section shows before any server is added.
+    let page = dashboard.get("/settings").await;
+    assert!(page.body.contains("MCP servers"));
+    assert!(page.body.contains("No servers yet."));
+
+    // Add one.
+    let added = dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert!(added.body.contains("context7"));
+    assert!(added.body.contains("https://mcp.context7.com/mcp"));
+    assert_eq!(
+        dashboard
+            .store
+            .mcp_server("context7")
+            .unwrap()
+            .unwrap()
+            .headers,
+        vec!["Authorization".to_owned()],
+    );
+
+    // Edit its URL path and headers. The name stays, so the route keys on it.
+    let edited = dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fv2%2Fmcp&headers=",
+        )
+        .await;
+    assert_eq!(edited.status, StatusCode::OK);
+    let server = dashboard.store.mcp_server("context7").unwrap().unwrap();
+    assert_eq!(server.url, "https://mcp.context7.com/v2/mcp");
+    assert_eq!(server.headers, Vec::<String>::new());
+
+    // Delete it.
+    let deleted = dashboard.post("/settings/mcp/context7/delete", "").await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert!(dashboard.store.mcp_server("context7").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_invalid_mcp_server_is_a_bad_request() {
+    let dashboard = dashboard();
+    // A non-https URL.
+    let bad_url = dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=http%3A%2F%2Fx.test%2Fmcp&headers=",
+        )
+        .await;
+    assert_eq!(bad_url.status, StatusCode::BAD_REQUEST);
+    // A reserved header name.
+    let reserved = dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fx.test%2Fmcp&headers=Host",
+        )
+        .await;
+    assert_eq!(reserved.status, StatusCode::BAD_REQUEST);
+    // Nothing was stored.
+    assert_eq!(dashboard.store.mcp_servers().unwrap(), Vec::new());
+}

@@ -2,6 +2,7 @@
 
 mod cost;
 mod github;
+mod mcp;
 mod pages;
 mod podman;
 mod projects;
@@ -18,6 +19,7 @@ pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
     check_repo,
 };
+pub use mcp::{McpError, McpServer};
 pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, import_tomls};
 pub use scheduler::{

@@ -7,6 +7,7 @@ use factory_core::{AgentResult, EFFORTS, Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use crate::mcp::{self, McpError, McpServer};
 use crate::projects::{Project, StageEfforts, StageModels};
 use crate::secrets::SecretRef;
 use crate::settings::Settings;
@@ -105,6 +106,11 @@ CREATE TABLE IF NOT EXISTS secrets (
     backend TEXT NOT NULL,
     value BLOB NOT NULL,
     PRIMARY KEY (project, server, header)
+);
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    name TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    headers TEXT NOT NULL
 );
 ";
 
@@ -1098,6 +1104,167 @@ impl Store {
             "DELETE FROM secrets WHERE project = ?1 AND server = ?2 AND header = ?3",
             params![at.project, at.server, at.header],
         )?;
+        Ok(())
+    }
+
+    /// Every registered MCP server, in name order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored header list that does not parse.
+    pub fn mcp_servers(&self) -> Result<Vec<McpServer>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT name, url, headers FROM mcp_servers ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut servers = Vec::new();
+        for row in rows {
+            let (name, url, headers) = row?;
+            servers.push(McpServer {
+                name,
+                url,
+                headers: serde_json::from_str(&headers)?,
+            });
+        }
+        Ok(servers)
+    }
+
+    /// The server registered under `name`, or `None` when none is.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored header list that does not parse.
+    pub fn mcp_server(&self, name: &str) -> Result<Option<McpServer>, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT url, headers FROM mcp_servers WHERE name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((url, headers)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(McpServer {
+            name: name.to_owned(),
+            url,
+            headers: serde_json::from_str(&headers)?,
+        }))
+    }
+
+    /// Registers an MCP server. The name, URL and header names are validated,
+    /// and header names are deduplicated case-insensitively before storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::BadName`], [`McpError::BadUrl`],
+    /// [`McpError::BadHeader`] or [`McpError::ReservedHeader`] for an invalid
+    /// field, and [`McpError::DuplicateName`] when `name` is taken. Nothing is
+    /// written when it fails.
+    pub fn create_mcp_server(
+        &self,
+        name: &str,
+        url: &str,
+        headers: &[String],
+    ) -> Result<(), McpError> {
+        mcp::validate_name(name)?;
+        mcp::validate_url(url)?;
+        let headers = mcp::normalize_headers(headers)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let taken = tx
+            .query_row("SELECT 1 FROM mcp_servers WHERE name = ?1", [name], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if taken {
+            return Err(McpError::DuplicateName(name.to_owned()));
+        }
+        tx.execute(
+            "INSERT INTO mcp_servers (name, url, headers) VALUES (?1, ?2, ?3)",
+            params![name, url, serde_json::to_string(&headers)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Edits the URL and header names of the server `name`. The name itself does
+    /// not change, because it keys the stored secrets and the proxy path.
+    ///
+    /// When the new URL's origin (scheme, host or port) differs from the old
+    /// one, every project's stored secret value for this server is deleted, so a
+    /// redirected server cannot collect another project's keys. Otherwise, each
+    /// header name no longer declared has its stored values deleted. Both happen
+    /// in the same transaction as the update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::BadUrl`], [`McpError::BadHeader`] or
+    /// [`McpError::ReservedHeader`] for an invalid field, and
+    /// [`McpError::NotFound`] when no server is registered under `name`. Nothing
+    /// is written when it fails.
+    pub fn edit_mcp_server(
+        &self,
+        name: &str,
+        url: &str,
+        headers: &[String],
+    ) -> Result<(), McpError> {
+        mcp::validate_url(url)?;
+        let headers = mcp::normalize_headers(headers)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT url, headers FROM mcp_servers WHERE name = ?1",
+                [name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((old_url, old_headers)) = existing else {
+            return Err(McpError::NotFound(name.to_owned()));
+        };
+        if mcp::same_origin(&old_url, url) {
+            let old_headers: Vec<String> = serde_json::from_str(&old_headers)?;
+            for removed in old_headers
+                .iter()
+                .filter(|old| !headers.iter().any(|kept| kept.eq_ignore_ascii_case(old)))
+            {
+                tx.execute(
+                    "DELETE FROM secrets WHERE server = ?1 AND header = ?2",
+                    params![name, removed],
+                )?;
+            }
+        } else {
+            tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
+        }
+        tx.execute(
+            "UPDATE mcp_servers SET url = ?1, headers = ?2 WHERE name = ?3",
+            params![url, serde_json::to_string(&headers)?, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes the server `name` with every project's stored secret value for
+    /// it, in one transaction. Deleting a server that is not registered is fine.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn delete_mcp_server(&self, name: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
+        // Per-project MCP settings are deleted here too once that table lands.
+        tx.execute("DELETE FROM mcp_servers WHERE name = ?1", [name])?;
+        tx.commit()?;
         Ok(())
     }
 

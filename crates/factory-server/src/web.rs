@@ -15,6 +15,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::github::{RepoChecker, RepoReport};
+use crate::mcp::McpError;
 use crate::pages;
 use crate::projects::{Project, Projects, StageEfforts, StageModels};
 use crate::settings::Settings;
@@ -84,6 +85,9 @@ pub fn app(
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(show_settings).post(save_settings))
         .route("/settings/projects/{name}", post(save_project_models))
+        .route("/settings/mcp", post(add_mcp_server))
+        .route("/settings/mcp/{name}", post(edit_mcp_server))
+        .route("/settings/mcp/{name}/delete", post(delete_mcp_server))
         .with_state(AppState {
             store,
             projects,
@@ -105,6 +109,7 @@ fn user(headers: &HeaderMap) -> String {
 
 enum AppError {
     BadRequest(String),
+    NotFound(String),
     Io(String),
     UnknownProject(String),
     Store(StoreError),
@@ -116,10 +121,21 @@ impl From<StoreError> for AppError {
     }
 }
 
+impl From<McpError> for AppError {
+    fn from(err: McpError) -> Self {
+        match err {
+            McpError::Store(err) => AppError::Store(err),
+            err @ McpError::NotFound(_) => AppError::NotFound(err.to_string()),
+            err => AppError::BadRequest(err.to_string()),
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            AppError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             AppError::UnknownProject(name) => (StatusCode::NOT_FOUND, format!("no project {name}")),
             AppError::Io(message) => {
                 tracing::error!("{message}");
@@ -637,6 +653,7 @@ fn settings_page(
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
     let settings = state.store.settings()?;
+    let servers = state.store.mcp_servers()?;
     let projects = state
         .projects
         .list()?
@@ -652,6 +669,7 @@ fn settings_page(
     Ok(pages::settings(
         &user(headers),
         &settings,
+        &servers,
         &projects,
         notice,
     ))
@@ -720,6 +738,65 @@ async fn save_project_models(
     )?;
     state.wake.notify_one();
     settings_page(&state, &headers, Some("Saved."))
+}
+
+#[derive(Deserialize)]
+struct McpAddForm {
+    name: String,
+    url: String,
+    /// Header names, one per line or separated by commas. Empty for a keyless
+    /// server.
+    headers: String,
+}
+
+#[derive(Deserialize)]
+struct McpEditForm {
+    url: String,
+    headers: String,
+}
+
+/// Splits a header-names field into trimmed, non-empty names, in order. The
+/// store validates and deduplicates them.
+fn header_names(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn add_mcp_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<McpAddForm>,
+) -> Result<Markup, AppError> {
+    state.store.create_mcp_server(
+        form.name.trim(),
+        form.url.trim(),
+        &header_names(&form.headers),
+    )?;
+    settings_page(&state, &headers, Some("Saved."))
+}
+
+async fn edit_mcp_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<McpEditForm>,
+) -> Result<Markup, AppError> {
+    state
+        .store
+        .edit_mcp_server(&name, form.url.trim(), &header_names(&form.headers))?;
+    settings_page(&state, &headers, Some("Saved."))
+}
+
+async fn delete_mcp_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Markup, AppError> {
+    state.store.delete_mcp_server(&name)?;
+    settings_page(&state, &headers, Some("Deleted."))
 }
 
 #[derive(Deserialize)]

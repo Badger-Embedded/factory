@@ -9,6 +9,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
+use crate::mcp::McpServer;
 use crate::projects::Project;
 use crate::projects::{StageEfforts, StageModels};
 use crate::settings::Settings;
@@ -349,6 +350,7 @@ fn project_selector(names: &[String], selected: &str) -> Markup {
 pub fn settings(
     user: &str,
     settings: &Settings,
+    servers: &[McpServer],
     projects: &[(String, StageModels, StageEfforts, bool, bool)],
     notice: Option<&str>,
 ) -> Markup {
@@ -412,11 +414,80 @@ pub fn settings(
                 }
                 button.primary { "Save" }
             }
+            (mcp_servers(servers))
             @for (name, models, efforts, auto_merge, llm_review) in projects {
                 (project_form(name, models, efforts, *auto_merge, *llm_review))
             }
         },
     )
+}
+
+/// The "MCP servers" section: one edit form per registered server, then a form
+/// to add one. A project turns a server on and gives its header values in the
+/// project's own settings form, so this section carries no per-project state.
+fn mcp_servers(servers: &[McpServer]) -> Markup {
+    html! {
+        div.card {
+            h2 { "MCP servers" }
+            p.hint { "Remote MCP servers over HTTPS, offered to agent runs. A project turns one on and picks its stages in the project's own settings below. Header values are entered per project." }
+            @if servers.is_empty() {
+                p.meta { "No servers yet." }
+            }
+        }
+        @for server in servers {
+            (mcp_server_form(server))
+        }
+        form.card method="post" action="/settings/mcp" {
+            h2 { "Add a server" }
+            div.field {
+                label for="mcp-new-name" { "Name" }
+                input #mcp-new-name type="text" name="name" required;
+                p.hint { "1 to 32 characters of a-z, 0-9 and -. It is the key in a run's MCP config and part of the proxy path." }
+            }
+            div.field {
+                label for="mcp-new-url" { "URL" }
+                input #mcp-new-url.wide type="url" name="url" required
+                    placeholder="https://mcp.context7.com/mcp";
+                p.hint { "An https URL to the server's streamable-HTTP endpoint." }
+            }
+            div.field {
+                label for="mcp-new-headers" { "Header names" }
+                textarea #mcp-new-headers name="headers" placeholder="Authorization" {}
+                p.hint { "Optional, one per line. Each project gives its own value for these, such as an API key. A keyless server needs none." }
+            }
+            button.primary { "Add server" }
+        }
+    }
+}
+
+/// One server's edit form: its URL and header names, a Save button and a Delete
+/// button that posts the same form to the delete route. The name is fixed,
+/// because it keys the stored secrets and the proxy path.
+fn mcp_server_form(server: &McpServer) -> Markup {
+    let action = format!("/settings/mcp/{}", server.name);
+    let delete = format!("/settings/mcp/{}/delete", server.name);
+    html! {
+        form.card method="post" action=(action) {
+            h2 { (server.name) }
+            div.field {
+                label for={ "mcp-" (server.name) "-url" } { "URL" }
+                input id={ "mcp-" (server.name) "-url" }.wide type="url" name="url" required
+                    value=(server.url);
+            }
+            div.field {
+                label for={ "mcp-" (server.name) "-headers" } { "Header names" }
+                textarea id={ "mcp-" (server.name) "-headers" } name="headers" {
+                    (server.headers.join("\n"))
+                }
+                p.hint { "One per line. Each project gives its own value for these." }
+            }
+            p.hint { "Changing the URL's host or port deletes every project's stored values for this server, so they must be entered again. Changing only the path keeps them." }
+            div.row {
+                button.primary { "Save" }
+                button.danger formaction=(delete) formnovalidate { "Delete" }
+            }
+        }
+    }
 }
 
 /// One project's form on the settings page: its two flags and a model field
