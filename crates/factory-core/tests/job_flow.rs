@@ -778,3 +778,32 @@ fn the_gate_takes_no_approval_before_checks_pass_and_no_summary_after() {
     apply(&mut job, Event::Summarized(summary()));
     assert!(job.apply(Event::Summarized(summary())).is_err());
 }
+
+#[test]
+fn merged_failed_and_cancelled_jobs_are_finished() {
+    let mut merged = watching(9);
+    apply(&mut merged, Event::Merged);
+
+    let mut failed = implementing(&["only"]);
+    apply(
+        &mut failed,
+        Event::AgentFailed {
+            reason: "no output".into(),
+        },
+    );
+
+    let mut cancelled = implementing(&["only"]);
+    apply(&mut cancelled, Event::Cancel);
+
+    for job in [&merged, &failed, &cancelled] {
+        assert!(job.is_finished(), "{:?}", job.stage());
+    }
+}
+
+#[test]
+fn jobs_that_still_have_a_step_are_not_finished() {
+    let requested = Job::new("add a reboot button", Gates::default());
+    assert!(!requested.is_finished());
+    assert!(!implementing(&["only"]).is_finished());
+    assert!(!watching(9).is_finished());
+}
