@@ -278,11 +278,11 @@ async fn the_index_lists_jobs_and_flags_those_waiting_for_the_user() {
     let id = dashboard.new_job().await;
     let page = dashboard.get("/").await;
     assert!(page.body.contains(&format!("href=\"/jobs/{id}\"")));
-    assert!(page.body.contains("Nothing needs you right now."));
+    assert!(!page.body.contains("class=\"inbox inbox-you\""));
 
     to_spec_approval(&dashboard, id);
     let page = dashboard.get("/").await;
-    assert!(!page.body.contains("Nothing needs you right now."));
+    assert!(page.body.contains("class=\"inbox inbox-you\""));
     assert!(page.body.contains("class=\"badge you\""));
 }
 
@@ -1159,7 +1159,7 @@ async fn a_pull_request_in_review_waits_for_the_user() {
     assert!(!page.body.contains("factory working"));
 
     let index = dashboard.get("/").await;
-    assert!(!index.body.contains("Nothing needs you right now."));
+    assert!(index.body.contains("class=\"inbox inbox-you\""));
 
     dashboard
         .store
@@ -1169,7 +1169,7 @@ async fn a_pull_request_in_review_waits_for_the_user() {
     assert!(page.body.contains("merges when green"));
     assert!(page.body.contains("Auto-merge is on"));
     let index = dashboard.get("/").await;
-    assert!(index.body.contains("Nothing needs you right now."));
+    assert!(!index.body.contains("class=\"inbox inbox-you\""));
 }
 
 /// Drives a job to a green pull request and starts a reviewer run, so the
@@ -1439,13 +1439,13 @@ async fn the_board_shows_only_the_selected_project() {
     assert!(page.body.contains("<option selected>tool</option>"));
     assert!(page.body.contains("Tool change"));
     assert!(!page.body.contains("Add a reboot button</a>"));
-    assert!(page.body.contains("Nothing needs you right now."));
+    assert!(!page.body.contains("class=\"inbox inbox-you\""));
     assert!(page.body.contains("New request for tool"));
     assert!(page.body.contains("name=\"project\" value=\"tool\""));
 
     let page = dashboard.get("/?project=maestro").await;
     assert!(!page.body.contains("Tool change"));
-    assert!(!page.body.contains("Nothing needs you right now."));
+    assert!(page.body.contains("class=\"inbox inbox-you\""));
     assert_eq!(page.body.matches("Add a reboot button</a>").count(), 1);
 }
 
@@ -1777,7 +1777,7 @@ async fn the_form_has_the_paste_script_and_a_thumbnail_list() {
     );
     assert!(
         page.body
-            .contains(r#"<label class="file-button" for="images">Choose images</label>"#)
+            .contains(r#"<label class="file-button" for="images">Attach images</label>"#)
     );
     assert!(page.body.contains(r#"class="visually-hidden">"#));
 }
@@ -1907,7 +1907,7 @@ async fn the_publish_approval_shows_the_pull_request_and_counts_as_waiting_for_y
     assert!(!page.body.contains("Approve and push"));
     assert!(page.body.contains("collecting the commits"));
     let index = dashboard.get("/").await;
-    assert!(index.body.contains("Nothing needs you right now."));
+    assert!(!index.body.contains("class=\"inbox inbox-you\""));
 
     dashboard.apply(id, Event::Summarized(branch_summary()));
     let page = dashboard.get(&format!("/jobs/{id}")).await;
@@ -1928,7 +1928,7 @@ async fn the_publish_approval_shows_the_pull_request_and_counts_as_waiting_for_y
     assert!(page.body.contains(&format!("/jobs/{id}/approve")));
     assert!(page.body.contains(&format!("/jobs/{id}/changes")));
     let index = dashboard.get("/").await;
-    assert!(!index.body.contains("Nothing needs you right now."));
+    assert!(index.body.contains("class=\"inbox inbox-you\""));
     assert!(index.body.contains("needs you"));
 }
 
@@ -1967,30 +1967,25 @@ async fn requesting_changes_at_the_publish_gate_sends_the_feedback_to_the_agent(
     );
 }
 
-/// The text of the lane `class` on the index page, up to the next lane.
+/// The text of the board section `class` on the index page, up to the next
+/// section.
 fn lane_html<'a>(body: &'a str, class: &str) -> &'a str {
-    let marker = format!("class=\"lane {class}\"");
+    let marker = format!("class=\"inbox {class}\"");
     let start = body.find(&marker).unwrap_or_else(|| panic!("no {class}"));
     let rest = &body[start + marker.len()..];
-    &rest[..rest.find("class=\"lane ").unwrap_or(rest.len())]
+    &rest[..rest.find("</section>").unwrap_or(rest.len())]
 }
 
-/// The lanes that list job `id`. The Failed lane renders only when a job has
-/// failed, so a class the board left out is skipped before `lane_html` reads
+/// The board sections that list job `id`. A section renders only when it has
+/// a job, so a class the board left out is skipped before `lane_html` reads
 /// it.
 fn lanes_of(body: &str, id: i64) -> Vec<&'static str> {
     let link = format!("href=\"/jobs/{id}\"");
-    [
-        "lane-you",
-        "lane-agent",
-        "lane-factory",
-        "lane-failed",
-        "lane-done",
-    ]
-    .into_iter()
-    .filter(|class| body.contains(&format!("class=\"lane {class}\"")))
-    .filter(|class| lane_html(body, class).contains(&link))
-    .collect()
+    ["inbox-you", "inbox-failed", "inbox-running", "inbox-done"]
+        .into_iter()
+        .filter(|class| body.contains(&format!("class=\"inbox {class}\"")))
+        .filter(|class| lane_html(body, class).contains(&link))
+        .collect()
 }
 
 async fn assert_lane(dashboard: &Dashboard, id: i64, lane: &str) {
@@ -2006,41 +2001,41 @@ fn plan_of_one() -> Vec<PlannedPr> {
 async fn every_stage_and_turn_lands_in_exactly_one_lane() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    assert_lane(&dashboard, id, "lane-factory").await;
+    assert_lane(&dashboard, id, "inbox-running").await;
 
     let steps = [
-        (Event::Start, "lane-agent"),
+        (Event::Start, "inbox-running"),
         (
             Event::Agent(AgentResult::Questions(vec![Question {
                 text: "Which?".into(),
             }])),
-            "lane-you",
+            "inbox-you",
         ),
-        (Event::Answer(vec!["This".into()]), "lane-agent"),
-        (Event::Agent(AgentResult::Clarified), "lane-agent"),
-        (Event::Agent(AgentResult::Spec("Goal.".into())), "lane-you"),
-        (Event::Approve, "lane-agent"),
-        (Event::Agent(AgentResult::Plan(plan_of_one())), "lane-you"),
-        (Event::Approve, "lane-agent"),
+        (Event::Answer(vec!["This".into()]), "inbox-running"),
+        (Event::Agent(AgentResult::Clarified), "inbox-running"),
+        (Event::Agent(AgentResult::Spec("Goal.".into())), "inbox-you"),
+        (Event::Approve, "inbox-running"),
+        (Event::Agent(AgentResult::Plan(plan_of_one())), "inbox-you"),
+        (Event::Approve, "inbox-running"),
         (
             Event::Agent(AgentResult::CommitsReady(ready())),
-            "lane-factory",
+            "inbox-running",
         ),
-        (Event::ChecksPassed, "lane-factory"),
-        (Event::Published { number: 7 }, "lane-you"),
+        (Event::ChecksPassed, "inbox-running"),
+        (Event::Published { number: 7 }, "inbox-you"),
         (
             Event::ReviewComments {
                 comments: "Rename it".into(),
             },
-            "lane-agent",
+            "inbox-running",
         ),
         (
             Event::Agent(AgentResult::CommitsReady(ready())),
-            "lane-factory",
+            "inbox-running",
         ),
-        (Event::ChecksPassed, "lane-factory"),
-        (Event::Published { number: 7 }, "lane-you"),
-        (Event::Merged, "lane-done"),
+        (Event::ChecksPassed, "inbox-running"),
+        (Event::Published { number: 7 }, "inbox-you"),
+        (Event::Merged, "inbox-done"),
     ];
     for (event, lane) in steps {
         dashboard.apply(id, event.clone());
@@ -2063,17 +2058,17 @@ async fn a_failed_job_lands_in_the_failed_lane_and_cancelled_in_done() {
     );
     let cancelled = dashboard.new_job().await;
     dashboard.apply(cancelled, Event::Cancel);
-    assert_lane(&dashboard, failed, "lane-failed").await;
-    assert_lane(&dashboard, cancelled, "lane-done").await;
+    assert_lane(&dashboard, failed, "inbox-failed").await;
+    assert_lane(&dashboard, cancelled, "inbox-done").await;
 }
 
 #[tokio::test]
 async fn the_publish_gate_waits_in_factory_then_you() {
     let dashboard = dashboard();
     let id = at_publish_gate(&dashboard).await;
-    assert_lane(&dashboard, id, "lane-factory").await;
+    assert_lane(&dashboard, id, "inbox-running").await;
     dashboard.apply(id, Event::Summarized(branch_summary()));
-    assert_lane(&dashboard, id, "lane-you").await;
+    assert_lane(&dashboard, id, "inbox-you").await;
 }
 
 #[tokio::test]
@@ -2087,12 +2082,12 @@ async fn a_pull_request_in_review_moves_to_factory_with_auto_merge() {
     dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 3 });
-    assert_lane(&dashboard, id, "lane-you").await;
+    assert_lane(&dashboard, id, "inbox-you").await;
     dashboard
         .store
         .save_project_auto_merge("maestro", true)
         .unwrap();
-    assert_lane(&dashboard, id, "lane-factory").await;
+    assert_lane(&dashboard, id, "inbox-running").await;
 }
 
 #[tokio::test]
@@ -2101,96 +2096,190 @@ async fn the_board_replaces_the_two_lists() {
     assert!(!body.contains("Waiting for you"));
     assert!(!body.contains("All jobs"));
     assert!(!body.contains("No jobs yet."));
-    for title in ["You", "Agent", "Factory", "Done"] {
-        assert!(
-            body.contains(&format!("{title} <span class=\"count\">0</span>")),
-            "{title}"
-        );
-    }
+    assert!(!body.contains("Live jobs by lane"));
 }
 
 #[tokio::test]
-async fn empty_lanes_say_so() {
+async fn an_empty_board_hides_every_section_and_says_it_is_quiet() {
     let body = dashboard().get("/").await.body;
-    for (class, message) in [
-        ("lane-you", "Nothing needs you right now."),
-        ("lane-agent", "No agent is working."),
-        ("lane-factory", "The factory has nothing to do."),
-        ("lane-done", "No finished jobs."),
-    ] {
-        assert!(lane_html(&body, class).contains(message), "{class}");
-    }
+    assert!(!body.contains("class=\"inbox "));
+    assert!(body.contains("Nothing needs you and no job is running."));
 
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
+    let body = dashboard.get("/").await.body;
+    assert_eq!(lanes_of(&body, id), ["inbox-running"]);
+    assert!(!body.contains("Nothing needs you and no job is running."));
+    assert!(!body.contains("inbox-you"));
+    assert!(!body.contains("inbox-done"));
+
     dashboard.apply(id, Event::Cancel);
     let body = dashboard.get("/").await.body;
-    assert!(!lane_html(&body, "lane-done").contains("No finished jobs."));
-    assert!(lane_html(&body, "lane-factory").contains("The factory has nothing to do."));
+    assert_eq!(lanes_of(&body, id), ["inbox-done"]);
+    assert!(body.contains("Nothing needs you and no job is running."));
 }
 
 #[tokio::test]
-async fn lanes_show_their_job_counts() {
+async fn sections_show_their_job_counts_in_the_order_you_act() {
     let dashboard = dashboard();
     let a = dashboard.new_job().await;
     let b = dashboard.new_job().await;
     let c = dashboard.new_job().await;
+    dashboard.new_job().await;
     to_spec_approval(&dashboard, a);
     to_spec_approval(&dashboard, b);
     dashboard.apply(c, Event::Cancel);
+    failed_out_of_rounds(&dashboard).await;
     let body = dashboard.get("/").await.body;
-    assert!(body.contains("You <span class=\"count\">2</span>"));
-    assert!(body.contains("Agent <span class=\"count\">0</span>"));
-    assert!(body.contains("Factory <span class=\"count\">0</span>"));
+    assert!(body.contains("Needs you <span class=\"count\">2</span>"));
+    assert!(body.contains("Failed <span class=\"count\">1</span>"));
+    assert!(body.contains("Running <span class=\"count\">1</span>"));
     assert!(body.contains("Done <span class=\"count\">1</span>"));
+    let at = |class: &str| body.find(&format!("class=\"inbox {class}\"")).unwrap();
+    assert!(at("inbox-you") < at("inbox-failed"));
+    assert!(at("inbox-failed") < at("inbox-running"));
+    assert!(at("inbox-running") < at("inbox-done"));
 }
 
 #[tokio::test]
-async fn done_is_a_collapsed_details_element_that_shows_its_count() {
+async fn done_shows_five_jobs_and_collapses_the_older_ones() {
     let dashboard = dashboard();
-    let id = dashboard.new_job().await;
-    dashboard.apply(id, Event::Cancel);
-    let body = dashboard.get("/").await.body;
-    assert!(body.contains(
-        "<details class=\"lane lane-done\"><summary>Done <span class=\"count\">1</span></summary>"
-    ));
-    assert!(!body.contains("<details open"));
-    assert!(!body.contains("details class=\"lane lane-done\" open"));
-    for other in ["lane-you", "lane-agent", "lane-factory"] {
-        assert!(body.contains(&format!("<section class=\"lane {other}\">")));
+    let mut ids = Vec::new();
+    for _ in 0..7 {
+        let id = dashboard.new_job().await;
+        dashboard.apply(id, Event::Cancel);
+        ids.push(id);
     }
+    let body = dashboard.get("/").await.body;
+    let done = lane_html(&body, "inbox-done");
+    assert!(done.contains("Done <span class=\"count\">7</span>"));
+    let older = &done[done.find("<details class=\"older\">").unwrap()..];
+    assert!(older.contains("<summary>Show 2 older</summary>"));
+    // Newest first, so the two oldest jobs are the collapsed ones.
+    for id in &ids[..2] {
+        assert!(older.contains(&format!("href=\"/jobs/{id}\"")), "{id}");
+    }
+    for id in &ids[2..] {
+        assert!(!older.contains(&format!("href=\"/jobs/{id}\"")), "{id}");
+    }
+    assert!(!done.contains("<details class=\"older\" open"));
 }
 
 #[tokio::test]
-async fn each_lane_lists_the_newest_job_first() {
+async fn done_has_no_collapsed_part_with_five_jobs_or_fewer() {
+    let dashboard = dashboard();
+    for _ in 0..5 {
+        let id = dashboard.new_job().await;
+        dashboard.apply(id, Event::Cancel);
+    }
+    let body = dashboard.get("/").await.body;
+    assert!(!body.contains("class=\"older\""));
+}
+
+#[tokio::test]
+async fn each_section_lists_the_newest_job_first() {
     let dashboard = dashboard();
     let first = dashboard.new_job().await;
     let second = dashboard.new_job().await;
     let body = dashboard.get("/").await.body;
-    let lane = lane_html(&body, "lane-factory");
+    let lane = lane_html(&body, "inbox-running");
     let older = lane.find(&format!("href=\"/jobs/{first}\"")).unwrap();
     let newer = lane.find(&format!("href=\"/jobs/{second}\"")).unwrap();
     assert!(newer < older);
 }
 
 #[tokio::test]
-async fn cards_show_the_id_title_badge_stage_and_requester() {
+async fn rows_show_the_id_title_badge_stage_and_requester() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     let body = dashboard.get("/").await.body;
-    let lane = lane_html(&body, "lane-factory");
+    let lane = lane_html(&body, "inbox-running");
     assert!(lane.contains(&format!("#{id}")));
     assert!(lane.contains("Add a reboot button</a>"));
     assert!(lane.contains("class=\"badge factory\">queued"));
-    assert!(lane.contains("<span>requested</span>"));
+    assert!(lane.contains("<span class=\"stage\">requested</span>"));
     let at = |needle: &str| lane.find(needle).unwrap();
-    assert!(at("class=\"id\"") < at("class=\"badge factory\""));
-    assert!(at("class=\"badge factory\"") < at("class=\"title\""));
-    assert!(at("class=\"title\"") < at("<span>requested</span>"));
-    assert!(at("<span>requested</span>") < at("class=\"requester\""));
+    assert!(at("class=\"id\"") < at("class=\"title\""));
+    assert!(at("class=\"title\"") < at("class=\"badge factory\""));
+    assert!(at("class=\"badge factory\"") < at("class=\"stage\""));
+    assert!(at("class=\"stage\"") < at("class=\"requester\""));
     assert!(at("class=\"requester\"") < at("class=\"cost\""));
     assert!(!lane.contains("maestro"));
     assert!(lane.contains("alice@example.com"));
+}
+
+#[tokio::test]
+async fn a_live_row_shows_its_place_in_the_job_flow() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("aria-label=\"Step 1 of 9: requested\""));
+
+    to_spec_approval(&dashboard, id);
+    let body = dashboard.get("/").await.body;
+    let row = lane_html(&body, "inbox-you");
+    assert!(row.contains("aria-label=\"Step 3 of 9: spec\""));
+    assert_eq!(row.matches("class=\"step done\"").count(), 2);
+    assert_eq!(row.matches("class=\"step current\"").count(), 1);
+    assert_eq!(row.matches("class=\"step\"").count(), 6);
+}
+
+#[tokio::test]
+async fn finished_rows_show_no_flow_and_no_repeated_stage() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Cancel);
+    let body = dashboard.get("/").await.body;
+    let done = lane_html(&body, "inbox-done");
+    assert!(!done.contains("class=\"steps\""));
+    assert!(!done.contains("class=\"stage\""));
+    assert!(done.contains("class=\"badge factory\">cancelled"));
+}
+
+#[tokio::test]
+async fn a_failed_row_says_why_it_failed() {
+    let dashboard = dashboard();
+    failed_out_of_rounds(&dashboard).await;
+    let body = dashboard.get("/").await.body;
+    let failed = lane_html(&body, "inbox-failed");
+    assert!(
+        failed.contains(
+            "<span class=\"stage\">5 failed check or CI rounds on one pull request</span>"
+        )
+    );
+    assert!(!failed.contains("class=\"steps\""));
+}
+
+#[tokio::test]
+async fn a_gate_row_links_to_what_you_approve() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    let body = dashboard.get("/").await.body;
+    let row = lane_html(&body, "inbox-you");
+    assert!(row.contains(&format!(
+        "<a class=\"link-button\" href=\"/jobs/{id}\">Read spec</a>"
+    )));
+    assert!(row.contains("Approve spec"));
+}
+
+#[tokio::test]
+async fn a_row_waiting_on_questions_links_to_the_job_page() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Questions(vec![Question {
+            text: "Which board?".into(),
+        }])),
+    );
+    let body = dashboard.get("/").await.body;
+    let row = lane_html(&body, "inbox-you");
+    assert!(row.contains(&format!(
+        "<a class=\"link-button\" href=\"/jobs/{id}\">Open</a>"
+    )));
+    assert!(!row.contains("<form"));
 }
 
 #[tokio::test]
@@ -2202,7 +2291,7 @@ async fn only_the_you_lane_has_forms_and_buttons() {
     let board = &body[body.find("class=\"board\"").unwrap()..];
     assert_eq!(board.matches("<form").count(), 1);
     assert_eq!(board.matches("<button").count(), 1);
-    assert!(lane_html(&body, "lane-you").contains("<form"));
+    assert!(lane_html(&body, "inbox-you").contains("<form"));
 }
 
 #[tokio::test]
@@ -2212,9 +2301,9 @@ async fn the_board_counts_only_the_selected_projects_jobs() {
     dashboard.post_job("tool", "Tool change", &[]).await;
     dashboard.post_job("tool", "Another tool change", &[]).await;
     let body = dashboard.get("/?project=tool").await.body;
-    assert!(body.contains("Factory <span class=\"count\">2</span>"));
+    assert!(body.contains("Running <span class=\"count\">2</span>"));
     let body = dashboard.get("/?project=maestro").await.body;
-    assert!(body.contains("Factory <span class=\"count\">1</span>"));
+    assert!(body.contains("Running <span class=\"count\">1</span>"));
     assert!(!body.contains("Tool change"));
 }
 
@@ -2343,7 +2432,7 @@ fn merge(dashboard: &Dashboard, id: i64) {
 }
 
 fn tile(value: &str, label: &str) -> String {
-    format!("<div class=\"stat-value\">{value}</div><div class=\"stat-label\">{label}</div>")
+    format!("<div class=\"total\"><dt>{label}</dt><dd>{value}</dd></div>")
 }
 
 #[tokio::test]
@@ -2363,7 +2452,6 @@ async fn the_stats_strip_shows_the_stored_totals() {
     assert!(body.contains(&tile("4", "Jobs created")));
     assert!(body.contains(&tile("2", "Jobs merged")));
     assert!(body.contains(&tile("50%", "Merge rate")));
-    assert!(body.contains("stroke-dasharray=\"50.0 100\""));
     assert!(body.contains(&tile("$1.75", "Cost per merged job")));
 }
 
@@ -2376,7 +2464,6 @@ async fn the_stats_strip_shows_dashes_for_a_project_without_jobs() {
     assert!(body.contains(&tile("–", "Merge rate")));
     assert!(body.contains(&tile("–", "Cost per merged job")));
     assert!(!body.contains("NaN"));
-    assert!(body.contains("stroke-dasharray=\"0.0 100\""));
     assert!(!body.contains("inf"));
 }
 
@@ -2391,7 +2478,6 @@ async fn jobs_without_a_merge_show_dashes_for_the_ratios() {
     assert!(body.contains(&tile("1", "Jobs created")));
     assert!(body.contains(&tile("–", "Jobs merged")));
     assert!(body.contains(&tile("0%", "Merge rate")));
-    assert!(body.contains("stroke-dasharray=\"0.0 100\""));
     assert!(body.contains(&tile("–", "Cost per merged job")));
     assert!(!body.contains("NaN"));
 }
@@ -2468,49 +2554,6 @@ fn merge_fraction_is_zero_without_created_jobs() {
     assert!(!fraction.is_nan());
     assert!(fraction.abs() < f64::EPSILON);
     assert!(factory_server::merge_fraction(0, 2).abs() < f64::EPSILON);
-}
-
-fn bar(lane: &str, count: usize, width: &str) -> String {
-    let title = match lane {
-        "you" => "You",
-        "agent" => "Agent",
-        _ => "Factory",
-    };
-    format!(
-        "<li class=\"bar bar-{lane}\"><span class=\"bar-label\">{title}</span><span class=\"bar-count\">{count}</span><span class=\"bar-track\"><span class=\"bar-fill\" style=\"width: {width}\"></span></span></li>"
-    )
-}
-
-#[tokio::test]
-async fn the_lane_bars_count_live_jobs_per_lane() {
-    let dashboard = dashboard();
-    for _ in 0..2 {
-        let id = dashboard.new_job().await;
-        to_spec_approval(&dashboard, id);
-    }
-    dashboard.new_job().await;
-    let merged = dashboard.new_job().await;
-    merge(&dashboard, merged);
-
-    let body = dashboard.get("/").await.body;
-    assert!(body.contains("Live jobs by lane"));
-    assert!(body.contains(&bar("you", 2, "100.0%")));
-    assert!(body.contains(&bar("agent", 0, "0.0%")));
-    assert!(body.contains(&bar("factory", 1, "50.0%")));
-    assert!(!body.contains("No live jobs."));
-}
-
-#[tokio::test]
-async fn the_lane_bars_show_an_empty_state_without_live_jobs() {
-    let dashboard = dashboard();
-    let body = dashboard.get("/").await.body;
-    assert!(body.contains("No live jobs."));
-    assert!(!body.contains("class=\"bars\""));
-
-    let id = dashboard.new_job().await;
-    merge(&dashboard, id);
-    let body = dashboard.get("/").await.body;
-    assert!(body.contains("No live jobs."));
 }
 
 fn models(clarify: Option<&str>, implement: Option<&str>) -> StageModels {
@@ -3441,15 +3484,17 @@ async fn failed_without_retry(dashboard: &Dashboard) -> i64 {
 async fn a_failed_job_sits_in_its_own_expanded_lane_above_done() {
     let dashboard = dashboard();
     let id = failed_out_of_rounds(&dashboard).await;
+    let cancelled = dashboard.new_job().await;
+    dashboard.apply(cancelled, Event::Cancel);
 
     let body = dashboard.get("/").await.body;
-    assert!(body.contains("<section class=\"lane lane-failed\">"));
+    assert!(body.contains("<section class=\"inbox inbox-failed\">"));
     assert!(body.contains("Failed <span class=\"count\">1</span>"));
-    assert_eq!(lanes_of(&body, id), ["lane-failed"]);
+    assert_eq!(lanes_of(&body, id), ["inbox-failed"]);
     // The Failed lane comes before the collapsed Done lane.
     assert!(
-        body.find("class=\"lane lane-failed\"").unwrap()
-            < body.find("class=\"lane lane-done\"").unwrap()
+        body.find("class=\"inbox inbox-failed\"").unwrap()
+            < body.find("class=\"inbox inbox-done\"").unwrap()
     );
 }
 
@@ -3458,7 +3503,7 @@ async fn the_failed_lane_is_hidden_with_no_empty_message_when_nothing_failed() {
     let dashboard = dashboard();
     dashboard.new_job().await;
     let body = dashboard.get("/").await.body;
-    assert!(!body.contains("lane-failed"));
+    assert!(!body.contains("inbox-failed"));
     assert!(!body.contains("No failed jobs."));
     assert!(!body.contains("Failed <span"));
 }
@@ -3475,8 +3520,8 @@ async fn done_counts_merged_and_cancelled_but_not_failed_jobs() {
     let body = dashboard.get("/").await.body;
     assert!(body.contains("Done <span class=\"count\">2</span>"));
     assert!(body.contains("Failed <span class=\"count\">1</span>"));
-    assert_eq!(lanes_of(&body, merged), ["lane-done"]);
-    assert_eq!(lanes_of(&body, cancelled), ["lane-done"]);
+    assert_eq!(lanes_of(&body, merged), ["inbox-done"]);
+    assert_eq!(lanes_of(&body, cancelled), ["inbox-done"]);
 }
 
 #[tokio::test]
@@ -3485,7 +3530,7 @@ async fn a_failed_card_shows_a_retry_button_that_returns_to_the_board() {
     let id = failed_out_of_rounds(&dashboard).await;
 
     let body = dashboard.get("/").await.body;
-    let lane = lane_html(&body, "lane-failed");
+    let lane = lane_html(&body, "inbox-failed");
     assert!(lane.contains(&format!("action=\"/jobs/{id}/retry\"")));
     assert!(lane.contains("name=\"project\" value=\"maestro\""));
     assert!(lane.contains(">Retry</button>"));
@@ -3507,24 +3552,10 @@ async fn a_failed_card_without_a_retry_target_shows_no_button() {
     let id = failed_without_retry(&dashboard).await;
 
     let body = dashboard.get("/").await.body;
-    let lane = lane_html(&body, "lane-failed");
+    let lane = lane_html(&body, "inbox-failed");
     assert!(lane.contains(&format!("href=\"/jobs/{id}\"")));
     assert!(!lane.contains("/retry"));
     assert!(!lane.contains("Retry"));
-}
-
-#[tokio::test]
-async fn the_live_panel_has_no_bar_for_the_failed_lane() {
-    let dashboard = dashboard();
-    failed_out_of_rounds(&dashboard).await;
-    dashboard.new_job().await;
-
-    let body = dashboard.get("/").await.body;
-    assert!(body.contains("Live jobs by lane"));
-    assert!(body.contains(&bar("you", 0, "0.0%")));
-    assert!(body.contains(&bar("agent", 0, "0.0%")));
-    assert!(body.contains(&bar("factory", 1, "100.0%")));
-    assert!(!body.contains("bar-failed"));
 }
 
 #[tokio::test]
@@ -3534,7 +3565,7 @@ async fn a_failed_job_still_counts_as_finished_for_the_30_day_expiry() {
     // The Failed lane only changes where the board shows the job. The expiry
     // loop deletes it once it is 30 days old, because it is still finished.
     assert!(dashboard.store.get(id).unwrap().job.is_finished());
-    assert_lane(&dashboard, id, "lane-failed").await;
+    assert_lane(&dashboard, id, "inbox-failed").await;
 }
 
 /// A `?skip_spend=1` body with Fable in `model_scoped`, using Unix timestamps
@@ -3569,7 +3600,7 @@ fn now() -> i64 {
 
 /// The plan usage panel on the page, or `None` when the tile is hidden.
 fn usage_tile(body: &str) -> Option<&str> {
-    let marker = "<section class=\"card plan-usage\">";
+    let marker = "<section class=\"plan-usage\">";
     let start = body.find(marker)?;
     let rest = &body[start..];
     Some(&rest[..rest.find("</section>").unwrap() + "</section>".len()])
@@ -3616,7 +3647,7 @@ async fn an_empty_cache_hides_the_tile_and_renders_the_rest() {
     assert!(!body.contains("Claude plan usage"));
     // The rest of the board renders.
     assert!(body.contains("Add a reboot button"));
-    assert!(body.contains("Live jobs by lane"));
+    assert!(body.contains("id=\"board\""));
 }
 
 #[tokio::test]
@@ -3629,7 +3660,7 @@ async fn a_stale_success_hides_the_tile() {
 
     let body = dashboard.get("/").await.body;
     assert!(usage_tile(&body).is_none());
-    assert!(body.contains("Live jobs by lane"));
+    assert!(body.contains("id=\"board\""));
 }
 
 #[tokio::test]
@@ -3642,7 +3673,7 @@ async fn an_errored_fetch_hides_the_tile() {
 
     let body = dashboard.get("/").await.body;
     assert!(usage_tile(&body).is_none());
-    assert!(body.contains("Live jobs by lane"));
+    assert!(body.contains("id=\"board\""));
 }
 
 #[tokio::test]
@@ -3676,14 +3707,20 @@ async fn each_board_region_polls_its_fragment_every_five_seconds() {
     for url in [
         "/fragments/plan-usage",
         "/fragments/stats?project=maestro",
-        "/fragments/lanes?project=maestro",
         "/fragments/board?project=maestro",
     ] {
         assert!(body.contains(&format!("hx-get=\"{url}\"")), "{url}");
     }
-    // One trigger per region: the tile, the KPI strip, the lane panel and the
-    // job cards.
-    assert_eq!(body.matches("hx-trigger=\"every 5s\"").count(), 4);
+    // One trigger per region: the usage meters, the totals line and the job
+    // rows.
+    assert_eq!(body.matches("hx-trigger=\"every 5s\"").count(), 3);
+    assert!(!body.contains("/fragments/lanes"));
+}
+
+#[tokio::test]
+async fn the_lanes_fragment_is_gone() {
+    let reply = dashboard().get("/fragments/lanes?project=maestro").await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -3691,13 +3728,24 @@ async fn the_new_request_form_is_outside_every_swapped_region() {
     let dashboard = dashboard();
     let body = dashboard.get("/").await.body;
     let form = body.find("action=\"/jobs\"").unwrap();
-    // The KPI strip, the lane panel and the job cards all come after the form,
-    // so a poll that swaps one never touches the form.
-    for id in ["id=\"stats\"", "id=\"lanes\"", "id=\"board\""] {
+    // The job rows and the totals line come after the form, so a poll that
+    // swaps one never touches the form.
+    for id in ["id=\"stats\"", "id=\"board\""] {
         assert!(body.find(id).unwrap() > form, "{id} is not after the form");
     }
     // The plan usage wrapper above the form holds the tile, not the form.
     assert!(!usage_wrapper(&body).contains("<form"));
+}
+
+#[tokio::test]
+async fn the_new_request_form_is_a_one_line_bar_with_the_image_picker() {
+    let body = dashboard().get("/").await.body;
+    assert!(body.contains("<form class=\"composer\""));
+    assert!(body.contains("rows=\"1\""));
+    assert!(body.contains("placeholder=\"Describe a change for maestro…\""));
+    assert!(body.contains("New request for maestro"));
+    assert!(body.contains("id=\"images\""));
+    assert!(body.contains("id=\"pasted-images\""));
 }
 
 #[tokio::test]
@@ -3735,22 +3783,16 @@ async fn a_new_job_shows_up_in_the_board_fragment() {
 }
 
 #[tokio::test]
-async fn a_lane_change_shows_up_in_the_board_and_lane_fragments() {
+async fn a_lane_change_shows_up_in_the_board_fragment() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    // Queued, so the job is in the Factory lane and its bar leads.
     let board = dashboard.get("/fragments/board?project=maestro").await.body;
-    assert_eq!(lanes_of(&board, id), ["lane-factory"]);
-    let lanes = dashboard.get("/fragments/lanes?project=maestro").await.body;
-    assert!(lanes.contains(&bar("factory", 1, "100.0%")));
+    assert_eq!(lanes_of(&board, id), ["inbox-running"]);
 
     to_spec_approval(&dashboard, id);
-    // The spec is ready, so the same job moves to the You lane.
+    // The spec is ready, so the same job moves to Needs you.
     let board = dashboard.get("/fragments/board?project=maestro").await.body;
-    assert_eq!(lanes_of(&board, id), ["lane-you"]);
-    let lanes = dashboard.get("/fragments/lanes?project=maestro").await.body;
-    assert!(lanes.contains(&bar("you", 1, "100.0%")));
-    assert!(lanes.contains(&bar("factory", 0, "0.0%")));
+    assert_eq!(lanes_of(&board, id), ["inbox-you"]);
 }
 
 #[tokio::test]
@@ -3765,7 +3807,7 @@ async fn the_plan_usage_fragment_hides_and_reappears_with_the_cache() {
         .usage
         .record_success(usage(USAGE_WITH_FABLE), now());
     let fresh = dashboard.get("/fragments/plan-usage").await.body;
-    assert!(fresh.contains("<section class=\"card plan-usage\">"));
+    assert!(fresh.contains("<section class=\"plan-usage\">"));
     assert!(fresh.contains("Claude plan usage"));
     assert!(fresh.contains("Fable"));
 

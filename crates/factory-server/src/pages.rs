@@ -113,33 +113,9 @@ pub fn index(
         &html! {
             (plan_usage_region(plan_usage))
             @if let Some(selected) = selected {
-                form.card method="post" action="/jobs" enctype="multipart/form-data" {
-                    h2.form-title { "New request for " (selected) }
-                    input type="hidden" name="project" value=(selected);
-                    div.field {
-                        label for="request" { "What should change?" }
-                        textarea #request name="request" required
-                            placeholder="Add a reboot button to the device page" {}
-                    }
-                    div.field {
-                        label for="images" { "Images (optional)" }
-                        div.file-picker {
-                            input #images type="file" name="images" multiple
-                                accept="image/png,image/jpeg,image/gif,image/webp"
-                                class="visually-hidden";
-                            label.file-button for="images" { "Choose images" }
-                            span.hint { "PNG, JPEG, GIF or WebP. You can also paste them into the box above." }
-                        }
-                        ul #pasted-images.pasted-images {}
-                    }
-                    div.form-actions { button.primary { "Request" } }
-                    script { (PreEscaped(PASTE_IMAGES)) }
-                }
-                div.overview {
-                    (stats(totals, selected))
-                    (lane_counts(&all, auto_merge, selected))
-                }
+                (composer(selected))
                 (board(&all, costs, auto_merge, selected))
+                (stats(totals, selected))
             } @else {
                 div.card {
                     p.empty { "No projects are configured." }
@@ -150,96 +126,67 @@ pub fn index(
     )
 }
 
-/// A bar list of the live jobs per lane. Done jobs are not live. The longest
-/// bar is the lane with the most jobs, and the others scale against it.
-#[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
-pub fn lane_counts(rows: &[&JobRow], auto_merge: bool, project: &str) -> Markup {
-    let counts: Vec<(Lane, usize)> = Lane::ALL
-        .into_iter()
-        .filter(|lane| matches!(lane, Lane::You | Lane::Agent | Lane::Factory))
-        .map(|lane| {
-            let count = rows
-                .iter()
-                .filter(|row| status(&row.job, auto_merge).lane == lane)
-                .count();
-            (lane, count)
-        })
-        .collect();
-    let longest = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
+/// The new-request form as a one-line bar. It grows, and shows the image
+/// picker, once it has focus or text, so it takes little room on a board
+/// that is opened more often to check on jobs than to file one.
+fn composer(project: &str) -> Markup {
     html! {
-        section.card.lane-counts #lanes hx-get=(fragment_url("lanes", project))
-            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
-            h2 { "Live jobs by lane" }
-            @if longest == 0 {
-                p.empty { "No live jobs." }
-            } @else {
-                ul.bars {
-                    @for (lane, count) in counts {
-                        @let width = format!("{:.1}%", count as f64 / longest as f64 * 100.0);
-                        li class={ "bar bar-" (lane.name()) } {
-                            span.bar-label { (lane.title()) }
-                            span.bar-count { (count) }
-                            span.bar-track { span.bar-fill style={ "width: " (width) } {} }
-                        }
-                    }
-                }
+        form.composer method="post" action="/jobs" enctype="multipart/form-data" {
+            input type="hidden" name="project" value=(project);
+            label.visually-hidden for="request" { "New request for " (project) }
+            div.composer-line {
+                textarea #request name="request" required rows="1"
+                    placeholder={ "Describe a change for " (project) "…" } {}
+                button.primary { "Request" }
             }
+            div.composer-more {
+                div.file-picker {
+                    input #images type="file" name="images" multiple
+                        accept="image/png,image/jpeg,image/gif,image/webp"
+                        class="visually-hidden";
+                    label.file-button for="images" { "Attach images" }
+                    span.hint { "PNG, JPEG, GIF or WebP. You can also paste them into the box above." }
+                }
+                ul #pasted-images.pasted-images {}
+            }
+            script { (PreEscaped(PASTE_IMAGES)) }
         }
     }
 }
 
 const NO_VALUE: &str = "–";
 
-/// The KPI strip: large-number tiles for the project's totals and a gauge
-/// for the merge rate. A figure that is zero or would divide by zero shows a
-/// dash.
+/// The project's totals as one line under the board. A figure that is zero
+/// or would divide by zero shows a dash.
 #[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
 pub fn stats(totals: ProjectTotals, project: &str) -> Markup {
     let created = totals.jobs_created;
     let merged = totals.jobs_merged;
     let average = (merged > 0).then(|| format_cost(totals.usd / merged as f64));
-    let tiles = [
+    let rate = if created > 0 {
+        format!("{:.0}%", merge_fraction(created, merged) * 100.0)
+    } else {
+        NO_VALUE.to_owned()
+    };
+    let figures = [
         ("Total API cost", format_cost(totals.usd)),
         ("Jobs created", count_or_dash(created)),
         ("Jobs merged", count_or_dash(merged)),
+        ("Merge rate", rate),
         (
             "Cost per merged job",
             average.unwrap_or_else(|| NO_VALUE.to_owned()),
         ),
     ];
     html! {
-        div.stats #stats hx-get=(fragment_url("stats", project))
+        dl.totals #stats hx-get=(fragment_url("stats", project))
             hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
-            @for (label, value) in tiles {
-                div.card.stat {
-                    div.stat-value { (value) }
-                    div.stat-label { (label) }
+            @for (label, value) in figures {
+                div.total {
+                    dt { (label) }
+                    dd { (value) }
                 }
             }
-            (merge_gauge(created, merged))
-        }
-    }
-}
-
-/// A half-circle gauge filled to the merge rate. The arc has `pathLength` 100,
-/// so the dash length is the percentage.
-fn merge_gauge(created: i64, merged: i64) -> Markup {
-    let fraction = merge_fraction(created, merged);
-    let label = if created > 0 {
-        format!("{:.0}%", fraction * 100.0)
-    } else {
-        NO_VALUE.to_owned()
-    };
-    let fill = format!("{:.1} 100", fraction * 100.0);
-    html! {
-        div.card.stat.gauge {
-            svg.gauge-arc viewBox="0 0 100 56" role="img" aria-label=(format!("Merge rate {label}")) {
-                path.gauge-track d="M 10 50 A 40 40 0 0 1 90 50" pathLength="100" {}
-                path.gauge-fill d="M 10 50 A 40 40 0 0 1 90 50" pathLength="100"
-                    stroke-dasharray=(fill) {}
-            }
-            div.stat-value { (label) }
-            div.stat-label { "Merge rate" }
         }
     }
 }
@@ -271,7 +218,7 @@ pub fn plan_usage(usage: Option<&PlanUsage>) -> Markup {
 /// the account.
 fn plan_usage_panel(usage: &PlanUsage) -> Markup {
     html! {
-        section.card.plan-usage {
+        section.plan-usage {
             h2 { "Claude plan usage" }
             ul.usage-windows {
                 (usage_window("5-hour", &usage.five_hour))
@@ -287,12 +234,13 @@ fn plan_usage_panel(usage: &PlanUsage) -> Markup {
 fn usage_window(label: &str, window: &UsageWindow) -> Markup {
     let percent = window.percent_used();
     let fill = format!("{:.1}%", percent.clamp(0.0, 100.0));
+    let reset = format!("resets {}", format_reset(window.resets_at));
     html! {
-        li.usage-window {
+        li.usage-window title=(reset) {
             span.usage-name { (label) }
-            span.usage-percent { (format!("{percent:.0}% used")) }
-            span.usage-reset { "resets " (format_reset(window.resets_at)) }
             span.usage-track { span.usage-fill style={ "width: " (fill) } {} }
+            span.usage-percent { (format!("{percent:.0}% used")) }
+            span.usage-reset { (reset) }
         }
     }
 }
@@ -622,55 +570,55 @@ enum Lane {
     Done,
 }
 
-impl Lane {
-    const ALL: [Lane; 5] = [
-        Lane::You,
-        Lane::Agent,
-        Lane::Factory,
-        Lane::Failed,
-        Lane::Done,
+/// The board's sections, top to bottom, in the order you act on them. Agent
+/// and Factory share Running, and each row's badge says which one has the
+/// turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    You,
+    Failed,
+    Running,
+    Done,
+}
+
+impl Section {
+    const ALL: [Section; 4] = [
+        Section::You,
+        Section::Failed,
+        Section::Running,
+        Section::Done,
     ];
+
+    fn of(lane: Lane) -> Section {
+        match lane {
+            Lane::You => Section::You,
+            Lane::Failed => Section::Failed,
+            Lane::Agent | Lane::Factory => Section::Running,
+            Lane::Done => Section::Done,
+        }
+    }
 
     fn title(self) -> &'static str {
         match self {
-            Lane::You => "You",
-            Lane::Agent => "Agent",
-            Lane::Factory => "Factory",
-            Lane::Failed => "Failed",
-            Lane::Done => "Done",
+            Section::You => "Needs you",
+            Section::Failed => "Failed",
+            Section::Running => "Running",
+            Section::Done => "Done",
         }
     }
 
     fn name(self) -> &'static str {
         match self {
-            Lane::You => "you",
-            Lane::Agent => "agent",
-            Lane::Factory => "factory",
-            Lane::Failed => "failed",
-            Lane::Done => "done",
-        }
-    }
-
-    fn class(self) -> &'static str {
-        match self {
-            Lane::You => "lane lane-you",
-            Lane::Agent => "lane lane-agent",
-            Lane::Factory => "lane lane-factory",
-            Lane::Failed => "lane lane-failed",
-            Lane::Done => "lane lane-done",
-        }
-    }
-
-    fn empty(self) -> &'static str {
-        match self {
-            Lane::You => "Nothing needs you right now.",
-            Lane::Agent => "No agent is working.",
-            Lane::Factory => "The factory has nothing to do.",
-            Lane::Failed => "No failed jobs.",
-            Lane::Done => "No finished jobs.",
+            Section::You => "you",
+            Section::Failed => "failed",
+            Section::Running => "running",
+            Section::Done => "done",
         }
     }
 }
+
+/// Done lists this many jobs. The older ones sit in a collapsed `<details>`.
+const DONE_SHOWN: usize = 5;
 
 pub fn board(
     rows: &[&JobRow],
@@ -678,29 +626,32 @@ pub fn board(
     auto_merge: bool,
     project: &str,
 ) -> Markup {
+    let in_section = |section: Section| -> Vec<&JobRow> {
+        rows.iter()
+            .copied()
+            .filter(|row| Section::of(status(&row.job, auto_merge).lane) == section)
+            .collect()
+    };
+    let live = rows.iter().any(|row| !row.job.is_finished());
     html! {
         div.board #board hx-get=(fragment_url("board", project))
             hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
-            @for lane in Lane::ALL {
-                @let cards: Vec<&JobRow> = rows
-                    .iter()
-                    .copied()
-                    .filter(|row| status(&row.job, auto_merge).lane == lane)
-                    .collect();
-                @match lane {
-                    Lane::Done => {
-                        details class=(lane.class()) {
-                            summary { (lane.title()) " " span.count { (cards.len()) } }
-                            (lane_cards(&cards, costs, auto_merge, lane))
-                        }
-                    }
-                    // The Failed lane appears only when a job has failed, and
-                    // shows no empty message.
-                    Lane::Failed if cards.is_empty() => {}
-                    _ => {
-                        section class=(lane.class()) {
-                            h2 { (lane.title()) " " span.count { (cards.len()) } }
-                            (lane_cards(&cards, costs, auto_merge, lane))
+            @if !live {
+                p.board-quiet { "Nothing needs you and no job is running." }
+            }
+            @for section in Section::ALL {
+                @let jobs = in_section(section);
+                @if !jobs.is_empty() {
+                    section class={ "inbox inbox-" (section.name()) } {
+                        h2 { (section.title()) " " span.count { (jobs.len()) } }
+                        @if section == Section::Done && jobs.len() > DONE_SHOWN {
+                            (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge))
+                            details.older {
+                                summary { "Show " (jobs.len() - DONE_SHOWN) " older" }
+                                (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge))
+                            }
+                        } @else {
+                            (job_rows(&jobs, costs, auto_merge))
                         }
                     }
                 }
@@ -709,47 +660,118 @@ pub fn board(
     }
 }
 
-fn lane_cards(
-    cards: &[&JobRow],
-    costs: &HashMap<i64, f64>,
-    auto_merge: bool,
-    lane: Lane,
-) -> Markup {
+fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Markup {
     html! {
-        @if cards.is_empty() {
-            p.empty { (lane.empty()) }
-        } @else {
-            ul.jobs {
-                @for row in cards {
-                    li.card.job {
-                        div.job-head {
-                            span.id { "#" (row.id) }
-                            (turn_badge(&row.job, auto_merge))
-                        }
-                        a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
-                            (first_line(row.job.request()))
-                        }
-                        div.job-sub {
-                            span { (stage_label(&row.job)) }
-                            span.requester title=(row.requested_by) { (row.requested_by) }
-                            span.cost { (cost_label(costs.get(&row.id).copied().unwrap_or(0.0))) }
-                        }
-                        @if lane == Lane::You {
-                            @if let Some(gate) = gate_name(&row.job) {
-                                form.approve method="post" action={ "/jobs/" (row.id) "/approve" } {
-                                    input type="hidden" name="project" value=(row.project);
-                                    button.primary { "Approve " (gate) }
-                                }
-                            }
-                        }
-                        @if lane == Lane::Failed && row.job.can_retry() {
-                            form.retry method="post" action={ "/jobs/" (row.id) "/retry" } {
-                                input type="hidden" name="project" value=(row.project);
-                                button.primary { "Retry" }
-                            }
-                        }
+        ul.jobs {
+            @for row in rows {
+                @let lane = status(&row.job, auto_merge).lane;
+                li class={ "job job-" (Section::of(lane).name()) } {
+                    span.id { "#" (row.id) }
+                    a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
+                        (first_line(row.job.request()))
                     }
+                    div.job-sub {
+                        (turn_badge(&row.job, auto_merge))
+                        @if !row.job.is_finished() { (flow_steps(&row.job)) }
+                        @if let Some(detail) = row_detail(&row.job) {
+                            span.stage { (detail) }
+                        }
+                        span.requester title=(row.requested_by) { (row.requested_by) }
+                        span.cost { (cost_label(costs.get(&row.id).copied().unwrap_or(0.0))) }
+                    }
+                    (row_actions(row, lane))
                 }
+            }
+        }
+    }
+}
+
+/// The stage of a live job, or why a failed one failed. A merged or
+/// cancelled job has none, because its badge already says so.
+fn row_detail(job: &Job) -> Option<String> {
+    match job.stage() {
+        Stage::Failed { reason, .. } => Some(first_line(reason)),
+        Stage::Merged | Stage::Cancelled => None,
+        _ => Some(stage_label(job)),
+    }
+}
+
+/// Approve for a spec or plan gate, next to a link to read what you approve.
+/// Retry for a failed job that can resume. Any other job that waits on you
+/// links to its page, where the answer and review controls are.
+fn row_actions(row: &JobRow, lane: Lane) -> Markup {
+    let page = format!("/jobs/{}", row.id);
+    html! {
+        @if lane == Lane::You {
+            div.job-actions {
+                @if let Some(gate) = gate_name(&row.job) {
+                    a.link-button href=(page) { "Read " (gate) }
+                    form.approve method="post" action={ (page) "/approve" } {
+                        input type="hidden" name="project" value=(row.project);
+                        button.primary { "Approve " (gate) }
+                    }
+                } @else {
+                    a.link-button href=(page) { "Open" }
+                }
+            }
+        }
+        @if lane == Lane::Failed && row.job.can_retry() {
+            div.job-actions {
+                form.retry method="post" action={ (page) "/retry" } {
+                    input type="hidden" name="project" value=(row.project);
+                    button.primary { "Retry" }
+                }
+            }
+        }
+    }
+}
+
+/// The job flow's steps, with the per-pull-request steps once. A job with
+/// several pull requests shows the steps of the one it is on, and its stage
+/// label says which.
+const FLOW: [&str; 9] = [
+    "requested",
+    "clarifying",
+    "spec",
+    "plan",
+    "implementing",
+    "verifying",
+    "pr-open",
+    "ci-and-review",
+    "merged",
+];
+
+fn flow_index(stage: &Stage) -> Option<usize> {
+    Some(match stage {
+        Stage::Requested => 0,
+        Stage::Clarifying => 1,
+        Stage::Spec => 2,
+        Stage::Plan => 3,
+        Stage::Implementing { .. } => 4,
+        Stage::Verifying { .. } => 5,
+        Stage::PrOpen { .. } => 6,
+        Stage::CiAndReview { .. } => 7,
+        Stage::Merged => 8,
+        Stage::Cancelled | Stage::Failed { .. } => return None,
+    })
+}
+
+/// A row of small segments, one per step of [`FLOW`]: done, current, or to
+/// come.
+fn flow_steps(job: &Job) -> Markup {
+    let Some(current) = flow_index(job.stage()) else {
+        return html! {};
+    };
+    let label = format!("Step {} of {}: {}", current + 1, FLOW.len(), FLOW[current]);
+    html! {
+        span.steps role="img" aria-label=(label) title=(label) {
+            @for i in 0..FLOW.len() {
+                @let class = match i.cmp(&current) {
+                    std::cmp::Ordering::Less => "step done",
+                    std::cmp::Ordering::Equal => "step current",
+                    std::cmp::Ordering::Greater => "step",
+                };
+                span class=(class) {}
             }
         }
     }

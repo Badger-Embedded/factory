@@ -65,7 +65,6 @@ pub fn app(
         .route("/", get(index))
         .route("/fragments/plan-usage", get(plan_usage_fragment))
         .route("/fragments/stats", get(stats_fragment))
-        .route("/fragments/lanes", get(lanes_fragment))
         .route("/fragments/board", get(board_fragment))
         .route("/style.css", get(stylesheet))
         .route("/htmx.min.js", get(htmx))
@@ -253,17 +252,6 @@ async fn stats_fragment(
         return Ok(html! {});
     };
     Ok(pages::stats(data.totals, project))
-}
-
-async fn lanes_fragment(
-    State(state): State<AppState>,
-    Query(query): Query<IndexQuery>,
-) -> Result<Markup, AppError> {
-    let data = load_board(&state, query.project)?;
-    let Some(project) = data.selected.as_deref() else {
-        return Ok(html! {});
-    };
-    Ok(pages::lane_counts(&data.rows(), data.auto_merge, project))
 }
 
 async fn board_fragment(
