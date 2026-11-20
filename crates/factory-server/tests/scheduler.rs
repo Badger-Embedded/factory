@@ -9,7 +9,7 @@ use factory_core::{
 use factory_runner::{Expect, LogLine, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Scheduler,
-    Settings, Store, SummaryRequest, WatchReport, WatchRequest,
+    Settings, Store, SummaryRequest, WatchReport, WatchRequest, format_cost,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -28,6 +28,7 @@ struct FakeExecutor {
     gate: Semaphore,
     respond: Respond,
     requests: Mutex<Vec<AgentRequest>>,
+    costs: Mutex<VecDeque<Option<f64>>>,
     stopped: Mutex<Vec<i64>>,
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
@@ -44,6 +45,7 @@ impl FakeExecutor {
             gate: Semaphore::new(0),
             respond: Box::new(respond),
             requests: Mutex::new(Vec::new()),
+            costs: Mutex::new(VecDeque::new()),
             stopped: Mutex::new(Vec::new()),
             checks: Mutex::new(VecDeque::new()),
             checks_run: Mutex::new(Vec::new()),
@@ -77,7 +79,7 @@ impl Executor for FakeExecutor {
         RunReport {
             event: (self.respond)(&request),
             session_id: Some(request.session_id),
-            cost_usd: Some(0.12),
+            cost_usd: self.costs.lock().unwrap().pop_front().unwrap_or(Some(0.12)),
         }
     }
 
@@ -412,6 +414,101 @@ async fn a_job_for_an_unknown_project_fails() {
         store.get(id).unwrap().job.stage(),
         Stage::Failed { reason } if reason.contains("\"gone\"")
     ));
+}
+
+/// Runs a clarify run that asks a question, answers it, and runs again, with
+/// the executor reporting `costs` for the two runs.
+async fn two_clarify_runs(
+    costs: [Option<f64>; 2],
+) -> (Arc<Store>, Arc<Scheduler<FakeExecutor>>, i64) {
+    let (store, executor, scheduler) = setup(|request| {
+        if request.prompt.contains("A: rpi5") {
+            Event::Agent(AgentResult::Clarified)
+        } else {
+            questions()
+        }
+    });
+    executor.costs.lock().unwrap().extend(costs);
+    executor.release(10);
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+    (store, scheduler, id)
+}
+
+#[tokio::test]
+async fn costs_sum_over_the_runs_of_a_job() {
+    let (store, _scheduler, id) = two_clarify_runs([Some(0.5), Some(1.25)]).await;
+
+    assert!((store.cost_usd(id).unwrap() - 1.75).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn a_run_without_a_cost_leaves_the_total_alone() {
+    let (store, _scheduler, id) = two_clarify_runs([Some(0.5), None]).await;
+
+    assert!((store.cost_usd(id).unwrap() - 0.5).abs() < 1e-9);
+    let finished: Vec<String> = store
+        .logs(id, 20)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .filter(|text| text.starts_with("Agent run finished"))
+        .collect();
+    assert_eq!(
+        finished,
+        [
+            format!("Agent run finished, {} at API prices.", format_cost(0.5)),
+            "Agent run finished.".to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_job_that_never_ran_costs_nothing() {
+    let (store, _executor, _scheduler) = setup(|_| questions());
+    let id = store.create("maestro", "alice", "x").unwrap();
+
+    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
+}
+
+#[tokio::test]
+async fn a_cancelled_job_keeps_its_cost() {
+    let (store, _scheduler, id) = two_clarify_runs([Some(0.5), Some(0.25)]).await;
+    store.apply(id, Event::Cancel).unwrap();
+
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Cancelled);
+    assert!((store.cost_usd(id).unwrap() - 0.75).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn a_failed_job_keeps_its_cost() {
+    let (store, executor, scheduler) = setup(|_| Event::AgentFailed {
+        reason: "the worker exited without a result".into(),
+    });
+    executor.costs.lock().unwrap().push_back(Some(0.4));
+    executor.release(1);
+    let id = store.create("maestro", "alice", "x").unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+    assert!((store.cost_usd(id).unwrap() - 0.4).abs() < 1e-9);
+}
+
+#[test]
+fn cost_formats_as_dollars_and_cents() {
+    assert_eq!(format_cost(1.234), "$1.23");
+    assert_eq!(format_cost(0.0), "$0.00");
+    assert_eq!(format_cost(12.0), "$12.00");
 }
 
 /// Runs the job until its first pull request's commits are ready.

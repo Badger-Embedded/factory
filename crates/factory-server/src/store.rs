@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS job_images (
     name TEXT NOT NULL,
     PRIMARY KEY (job_id, name)
 );
+CREATE TABLE IF NOT EXISTS job_costs (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
+    usd REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pr_watermarks (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     pr INTEGER NOT NULL,
@@ -209,7 +213,13 @@ impl Store {
         }
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        for table in ["job_images", "pr_watermarks", "logs", "sessions"] {
+        for table in [
+            "job_images",
+            "job_costs",
+            "pr_watermarks",
+            "logs",
+            "sessions",
+        ] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
         tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
@@ -251,6 +261,37 @@ impl Store {
             )?;
         }
         Ok(tx.commit()?)
+    }
+
+    /// Adds `usd` to the running API cost of job `id`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn add_cost(&self, id: i64, usd: f64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO job_costs (job_id, usd) VALUES (?1, ?2)
+             ON CONFLICT (job_id) DO UPDATE SET usd = usd + excluded.usd",
+            params![id, usd],
+        )?;
+        Ok(())
+    }
+
+    /// The API cost of job `id` in USD, summed over its agent runs. A job
+    /// with no recorded cost, such as one from before costs were stored,
+    /// reads 0.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn cost_usd(&self, id: i64) -> Result<f64, StoreError> {
+        let usd = self
+            .conn()
+            .query_row("SELECT usd FROM job_costs WHERE job_id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(usd.unwrap_or(0.0))
     }
 
     /// The image file names saved for job `id`, in upload order.

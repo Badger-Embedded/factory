@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::cost::format_cost;
 use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, Store, StoreError};
@@ -481,9 +482,14 @@ impl<E: Executor> Scheduler<E> {
             }
         });
         let report = self.executor.run_agent(settings, request, sink).await;
-        let cost = report
-            .cost_usd
-            .map_or(String::new(), |cost| format!(", ${cost:.2} at API prices"));
+        if let Some(usd) = report.cost_usd
+            && let Err(err) = self.store.add_cost(job_id, usd)
+        {
+            tracing::error!("job {job_id}: {err}");
+        }
+        let cost = report.cost_usd.map_or(String::new(), |usd| {
+            format!(", {} at API prices", format_cost(usd))
+        });
         self.note(job_id, &format!("Agent run finished{cost}."));
         self.apply(job_id, report.event);
     }

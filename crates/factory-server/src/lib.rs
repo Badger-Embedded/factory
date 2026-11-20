@@ -1,5 +1,6 @@
 //! The factory's dashboard and job store.
 
+mod cost;
 mod pages;
 mod podman;
 mod projects;
@@ -8,6 +9,7 @@ mod settings;
 mod store;
 mod web;
 
+pub use cost::format_cost;
 pub use podman::PodmanExecutor;
 pub use projects::{Project, Projects, ProjectsError};
 pub use scheduler::{
