@@ -22,6 +22,6 @@ pub use outcome::{Expect, event_from_result};
 pub use prompt::{job_prompt, prompt};
 pub use stream::{LogLine, ResultMessage, StreamItem, parse_line};
 pub use worker::{
-    AGENT_SETTINGS, RunReport, SessionRun, WorkerConfig, WorkerRun, podman_args, remove_container,
-    run,
+    AGENT_SETTINGS, McpConfig, RunReport, SessionRun, WorkerConfig, WorkerRun, podman_args,
+    remove_container, run,
 };

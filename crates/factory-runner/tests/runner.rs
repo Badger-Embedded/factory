@@ -7,7 +7,7 @@ use factory_core::{
     Task,
 };
 use factory_runner::{
-    Expect, LogLine, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
+    Expect, LogLine, McpConfig, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
     event_from_result, job_prompt, parse_line, place_images, podman_args, prompt, remove_container,
     run, show_images,
 };
@@ -51,6 +51,7 @@ fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
         prompt: "Write the spec.".into(),
         model: None,
         effort: None,
+        mcp: None,
     }
 }
 
@@ -646,6 +647,70 @@ fn podman_args_pass_the_set_effort_to_claude() {
         let args = args_with_effort(Expect::Commits, Some(effort));
         assert_eq!(value_after(&args, "--effort"), effort, "{effort}");
     }
+}
+
+#[test]
+fn podman_args_pass_no_mcp_config_without_an_active_server() {
+    // A run with no MCP, and a config whose server list is empty, both add
+    // nothing, so the arguments match a run from before MCP.
+    for mcp in [None, Some(Vec::new())] {
+        let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+        run.mcp = mcp.map(|servers| McpConfig {
+            proxy_url: "http://factory:8081".into(),
+            token: "unused".into(),
+            servers,
+        });
+        let args = strings(&podman_args(&WorkerConfig::default(), &run));
+        assert!(!args.iter().any(|arg| arg == "--mcp-config"), "{args:?}");
+    }
+}
+
+#[test]
+fn podman_args_give_each_active_server_a_proxy_entry_with_the_run_token() {
+    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Resume(SESSION.into()));
+    run.mcp = Some(McpConfig {
+        proxy_url: "http://factory:8081".into(),
+        token: "d34db33f".into(),
+        servers: vec!["context7".into(), "docs".into()],
+    });
+    let args = strings(&podman_args(&WorkerConfig::default(), &run));
+
+    // The flag sits in the claude arguments, after the image.
+    let image = args.iter().position(|arg| arg == "claude").unwrap();
+    assert!(args.iter().position(|arg| arg == "--mcp-config").unwrap() > image);
+
+    let config: Value = serde_json::from_str(value_after(&args, "--mcp-config")).unwrap();
+    let servers = config["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 2);
+    for name in ["context7", "docs"] {
+        let entry = &servers[name];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], format!("http://factory:8081/mcp/{name}"));
+        assert_eq!(
+            entry["headers"],
+            json!({ "Authorization": "Bearer d34db33f" }),
+            "the run token is the entry's only header"
+        );
+    }
+}
+
+#[test]
+fn podman_args_attach_the_worker_to_the_configured_network() {
+    let config = WorkerConfig {
+        network: Some("factory".into()),
+        ..WorkerConfig::default()
+    };
+    let run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+    let args = strings(&podman_args(&config, &run));
+
+    assert_eq!(value_after(&args, "--network"), "factory");
+    // The network flag is a `podman run` flag, before the image.
+    let image = args.iter().position(|arg| arg == "claude").unwrap();
+    assert!(args.iter().position(|arg| arg == "--network").unwrap() < image);
+
+    // The default leaves podman's own network, so no run before MCP changes.
+    let plain = strings(&podman_args(&WorkerConfig::default(), &run));
+    assert!(!plain.iter().any(|arg| arg == "--network"), "{plain:?}");
 }
 
 fn planned(title: &str) -> PlannedPr {

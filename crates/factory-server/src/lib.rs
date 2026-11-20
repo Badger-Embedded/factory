@@ -26,9 +26,9 @@ pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, import_tomls};
 pub use proxy::{ProxyWarning, RunTokens, StoreUpstreams, Upstream, Upstreams, WarnFn, proxy_app};
 pub use scheduler::{
-    AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, PublishRequest, Published,
-    ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest, branch_name,
-    ready_action,
+    AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, McpRuntime, PublishRequest,
+    Published, ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest,
+    branch_name, ready_action,
 };
 pub use secrets::{
     LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore,

@@ -43,6 +43,12 @@ pub struct WorkerConfig {
     /// More `--volume` values for every worker, such as a named volume for
     /// the nix store that all workers share.
     pub volumes: Vec<String>,
+    /// The podman network every worker joins, so it can reach the factory's
+    /// MCP proxy by the factory container's name. `None` leaves podman's
+    /// default network, which has no route to the proxy. The dashboard port is
+    /// published to the host loopback alone, so a worker on this network cannot
+    /// reach it.
+    pub network: Option<String>,
 }
 
 impl Default for WorkerConfig {
@@ -55,7 +61,51 @@ impl Default for WorkerConfig {
             token_secret: "claude-token".into(),
             plugin_dir: None,
             volumes: Vec::new(),
+            network: None,
         }
+    }
+}
+
+/// The MCP servers active for one run, and how the worker reaches them. The
+/// factory passes each as an `http` entry to `claude --mcp-config`, pointed at
+/// the proxy with the per-run token, so a server credential never enters the
+/// worker: the proxy swaps the token for the project's stored headers. The
+/// scheduler builds this only when at least one server is active, so a run
+/// with none passes no MCP flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConfig {
+    /// The proxy's base URL the worker reaches, such as `http://factory:8081`.
+    pub proxy_url: String,
+    /// The per-run bearer token the proxy checks. It is the entry's only
+    /// header, scoped to this job and these servers, and revoked when the run
+    /// ends.
+    pub token: String,
+    /// The active server names. Each becomes one `http` entry keyed by the
+    /// name, pointing at `<proxy_url>/mcp/<name>`. Never empty when this is set.
+    pub servers: Vec<String>,
+}
+
+impl McpConfig {
+    /// The JSON for `claude --mcp-config`: one `http` entry per active server,
+    /// each pointing at the proxy and carrying `Authorization: Bearer <token>`
+    /// as its only header. No stored credential appears here; the proxy adds it.
+    #[must_use]
+    fn to_arg(&self) -> String {
+        let servers: serde_json::Map<String, serde_json::Value> = self
+            .servers
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "type": "http",
+                        "url": format!("{}/mcp/{name}", self.proxy_url),
+                        "headers": { "Authorization": format!("Bearer {}", self.token) },
+                    }),
+                )
+            })
+            .collect();
+        serde_json::json!({ "mcpServers": servers }).to_string()
     }
 }
 
@@ -138,6 +188,9 @@ pub struct WorkerRun {
     /// older server, runs at [`DEFAULT_EFFORT`], so a run always passes an
     /// explicit level.
     pub effort: Option<String>,
+    /// The MCP servers active for this run, or `None` when none is. `None`
+    /// passes no `--mcp-config`, so the arguments are unchanged.
+    pub mcp: Option<McpConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,6 +227,13 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
         WORK_DIR,
     ] {
         push(arg);
+    }
+    // The worker joins the factory's podman network so it can reach the MCP
+    // proxy by the factory container's name. It is added before the image, with
+    // the other `podman run` flags.
+    if let Some(network) = &config.network {
+        args.push("--network".into());
+        args.push(network.into());
     }
     let mut mount = |host: &PathBuf, target: &str, options: &str| {
         let mut volume = OsString::from(host.as_os_str());
@@ -222,6 +282,13 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     }
     let effort = run.effort.as_deref().unwrap_or(DEFAULT_EFFORT);
     args.extend(["--effort".into(), effort.into()]);
+    // One `http` entry per active MCP server, pointed at the proxy with the run
+    // token. A run with no active server adds nothing, so its arguments match a
+    // run from before MCP.
+    if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
+        args.push("--mcp-config".into());
+        args.push(mcp.to_arg().into());
+    }
     args
 }
 
