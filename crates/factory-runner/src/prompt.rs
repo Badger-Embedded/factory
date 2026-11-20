@@ -90,6 +90,9 @@ fn review_prompt() -> String {
      against the base branch the checkout is on. Check the change for correctness and \
      for the repository's own rules in CLAUDE.md and CONTRIBUTING.md. Do not change any \
      files and do not push.\n\n\
+     The factory's review skill describes the method. The repository you are reviewing \
+     may carry its own review, lint or project skills; use them, since they know rules \
+     this prompt does not.\n\n\
      End with outcome \"approve\" when the change is ready to merge, or \"changes\" with \
      feedback the author can act on when it is not."
         .to_owned()
