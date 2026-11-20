@@ -90,12 +90,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!("workers are off, set FACTORY_WORKERS=podman to run jobs");
     }
 
+    let plan_usage = Arc::new(PlanUsageCache::new());
     if let Some(token) = claude_token() {
         let source = CurlUsageSource {
             curl: path_var("FACTORY_CURL", "curl"),
             token,
         };
-        tokio::spawn(refresh_forever(source, Arc::new(PlanUsageCache::new())));
+        tokio::spawn(refresh_forever(source, Arc::clone(&plan_usage)));
         tracing::info!("refreshing Claude plan usage every {PLAN_USAGE_REFRESH:?}");
     } else {
         tracing::info!("no Claude token, the plan usage tile is off");
@@ -103,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
-    axum::serve(listener, app(store, projects, wake, data_dir))
+    axum::serve(listener, app(store, projects, wake, data_dir, plan_usage))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

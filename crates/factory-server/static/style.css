@@ -202,6 +202,21 @@ h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
 .bar-you .bar-fill { background: var(--you); }
 .bar-agent .bar-fill { background: var(--agent); }
 .bar-count { font-weight: var(--weight-semibold); }
+
+.plan-usage h2 { margin: 0 0 var(--space-12); font-size: var(--font-size-lg); }
+.usage-windows {
+  list-style: none; margin: 0; padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-16);
+}
+.usage-window { display: grid; grid-template-columns: 1fr auto; gap: var(--space-4); font-size: var(--font-size-sm); }
+.usage-name { font-weight: var(--weight-semibold); }
+.usage-percent { font-variant-numeric: tabular-nums; }
+.usage-reset { grid-column: 1 / -1; color: var(--muted); font-size: var(--font-size-xs); }
+.usage-track { grid-column: 1 / -1; height: 6px; background: var(--sunken); border-radius: var(--radius-pill); overflow: hidden; }
+.usage-fill { display: block; height: 100%; border-radius: var(--radius-pill); background: var(--factory); }
+
 @media (max-width: 760px) { .overview { grid-template-columns: 1fr; } }
 
 .card.needs-you { border-color: var(--you); background: linear-gradient(var(--you-bg), var(--you-bg)) var(--surface); box-shadow: var(--elevation-bar) var(--you); }
