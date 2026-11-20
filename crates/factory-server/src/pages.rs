@@ -753,7 +753,7 @@ fn status(job: &Job, settings: &Settings) -> Status {
         }
         _ if in_review(job) => (Lane::You, "you", "in review"),
         (_, Turn::Agent(_)) => (Lane::Agent, "agent", "agent working"),
-        (_, Turn::User(_) | Turn::Factory | Turn::Done) => {
+        (_, Turn::User(_) | Turn::Factory | Turn::RerunCi { .. } | Turn::Done) => {
             (Lane::Factory, "factory", "factory working")
         }
     };
@@ -816,13 +816,15 @@ fn turn_detail(job: &Job, settings: &Settings) -> String {
                     settings.poll_seconds
                 )
             }
-            Some(Command::RunAgent { .. } | Command::Summarize { .. }) | None => {
-                "Waiting for a free worker.".into()
-            }
+            Some(
+                Command::RunAgent { .. } | Command::Summarize { .. } | Command::RerunCi { .. },
+            )
+            | None => "Waiting for a free worker.".into(),
         },
         Turn::User(_) if collecting(job) => {
             "The factory is collecting the commits and the diff stat for your approval.".into()
         }
+        Turn::RerunCi { .. } => "The factory is rerunning the failed CI runs.".into(),
         Turn::User(_) => "Waiting for you.".into(),
         Turn::Done => match job.stage() {
             Stage::Merged => "Every planned pull request is merged.".into(),
