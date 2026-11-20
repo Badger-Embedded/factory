@@ -322,6 +322,43 @@ fn a_pull_request_without_any_checks_is_not_ready() {
 }
 
 #[tokio::test]
+async fn merged_pr_finds_the_merged_pull_request_for_a_branch() {
+    let _serial = SCRIPTS.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let gh = script(
+        dir.path(),
+        "gh",
+        &format!(
+            r#"echo "$@" >> '{calls}'
+case "$*" in
+  *job-7-pr-1*) echo 12 ;;
+  *) echo null ;;
+esac"#,
+            calls = calls.display()
+        ),
+    );
+    let github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+
+    assert_eq!(
+        github.merged_pr("o/r", "factory/job-7-pr-1").await.unwrap(),
+        Some(12)
+    );
+    assert_eq!(
+        github.merged_pr("o/r", "factory/job-7-pr-2").await.unwrap(),
+        None
+    );
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(
+        calls.starts_with("pr list --repo o/r --head factory/job-7-pr-1 --state merged"),
+        "{calls}"
+    );
+}
+
+#[tokio::test]
 async fn merge_squashes_and_deletes_the_branch() {
     let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();

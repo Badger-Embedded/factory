@@ -8,8 +8,8 @@ use factory_core::{
 };
 use factory_runner::{Expect, LogLine, RunReport};
 use factory_server::{
-    AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Scheduler,
-    Settings, Store, SummaryRequest, WatchReport, WatchRequest, format_cost,
+    AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Published,
+    Scheduler, Settings, Store, SummaryRequest, WatchReport, WatchRequest, format_cost,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -33,7 +33,7 @@ struct FakeExecutor {
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
     summarized: Mutex<Vec<SummaryRequest>>,
-    publishes: Mutex<VecDeque<Result<u64, String>>>,
+    publishes: Mutex<VecDeque<Result<Published, String>>>,
     published: Mutex<Vec<PublishRequest>>,
     watches: Mutex<VecDeque<Result<WatchReport, String>>>,
     watched: Mutex<Vec<WatchRequest>>,
@@ -106,10 +106,14 @@ impl Executor for FakeExecutor {
         })
     }
 
-    async fn publish(&self, request: PublishRequest) -> Result<u64, String> {
+    async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
         tokio::task::yield_now().await;
         self.published.lock().unwrap().push(request);
-        self.publishes.lock().unwrap().pop_front().unwrap_or(Ok(12))
+        self.publishes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(Published::Open(12)))
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
@@ -819,6 +823,30 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
     assert_eq!(
         store.get(id).unwrap().job.stage(),
         &Stage::CiAndReview { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn a_pull_request_merged_before_the_push_moves_the_job_on() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Ok(Published::AlreadyMerged(12)));
+
+    step(&scheduler).await;
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 1 });
+    assert_eq!(job.plan()[0].number, Some(12));
+    let logs = store.logs(id, 10).unwrap();
+    assert!(
+        logs.iter()
+            .any(|line| line.text.contains("#12 was merged before the push")),
+        "{logs:?}"
     );
 }
 

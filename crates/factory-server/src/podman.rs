@@ -8,8 +8,8 @@ use factory_runner::{
 };
 
 use crate::scheduler::{
-    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, SummaryRequest, WatchReport,
-    WatchRequest,
+    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, SummaryRequest,
+    WatchReport, WatchRequest,
 };
 use crate::settings::Settings;
 
@@ -154,7 +154,14 @@ impl Executor for PodmanExecutor {
         self.git.summarize_branch(&workspace, &request.base).await
     }
 
-    async fn publish(&self, request: PublishRequest) -> Result<u64, String> {
+    async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
+        if let Some(number) = self
+            .github
+            .merged_pr(&request.repo, &request.branch)
+            .await?
+        {
+            return Ok(Published::AlreadyMerged(number));
+        }
         let workspace = self.job_dir(request.job_id).join("work");
         self.git.push(&workspace, &request.branch).await?;
         self.github
@@ -165,6 +172,7 @@ impl Executor for PodmanExecutor {
                 &request.description,
             )
             .await
+            .map(Published::Open)
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
