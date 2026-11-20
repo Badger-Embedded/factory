@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arc::clone(&projects),
             Arc::new(executor),
             Arc::clone(&wake),
+            data_dir.clone(),
         );
         tokio::spawn(scheduler.run());
         tracing::info!("running jobs in podman workers");

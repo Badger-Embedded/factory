@@ -552,7 +552,9 @@ impl Job {
         }
     }
 
-    fn is_finished(&self) -> bool {
+    /// Whether the job is merged, failed or cancelled, so no step is left.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
         matches!(
             self.stage,
             Stage::Merged | Stage::Cancelled | Stage::Failed { .. }

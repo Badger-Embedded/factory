@@ -78,6 +78,7 @@ pub enum StoreError {
     Rejected(Rejected),
     Db(rusqlite::Error),
     Json(serde_json::Error),
+    Io(std::io::Error),
 }
 
 impl fmt::Display for StoreError {
@@ -87,6 +88,7 @@ impl fmt::Display for StoreError {
             StoreError::Rejected(rejected) => rejected.fmt(f),
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
+            StoreError::Io(err) => write!(f, "file system: {err}"),
         }
     }
 }
@@ -173,6 +175,45 @@ impl Store {
         )?;
         let rows = stmt.query_map([], raw_row)?;
         rows.map(|row| parse_row(row?)).collect()
+    }
+
+    /// The ids of jobs created more than `days` days ago.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn ids_older_than(&self, days: u32) -> Result<Vec<i64>, StoreError> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT id FROM jobs WHERE created_at < datetime('now', ?1) ORDER BY id")?;
+        let rows = stmt.query_map([format!("-{days} days")], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Deletes job `id` with its rows in every table and its directory
+    /// `<data_dir>/jobs/<id>`. A directory that is already gone is fine.
+    /// When the directory cannot be removed, the rows stay, so a later call
+    /// can finish the job.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on
+    /// a file system or database error.
+    pub fn delete_job(&self, id: i64, data_dir: &Path) -> Result<(), StoreError> {
+        Self::load(&self.conn(), id)?;
+        match std::fs::remove_dir_all(data_dir.join("jobs").join(id.to_string())) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                return Err(StoreError::Io(err));
+            }
+            _ => {}
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for table in ["job_images", "pr_watermarks", "logs", "sessions"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
+        }
+        tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+        Ok(tx.commit()?)
     }
 
     /// Applies `event` to job `id` and saves the result in one transaction.

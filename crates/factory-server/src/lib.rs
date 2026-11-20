@@ -11,7 +11,8 @@ mod web;
 pub use podman::PodmanExecutor;
 pub use projects::{Project, Projects, ProjectsError};
 pub use scheduler::{
-    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Scheduler, SummaryRequest,
+    AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, PublishRequest, Scheduler,
+    SummaryRequest,
     WatchReport, WatchRequest, branch_name,
 };
 pub use settings::Settings;

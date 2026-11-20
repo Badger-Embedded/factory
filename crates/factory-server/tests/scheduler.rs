@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -154,6 +155,7 @@ fn setup(
         Arc::new(projects),
         Arc::clone(&executor),
         Arc::new(Notify::new()),
+        PathBuf::new(),
     );
     (store, executor, scheduler)
 }
@@ -544,6 +546,7 @@ async fn a_project_without_checks_publishes_unchecked() {
         Arc::new(projects),
         Arc::clone(&executor),
         Arc::new(Notify::new()),
+        PathBuf::new(),
     );
     drop(scheduler);
     for event in [
@@ -609,6 +612,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
         ),
         Arc::clone(&executor),
         Arc::new(Notify::new()),
+        PathBuf::new(),
     );
     step(&fresh).await;
     assert_eq!(executor.published.lock().unwrap().len(), 2);
@@ -785,4 +789,218 @@ async fn the_publish_gate_holds_the_push_until_the_user_approves() {
         store.get(id).unwrap().job.stage(),
         &Stage::CiAndReview { pr: 0 }
     );
+
+mod purge {
+    use super::*;
+    use factory_server::FINISHED_JOB_DAYS;
+
+    struct Fixture {
+        store: Arc<Store>,
+        scheduler: Arc<Scheduler<FakeExecutor>>,
+        data: tempfile::TempDir,
+        db: rusqlite::Connection,
+    }
+
+    fn fixture() -> Fixture {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("factory.db");
+        let store = Arc::new(Store::open(&path).unwrap());
+        let scheduler = Scheduler::new(
+            Arc::clone(&store),
+            Arc::new([].into_iter().collect()),
+            FakeExecutor::new(|_| questions()),
+            Arc::new(Notify::new()),
+            data.path().to_owned(),
+        );
+        let db = rusqlite::Connection::open(&path).unwrap();
+        Fixture {
+            store,
+            scheduler,
+            data,
+            db,
+        }
+    }
+
+    impl Fixture {
+        /// Creates a job with a log line, an image row, a session, an image
+        /// file and a work directory, created `days` days ago.
+        fn job(&self, days: u32) -> i64 {
+            let id = self.store.create("maestro", "alice", "x").unwrap();
+            self.db
+                .execute(
+                    "UPDATE jobs SET created_at = datetime('now', ?1) WHERE id = ?2",
+                    rusqlite::params![format!("-{days} days"), id],
+                )
+                .unwrap();
+            self.store.append_factory_log(id, "hello").unwrap();
+            self.store
+                .session_uuid(id, factory_core::Session::Planning)
+                .unwrap();
+            self.store.add_images(id, &["image-1.png".into()]).unwrap();
+            let images = self.dir(id).join("images");
+            std::fs::create_dir_all(&images).unwrap();
+            std::fs::write(images.join("image-1.png"), b"png").unwrap();
+            std::fs::create_dir_all(self.dir(id).join("work")).unwrap();
+            id
+        }
+
+        fn dir(&self, id: i64) -> std::path::PathBuf {
+            self.data.path().join("jobs").join(id.to_string())
+        }
+
+        fn exists(&self, id: i64) -> bool {
+            self.store.get(id).is_ok()
+        }
+
+        fn rows(&self, table: &str, id: i64) -> i64 {
+            self.db
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        fn finish(&self, id: i64, how: &str) {
+            let store = &self.store;
+            match how {
+                "cancelled" => {
+                    store.apply(id, Event::Cancel).unwrap();
+                }
+                "failed" => {
+                    store.apply(id, Event::Start).unwrap();
+                    store
+                        .apply(id, Event::AgentFailed { reason: "x".into() })
+                        .unwrap();
+                }
+                _ => {
+                    for event in [
+                        Event::Start,
+                        Event::Agent(AgentResult::Clarified),
+                        Event::Agent(AgentResult::Spec("s".into())),
+                        Event::Approve,
+                        Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+                            title: "t".into(),
+                            summary: "s".into(),
+                            number: None,
+                            description: None,
+                        }])),
+                        Event::Approve,
+                        Event::Agent(AgentResult::CommitsReady(ready())),
+                        Event::ChecksPassed,
+                        Event::Published { number: 3 },
+                        Event::Merged,
+                    ] {
+                        store.apply(id, event).unwrap();
+                    }
+                }
+            }
+            assert!(
+                store.get(id).unwrap().job.is_finished(),
+                "{how} is finished"
+            );
+        }
+    }
+
+    #[test]
+    fn the_age_limit_is_30_days() {
+        assert_eq!(FINISHED_JOB_DAYS, 30);
+    }
+
+    #[tokio::test]
+    async fn finished_jobs_are_deleted_after_30_days_and_not_before() {
+        let f = fixture();
+        let young = f.job(29);
+        let old = f.job(31);
+        for id in [young, old] {
+            f.finish(id, "cancelled");
+        }
+        f.scheduler.tick().await.unwrap();
+        assert!(f.exists(young));
+        assert!(!f.exists(old));
+    }
+
+    #[tokio::test]
+    async fn merged_failed_and_cancelled_jobs_are_all_deleted() {
+        let f = fixture();
+        let ids: Vec<i64> = ["merged", "failed", "cancelled"]
+            .into_iter()
+            .map(|how| {
+                let id = f.job(31);
+                f.finish(id, how);
+                id
+            })
+            .collect();
+        f.scheduler.tick().await.unwrap();
+        for id in ids {
+            assert!(!f.exists(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_jobs_are_kept_however_old() {
+        let f = fixture();
+        let requested = f.job(400);
+        let waiting = f.job(400);
+        f.store.apply(waiting, Event::Start).unwrap();
+        f.store
+            .apply(waiting, Event::Agent(AgentResult::Clarified))
+            .unwrap();
+        f.scheduler.tick().await.unwrap();
+        assert!(f.exists(requested));
+        assert!(f.exists(waiting));
+        assert!(f.dir(waiting).exists());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_job_removes_its_rows_images_and_directory() {
+        let f = fixture();
+        let old = f.job(31);
+        let other = f.job(1);
+        f.finish(old, "cancelled");
+        f.scheduler.tick().await.unwrap();
+
+        for table in ["logs", "sessions", "job_images"] {
+            assert_eq!(f.rows(table, old), 0, "{table}");
+            assert_eq!(f.rows(table, other), 1, "{table}");
+        }
+        assert!(!f.dir(old).exists());
+        assert!(f.dir(other).join("images/image-1.png").exists());
+        assert_eq!(f.store.images(old).unwrap(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_directory_is_still_deleted() {
+        let f = fixture();
+        let id = f.store.create("maestro", "alice", "x").unwrap();
+        f.db.execute(
+            "UPDATE jobs SET created_at = datetime('now', '-40 days')",
+            [],
+        )
+        .unwrap();
+        f.finish(id, "cancelled");
+        f.scheduler.tick().await.unwrap();
+        assert!(!f.exists(id));
+    }
+
+    #[tokio::test]
+    async fn one_failing_job_does_not_stop_the_others() {
+        let f = fixture();
+        let first = f.job(31);
+        let stuck = f.job(31);
+        let last = f.job(31);
+        for id in [first, stuck, last] {
+            f.finish(id, "cancelled");
+        }
+        // remove_dir_all fails on a file, so this job cannot be deleted.
+        std::fs::remove_dir_all(f.dir(stuck)).unwrap();
+        std::fs::write(f.dir(stuck), b"not a directory").unwrap();
+
+        f.scheduler.tick().await.unwrap();
+        assert!(!f.exists(first));
+        assert!(f.exists(stuck));
+        assert!(!f.exists(last));
+        assert_eq!(f.rows("logs", stuck), 1);
+    }
 }

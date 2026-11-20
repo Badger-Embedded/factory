@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -15,6 +16,10 @@ use crate::store::{JobRow, Store, StoreError};
 
 /// How often the loop looks at the jobs when nothing wakes it.
 const POLL: Duration = Duration::from_secs(5);
+
+/// A finished job is deleted once it is this many days old, counted from
+/// `created_at`.
+pub const FINISHED_JOB_DAYS: u32 = 30;
 
 /// The branch the factory pushes planned pull request `pr` of job `job_id`
 /// from.
@@ -157,6 +162,7 @@ pub struct Scheduler<E> {
     projects: Arc<Projects>,
     executor: Arc<E>,
     wake: Arc<Notify>,
+    data_dir: PathBuf,
     tasks: Mutex<HashMap<i64, Task>>,
     /// Jobs whose factory step waits until the given time: the next look at
     /// a pull request, or a retry after a failed step.
@@ -169,12 +175,14 @@ impl<E: Executor> Scheduler<E> {
         projects: Arc<Projects>,
         executor: Arc<E>,
         wake: Arc<Notify>,
+        data_dir: PathBuf,
     ) -> Arc<Self> {
         Arc::new(Scheduler {
             store,
             projects,
             executor,
             wake,
+            data_dir,
             tasks: Mutex::new(HashMap::new()),
             not_before: Mutex::new(HashMap::new()),
         })
@@ -217,6 +225,7 @@ impl<E: Executor> Scheduler<E> {
         let mut rows = self.store.list()?;
         rows.reverse();
         self.stop_unwanted(&rows).await?;
+        let rows = self.purge_expired(rows)?;
 
         for row in rows {
             if self.tasks().contains_key(&row.id) {
@@ -288,6 +297,23 @@ impl<E: Executor> Scheduler<E> {
             }
         }
         Ok(())
+    }
+
+    /// Deletes the finished jobs older than [`FINISHED_JOB_DAYS`] and returns
+    /// the rows that remain. A job that fails to delete is logged and kept.
+    fn purge_expired(&self, rows: Vec<JobRow>) -> Result<Vec<JobRow>, StoreError> {
+        let old = self.store.ids_older_than(FINISHED_JOB_DAYS)?;
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.job.is_finished() && old.contains(&row.id) {
+                match self.store.delete_job(row.id, &self.data_dir) {
+                    Ok(()) => continue,
+                    Err(err) => tracing::error!("deleting job {}: {err}", row.id),
+                }
+            }
+            kept.push(row);
+        }
+        Ok(kept)
     }
 
     async fn stop_unwanted(&self, rows: &[JobRow]) -> Result<(), StoreError> {
