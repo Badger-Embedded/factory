@@ -337,7 +337,7 @@ fn project_selector(projects: &Projects, selected: &str) -> Markup {
 pub fn settings(
     user: &str,
     settings: &Settings,
-    projects: &[(String, StageModels, bool)],
+    projects: &[(String, StageModels, bool, bool)],
     notice: Option<&str>,
 ) -> Markup {
     layout(
@@ -400,7 +400,7 @@ pub fn settings(
                 }
                 button.primary { "Save" }
             }
-            @for (name, models, auto_merge) in projects {
+            @for (name, models, auto_merge, llm_review) in projects {
                 form.card method="post" action={ "/settings/projects/" (name) } {
                     h2 { (name) }
                     div.field {
@@ -409,6 +409,13 @@ pub fn settings(
                             " Merge pull requests when their checks pass"
                         }
                         p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
+                    }
+                    div.field {
+                        label.check {
+                            input type="checkbox" name="llm_review" value="on" checked[*llm_review];
+                            " Review with an LLM before merge"
+                        }
+                        p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent." }
                     }
                     p.hint { "The model each stage runs with. Empty means no model." }
                     @for (stage, value) in [

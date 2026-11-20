@@ -146,6 +146,12 @@ fn toml_auto_merge(state: &AppState, project: &str) -> bool {
     state.projects.get(project).is_some_and(|p| p.auto_merge)
 }
 
+/// The project's LLM-review default from its project file, false when the
+/// project is unknown. A saved row in `project_settings` replaces it.
+fn toml_llm_review(state: &AppState, project: &str) -> bool {
+    state.projects.get(project).is_some_and(|p| p.llm_review)
+}
+
 async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -490,6 +496,9 @@ fn settings_page(
                 state
                     .store
                     .project_auto_merge(name, toml_auto_merge(state, name))?,
+                state
+                    .store
+                    .project_llm_review(name, toml_llm_review(state, name))?,
             ))
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
@@ -508,8 +517,9 @@ struct ModelsForm {
     plan: String,
     implement: String,
     review: String,
-    /// A checkbox: present when ticked.
+    /// Checkboxes: present when ticked.
     auto_merge: Option<String>,
+    llm_review: Option<String>,
 }
 
 async fn save_project_models(
@@ -530,9 +540,11 @@ async fn save_project_models(
         review: model(form.review),
     };
     state.store.save_project_models(&name, &models)?;
-    state
-        .store
-        .save_project_auto_merge(&name, form.auto_merge.is_some())?;
+    state.store.save_project_settings(
+        &name,
+        form.auto_merge.is_some(),
+        form.llm_review.is_some(),
+    )?;
     state.wake.notify_one();
     settings_page(&state, &headers, Some("Saved."))
 }
