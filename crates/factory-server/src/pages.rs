@@ -7,6 +7,7 @@ use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry};
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
+const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const LOG_SCROLL: &str = include_str!("../static/log-scroll.js");
 
 const STEPS: [&str; 9] = [
@@ -22,10 +23,10 @@ const STEPS: [&str; 9] = [
 ];
 
 fn layout(user: &str, title: &str, body: &Markup) -> Markup {
-    page(user, title, false, body)
+    page(user, title, false, &html! {}, body)
 }
 
-fn page(user: &str, title: &str, refresh: bool, body: &Markup) -> Markup {
+fn page(user: &str, title: &str, refresh: bool, nav: &Markup, body: &Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -41,6 +42,7 @@ fn page(user: &str, title: &str, refresh: bool, body: &Markup) -> Markup {
                     div.topbar-inner {
                         a.brand href="/" { "factory" }
                         div.topbar-end {
+                            (nav)
                             a.nav href="/settings" { "Settings" }
                             @if !user.is_empty() { span.user { (user) } }
                         }
@@ -66,30 +68,42 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
     )
 }
 
-pub fn index(user: &str, projects: &Projects, settings: &Settings, jobs: &[JobRow]) -> Markup {
-    let waiting: Vec<&JobRow> = jobs
+pub fn index(
+    user: &str,
+    projects: &Projects,
+    selected: Option<&str>,
+    settings: &Settings,
+    jobs: &[JobRow],
+) -> Markup {
+    let all: Vec<&JobRow> = jobs
         .iter()
+        .filter(|row| Some(row.project.as_str()) == selected)
+        .collect();
+    let waiting: Vec<&JobRow> = all
+        .iter()
+        .copied()
         .filter(|row| needs_user(&row.job, settings))
         .collect();
-    let all: Vec<&JobRow> = jobs.iter().collect();
-    layout(
+    let nav = selected.map_or_else(|| html! {}, |selected| project_selector(projects, selected));
+    page(
         user,
         "Jobs",
+        false,
+        &nav,
         &html! {
-            form.card method="post" action="/jobs" {
-                h2 { "New request" }
-                div.field {
-                    label for="project" { "Project" }
-                    select #project name="project" {
-                        @for name in projects.names() { option { (name) } }
+            @if let Some(selected) = selected {
+                form.card method="post" action="/jobs" {
+                    h2 { "New request for " (selected) }
+                    input type="hidden" name="project" value=(selected);
+                    div.field {
+                        label for="request" { "What should change?" }
+                        textarea #request name="request" required
+                            placeholder="Add a reboot button to the device page" {}
                     }
+                    button.primary { "Request" }
                 }
-                div.field {
-                    label for="request" { "What should change?" }
-                    textarea #request name="request" required
-                        placeholder="Add a reboot button to the device page" {}
-                }
-                button.primary { "Request" }
+            } @else {
+                div.card { p.empty { "No projects are configured." } }
             }
             h2.section-title { "Waiting for you" }
             (job_list(&waiting, settings, "Nothing needs you right now."))
@@ -97,6 +111,21 @@ pub fn index(user: &str, projects: &Projects, settings: &Settings, jobs: &[JobRo
             (job_list(&all, settings, "No jobs yet."))
         },
     )
+}
+
+fn project_selector(projects: &Projects, selected: &str) -> Markup {
+    html! {
+        form.project-picker method="get" action="/" {
+            label.visually-hidden for="project" { "Project" }
+            select #project name="project" {
+                @for name in projects.names() {
+                    option selected[name == selected] { (name) }
+                }
+            }
+            noscript { button { "Go" } }
+            script { (PreEscaped(PROJECT_PICKER)) }
+        }
+    }
 }
 
 pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup {
@@ -192,6 +221,7 @@ pub fn job(
         user,
         &format!("Job #{id}"),
         matches!(job.turn(), Turn::Agent(_)),
+        &html! {},
         &html! {
             h1 { "#" (id) " " (first_line(job.request())) }
             p.meta {

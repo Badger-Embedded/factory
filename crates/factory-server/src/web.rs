@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -98,12 +98,29 @@ async fn stylesheet() -> impl IntoResponse {
     )
 }
 
-async fn index(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {
+#[derive(Deserialize)]
+struct IndexQuery {
+    project: Option<String>,
+}
+
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IndexQuery>,
+) -> Result<Markup, AppError> {
+    let selected = match query.project {
+        Some(name) if state.projects.get(&name).is_none() => {
+            return Err(AppError::BadRequest(format!("unknown project {name:?}")));
+        }
+        Some(name) => Some(name),
+        None => state.projects.names().next().map(str::to_owned),
+    };
     let jobs = state.store.list()?;
     let settings = state.store.settings()?;
     Ok(pages::index(
         &user(&headers),
         &state.projects,
+        selected.as_deref(),
         &settings,
         &jobs,
     ))
