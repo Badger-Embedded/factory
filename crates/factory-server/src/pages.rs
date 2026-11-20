@@ -2,14 +2,15 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, Gates, Job, PlanUsage, Stage, Task, Turn, UsageWindow, Verdict,
+    Ask, BranchSummary, Command, EFFORTS, Gates, Job, PlanUsage, Stage, Task, Turn, UsageWindow,
+    Verdict,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
 use crate::projects::Project;
-use crate::projects::StageModels;
+use crate::projects::{StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{JobEvent, JobRow, LogEntry, ProjectTotals};
 use crate::timeline::timeline;
@@ -348,7 +349,7 @@ fn project_selector(names: &[String], selected: &str) -> Markup {
 pub fn settings(
     user: &str,
     settings: &Settings,
-    projects: &[(String, StageModels, bool, bool)],
+    projects: &[(String, StageModels, StageEfforts, bool, bool)],
     notice: Option<&str>,
 ) -> Markup {
     layout(
@@ -411,42 +412,68 @@ pub fn settings(
                 }
                 button.primary { "Save" }
             }
-            @for (name, models, auto_merge, llm_review) in projects {
-                form.card method="post" action={ "/settings/projects/" (name) } {
-                    h2 { (name) }
-                    div.field {
-                        label.check {
-                            input type="checkbox" name="auto_merge" value="on" checked[*auto_merge];
-                            " Merge pull requests when their checks pass"
-                        }
-                        p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
-                    }
-                    div.field {
-                        label.check {
-                            input type="checkbox" name="llm_review" value="on" checked[*llm_review];
-                            " Review with an LLM before merge"
-                        }
-                        p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent." }
-                    }
-                    p.hint { "The model each stage runs with. Empty means no model." }
-                    @for (stage, value) in [
-                        ("clarify", &models.clarify),
-                        ("spec", &models.spec),
-                        ("plan", &models.plan),
-                        ("implement", &models.implement),
-                        ("review", &models.review),
-                    ] {
-                        div.field {
-                            label for={ (name) "-" (stage) } { (stage) }
-                            input id={ (name) "-" (stage) } type="text" name=(stage)
-                                value=(value.as_deref().unwrap_or_default());
-                        }
-                    }
-                    button.primary { "Save " (name) }
-                }
+            @for (name, models, efforts, auto_merge, llm_review) in projects {
+                (project_form(name, models, efforts, *auto_merge, *llm_review))
             }
         },
     )
+}
+
+/// One project's form on the settings page: its two flags and a model field
+/// with an effort selector beside it for each of the five stages.
+fn project_form(
+    name: &str,
+    models: &StageModels,
+    efforts: &StageEfforts,
+    auto_merge: bool,
+    llm_review: bool,
+) -> Markup {
+    html! {
+        form.card method="post" action={ "/settings/projects/" (name) } {
+            h2 { (name) }
+            div.field {
+                label.check {
+                    input type="checkbox" name="auto_merge" value="on" checked[auto_merge];
+                    " Merge pull requests when their checks pass"
+                }
+                p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
+            }
+            div.field {
+                label.check {
+                    input type="checkbox" name="llm_review" value="on" checked[llm_review];
+                    " Review with an LLM before merge"
+                }
+                p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent." }
+            }
+            p.hint { "The model and effort each stage runs with. An empty model means no model; effort is medium unless you change it." }
+            @for (stage, model, effort) in [
+                ("clarify", &models.clarify, &efforts.clarify),
+                ("spec", &models.spec, &efforts.spec),
+                ("plan", &models.plan, &efforts.plan),
+                ("implement", &models.implement, &efforts.implement),
+                ("review", &models.review, &efforts.review),
+            ] {
+                div.row {
+                    div.field {
+                        label for={ (name) "-" (stage) } { (stage) " model" }
+                        input id={ (name) "-" (stage) } type="text" name=(stage)
+                            value=(model.as_deref().unwrap_or_default());
+                    }
+                    div.field {
+                        label for={ (name) "-" (stage) "-effort" } { (stage) " effort" }
+                        select id={ (name) "-" (stage) "-effort" } name={ (stage) "_effort" } {
+                            @for level in EFFORTS {
+                                option value=(level) selected[level == effort.as_str()] {
+                                    (level)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            button.primary { "Save " (name) }
+        }
+    }
 }
 
 /// The values the onboarding form holds on a redraw, so a failed submit keeps
@@ -758,6 +785,7 @@ pub fn job(
     images: &[String],
     cost_usd: f64,
     models: &StageModels,
+    efforts: &StageEfforts,
     auto_merge: bool,
 ) -> Markup {
     let job = &row.job;
@@ -776,7 +804,7 @@ pub fn job(
                     (status_region(false, id, job, settings, auto_merge))
                     p.meta { "Approval gates: " (gates_line(job.gates())) }
                 }
-                aside.job-side { (timeline_region(false, job, events, models)) }
+                aside.job-side { (timeline_region(false, job, events, models, efforts)) }
                 div.job-main {
                     (request_card(id, job, images))
                     (spec_region(false, job))
@@ -813,6 +841,7 @@ pub fn job_fragment(
     events: &[JobEvent],
     cost_usd: f64,
     models: &StageModels,
+    efforts: &StageEfforts,
     auto_merge: bool,
 ) -> Markup {
     let job = &row.job;
@@ -821,7 +850,7 @@ pub fn job_fragment(
     html! {
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd))
-        (timeline_region(true, job, events, models))
+        (timeline_region(true, job, events, models, efforts))
         (status_region(true, row.id, job, settings, auto_merge))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
@@ -865,10 +894,16 @@ fn cost_badge(oob: bool, cost_usd: f64) -> Markup {
 }
 
 /// The timeline, in a region a poll swaps. It sits in the side column.
-fn timeline_region(oob: bool, job: &Job, events: &[JobEvent], models: &StageModels) -> Markup {
+fn timeline_region(
+    oob: bool,
+    job: &Job,
+    events: &[JobEvent],
+    models: &StageModels,
+    efforts: &StageEfforts,
+) -> Markup {
     html! {
         div #job-timeline hx-swap-oob=[oob.then_some("true")] {
-            (timeline(job, events, models))
+            (timeline(job, events, models, efforts))
         }
     }
 }

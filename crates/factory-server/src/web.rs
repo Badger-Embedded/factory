@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 
 use crate::github::{RepoChecker, RepoReport};
 use crate::pages;
-use crate::projects::{Project, Projects, StageModels};
+use crate::projects::{Project, Projects, StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
@@ -130,6 +130,9 @@ impl IntoResponse for AppError {
             }
             AppError::Store(err @ StoreError::Rejected(_)) => {
                 (StatusCode::CONFLICT, err.to_string())
+            }
+            AppError::Store(err @ StoreError::InvalidEffort(_)) => {
+                (StatusCode::BAD_REQUEST, err.to_string())
             }
             AppError::Store(err) => {
                 tracing::error!("{err}");
@@ -418,6 +421,7 @@ struct JobData {
     events: Vec<crate::store::JobEvent>,
     cost_usd: f64,
     models: StageModels,
+    efforts: StageEfforts,
     auto_merge: bool,
 }
 
@@ -433,6 +437,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         .map(|project| project.models.clone())
         .unwrap_or_default();
     let models = state.store.project_models(&row.project, &defaults)?;
+    let efforts = state.store.project_efforts(&row.project)?;
     let default_auto_merge = project.as_ref().is_some_and(|p| p.auto_merge);
     let auto_merge = state
         .store
@@ -445,6 +450,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         events,
         cost_usd,
         models,
+        efforts,
         auto_merge,
     })
 }
@@ -466,6 +472,7 @@ async fn show_job(
         &images,
         data.cost_usd,
         &data.models,
+        &data.efforts,
         data.auto_merge,
     ))
 }
@@ -486,6 +493,7 @@ async fn job_fragment(
         &data.events,
         data.cost_usd,
         &data.models,
+        &data.efforts,
         data.auto_merge,
     ))
 }
@@ -635,9 +643,10 @@ fn settings_page(
         .into_iter()
         .map(|(name, project)| {
             let models = state.store.project_models(&name, &project.models)?;
+            let efforts = state.store.project_efforts(&name)?;
             let auto_merge = state.store.project_auto_merge(&name, project.auto_merge)?;
             let llm_review = state.store.project_llm_review(&name, project.llm_review)?;
-            Ok((name, models, auto_merge, llm_review))
+            Ok((name, models, efforts, auto_merge, llm_review))
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
     Ok(pages::settings(
@@ -655,9 +664,25 @@ struct ModelsForm {
     plan: String,
     implement: String,
     review: String,
+    // The effort per stage. A missing field falls back to medium, so a request
+    // from before the selector existed still saves.
+    #[serde(default = "default_effort")]
+    clarify_effort: String,
+    #[serde(default = "default_effort")]
+    spec_effort: String,
+    #[serde(default = "default_effort")]
+    plan_effort: String,
+    #[serde(default = "default_effort")]
+    implement_effort: String,
+    #[serde(default = "default_effort")]
+    review_effort: String,
     /// Checkboxes: present when ticked.
     auto_merge: Option<String>,
     llm_review: Option<String>,
+}
+
+fn default_effort() -> String {
+    factory_core::DEFAULT_EFFORT.to_owned()
 }
 
 async fn save_project_models(
@@ -677,6 +702,16 @@ async fn save_project_models(
         implement: model(form.implement),
         review: model(form.review),
     };
+    let efforts = StageEfforts {
+        clarify: form.clarify_effort,
+        spec: form.spec_effort,
+        plan: form.plan_effort,
+        implement: form.implement_effort,
+        review: form.review_effort,
+    };
+    // Efforts first, so a bad level is rejected before anything is written and
+    // the save leaves every table as it was.
+    state.store.save_project_efforts(&name, &efforts)?;
     state.store.save_project_models(&name, &models)?;
     state.store.save_project_settings(
         &name,

@@ -8,7 +8,7 @@ use maud::{Markup, html};
 
 use crate::cost::format_cost;
 use crate::pages::task_label;
-use crate::projects::StageModels;
+use crate::projects::{StageEfforts, StageModels};
 use crate::store::JobEvent;
 
 const PLANNING: [&str; 4] = ["requested", "clarifying", "spec", "plan"];
@@ -238,7 +238,28 @@ fn model<'a>(job: &Job, models: &'a StageModels) -> Option<&'a str> {
     Some(model.as_deref().unwrap_or("default"))
 }
 
-pub(crate) fn timeline(job: &Job, events: &[JobEvent], models: &StageModels) -> Markup {
+/// The effort the next run of the step would use, from the same stage mapping
+/// as the model. `None` when the step is not an agent turn.
+fn effort<'a>(job: &Job, efforts: &'a StageEfforts) -> Option<&'a str> {
+    let Turn::Agent(task) = job.turn() else {
+        return None;
+    };
+    let effort = match Expect::for_task(job.stage(), task)? {
+        Expect::Clarify => &efforts.clarify,
+        Expect::Spec => &efforts.spec,
+        Expect::Plan => &efforts.plan,
+        Expect::Commits | Expect::FixCi => &efforts.implement,
+        Expect::Review => &efforts.review,
+    };
+    Some(effort.as_str())
+}
+
+pub(crate) fn timeline(
+    job: &Job,
+    events: &[JobEvent],
+    models: &StageModels,
+    efforts: &StageEfforts,
+) -> Markup {
     let timeline = build(job, events);
     let prs = job.plan().len();
     let merged = merged_order(prs);
@@ -246,15 +267,15 @@ pub(crate) fn timeline(job: &Job, events: &[JobEvent], models: &StageModels) -> 
         div.card.timeline {
             h2 { "Timeline" }
             ol.tl {
-                @for order in 0..PLANNING.len() { (step(job, &timeline, models, order)) }
+                @for order in 0..PLANNING.len() { (step(job, &timeline, models, efforts, order)) }
             }
             @if prs == 0 {
                 ol.tl {
                     li.pending { span.node {} span.step-name { "the planned pull requests" } }
                 }
             }
-            @for pr in 0..prs { (pr_group(job, &timeline, models, pr)) }
-            ol.tl { (step(job, &timeline, models, merged)) }
+            @for pr in 0..prs { (pr_group(job, &timeline, models, efforts, pr)) }
+            ol.tl { (step(job, &timeline, models, efforts, merged)) }
             @if timeline.current.is_none() {
                 @if let Stage::Failed { reason, .. } = job.stage() {
                     p.tl-end.failed { "Failed: " (reason) }
@@ -264,7 +285,13 @@ pub(crate) fn timeline(job: &Job, events: &[JobEvent], models: &StageModels) -> 
     }
 }
 
-fn pr_group(job: &Job, timeline: &Timeline, models: &StageModels, pr: usize) -> Markup {
+fn pr_group(
+    job: &Job,
+    timeline: &Timeline,
+    models: &StageModels,
+    efforts: &StageEfforts,
+    pr: usize,
+) -> Markup {
     let planned = &job.plan()[pr];
     let orders: Vec<usize> = (0..PER_PR.len())
         .map(|i| PLANNING.len() + PER_PR.len() * pr + i)
@@ -298,13 +325,19 @@ fn pr_group(job: &Job, timeline: &Timeline, models: &StageModels, pr: usize) -> 
                 span.pr-title { (planned.title) }
             }
             ol.tl {
-                @for order in orders { (step(job, timeline, models, order)) }
+                @for order in orders { (step(job, timeline, models, efforts, order)) }
             }
         }
     }
 }
 
-fn step(job: &Job, timeline: &Timeline, models: &StageModels, order: usize) -> Markup {
+fn step(
+    job: &Job,
+    timeline: &Timeline,
+    models: &StageModels,
+    efforts: &StageEfforts,
+    order: usize,
+) -> Markup {
     let step = &timeline.steps[order];
     let state = state(job, timeline, order);
     let hidden = step.notes.len().saturating_sub(NOTES_SHOWN);
@@ -321,7 +354,7 @@ fn step(job: &Job, timeline: &Timeline, models: &StageModels, order: usize) -> M
                 } @else if gate(job, order) && state != State::Done {
                     span.step-tag.gate title="Waits for your approval" { "✋ approval" }
                 }
-                @if state == State::Current { (actor(job, models)) }
+                @if state == State::Current { (actor(job, models, efforts)) }
                 @if state == State::Failed {
                     @if let Stage::Failed { reason, .. } = job.stage() {
                         span.failure { (reason) }
@@ -361,11 +394,12 @@ fn when(step: &Step, state: State) -> String {
     }
 }
 
-fn actor(job: &Job, models: &StageModels) -> Markup {
+fn actor(job: &Job, models: &StageModels, efforts: &StageEfforts) -> Markup {
     match job.turn() {
         Turn::Agent(task) => html! {
-            span.step-tag.agent title="The model of this run" {
+            span.step-tag.agent title="The model and effort of this run" {
                 (model(job, models).unwrap_or("default"))
+                @if let Some(effort) = effort(job, efforts) { " · " (effort) }
             }
             span { (task_label(task)) }
         },
