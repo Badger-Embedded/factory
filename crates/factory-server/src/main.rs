@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
-    axum::serve(listener, app(store, projects, wake))
+    axum::serve(listener, app(store, projects, wake, data_dir))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

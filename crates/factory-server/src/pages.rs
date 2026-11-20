@@ -92,13 +92,18 @@ pub fn index(
         &nav,
         &html! {
             @if let Some(selected) = selected {
-                form.card method="post" action="/jobs" {
+                form.card method="post" action="/jobs" enctype="multipart/form-data" {
                     h2 { "New request for " (selected) }
                     input type="hidden" name="project" value=(selected);
                     div.field {
                         label for="request" { "What should change?" }
                         textarea #request name="request" required
                             placeholder="Add a reboot button to the device page" {}
+                    }
+                    div.field {
+                        label for="images" { "Images (optional)" }
+                        input #images type="file" name="images" multiple
+                            accept="image/png,image/jpeg,image/gif,image/webp";
                     }
                     button.primary { "Request" }
                 }

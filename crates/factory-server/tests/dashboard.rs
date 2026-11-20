@@ -16,6 +16,7 @@ use tower::ServiceExt;
 struct Dashboard {
     store: Arc<Store>,
     router: Router,
+    data: tempfile::TempDir,
 }
 
 struct Reply {
@@ -23,6 +24,13 @@ struct Reply {
     location: Option<String>,
     body: String,
 }
+
+const BOUNDARY: &str = "factory-test-boundary";
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000";
+const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0];
+const GIF: &[u8] = b"GIF89a0000";
+const WEBP: &[u8] = b"RIFF\x04\0\0\0WEBPVP8 ";
 
 fn dashboard() -> Dashboard {
     dashboard_for("Badger-Embedded/maestro")
@@ -37,9 +45,16 @@ fn dashboard_for(repo: &str) -> Dashboard {
     );
     let projects = Arc::new(Projects::load(dir.path()).unwrap());
     let store = Arc::new(Store::open_in_memory().unwrap());
+    let data = tempfile::tempdir().unwrap();
     Dashboard {
-        router: app(store.clone(), projects, Arc::new(Notify::new())),
+        router: app(
+            store.clone(),
+            projects,
+            Arc::new(Notify::new()),
+            data.path().to_owned(),
+        ),
         store,
+        data,
     }
 }
 
@@ -80,10 +95,45 @@ impl Dashboard {
         .await
     }
 
+    async fn post_job(&self, project: &str, request: &str, images: &[(&str, &[u8])]) -> Reply {
+        let mut body = Vec::new();
+        let mut part = |disposition: String, content: &[u8]| {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\n{disposition}\r\n\r\n").as_bytes());
+            body.extend_from_slice(content);
+            body.extend_from_slice(b"\r\n");
+        };
+        part(
+            "Content-Disposition: form-data; name=\"project\"".into(),
+            project.as_bytes(),
+        );
+        part(
+            "Content-Disposition: form-data; name=\"request\"".into(),
+            request.as_bytes(),
+        );
+        for (file_name, bytes) in images {
+            part(
+                format!(
+                    "Content-Disposition: form-data; name=\"images\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream"
+                ),
+                bytes,
+            );
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        self.send(
+            Request::post("/jobs")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .header(USER_HEADER, "alice@example.com")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
     async fn new_job(&self) -> i64 {
-        let reply = self
-            .post("/jobs", "project=maestro&request=Add+a+reboot+button")
-            .await;
+        let reply = self.post_job("maestro", "Add a reboot button", &[]).await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER);
         let location = reply.location.unwrap();
         location.strip_prefix("/jobs/").unwrap().parse().unwrap()
@@ -129,8 +179,13 @@ async fn without_the_tailscale_header_the_user_is_local() {
     let reply = dashboard
         .send(
             Request::post("/jobs")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("project=maestro&request=x"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"project\"\r\n\r\nmaestro\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\nx\r\n--{BOUNDARY}--\r\n"
+                )))
                 .unwrap(),
         )
         .await;
@@ -141,9 +196,9 @@ async fn without_the_tailscale_header_the_user_is_local() {
 #[tokio::test]
 async fn bad_requests_create_no_job() {
     let dashboard = dashboard();
-    let unknown = dashboard.post("/jobs", "project=nope&request=x").await;
+    let unknown = dashboard.post_job("nope", "x", &[]).await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
-    let empty = dashboard.post("/jobs", "project=maestro&request=++").await;
+    let empty = dashboard.post_job("maestro", "  ", &[]).await;
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     assert_eq!(dashboard.store.list().unwrap().len(), 0);
 }
@@ -639,10 +694,12 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         dashboard.store.clone(),
         Arc::new(Projects::default()),
         Arc::new(Notify::new()),
+        dashboard.data.path().to_owned(),
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
         router,
+        data: tempfile::tempdir().unwrap(),
     }
     .get(&format!("/jobs/{id}"))
     .await;
@@ -677,9 +734,16 @@ fn two_projects() -> Dashboard {
     }
     let projects = Arc::new(Projects::load(dir.path()).unwrap());
     let store = Arc::new(Store::open_in_memory().unwrap());
+    let data = tempfile::tempdir().unwrap();
     Dashboard {
-        router: app(store.clone(), projects, Arc::new(Notify::new())),
+        router: app(
+            store.clone(),
+            projects,
+            Arc::new(Notify::new()),
+            data.path().to_owned(),
+        ),
         store,
+        data,
     }
 }
 
@@ -687,9 +751,7 @@ fn two_projects() -> Dashboard {
 async fn the_index_defaults_to_the_first_project() {
     let dashboard = two_projects();
     dashboard.new_job().await;
-    dashboard
-        .post("/jobs", "project=tool&request=Tool+change")
-        .await;
+    dashboard.post_job("tool", "Tool change", &[]).await;
     let page = dashboard.get("/").await;
     assert!(page.body.contains("<option selected>maestro</option>"));
     assert!(page.body.contains("Add a reboot button</a>"));
@@ -700,9 +762,7 @@ async fn the_index_defaults_to_the_first_project() {
 async fn both_job_lists_show_only_the_selected_project() {
     let dashboard = two_projects();
     let maestro = dashboard.new_job().await;
-    dashboard
-        .post("/jobs", "project=tool&request=Tool+change")
-        .await;
+    dashboard.post_job("tool", "Tool change", &[]).await;
     to_spec_approval(&dashboard, maestro);
 
     let page = dashboard.get("/?project=tool").await;
@@ -738,4 +798,180 @@ async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
     assert!(topbar.contains("<noscript><button>Go</button></noscript>"));
     assert!(!rest.contains("<select"));
     assert!(rest.contains("<input type=\"hidden\" name=\"project\" value=\"tool\">"));
+}
+
+fn saved_images(dashboard: &Dashboard, id: i64) -> Vec<String> {
+    let dir = dashboard
+        .data
+        .path()
+        .join("jobs")
+        .join(id.to_string())
+        .join("images");
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn job_id(reply: &Reply) -> i64 {
+    reply
+        .location
+        .as_deref()
+        .unwrap()
+        .strip_prefix("/jobs/")
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_request_with_images_saves_them_under_the_job() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job(
+            "maestro",
+            "Match this mockup",
+            &[
+                ("a.png", PNG),
+                ("b.jpg", JPEG),
+                ("c.gif", GIF),
+                ("d.webp", WEBP),
+            ],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let id = job_id(&reply);
+
+    let names = ["image-1.png", "image-2.jpg", "image-3.gif", "image-4.webp"];
+    assert_eq!(dashboard.store.images(id).unwrap(), names);
+    assert_eq!(saved_images(&dashboard, id), names);
+    let saved = dashboard
+        .data
+        .path()
+        .join("jobs")
+        .join(id.to_string())
+        .join("images");
+    assert_eq!(fs::read(saved.join("image-1.png")).unwrap(), PNG);
+}
+
+#[tokio::test]
+async fn a_text_only_request_saves_no_images() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    assert_eq!(dashboard.store.images(id).unwrap().len(), 0);
+    assert_eq!(saved_images(&dashboard, id).len(), 0);
+}
+
+#[tokio::test]
+async fn an_empty_file_part_with_no_name_is_ignored() {
+    let dashboard = dashboard();
+    let reply = dashboard.post_job("maestro", "x", &[("", b"")]).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(dashboard.store.images(job_id(&reply)).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn upload_file_names_never_reach_the_file_system() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job(
+            "maestro",
+            "x",
+            &[("../../../escape.png", PNG), ("..\\..\\evil.png", PNG)],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let id = job_id(&reply);
+    assert_eq!(
+        dashboard.store.images(id).unwrap(),
+        ["image-1.png", "image-2.png"]
+    );
+    assert_eq!(saved_images(&dashboard, id), ["image-1.png", "image-2.png"]);
+    let outside: Vec<_> = fs::read_dir(dashboard.data.path()).unwrap().collect();
+    assert_eq!(outside.len(), 1, "only jobs/ exists in the data directory");
+}
+
+#[tokio::test]
+async fn an_image_is_checked_by_content_not_name_or_type() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job("maestro", "x", &[("photo.png", b"<svg></svg>")])
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("PNG, JPEG, GIF or WebP"));
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+
+    let disguised = dashboard
+        .post_job("maestro", "x", &[("photo.txt", PNG)])
+        .await;
+    assert_eq!(disguised.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        dashboard.store.images(job_id(&disguised)).unwrap(),
+        ["image-1.png"]
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_image_is_rejected_with_the_limit() {
+    let dashboard = dashboard();
+    let mut big = PNG.to_vec();
+    big.resize(factory_server::MAX_IMAGE_BYTES + 1, 0);
+    let reply = dashboard
+        .post_job("maestro", "x", &[("big.png", &big)])
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply
+            .body
+            .contains(&factory_server::MAX_IMAGE_BYTES.to_string())
+    );
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+
+    let mut exact = PNG.to_vec();
+    exact.resize(factory_server::MAX_IMAGE_BYTES, 0);
+    let reply = dashboard
+        .post_job("maestro", "x", &[("ok.png", &exact)])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn too_many_images_are_rejected_with_the_limit() {
+    let dashboard = dashboard();
+    let images: Vec<(&str, &[u8])> = vec![("a.png", PNG); factory_server::MAX_IMAGES + 1];
+    let reply = dashboard.post_job("maestro", "x", &images).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply
+            .body
+            .contains(&format!("at most {} images", factory_server::MAX_IMAGES))
+    );
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+    assert!(!dashboard.data.path().join("jobs").exists());
+
+    let images = &images[..factory_server::MAX_IMAGES];
+    let reply = dashboard.post_job("maestro", "x", images).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn images_without_text_are_rejected() {
+    let dashboard = dashboard();
+    let reply = dashboard.post_job("maestro", "  ", &[("a.png", PNG)]).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("the request is empty"));
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+    assert!(!dashboard.data.path().join("jobs").exists());
+}
+
+#[tokio::test]
+async fn the_form_posts_multipart_with_an_image_input() {
+    let page = dashboard().get("/").await;
+    assert!(page.body.contains("multipart/form-data"));
+    assert!(page.body.contains(r#"name="images""#));
 }

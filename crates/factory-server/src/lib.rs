@@ -16,4 +16,4 @@ pub use scheduler::{
 };
 pub use settings::Settings;
 pub use store::{JobRow, LogEntry, Store, StoreError};
-pub use web::{USER_HEADER, app};
+pub use web::{MAX_IMAGE_BYTES, MAX_IMAGES, USER_HEADER, app};

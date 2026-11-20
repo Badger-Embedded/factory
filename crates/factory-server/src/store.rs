@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS logs (
     text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS logs_by_job ON logs (job_id, id);
+CREATE TABLE IF NOT EXISTS job_images (
+    job_id INTEGER NOT NULL REFERENCES jobs (id),
+    name TEXT NOT NULL,
+    PRIMARY KEY (job_id, name)
+);
 CREATE TABLE IF NOT EXISTS pr_watermarks (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     pr INTEGER NOT NULL,
@@ -186,6 +191,37 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(row)
+    }
+
+    /// Records the file names of the images saved for job `id`. The bytes
+    /// live under the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn add_images(&self, id: i64, names: &[String]) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for name in names {
+            tx.execute(
+                "INSERT INTO job_images (job_id, name) VALUES (?1, ?2)",
+                params![id, name],
+            )?;
+        }
+        Ok(tx.commit()?)
+    }
+
+    /// The image file names saved for job `id`, in upload order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn images(&self, id: i64) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT name FROM job_images WHERE job_id = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map([id], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// The stored settings, or the defaults when none are stored.
