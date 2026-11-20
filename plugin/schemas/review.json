@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": ["approve", "changes"],
+      "description": "approve when the change is ready to merge, changes when the author must fix something first."
+    },
+    "feedback": {
+      "type": "string",
+      "description": "With outcome changes: the problems the author must fix, each with its file and line, concrete enough to act on without the diff in view."
+    }
+  },
+  "required": ["outcome"],
+  "additionalProperties": false
+}

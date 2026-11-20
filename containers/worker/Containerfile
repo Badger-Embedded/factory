@@ -27,4 +27,8 @@ RUN curl -fsSL https://nixos.org/nix/install | sh -s -- --no-daemon \
 RUN curl -fsSL https://claude.ai/install.sh | bash \
     && claude --version
 
+# The factory's own skills. A reviewer run loads them with --plugin-dir; the
+# reviewed repository's skills still load alongside them.
+COPY --chown=worker:worker plugin /factory-plugin
+
 WORKDIR /work
