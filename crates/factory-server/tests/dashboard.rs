@@ -1151,6 +1151,11 @@ async fn the_form_has_the_paste_script_and_a_thumbnail_list() {
         page.body
             .contains(r#"<input id="images" type="file" name="images" multiple"#)
     );
+    assert!(
+        page.body
+            .contains(r#"<label class="file-button" for="images">Choose images</label>"#)
+    );
+    assert!(page.body.contains(r#"class="visually-hidden">"#));
 }
 
 #[tokio::test]

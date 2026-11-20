@@ -44,7 +44,7 @@ fn page(user: &str, title: &str, refresh: bool, nav: &Markup, body: &Markup) -> 
             body {
                 div.topbar {
                     div.topbar-inner {
-                        a.brand href="/" { "factory" }
+                        a.brand href="/" { span.brand-mark aria-hidden="true" {} "factory" }
                         div.topbar-end {
                             (nav)
                             a.nav href="/settings" { "Settings" }
@@ -94,7 +94,7 @@ pub fn index(
         &html! {
             @if let Some(selected) = selected {
                 form.card method="post" action="/jobs" enctype="multipart/form-data" {
-                    h2 { "New request for " (selected) }
+                    h2.form-title { "New request for " (selected) }
                     input type="hidden" name="project" value=(selected);
                     div.field {
                         label for="request" { "What should change?" }
@@ -103,11 +103,16 @@ pub fn index(
                     }
                     div.field {
                         label for="images" { "Images (optional)" }
-                        input #images type="file" name="images" multiple
-                            accept="image/png,image/jpeg,image/gif,image/webp";
+                        div.file-picker {
+                            input #images type="file" name="images" multiple
+                                accept="image/png,image/jpeg,image/gif,image/webp"
+                                class="visually-hidden";
+                            label.file-button for="images" { "Choose images" }
+                            span.hint { "PNG, JPEG, GIF or WebP. You can also paste them into the box above." }
+                        }
                         ul #pasted-images.pasted-images {}
                     }
-                    button.primary { "Request" }
+                    div.form-actions { button.primary { "Request" } }
                     script { (PreEscaped(PASTE_IMAGES)) }
                 }
             } @else {

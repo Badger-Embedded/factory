@@ -49,6 +49,8 @@
   --weight-semibold: 600;
   --weight-bold: 700;
 
+  --max-width: 80rem;
+  --topbar-height: 56px;
   --border-width: 1px;
   --lane-bar: 3px;
   --step-bar: 4px;
@@ -97,27 +99,44 @@ a { color: var(--accent); }
 .topbar {
   background: var(--surface);
   border-bottom: var(--border-width) solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
 .topbar-inner, main {
-  max-width: 64rem;
+  max-width: var(--max-width);
   margin: 0 auto;
   padding: 0 var(--space-16);
+}
+
+@media (min-width: 1024px) {
+  .topbar-inner, main { padding: 0 var(--space-32); }
 }
 
 .topbar-inner {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 52px;
+  height: var(--topbar-height);
 }
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-8);
   font-weight: var(--weight-bold);
   font-size: var(--font-size-lg);
   color: var(--text);
   text-decoration: none;
   letter-spacing: -0.01em;
+}
+
+.brand-mark {
+  width: 12px;
+  height: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
 }
 
 .user {
@@ -129,7 +148,7 @@ a { color: var(--accent); }
   padding: var(--space-2) var(--space-10);
 }
 
-main { padding-top: var(--space-24); padding-bottom: var(--space-48); }
+main { padding-top: var(--space-32); padding-bottom: var(--space-48); }
 
 h1 { font-size: var(--font-size-xl); line-height: 1.3; margin: 0 0 var(--space-4); letter-spacing: -0.01em; }
 h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
@@ -277,10 +296,10 @@ button:hover { filter: brightness(0.96); }
 
 .board {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
   gap: var(--space-16);
   align-items: start;
-  margin-top: var(--space-32);
+  margin-top: var(--space-24);
 }
 
 .lane {
@@ -298,11 +317,16 @@ button:hover { filter: brightness(0.96); }
   letter-spacing: 0.04em;
   color: var(--muted);
   margin: 0;
-  padding: var(--space-12) var(--space-16);
+  padding: var(--space-14) var(--space-16);
+  border-bottom: var(--border-width) solid var(--border);
 }
 
 .lane summary { cursor: pointer; }
-.lane .count { font-variant-numeric: tabular-nums; margin-left: var(--space-4); }
+.lane .count {
+  font-variant-numeric: tabular-nums;
+  margin-left: var(--space-4);
+  color: var(--text);
+}
 .lane .empty { padding: var(--space-12) var(--space-16); }
 .lane-you { border-top: var(--lane-bar) solid var(--you); }
 .lane-agent { border-top: var(--lane-bar) solid var(--agent); }
@@ -429,3 +453,32 @@ label.check input { width: auto; }
 .pasted-images, .request-images { list-style: none; display: flex; flex-wrap: wrap; gap: var(--space-10); margin: var(--space-8) 0 0; padding: 0; }
 .pasted-images li, .request-images li { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-4); }
 .pasted-images img, .request-images img { max-width: 160px; max-height: 120px; border: var(--border-width) solid var(--border); border-radius: var(--radius-sm); display: block; }
+
+.form-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-8);
+  font-size: var(--font-size-lg);
+  margin-bottom: var(--space-16);
+}
+form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
+.form-actions { display: flex; justify-content: flex-end; }
+.form-actions button { min-width: 8rem; padding: var(--space-8) var(--space-20); }
+@media (max-width: 640px) {
+  form.card { padding: var(--space-16); }
+  .form-actions button { width: 100%; }
+}
+
+.file-picker { display: flex; align-items: center; gap: var(--space-12); flex-wrap: wrap; }
+.file-button {
+  display: inline-block;
+  margin: 0;
+  padding: 7px var(--space-14);
+  border: var(--border-width) dashed var(--muted);
+  border-radius: var(--radius-md);
+  background: var(--sunken);
+  cursor: pointer;
+}
+.file-button:hover { border-color: var(--accent); color: var(--accent); }
+.file-picker input:focus-visible + .file-button { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+.file-picker .hint { margin: 0; }
