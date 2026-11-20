@@ -7,6 +7,7 @@ use factory_core::{Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use crate::projects::StageModels;
 use crate::settings::Settings;
 
 const SCHEMA: &str = "
@@ -20,6 +21,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     settings TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_models (
+    project TEXT PRIMARY KEY,
+    clarify TEXT,
+    spec TEXT,
+    plan TEXT,
+    implement TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
@@ -426,6 +434,60 @@ impl Store {
             "INSERT INTO settings (id, settings) VALUES (1, ?1)
              ON CONFLICT (id) DO UPDATE SET settings = excluded.settings",
             [serde_json::to_string(settings)?],
+        )?;
+        Ok(())
+    }
+
+    /// The models saved for `project`, or `defaults` when none are saved.
+    /// Saved models replace the defaults as a whole, so saving an empty
+    /// stage clears a model the project file sets.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_models(
+        &self,
+        project: &str,
+        defaults: &StageModels,
+    ) -> Result<StageModels, StoreError> {
+        let stored = self
+            .conn()
+            .query_row(
+                "SELECT clarify, spec, plan, implement FROM project_models WHERE project = ?1",
+                [project],
+                |row| {
+                    Ok(StageModels {
+                        clarify: row.get(0)?,
+                        spec: row.get(1)?,
+                        plan: row.get(2)?,
+                        implement: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_else(|| defaults.clone()))
+    }
+
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_models(
+        &self,
+        project: &str,
+        models: &StageModels,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO project_models (project, clarify, spec, plan, implement)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (project) DO UPDATE SET clarify = excluded.clarify,
+                spec = excluded.spec, plan = excluded.plan, implement = excluded.implement",
+            params![
+                project,
+                models.clarify,
+                models.spec,
+                models.plan,
+                models.implement
+            ],
         )?;
         Ok(())
     }

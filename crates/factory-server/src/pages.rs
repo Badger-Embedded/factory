@@ -5,6 +5,7 @@ use factory_core::{Ask, BranchSummary, Command, Gates, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::cost::{format_cost, merge_fraction};
+use crate::projects::StageModels;
 use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, LogEntry, ProjectTotals};
@@ -244,7 +245,12 @@ fn project_selector(projects: &Projects, selected: &str) -> Markup {
     }
 }
 
-pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup {
+pub fn settings(
+    user: &str,
+    settings: &Settings,
+    models: &[(String, StageModels)],
+    notice: Option<&str>,
+) -> Markup {
     layout(
         user,
         "Settings",
@@ -311,6 +317,25 @@ pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup
                     p.hint { "Also the wait before retrying a failed push or GitHub call." }
                 }
                 button.primary { "Save" }
+            }
+            @for (name, models) in models {
+                form.card method="post" action={ "/settings/projects/" (name) } {
+                    h2 { (name) }
+                    p.hint { "The model each stage runs with. Empty means no model." }
+                    @for (stage, value) in [
+                        ("clarify", &models.clarify),
+                        ("spec", &models.spec),
+                        ("plan", &models.plan),
+                        ("implement", &models.implement),
+                    ] {
+                        div.field {
+                            label for={ (name) "-" (stage) } { (stage) }
+                            input id={ (name) "-" (stage) } type="text" name=(stage)
+                                value=(value.as_deref().unwrap_or_default());
+                        }
+                    }
+                    button.primary { "Save " (name) }
+                }
             }
         },
     )
