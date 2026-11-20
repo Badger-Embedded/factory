@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use factory_core::Event;
 use factory_runner::{
@@ -11,6 +12,7 @@ use crate::scheduler::{
     AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, ReadyAction,
     RerunRequest, SummaryRequest, WatchReport, WatchRequest, ready_action,
 };
+use crate::secrets::ClaudeToken;
 use crate::settings::Settings;
 
 /// Runs agents in podman worker containers.
@@ -28,6 +30,11 @@ pub struct PodmanExecutor {
     /// Opens pull requests and reads their state with the same token.
     pub github: GitHub,
     pub data_dir: PathBuf,
+    /// Resolves the Claude subscription token for each agent run. The run reads
+    /// the current token when it starts, so a token saved on the settings page
+    /// applies to the next run with no factory restart. When it resolves none,
+    /// the run fails with "no Claude token is set" before any container starts.
+    pub token: Arc<ClaudeToken>,
 }
 
 fn failed(reason: String) -> RunReport {
@@ -76,6 +83,13 @@ impl Executor for PodmanExecutor {
         request: AgentRequest,
         log: LogSink,
     ) -> RunReport {
+        // Resolve the token before preparing the checkout or starting a
+        // container. With none, the run fails here; the agent failure keeps the
+        // task as its retry target, so the job page shows Retry and a token
+        // saved on the settings page lets Retry run the task.
+        let Some(token) = self.token.resolve() else {
+            return failed("no Claude token is set".into());
+        };
         let config = self.worker_config(settings);
         let job_dir = self.job_dir(request.job_id);
         let workspace = job_dir.join("work");
@@ -113,6 +127,7 @@ impl Executor for PodmanExecutor {
             session,
             workspace,
             claude_dir,
+            token,
             expect: request.expect,
             prompt,
             model: request.model,
