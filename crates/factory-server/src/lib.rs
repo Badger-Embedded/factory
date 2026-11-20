@@ -12,7 +12,7 @@ mod web;
 
 pub use cost::{format_cost, merge_fraction};
 pub use podman::PodmanExecutor;
-pub use projects::{Project, Projects, ProjectsError, StageModels};
+pub use projects::{ImportError, Project, Projects, StageModels, import_tomls};
 pub use scheduler::{
     AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, PublishRequest, Published,
     ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest, branch_name,

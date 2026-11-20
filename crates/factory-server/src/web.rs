@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::pages;
-use crate::projects::{Project, Projects, ProjectsError, StageModels};
+use crate::projects::{Project, Projects, StageModels};
 use crate::settings::Settings;
 use crate::store::{JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
@@ -107,12 +107,6 @@ enum AppError {
 impl From<StoreError> for AppError {
     fn from(err: StoreError) -> Self {
         AppError::Store(err)
-    }
-}
-
-impl From<ProjectsError> for AppError {
-    fn from(err: ProjectsError) -> Self {
-        AppError::Io(format!("cannot read projects: {err}"))
     }
 }
 

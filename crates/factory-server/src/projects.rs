@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::store::{Store, StoreError};
+
 /// The model each stage of a job runs with. `None` means no model is set.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -23,7 +25,12 @@ pub struct StageModels {
     pub review: Option<String>,
 }
 
-/// One target repository, read from `projects/<name>/project.toml`.
+/// One target repository. The `projects` table holds `repo`, `base` and the
+/// optional `checks`. A project's models and its auto-merge and LLM-review
+/// flags live in `project_models` and `project_settings`, so a project read
+/// from the store carries those three fields at their defaults. The `[models]`,
+/// `auto_merge` and `llm_review` fields are read only when a `project.toml` is
+/// parsed for the one-time import, see [`import_tomls`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
@@ -35,57 +42,43 @@ pub struct Project {
     /// checkout, before it pushes. Without it, the factory pushes unchecked.
     #[serde(default)]
     pub checks: Option<String>,
-    /// Defaults for the project's models. Models saved on the settings page
-    /// replace them.
+    /// Defaults for the project's models, read from a `project.toml` for the
+    /// import. A project read from the store carries [`StageModels::default`].
     #[serde(default)]
     pub models: StageModels,
-    /// The default for auto-merge: squash-merge a pull request once its checks
-    /// pass and no review comment waits for the agent. A saved settings row
-    /// replaces it. Off by default.
+    /// The auto-merge default read from a `project.toml` for the import. A
+    /// project read from the store carries `false`.
     #[serde(default)]
     pub auto_merge: bool,
-    /// The default for the LLM review before merge. A saved settings row
-    /// replaces it. Off by default.
+    /// The LLM-review default read from a `project.toml` for the import. A
+    /// project read from the store carries `false`.
     #[serde(default)]
     pub llm_review: bool,
 }
 
-/// A handle that resolves project metadata on each `lookup` or `list`, rather
-/// than holding a snapshot taken once at startup. A project file edited while
-/// the service runs takes effect on the next call.
-#[derive(Debug, Clone)]
+/// A handle that resolves project metadata from the store on each `lookup` or
+/// `list`, rather than holding a snapshot taken once at startup. A project
+/// onboarded while the service runs is visible on the next call, with no
+/// restart.
+#[derive(Clone)]
 pub struct Projects(Source);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Source {
-    /// Reads `<dir>/<name>/project.toml` on each call.
-    Dir(PathBuf),
+    /// Reads the `projects` table on each call.
+    Db(Arc<Store>),
     /// Holds the projects in memory. Used by tests.
     Memory(Arc<BTreeMap<String, Project>>),
 }
 
-#[derive(Debug)]
-pub enum ProjectsError {
-    Read {
-        path: PathBuf,
-        source: io::Error,
-    },
-    Parse {
-        path: PathBuf,
-        source: toml::de::Error,
-    },
-}
-
-impl fmt::Display for ProjectsError {
+impl fmt::Debug for Projects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProjectsError::Read { path, source } => write!(f, "{}: {source}", path.display()),
-            ProjectsError::Parse { path, source } => write!(f, "{}: {source}", path.display()),
+        match &self.0 {
+            Source::Db(_) => f.debug_tuple("Projects").field(&"db").finish(),
+            Source::Memory(map) => f.debug_tuple("Projects").field(map).finish(),
         }
     }
 }
-
-impl std::error::Error for ProjectsError {}
 
 impl Default for Projects {
     fn default() -> Self {
@@ -100,23 +93,23 @@ impl FromIterator<(String, Project)> for Projects {
 }
 
 impl Projects {
-    /// A handle backed by `<dir>/<name>/project.toml`. It reads the files on
-    /// each call, not at construction, so the next lookup sees an edit.
+    /// A handle backed by the `projects` table of `store`. It reads the table
+    /// on each call, not at construction, so the next lookup sees a project
+    /// onboarded in the meantime.
     #[must_use]
-    pub fn from_dir(dir: PathBuf) -> Self {
-        Projects(Source::Dir(dir))
+    pub fn from_store(store: Arc<Store>) -> Self {
+        Projects(Source::Db(store))
     }
 
     /// The project named `name`, or `None` when none is onboarded under it.
     ///
     /// # Errors
     ///
-    /// Fails when the backing store cannot be read or a `project.toml` does
-    /// not parse.
-    pub fn lookup(&self, name: &str) -> Result<Option<Project>, ProjectsError> {
+    /// Fails when the store cannot be read.
+    pub fn lookup(&self, name: &str) -> Result<Option<Project>, StoreError> {
         match &self.0 {
             Source::Memory(map) => Ok(map.get(name).cloned()),
-            Source::Dir(dir) => read_project(&dir.join(name).join("project.toml")),
+            Source::Db(store) => store.project(name),
         }
     }
 
@@ -124,15 +117,14 @@ impl Projects {
     ///
     /// # Errors
     ///
-    /// Fails when the backing store cannot be read or a `project.toml` does
-    /// not parse.
-    pub fn list(&self) -> Result<Vec<(String, Project)>, ProjectsError> {
+    /// Fails when the store cannot be read.
+    pub fn list(&self) -> Result<Vec<(String, Project)>, StoreError> {
         match &self.0 {
             Source::Memory(map) => Ok(map
                 .iter()
                 .map(|(name, project)| (name.clone(), project.clone()))
                 .collect()),
-            Source::Dir(dir) => read_dir(dir),
+            Source::Db(store) => store.list_projects(),
         }
     }
 
@@ -141,42 +133,131 @@ impl Projects {
     /// # Errors
     ///
     /// As [`Projects::list`].
-    pub fn names(&self) -> Result<Vec<String>, ProjectsError> {
+    pub fn names(&self) -> Result<Vec<String>, StoreError> {
         Ok(self.list()?.into_iter().map(|(name, _)| name).collect())
     }
 }
 
+/// A fault while importing `project.toml` files into the store.
+#[derive(Debug)]
+pub enum ImportError {
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    Store(StoreError),
+}
+
+impl fmt::Display for ImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImportError::Read { path, source } => write!(f, "{}: {source}", path.display()),
+            ImportError::Parse { path, source } => write!(f, "{}: {source}", path.display()),
+            ImportError::Store(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ImportError {}
+
+impl From<StoreError> for ImportError {
+    fn from(err: StoreError) -> Self {
+        ImportError::Store(err)
+    }
+}
+
+/// Imports each `<dir>/<name>/project.toml` into `store`, once. It is the
+/// one-time move from `project.toml` files to the `projects` table.
+///
+/// The import is a no-op when `store` already has a project, so it runs only
+/// on the first start of a database with no projects. A rerun therefore does
+/// not duplicate rows or overwrite a later edit. A missing `dir` is also a
+/// no-op, so a fresh install with no files to import starts clean.
+///
+/// Each file's `repo`, `base` and `checks` go into the `projects` table. Its
+/// `[models]` go into `project_models` only when they are set, and its
+/// `auto_merge` or `llm_review` into `project_settings` only when one is on.
+/// A file that sets neither writes no settings row, so
+/// [`Store::migrate_global_auto_merge`] still applies the old global
+/// auto-merge to an imported project exactly as it did to the file.
+///
+/// After every file is imported, the files are deleted.
+///
+/// # Errors
+///
+/// Fails when `dir` cannot be read, a `project.toml` does not parse, the store
+/// rejects a project, or a file cannot be deleted.
+pub fn import_tomls(store: &Store, dir: &Path) -> Result<(), ImportError> {
+    if !store.list_projects()?.is_empty() {
+        return Ok(());
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ImportError::Read {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut found = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ImportError::Read {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path().join("project.toml");
+        if let Some(project) = read_project(&path)? {
+            found.insert(
+                entry.file_name().to_string_lossy().into_owned(),
+                (path, project),
+            );
+        }
+    }
+    for (name, (_, project)) in &found {
+        store.create_project(
+            name,
+            &project.repo,
+            &project.base,
+            project.checks.as_deref(),
+        )?;
+        if project.models != StageModels::default() {
+            store.save_project_models(name, &project.models)?;
+        }
+        if project.auto_merge || project.llm_review {
+            store.save_project_settings(name, project.auto_merge, project.llm_review)?;
+        }
+    }
+    for (path, _) in found.values() {
+        fs::remove_file(path).map_err(|source| ImportError::Read {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 /// Reads one `project.toml`. A missing file is `None`, so a subdirectory
 /// without one is not a project.
-fn read_project(path: &Path) -> Result<Option<Project>, ProjectsError> {
+fn read_project(path: &Path) -> Result<Option<Project>, ImportError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
-            return Err(ProjectsError::Read {
+            return Err(ImportError::Read {
                 path: path.to_path_buf(),
                 source,
             });
         }
     };
-    let project = toml::from_str(&text).map_err(|source| ProjectsError::Parse {
+    let project = toml::from_str(&text).map_err(|source| ImportError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
     Ok(Some(project))
-}
-
-fn read_dir(dir: &Path) -> Result<Vec<(String, Project)>, ProjectsError> {
-    let read_err = |path: &Path| {
-        let path = path.to_path_buf();
-        move |source| ProjectsError::Read { path, source }
-    };
-    let mut projects = BTreeMap::new();
-    for entry in fs::read_dir(dir).map_err(read_err(dir))? {
-        let entry = entry.map_err(read_err(dir))?;
-        if let Some(project) = read_project(&entry.path().join("project.toml"))? {
-            projects.insert(entry.file_name().to_string_lossy().into_owned(), project);
-        }
-    }
-    Ok(projects.into_iter().collect())
 }

@@ -7,10 +7,17 @@ use factory_core::{Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::projects::StageModels;
+use crate::projects::{Project, StageModels};
 use crate::settings::Settings;
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS projects (
+    name TEXT PRIMARY KEY,
+    repo TEXT NOT NULL UNIQUE,
+    base TEXT NOT NULL,
+    checks TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     project TEXT NOT NULL,
@@ -112,6 +119,10 @@ pub struct JobRow {
 pub enum StoreError {
     NotFound(i64),
     Rejected(Rejected),
+    /// A project with this name is already onboarded.
+    DuplicateName(String),
+    /// A project with this `owner/name` repo is already onboarded.
+    DuplicateRepo(String),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -122,6 +133,10 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::NotFound(id) => write!(f, "no job {id}"),
             StoreError::Rejected(rejected) => rejected.fmt(f),
+            StoreError::DuplicateName(name) => write!(f, "a project named {name:?} already exists"),
+            StoreError::DuplicateRepo(repo) => {
+                write!(f, "the repository {repo:?} is already onboarded")
+            }
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
             StoreError::Io(err) => write!(f, "file system: {err}"),
@@ -196,6 +211,79 @@ impl Store {
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Every onboarded project with its name, in name order. The models and
+    /// the auto-merge and LLM-review flags live in `project_models` and
+    /// `project_settings`, so each project carries those at their defaults.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn list_projects(&self) -> Result<Vec<(String, Project)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT name, repo, base, checks FROM projects ORDER BY name")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, project_row(row)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The project named `name`, or `None` when none is onboarded under it.
+    /// As [`Store::list_projects`], its models and flags read at their
+    /// defaults.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project(&self, name: &str) -> Result<Option<Project>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT repo, base, checks FROM projects WHERE name = ?1",
+                [name],
+                project_row_without_name,
+            )
+            .optional()?)
+    }
+
+    /// Onboards a project with its `repo`, `base` and optional `checks`. Its
+    /// models and flags start at their defaults; the settings page saves them
+    /// into `project_models` and `project_settings`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::DuplicateName`] when `name` is taken, with
+    /// [`StoreError::DuplicateRepo`] when `repo` is already onboarded, and on
+    /// a database error. Nothing is written when it fails.
+    pub fn create_project(
+        &self,
+        name: &str,
+        repo: &str,
+        base: &str,
+        checks: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let name_taken = tx
+            .query_row("SELECT 1 FROM projects WHERE name = ?1", [name], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if name_taken {
+            return Err(StoreError::DuplicateName(name.to_owned()));
+        }
+        let repo_taken = tx
+            .query_row("SELECT 1 FROM projects WHERE repo = ?1", [repo], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if repo_taken {
+            return Err(StoreError::DuplicateRepo(repo.to_owned()));
+        }
+        tx.execute(
+            "INSERT INTO projects (name, repo, base, checks) VALUES (?1, ?2, ?3, ?4)",
+            params![name, repo, base, checks],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// # Errors
@@ -778,6 +866,30 @@ impl Store {
             .ok_or(StoreError::NotFound(id))?;
         parse_row(raw)
     }
+}
+
+/// A `projects` row whose first column is `name`, as `list_projects` selects.
+fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        repo: row.get(1)?,
+        base: row.get(2)?,
+        checks: row.get(3)?,
+        models: StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    })
+}
+
+/// A `projects` row with no `name` column, as `project` selects.
+fn project_row_without_name(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        repo: row.get(0)?,
+        base: row.get(1)?,
+        checks: row.get(2)?,
+        models: StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    })
 }
 
 type RawRow = (i64, String, String, String, String);

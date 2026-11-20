@@ -6,7 +6,7 @@ use std::sync::Arc;
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
     CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, Scheduler,
-    Store, app, refresh_forever,
+    Store, app, import_tomls, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -51,10 +51,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listen = env::var("FACTORY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let data_dir = path_var("FACTORY_DATA", "data");
     let db = env::var_os("FACTORY_DB").map_or_else(|| data_dir.join("factory.db"), PathBuf::from);
-    let projects = Arc::new(Projects::from_dir(path_var("FACTORY_PROJECTS", "projects")));
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(Store::open(&db)?);
+    // The one-time move from `project.toml` files to the `projects` table. It
+    // runs only on the first start of a database with no projects, then deletes
+    // the files it imported.
+    import_tomls(&store, &path_var("FACTORY_IMPORT_PROJECTS", "projects"))?;
+    let projects = Arc::new(Projects::from_store(Arc::clone(&store)));
     let names = projects.names()?;
     store.migrate_global_auto_merge(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
     let wake = Arc::new(Notify::new());
