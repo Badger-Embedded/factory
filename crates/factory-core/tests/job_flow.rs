@@ -879,3 +879,92 @@ fn a_stored_job_without_fresh_sessions_keeps_the_planning_session() {
     apply(&mut job, Event::Approve);
     assert_runs(&job, Session::Planning, Task::WritePlan);
 }
+
+#[test]
+fn a_rerun_request_counts_a_round_and_returns_to_watching() {
+    let mut job = watching(7);
+    apply(
+        &mut job,
+        Event::CiFailed {
+            log: "flaky".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::RerunCi {
+            reason: "network timeout".into(),
+        }),
+    );
+
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(
+        job.next_command(),
+        Some(Command::RerunCi {
+            pr: 0,
+            number: 7,
+            reason: "network timeout".into(),
+        })
+    );
+
+    apply(&mut job, Event::CiRerun);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr { pr: 0, number: 7 })
+    );
+}
+
+#[test]
+fn a_rerun_request_is_only_taken_from_a_fix_ci_turn() {
+    let mut job = watching(7);
+    let before = job.clone();
+    let result = job.apply(Event::Agent(AgentResult::RerunCi {
+        reason: "flaky".into(),
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(job, before);
+}
+
+#[test]
+fn the_fifth_failed_round_fails_the_job_when_it_is_a_rerun() {
+    let mut job = watching(7);
+    apply(
+        &mut job,
+        Event::Conflicted {
+            base: "main".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    apply(
+        &mut job,
+        Event::CiFailed {
+            log: "flaky".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::RerunCi {
+            reason: "flaky".into(),
+        }),
+    );
+    apply(&mut job, Event::CiRerun);
+    apply(
+        &mut job,
+        Event::CiFailed {
+            log: "flaky".into(),
+        },
+    );
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::RerunCi {
+            reason: "flaky".into(),
+        }),
+    );
+
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert_eq!(job.next_command(), None);
+}

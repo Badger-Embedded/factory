@@ -76,6 +76,11 @@ pub enum Stage {
 pub enum Turn {
     Agent(Task),
     Factory,
+    /// The factory reruns the pull request's failed CI runs. The agent asked
+    /// for it and gave `reason`.
+    RerunCi {
+        reason: String,
+    },
     User(Ask),
     Done,
 }
@@ -195,6 +200,13 @@ pub enum Command {
         pr: usize,
         number: u64,
     },
+    /// Rerun the failed CI runs of the pull request. The factory logs
+    /// `reason`.
+    RerunCi {
+        pr: usize,
+        number: u64,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +216,11 @@ pub enum AgentResult {
     Spec(String),
     Plan(Vec<PlannedPr>),
     CommitsReady(PrDescription),
+    /// The agent has nothing to commit and wants CI to run again, for
+    /// example after a flaky failure. `reason` says why.
+    RerunCi {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +247,8 @@ pub enum Event {
     CiFailed {
         log: String,
     },
+    /// The factory reran the failed CI runs the agent asked to rerun.
+    CiRerun,
     /// The pull request no longer merges cleanly into `base`.
     Conflicted {
         base: String,
@@ -348,6 +367,13 @@ impl Job {
             (Turn::Factory, Stage::CiAndReview { pr }) => self.plan[*pr]
                 .number
                 .map(|number| Command::WatchPr { pr: *pr, number }),
+            (Turn::RerunCi { reason }, Stage::CiAndReview { pr }) => {
+                self.plan[*pr].number.map(|number| Command::RerunCi {
+                    pr: *pr,
+                    number,
+                    reason: reason.clone(),
+                })
+            }
             _ => None,
         }
     }
@@ -510,7 +536,7 @@ impl Job {
             ),
             (S::Verifying { pr }, Turn::Factory, E::ChecksFailed { report }) => {
                 let pr = *pr;
-                self.fail_round(S::Verifying { pr }, Task::FixChecks { report })
+                self.fail_round(S::Verifying { pr }, Turn::Agent(Task::FixChecks { report }))
             }
 
             (S::PrOpen { pr }, Turn::Factory, E::Published { number }) => {
@@ -521,11 +547,22 @@ impl Job {
 
             (S::CiAndReview { pr }, Turn::Factory, E::CiFailed { log }) => {
                 let pr = *pr;
-                self.fail_round(S::CiAndReview { pr }, Task::FixCi { log })
+                self.fail_round(S::CiAndReview { pr }, Turn::Agent(Task::FixCi { log }))
             }
             (S::CiAndReview { pr }, Turn::Factory, E::Conflicted { base }) => {
                 let pr = *pr;
-                self.fail_round(S::CiAndReview { pr }, Task::Rebase { base })
+                self.fail_round(S::CiAndReview { pr }, Turn::Agent(Task::Rebase { base }))
+            }
+            (
+                S::CiAndReview { pr },
+                Turn::Agent(Task::FixCi { .. }),
+                E::Agent(AgentResult::RerunCi { reason }),
+            ) => {
+                let pr = *pr;
+                self.fail_round(S::CiAndReview { pr }, Turn::RerunCi { reason })
+            }
+            (S::CiAndReview { pr }, Turn::RerunCi { .. }, E::CiRerun) => {
+                (S::CiAndReview { pr: *pr }, Turn::Factory)
             }
             (S::CiAndReview { pr }, Turn::Factory, E::ReviewComments { comments }) => (
                 S::CiAndReview { pr: *pr },
@@ -579,14 +616,14 @@ impl Job {
         )
     }
 
-    fn fail_round(&mut self, stage: Stage, fix: Task) -> (Stage, Turn) {
+    fn fail_round(&mut self, stage: Stage, next: Turn) -> (Stage, Turn) {
         self.failed_rounds += 1;
         if self.failed_rounds >= MAX_FAILED_ROUNDS {
             let reason =
                 format!("{MAX_FAILED_ROUNDS} failed check or CI rounds on one pull request");
             (Stage::Failed { reason }, Turn::Done)
         } else {
-            (stage, Turn::Agent(fix))
+            (stage, next)
         }
     }
 
