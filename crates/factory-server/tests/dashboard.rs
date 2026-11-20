@@ -6,7 +6,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    AgentResult, Ask, Event, PlannedPr, PrDescription, Question, Stage, Task, Turn,
+    AgentResult, Ask, Event, Gates, PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{Projects, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
@@ -547,6 +547,11 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
             worker_memory: "6g".into(),
             worker_cpus: "6".into(),
             auto_merge: false,
+            gates: Gates {
+                spec: false,
+                plan: false,
+                publish: false
+            },
         }
     );
     assert!(page.body.contains("name=\"auto_merge\""));
@@ -974,4 +979,116 @@ async fn the_form_posts_multipart_with_an_image_input() {
     let page = dashboard().get("/").await;
     assert!(page.body.contains("multipart/form-data"));
     assert!(page.body.contains(r#"name="images""#));
+}
+
+fn gate_form(gates: &str) -> String {
+    format!("max_workers=2&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4{gates}")
+}
+
+#[tokio::test]
+async fn the_settings_page_has_a_checkbox_per_gate_with_spec_and_plan_on() {
+    let dashboard = dashboard();
+    let body = dashboard.get("/settings").await.body;
+    assert!(body.contains("Approval gates"));
+    for name in ["gate_spec", "gate_plan", "gate_publish"] {
+        assert!(body.contains(&format!("name=\"{name}\"")), "{name}");
+    }
+    assert!(body.contains(r#"name="gate_spec" value="on" checked"#));
+    assert!(body.contains(r#"name="gate_plan" value="on" checked"#));
+    assert!(!body.contains(r#"name="gate_publish" value="on" checked"#));
+    assert!(body.contains("The publish gate has no effect yet."));
+}
+
+#[tokio::test]
+async fn the_gate_checkboxes_save_and_an_absent_box_means_off() {
+    let dashboard = dashboard();
+    let all = gate_form("&gate_spec=on&gate_plan=on&gate_publish=on");
+    assert_eq!(
+        dashboard.post("/settings", &all).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        dashboard.store.settings().unwrap().gates,
+        Gates {
+            spec: true,
+            plan: true,
+            publish: true
+        }
+    );
+
+    dashboard
+        .post("/settings", &gate_form("&gate_plan=on"))
+        .await;
+    assert_eq!(
+        dashboard.store.settings().unwrap().gates,
+        Gates {
+            spec: false,
+            plan: true,
+            publish: false
+        }
+    );
+
+    dashboard.post("/settings", &gate_form("")).await;
+    let gates = dashboard.store.settings().unwrap().gates;
+    assert_eq!(
+        gates,
+        Gates {
+            spec: false,
+            plan: false,
+            publish: false
+        }
+    );
+    let body = dashboard.get("/settings").await.body;
+    assert!(!body.contains(r#"name="gate_spec" value="on" checked"#));
+    assert!(!body.contains(r#"name="gate_plan" value="on" checked"#));
+}
+
+#[tokio::test]
+async fn the_job_page_shows_the_gates_the_job_started_with() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let page = dashboard.get(&format!("/jobs/{first}")).await;
+    assert!(page.body.contains("Approval gates: spec, plan"));
+
+    dashboard
+        .post("/settings", &gate_form("&gate_publish=on"))
+        .await;
+    let second = dashboard.new_job().await;
+    let page = dashboard.get(&format!("/jobs/{second}")).await;
+    assert!(page.body.contains("Approval gates: publish"));
+    let page = dashboard.get(&format!("/jobs/{first}")).await;
+    assert!(page.body.contains("Approval gates: spec, plan"));
+
+    dashboard.post("/settings", &gate_form("")).await;
+    let third = dashboard.new_job().await;
+    let page = dashboard.get(&format!("/jobs/{third}")).await;
+    assert!(page.body.contains("Approval gates: none"));
+}
+
+#[test]
+fn a_job_keeps_the_gates_it_was_created_with() {
+    let store = Store::open_in_memory().unwrap();
+    let before = store.create("maestro", "alice", "before").unwrap();
+    let changed = Gates {
+        spec: false,
+        plan: true,
+        publish: true,
+    };
+    store
+        .save_settings(&factory_server::Settings {
+            gates: changed,
+            ..factory_server::Settings::default()
+        })
+        .unwrap();
+    let after = store.create("maestro", "alice", "after").unwrap();
+    assert_eq!(store.get(before).unwrap().job.gates(), Gates::default());
+    assert_eq!(store.get(after).unwrap().job.gates(), changed);
+}
+
+#[test]
+fn a_settings_record_without_gates_loads_the_default_gates() {
+    let stored = r#"{"max_workers":4,"worker_image":"i","worker_memory":"3g","worker_cpus":"4","poll_seconds":60,"auto_merge":true}"#;
+    let settings: factory_server::Settings = serde_json::from_str(stored).unwrap();
+    assert_eq!(settings.max_workers, 4);
+    assert_eq!(settings.gates, Gates::default());
 }

@@ -1,3 +1,4 @@
+use factory_core::Gates;
 use serde::{Deserialize, Serialize};
 
 /// Factory settings that change while it runs. The job loop reads them on
@@ -19,6 +20,8 @@ pub struct Settings {
     /// Squash-merge a pull request once all its checks pass and no review
     /// comment waits for the agent. Off, the user merges on GitHub.
     pub auto_merge: bool,
+    /// The gates a new job starts with. A job keeps its own copy.
+    pub gates: Gates,
 }
 
 impl Default for Settings {
@@ -30,6 +33,7 @@ impl Default for Settings {
             worker_cpus: "4".into(),
             poll_seconds: 60,
             auto_merge: false,
+            gates: Gates::default(),
         }
     }
 }

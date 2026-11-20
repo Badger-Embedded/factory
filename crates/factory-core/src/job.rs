@@ -247,6 +247,11 @@ impl Job {
     }
 
     #[must_use]
+    pub fn gates(&self) -> Gates {
+        self.gates
+    }
+
+    #[must_use]
     pub fn request(&self) -> &str {
         &self.request
     }

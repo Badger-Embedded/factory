@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use factory_core::{Event, Gates, Job, Rejected, Session};
+use factory_core::{Event, Job, Rejected, Session};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -144,7 +144,8 @@ impl Store {
         requested_by: &str,
         request: &str,
     ) -> Result<i64, StoreError> {
-        let job = serde_json::to_string(&Job::new(request, Gates::default()))?;
+        let gates = self.settings()?.gates;
+        let job = serde_json::to_string(&Job::new(request, gates))?;
         let conn = self.conn();
         conn.execute(
             "INSERT INTO jobs (project, requested_by, job) VALUES (?1, ?2, ?3)",

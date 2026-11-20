@@ -18,7 +18,7 @@ These decisions were made on 2026-11-19 while brainstorming in the maestro repos
 | GitHub identity | The bot account `moonthebot`, logged in with `gh` on moon (scope `repo`). It must be a **Write** collaborator on each target repository, not Admin, so a ruleset's Admin bypass does not apply to it. |
 | Credentials | Only the factory holds the GitHub token. Workers get no GitHub credentials. |
 | Claude auth | The subscription token from `claude setup-token`, stored as a podman secret and given only to workers. Its usage limits are shared with interactive use. Switch to an API key if the factory hits them often. |
-| Approval gates | Spec and plan. Everything after the plan runs without stopping, apart from questions the agent asks. You merge on GitHub, unless the auto-merge setting is on: then the factory squash-merges a pull request once every check passed and no review comment waits for the agent. A pull request with no checks reported yet is not merged, so a push is never merged before GitHub starts its CI. |
+| Approval gates | Spec and plan, each on by default. The settings page turns each off. A job copies the gates from the settings when it is created, so a later settings change does not touch existing jobs. Everything after the last gate runs without stopping, apart from questions the agent asks. The state machine stops at a gate only when the job has it. The settings page also lists a publish gate, stored but with no effect until the publish step uses it. You merge on GitHub, unless the auto-merge setting is on: then the factory squash-merges a pull request once every check passed and no review comment waits for the agent. A pull request with no checks reported yet is not merged, so a push is never merged before GitHub starts its CI. |
 | Notifications | The dashboard inbox only. |
 | Project registry | `projects/<name>/project.toml` files in this repository. Adding a project is a pull request. |
 | Request images | The New request form posts multipart. The handler accepts up to 5 images of at most 5 MiB each, and the request text may be at most 256 KiB. It checks each image by its first bytes, not by file name or declared type, and accepts PNG, JPEG, GIF and WebP. A request over a limit, or one with images and no text, gets a 400 that names the limit and creates no job. The factory saves each image as `<data_dir>/jobs/<id>/images/image-<n>.<ext>` under a name it generates, so an upload's file name never reaches the file system. The job row in SQLite records only the file names, in a `job_images` table. `factory-core`'s `Job` holds no image data, since it does no I/O. |
@@ -43,7 +43,7 @@ GitHub cannot reach `moon.local`, so the factory polls GitHub with `gh api` abou
 
 ## Job flow
 
-Each job moves through these states. Each ✋ is an approval gate.
+Each job moves through these states. Each ✋ is an approval gate that the job may have turned off.
 
 ```text
 requested → clarifying → spec ✋ → plan ✋ → implementing → verifying → pr-open → ci-and-review → merged
@@ -109,7 +109,6 @@ One maestro job from start to end: a request typed in the dashboard ends as a gr
 ## Open questions
 
 - **Sign-off on factory pull requests.** maestro's `CONTRIBUTING.md` asks for a `Signed-off-by` line in the pull request description, and its `open-pr` skill signs with the git identity. A pull request from moonthebot needs a decision: no sign-off, or yours added when you approve the plan.
-- **Configurable approval gates.** The gates are fixed in `factory-core` today: spec and plan. To let a settings page add gates, such as approving before the factory pushes, a job would carry its set of gates, copied from the settings when the job is created. A job then keeps the gates it started with when the settings change. The state machine stops at a gate only when the job's set includes it.
 - **Overlap with maestro's skills.** Once the factory works, decide whether maestro keeps its own `no-comments` and `open-pr` skills for interactive sessions or drops them.
 
 ## Lessons from building maestro's checks
