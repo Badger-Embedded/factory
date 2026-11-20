@@ -4758,6 +4758,116 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
     assert!(store.project_mcp("maestro", "context7").unwrap().enabled);
 }
 
+/// The Claude token stored with the same key the dashboard's secret store uses.
+fn stored_claude_token(dashboard: &Dashboard) -> Option<String> {
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .claude_token()
+        .unwrap()
+}
+
+/// Stores a Claude token with the same key the dashboard's secret store uses.
+fn store_claude_token(dashboard: &Dashboard, value: &str) {
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .set_claude_token(value)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_settings_page_has_a_claude_token_field_in_the_global_section() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/settings").await.body;
+    assert!(page.contains("Claude token"));
+    assert!(page.contains("name=\"claude_token\""));
+    assert!(page.contains("action=\"/settings/claude-token\""));
+    // No token yet, so the field shows "not set".
+    assert!(page.contains("placeholder=\"not set\""));
+}
+
+#[tokio::test]
+async fn the_claude_token_is_never_rendered_but_its_presence_shows() {
+    let dashboard = dashboard();
+    store_claude_token(&dashboard, "sk-ant-oat-secret-xyz");
+
+    let page = dashboard.get("/settings").await.body;
+    assert!(
+        !page.contains("sk-ant-oat-secret-xyz"),
+        "the stored token leaked into the HTML"
+    );
+    // The field shows only that a token is stored, never a value attribute.
+    assert!(page.contains("placeholder=\"set\""));
+    assert!(!page.contains("value=\"sk-ant"));
+}
+
+#[tokio::test]
+async fn saving_the_claude_token_replaces_it_and_trims_whitespace() {
+    let dashboard = dashboard();
+    store_claude_token(&dashboard, "sk-ant-oat-old");
+
+    // A value pasted with surrounding whitespace and a trailing newline is
+    // stored without them, and replaces the old token.
+    let reply = dashboard
+        .post(
+            "/settings/claude-token",
+            "claude_token=%20sk-ant-oat-new%0A",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    assert_eq!(
+        stored_claude_token(&dashboard).as_deref(),
+        Some("sk-ant-oat-new")
+    );
+}
+
+#[tokio::test]
+async fn an_empty_claude_token_field_keeps_the_stored_token() {
+    let dashboard = dashboard();
+    store_claude_token(&dashboard, "sk-ant-oat-keep");
+
+    let reply = dashboard
+        .post("/settings/claude-token", "claude_token=")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        stored_claude_token(&dashboard).as_deref(),
+        Some("sk-ant-oat-keep")
+    );
+}
+
+#[tokio::test]
+async fn the_clear_control_removes_the_claude_token() {
+    let dashboard = dashboard();
+    store_claude_token(&dashboard, "sk-ant-oat-gone");
+
+    let reply = dashboard
+        .post("/settings/claude-token/clear", "claude_token=")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Cleared."));
+    assert_eq!(stored_claude_token(&dashboard), None);
+}
+
+#[tokio::test]
+async fn without_a_master_key_the_claude_token_field_is_disabled_with_a_message() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    let dashboard = dashboard_with_secrets(
+        Arc::clone(&store),
+        Arc::new(FakeRepos::fit()),
+        Arc::new(UnavailableSecrets::new(Arc::clone(&store))),
+    );
+
+    let page = dashboard.get("/settings").await.body;
+    // The field is present but disabled, and the page says why.
+    assert!(page.contains("name=\"claude_token\""));
+    assert!(page.contains("master key is missing"));
+    assert!(page.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+    // The token input is one of the disabled fields.
+    assert!(page.contains("disabled"));
+}
+
 /// Adds the `context7` server with an `Authorization` header through the form.
 async fn add_context7(dashboard: &Dashboard) {
     dashboard

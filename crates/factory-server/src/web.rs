@@ -104,6 +104,8 @@ pub fn app(
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(show_settings).post(save_settings))
         .route("/settings/projects/{name}", post(save_project_models))
+        .route("/settings/claude-token", post(save_claude_token))
+        .route("/settings/claude-token/clear", post(clear_claude_token))
         .route("/settings/mcp", post(add_mcp_server))
         .route("/settings/mcp/{name}", post(edit_mcp_server))
         .route("/settings/mcp/{name}/delete", post(delete_mcp_server))
@@ -745,12 +747,18 @@ fn settings_page(
             })
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
+    // With the store unavailable the token cannot be read, so the field shows
+    // "not set" and is disabled. A decrypt error also reads as not set; a save
+    // then replaces it.
+    let claude_token_set =
+        state.secrets.available() && state.secrets.claude_token().ok().flatten().is_some();
     Ok(pages::settings(
         &user(headers),
         &settings,
         &servers,
         &projects,
         state.secrets.available(),
+        claude_token_set,
         notice,
     ))
 }
@@ -1040,6 +1048,41 @@ async fn save_settings(
     state.store.save_settings(&settings)?;
     state.wake.notify_one();
     settings_page(&state, &headers, Some("Saved."))
+}
+
+#[derive(Deserialize)]
+struct ClaudeTokenForm {
+    #[serde(default)]
+    claude_token: String,
+}
+
+/// Replaces the stored Claude token with the posted value. The value is trimmed
+/// of surrounding whitespace and a trailing newline, the way a pasted
+/// `claude setup-token` output needs. An empty field keeps the stored token, so
+/// a save that leaves the field blank is a no-op. The resolver reads the token
+/// afresh, so the next worker run and the next plan usage refresh use the new
+/// one with no restart.
+async fn save_claude_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ClaudeTokenForm>,
+) -> Result<Markup, AppError> {
+    let token = form.claude_token.trim();
+    if !token.is_empty() {
+        state.secrets.set_claude_token(token)?;
+    }
+    settings_page(&state, &headers, Some("Saved."))
+}
+
+/// Clears the stored Claude token. The posted form fields, if any, are ignored.
+/// Clearing works even when the master key is missing, so a token stranded by a
+/// lost key can still be removed.
+async fn clear_claude_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    state.secrets.clear_claude_token()?;
+    settings_page(&state, &headers, Some("Cleared."))
 }
 
 /// The base branch an empty field defaults to.
