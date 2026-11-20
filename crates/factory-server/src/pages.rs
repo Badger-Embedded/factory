@@ -506,7 +506,10 @@ fn cost_label(usd: f64) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "the page takes each value its handler read")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the page takes each value its handler read"
+)]
 pub fn job(
     user: &str,
     row: &JobRow,
