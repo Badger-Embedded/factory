@@ -2,9 +2,9 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use factory_core::{Event, Job, Rejected, Session};
+use factory_core::{Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::settings::Settings;
 
@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS job_costs (
     job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
     usd REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS project_totals (
+    project TEXT PRIMARY KEY,
+    usd REAL NOT NULL DEFAULT 0,
+    jobs_created INTEGER NOT NULL DEFAULT 0,
+    jobs_merged INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS pr_watermarks (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     pr INTEGER NOT NULL,
@@ -59,6 +65,17 @@ pub struct LogEntry {
     /// `text`, `tool`, `other` for agent output, or `factory`.
     pub kind: String,
     pub text: String,
+}
+
+/// What a project has used since the totals were introduced. Deleting a job
+/// does not lower them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProjectTotals {
+    /// API cost of all agent runs, in USD.
+    pub usd: f64,
+    pub jobs_created: i64,
+    /// Jobs that reached `Merged`. A job with several pull requests counts once.
+    pub jobs_merged: i64,
 }
 
 /// The jobs, kept in SQLite. Each job is stored as JSON in one row.
@@ -152,12 +169,20 @@ impl Store {
     ) -> Result<i64, StoreError> {
         let gates = self.settings()?.gates;
         let job = serde_json::to_string(&Job::new(request, gates))?;
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO jobs (project, requested_by, job) VALUES (?1, ?2, ?3)",
             params![project, requested_by, job],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO project_totals (project, jobs_created) VALUES (?1, 1)
+             ON CONFLICT (project) DO UPDATE SET jobs_created = jobs_created + 1",
+            [project],
+        )?;
+        tx.commit()?;
+        Ok(id)
     }
 
     /// # Errors
@@ -236,13 +261,28 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut row = Self::load(&tx, id)?;
+        Self::apply_in(&tx, &mut row, event)?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// Applies `event` to `row`, saves the job and counts a first arrival at
+    /// `Merged` in the project totals.
+    fn apply_in(tx: &Transaction<'_>, row: &mut JobRow, event: Event) -> Result<(), StoreError> {
+        let was_merged = *row.job.stage() == Stage::Merged;
         row.job.apply(event).map_err(StoreError::Rejected)?;
         tx.execute(
             "UPDATE jobs SET job = ?1 WHERE id = ?2",
-            params![serde_json::to_string(&row.job)?, id],
+            params![serde_json::to_string(&row.job)?, row.id],
         )?;
-        tx.commit()?;
-        Ok(row)
+        if !was_merged && *row.job.stage() == Stage::Merged {
+            tx.execute(
+                "INSERT INTO project_totals (project, jobs_merged) VALUES (?1, 1)
+                 ON CONFLICT (project) DO UPDATE SET jobs_merged = jobs_merged + 1",
+                [&row.project],
+            )?;
+        }
+        Ok(())
     }
 
     /// Records the file names of the images saved for job `id`. The bytes
@@ -263,18 +303,56 @@ impl Store {
         Ok(tx.commit()?)
     }
 
-    /// Adds `usd` to the running API cost of job `id`.
+    /// Adds `usd` to the running API cost of job `id` and to the totals of
+    /// its project.
     ///
     /// # Errors
     ///
-    /// Fails on a database error.
+    /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on
+    /// a database error.
     pub fn add_cost(&self, id: i64, usd: f64) -> Result<(), StoreError> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row = Self::load(&tx, id)?;
+        tx.execute(
             "INSERT INTO job_costs (job_id, usd) VALUES (?1, ?2)
              ON CONFLICT (job_id) DO UPDATE SET usd = usd + excluded.usd",
             params![id, usd],
         )?;
-        Ok(())
+        tx.execute(
+            "INSERT INTO project_totals (project, usd) VALUES (?1, ?2)
+             ON CONFLICT (project) DO UPDATE SET usd = usd + excluded.usd",
+            params![row.project, usd],
+        )?;
+        Ok(tx.commit()?)
+    }
+
+    /// The totals of `project`. A project with no jobs since the totals were
+    /// introduced reads 0 everywhere.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_totals(&self, project: &str) -> Result<ProjectTotals, StoreError> {
+        let totals = self
+            .conn()
+            .query_row(
+                "SELECT usd, jobs_created, jobs_merged FROM project_totals WHERE project = ?1",
+                [project],
+                |row| {
+                    Ok(ProjectTotals {
+                        usd: row.get(0)?,
+                        jobs_created: row.get(1)?,
+                        jobs_merged: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(totals.unwrap_or(ProjectTotals {
+            usd: 0.0,
+            jobs_created: 0,
+            jobs_merged: 0,
+        }))
     }
 
     /// The API cost of job `id` in USD, summed over its agent runs. A job
@@ -393,11 +471,7 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut row = Self::load(&tx, job_id)?;
-        row.job.apply(event).map_err(StoreError::Rejected)?;
-        tx.execute(
-            "UPDATE jobs SET job = ?1 WHERE id = ?2",
-            params![serde_json::to_string(&row.job)?, job_id],
-        )?;
+        Self::apply_in(&tx, &mut row, event)?;
         tx.execute(
             "INSERT INTO pr_watermarks (job_id, pr, seen_until) VALUES (?1, ?2, ?3)
              ON CONFLICT (job_id, pr) DO UPDATE SET seen_until = excluded.seen_until",
