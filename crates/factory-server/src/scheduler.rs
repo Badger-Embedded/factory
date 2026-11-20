@@ -308,8 +308,7 @@ impl<E: Executor> Scheduler<E> {
             let Some(command) = job.next_command() else {
                 continue;
             };
-            let Some(project) = self.projects.get(&row.project).cloned() else {
-                self.fail_unknown_project(&row, &job)?;
+            let Some(project) = self.project_for(&row, &job)? else {
                 continue;
             };
             match command {
@@ -422,6 +421,23 @@ impl<E: Executor> Scheduler<E> {
             .filter(|task| task.kind == Kind::Worker && !task.handle.is_finished())
             .count();
         busy < settings.max_workers
+    }
+
+    /// The project a job runs against, or `None` when the job cannot go on
+    /// this pass. An unknown project fails the job. A read error is logged and
+    /// left for the next pass, so a transient fault does not fail the job.
+    fn project_for(&self, row: &JobRow, job: &Job) -> Result<Option<Project>, StoreError> {
+        match self.projects.lookup(&row.project) {
+            Ok(project @ Some(_)) => Ok(project),
+            Ok(None) => {
+                self.fail_unknown_project(row, job)?;
+                Ok(None)
+            }
+            Err(err) => {
+                tracing::error!("job {}: cannot read project {}: {err}", row.id, row.project);
+                Ok(None)
+            }
+        }
     }
 
     fn fail_unknown_project(&self, row: &JobRow, job: &Job) -> Result<(), StoreError> {
