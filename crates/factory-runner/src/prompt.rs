@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use factory_core::{Job, PlannedPr, Task};
+use factory_core::{Job, PlannedPr, Task, Verdict};
 
 use crate::outcome::Expect;
 
@@ -69,7 +69,7 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
         ),
-        Task::Review => return review_prompt(),
+        Task::Review => return review_prompt(None),
     };
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
@@ -83,19 +83,43 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
 }
 
 /// The prompt for an LLM review run. The worker has no GitHub token, so the
-/// reviewer reads the branch's diff from the checkout and does not push. It
-/// resumes across passes, so a later pass reviews only the new commits.
-fn review_prompt() -> String {
-    "Review the commits this branch adds on top of its base. Read the diff with git, \
-     against the base branch the checkout is on. Check the change for correctness and \
-     for the repository's own rules in CLAUDE.md and CONTRIBUTING.md. Do not change any \
-     files and do not push.\n\n\
-     The factory's review skill describes the method. The repository you are reviewing \
-     may carry its own review, lint or project skills; use them, since they know rules \
-     this prompt does not.\n\n\
-     End with outcome \"approve\" when the change is ready to merge, or \"changes\" with \
-     feedback the author can act on when it is not."
-        .to_owned()
+/// reviewer reads the branch's diff from the checkout and does not push. The
+/// session resumes across passes, so on a later pass it already holds the
+/// earlier diff; `previous` restates the feedback it asked for and limits the
+/// pass to the commits added since.
+fn review_prompt(previous: Option<&str>) -> String {
+    let mut text = String::from(
+        "Review the commits this branch adds on top of its base. Read the diff with git, \
+         against the base branch the checkout is on. Check the change for correctness and \
+         for the repository's own rules in CLAUDE.md and CONTRIBUTING.md. Do not change any \
+         files and do not push.\n\n\
+         The factory's review skill describes the method. The repository you are reviewing \
+         may carry its own review, lint or project skills; use them, since they know rules \
+         this prompt does not.\n\n",
+    );
+    if let Some(feedback) = previous {
+        let _ = write!(
+            text,
+            "You reviewed an earlier version of this branch and asked for these changes:\n\n\
+             {feedback}\n\n\
+             The author has pushed commits since. Review only the commits added since your \
+             last review, and check that each point above is handled.\n\n"
+        );
+    }
+    text.push_str(
+        "End with outcome \"approve\" when the change is ready to merge, or \"changes\" with \
+         feedback the author can act on when it is not.",
+    );
+    text
+}
+
+/// The feedback from the most recent review pass that asked for changes, for a
+/// later review pass. `None` on the first pass, which reviews the whole branch.
+fn previous_feedback(job: &Job) -> Option<&str> {
+    job.reviews()
+        .last()
+        .filter(|pass| pass.verdict == Verdict::Changes)
+        .and_then(|pass| pass.feedback.as_deref())
 }
 
 /// The prompt for one agent run of `job`. A job with fresh sessions starts
@@ -103,6 +127,9 @@ fn review_prompt() -> String {
 /// carry what the session has not seen. Every other run uses [`prompt`].
 #[must_use]
 pub fn job_prompt(job: &Job, task: &Task, expect: Expect) -> String {
+    if let Task::Review = task {
+        return review_prompt(previous_feedback(job));
+    }
     let body = prompt(task, expect);
     if !job.fresh_sessions() {
         return body;

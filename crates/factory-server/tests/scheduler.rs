@@ -305,6 +305,7 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
             description: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
+        Expect::Review => unreachable!("the scheduler runs no review until its wiring lands"),
     });
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -1296,6 +1297,7 @@ fn one_pass(request: &AgentRequest) -> Event {
             description: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
+        Expect::Review => unreachable!("the scheduler runs no review until its wiring lands"),
     }
 }
 
