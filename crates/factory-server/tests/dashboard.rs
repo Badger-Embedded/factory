@@ -453,7 +453,7 @@ async fn the_job_page_shows_the_cost_summed_over_runs() {
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(
         page.body
-            .contains("<span class=\"badge cost\">$1.25</span>")
+            .contains("<span class=\"badge cost\" id=\"job-cost\">$1.25</span>")
     );
     assert!(page.body.contains("requested by alice@example.com"));
     assert!(page.body.contains(" UTC</p>"));
@@ -466,7 +466,10 @@ async fn a_job_without_cost_shows_a_dash() {
     let id = dashboard.new_job().await;
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(page.body.contains("<span class=\"badge cost\">–</span>"));
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\" id=\"job-cost\">–</span>")
+    );
 }
 
 #[tokio::test]
@@ -480,7 +483,7 @@ async fn a_cancelled_job_still_shows_its_cost() {
     assert!(page.body.contains("cancelled"));
     assert!(
         page.body
-            .contains("<span class=\"badge cost\">$2.00</span>")
+            .contains("<span class=\"badge cost\" id=\"job-cost\">$2.00</span>")
     );
 }
 
@@ -565,11 +568,12 @@ fn settings_default_until_saved() {
     assert_eq!(store.settings().unwrap(), changed);
 }
 
-#[tokio::test]
-async fn the_job_page_shows_the_log_and_reloads_while_the_agent_works() {
-    let dashboard = dashboard();
-    let id = dashboard.new_job().await;
-    dashboard.apply(id, Event::Start);
+/// The attribute that makes the job page poll its fragment.
+fn poll_attr(id: i64) -> String {
+    format!("hx-get=\"/jobs/{id}/fragment\"")
+}
+
+fn append_a_log_line(dashboard: &Dashboard, id: i64) {
     dashboard
         .store
         .append_log(
@@ -580,6 +584,14 @@ async fn the_job_page_shows_the_log_and_reloads_while_the_agent_works() {
             },
         )
         .unwrap();
+}
+
+#[tokio::test]
+async fn the_job_page_shows_the_log_and_polls_while_the_agent_works() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    append_a_log_line(&dashboard, id);
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("Bash: cargo test"));
@@ -587,43 +599,141 @@ async fn the_job_page_shows_the_log_and_reloads_while_the_agent_works() {
         page.body
             .contains(r#"<span class="log-count">1 line</span>"#)
     );
-    assert!(page.body.contains("http-equiv=\"refresh\""));
-
-    to_spec_approval_from_clarifying(&dashboard, id);
-    let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(!page.body.contains("http-equiv=\"refresh\""));
+    // No meta refresh: the page polls its fragment every five seconds instead.
+    assert!(!page.body.contains("http-equiv"));
+    assert!(page.body.contains(&poll_attr(id)));
+    assert!(page.body.contains("hx-trigger=\"every 5s\""));
 }
 
 #[tokio::test]
-async fn the_job_page_keeps_the_log_scrolled_only_where_the_log_is_shown() {
+async fn the_job_page_loads_its_update_script_but_the_board_does_not() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
 
+    // The job page carries the script that keeps the log scroll and a typed
+    // form across a swap, with the live regions it drives.
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(!page.body.contains("sessionStorage"));
-
-    dashboard.apply(id, Event::Start);
-    dashboard
-        .store
-        .append_log(
-            id,
-            &factory_runner::LogLine::Tool {
-                name: "Bash".into(),
-                summary: "cargo test".into(),
-            },
-        )
-        .unwrap();
-    let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert_eq!(page.body.matches("<script>").count(), 1);
     assert!(page.body.contains("sessionStorage"));
-    assert!(page.body.contains("http-equiv=\"refresh\" content=\"5\""));
+    for region in ["id=\"job-status\"", "id=\"job-log\"", "id=\"job-poll\""] {
+        assert!(page.body.contains(region), "{region}");
+    }
 
+    // The board does not; its regions poll on their own.
     assert!(!dashboard.get("/").await.body.contains("sessionStorage"));
 }
 
-fn to_spec_approval_from_clarifying(dashboard: &Dashboard, id: i64) {
-    dashboard.apply(id, Event::Agent(AgentResult::Clarified));
-    dashboard.apply(id, Event::Agent(AgentResult::Spec("spec".into())));
+#[tokio::test]
+async fn the_job_page_has_no_meta_refresh_in_any_state() {
+    let dashboard = dashboard();
+    for id in [
+        dashboard.new_job().await,
+        at_spec_gate(&dashboard).await,
+        watching_ci(&dashboard).await,
+        merged(&dashboard).await,
+    ] {
+        let page = dashboard.get(&format!("/jobs/{id}")).await;
+        assert!(
+            !page.body.contains("http-equiv"),
+            "job {id} still has a meta refresh"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_terminal_job_page_renders_no_polling_attribute() {
+    let dashboard = dashboard();
+    // Cancelled, failed and merged jobs do not change again, so the page does
+    // not poll and carries no `every 5s` trigger.
+    let cancelled = dashboard.new_job().await;
+    dashboard.apply(cancelled, Event::Cancel);
+    let failed = failed_without_retry(&dashboard).await;
+    let merged = merged(&dashboard).await;
+
+    for id in [cancelled, failed, merged] {
+        let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+        assert!(body.contains("id=\"job-poll\""), "job {id} lost the slot");
+        assert!(!body.contains(&poll_attr(id)), "job {id} still polls");
+        assert!(
+            !body.contains("hx-trigger=\"every 5s\""),
+            "job {id} still polls"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_job_page_polls_at_a_gate_and_while_watching_ci() {
+    let dashboard = dashboard();
+    // A gate and a CI watch are not agent turns, yet a state change can still
+    // land there, so both keep polling.
+    for id in [
+        at_spec_gate(&dashboard).await,
+        watching_ci(&dashboard).await,
+    ] {
+        let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+        assert!(body.contains(&poll_attr(id)), "job {id} does not poll");
+    }
+}
+
+#[tokio::test]
+async fn the_job_fragment_is_a_plain_get_of_only_the_live_regions() {
+    let dashboard = dashboard();
+    let id = at_spec_gate(&dashboard).await;
+    append_a_log_line(&dashboard, id);
+
+    let reply = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // Only the regions, swapped out of band: no page chrome, no cancel form.
+    assert!(!reply.body.contains("<html"));
+    assert!(!reply.body.contains("<head"));
+    assert!(!reply.body.contains("Cancel job"));
+    assert!(reply.body.contains("hx-swap-oob=\"true\""));
+    // The gate's spec and approval controls are in the swapped regions.
+    assert!(reply.body.contains("id=\"job-status\""));
+    assert!(reply.body.contains("Approve spec"));
+    assert!(reply.body.contains("Bash: cargo test"));
+}
+
+#[tokio::test]
+async fn a_fragment_for_a_terminal_job_stops_the_poll() {
+    let dashboard = dashboard();
+    let id = merged(&dashboard).await;
+
+    // A page opened while the job ran polls on; once the job is terminal the
+    // fragment swaps the slot for one with no trigger, which ends the loop.
+    let reply = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply
+            .body
+            .contains("<div id=\"job-poll\" hx-swap-oob=\"true\"></div>")
+    );
+    assert!(!reply.body.contains(&poll_attr(id)));
+}
+
+async fn at_spec_gate(dashboard: &Dashboard) -> i64 {
+    let id = dashboard.new_job().await;
+    to_spec_approval(dashboard, id);
+    id
+}
+
+/// A job whose pull request is open and waiting for CI and review, a factory
+/// turn rather than an agent one.
+async fn watching_ci(dashboard: &Dashboard) -> i64 {
+    let id = dashboard.new_job().await;
+    to_spec_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 7 });
+    id
+}
+
+async fn merged(dashboard: &Dashboard) -> i64 {
+    let id = watching_ci(dashboard).await;
+    dashboard.apply(id, Event::Merged);
+    id
 }
 
 #[tokio::test]
