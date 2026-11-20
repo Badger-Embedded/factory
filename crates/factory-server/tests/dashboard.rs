@@ -612,7 +612,6 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
             worker_image: "localhost/w:2".into(),
             worker_memory: "6g".into(),
             worker_cpus: "6".into(),
-            auto_merge: false,
             gates: Gates {
                 spec: false,
                 plan: false,
@@ -620,16 +619,44 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
             },
         }
     );
+}
+
+#[tokio::test]
+async fn auto_merge_is_a_per_project_setting() {
+    let dashboard = dashboard();
+    // The per-project form carries the auto-merge toggle, the global form
+    // does not.
+    let page = dashboard.get("/settings").await;
     assert!(page.body.contains("name=\"auto_merge\""));
+    assert!(
+        !dashboard
+            .store
+            .project_auto_merge("maestro", false)
+            .unwrap()
+    );
 
     dashboard
         .post(
-            "/settings",
-            "max_workers=2&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4&auto_merge=on",
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&auto_merge=on",
         )
         .await;
-    assert!(dashboard.store.settings().unwrap().auto_merge);
+    assert!(
+        dashboard
+            .store
+            .project_auto_merge("maestro", false)
+            .unwrap()
+    );
     assert!(dashboard.get("/settings").await.body.contains("checked"));
+
+    // Saving again without the checkbox clears it.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=",
+        )
+        .await;
+    assert!(!dashboard.store.project_auto_merge("maestro", true).unwrap());
 }
 
 #[tokio::test]
@@ -690,10 +717,7 @@ async fn a_pull_request_in_review_waits_for_the_user() {
 
     dashboard
         .store
-        .save_settings(&factory_server::Settings {
-            auto_merge: true,
-            ..factory_server::Settings::default()
-        })
+        .save_project_auto_merge("maestro", true)
         .unwrap();
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("merges when green"));
@@ -1499,10 +1523,7 @@ async fn a_pull_request_in_review_moves_to_factory_with_auto_merge() {
     assert_lane(&dashboard, id, "lane-you").await;
     dashboard
         .store
-        .save_settings(&factory_server::Settings {
-            auto_merge: true,
-            ..factory_server::Settings::default()
-        })
+        .save_project_auto_merge("maestro", true)
         .unwrap();
     assert_lane(&dashboard, id, "lane-factory").await;
 }
@@ -1969,6 +1990,128 @@ fn a_project_file_sets_default_models_and_saved_models_win() {
     let saved = models(None, Some("sonnet"));
     store.save_project_models("x", &saved).unwrap();
     assert_eq!(store.project_models("x", &defaults).unwrap(), saved);
+}
+
+#[test]
+fn project_auto_merge_defaults_off_and_a_saved_row_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let store = Store::open(&path).unwrap();
+        // No row yet: the project file default decides.
+        assert!(!store.project_auto_merge("maestro", false).unwrap());
+        assert!(store.project_auto_merge("maestro", true).unwrap());
+        store.save_project_auto_merge("maestro", true).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    // A saved row replaces the default, whichever way the default points.
+    assert!(store.project_auto_merge("maestro", false).unwrap());
+    store.save_project_auto_merge("maestro", false).unwrap();
+    assert!(!store.project_auto_merge("maestro", true).unwrap());
+    // Each project keeps its own value.
+    assert!(!store.project_auto_merge("other", false).unwrap());
+}
+
+#[test]
+fn a_project_file_sets_the_auto_merge_default() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(
+        dir.path(),
+        "x",
+        "repo = \"a/b\"\nbase = \"main\"\nauto_merge = true\n",
+    );
+    let projects = Projects::load(dir.path()).unwrap();
+    assert!(projects.get("x").unwrap().auto_merge);
+
+    let store = Store::open_in_memory().unwrap();
+    assert!(store.project_auto_merge("x", true).unwrap());
+    store.save_project_auto_merge("x", false).unwrap();
+    assert!(!store.project_auto_merge("x", true).unwrap());
+}
+
+/// An old settings record with the global `auto_merge` on, as written before
+/// the setting became per-project.
+const LEGACY_SETTINGS_ON: &str = r#"{"max_workers":2,"worker_image":"i","worker_memory":"3g","worker_cpus":"4","poll_seconds":60,"auto_merge":true,"gates":{"spec":false,"plan":false,"publish":false}}"#;
+
+fn store_legacy_settings(path: &Path, settings: &str) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute(
+        "INSERT INTO settings (id, settings) VALUES (1, ?1)
+         ON CONFLICT (id) DO UPDATE SET settings = excluded.settings",
+        [settings],
+    )
+    .unwrap();
+}
+
+fn raw_settings(path: &Path) -> String {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT settings FROM settings WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn the_migration_moves_a_global_auto_merge_into_each_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    store_legacy_settings(&path, LEGACY_SETTINGS_ON);
+
+    store
+        .migrate_global_auto_merge(&["maestro", "factory"])
+        .unwrap();
+    // Every listed project keeps the old behaviour.
+    assert!(store.project_auto_merge("maestro", false).unwrap());
+    assert!(store.project_auto_merge("factory", false).unwrap());
+    // The global field is gone from the stored settings.
+    assert!(!raw_settings(&path).contains("auto_merge"));
+}
+
+#[test]
+fn the_migration_runs_once_and_leaves_new_projects_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    store_legacy_settings(&path, LEGACY_SETTINGS_ON);
+
+    store.migrate_global_auto_merge(&["maestro"]).unwrap();
+    assert!(store.project_auto_merge("maestro", false).unwrap());
+    // The user turns maestro off again.
+    store.save_project_auto_merge("maestro", false).unwrap();
+
+    // A later pass, now with a new project, does not re-run: the global field
+    // was already dropped, so neither project is turned back on.
+    store
+        .migrate_global_auto_merge(&["maestro", "newproj"])
+        .unwrap();
+    assert!(!store.project_auto_merge("maestro", false).unwrap());
+    assert!(!store.project_auto_merge("newproj", false).unwrap());
+}
+
+#[test]
+fn the_migration_with_the_global_off_turns_no_project_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    let off = LEGACY_SETTINGS_ON.replace("\"auto_merge\":true", "\"auto_merge\":false");
+    store_legacy_settings(&path, &off);
+
+    store.migrate_global_auto_merge(&["maestro"]).unwrap();
+    assert!(!store.project_auto_merge("maestro", false).unwrap());
+    assert!(!raw_settings(&path).contains("auto_merge"));
+}
+
+#[test]
+fn the_migration_without_stored_settings_does_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    store.migrate_global_auto_merge(&["maestro"]).unwrap();
+    assert!(!store.project_auto_merge("maestro", false).unwrap());
+    assert_eq!(
+        store.settings().unwrap(),
+        factory_server::Settings::default()
+    );
 }
 
 #[tokio::test]

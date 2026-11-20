@@ -103,11 +103,11 @@ pub fn index(
     user: &str,
     projects: &Projects,
     selected: Option<&str>,
-    settings: &Settings,
     jobs: &[JobRow],
     costs: &HashMap<i64, f64>,
     totals: ProjectTotals,
     plan_usage: Option<&PlanUsage>,
+    auto_merge: bool,
 ) -> Markup {
     let all: Vec<&JobRow> = jobs
         .iter()
@@ -152,10 +152,10 @@ pub fn index(
             @if selected.is_some() {
                 div.overview {
                     (stats(totals))
-                    (lane_counts(&all, settings))
+                    (lane_counts(&all, auto_merge))
                 }
             }
-            (board(&all, costs, settings))
+            (board(&all, costs, auto_merge))
         },
     )
 }
@@ -163,14 +163,14 @@ pub fn index(
 /// A bar list of the live jobs per lane. Done jobs are not live. The longest
 /// bar is the lane with the most jobs, and the others scale against it.
 #[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
-fn lane_counts(rows: &[&JobRow], settings: &Settings) -> Markup {
+fn lane_counts(rows: &[&JobRow], auto_merge: bool) -> Markup {
     let counts: Vec<(Lane, usize)> = Lane::ALL
         .into_iter()
         .filter(|lane| matches!(lane, Lane::You | Lane::Agent | Lane::Factory))
         .map(|lane| {
             let count = rows
                 .iter()
-                .filter(|row| status(&row.job, settings).lane == lane)
+                .filter(|row| status(&row.job, auto_merge).lane == lane)
                 .count();
             (lane, count)
         })
@@ -337,7 +337,7 @@ fn project_selector(projects: &Projects, selected: &str) -> Markup {
 pub fn settings(
     user: &str,
     settings: &Settings,
-    models: &[(String, StageModels)],
+    projects: &[(String, StageModels, bool)],
     notice: Option<&str>,
 ) -> Markup {
     layout(
@@ -393,13 +393,6 @@ pub fn settings(
                 }
                 h2 { "GitHub" }
                 div.field {
-                    label.check {
-                        input type="checkbox" name="auto_merge" value="on" checked[settings.auto_merge];
-                        " Merge pull requests when their checks pass"
-                    }
-                    p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
-                }
-                div.field {
                     label for="poll_seconds" { "Seconds between looks at a pull request" }
                     input #poll_seconds type="number" name="poll_seconds" min="10" required
                         value=(settings.poll_seconds);
@@ -407,9 +400,16 @@ pub fn settings(
                 }
                 button.primary { "Save" }
             }
-            @for (name, models) in models {
+            @for (name, models, auto_merge) in projects {
                 form.card method="post" action={ "/settings/projects/" (name) } {
                     h2 { (name) }
+                    div.field {
+                        label.check {
+                            input type="checkbox" name="auto_merge" value="on" checked[*auto_merge];
+                            " Merge pull requests when their checks pass"
+                        }
+                        p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
+                    }
                     p.hint { "The model each stage runs with. Empty means no model." }
                     @for (stage, value) in [
                         ("clarify", &models.clarify),
@@ -505,20 +505,20 @@ impl Lane {
     }
 }
 
-fn board(rows: &[&JobRow], costs: &HashMap<i64, f64>, settings: &Settings) -> Markup {
+fn board(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Markup {
     html! {
         div.board {
             @for lane in Lane::ALL {
                 @let cards: Vec<&JobRow> = rows
                     .iter()
                     .copied()
-                    .filter(|row| status(&row.job, settings).lane == lane)
+                    .filter(|row| status(&row.job, auto_merge).lane == lane)
                     .collect();
                 @match lane {
                     Lane::Done => {
                         details class=(lane.class()) {
                             summary { (lane.title()) " " span.count { (cards.len()) } }
-                            (lane_cards(&cards, costs, settings, lane))
+                            (lane_cards(&cards, costs, auto_merge, lane))
                         }
                     }
                     // The Failed lane appears only when a job has failed, and
@@ -527,7 +527,7 @@ fn board(rows: &[&JobRow], costs: &HashMap<i64, f64>, settings: &Settings) -> Ma
                     _ => {
                         section class=(lane.class()) {
                             h2 { (lane.title()) " " span.count { (cards.len()) } }
-                            (lane_cards(&cards, costs, settings, lane))
+                            (lane_cards(&cards, costs, auto_merge, lane))
                         }
                     }
                 }
@@ -539,7 +539,7 @@ fn board(rows: &[&JobRow], costs: &HashMap<i64, f64>, settings: &Settings) -> Ma
 fn lane_cards(
     cards: &[&JobRow],
     costs: &HashMap<i64, f64>,
-    settings: &Settings,
+    auto_merge: bool,
     lane: Lane,
 ) -> Markup {
     html! {
@@ -551,7 +551,7 @@ fn lane_cards(
                     li.card.job {
                         div.job-head {
                             span.id { "#" (row.id) }
-                            (turn_badge(&row.job, settings))
+                            (turn_badge(&row.job, auto_merge))
                         }
                         a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
                             (first_line(row.job.request()))
@@ -611,6 +611,7 @@ pub fn job(
     images: &[String],
     cost_usd: f64,
     models: &StageModels,
+    auto_merge: bool,
 ) -> Markup {
     let job = &row.job;
     let repo_url = project.map(|project| format!("https://github.com/{}", project.repo));
@@ -634,7 +635,7 @@ pub fn job(
                 " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
             }
             (steps(job, models))
-            (status_card(id, job, settings))
+            (status_card(id, job, settings, auto_merge))
             p.meta { "Approval gates: " (gates_line(job.gates())) }
             div.card {
                 h2 { "Request" }
@@ -749,7 +750,7 @@ fn steps(job: &Job, models: &StageModels) -> Markup {
     }
 }
 
-fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
+fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Markup {
     match (job.stage(), job.turn()) {
         (_, Turn::User(Ask::Answers { questions })) => html! {
             form.card.needs-you method="post" action={ "/jobs/" (id) "/answers" } {
@@ -818,8 +819,8 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
         },
         _ => html! {
             div.card.status {
-                (turn_badge(job, settings))
-                span.status-detail { (turn_detail(job, settings)) }
+                (turn_badge(job, auto_merge))
+                span.status-detail { (turn_detail(job, settings, auto_merge)) }
             }
         },
     }
@@ -842,16 +843,14 @@ struct Status {
 }
 
 /// One match decides the lane and the badge, so they cannot disagree.
-fn status(job: &Job, settings: &Settings) -> Status {
+fn status(job: &Job, auto_merge: bool) -> Status {
     let (lane, class, text) = match (job.stage(), job.turn()) {
         (Stage::Merged, _) => (Lane::Done, "ok", "merged"),
         (Stage::Failed { .. }, _) => (Lane::Failed, "bad", "failed"),
         (Stage::Cancelled, _) => (Lane::Done, "factory", "cancelled"),
         (Stage::Requested, _) => (Lane::Factory, "factory", "queued"),
         (_, Turn::User(_)) if !collecting(job) => (Lane::You, "you", "needs you"),
-        _ if in_review(job) && settings.auto_merge => {
-            (Lane::Factory, "factory", "merges when green")
-        }
+        _ if in_review(job) && auto_merge => (Lane::Factory, "factory", "merges when green"),
         _ if in_review(job) => (Lane::You, "you", "in review"),
         (_, Turn::Agent(_)) => (Lane::Agent, "agent", "agent working"),
         (_, Turn::User(_) | Turn::Factory | Turn::RerunCi { .. } | Turn::Done) => {
@@ -861,8 +860,8 @@ fn status(job: &Job, settings: &Settings) -> Status {
     Status { lane, class, text }
 }
 
-fn turn_badge(job: &Job, settings: &Settings) -> Markup {
-    let Status { class, text, .. } = status(job, settings);
+fn turn_badge(job: &Job, auto_merge: bool) -> Markup {
+    let Status { class, text, .. } = status(job, auto_merge);
     html! { span class={ "badge " (class) } { (text) } }
 }
 
@@ -893,7 +892,7 @@ fn stage_label(job: &Job) -> String {
     }
 }
 
-fn turn_detail(job: &Job, settings: &Settings) -> String {
+fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
     match job.turn() {
         Turn::Agent(task) => format!("The agent is {}.", task_label(task)),
         Turn::Factory => match job.next_command() {
@@ -903,7 +902,7 @@ fn turn_detail(job: &Job, settings: &Settings) -> String {
             Some(Command::Publish { .. }) => {
                 "The factory is pushing the branch and opening the pull request.".into()
             }
-            Some(Command::WatchPr { number, .. }) if settings.auto_merge => format!(
+            Some(Command::WatchPr { number, .. }) if auto_merge => format!(
                 "Auto-merge is on. The factory merges pull request #{number} once all its \
                  checks pass, unless review comments come first, which go to the agent. It \
                  looks every {} seconds.",
