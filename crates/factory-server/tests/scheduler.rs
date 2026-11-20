@@ -286,7 +286,7 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
             number: None,
             description: None,
         }])),
-        Expect::Commits => Event::Agent(AgentResult::CommitsReady(ready())),
+        Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
     });
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -1272,7 +1272,7 @@ fn one_pass(request: &AgentRequest) -> Event {
             number: None,
             description: None,
         }])),
-        Expect::Commits => Event::Agent(AgentResult::CommitsReady(ready())),
+        Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
     }
 }
 

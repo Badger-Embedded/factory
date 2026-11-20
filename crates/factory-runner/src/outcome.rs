@@ -1,4 +1,4 @@
-use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question, Stage};
+use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question, Stage, Task};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -11,6 +11,8 @@ pub enum Expect {
     Spec,
     Plan,
     Commits,
+    /// Like `Commits`, and the run may also end with `rerun_ci`.
+    FixCi,
 }
 
 impl Expect {
@@ -28,16 +30,30 @@ impl Expect {
         }
     }
 
+    /// What the run of `task` in `stage` must end with. A `FixCi` task may
+    /// also end with `rerun_ci`.
+    #[must_use]
+    pub fn for_task(stage: &Stage, task: &Task) -> Option<Self> {
+        match (Self::for_stage(stage)?, task) {
+            (Expect::Commits, Task::FixCi { .. }) => Some(Expect::FixCi),
+            (expect, _) => Some(expect),
+        }
+    }
+
     /// The outcomes a run may end with. Every run may end with questions.
     #[must_use]
-    pub fn outcomes(self) -> [&'static str; 2] {
+    pub fn outcomes(self) -> Vec<&'static str> {
         let done = match self {
             Expect::Clarify => "clarified",
             Expect::Spec => "spec",
             Expect::Plan => "plan",
-            Expect::Commits => "commits_ready",
+            Expect::Commits | Expect::FixCi => "commits_ready",
         };
-        ["questions", done]
+        let mut outcomes = vec!["questions", done];
+        if self == Expect::FixCi {
+            outcomes.push("rerun_ci");
+        }
+        outcomes
     }
 
     /// The JSON Schema passed to `claude --json-schema`.
@@ -73,7 +89,7 @@ impl Expect {
                     }
                 });
             }
-            Expect::Commits => {
+            Expect::Commits | Expect::FixCi => {
                 properties["pull_request"] = json!({
                     "type": "object",
                     "description": "With outcome commits_ready: the pull request's title and description, following the repository's CONTRIBUTING.md.",
@@ -86,6 +102,12 @@ impl Expect {
                 });
             }
             Expect::Clarify => {}
+        }
+        if self == Expect::FixCi {
+            properties["reason"] = json!({
+                "type": "string",
+                "description": "With outcome rerun_ci: why a rerun is enough and nothing needs a commit."
+            });
         }
         json!({
             "type": "object",
@@ -104,6 +126,7 @@ struct Output {
     spec: Option<String>,
     plan: Option<Vec<PlanEntry>>,
     pull_request: Option<PrDescription>,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -174,7 +197,7 @@ fn agent_result(expect: Expect, result: &ResultMessage) -> Result<AgentResult, S
                 })
                 .collect(),
         )),
-        (Expect::Commits, "commits_ready") => match output.pull_request {
+        (Expect::Commits | Expect::FixCi, "commits_ready") => match output.pull_request {
             Some(pr) if !pr.title.trim().is_empty() && !pr.body.trim().is_empty() => {
                 Ok(AgentResult::CommitsReady(pr))
             }
@@ -182,6 +205,10 @@ fn agent_result(expect: Expect, result: &ResultMessage) -> Result<AgentResult, S
                 "the agent ended with outcome commits_ready but wrote no pull request title and description"
                     .into(),
             ),
+        },
+        (Expect::FixCi, "rerun_ci") => match output.reason {
+            Some(reason) if !reason.trim().is_empty() => Ok(AgentResult::RerunCi { reason }),
+            _ => Err("the agent ended with outcome rerun_ci but gave no reason".into()),
         },
         (_, other) => Err(format!(
             "the agent ended with outcome {other:?}, expected one of {:?}",

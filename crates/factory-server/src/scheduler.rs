@@ -265,7 +265,7 @@ impl<E: Executor> Scheduler<E> {
             };
             match command {
                 Command::RunAgent { session, task } if workers_free => {
-                    let Some(expect) = Expect::for_stage(job.stage()) else {
+                    let Some(expect) = Expect::for_task(job.stage(), &task) else {
                         continue;
                     };
                     let models = self.store.project_models(&row.project, &project.models)?;
@@ -273,7 +273,7 @@ impl<E: Executor> Scheduler<E> {
                         Expect::Clarify => models.clarify,
                         Expect::Spec => models.spec,
                         Expect::Plan => models.plan,
-                        Expect::Commits => models.implement,
+                        Expect::Commits | Expect::FixCi => models.implement,
                     };
                     let request = AgentRequest {
                         job_id: row.id,
