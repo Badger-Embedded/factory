@@ -22,7 +22,7 @@ use crate::projects::{Project, Projects, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
-use crate::store::{JobRow, ProjectTotals, Store, StoreError};
+use crate::store::{JobFile, JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
 
@@ -35,10 +35,10 @@ const LOG_LINES: usize = 300;
 /// takes two.
 const MIN_POLL_SECONDS: u64 = 10;
 
-/// Attachments one request may carry.
+/// Attachments one request may carry, images and files counted together.
 pub const MAX_ATTACHMENTS: usize = 5;
 /// Bytes in one attachment.
-pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 /// Bytes of the request text and the other form fields together.
 const MAX_FORM_BYTES: usize = 256 * 1024;
 const MAX_UPLOAD_BYTES: usize = MAX_ATTACHMENTS * MAX_ATTACHMENT_BYTES + MAX_FORM_BYTES;
@@ -97,6 +97,7 @@ pub fn app(
         .route("/jobs/{id}", get(show_job))
         .route("/jobs/{id}/fragment", get(job_fragment))
         .route("/jobs/{id}/images/{name}", get(show_image))
+        .route("/jobs/{id}/files/{name}", get(show_file))
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/retry", post(retry))
@@ -368,9 +369,24 @@ fn now_secs() -> i64 {
         })
 }
 
-struct Upload {
-    extension: &'static str,
-    bytes: Vec<u8>,
+/// The accepted upload kinds, named in the 400 a rejected upload gets.
+const ACCEPTED_TYPES: &str = "an upload is not an accepted type: a PNG, JPEG, GIF or WebP image, a UTF-8 text file, \
+     or a ZIP archive";
+
+/// One classified attachment. An image keeps the current storage; a file is a
+/// UTF-8 text file or a ZIP archive. `name` on a file is the requester's file
+/// name, trimmed to its last path component, or `None` when the upload carried
+/// no usable name.
+enum Attachment {
+    Image {
+        extension: &'static str,
+        bytes: Vec<u8>,
+    },
+    File {
+        extension: &'static str,
+        name: Option<String>,
+        bytes: Vec<u8>,
+    },
 }
 
 /// The file extension for the image format `bytes` starts with.
@@ -388,6 +404,53 @@ fn image_extension(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Whether `bytes` are a ZIP archive: an archive with entries starts with
+/// `PK\x03\x04`, and an empty archive with `PK\x05\x06`.
+fn is_zip(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
+}
+
+/// Whether `bytes` are a UTF-8 text file: valid UTF-8, which allows a leading
+/// byte order mark, and with no NUL byte.
+fn is_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+/// Keeps the last path component of an upload's file name, since some browsers
+/// send a full path, and cuts the result to 255 characters. An empty result,
+/// such as from a name that is all slashes, becomes `None`.
+fn attachment_name(raw: &str) -> Option<String> {
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let trimmed: String = last.chars().take(255).collect();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Classifies one upload's bytes, checked in order: image signatures, then a
+/// ZIP signature, then UTF-8 text. Anything else, including zero bytes, is a
+/// 400 that names the accepted types.
+fn classify(name: Option<String>, bytes: Vec<u8>) -> Result<Attachment, AppError> {
+    if bytes.is_empty() {
+        return Err(AppError::BadRequest(ACCEPTED_TYPES.into()));
+    }
+    if let Some(extension) = image_extension(&bytes) {
+        Ok(Attachment::Image { extension, bytes })
+    } else if is_zip(&bytes) {
+        Ok(Attachment::File {
+            extension: "zip",
+            name,
+            bytes,
+        })
+    } else if is_text(&bytes) {
+        Ok(Attachment::File {
+            extension: "txt",
+            name,
+            bytes,
+        })
+    } else {
+        Err(AppError::BadRequest(ACCEPTED_TYPES.into()))
+    }
+}
+
 fn multipart_error(err: &MultipartError) -> AppError {
     AppError::BadRequest(format!(
         "the upload is malformed or over {MAX_UPLOAD_BYTES} bytes: {}",
@@ -399,42 +462,43 @@ async fn read_text(field: Field<'_>) -> Result<String, AppError> {
     field.text().await.map_err(|err| multipart_error(&err))
 }
 
-/// Reads one upload part's bytes. Browsers send an empty part with no file
-/// name when no file is chosen; that part yields `None`. Stops reading once a
-/// part passes the per-attachment limit.
-async fn read_upload(mut field: Field<'_>) -> Result<Option<Vec<u8>>, AppError> {
-    let named = field.file_name().is_some_and(|name| !name.is_empty());
+/// Reads one upload part's bytes and its file name. Browsers send an empty
+/// part with no file name when no file is chosen; that part yields `None`.
+/// Stops reading once a part passes the per-attachment limit.
+async fn read_upload(mut field: Field<'_>) -> Result<Option<(Option<String>, Vec<u8>)>, AppError> {
+    let name = field
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned);
     let mut bytes = Vec::new();
     while let Some(chunk) = field.chunk().await.map_err(|err| multipart_error(&err))? {
         bytes.extend_from_slice(&chunk);
         if bytes.len() > MAX_ATTACHMENT_BYTES {
             return Err(AppError::BadRequest(format!(
-                "an image is over the limit of {MAX_ATTACHMENT_BYTES} bytes"
+                "an attachment is over the limit of {MAX_ATTACHMENT_BYTES} bytes"
             )));
         }
     }
-    if bytes.is_empty() && !named {
+    if bytes.is_empty() && name.is_none() {
         return Ok(None);
     }
-    Ok(Some(bytes))
+    Ok(Some((name.as_deref().and_then(attachment_name), bytes)))
 }
 
-/// Classifies one upload's bytes and adds it to `uploads`.
-async fn read_image(field: Field<'_>, uploads: &mut Vec<Upload>) -> Result<(), AppError> {
-    let Some(bytes) = read_upload(field).await? else {
+/// Classifies one upload's bytes and adds it to `attachments`.
+async fn read_attachment(
+    field: Field<'_>,
+    attachments: &mut Vec<Attachment>,
+) -> Result<(), AppError> {
+    let Some((name, bytes)) = read_upload(field).await? else {
         return Ok(());
     };
-    let Some(extension) = image_extension(&bytes) else {
-        return Err(AppError::BadRequest(
-            "an upload is not a PNG, JPEG, GIF or WebP image".into(),
-        ));
-    };
-    if uploads.len() == MAX_ATTACHMENTS {
+    if attachments.len() == MAX_ATTACHMENTS {
         return Err(AppError::BadRequest(format!(
-            "a request takes at most {MAX_ATTACHMENTS} images"
+            "a request takes at most {MAX_ATTACHMENTS} attachments"
         )));
     }
-    uploads.push(Upload { extension, bytes });
+    attachments.push(classify(name, bytes)?);
     Ok(())
 }
 
@@ -445,7 +509,7 @@ async fn create_job(
 ) -> Result<Redirect, AppError> {
     let mut project = None;
     let mut request = None;
-    let mut uploads = Vec::new();
+    let mut attachments = Vec::new();
     while let Some(field) = form
         .next_field()
         .await
@@ -454,7 +518,7 @@ async fn create_job(
         match field.name() {
             Some("project") => project = Some(read_text(field).await?),
             Some("request") => request = Some(read_text(field).await?),
-            Some("images") => read_image(field, &mut uploads).await?,
+            Some("images") => read_attachment(field, &mut attachments).await?,
             _ => {}
         }
     }
@@ -468,8 +532,8 @@ async fn create_job(
         return Err(AppError::BadRequest("the request is empty".into()));
     }
     let id = state.store.create(&project, &user(&headers), request)?;
-    if !uploads.is_empty()
-        && let Err(err) = save_images(&state, id, &uploads)
+    if !attachments.is_empty()
+        && let Err(err) = save_attachments(&state, id, &attachments)
     {
         state.store.apply(id, Event::Cancel)?;
         return Err(err);
@@ -477,23 +541,51 @@ async fn create_job(
     Ok(job_redirect(id))
 }
 
-/// Writes the images under generated names, so an upload's own file name
-/// never reaches the file system, and records the names with the job.
-fn save_images(state: &AppState, id: i64, uploads: &[Upload]) -> Result<(), AppError> {
-    let dir = state
-        .data_dir
-        .join("jobs")
-        .join(id.to_string())
-        .join("images");
-    let io = |err: std::io::Error| AppError::Io(format!("cannot save the images: {err}"));
-    std::fs::create_dir_all(&dir).map_err(io)?;
-    let mut names = Vec::new();
-    for (index, upload) in uploads.iter().enumerate() {
-        let name = format!("image-{}.{}", index + 1, upload.extension);
-        std::fs::write(dir.join(&name), &upload.bytes).map_err(io)?;
-        names.push(name);
+/// Writes each attachment under a generated name, so an upload's own file name
+/// never reaches the file system, and records the names with the job. Images
+/// go under `images/` and keep the `job_images` table; files go under `files/`
+/// and record their original name in `job_files`. Images and files are
+/// numbered apart, each in upload order.
+fn save_attachments(state: &AppState, id: i64, attachments: &[Attachment]) -> Result<(), AppError> {
+    let job_dir = state.data_dir.join("jobs").join(id.to_string());
+    let mut image_names = Vec::new();
+    let mut files = Vec::new();
+    for attachment in attachments {
+        match attachment {
+            Attachment::Image { extension, bytes } => {
+                let name = format!("image-{}.{extension}", image_names.len() + 1);
+                write_attachment(&job_dir.join("images"), &name, bytes)?;
+                image_names.push(name);
+            }
+            Attachment::File {
+                extension,
+                name,
+                bytes,
+            } => {
+                let stored = format!("file-{}.{extension}", files.len() + 1);
+                write_attachment(&job_dir.join("files"), &stored, bytes)?;
+                let original_name = name.clone().unwrap_or_else(|| stored.clone());
+                files.push(JobFile {
+                    name: stored,
+                    original_name,
+                });
+            }
+        }
     }
-    state.store.add_images(id, &names)?;
+    if !image_names.is_empty() {
+        state.store.add_images(id, &image_names)?;
+    }
+    if !files.is_empty() {
+        state.store.add_files(id, &files)?;
+    }
+    Ok(())
+}
+
+/// Writes one attachment's bytes under `dir`, creating `dir` on the first file.
+fn write_attachment(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<(), AppError> {
+    let io = |err: std::io::Error| AppError::Io(format!("cannot save the attachments: {err}"));
+    std::fs::create_dir_all(dir).map_err(io)?;
+    std::fs::write(dir.join(name), bytes).map_err(io)?;
     Ok(())
 }
 
@@ -548,6 +640,7 @@ async fn show_job(
 ) -> Result<Markup, AppError> {
     let data = load_job(&state, id)?;
     let images = state.store.images(id)?;
+    let files = state.store.files(id)?;
     Ok(pages::job(
         &user(&headers),
         &data.row,
@@ -556,6 +649,7 @@ async fn show_job(
         &data.logs,
         &data.events,
         &images,
+        &files,
         data.cost_usd,
         &data.models,
         &data.efforts,
@@ -612,6 +706,51 @@ async fn show_image(
         [
             (header::CONTENT_TYPE, content_type),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Serves a file the store lists for the job. The name must match a stored
+/// one, so a request cannot reach any other file. A text file is served as
+/// `text/plain`, a ZIP archive as `application/zip`, both as an attachment
+/// whose download name is the original name, percent-encoded so the name
+/// never enters the header unencoded.
+async fn show_file(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(i64, String)>,
+) -> Result<Response, AppError> {
+    let not_found = || AppError::from(StoreError::NotFound(id));
+    let content_type = match name.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("zip") => "application/zip",
+        _ => return Err(not_found()),
+    };
+    let Some(file) = state
+        .store
+        .files(id)?
+        .into_iter()
+        .find(|file| file.name == name)
+    else {
+        return Err(not_found());
+    };
+    let path = state
+        .data_dir
+        .join("jobs")
+        .join(id.to_string())
+        .join("files")
+        .join(&name);
+    let bytes = tokio::fs::read(path).await.map_err(|_| not_found())?;
+    let disposition = format!(
+        "attachment; filename*=UTF-8''{}",
+        query_escape(&file.original_name)
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CONTENT_DISPOSITION, disposition.as_str()),
         ],
         bytes,
     )

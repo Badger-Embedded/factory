@@ -14,7 +14,7 @@ use crate::mcp::{McpServer, McpStages, McpToolState};
 use crate::projects::Project;
 use crate::projects::{StageEfforts, StageModels};
 use crate::settings::Settings;
-use crate::store::{JobEvent, JobRow, LogEntry, ProjectTotals};
+use crate::store::{JobEvent, JobFile, JobRow, LogEntry, ProjectTotals};
 use crate::timeline::timeline;
 use crate::workers::Slot;
 
@@ -222,7 +222,7 @@ fn held_for(seconds: i64) -> String {
     }
 }
 
-/// The new-request form as a one-line bar. It grows, and shows the image
+/// The new-request form as a one-line bar. It grows, and shows the file
 /// picker, once it has focus or text, so it takes little room on a board
 /// that is opened more often to check on jobs than to file one.
 fn composer(project: &str) -> Markup {
@@ -237,11 +237,12 @@ fn composer(project: &str) -> Markup {
             }
             div.composer-more {
                 div.file-picker {
-                    input #images type="file" name="images" multiple
-                        accept="image/png,image/jpeg,image/gif,image/webp"
-                        class="visually-hidden";
-                    label.file-button for="images" { "Attach images" }
-                    span.hint { "PNG, JPEG, GIF or WebP. You can also paste them into the box above." }
+                    input #images type="file" name="images" multiple class="visually-hidden";
+                    label.file-button for="images" { "Attach files" }
+                    span.hint {
+                        "Images (PNG, JPEG, GIF, WebP), text files or ZIP archives, up to 10 MiB \
+                         each and 5 in total. You can also paste images into the box above."
+                    }
                 }
                 ul #pasted-images.pasted-images {}
             }
@@ -1967,6 +1968,7 @@ pub fn job(
     logs: &[LogEntry],
     events: &[JobEvent],
     images: &[String],
+    files: &[JobFile],
     cost_usd: f64,
     models: &StageModels,
     efforts: &StageEfforts,
@@ -1990,7 +1992,7 @@ pub fn job(
                 }
                 aside.job-side { (timeline_region(false, job, events, models, efforts)) }
                 div.job-main {
-                    (request_card(id, job, images))
+                    (request_card(id, job, images, files))
                     (spec_region(false, job))
                     (plan_region(false, job, repo_url))
                     (reviews_region(false, job))
@@ -2150,7 +2152,7 @@ fn job_header(id: i64, row: &JobRow, repo_url: Option<&str>, cost_usd: f64) -> M
     }
 }
 
-fn request_card(id: i64, job: &Job, images: &[String]) -> Markup {
+fn request_card(id: i64, job: &Job, images: &[String], files: &[JobFile]) -> Markup {
     html! {
         div.card {
             h2 { "Request" }
@@ -2166,6 +2168,52 @@ fn request_card(id: i64, job: &Job, images: &[String]) -> Markup {
                     }
                 }
             }
+            @if !files.is_empty() {
+                ul.request-files {
+                    @for file in files {
+                        li {
+                            a.file-tile href={ "/jobs/" (id) "/files/" (file.name) } {
+                                (file_icon(is_zip(&file.name)))
+                                span.file-name { (file.original_name) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether a stored file name is a ZIP archive, by its extension. The server
+/// generates the name, so it ends in `.zip` only for an archive.
+fn is_zip(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+}
+
+/// An inline icon for a request file: an archive icon for a ZIP file, a
+/// document icon otherwise. The icon is inline SVG in the factory's own markup,
+/// so the job page fetches nothing from another host.
+fn file_icon(zip: bool) -> Markup {
+    let body = if zip {
+        html! {
+            path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" {}
+            path d="M13 2v6h6" {}
+            path d="M10 4h2v2h-2zM10 8h2v2h-2zM10 12h2v2h-2z" {}
+        }
+    } else {
+        html! {
+            path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" {}
+            path d="M14 2v6h6" {}
+            path d="M8 13h8M8 17h8M8 9h2" {}
+        }
+    };
+    html! {
+        svg.file-icon viewBox="0 0 24 24" width="40" height="40"
+            fill="none" stroke="currentColor" stroke-width="1.5"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" {
+            (body)
         }
     }
 }

@@ -1599,8 +1599,9 @@ mod purge {
     }
 
     impl Fixture {
-        /// Creates a job with a log line, an image row, a session, an image
-        /// file and a work directory, created `days` days ago.
+        /// Creates a job with a log line, a session, an image row and file, a
+        /// `job_files` row and file, and a work directory, created `days` days
+        /// ago.
         fn job(&self, days: u32) -> i64 {
             let id = self.store.create("maestro", "alice", "x").unwrap();
             self.db
@@ -1617,6 +1618,18 @@ mod purge {
             let images = self.dir(id).join("images");
             std::fs::create_dir_all(&images).unwrap();
             std::fs::write(images.join("image-1.png"), b"png").unwrap();
+            self.store
+                .add_files(
+                    id,
+                    &[factory_server::JobFile {
+                        name: "file-1.txt".into(),
+                        original_name: "server.log".into(),
+                    }],
+                )
+                .unwrap();
+            let files = self.dir(id).join("files");
+            std::fs::create_dir_all(&files).unwrap();
+            std::fs::write(files.join("file-1.txt"), b"log").unwrap();
             std::fs::create_dir_all(self.dir(id).join("work")).unwrap();
             id
         }
@@ -1738,7 +1751,7 @@ mod purge {
         f.finish(old, "cancelled");
         f.scheduler.tick().await.unwrap();
 
-        for table in ["logs", "sessions", "job_images"] {
+        for table in ["logs", "sessions", "job_images", "job_files"] {
             assert_eq!(f.rows(table, old), 0, "{table}");
             assert_eq!(f.rows(table, other), 1, "{table}");
         }
@@ -1746,7 +1759,12 @@ mod purge {
         assert!(f.rows("job_events", other) > 0);
         assert!(!f.dir(old).exists());
         assert!(f.dir(other).join("images/image-1.png").exists());
+        assert!(f.dir(other).join("files/file-1.txt").exists());
         assert_eq!(f.store.images(old).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            f.store.files(old).unwrap(),
+            [] as [factory_server::JobFile; 0]
+        );
     }
 
     #[tokio::test]

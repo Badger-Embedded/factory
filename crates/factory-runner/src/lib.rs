@@ -2,6 +2,7 @@
 //! into a `factory_core` event.
 
 mod checks;
+mod files;
 mod git;
 mod github;
 mod images;
@@ -12,6 +13,7 @@ mod worker;
 
 pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
+pub use files::{PlacedFile, place_files, show_files};
 pub use git::Git;
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, Observation, PrState, PrStatus, Rerun, actions_job_id,

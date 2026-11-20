@@ -127,8 +127,17 @@ struct Reply {
     status: StatusCode,
     location: Option<String>,
     content_type: Option<String>,
+    headers: header::HeaderMap,
     bytes: Vec<u8>,
     body: String,
+}
+
+impl Reply {
+    fn header(&self, name: header::HeaderName) -> Option<String> {
+        self.headers
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_owned())
+    }
 }
 
 const BOUNDARY: &str = "factory-test-boundary";
@@ -137,6 +146,8 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000";
 const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0];
 const GIF: &[u8] = b"GIF89a0000";
 const WEBP: &[u8] = b"RIFF\x04\0\0\0WEBPVP8 ";
+const ZIP: &[u8] = b"PK\x03\x04 a zip archive";
+const TEXT: &[u8] = b"a log line\n";
 
 fn dashboard() -> Dashboard {
     dashboard_for("Badger-Embedded/maestro")
@@ -206,11 +217,13 @@ impl Dashboard {
             .headers()
             .get(header::CONTENT_TYPE)
             .map(|value| value.to_str().unwrap().to_owned());
+        let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         Reply {
             status,
             location,
             content_type,
+            headers,
             body: String::from_utf8_lossy(&bytes).into_owned(),
             bytes: bytes.to_vec(),
         }
@@ -1952,23 +1965,52 @@ async fn upload_file_names_never_reach_the_file_system() {
 }
 
 #[tokio::test]
-async fn an_image_is_checked_by_content_not_name_or_type() {
+async fn an_attachment_is_classified_by_content_not_name_or_type() {
     let dashboard = dashboard();
+    // A PNG named as text is stored as an image. A text file named as a PNG,
+    // and a ZIP file named as text, are stored by their bytes.
     let reply = dashboard
-        .post_job("maestro", "x", &[("photo.png", b"<svg></svg>")])
+        .post_job(
+            "maestro",
+            "x",
+            &[
+                ("photo.txt", PNG),
+                ("notes.png", b"a log line"),
+                ("data.txt", ZIP),
+            ],
+        )
         .await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert!(reply.body.contains("PNG, JPEG, GIF or WebP"));
-    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let id = job_id(&reply);
+    assert_eq!(dashboard.store.images(id).unwrap(), ["image-1.png"]);
+    let files = dashboard.store.files(id).unwrap();
+    assert_eq!(files[0].name, "file-1.txt");
+    assert_eq!(files[0].original_name, "notes.png");
+    assert_eq!(files[1].name, "file-2.zip");
+    assert_eq!(files[1].original_name, "data.txt");
+}
 
-    let disguised = dashboard
-        .post_job("maestro", "x", &[("photo.txt", PNG)])
-        .await;
-    assert_eq!(disguised.status, StatusCode::SEE_OTHER);
-    assert_eq!(
-        dashboard.store.images(job_id(&disguised)).unwrap(),
-        ["image-1.png"]
-    );
+#[tokio::test]
+async fn a_rejected_type_names_the_accepted_types_and_creates_no_job() {
+    let dashboard = dashboard();
+    // A PDF, a file with a NUL byte, bytes that are neither UTF-8 nor an image
+    // or ZIP, and a named zero-byte upload are each rejected.
+    for bytes in [
+        // A PDF carries a high-byte comment after its header, so it is not
+        // valid UTF-8.
+        b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".as_slice(),
+        b"text\0with nul",
+        &[0xFF, 0xFE, 0x41, 0x00],
+        b"",
+    ] {
+        let reply = dashboard
+            .post_job("maestro", "x", &[("f.bin", bytes)])
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(reply.body.contains("ZIP archive"), "{:?}", reply.body);
+    }
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+    assert!(!dashboard.data.path().join("jobs").exists());
 }
 
 #[tokio::test]
@@ -1996,20 +2038,24 @@ async fn an_oversized_image_is_rejected_with_the_limit() {
 }
 
 #[tokio::test]
-async fn too_many_images_are_rejected_with_the_limit() {
+async fn too_many_attachments_are_rejected_with_the_limit() {
     let dashboard = dashboard();
-    let images: Vec<(&str, &[u8])> = vec![("a.png", PNG); factory_server::MAX_ATTACHMENTS + 1];
-    let reply = dashboard.post_job("maestro", "x", &images).await;
+    // A mix of images and files counts against one limit.
+    let mut attachments: Vec<(&str, &[u8])> = vec![("a.png", PNG), ("b.txt", TEXT), ("c.zip", ZIP)];
+    while attachments.len() < factory_server::MAX_ATTACHMENTS + 1 {
+        attachments.push(("a.png", PNG));
+    }
+    let reply = dashboard.post_job("maestro", "x", &attachments).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert!(reply.body.contains(&format!(
-        "at most {} images",
+        "at most {} attachments",
         factory_server::MAX_ATTACHMENTS
     )));
     assert_eq!(dashboard.store.list().unwrap().len(), 0);
     assert!(!dashboard.data.path().join("jobs").exists());
 
-    let images = &images[..factory_server::MAX_ATTACHMENTS];
-    let reply = dashboard.post_job("maestro", "x", images).await;
+    let attachments = &attachments[..factory_server::MAX_ATTACHMENTS];
+    let reply = dashboard.post_job("maestro", "x", attachments).await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
 }
 
@@ -2329,9 +2375,12 @@ async fn the_form_has_the_paste_script_and_a_thumbnail_list() {
     );
     assert!(
         page.body
-            .contains(r#"<label class="file-button" for="images">Attach images</label>"#)
+            .contains(r#"<label class="file-button" for="images">Attach files</label>"#)
     );
     assert!(page.body.contains(r#"class="visually-hidden">"#));
+    // The accept attribute is gone, since text files have no fixed extensions.
+    assert!(!page.body.contains("accept="));
+    assert!(page.body.contains("text files or ZIP archives"));
 }
 
 #[tokio::test]
@@ -2401,6 +2450,220 @@ async fn only_the_jobs_own_stored_images_are_served() {
             "{uri}"
         );
     }
+}
+
+fn saved_files(dashboard: &Dashboard, id: i64) -> Vec<String> {
+    let dir = dashboard
+        .data
+        .path()
+        .join("jobs")
+        .join(id.to_string())
+        .join("files");
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_request_with_an_image_a_text_file_and_a_zip_saves_each_apart() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job(
+            "maestro",
+            "Fix this",
+            &[("shot.png", PNG), ("server.log", TEXT), ("bundle.zip", ZIP)],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let id = job_id(&reply);
+
+    assert_eq!(dashboard.store.images(id).unwrap(), ["image-1.png"]);
+    assert_eq!(saved_images(&dashboard, id), ["image-1.png"]);
+    assert_eq!(saved_files(&dashboard, id), ["file-1.txt", "file-2.zip"]);
+    let files = dashboard.store.files(id).unwrap();
+    assert_eq!(files[0].name, "file-1.txt");
+    assert_eq!(files[0].original_name, "server.log");
+    assert_eq!(files[1].name, "file-2.zip");
+    assert_eq!(files[1].original_name, "bundle.zip");
+    let dir = dashboard
+        .data
+        .path()
+        .join("jobs")
+        .join(id.to_string())
+        .join("files");
+    assert_eq!(fs::read(dir.join("file-1.txt")).unwrap(), TEXT);
+    assert_eq!(fs::read(dir.join("file-2.zip")).unwrap(), ZIP);
+}
+
+#[tokio::test]
+async fn an_attachment_of_exactly_the_limit_is_accepted_and_one_more_byte_is_not() {
+    let dashboard = dashboard();
+    let mut exact = TEXT.to_vec();
+    exact.resize(factory_server::MAX_ATTACHMENT_BYTES, b'x');
+    let reply = dashboard
+        .post_job("maestro", "x", &[("big.log", &exact)])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(dashboard.store.files(job_id(&reply)).unwrap().len(), 1);
+
+    let mut over = exact;
+    over.push(b'x');
+    let reply = dashboard
+        .post_job("maestro", "x", &[("big.log", &over)])
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply
+            .body
+            .contains(&factory_server::MAX_ATTACHMENT_BYTES.to_string())
+    );
+}
+
+#[tokio::test]
+async fn attachments_without_text_are_rejected() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job("maestro", "  ", &[("a.log", TEXT)])
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+    assert!(!dashboard.data.path().join("jobs").exists());
+}
+
+#[tokio::test]
+async fn a_file_upload_name_is_cut_to_its_last_path_component() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job(
+            "maestro",
+            "x",
+            &[("../../etc/passwd", TEXT), ("C:\\x\\y.txt", TEXT)],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let id = job_id(&reply);
+    let files = dashboard.store.files(id).unwrap();
+    assert_eq!(files[0].original_name, "passwd");
+    assert_eq!(files[1].original_name, "y.txt");
+    // Only generated names reach the file system, both under files/.
+    assert_eq!(saved_files(&dashboard, id), ["file-1.txt", "file-2.txt"]);
+    let outside: Vec<_> = fs::read_dir(dashboard.data.path()).unwrap().collect();
+    assert_eq!(outside.len(), 1, "only jobs/ exists in the data directory");
+}
+
+#[tokio::test]
+async fn a_stored_file_is_served_as_an_attachment_with_its_original_name() {
+    let dashboard = dashboard();
+    let id = job_id(
+        &dashboard
+            .post_job("maestro", "x", &[("a b.log", TEXT), ("data.zip", ZIP)])
+            .await,
+    );
+    let text = dashboard.get(&format!("/jobs/{id}/files/file-1.txt")).await;
+    assert_eq!(text.status, StatusCode::OK);
+    assert_eq!(
+        text.content_type.as_deref(),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(text.bytes, TEXT);
+    let disposition = text.header(header::CONTENT_DISPOSITION);
+    assert_eq!(
+        disposition.as_deref(),
+        Some("attachment; filename*=UTF-8''a%20b.log")
+    );
+    assert_eq!(
+        text.header(header::X_CONTENT_TYPE_OPTIONS).as_deref(),
+        Some("nosniff")
+    );
+
+    let zip = dashboard.get(&format!("/jobs/{id}/files/file-2.zip")).await;
+    assert_eq!(zip.content_type.as_deref(), Some("application/zip"));
+    assert_eq!(zip.bytes, ZIP);
+}
+
+#[tokio::test]
+async fn only_the_jobs_own_stored_files_are_served() {
+    let dashboard = dashboard();
+    let id = job_id(&dashboard.post_job("maestro", "x", &[("a.log", TEXT)]).await);
+    // The other job also has a ZIP, so file-2.zip is a name it lists but this
+    // job does not.
+    let other = job_id(
+        &dashboard
+            .post_job("maestro", "y", &[("b.log", TEXT), ("c.zip", ZIP)])
+            .await,
+    );
+    for uri in [
+        // file-1.zip is not a name this job lists.
+        format!("/jobs/{id}/files/file-1.zip"),
+        format!("/jobs/{id}/files/file-2.txt"),
+        // file-2.zip is listed for the other job, not this one.
+        format!("/jobs/{id}/files/file-2.zip"),
+        format!("/jobs/{id}/files/..%2F..%2Fjobs.db"),
+        "/jobs/999/files/file-1.txt".to_owned(),
+    ] {
+        assert_eq!(
+            dashboard.get(&uri).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    // Each job's own files still serve.
+    assert_eq!(
+        dashboard
+            .get(&format!("/jobs/{id}/files/file-1.txt"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        dashboard
+            .get(&format!("/jobs/{other}/files/file-2.zip"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn the_job_page_lists_files_as_icon_tiles_with_escaped_names() {
+    let dashboard = dashboard();
+    let id = job_id(
+        &dashboard
+            .post_job(
+                "maestro",
+                "Look here",
+                &[("x<b>&.log", TEXT), ("archive.zip", ZIP)],
+            )
+            .await,
+    );
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains(&format!(r#"href="/jobs/{id}/files/file-1.txt""#))
+    );
+    assert!(
+        page.body
+            .contains(&format!(r#"href="/jobs/{id}/files/file-2.zip""#))
+    );
+    // The original name is HTML-escaped.
+    assert!(page.body.contains("x&lt;b&gt;&amp;.log"));
+    assert!(!page.body.contains("x<b>&.log"));
+    // The tiles are inline SVG, fetched from no outside host.
+    assert!(page.body.contains("<svg"));
+}
+
+#[tokio::test]
+async fn a_job_without_files_shows_no_file_list() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(!page.body.contains(r#"<ul class="request-files">"#));
 }
 
 fn description() -> PrDescription {

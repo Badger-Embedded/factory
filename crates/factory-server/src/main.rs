@@ -173,6 +173,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             },
             data_dir: data_dir.clone(),
             token: Arc::clone(&claude_token),
+            store: Arc::clone(&store),
         };
         let scheduler = Scheduler::new(
             Arc::clone(&store),

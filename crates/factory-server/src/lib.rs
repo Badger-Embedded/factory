@@ -39,7 +39,7 @@ pub use secrets::{
     UnavailableSecrets, master_key_from_env,
 };
 pub use settings::Settings;
-pub use store::{JobEvent, JobRow, LogEntry, ProjectTotals, Store, StoreError};
+pub use store::{JobEvent, JobFile, JobRow, LogEntry, ProjectTotals, Store, StoreError};
 pub use usage::{
     CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, UsageSource, refresh_forever, refresh_once,
 };

@@ -18,7 +18,7 @@ use factory_server::{
     Settings, Store,
 };
 
-fn executor(token: Arc<ClaudeToken>, data_dir: PathBuf) -> PodmanExecutor {
+fn executor(token: Arc<ClaudeToken>, data_dir: PathBuf, store: Arc<Store>) -> PodmanExecutor {
     PodmanExecutor {
         base: WorkerConfig::default(),
         // A missing git binary makes the checkout step fail, so a run that gets
@@ -30,6 +30,7 @@ fn executor(token: Arc<ClaudeToken>, data_dir: PathBuf) -> PodmanExecutor {
         github: GitHub::default(),
         data_dir,
         token,
+        store,
     }
 }
 
@@ -62,7 +63,7 @@ async fn a_run_with_no_token_fails_before_any_container() {
         Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
     let token = Arc::new(ClaudeToken::new(secrets, None));
     let data_dir = tempfile::tempdir().unwrap();
-    let executor = executor(token, data_dir.path().to_path_buf());
+    let executor = executor(token, data_dir.path().to_path_buf(), Arc::clone(&store));
 
     let report = executor
         .run_agent(&Settings::default(), request(), Box::new(|_| {}))
@@ -81,7 +82,11 @@ async fn a_token_saved_between_runs_reaches_the_next_run() {
         Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
     let token = Arc::new(ClaudeToken::new(Arc::clone(&secrets), None));
     let data_dir = tempfile::tempdir().unwrap();
-    let executor = executor(Arc::clone(&token), data_dir.path().to_path_buf());
+    let executor = executor(
+        Arc::clone(&token),
+        data_dir.path().to_path_buf(),
+        Arc::clone(&store),
+    );
 
     // No token yet: the run fails at the gate.
     let first = executor

@@ -7,9 +7,9 @@ use factory_core::{
     Task,
 };
 use factory_runner::{
-    Expect, LogLine, McpConfig, McpServerStatus, ResultMessage, SessionRun, StreamItem,
-    WorkerConfig, WorkerRun, event_from_result, job_prompt, parse_line, place_images, podman_args,
-    prompt, remove_container, run, show_images,
+    Expect, LogLine, McpConfig, McpServerStatus, PlacedFile, ResultMessage, SessionRun, StreamItem,
+    WorkerConfig, WorkerRun, event_from_result, job_prompt, parse_line, place_files, place_images,
+    podman_args, prompt, remove_container, run, show_files, show_images,
 };
 use serde_json::{Value, json};
 
@@ -667,6 +667,93 @@ fn a_prompt_without_images_stays_the_same() {
     assert_eq!(show_images("Write the spec.", &[]), "Write the spec.");
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(place_images(dir.path(), &[]).unwrap(), Vec::<String>::new());
+}
+
+#[test]
+fn placed_files_keep_their_bytes_and_leave_git_status_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    init_repo(&work);
+    let uploads = dir.path().join("files");
+    std::fs::create_dir(&uploads).unwrap();
+    let log = b"a log line\n";
+    let zip = b"PK\x03\x04 bytes";
+    std::fs::write(uploads.join("file-1.txt"), log).unwrap();
+    std::fs::write(uploads.join("file-2.zip"), zip).unwrap();
+
+    let placed = place_files(
+        &work,
+        &[
+            (uploads.join("file-1.txt"), "server.log".into()),
+            (uploads.join("file-2.zip"), "bundle.zip".into()),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        placed,
+        [
+            PlacedFile {
+                path: "/work/.git/factory-files/file-1.txt".into(),
+                original_name: "server.log".into(),
+                is_zip: false,
+            },
+            PlacedFile {
+                path: "/work/.git/factory-files/file-2.zip".into(),
+                original_name: "bundle.zip".into(),
+                is_zip: true,
+            },
+        ]
+    );
+    let host = work.join(".git/factory-files");
+    assert_eq!(std::fs::read(host.join("file-1.txt")).unwrap(), log);
+    assert_eq!(std::fs::read(host.join("file-2.zip")).unwrap(), zip);
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+}
+
+#[test]
+fn the_clarify_prompt_lists_the_files_with_their_names_and_unzip_steps() {
+    let base = prompt(
+        &Task::Clarify {
+            request: "Add a reboot button".into(),
+        },
+        Expect::Clarify,
+    );
+    let files = vec![
+        PlacedFile {
+            path: "/work/.git/factory-files/file-1.txt".into(),
+            original_name: "server.log".into(),
+            is_zip: false,
+        },
+        PlacedFile {
+            path: "/work/.git/factory-files/file-2.zip".into(),
+            original_name: "bundle.zip".into(),
+            is_zip: true,
+        },
+    ];
+    let text = show_files(&base, &files);
+    assert!(text.starts_with(&base));
+    assert!(text.contains("- /work/.git/factory-files/file-1.txt (server.log)\n"));
+    assert!(text.contains("- /work/.git/factory-files/file-2.zip (bundle.zip)\n"));
+    assert!(text.contains("unzip -l"));
+    assert!(text.contains("unzip -d"));
+}
+
+#[test]
+fn a_prompt_without_files_stays_the_same() {
+    assert_eq!(show_files("Write the spec.", &[]), "Write the spec.");
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        place_files(dir.path(), &[]).unwrap(),
+        Vec::<PlacedFile>::new()
+    );
 }
 
 fn args_with_model(model: Option<&str>) -> Vec<String> {
