@@ -143,6 +143,7 @@ async fn index(
         None => state.projects.names().next().map(str::to_owned),
     };
     let jobs = state.store.list()?;
+    let costs = state.store.costs()?;
     let settings = state.store.settings()?;
     let totals = match &selected {
         Some(name) => state.store.project_totals(name)?,
@@ -154,6 +155,7 @@ async fn index(
         selected.as_deref(),
         &settings,
         &jobs,
+        &costs,
         totals,
     ))
 }

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::http::StatusCode;
 use factory_core::{Ask, BranchSummary, Command, Gates, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -76,6 +78,7 @@ pub fn index(
     selected: Option<&str>,
     settings: &Settings,
     jobs: &[JobRow],
+    costs: &HashMap<i64, f64>,
     totals: ProjectTotals,
 ) -> Markup {
     let all: Vec<&JobRow> = jobs
@@ -113,7 +116,7 @@ pub fn index(
             @if selected.is_some() {
                 (stats(totals))
             }
-            (board(&all, settings))
+            (board(&all, costs, settings))
         },
     )
 }
@@ -300,7 +303,7 @@ impl Lane {
     }
 }
 
-fn board(rows: &[&JobRow], settings: &Settings) -> Markup {
+fn board(rows: &[&JobRow], costs: &HashMap<i64, f64>, settings: &Settings) -> Markup {
     html! {
         div.board {
             @for lane in Lane::ALL {
@@ -312,12 +315,12 @@ fn board(rows: &[&JobRow], settings: &Settings) -> Markup {
                 @if lane == Lane::Done {
                     details class=(lane.class()) {
                         summary { (lane.title()) " " span.count { (cards.len()) } }
-                        (lane_cards(&cards, settings, lane))
+                        (lane_cards(&cards, costs, settings, lane))
                     }
                 } @else {
                     section class=(lane.class()) {
                         h2 { (lane.title()) " " span.count { (cards.len()) } }
-                        (lane_cards(&cards, settings, lane))
+                        (lane_cards(&cards, costs, settings, lane))
                     }
                 }
             }
@@ -325,19 +328,30 @@ fn board(rows: &[&JobRow], settings: &Settings) -> Markup {
     }
 }
 
-fn lane_cards(cards: &[&JobRow], settings: &Settings, lane: Lane) -> Markup {
+fn lane_cards(
+    cards: &[&JobRow],
+    costs: &HashMap<i64, f64>,
+    settings: &Settings,
+    lane: Lane,
+) -> Markup {
     html! {
         @if cards.is_empty() {
             p.empty { (lane.empty()) }
         } @else {
             ul.jobs {
                 @for row in cards {
-                    li {
-                        span.id { "#" (row.id) }
-                        a.title href={ "/jobs/" (row.id) } { (first_line(row.job.request())) }
-                        (turn_badge(&row.job, settings))
-                        span.sub {
-                            (row.project) " · " (stage_label(&row.job)) " · " (row.requested_by)
+                    li.card.job {
+                        div.job-head {
+                            span.id { "#" (row.id) }
+                            a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
+                                (first_line(row.job.request()))
+                            }
+                            (turn_badge(&row.job, settings))
+                        }
+                        div.job-sub {
+                            span { (stage_label(&row.job)) }
+                            span.requester title=(row.requested_by) { (row.requested_by) }
+                            span.cost { (cost_label(costs.get(&row.id).copied().unwrap_or(0.0))) }
                         }
                         @if lane == Lane::You {
                             @if let Some(gate) = gate_name(&row.job) {

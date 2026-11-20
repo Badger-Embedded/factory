@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -370,6 +371,20 @@ impl Store {
             })
             .optional()?;
         Ok(usd.unwrap_or(0.0))
+    }
+
+    /// The API cost in USD of every job that has a `job_costs` row, by job id.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn costs(&self) -> Result<HashMap<i64, f64>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT job_id, usd FROM job_costs")?;
+        let costs = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(costs)
     }
 
     /// The image file names saved for job `id`, in upload order.
