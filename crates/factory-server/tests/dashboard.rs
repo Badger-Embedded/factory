@@ -408,7 +408,13 @@ async fn the_job_page_shows_the_cost_summed_over_runs() {
     dashboard.store.add_cost(id, 0.75).unwrap();
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(page.body.contains(" UTC · $1.25</p>"));
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\">$1.25</span>")
+    );
+    assert!(page.body.contains("requested by alice@example.com"));
+    assert!(page.body.contains(" UTC</p>"));
+    assert!(!page.body.contains(" UTC · "));
 }
 
 #[tokio::test]
@@ -417,7 +423,7 @@ async fn a_job_without_cost_shows_a_dash() {
     let id = dashboard.new_job().await;
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(page.body.contains(" UTC · –</p>"));
+    assert!(page.body.contains("<span class=\"badge cost\">–</span>"));
 }
 
 #[tokio::test]
@@ -429,7 +435,10 @@ async fn a_cancelled_job_still_shows_its_cost() {
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("cancelled"));
-    assert!(page.body.contains(" UTC · $2.00</p>"));
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\">$2.00</span>")
+    );
 }
 
 #[tokio::test]

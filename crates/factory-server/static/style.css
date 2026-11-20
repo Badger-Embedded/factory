@@ -153,6 +153,17 @@ main { padding-top: var(--space-32); padding-bottom: var(--space-48); }
 h1 { font-size: var(--font-size-xl); line-height: 1.3; margin: 0 0 var(--space-4); letter-spacing: -0.01em; }
 h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
 
+.title-row { display: flex; align-items: center; gap: var(--space-12); flex-wrap: wrap; }
+.title-row h1 { flex: 1 1 auto; min-width: 0; }
+.badge.cost {
+  flex-shrink: 0;
+  margin-left: auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: var(--factory);
+  background: var(--factory-bg);
+}
+
 .meta { color: var(--muted); font-size: var(--font-size-sm); margin: 0 0 var(--space-20); }
 
 .card {
