@@ -1,5 +1,6 @@
 //! The factory's dashboard and job store.
 
+mod check;
 mod cost;
 mod github;
 mod mcp;
@@ -17,6 +18,7 @@ mod warnings;
 mod web;
 mod workers;
 
+pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT};
 pub use cost::{format_cost, merge_fraction};
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,

@@ -14,10 +14,12 @@ use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
+use crate::check::McpChecker;
 use crate::github::{RepoChecker, RepoReport};
 use crate::mcp::{McpError, McpProjectSettings, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, Projects, StageEfforts, StageModels};
+use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
 use crate::store::{JobRow, ProjectTotals, Store, StoreError};
@@ -51,6 +53,7 @@ struct AppState {
     github: Arc<dyn RepoChecker>,
     slots: Arc<WorkerSlots>,
     secrets: Arc<dyn SecretStore>,
+    checker: Arc<dyn McpChecker>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -60,7 +63,9 @@ struct AppState {
 /// The onboarding wizard runs its repository checks through `github`. The
 /// board shows the worker slots the scheduler fills in `slots`. Per-project
 /// MCP header values are read and written through `secrets`, which reports
-/// itself unavailable when no master key is present.
+/// itself unavailable when no master key is present. The per-project MCP
+/// connection check runs through `checker`, the way the onboarding checks run
+/// through `github`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the dashboard wires each long-lived dependency the handlers share"
@@ -74,6 +79,7 @@ pub fn app(
     github: Arc<dyn RepoChecker>,
     slots: Arc<WorkerSlots>,
     secrets: Arc<dyn SecretStore>,
+    checker: Arc<dyn McpChecker>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -101,6 +107,10 @@ pub fn app(
         .route("/settings/mcp", post(add_mcp_server))
         .route("/settings/mcp/{name}", post(edit_mcp_server))
         .route("/settings/mcp/{name}/delete", post(delete_mcp_server))
+        .route(
+            "/settings/projects/{project}/mcp/{server}/check",
+            post(check_mcp_server),
+        )
         .with_state(AppState {
             store,
             projects,
@@ -110,6 +120,7 @@ pub fn app(
             github,
             slots,
             secrets,
+            checker,
         })
 }
 
@@ -943,6 +954,44 @@ async fn delete_mcp_server(
 ) -> Result<Markup, AppError> {
     state.store.delete_mcp_server(&name)?;
     settings_page(&state, &headers, Some("Deleted."))
+}
+
+/// Checks a project's connection to one MCP server and returns an HTML fragment
+/// with the result, which htmx swaps into the server block. The check uses the
+/// saved URL and the project's saved header values, resolved the way the proxy
+/// resolves them, so it and a real run send the same headers. Any form field
+/// posted with the request is ignored, so an unsaved value typed into the page
+/// is never sent. The result is not stored.
+async fn check_mcp_server(
+    State(state): State<AppState>,
+    Path((project, server)): Path<(String, String)>,
+) -> Result<Markup, AppError> {
+    if state.projects.lookup(&project)?.is_none() {
+        return Err(AppError::UnknownProject(project));
+    }
+    let Some(registered) = state.store.mcp_server(&server)? else {
+        return Err(AppError::NotFound(format!(
+            "no MCP server named {server:?}"
+        )));
+    };
+    // Resolve the saved URL and values the way the proxy does, so the check and
+    // a run send the same headers. `resolve` returns `None` only for a server
+    // that is not registered, which the lookup above has ruled out.
+    let upstreams = StoreUpstreams::new(Arc::clone(&state.store), Arc::clone(&state.secrets));
+    let Upstream { url, headers } = upstreams
+        .resolve(&project, &server)
+        .ok_or_else(|| AppError::NotFound(format!("no MCP server named {server:?}")))?;
+    // A declared header with no resolved value has none stored, or one that
+    // would not decrypt. The result names these, and the check runs without
+    // them.
+    let missing: Vec<String> = registered
+        .headers
+        .iter()
+        .filter(|name| !headers.iter().any(|(have, _)| have == *name))
+        .cloned()
+        .collect();
+    let outcome = state.checker.check(&url, headers).await;
+    Ok(pages::mcp_check_result(&outcome, &missing))
 }
 
 #[derive(Deserialize)]
