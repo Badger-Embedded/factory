@@ -1,10 +1,10 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use factory_core::Event;
 use factory_runner::{
     Git, GitHub, Observation, RunReport, SessionRun, WorkerConfig, WorkerRun, observe,
-    remove_container, run, run_checks,
+    place_images, remove_container, run, run_checks, show_images,
 };
 
 use crate::scheduler::{
@@ -56,6 +56,17 @@ impl PodmanExecutor {
     }
 }
 
+/// The images saved for a job, in name order. A job without images has no
+/// `images` directory.
+fn job_images(job_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(job_dir.join("images")) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    files.sort();
+    files
+}
+
 impl Executor for PodmanExecutor {
     async fn run_agent(
         &self,
@@ -87,13 +98,21 @@ impl Executor for PodmanExecutor {
         if let Err(err) = remove_container(&config, &name).await {
             tracing::warn!("removing {name}: {err}");
         }
+        let session = SessionRun::for_session(&claude_dir, &request.session_id);
+        let mut prompt = request.prompt;
+        if matches!(session, SessionRun::Start(_)) {
+            match place_images(&workspace, &job_images(&job_dir)) {
+                Ok(paths) => prompt = show_images(&prompt, &paths),
+                Err(err) => return failed(format!("could not place the images: {err}")),
+            }
+        }
         let worker = WorkerRun {
             name,
-            session: SessionRun::for_session(&claude_dir, &request.session_id),
+            session,
             workspace,
             claude_dir,
             expect: request.expect,
-            prompt: request.prompt,
+            prompt,
         };
         run(&config, &worker, log).await
     }

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question, Stage, Task};
 use factory_runner::{
     Expect, LogLine, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
-    event_from_result, parse_line, podman_args, prompt, remove_container, run,
+    event_from_result, parse_line, place_images, podman_args, prompt, remove_container, run,
+    show_images,
 };
 use serde_json::{Value, json};
 
@@ -490,4 +491,90 @@ fn the_rebase_prompt_names_the_fetched_base() {
     assert!(text.contains("origin/main"));
     assert!(text.contains("Do not push"));
     assert!(text.contains("\"commits_ready\""));
+}
+
+fn init_repo(dir: &Path) {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir.join("README.md"), "hello").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "first"]);
+}
+
+#[test]
+fn placed_images_keep_their_bytes_and_leave_git_status_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    init_repo(&work);
+    let uploads = dir.path().join("images");
+    std::fs::create_dir(&uploads).unwrap();
+    let png = [0x89, b'P', b'N', b'G', 0, 1, 2, 255];
+    let gif = *b"GIF89a\x00\xff";
+    std::fs::write(uploads.join("image-1.png"), png).unwrap();
+    std::fs::write(uploads.join("image-2.gif"), gif).unwrap();
+
+    let paths = place_images(
+        &work,
+        &[uploads.join("image-1.png"), uploads.join("image-2.gif")],
+    )
+    .unwrap();
+
+    assert_eq!(
+        paths,
+        [
+            "/work/.git/factory-images/image-1.png",
+            "/work/.git/factory-images/image-2.gif"
+        ]
+    );
+    let host = work.join(".git/factory-images");
+    assert_eq!(std::fs::read(host.join("image-1.png")).unwrap(), png);
+    assert_eq!(std::fs::read(host.join("image-2.gif")).unwrap(), gif);
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+}
+
+#[test]
+fn the_clarify_prompt_lists_the_images_and_asks_the_agent_to_look() {
+    let base = prompt(
+        &Task::Clarify {
+            request: "Add a reboot button".into(),
+        },
+        Expect::Clarify,
+    );
+    let paths = vec![
+        "/work/.git/factory-images/image-1.png".to_owned(),
+        "/work/.git/factory-images/image-2.gif".to_owned(),
+    ];
+    let text = show_images(&base, &paths);
+    assert!(text.starts_with(&base));
+    assert!(text.contains("Look at each one"));
+    assert!(text.contains("- /work/.git/factory-images/image-1.png\n"));
+    assert!(text.contains("- /work/.git/factory-images/image-2.gif\n"));
+}
+
+#[test]
+fn a_prompt_without_images_stays_the_same() {
+    assert_eq!(show_images("Write the spec.", &[]), "Write the spec.");
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(place_images(dir.path(), &[]).unwrap(), Vec::<String>::new());
 }
