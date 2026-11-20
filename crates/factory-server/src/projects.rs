@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use factory_core::DEFAULT_EFFORT;
 use serde::Deserialize;
 
 use crate::store::{Store, StoreError};
@@ -23,6 +24,31 @@ pub struct StageModels {
     pub implement: Option<String>,
     #[serde(default)]
     pub review: Option<String>,
+}
+
+/// The effort level each stage of a job runs with. Every stage always has one,
+/// unlike a model: a project that saves no effort runs all five at
+/// [`DEFAULT_EFFORT`], which [`StageEfforts::default`] fills in. Effort is
+/// never read from `project.toml`; SQLite is its only store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageEfforts {
+    pub clarify: String,
+    pub spec: String,
+    pub plan: String,
+    pub implement: String,
+    pub review: String,
+}
+
+impl Default for StageEfforts {
+    fn default() -> Self {
+        StageEfforts {
+            clarify: DEFAULT_EFFORT.to_owned(),
+            spec: DEFAULT_EFFORT.to_owned(),
+            plan: DEFAULT_EFFORT.to_owned(),
+            implement: DEFAULT_EFFORT.to_owned(),
+            review: DEFAULT_EFFORT.to_owned(),
+        }
+    }
 }
 
 /// One target repository. The `projects` table holds `repo`, `base` and the

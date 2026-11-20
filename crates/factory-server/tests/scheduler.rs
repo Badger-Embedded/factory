@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
-    PrDescription, Question, ReviewState, Stage, Turn,
+    AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
+    MAX_REVIEW_ROUNDS, PrDescription, Question, ReviewState, Stage, Turn,
 };
 use factory_runner::{Expect, LogLine, Rerun, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Published,
-    ReadyAction, RerunRequest, Scheduler, Settings, Store, SummaryRequest, WatchReport,
-    WatchRequest, format_cost, ready_action,
+    ReadyAction, RerunRequest, Scheduler, Settings, StageEfforts, Store, SummaryRequest,
+    WatchReport, WatchRequest, format_cost, ready_action,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -1938,6 +1938,188 @@ async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_model() {
         .collect();
     assert_eq!(used.len(), 4, "{used:?}");
     assert!(used.iter().all(|model| model == "i"), "{used:?}");
+}
+
+fn effort_of(request: &AgentRequest) -> &str {
+    request
+        .effort
+        .as_deref()
+        .expect("the scheduler always sets an effort")
+}
+
+fn stage_efforts(
+    clarify: &str,
+    spec: &str,
+    plan: &str,
+    implement: &str,
+    review: &str,
+) -> StageEfforts {
+    StageEfforts {
+        clarify: clarify.into(),
+        spec: spec.into(),
+        plan: plan.into(),
+        implement: implement.into(),
+        review: review.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_project_without_effort_runs_every_stage_at_medium() {
+    let (store, executor, scheduler) = setup(one_pass);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(10);
+
+    step(&scheduler).await;
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+
+    // Clarify, the clarify answer, spec, plan and implement all run at medium.
+    let requests = executor.requests();
+    let used: Vec<&str> = requests.iter().map(effort_of).collect();
+    assert_eq!(used, [DEFAULT_EFFORT; 5]);
+}
+
+#[tokio::test]
+async fn each_stage_runs_with_its_saved_effort() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_efforts(
+            "maestro",
+            &stage_efforts("low", "high", "xhigh", "max", "medium"),
+        )
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(10);
+
+    step(&scheduler).await;
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let used: Vec<&str> = requests.iter().map(effort_of).collect();
+    assert_eq!(used, ["low", "low", "high", "xhigh", "max"]);
+}
+
+#[tokio::test]
+async fn an_effort_change_reaches_the_next_run() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_efforts("maestro", &stage_efforts("low", "low", "low", "low", "low"))
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(10);
+
+    step(&scheduler).await;
+    store
+        .save_project_efforts(
+            "maestro",
+            &stage_efforts("high", "high", "high", "high", "high"),
+        )
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+
+    // The first clarify ran before the change; every run after it uses high.
+    let requests = executor.requests();
+    let used: Vec<&str> = requests.iter().map(effort_of).collect();
+    assert_eq!(used, ["low", "high", "high", "high", "high"]);
+}
+
+#[tokio::test]
+async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_effort() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    store
+        .save_project_efforts(
+            "maestro",
+            &stage_efforts("low", "low", "low", "high", "low"),
+        )
+        .unwrap();
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    executor
+        .checks
+        .lock()
+        .unwrap()
+        .push_back(Ok(Event::ChecksFailed {
+            report: "clippy".into(),
+        }));
+
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::FixChecks { .. })
+    ));
+    executor.release(1);
+    step(&scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    for event in [
+        Event::CiFailed { log: "red".into() },
+        Event::ReviewComments {
+            comments: "Needs a test.".into(),
+        },
+    ] {
+        executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+            event: Some(event),
+            seen_until: None,
+            merged_by_factory: false,
+        }));
+        step(&scheduler).await;
+        executor.release(1);
+        step(&scheduler).await;
+        step(&scheduler).await;
+        step(&scheduler).await;
+    }
+
+    let used: Vec<String> = executor
+        .requests()
+        .iter()
+        .map(|r| effort_of(r).to_owned())
+        .collect();
+    assert_eq!(used.len(), 4, "{used:?}");
+    assert!(used.iter().all(|effort| effort == "high"), "{used:?}");
+}
+
+#[tokio::test]
+async fn the_review_run_uses_the_review_effort() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewApproved,
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    store
+        .save_project_efforts(
+            "maestro",
+            &stage_efforts("low", "low", "low", "low", "xhigh"),
+        )
+        .unwrap();
+    to_watching(&store, &executor, &scheduler).await;
+
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    executor.release(1);
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let review = requests.last().unwrap();
+    assert_eq!(review.expect, Expect::Review);
+    assert_eq!(effort_of(review), "xhigh");
 }
 
 #[tokio::test]

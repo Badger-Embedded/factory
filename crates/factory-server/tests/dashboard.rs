@@ -7,12 +7,12 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlanUsage,
-    PlannedPr, PrDescription, Question, Stage, Task, Turn,
+    AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
+    MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{
     BranchInfo, GitHubRepos, Permission, PlanUsageCache, Projects, Protection, RepoChecker,
-    RepoInfo, StageModels, Store, StoreError, USER_HEADER, app,
+    RepoInfo, StageEfforts, StageModels, Store, StoreError, USER_HEADER, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -2595,6 +2595,117 @@ fn an_old_project_models_table_gains_the_review_column() {
     };
     store.save_project_models("maestro", &with_review).unwrap();
     assert_eq!(store.project_models("maestro", &none).unwrap(), with_review);
+}
+
+fn efforts(clarify: &str, spec: &str, plan: &str, implement: &str, review: &str) -> StageEfforts {
+    StageEfforts {
+        clarify: clarify.into(),
+        spec: spec.into(),
+        plan: plan.into(),
+        implement: implement.into(),
+        review: review.into(),
+    }
+}
+
+#[test]
+fn a_project_without_effort_reads_medium_for_every_stage() {
+    let store = Store::open_in_memory().unwrap();
+    let medium = StageEfforts::default();
+    assert_eq!(medium.clarify, DEFAULT_EFFORT);
+    assert_eq!(medium.review, DEFAULT_EFFORT);
+    assert_eq!(store.project_efforts("maestro").unwrap(), medium);
+}
+
+#[test]
+fn project_efforts_are_stored_and_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let saved = efforts("low", "medium", "high", "xhigh", "max");
+    {
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.project_efforts("maestro").unwrap(),
+            StageEfforts::default()
+        );
+        store.save_project_efforts("maestro", &saved).unwrap();
+    }
+    // Every stage's effort survives a reopen, and another project is untouched.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.project_efforts("maestro").unwrap(), saved);
+    assert_eq!(
+        store.project_efforts("other").unwrap(),
+        StageEfforts::default()
+    );
+}
+
+#[test]
+fn saving_one_projects_effort_leaves_other_projects_alone() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_project_efforts("maestro", &efforts("high", "high", "high", "high", "high"))
+        .unwrap();
+    store
+        .save_project_efforts("factory", &efforts("low", "low", "low", "low", "low"))
+        .unwrap();
+    store
+        .save_project_efforts("maestro", &efforts("max", "max", "max", "max", "max"))
+        .unwrap();
+    assert_eq!(
+        store.project_efforts("factory").unwrap(),
+        efforts("low", "low", "low", "low", "low")
+    );
+    assert_eq!(
+        store.project_efforts("maestro").unwrap(),
+        efforts("max", "max", "max", "max", "max")
+    );
+}
+
+#[test]
+fn an_effort_outside_the_allowed_set_is_rejected_and_not_stored() {
+    let store = Store::open_in_memory().unwrap();
+    let bad = efforts("medium", "medium", "turbo", "medium", "medium");
+    let err = store.save_project_efforts("maestro", &bad).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidEffort(level) if level == "turbo"),
+        "{err:?}"
+    );
+    // Nothing was written, so the project still reads the default.
+    assert_eq!(
+        store.project_efforts("maestro").unwrap(),
+        StageEfforts::default()
+    );
+}
+
+#[test]
+fn a_database_from_before_the_effort_table_opens_and_reads_medium() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    // A database as it was before `project_efforts` existed: it has a project
+    // but no effort table at all.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                name TEXT PRIMARY KEY,
+                repo TEXT NOT NULL UNIQUE,
+                base TEXT NOT NULL,
+                checks TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO projects (name, repo, base) VALUES ('maestro', 'o/n', 'main');",
+        )
+        .unwrap();
+    }
+    // Opening the store creates the table, so the old project reads medium and
+    // a new effort can be saved.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.project_efforts("maestro").unwrap(),
+        StageEfforts::default()
+    );
+    let saved = efforts("high", "high", "high", "high", "high");
+    store.save_project_efforts("maestro", &saved).unwrap();
+    assert_eq!(store.project_efforts("maestro").unwrap(), saved);
 }
 
 #[test]

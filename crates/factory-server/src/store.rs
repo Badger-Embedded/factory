@@ -3,11 +3,11 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use factory_core::{AgentResult, Event, Job, Rejected, Session, Stage};
+use factory_core::{AgentResult, EFFORTS, Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::projects::{Project, StageModels};
+use crate::projects::{Project, StageEfforts, StageModels};
 use crate::settings::Settings;
 
 const SCHEMA: &str = "
@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS project_settings (
     project TEXT PRIMARY KEY,
     auto_merge INTEGER NOT NULL DEFAULT 0,
     llm_review INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS project_efforts (
+    project TEXT PRIMARY KEY,
+    clarify TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    implement TEXT NOT NULL,
+    review TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
@@ -156,6 +164,8 @@ pub enum StoreError {
     DuplicateName(String),
     /// A project with this `owner/name` repo is already onboarded.
     DuplicateRepo(String),
+    /// An effort level outside the allowed set was submitted. It is not stored.
+    InvalidEffort(String),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -169,6 +179,9 @@ impl fmt::Display for StoreError {
             StoreError::DuplicateName(name) => write!(f, "a project named {name:?} already exists"),
             StoreError::DuplicateRepo(repo) => {
                 write!(f, "the repository {repo:?} is already onboarded")
+            }
+            StoreError::InvalidEffort(effort) => {
+                write!(f, "{effort:?} is not an allowed effort level")
             }
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
@@ -706,6 +719,77 @@ impl Store {
                 models.plan,
                 models.implement,
                 models.review
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The effort levels saved for `project`, or the default of
+    /// [`DEFAULT_EFFORT`](factory_core::DEFAULT_EFFORT) for every stage when no
+    /// row is saved. A project in a database made before this table existed has
+    /// no row and so reads every stage at the default.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_efforts(&self, project: &str) -> Result<StageEfforts, StoreError> {
+        let stored = self
+            .conn()
+            .query_row(
+                "SELECT clarify, spec, plan, implement, review FROM project_efforts WHERE project = ?1",
+                [project],
+                |row| {
+                    Ok(StageEfforts {
+                        clarify: row.get(0)?,
+                        spec: row.get(1)?,
+                        plan: row.get(2)?,
+                        implement: row.get(3)?,
+                        review: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    /// Saves `project`'s effort for all five stages, writing only this
+    /// project's row. Every level must be one the `claude` CLI accepts, see
+    /// [`EFFORTS`]; a value outside that set is rejected and nothing is
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidEffort`] for a level outside the allowed
+    /// set, before any write. Otherwise fails only on a database error.
+    pub fn save_project_efforts(
+        &self,
+        project: &str,
+        efforts: &StageEfforts,
+    ) -> Result<(), StoreError> {
+        for level in [
+            &efforts.clarify,
+            &efforts.spec,
+            &efforts.plan,
+            &efforts.implement,
+            &efforts.review,
+        ] {
+            if !EFFORTS.contains(&level.as_str()) {
+                return Err(StoreError::InvalidEffort(level.clone()));
+            }
+        }
+        self.conn().execute(
+            "INSERT INTO project_efforts (project, clarify, spec, plan, implement, review)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (project) DO UPDATE SET clarify = excluded.clarify,
+                spec = excluded.spec, plan = excluded.plan,
+                implement = excluded.implement, review = excluded.review",
+            params![
+                project,
+                efforts.clarify,
+                efforts.spec,
+                efforts.plan,
+                efforts.implement,
+                efforts.review
             ],
         )?;
         Ok(())
