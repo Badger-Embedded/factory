@@ -499,7 +499,12 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
             h2 { "Add a server" }
             div.field {
                 label for="mcp-new-name" { "Name" }
-                input #mcp-new-name type="text" name="name" required;
+                // The pattern and maxlength mirror `validate_name` in mcp.rs, so
+                // the browser blocks a bad name before submit. Change both together.
+                input #mcp-new-name type="text" name="name" required
+                    pattern="[a-z0-9-]{1,32}" maxlength="32"
+                    title="1 to 32 characters of a-z, 0-9 and -"
+                    autocapitalize="none" autocomplete="off" spellcheck="false";
                 p.hint { "1 to 32 characters of a-z, 0-9 and -. It is the key in a run's MCP config and part of the proxy path." }
             }
             div.field {
