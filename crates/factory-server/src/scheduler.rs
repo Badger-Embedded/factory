@@ -293,7 +293,7 @@ impl<E: Executor> Scheduler<E> {
                         base: project.base.clone(),
                         branch: match session {
                             Session::Planning | Session::Spec | Session::Plan => None,
-                            Session::Pr(pr) => Some(branch_name(row.id, pr)),
+                            Session::Pr(pr) | Session::Review(pr) => Some(branch_name(row.id, pr)),
                         },
                         session_id: self.store.session_uuid(row.id, session)?,
                         expect,

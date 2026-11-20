@@ -69,6 +69,7 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
         ),
+        Task::Review => return review_prompt(),
     };
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
@@ -79,6 +80,19 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
          continue, and list the questions."
     );
     text
+}
+
+/// The prompt for an LLM review run. The worker has no GitHub token, so the
+/// reviewer reads the branch's diff from the checkout and does not push. It
+/// resumes across passes, so a later pass reviews only the new commits.
+fn review_prompt() -> String {
+    "Review the commits this branch adds on top of its base. Read the diff with git, \
+     against the base branch the checkout is on. Check the change for correctness and \
+     for the repository's own rules in CLAUDE.md and CONTRIBUTING.md. Do not change any \
+     files and do not push.\n\n\
+     End with outcome \"approve\" when the change is ready to merge, or \"changes\" with \
+     feedback the author can act on when it is not."
+        .to_owned()
 }
 
 /// The prompt for one agent run of `job`. A job with fresh sessions starts
