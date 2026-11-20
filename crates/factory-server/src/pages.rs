@@ -42,6 +42,7 @@ const HEADER_NAME_PATTERN: &str = r"[A-Za-z0-9!#$%&'*+.^_`\|~\-]+";
 /// runs once on the job page, outside every swapped region, so a swap never
 /// re-runs or removes it.
 const JOB_UPDATES: &str = include_str!("../static/job-updates.js");
+const LOCAL_TIME: &str = include_str!("../static/local-time.js");
 
 /// Each live region polls its own fragment on this interval, so a state change
 /// shows without a reload.
@@ -144,6 +145,7 @@ pub fn index(
                     p { a.nav href="/onboard" { "Onboard a project" } }
                 }
             }
+            script { (PreEscaped(LOCAL_TIME)) }
         },
     )
 }
@@ -328,41 +330,14 @@ fn plan_usage_panel(usage: &PlanUsage) -> Markup {
 fn usage_window(label: &str, window: &UsageWindow) -> Markup {
     let percent = window.percent_used();
     let fill = format!("{:.1}%", percent.clamp(0.0, 100.0));
-    let reset = format!("resets {}", format_reset(window.resets_at));
     html! {
-        li.usage-window title=(reset) {
+        li.usage-window {
             span.usage-name { (label) }
             span.usage-track { span.usage-fill style={ "width: " (fill) } {} }
             span.usage-percent { (format!("{percent:.0}% used")) }
-            span.usage-reset { (reset) }
+            span.usage-reset { "resets " (crate::localtime::reset(window.resets_at)) }
         }
     }
-}
-
-/// `unix`, a Unix timestamp in seconds, as `YYYY-MM-DD HH:MM UTC`.
-fn format_reset(unix: i64) -> String {
-    let (year, month, day) = civil_from_days(unix.div_euclid(86_400));
-    let secs = unix.rem_euclid(86_400);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        secs / 3600,
-        secs % 3600 / 60
-    )
-}
-
-/// The civil date (year, month 1 to 12, day 1 to 31) for `days` days after
-/// 1970-01-01, by Howard Hinnant's `civil_from_days`.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn count_or_dash(count: i64) -> String {
@@ -2028,6 +2003,7 @@ pub fn job(
                 }
             }
             script { (PreEscaped(JOB_UPDATES)) }
+            script { (PreEscaped(LOCAL_TIME)) }
         },
     )
 }
@@ -2169,7 +2145,7 @@ fn job_header(id: i64, row: &JobRow, repo_url: Option<&str>, cost_usd: f64) -> M
             } @else {
                 (row.project)
             }
-            " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
+            " · requested by " (row.requested_by) " · " (crate::localtime::date_time(&row.created_at))
         }
     }
 }
@@ -2285,7 +2261,7 @@ fn log_card(logs: &[LogEntry]) -> Markup {
                 ol.log {
                     @for entry in logs {
                         li class={ "log-" (entry.kind) } {
-                            span.log-at { (entry.at.get(11..).unwrap_or(&entry.at)) }
+                            span.log-at { (crate::localtime::time_seconds(&entry.at)) }
                             span.log-text { (entry.text) }
                         }
                     }
