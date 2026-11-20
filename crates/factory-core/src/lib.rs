@@ -8,6 +8,6 @@
 mod job;
 
 pub use job::{
-    AgentResult, Ask, Command, Event, Job, MAX_FAILED_ROUNDS, PlannedPr, PrDescription, Question,
-    Rejected, Session, Stage, Task, Turn,
+    AgentResult, Ask, Command, Event, Gates, Job, MAX_FAILED_ROUNDS, PlannedPr, PrDescription,
+    Question, Rejected, Session, Stage, Task, Turn,
 };
