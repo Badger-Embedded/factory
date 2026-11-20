@@ -233,11 +233,15 @@ impl Dashboard {
         ]
         .map(str::to_owned)
         .into();
-        for server in self.store.mcp_servers().unwrap() {
+        let servers = self.store.mcp_servers().unwrap();
+        for server in &servers {
             uris.push(format!("/settings/mcp/{}", server.name));
         }
         for (name, _) in self.store.list_projects().unwrap() {
             uris.push(format!("/settings/projects/{name}"));
+            for server in &servers {
+                uris.push(format!("/settings/projects/{name}/mcp/{}", server.name));
+            }
         }
         let mut body = String::new();
         for uri in uris {
@@ -4703,7 +4707,9 @@ async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
     assert_eq!(server.headers, Vec::<String>::new());
 
     // Delete it.
-    let deleted = dashboard.post("/settings/mcp/context7/delete", "").await;
+    let deleted = dashboard
+        .post("/settings/mcp/context7/delete", "confirm_name=context7")
+        .await;
     assert_eq!(deleted.status, StatusCode::OK);
     assert!(dashboard.store.mcp_server("context7").unwrap().is_none());
 }
@@ -4884,7 +4890,7 @@ async fn enabling_a_server_with_no_stage_is_a_bad_request() {
         .await;
     let reply = dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=&mcp.context7.enabled=on",
         )
         .await;
@@ -4908,7 +4914,7 @@ async fn enabling_a_server_with_a_stage_saves_it() {
         .await;
     let reply = dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.clarify=on",
         )
@@ -4954,7 +4960,7 @@ async fn an_empty_header_field_keeps_the_stored_value_and_clear_deletes_it() {
     // Saving with the header field empty leaves the stored value untouched.
     dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.clarify=on&mcp.context7.header.Authorization=",
         )
@@ -4967,7 +4973,7 @@ async fn an_empty_header_field_keeps_the_stored_value_and_clear_deletes_it() {
     // Typing a new value replaces it.
     dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.clarify=on\
              &mcp.context7.header.Authorization=Bearer%20sk-new",
@@ -4981,7 +4987,7 @@ async fn an_empty_header_field_keeps_the_stored_value_and_clear_deletes_it() {
     // The clear control deletes the stored value.
     dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.clarify=on\
              &mcp.context7.clear.Authorization=on",
@@ -5002,7 +5008,7 @@ async fn saving_one_projects_mcp_leaves_other_projects_alone() {
     // tool turns the server on for the plan stage.
     dashboard
         .post(
-            "/settings/projects/tool",
+            "/settings/projects/tool/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.plan=on",
         )
@@ -5010,7 +5016,7 @@ async fn saving_one_projects_mcp_leaves_other_projects_alone() {
     // Saving maestro's MCP settings does not touch tool's.
     dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.review=on",
         )
@@ -5046,7 +5052,7 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
     // A header value cannot be saved, but the enabled and stage choices still can.
     let refused = dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.clarify=on\
              &mcp.context7.header.Authorization=Bearer%20sk-x",
@@ -5063,7 +5069,7 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
     // Without a value field, the enabled and stage choices save.
     let ok = dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "clarify=&spec=&plan=&implement=&review=\
              &mcp.context7.enabled=on&mcp.context7.stage.clarify=on",
         )
@@ -5312,7 +5318,7 @@ async fn saving_turns_off_the_shown_tools_left_unchecked() {
     // `a` is shown and checked, `b` is shown and unchecked, `c` is not shown.
     let reply = dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "mcp.context7.shown.a=on&mcp.context7.tool.a=on&mcp.context7.shown.b=on",
         )
         .await;
@@ -5331,7 +5337,7 @@ async fn saving_turns_off_the_shown_tools_left_unchecked() {
     // Checking it again turns it back on.
     dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "mcp.context7.shown.b=on&mcp.context7.tool.b=on",
         )
         .await;
@@ -5346,7 +5352,7 @@ async fn a_later_refresh_marks_new_tools_and_keeps_a_dropped_one_off() {
     refresh(&dashboard, "maestro").await;
     dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "mcp.context7.shown.a=on&mcp.context7.shown.b=on&mcp.context7.tool.b=on",
         )
         .await;
@@ -5354,8 +5360,16 @@ async fn a_later_refresh_marks_new_tools_and_keeps_a_dropped_one_off() {
     // The server drops `a` and adds `c`.
     dashboard.checker.set(listed(&["b", "c"]));
     let reply = refresh(&dashboard, "maestro").await;
-    assert!(reply.body.contains("(new)"));
-    assert!(reply.body.contains("(no longer offered)"));
+    assert!(
+        reply
+            .body
+            .contains(r#"<span class="badge agent">new</span>"#)
+    );
+    assert!(
+        reply
+            .body
+            .contains(r#"<span class="badge factory">no longer offered</span>"#)
+    );
     assert_eq!(
         tool_states(&dashboard, "maestro"),
         vec![
@@ -5413,7 +5427,7 @@ async fn an_origin_change_unlists_the_tools_and_a_delete_drops_them() {
     refresh(&dashboard, "maestro").await;
     dashboard
         .post(
-            "/settings/projects/maestro",
+            "/settings/projects/maestro/mcp/context7",
             "mcp.context7.shown.a=on&mcp.context7.shown.b=on&mcp.context7.tool.b=on",
         )
         .await;
@@ -5442,7 +5456,9 @@ async fn an_origin_change_unlists_the_tools_and_a_delete_drops_them() {
         ],
     );
 
-    dashboard.post("/settings/mcp/context7/delete", "").await;
+    dashboard
+        .post("/settings/mcp/context7/delete", "confirm_name=context7")
+        .await;
     assert_eq!(tool_states(&dashboard, "maestro"), Vec::new());
 }
 
@@ -5710,7 +5726,9 @@ async fn a_save_redraws_the_same_page_with_a_notice() {
     assert!(reply.body.contains("<h1>Default gates</h1>"));
 
     add_context7(&dashboard).await;
-    let reply = dashboard.post("/settings/mcp/context7/delete", "").await;
+    let reply = dashboard
+        .post("/settings/mcp/context7/delete", "confirm_name=context7")
+        .await;
     assert!(reply.body.contains("Deleted."));
     assert!(reply.body.contains("<h1>MCP servers</h1>"));
 }
@@ -5742,4 +5760,245 @@ async fn an_unknown_project_or_server_page_is_not_found() {
         dashboard.get("/settings/mcp/nope").await.status,
         StatusCode::NOT_FOUND
     );
+}
+
+fn has_value(dashboard: &Dashboard, project: &str, header: &str) -> bool {
+    dashboard
+        .store
+        .has_secret(factory_server::SecretRef {
+            project,
+            server: "context7",
+            header,
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_project_page_sums_up_each_server_and_links_its_page() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+    dashboard
+        .post(
+            "/settings/projects/maestro/mcp/context7",
+            "mcp.context7.enabled=on&mcp.context7.stage.plan=on&mcp.context7.stage.review=on",
+        )
+        .await;
+
+    let page = dashboard.get("/settings/projects/maestro").await.body;
+    assert!(page.contains("On in 2 of 5 stages"));
+    assert!(page.contains("Key stored"));
+    assert!(page.contains(r#"href="/settings/projects/maestro/mcp/context7""#));
+    // The project form no longer carries the server's fields.
+    assert!(!page.contains("mcp.context7."));
+
+    let other = dashboard.get("/settings/projects/tool").await.body;
+    assert!(other.contains("Off"));
+    assert!(other.contains("Key missing"));
+}
+
+#[tokio::test]
+async fn saving_the_project_form_leaves_its_mcp_settings_alone() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard
+        .post(
+            "/settings/projects/maestro/mcp/context7",
+            "mcp.context7.enabled=on&mcp.context7.stage.plan=on",
+        )
+        .await;
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=opus&plan=&implement=&review=",
+        )
+        .await;
+    assert!(
+        dashboard
+            .store
+            .project_mcp("maestro", "context7")
+            .unwrap()
+            .enabled
+    );
+}
+
+#[tokio::test]
+async fn a_projects_server_page_holds_its_settings_and_the_tool_controls() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard
+        .checker
+        .set(listed(&["query-docs", "resolve-library-id"]));
+    refresh(&dashboard, "maestro").await;
+
+    let page = dashboard
+        .get("/settings/projects/maestro/mcp/context7")
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    let body = page.body;
+    assert!(body.contains("<h1>context7 for maestro</h1>"));
+    assert!(body.contains(r#"action="/settings/projects/maestro/mcp/context7""#));
+    assert!(body.contains(r#"href="/settings/projects/maestro" aria-current="page""#));
+    assert!(body.contains("Refresh connection"));
+    assert!(body.contains(r#"class="mcp-tool-controls""#));
+    assert!(body.contains("2 of 2 on"));
+    assert!(body.contains(r#"data-tool="query-docs""#));
+    assert!(body.contains("mcp-tools-js"));
+    assert_eq!(body.matches(r#"class="save-bar""#).count(), 1);
+}
+
+#[tokio::test]
+async fn a_projects_server_page_for_an_unknown_name_is_not_found() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    for uri in [
+        "/settings/projects/nope/mcp/context7",
+        "/settings/projects/maestro/mcp/nope",
+    ] {
+        assert_eq!(
+            dashboard.get(uri).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+        assert_eq!(
+            dashboard.post(uri, "").await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_servers_page_lists_the_projects_that_use_it() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+    dashboard
+        .post(
+            "/settings/projects/maestro/mcp/context7",
+            "mcp.context7.enabled=on&mcp.context7.stage.clarify=on",
+        )
+        .await;
+
+    let page = dashboard.get("/settings/mcp/context7").await.body;
+    let used = &page[page.find("Used by").unwrap()..];
+    assert!(used.contains("maestro"));
+    assert!(used.contains("On in 1 of 5 stages"));
+    assert!(used.contains("Key stored"));
+    assert!(used.contains("tool"));
+    assert!(used.contains("Key missing"));
+    assert!(used.contains(r#"href="/settings/projects/tool/mcp/context7""#));
+}
+
+#[tokio::test]
+async fn an_edit_that_deletes_stored_values_waits_for_a_confirm() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+
+    // Renaming the header would delete maestro's value, so nothing is saved.
+    let reply = dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=X-Api-Key",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Not saved yet."));
+    assert!(reply.body.contains("maestro: <code>Authorization</code>"));
+    assert!(
+        reply
+            .body
+            .contains(r#"<input type="hidden" name="confirm" value="on">"#)
+    );
+    assert!(reply.body.contains("Save and delete 1 value"));
+    assert!(reply.body.contains(r#"<div class="save-bar dirty">"#));
+    // The page keeps the posted name, ready to confirm.
+    assert!(reply.body.contains(r#"value="X-Api-Key""#));
+    assert_eq!(
+        dashboard
+            .store
+            .mcp_server("context7")
+            .unwrap()
+            .unwrap()
+            .headers,
+        vec!["Authorization".to_owned()]
+    );
+    assert!(has_value(&dashboard, "maestro", "Authorization"));
+
+    // Confirming saves it and deletes the value.
+    let reply = dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=X-Api-Key&confirm=on",
+        )
+        .await;
+    assert!(reply.body.contains("Saved."));
+    assert_eq!(
+        dashboard
+            .store
+            .mcp_server("context7")
+            .unwrap()
+            .unwrap()
+            .headers,
+        vec!["X-Api-Key".to_owned()]
+    );
+    assert!(!has_value(&dashboard, "maestro", "Authorization"));
+}
+
+#[tokio::test]
+async fn an_origin_change_with_stored_values_waits_for_a_confirm() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+    let reply = dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fother.example%2Fmcp&header=Authorization",
+        )
+        .await;
+    assert!(reply.body.contains("Not saved yet."));
+    assert_eq!(
+        dashboard.store.mcp_server("context7").unwrap().unwrap().url,
+        "https://mcp.context7.com/mcp"
+    );
+    assert!(has_value(&dashboard, "maestro", "Authorization"));
+}
+
+#[tokio::test]
+async fn an_edit_that_deletes_nothing_saves_at_once() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    // No project stored a value, so a rename deletes nothing.
+    let reply = dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fv2&header=X-Api-Key",
+        )
+        .await;
+    assert!(reply.body.contains("Saved."));
+    assert!(!reply.body.contains("Not saved yet."));
+}
+
+#[tokio::test]
+async fn deleting_a_server_needs_its_name_typed() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+    let page = dashboard.get("/settings/mcp/context7").await.body;
+    assert!(page.contains("deletes the 1 stored value for it"));
+    assert!(page.contains(r#"name="confirm_name""#));
+
+    for form in ["", "confirm_name=context", "confirm_name=Context7"] {
+        let reply = dashboard.post("/settings/mcp/context7/delete", form).await;
+        assert_eq!(reply.status, StatusCode::OK, "{form}");
+        assert!(reply.body.contains("Nothing was deleted."), "{form}");
+        assert!(dashboard.store.mcp_server("context7").unwrap().is_some());
+    }
+
+    let reply = dashboard
+        .post("/settings/mcp/context7/delete", "confirm_name=context7")
+        .await;
+    assert!(reply.body.contains("Deleted."));
+    assert!(dashboard.store.mcp_server("context7").unwrap().is_none());
 }

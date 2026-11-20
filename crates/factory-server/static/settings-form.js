@@ -17,6 +17,12 @@
     if (note) note.textContent = "Unsaved changes.";
   }
 
+  // A form the server drew with unsaved changes, such as an edit that waits
+  // for a confirm, starts out dirty.
+  document.querySelectorAll(".settings-form .save-bar.dirty").forEach(function (bar) {
+    dirty.add(bar.closest(".settings-form"));
+  });
+
   document.addEventListener("input", mark);
   document.addEventListener("change", mark);
   // Adding or removing a header row changes the form without an input event.

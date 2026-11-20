@@ -768,3 +768,14 @@ form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
   .settings-group { display: none; }
   .settings-link { flex: none; white-space: nowrap; }
 }
+
+/* The tool list controls show only when mcp-tools.js runs. */
+.mcp-tool-controls { display: none; gap: var(--space-8); align-items: center; flex-wrap: wrap; margin: var(--space-8) 0; }
+.mcp-tools-js .mcp-tool-controls { display: flex; }
+.mcp-tool { padding: var(--space-6) 0; border-top: var(--border-width) solid var(--border); }
+.mcp-tool .hint { margin-left: calc(15px + var(--space-8)); }
+.confirm { margin-bottom: var(--space-16); padding: var(--space-12) var(--space-16); border: var(--border-width) solid var(--you); border-radius: var(--radius-md); background: var(--you-bg); color: var(--text); }
+.confirm p { margin: 0 0 var(--space-6); }
+.confirm ul { margin: 0; padding-left: var(--space-20); }
+.server-row .badge { flex: none; }
+.mcp-tool-filter { flex: 1 1 12rem; min-width: 0; }

@@ -1459,6 +1459,51 @@ impl Store {
         Ok(())
     }
 
+    /// The stored header values for server `name`, as `(project, header)`
+    /// pairs in project and header order. The values themselves stay sealed.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn mcp_secrets(&self, name: &str) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT project, header FROM secrets WHERE server = ?1 ORDER BY project, header",
+        )?;
+        let rows = stmt.query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The stored values that [`Store::edit_mcp_server`] would delete for the
+    /// same arguments, as `(project, header)` pairs, without writing anything:
+    /// every value when the URL's origin changes, else the values of each
+    /// removed header. The dashboard asks before a save that deletes any.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Store::edit_mcp_server`] would, on an invalid URL or header
+    /// name, an unknown server or a database error.
+    pub fn mcp_edit_deletes(
+        &self,
+        name: &str,
+        url: &str,
+        headers: &[String],
+    ) -> Result<Vec<(String, String)>, McpError> {
+        mcp::validate_url(url)?;
+        let headers = mcp::normalize_headers(headers)?;
+        let Some(server) = self.mcp_server(name)? else {
+            return Err(McpError::NotFound(name.to_owned()));
+        };
+        let stored = self.mcp_secrets(name)?;
+        if !mcp::same_origin(&server.url, url) {
+            return Ok(stored);
+        }
+        Ok(stored
+            .into_iter()
+            .filter(|(_, header)| !headers.iter().any(|kept| kept.eq_ignore_ascii_case(header)))
+            .collect())
+    }
+
     /// Deletes the server `name` with every project's settings, stored secret
     /// values and stored tools for it, in one transaction. Deleting a server that is not registered is fine.
     ///
