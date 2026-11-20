@@ -102,12 +102,22 @@ pub fn app(
         .route("/jobs/{id}/retry", post(retry))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
-        .route("/settings", get(show_settings).post(save_settings))
-        .route("/settings/projects/{name}", post(save_project_models))
+        .route("/settings", get(settings_home))
+        .route("/settings/workers", get(show_workers).post(save_workers))
+        .route("/settings/gates", get(show_gates).post(save_gates))
+        .route("/settings/github", get(show_github).post(save_github))
+        .route("/settings/claude", get(show_claude))
+        .route(
+            "/settings/projects/{name}",
+            get(show_project_settings).post(save_project_models),
+        )
         .route("/settings/claude-token", post(save_claude_token))
         .route("/settings/claude-token/clear", post(clear_claude_token))
-        .route("/settings/mcp", post(add_mcp_server))
-        .route("/settings/mcp/{name}", post(edit_mcp_server))
+        .route("/settings/mcp", get(show_mcp).post(add_mcp_server))
+        .route(
+            "/settings/mcp/{name}",
+            get(show_mcp_server).post(edit_mcp_server),
+        )
         .route("/settings/mcp/{name}/delete", post(delete_mcp_server))
         .route(
             "/settings/projects/{project}/mcp/{server}/check",
@@ -687,83 +697,226 @@ async fn request_changes(
     )
 }
 
-async fn show_settings(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Markup, AppError> {
-    settings_page(&state, &headers, None)
+/// `/settings` opens the first project's page, or Workers when no project is
+/// onboarded.
+async fn settings_home(State(state): State<AppState>) -> Result<Redirect, AppError> {
+    let names = state.projects.names()?;
+    Ok(match names.first() {
+        Some(name) => Redirect::to(&format!("/settings/projects/{}", query_escape(name))),
+        None => Redirect::to("/settings/workers"),
+    })
 }
 
-fn settings_page(
+fn settings_nav(state: &AppState) -> Result<pages::SettingsNav, StoreError> {
+    Ok(pages::SettingsNav {
+        projects: state.projects.names()?,
+        servers: state
+            .store
+            .mcp_servers()?
+            .into_iter()
+            .map(|server| server.name)
+            .collect(),
+    })
+}
+
+fn workers_page(
     state: &AppState,
     headers: &HeaderMap,
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
-    let settings = state.store.settings()?;
-    let servers = state.store.mcp_servers()?;
-    let projects = state
-        .projects
-        .list()?
-        .into_iter()
-        .map(|(name, project)| {
-            let models = state.store.project_models(&name, &project.models)?;
-            let efforts = state.store.project_efforts(&name)?;
-            let auto_merge = state.store.project_auto_merge(&name, project.auto_merge)?;
-            let llm_review = state.store.project_llm_review(&name, project.llm_review)?;
-            let gates = state.store.project_gates(&name)?;
-            let project_servers = servers
-                .iter()
-                .map(|server| {
-                    let saved = state.store.project_mcp(&name, &server.name)?;
-                    let headers = server
-                        .headers
-                        .iter()
-                        .map(|header| {
-                            let at = SecretRef {
-                                project: &name,
-                                server: &server.name,
-                                header,
-                            };
-                            Ok(HeaderState {
-                                name: header.clone(),
-                                set: state.store.has_secret(at)?,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, StoreError>>()?;
-                    Ok(ServerSettings {
-                        name: server.name.clone(),
-                        enabled: saved.enabled,
-                        stages: saved.stages,
-                        headers,
-                        tools: state.store.mcp_tools(&name, &server.name)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, StoreError>>()?;
-            Ok(ProjectSettings {
-                name,
-                models,
-                efforts,
-                auto_merge,
-                llm_review,
-                gates,
-                servers: project_servers,
-            })
-        })
-        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(pages::settings_workers(
+        &user(headers),
+        &settings_nav(state)?,
+        &state.store.settings()?,
+        notice,
+    ))
+}
+
+fn gates_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    Ok(pages::settings_gates(
+        &user(headers),
+        &settings_nav(state)?,
+        &state.store.settings()?,
+        notice,
+    ))
+}
+
+fn github_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    Ok(pages::settings_github(
+        &user(headers),
+        &settings_nav(state)?,
+        &state.store.settings()?,
+        notice,
+    ))
+}
+
+fn claude_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
     // With the store unavailable the token cannot be read, so the field shows
     // "not set" and is disabled. A decrypt error also reads as not set; a save
     // then replaces it.
     let claude_token_set =
         state.secrets.available() && state.secrets.claude_token().ok().flatten().is_some();
-    Ok(pages::settings(
+    Ok(pages::settings_claude(
         &user(headers),
-        &settings,
-        &servers,
-        &projects,
-        state.secrets.available(),
+        &settings_nav(state)?,
         claude_token_set,
+        state.secrets.available(),
         notice,
     ))
+}
+
+fn mcp_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    Ok(pages::settings_mcp(
+        &user(headers),
+        &settings_nav(state)?,
+        &state.store.mcp_servers()?,
+        state.secrets.available(),
+        notice,
+    ))
+}
+
+fn mcp_server_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    name: &str,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let Some(server) = state.store.mcp_server(name)? else {
+        return Err(AppError::NotFound(format!("no MCP server named {name:?}")));
+    };
+    Ok(pages::settings_mcp_server(
+        &user(headers),
+        &settings_nav(state)?,
+        &server,
+        notice,
+    ))
+}
+
+fn project_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    name: &str,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let Some(project) = state.projects.lookup(name)? else {
+        return Err(AppError::UnknownProject(name.to_owned()));
+    };
+    Ok(pages::settings_project(
+        &user(headers),
+        &settings_nav(state)?,
+        &project_settings(state, name, &project)?,
+        state.secrets.available(),
+        notice,
+    ))
+}
+
+/// Everything a project's settings page shows: its models, efforts, flags and
+/// gates, and its settings for each registered MCP server.
+fn project_settings(
+    state: &AppState,
+    name: &str,
+    project: &Project,
+) -> Result<ProjectSettings, StoreError> {
+    let servers = state
+        .store
+        .mcp_servers()?
+        .into_iter()
+        .map(|server| {
+            let saved = state.store.project_mcp(name, &server.name)?;
+            let headers = server
+                .headers
+                .iter()
+                .map(|header| {
+                    let at = SecretRef {
+                        project: name,
+                        server: &server.name,
+                        header,
+                    };
+                    Ok(HeaderState {
+                        name: header.clone(),
+                        set: state.store.has_secret(at)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Ok(ServerSettings {
+                tools: state.store.mcp_tools(name, &server.name)?,
+                name: server.name,
+                enabled: saved.enabled,
+                stages: saved.stages,
+                headers,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(ProjectSettings {
+        name: name.to_owned(),
+        models: state.store.project_models(name, &project.models)?,
+        efforts: state.store.project_efforts(name)?,
+        auto_merge: state.store.project_auto_merge(name, project.auto_merge)?,
+        llm_review: state.store.project_llm_review(name, project.llm_review)?,
+        gates: state.store.project_gates(name)?,
+        servers,
+    })
+}
+
+async fn show_workers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    workers_page(&state, &headers, None)
+}
+
+async fn show_gates(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {
+    gates_page(&state, &headers, None)
+}
+
+async fn show_github(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    github_page(&state, &headers, None)
+}
+
+async fn show_claude(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    claude_page(&state, &headers, None)
+}
+
+async fn show_mcp(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {
+    mcp_page(&state, &headers, None)
+}
+
+async fn show_mcp_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Markup, AppError> {
+    mcp_server_page(&state, &headers, &name, None)
+}
+
+async fn show_project_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Markup, AppError> {
+    project_page(&state, &headers, &name, None)
 }
 
 fn default_effort() -> String {
@@ -927,7 +1080,7 @@ async fn save_project_models(
         }
     }
     state.wake.notify_one();
-    settings_page(&state, &headers, Some("Saved."))
+    project_page(&state, &headers, &name, Some("Saved."))
 }
 
 /// An MCP server form: its `url` and one `header` field per header-name row. The
@@ -976,7 +1129,7 @@ async fn add_mcp_server(
     state
         .store
         .create_mcp_server(form.name.trim(), form.url.trim(), &form.headers)?;
-    settings_page(&state, &headers, Some("Saved."))
+    mcp_server_page(&state, &headers, form.name.trim(), Some("Added."))
 }
 
 async fn edit_mcp_server(
@@ -989,7 +1142,7 @@ async fn edit_mcp_server(
     state
         .store
         .edit_mcp_server(&name, form.url.trim(), &form.headers)?;
-    settings_page(&state, &headers, Some("Saved."))
+    mcp_server_page(&state, &headers, &name, Some("Saved."))
 }
 
 async fn delete_mcp_server(
@@ -998,7 +1151,7 @@ async fn delete_mcp_server(
     Path(name): Path<String>,
 ) -> Result<Markup, AppError> {
     state.store.delete_mcp_server(&name)?;
-    settings_page(&state, &headers, Some("Deleted."))
+    mcp_page(&state, &headers, Some("Deleted."))
 }
 
 /// Checks a project's connection to one MCP server, stores the tools it lists,
@@ -1055,51 +1208,92 @@ async fn check_mcp_server(
 }
 
 #[derive(Deserialize)]
-struct SettingsForm {
+struct WorkersForm {
     max_workers: usize,
-    poll_seconds: u64,
     worker_image: String,
     worker_memory: String,
     worker_cpus: String,
-    /// Checkboxes: present when ticked.
-    gate_spec: Option<String>,
-    gate_plan: Option<String>,
-    gate_publish: Option<String>,
 }
 
-async fn save_settings(
+#[derive(Deserialize)]
+struct GatesForm {
+    /// Checkboxes: present when ticked.
+    #[serde(rename = "gate_spec")]
+    spec: Option<String>,
+    #[serde(rename = "gate_plan")]
+    plan: Option<String>,
+    #[serde(rename = "gate_publish")]
+    publish: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubForm {
+    poll_seconds: u64,
+}
+
+/// A trimmed text field, or a 400 that names the field when it is empty.
+fn required(value: &str, name: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(AppError::BadRequest(format!("{name} is empty")))
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+/// Each settings page saves its own fields into the stored settings and leaves
+/// the rest as they are.
+async fn save_workers(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<SettingsForm>,
+    Form(form): Form<WorkersForm>,
 ) -> Result<Markup, AppError> {
-    let text = |value: String, name: &str| {
-        let value = value.trim().to_owned();
-        if value.is_empty() {
-            Err(AppError::BadRequest(format!("{name} is empty")))
-        } else {
-            Ok(value)
-        }
+    let settings = Settings {
+        max_workers: form.max_workers,
+        worker_image: required(&form.worker_image, "the worker image")?,
+        worker_memory: required(&form.worker_memory, "the worker memory")?,
+        worker_cpus: required(&form.worker_cpus, "the worker CPUs")?,
+        ..state.store.settings()?
     };
+    state.store.save_settings(&settings)?;
+    state.wake.notify_one();
+    workers_page(&state, &headers, Some("Saved."))
+}
+
+async fn save_gates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<GatesForm>,
+) -> Result<Markup, AppError> {
+    let settings = Settings {
+        gates: Gates {
+            spec: form.spec.is_some(),
+            plan: form.plan.is_some(),
+            publish: form.publish.is_some(),
+        },
+        ..state.store.settings()?
+    };
+    state.store.save_settings(&settings)?;
+    gates_page(&state, &headers, Some("Saved."))
+}
+
+async fn save_github(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<GithubForm>,
+) -> Result<Markup, AppError> {
     if form.poll_seconds < MIN_POLL_SECONDS {
         return Err(AppError::BadRequest(format!(
             "the poll interval must be at least {MIN_POLL_SECONDS} seconds"
         )));
     }
     let settings = Settings {
-        max_workers: form.max_workers,
         poll_seconds: form.poll_seconds,
-        worker_image: text(form.worker_image, "the worker image")?,
-        worker_memory: text(form.worker_memory, "the worker memory")?,
-        worker_cpus: text(form.worker_cpus, "the worker CPUs")?,
-        gates: Gates {
-            spec: form.gate_spec.is_some(),
-            plan: form.gate_plan.is_some(),
-            publish: form.gate_publish.is_some(),
-        },
+        ..state.store.settings()?
     };
     state.store.save_settings(&settings)?;
     state.wake.notify_one();
-    settings_page(&state, &headers, Some("Saved."))
+    github_page(&state, &headers, Some("Saved."))
 }
 
 #[derive(Deserialize)]
@@ -1123,7 +1317,7 @@ async fn save_claude_token(
     if !token.is_empty() {
         state.secrets.set_claude_token(token)?;
     }
-    settings_page(&state, &headers, Some("Saved."))
+    claude_page(&state, &headers, Some("Saved."))
 }
 
 /// Clears the stored Claude token. The posted form fields, if any, are ignored.
@@ -1134,7 +1328,7 @@ async fn clear_claude_token(
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
     state.secrets.clear_claude_token()?;
-    settings_page(&state, &headers, Some("Cleared."))
+    claude_page(&state, &headers, Some("Cleared."))
 }
 
 /// The base branch an empty field defaults to.
