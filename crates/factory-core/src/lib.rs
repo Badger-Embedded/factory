@@ -6,8 +6,12 @@
 //! Every [`Command`] must therefore be safe to run twice.
 
 mod job;
+mod usage;
 
 pub use job::{
     AgentResult, Answered, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
     PlannedPr, PrDescription, Question, Rejected, RetryTarget, Session, Stage, Task, Turn,
+};
+pub use usage::{
+    ModelWindow, PLAN_USAGE_STALE_AFTER_SECS, ParseError, PlanUsage, PlanUsageSnapshot, UsageWindow,
 };
