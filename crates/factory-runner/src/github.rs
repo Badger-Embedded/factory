@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use factory_core::PrDescription;
 use serde::Deserialize;
@@ -16,6 +17,10 @@ pub struct GitHub {
     pub token: Option<String>,
     /// The factory's own login. Its comments are not review feedback.
     pub bot_login: String,
+    /// How many times [`GitHub::rerun_failed`] reads the pull request while
+    /// it waits for GitHub to stop reporting the old failure.
+    pub settle_polls: u32,
+    pub settle_interval: Duration,
 }
 
 impl Default for GitHub {
@@ -24,6 +29,8 @@ impl Default for GitHub {
             gh: PathBuf::from("gh"),
             token: None,
             bot_login: "moonthebot".into(),
+            settle_polls: 10,
+            settle_interval: Duration::from_secs(3),
         }
     }
 }
@@ -33,6 +40,16 @@ pub enum PrState {
     Open,
     Merged,
     Closed,
+}
+
+/// What [`GitHub::rerun_failed`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rerun {
+    /// The IDs of the Actions runs it restarted.
+    Started(Vec<u64>),
+    /// The head commit has no failed Actions run, such as when the failed
+    /// check comes from outside Actions.
+    NothingToRerun,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +162,14 @@ struct InlineCommentJson {
     path: Option<String>,
     line: Option<u64>,
     created_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunJson {
+    database_id: u64,
+    #[serde(default)]
+    conclusion: String,
 }
 
 const FAILED_CONCLUSIONS: [&str; 5] = [
@@ -316,6 +341,11 @@ impl GitHub {
     /// Opens the pull request for `branch`, or updates the title and
     /// description of the open one, and returns its number.
     ///
+    /// When the open pull request's checks had failed before the edit, the
+    /// failed Actions runs on its head run again afterwards, so they read
+    /// the new description. No round is counted. A failed rerun is logged,
+    /// because the edit itself worked.
+    ///
     /// # Errors
     ///
     /// Returns gh's message when a call fails.
@@ -347,6 +377,13 @@ impl GitHub {
             .await?;
         if let Ok(number) = existing.trim().parse::<u64>() {
             let number_text = number.to_string();
+            let was_failed = match self.status(repo, number).await {
+                Ok(status) => matches!(status.ci, Ci::Failed(_)),
+                Err(err) => {
+                    tracing::error!("reading the checks of pull request {number}: {err}");
+                    false
+                }
+            };
             self.run(
                 &[
                     "pr",
@@ -362,6 +399,15 @@ impl GitHub {
                 Some(&description.body),
             )
             .await?;
+            if was_failed {
+                match self.rerun_failed(repo, number).await {
+                    Ok(Rerun::Started(_)) => {}
+                    Ok(Rerun::NothingToRerun) => {
+                        tracing::error!("pull request {number} has no failed run to rerun");
+                    }
+                    Err(err) => tracing::error!("rerunning pull request {number}: {err}"),
+                }
+            }
             return Ok(number);
         }
         let url = self
@@ -388,6 +434,78 @@ impl GitHub {
             .next()
             .and_then(|tail| tail.parse().ok())
             .ok_or_else(|| format!("gh pr create printed no pull request URL: {url}"))
+    }
+
+    /// Runs `gh run rerun --failed` for each failed Actions run on the head
+    /// commit of the pull request.
+    ///
+    /// GitHub keeps reporting the old failure for a moment after a rerun.
+    /// A watch in that moment would read it as a new failure and count a
+    /// second round. So after the reruns this reads the pull request until
+    /// no check is failed, up to `settle_polls` times.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when a call fails or its output does not parse.
+    pub async fn rerun_failed(&self, repo: &str, number: u64) -> Result<Rerun, String> {
+        let number_text = number.to_string();
+        let head = self
+            .run(
+                &[
+                    "pr",
+                    "view",
+                    &number_text,
+                    "--repo",
+                    repo,
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+                None,
+            )
+            .await?;
+        let runs = self
+            .run(
+                &[
+                    "run",
+                    "list",
+                    "--repo",
+                    repo,
+                    "--commit",
+                    head.trim(),
+                    "--limit",
+                    "100",
+                    "--json",
+                    "databaseId,conclusion",
+                ],
+                None,
+            )
+            .await?;
+        let runs: Vec<RunJson> =
+            serde_json::from_str(&runs).map_err(|err| format!("gh run list output: {err}"))?;
+        let failed: Vec<u64> = runs
+            .iter()
+            .filter(|run| FAILED_CONCLUSIONS.contains(&run.conclusion.to_uppercase().as_str()))
+            .map(|run| run.database_id)
+            .collect();
+        if failed.is_empty() {
+            return Ok(Rerun::NothingToRerun);
+        }
+        for id in &failed {
+            self.run(
+                &["run", "rerun", &id.to_string(), "--repo", repo, "--failed"],
+                None,
+            )
+            .await?;
+        }
+        for _ in 0..self.settle_polls {
+            if !matches!(self.status(repo, number).await?.ci, Ci::Failed(_)) {
+                break;
+            }
+            tokio::time::sleep(self.settle_interval).await;
+        }
+        Ok(Rerun::Started(failed))
     }
 
     /// Squash-merges the pull request and deletes its branch. GitHub builds

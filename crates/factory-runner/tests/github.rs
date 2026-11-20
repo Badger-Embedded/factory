@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Event, PrDescription};
 use factory_runner::{
-    Ci, FailedCheck, GitHub, Observation, PrState, WorkerConfig, actions_job_id, checks_args,
-    observe, parse_status, run_checks,
+    Ci, FailedCheck, GitHub, Observation, PrState, Rerun, WorkerConfig, actions_job_id,
+    checks_args, observe, parse_status, run_checks,
 };
 
 const VIEW: &str = r#"{
@@ -195,7 +195,10 @@ esac"#,
         .lines()
         .map(|line| line.split(' ').take(2).last().unwrap())
         .collect();
-    assert_eq!(kinds, ["list", "create", "list", "edit"]);
+    assert_eq!(
+        kinds,
+        ["list", "create", "list", "view", "--paginate", "edit"]
+    );
     assert!(calls.contains("--head factory/job-7-pr-1"));
     assert!(!calls.contains("ghp_secret"));
 }
@@ -360,4 +363,168 @@ fn a_conflict_comes_before_ci_and_comments() {
         assert!(!status.conflicting, "{mergeable}");
         assert!(matches!(observe(&status, None), Observation::CiFailed(_)));
     }
+}
+
+const RUNS: &str = r#"[
+  {"databaseId": 44, "conclusion": "failure"},
+  {"databaseId": 45, "conclusion": "success"},
+  {"databaseId": 46, "conclusion": "timed_out"},
+  {"databaseId": 47, "conclusion": ""}
+]"#;
+
+fn check(conclusion: &str) -> String {
+    format!(
+        r#"{{"state": "OPEN", "statusCheckRollup": [{{"name": "Lint and test", "status": "COMPLETED", "conclusion": "{conclusion}"}}]}}"#
+    )
+}
+
+/// A fake gh for a pull request 12 whose checks read `before` until a
+/// `gh run rerun` call and `after` from then on. Returns the gh path and the
+/// file that records each call.
+fn rerun_gh(dir: &Path, before: &str, after: &str, runs: &str) -> (PathBuf, PathBuf) {
+    let calls = dir.join("calls");
+    fs::write(dir.join("before"), before).unwrap();
+    fs::write(dir.join("after"), after).unwrap();
+    fs::write(dir.join("runs"), runs).unwrap();
+    let gh = script(
+        dir,
+        "gh",
+        &format!(
+            r#"echo "$@" >> '{calls}'
+case "$1 $2" in
+  "pr list") echo 12 ;;
+  "pr edit") cat > /dev/null ;;
+  "pr view")
+    case "$*" in
+      *headRefOid*) echo abc123 ;;
+      *) if [ -e '{dir}/rerun' ]; then cat '{dir}/after'; else cat '{dir}/before'; fi ;;
+    esac ;;
+  "run list") cat '{dir}/runs' ;;
+  "run rerun") touch '{dir}/rerun' ;;
+esac"#,
+            calls = calls.display(),
+            dir = dir.display()
+        ),
+    );
+    (gh, calls)
+}
+
+fn quick(gh: PathBuf) -> GitHub {
+    GitHub {
+        gh,
+        settle_polls: 3,
+        settle_interval: std::time::Duration::ZERO,
+        ..GitHub::default()
+    }
+}
+
+#[tokio::test]
+async fn rerun_failed_reruns_each_failed_run_and_no_passed_one() {
+    let _serial = SCRIPTS.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("SUCCESS"), RUNS);
+
+    let rerun = quick(gh).rerun_failed("o/r", 12).await.unwrap();
+
+    assert_eq!(rerun, Rerun::Started(vec![44, 46]));
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("run list --repo o/r --commit abc123"));
+    let reruns: Vec<&str> = calls
+        .lines()
+        .filter(|l| l.starts_with("run rerun"))
+        .collect();
+    assert_eq!(
+        reruns,
+        [
+            "run rerun 44 --repo o/r --failed",
+            "run rerun 46 --repo o/r --failed"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rerun_failed_reports_when_no_run_failed() {
+    let _serial = SCRIPTS.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let runs = r#"[{"databaseId": 45, "conclusion": "success"}]"#;
+    let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), runs);
+
+    let rerun = quick(gh).rerun_failed("o/r", 12).await.unwrap();
+
+    assert_eq!(rerun, Rerun::NothingToRerun);
+    assert!(!fs::read_to_string(&calls).unwrap().contains("run rerun"));
+}
+
+#[tokio::test]
+async fn rerun_failed_waits_until_the_old_failure_is_gone() {
+    let _serial = SCRIPTS.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), RUNS);
+    // GitHub still reports the failure, so every poll reads it.
+    quick(gh).rerun_failed("o/r", 12).await.unwrap();
+    let reads = fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("pr view") && l.contains("statusCheckRollup"))
+        .count();
+    assert_eq!(reads, 3);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("SUCCESS"), RUNS);
+    quick(gh).rerun_failed("o/r", 12).await.unwrap();
+    let reads = fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("pr view") && l.contains("statusCheckRollup"))
+        .count();
+    assert_eq!(reads, 1);
+}
+
+async fn edit_and_count_reruns(before: &str) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, calls) = rerun_gh(dir.path(), before, &check("SUCCESS"), RUNS);
+    let number = quick(gh)
+        .open_pr("o/r", "main", "factory/job-7-pr-1", &description())
+        .await
+        .unwrap();
+    assert_eq!(number, 12);
+    let calls = fs::read_to_string(&calls).unwrap();
+    let edit = calls
+        .lines()
+        .position(|l| l.starts_with("pr edit"))
+        .unwrap();
+    let rerun = calls.lines().position(|l| l.starts_with("run rerun"));
+    assert!(
+        rerun.is_none_or(|rerun| rerun > edit),
+        "rerun before the edit"
+    );
+    calls.lines().filter(|l| l.starts_with("run rerun")).count()
+}
+
+#[tokio::test]
+async fn editing_a_pr_with_failed_checks_reruns_them_after_the_edit() {
+    let _serial = SCRIPTS.lock().await;
+    assert_eq!(edit_and_count_reruns(&check("FAILURE")).await, 2);
+}
+
+#[tokio::test]
+async fn editing_a_pr_whose_checks_did_not_fail_reruns_nothing() {
+    let _serial = SCRIPTS.lock().await;
+    assert_eq!(edit_and_count_reruns(&check("SUCCESS")).await, 0);
+    let pending =
+        r#"{"state": "OPEN", "statusCheckRollup": [{"name": "x", "status": "IN_PROGRESS"}]}"#;
+    assert_eq!(edit_and_count_reruns(pending).await, 0);
+    assert_eq!(edit_and_count_reruns(r#"{"state": "OPEN"}"#).await, 0);
+}
+
+#[tokio::test]
+async fn a_failed_rerun_does_not_fail_the_edit() {
+    let _serial = SCRIPTS.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, _) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), "not json");
+    let number = quick(gh)
+        .open_pr("o/r", "main", "factory/job-7-pr-1", &description())
+        .await
+        .unwrap();
+    assert_eq!(number, 12);
 }

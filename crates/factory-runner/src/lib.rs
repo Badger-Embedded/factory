@@ -14,8 +14,8 @@ pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
 pub use git::Git;
 pub use github::{
-    Ci, Comment, FailedCheck, GitHub, Observation, PrState, PrStatus, actions_job_id, observe,
-    parse_status,
+    Ci, Comment, FailedCheck, GitHub, Observation, PrState, PrStatus, Rerun, actions_job_id,
+    observe, parse_status,
 };
 pub use images::{place_images, show_images};
 pub use outcome::{Expect, event_from_result};
