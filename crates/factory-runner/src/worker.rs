@@ -1,31 +1,21 @@
 use std::ffi::OsString;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 
-use factory_core::{DEFAULT_EFFORT, Event};
+use factory_core::{Agent, Event};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::outcome::{Expect, event_from_result};
-use crate::stream::{LogLine, ResultMessage, StreamItem, parse_line};
+use crate::agent::{AgentItem, RunResult, backend};
+use crate::outcome::Expect;
+use crate::stream::LogLine;
 
 /// Where the job's checkout appears inside the worker.
 pub const WORK_DIR: &str = "/work";
-/// Where the job's Claude Code config and sessions appear inside the worker.
-pub const CLAUDE_DIR: &str = "/claude";
 /// Where the factory plugin appears inside the worker.
 pub const PLUGIN_DIR: &str = "/factory-plugin";
 
 const MAX_STDERR: usize = 4096;
-
-/// Settings for every agent run. Claude Code adds a `Co-Authored-By`
-/// trailer to commits and a footer to pull request descriptions unless
-/// `attribution` empties them, and GitHub copies a branch's co-author
-/// trailers into the squash commit on the base branch. Empty strings work
-/// on every Claude Code version; `"attribution": false` makes versions
-/// before 2.1.281 skip the whole settings value.
-pub const AGENT_SETTINGS: &str = r#"{"attribution":{"commit":"","pr":"","sessionUrl":false}}"#;
 
 /// Settings shared by every worker.
 #[derive(Debug, Clone)]
@@ -64,11 +54,11 @@ impl Default for WorkerConfig {
 }
 
 /// The MCP servers active for one run, and how the worker reaches them. The
-/// factory passes each as an `http` entry to `claude --mcp-config`, pointed at
-/// the proxy with the per-run token, so a server credential never enters the
-/// worker: the proxy swaps the token for the project's stored headers. The
-/// scheduler builds this only when at least one server is active, so a run
-/// with none passes no MCP flag.
+/// agent passes each as an `http` entry in its MCP config, pointed at the proxy
+/// with the per-run token, so a server credential never enters the worker: the
+/// proxy swaps the token for the project's stored headers. The scheduler builds
+/// this only when at least one server is active, so a run with none passes no
+/// MCP config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfig {
     /// The proxy's base URL the worker reaches, such as `http://factory:8081`.
@@ -82,30 +72,6 @@ pub struct McpConfig {
     pub servers: Vec<String>,
 }
 
-impl McpConfig {
-    /// The JSON for `claude --mcp-config`: one `http` entry per active server,
-    /// each pointing at the proxy and carrying `Authorization: Bearer <token>`
-    /// as its only header. No stored credential appears here; the proxy adds it.
-    #[must_use]
-    fn to_arg(&self) -> String {
-        let servers: serde_json::Map<String, serde_json::Value> = self
-            .servers
-            .iter()
-            .map(|name| {
-                (
-                    name.clone(),
-                    serde_json::json!({
-                        "type": "http",
-                        "url": format!("{}/mcp/{name}", self.proxy_url),
-                        "headers": { "Authorization": format!("Bearer {}", self.token) },
-                    }),
-                )
-            })
-            .collect();
-        serde_json::json!({ "mcpServers": servers }).to_string()
-    }
-}
-
 /// Whether a run starts the session or continues it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRun {
@@ -113,35 +79,6 @@ pub enum SessionRun {
     /// so it is known even if the factory dies during the run.
     Start(String),
     Resume(String),
-}
-
-impl SessionRun {
-    /// Resumes session `id` when Claude Code already wrote its transcript
-    /// under `claude_dir`, and starts it otherwise. A run that died before
-    /// Claude Code wrote anything can then start again with the same ID.
-    #[must_use]
-    pub fn for_session(claude_dir: &Path, id: &str) -> Self {
-        let transcript = format!("{id}.jsonl");
-        if contains_file(&claude_dir.join("projects"), &transcript) {
-            SessionRun::Resume(id.to_owned())
-        } else {
-            SessionRun::Start(id.to_owned())
-        }
-    }
-}
-
-fn contains_file(dir: &Path, name: &str) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            contains_file(&path, name)
-        } else {
-            entry.file_name() == name
-        }
-    })
 }
 
 /// Removes container `name` if it exists, such as a worker that outlived
@@ -170,30 +107,34 @@ pub struct WorkerRun {
     /// The container name. Naming each run lets the factory remove a
     /// container that outlived a crash.
     pub name: String,
+    /// The agent this run uses. It picks the command after the image, the
+    /// credential and config-directory environment variables, the
+    /// session-resume check and the parser.
+    pub agent: Agent,
     /// The job's checkout on the host.
     pub workspace: PathBuf,
-    /// The job's Claude Code config directory on the host. It keeps the
-    /// session files between runs, so `--resume` finds them.
-    pub claude_dir: PathBuf,
+    /// The agent's config directory on the host. It keeps the session files
+    /// between runs, so a resumed run finds them.
+    pub config_dir: PathBuf,
     pub session: SessionRun,
-    /// The Claude subscription token the factory resolved when this run
-    /// started. [`run`] sets it as `CLAUDE_CODE_OAUTH_TOKEN` in the podman
-    /// process environment and [`podman_args`] passes `--env
-    /// CLAUDE_CODE_OAUTH_TOKEN` with no value, so the token never appears in the
-    /// `podman` arguments, the job log or an error message. A token saved on the
-    /// settings page reaches the next run this way, with no factory restart.
+    /// The subscription credential the factory resolved when this run started.
+    /// [`run`] sets it in the podman process environment under the agent's
+    /// credential variable and [`podman_args`] passes `--env <name>` with no
+    /// value, so the secret never appears in the `podman` arguments, the job log
+    /// or an error message. A credential saved on the settings page reaches the
+    /// next run this way, with no factory restart.
     pub token: String,
     pub expect: Expect,
     pub prompt: String,
-    /// The value for `claude --model`. `None` and an empty string pass no
-    /// flag, so Claude Code uses its own default.
+    /// The model for the run. `None` and an empty string pass no model flag,
+    /// so the agent uses its own default.
     pub model: Option<String>,
-    /// The value for `claude --effort`. `None`, such as a request from an
-    /// older server, runs at [`DEFAULT_EFFORT`], so a run always passes an
-    /// explicit level.
+    /// The effort level for the run. `None`, such as a request from an older
+    /// server, runs at the agent's default, so a run always passes an explicit
+    /// level.
     pub effort: Option<String>,
     /// The MCP servers active for this run, or `None` when none is. `None`
-    /// passes no `--mcp-config`, so the arguments are unchanged.
+    /// passes no MCP config, so the arguments are unchanged.
     pub mcp: Option<McpConfig>,
 }
 
@@ -218,9 +159,18 @@ pub struct McpUnavailable {
     pub reason: String,
 }
 
-/// The arguments after `podman` for one run.
+/// The arguments after `podman` for one run. The generic `podman run` flags
+/// are here; the agent's [`command`](crate::AgentBackend::command) and the
+/// agent's credential and config-directory variables come from its backend, so
+/// no one agent is named here.
+///
+/// # Panics
+///
+/// Panics when the run's agent has no worker backend. The factory builds a run
+/// only for an agent that can run, so this is an unreachable invariant.
 #[must_use]
 pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
+    let backend = backend(run.agent).expect("the run's agent has a worker backend");
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |arg: &str| args.push(arg.into());
     for arg in [
@@ -234,18 +184,19 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
         &config.memory,
         "--cpus",
         &config.cpus,
-        // Pass the Claude token through from the podman process environment,
-        // where `run` sets it, with no value here. The token then stays out of
-        // the arguments, the job log and any error message.
-        "--env",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "--env",
-        &format!("CLAUDE_CONFIG_DIR={CLAUDE_DIR}"),
-        "--workdir",
-        WORK_DIR,
     ] {
         push(arg);
     }
+    // Pass the credential through from the podman process environment, where
+    // `run` sets it, named here with no value. The secret then stays out of the
+    // arguments, the job log and any error message. The config directory env
+    // points the agent at its mounted config directory.
+    args.push("--env".into());
+    args.push(backend.credential_env().into());
+    args.push("--env".into());
+    args.push(format!("{}={}", backend.config_dir_env(), backend.config_dir()).into());
+    args.push("--workdir".into());
+    args.push(WORK_DIR.into());
     // The worker joins the factory's podman network so it can reach the MCP
     // proxy by the factory container's name. It is added before the image, with
     // the other `podman run` flags.
@@ -260,7 +211,7 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
         args.push(volume);
     };
     mount(&run.workspace, WORK_DIR, "");
-    mount(&run.claude_dir, CLAUDE_DIR, "");
+    mount(&run.config_dir, backend.config_dir(), "");
     if let Some(plugin) = &config.plugin_dir {
         mount(plugin, PLUGIN_DIR, ":ro");
     }
@@ -269,44 +220,8 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
         args.push(volume.into());
     }
 
-    let (session_flag, session_id) = match &run.session {
-        SessionRun::Start(id) => ("--session-id", id),
-        SessionRun::Resume(id) => ("--resume", id),
-    };
-    let schema = run.expect.schema().to_string();
-    let mut claude = vec![
-        config.image.as_str(),
-        "claude",
-        "-p",
-        run.prompt.as_str(),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "bypassPermissions",
-        "--json-schema",
-        schema.as_str(),
-        "--settings",
-        AGENT_SETTINGS,
-        session_flag,
-        session_id.as_str(),
-    ];
-    if config.plugin_dir.is_some() {
-        claude.extend(["--plugin-dir", PLUGIN_DIR]);
-    }
-    args.extend(claude.into_iter().map(OsString::from));
-    if let Some(model) = run.model.as_deref().filter(|model| !model.is_empty()) {
-        args.extend(["--model".into(), model.into()]);
-    }
-    let effort = run.effort.as_deref().unwrap_or(DEFAULT_EFFORT);
-    args.extend(["--effort".into(), effort.into()]);
-    // One `http` entry per active MCP server, pointed at the proxy with the run
-    // token. A run with no active server adds nothing, so its arguments match a
-    // run from before MCP.
-    if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
-        args.push("--mcp-config".into());
-        args.push(mcp.to_arg().into());
-    }
+    args.push(config.image.clone().into());
+    args.extend(backend.command(config, run));
     args
 }
 
@@ -331,12 +246,18 @@ pub async fn run(
         cost_usd: None,
         mcp_unavailable: Vec::new(),
     };
+    let Some(backend) = backend(run.agent) else {
+        return failed(format!(
+            "the {} agent has no worker backend",
+            run.agent.display_name()
+        ));
+    };
     let mut child = match Command::new(&config.podman)
         .args(podman_args(config, run))
-        // The token reaches the container through podman's own environment and
-        // the `--env CLAUDE_CODE_OAUTH_TOKEN` pass-through, not as an argument,
-        // so it is absent from the process list.
-        .env("CLAUDE_CODE_OAUTH_TOKEN", &run.token)
+        // The credential reaches the container through podman's own environment
+        // and the `--env <name>` pass-through, not as an argument, so it is
+        // absent from the process list.
+        .env(backend.credential_env(), &run.token)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -361,28 +282,16 @@ pub async fn run(
         text
     });
 
-    let mut result: Option<ResultMessage> = None;
+    let mut result: Option<RunResult> = None;
     let mut mcp_unavailable: Vec<McpUnavailable> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            for item in parse_line(&line) {
+            for item in backend.parse(run.expect, &line) {
                 match item {
-                    StreamItem::Log(line) => log(line),
-                    StreamItem::Result(message) => result = Some(message),
-                    StreamItem::Init(servers) => {
-                        for server in servers {
-                            if server.status != "connected" {
-                                mcp_unavailable.push(McpUnavailable {
-                                    reason: format!(
-                                        "the agent reported it as {}",
-                                        status_label(&server.status)
-                                    ),
-                                    server: server.name,
-                                });
-                            }
-                        }
-                    }
+                    AgentItem::Log(line) => log(line),
+                    AgentItem::Result(run_result) => result = Some(run_result),
+                    AgentItem::Unavailable(unavailable) => mcp_unavailable.push(unavailable),
                 }
             }
         }
@@ -392,9 +301,9 @@ pub async fn run(
     let stderr = stderr_task.await.unwrap_or_default();
     if let Some(result) = result {
         return RunReport {
-            event: event_from_result(run.expect, &result),
-            session_id: result.session_id.clone(),
-            cost_usd: result.total_cost_usd,
+            event: result.event,
+            session_id: result.session_id,
+            cost_usd: result.cost_usd,
             mcp_unavailable,
         };
     }
@@ -405,16 +314,6 @@ pub async fn run(
             "the worker exited ({status}) without a result{}",
             tail(&stderr)
         ))
-    }
-}
-
-/// A readable label for an MCP server's reported status. An empty status, which
-/// a server can leave out of the `init` line, reads as "not connected".
-fn status_label(status: &str) -> &str {
-    if status.is_empty() {
-        "not connected"
-    } else {
-        status
     }
 }
 
