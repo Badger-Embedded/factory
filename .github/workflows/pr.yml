@@ -9,6 +9,7 @@ concurrency:
   cancel-in-progress: true
 permissions:
   contents: read
+  pull-requests: read
 jobs:
   message:
     name: Title and description
@@ -19,7 +20,11 @@ jobs:
           fetch-depth: 0
       - name: Check title and description
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.base_ref }}
-        run: lint/scripts/check-pr-message.sh "origin/$BASE_REF"
+        run: |
+          PR_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq .title)
+          PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq .body)
+          export PR_TITLE PR_BODY
+          lint/scripts/check-pr-message.sh "origin/$BASE_REF"
