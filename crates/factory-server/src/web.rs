@@ -294,6 +294,10 @@ async fn show_job(
     let project = state.projects.get(&row.project);
     let images = state.store.images(id)?;
     let cost_usd = state.store.cost_usd(id)?;
+    let defaults = project
+        .map(|project| project.models.clone())
+        .unwrap_or_default();
+    let models = state.store.project_models(&row.project, &defaults)?;
     Ok(pages::job(
         &user(&headers),
         &row,
@@ -302,6 +306,7 @@ async fn show_job(
         &logs,
         &images,
         cost_usd,
+        &models,
     ))
 }
 

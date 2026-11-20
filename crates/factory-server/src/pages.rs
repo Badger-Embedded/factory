@@ -15,17 +15,37 @@ const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const LOG_SCROLL: &str = include_str!("../static/log-scroll.js");
 
-const STEPS: [&str; 9] = [
-    "requested",
-    "clarifying",
-    "spec",
-    "plan",
-    "implementing",
-    "verifying",
-    "pr-open",
-    "ci-and-review",
-    "merged",
+enum Who {
+    Agent(&'static str, fn(&StageModels) -> &Option<String>),
+    Factory,
+}
+
+const STEPS: [(&str, Who); 9] = [
+    ("requested", Who::Factory),
+    (
+        "clarifying",
+        Who::Agent("clarify", |models| &models.clarify),
+    ),
+    ("spec", Who::Agent("spec", |models| &models.spec)),
+    ("plan", Who::Agent("plan", |models| &models.plan)),
+    (
+        "implementing",
+        Who::Agent("implement", |models| &models.implement),
+    ),
+    ("verifying", Who::Factory),
+    ("pr-open", Who::Factory),
+    ("ci-and-review", Who::Factory),
+    ("merged", Who::Factory),
 ];
+
+fn has_gate(step: &str, gates: Gates) -> bool {
+    match step {
+        "spec" => gates.spec,
+        "plan" => gates.plan,
+        "pr-open" => gates.publish,
+        _ => false,
+    }
+}
 
 fn layout(user: &str, title: &str, body: &Markup) -> Markup {
     page(user, title, false, &html! {}, body)
@@ -486,6 +506,10 @@ fn cost_label(usd: f64) -> String {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the page takes each value its handler read"
+)]
 pub fn job(
     user: &str,
     row: &JobRow,
@@ -494,6 +518,7 @@ pub fn job(
     logs: &[LogEntry],
     images: &[String],
     cost_usd: f64,
+    models: &StageModels,
 ) -> Markup {
     let job = &row.job;
     let repo_url = project.map(|project| format!("https://github.com/{}", project.repo));
@@ -514,7 +539,7 @@ pub fn job(
                 " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
                 " · " (cost_label(cost_usd))
             }
-            (steps(job))
+            (steps(job, models))
             (status_card(id, job, settings))
             p.meta { "Approval gates: " (gates_line(job.gates())) }
             div.card {
@@ -600,16 +625,31 @@ fn step_index(stage: &Stage) -> Option<usize> {
     })
 }
 
-fn steps(job: &Job) -> Markup {
+fn steps(job: &Job, models: &StageModels) -> Markup {
     let Some(current) = step_index(job.stage()) else {
         return html! {};
     };
     let merged = *job.stage() == Stage::Merged;
     html! {
         ol.steps aria-label="Job stages" {
-            @for (i, step) in STEPS.iter().enumerate() {
+            @for (i, (step, who)) in STEPS.iter().enumerate() {
                 @let class = if i < current || merged { "done" } else if i == current { "current" } else { "" };
-                li class=(class) aria-current=[(i == current).then_some("step")] { (step) }
+                li class=(class) aria-current=[(i == current).then_some("step")] {
+                    span.step-name { (step) }
+                    @match who {
+                        Who::Agent(stage, model) => {
+                            span.step-tag.agent title="Agent stage and its model" {
+                                (stage) " · " (model(models).as_deref().unwrap_or("default"))
+                            }
+                        }
+                        Who::Factory => {
+                            span.step-tag.factory title="Run by the factory" { "factory" }
+                        }
+                    }
+                    @if has_gate(step, job.gates()) {
+                        span.step-tag.gate title="Waits for your approval" { "✋ approval" }
+                    }
+                }
             }
         }
     }

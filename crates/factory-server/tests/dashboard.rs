@@ -1996,3 +1996,44 @@ async fn models_for_an_unknown_project_are_not_saved() {
         .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn the_job_page_labels_each_step_as_agent_factory_or_gate() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_models(
+            "maestro",
+            &StageModels {
+                spec: Some("opus".into()),
+                ..StageModels::default()
+            },
+        )
+        .unwrap();
+    let id = dashboard.new_job().await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains(">spec · opus</span>"));
+    assert!(page.body.contains(">clarify · default</span>"));
+    assert!(page.body.contains(">implement · default</span>"));
+    assert!(page.body.contains("step-tag factory"));
+    assert!(page.body.contains(">factory</span>"));
+    assert_eq!(page.body.matches("step-tag gate").count(), 2);
+    assert!(page.body.contains("✋ approval"));
+}
+
+#[tokio::test]
+async fn a_job_without_gates_shows_no_gate_label() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings",
+            "max_workers=2&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4",
+        )
+        .await;
+    let id = dashboard.new_job().await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("step-tag agent"));
+    assert!(!page.body.contains("step-tag gate"));
+}
