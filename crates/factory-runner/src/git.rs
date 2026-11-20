@@ -21,6 +21,15 @@ pub struct Git {
     pub user_email: String,
 }
 
+/// What a pull request branch would add to its base branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchSummary {
+    /// One `<short sha> <subject>` entry per commit.
+    pub commits: Vec<String>,
+    /// The `git diff --stat` output. Empty when the branch changes nothing.
+    pub diff_stat: String,
+}
+
 impl Default for Git {
     fn default() -> Self {
         Git {
@@ -115,6 +124,27 @@ impl Git {
                 body.lines().any(credits_ai).then(|| head.trim().to_owned())
             })
             .collect())
+    }
+
+    /// The commits on the checked-out branch after `origin/<base>`, newest
+    /// first, and `git diff --stat` of the branch against `origin/<base>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when `git log` or `git diff` fails.
+    pub async fn summarize_branch(&self, work: &Path, base: &str) -> Result<BranchSummary, String> {
+        let range = format!("origin/{base}..HEAD");
+        let log = self
+            .run(work, &["log", "--format=%h %s", &range], false)
+            .await?;
+        let merge_base = format!("origin/{base}...HEAD");
+        let diff_stat = self
+            .run(work, &["diff", "--stat", &merge_base], false)
+            .await?;
+        Ok(BranchSummary {
+            commits: log.lines().map(str::to_owned).collect(),
+            diff_stat: diff_stat.trim_end().to_owned(),
+        })
     }
 
     async fn clone_into(&self, work: &Path, repo: &str, base: &str) -> Result<(), String> {
