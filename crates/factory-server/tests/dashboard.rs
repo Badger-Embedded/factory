@@ -272,6 +272,15 @@ async fn answers_from_the_form_go_back_to_the_agent_in_order() {
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("Which board?"));
     assert!(page.body.contains("name=\"answer_1\""));
+    assert!(
+        page.body
+            .contains(r#"<span class="question-number">2</span>"#)
+    );
+    assert!(
+        page.body
+            .contains(r#"<span class="badge you">needs you</span>"#)
+    );
+    assert!(page.body.contains("card needs-you"));
 
     let reply = dashboard
         .post(
@@ -522,6 +531,10 @@ async fn the_job_page_shows_the_log_and_reloads_while_the_agent_works() {
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("Bash: cargo test"));
+    assert!(
+        page.body
+            .contains(r#"<span class="log-count">1 line</span>"#)
+    );
     assert!(page.body.contains("http-equiv=\"refresh\""));
 
     to_spec_approval_from_clarifying(&dashboard, id);
@@ -1300,6 +1313,7 @@ async fn the_publish_approval_shows_the_pull_request_and_counts_as_waiting_for_y
     ] {
         assert!(page.body.contains(text), "{text}");
     }
+    assert!(page.body.contains(r#"<pre class="doc diff-stat">"#));
     assert!(page.body.contains(&format!("/jobs/{id}/approve")));
     assert!(page.body.contains(&format!("/jobs/{id}/changes")));
     let index = dashboard.get("/").await;
