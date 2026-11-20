@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Form, Path, Query, State};
+use axum::extract::multipart::{Field, Multipart, MultipartError};
+use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -25,20 +27,38 @@ const LOG_LINES: usize = 300;
 /// takes two.
 const MIN_POLL_SECONDS: u64 = 10;
 
+/// Images one request may carry.
+pub const MAX_IMAGES: usize = 5;
+/// Bytes in one image.
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+/// Bytes of the request text and the other form fields together.
+const MAX_FORM_BYTES: usize = 256 * 1024;
+const MAX_UPLOAD_BYTES: usize = MAX_IMAGES * MAX_IMAGE_BYTES + MAX_FORM_BYTES;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
     projects: Arc<Projects>,
     wake: Arc<Notify>,
+    data_dir: PathBuf,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
-/// job loop looks at the job right away.
-pub fn app(store: Arc<Store>, projects: Arc<Projects>, wake: Arc<Notify>) -> Router {
+/// job loop looks at the job right away. Uploaded images go under
+/// `<data_dir>/jobs/<id>/images/`.
+pub fn app(
+    store: Arc<Store>,
+    projects: Arc<Projects>,
+    wake: Arc<Notify>,
+    data_dir: PathBuf,
+) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/style.css", get(stylesheet))
-        .route("/jobs", post(create_job))
+        .route(
+            "/jobs",
+            post(create_job).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         .route("/jobs/{id}", get(show_job))
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
@@ -49,6 +69,7 @@ pub fn app(store: Arc<Store>, projects: Arc<Projects>, wake: Arc<Notify>) -> Rou
             store,
             projects,
             wake,
+            data_dir,
         })
 }
 
@@ -63,6 +84,7 @@ fn user(headers: &HeaderMap) -> String {
 
 enum AppError {
     BadRequest(String),
+    Io(String),
     Store(StoreError),
 }
 
@@ -76,6 +98,10 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            AppError::Io(message) => {
+                tracing::error!("{message}");
+                (StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
             AppError::Store(err @ StoreError::NotFound(_)) => {
                 (StatusCode::NOT_FOUND, err.to_string())
             }
@@ -126,31 +152,124 @@ async fn index(
     ))
 }
 
-#[derive(Deserialize)]
-struct NewJob {
-    project: String,
-    request: String,
+struct Upload {
+    extension: &'static str,
+    bytes: Vec<u8>,
+}
+
+/// The file extension for the image format `bytes` starts with.
+fn image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+fn multipart_error(err: &MultipartError) -> AppError {
+    AppError::BadRequest(format!(
+        "the upload is malformed or over {MAX_UPLOAD_BYTES} bytes: {}",
+        err.body_text()
+    ))
+}
+
+async fn read_text(field: Field<'_>) -> Result<String, AppError> {
+    field.text().await.map_err(|err| multipart_error(&err))
+}
+
+/// Reads one image part. Browsers send an empty part with no file name when
+/// no file is chosen, and that part is not an image.
+async fn read_image(mut field: Field<'_>, uploads: &mut Vec<Upload>) -> Result<(), AppError> {
+    let named = field.file_name().is_some_and(|name| !name.is_empty());
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|err| multipart_error(&err))? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "an image is over the limit of {MAX_IMAGE_BYTES} bytes"
+            )));
+        }
+    }
+    if bytes.is_empty() && !named {
+        return Ok(());
+    }
+    let Some(extension) = image_extension(&bytes) else {
+        return Err(AppError::BadRequest(
+            "an upload is not a PNG, JPEG, GIF or WebP image".into(),
+        ));
+    };
+    if uploads.len() == MAX_IMAGES {
+        return Err(AppError::BadRequest(format!(
+            "a request takes at most {MAX_IMAGES} images"
+        )));
+    }
+    uploads.push(Upload { extension, bytes });
+    Ok(())
 }
 
 async fn create_job(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<NewJob>,
+    mut form: Multipart,
 ) -> Result<Redirect, AppError> {
-    if state.projects.get(&form.project).is_none() {
-        return Err(AppError::BadRequest(format!(
-            "unknown project {:?}",
-            form.project
-        )));
+    let mut project = None;
+    let mut request = None;
+    let mut uploads = Vec::new();
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|err| multipart_error(&err))?
+    {
+        match field.name() {
+            Some("project") => project = Some(read_text(field).await?),
+            Some("request") => request = Some(read_text(field).await?),
+            Some("images") => read_image(field, &mut uploads).await?,
+            _ => {}
+        }
     }
-    let request = form.request.trim();
+    let project = project.unwrap_or_default();
+    if state.projects.get(&project).is_none() {
+        return Err(AppError::BadRequest(format!("unknown project {project:?}")));
+    }
+    let request = request.unwrap_or_default();
+    let request = request.trim();
     if request.is_empty() {
         return Err(AppError::BadRequest("the request is empty".into()));
     }
-    let id = state
-        .store
-        .create(&form.project, &user(&headers), request)?;
+    let id = state.store.create(&project, &user(&headers), request)?;
+    if !uploads.is_empty()
+        && let Err(err) = save_images(&state, id, &uploads)
+    {
+        state.store.apply(id, Event::Cancel)?;
+        return Err(err);
+    }
     Ok(job_redirect(id))
+}
+
+/// Writes the images under generated names, so an upload's own file name
+/// never reaches the file system, and records the names with the job.
+fn save_images(state: &AppState, id: i64, uploads: &[Upload]) -> Result<(), AppError> {
+    let dir = state
+        .data_dir
+        .join("jobs")
+        .join(id.to_string())
+        .join("images");
+    let io = |err: std::io::Error| AppError::Io(format!("cannot save the images: {err}"));
+    std::fs::create_dir_all(&dir).map_err(io)?;
+    let mut names = Vec::new();
+    for (index, upload) in uploads.iter().enumerate() {
+        let name = format!("image-{}.{}", index + 1, upload.extension);
+        std::fs::write(dir.join(&name), &upload.bytes).map_err(io)?;
+        names.push(name);
+    }
+    state.store.add_images(id, &names)?;
+    Ok(())
 }
 
 async fn show_job(
