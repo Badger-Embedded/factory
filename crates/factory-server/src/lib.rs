@@ -17,5 +17,5 @@ pub use scheduler::{
     SummaryRequest, WatchReport, WatchRequest, branch_name,
 };
 pub use settings::Settings;
-pub use store::{JobRow, LogEntry, Store, StoreError};
+pub use store::{JobRow, LogEntry, ProjectTotals, Store, StoreError};
 pub use web::{MAX_IMAGE_BYTES, MAX_IMAGES, USER_HEADER, app};

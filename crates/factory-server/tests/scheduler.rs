@@ -511,6 +511,98 @@ fn cost_formats_as_dollars_and_cents() {
     assert_eq!(format_cost(12.0), "$12.00");
 }
 
+fn planned_pr(title: &str) -> factory_core::PlannedPr {
+    factory_core::PlannedPr {
+        title: title.into(),
+        summary: "s".into(),
+        number: None,
+        description: None,
+    }
+}
+
+#[test]
+fn totals_count_created_jobs_per_project() {
+    let store = Store::open_in_memory().unwrap();
+    store.create("maestro", "alice", "x").unwrap();
+    store.create("maestro", "bob", "y").unwrap();
+    store.create("factory", "alice", "z").unwrap();
+
+    let maestro = store.project_totals("maestro").unwrap();
+    assert_eq!((maestro.jobs_created, maestro.jobs_merged), (2, 0));
+    assert_eq!(store.project_totals("factory").unwrap().jobs_created, 1);
+    let unknown = store.project_totals("nobody").unwrap();
+    assert_eq!(
+        (unknown.usd, unknown.jobs_created, unknown.jobs_merged),
+        (0.0, 0, 0)
+    );
+}
+
+#[test]
+fn totals_sum_the_cost_of_every_run_in_the_project() {
+    let store = Store::open_in_memory().unwrap();
+    let first = store.create("maestro", "alice", "x").unwrap();
+    let second = store.create("maestro", "alice", "y").unwrap();
+    let other = store.create("factory", "alice", "z").unwrap();
+    store.add_cost(first, 0.5).unwrap();
+    store.add_cost(first, 0.25).unwrap();
+    store.add_cost(second, 1.0).unwrap();
+    store.add_cost(other, 4.0).unwrap();
+
+    assert!((store.project_totals("maestro").unwrap().usd - 1.75).abs() < 1e-9);
+    assert!((store.project_totals("factory").unwrap().usd - 4.0).abs() < 1e-9);
+}
+
+#[test]
+fn a_job_with_two_pull_requests_counts_as_merged_once() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    for event in [
+        Event::Start,
+        Event::Agent(AgentResult::Clarified),
+        Event::Agent(AgentResult::Spec("s".into())),
+        Event::Approve,
+        Event::Agent(AgentResult::Plan(vec![planned_pr("a"), planned_pr("b")])),
+        Event::Approve,
+        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::ChecksPassed,
+        Event::Published { number: 3 },
+        Event::Merged,
+    ] {
+        store.apply(id, event).unwrap();
+    }
+    assert_ne!(store.get(id).unwrap().job.stage(), &Stage::Merged);
+    assert_eq!(store.project_totals("maestro").unwrap().jobs_merged, 0);
+
+    for event in [
+        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::ChecksPassed,
+        Event::Published { number: 4 },
+        Event::Merged,
+    ] {
+        store.apply(id, event).unwrap();
+    }
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Merged);
+    assert_eq!(store.project_totals("maestro").unwrap().jobs_merged, 1);
+
+    assert!(store.apply(id, Event::Merged).is_err());
+    assert_eq!(store.project_totals("maestro").unwrap().jobs_merged, 1);
+}
+
+#[test]
+fn cancelled_and_failed_jobs_count_as_created_only() {
+    let store = Store::open_in_memory().unwrap();
+    let cancelled = store.create("maestro", "alice", "x").unwrap();
+    let failed = store.create("maestro", "alice", "y").unwrap();
+    store.apply(cancelled, Event::Cancel).unwrap();
+    store.apply(failed, Event::Start).unwrap();
+    store
+        .apply(failed, Event::AgentFailed { reason: "x".into() })
+        .unwrap();
+
+    let totals = store.project_totals("maestro").unwrap();
+    assert_eq!((totals.jobs_created, totals.jobs_merged), (2, 0));
+}
+
 /// Runs the job until its first pull request's commits are ready.
 async fn to_commits_ready(
     store: &Store,
@@ -1080,6 +1172,20 @@ mod purge {
         f.finish(id, "cancelled");
         f.scheduler.tick().await.unwrap();
         assert!(!f.exists(id));
+    }
+
+    #[tokio::test]
+    async fn project_totals_survive_the_deletion_of_a_job() {
+        let f = fixture();
+        let id = f.job(31);
+        f.store.add_cost(id, 0.5).unwrap();
+        f.finish(id, "merged");
+        f.scheduler.tick().await.unwrap();
+        assert!(!f.exists(id));
+
+        let totals = f.store.project_totals("maestro").unwrap();
+        assert_eq!((totals.jobs_created, totals.jobs_merged), (1, 1));
+        assert!((totals.usd - 0.5).abs() < 1e-9);
     }
 
     #[tokio::test]
