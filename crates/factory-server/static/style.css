@@ -307,3 +307,7 @@ label.check input { width: auto; }
   .topbar-end { gap: 8px; }
   .project-picker select { max-width: 9rem; }
 }
+
+.pasted-images, .request-images { list-style: none; display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 0; padding: 0; }
+.pasted-images li, .request-images li { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.pasted-images img, .request-images img { max-width: 160px; max-height: 120px; border: 1px solid var(--border); border-radius: 4px; display: block; }

@@ -60,6 +60,7 @@ pub fn app(
             post(create_job).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .route("/jobs/{id}", get(show_job))
+        .route("/jobs/{id}/images/{name}", get(show_image))
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/changes", post(request_changes))
@@ -281,7 +282,49 @@ async fn show_job(
     let logs = state.store.logs(id, LOG_LINES)?;
     let settings = state.store.settings()?;
     let project = state.projects.get(&row.project);
-    Ok(pages::job(&user(&headers), &row, project, &settings, &logs))
+    let images = state.store.images(id)?;
+    Ok(pages::job(
+        &user(&headers),
+        &row,
+        project,
+        &settings,
+        &logs,
+        &images,
+    ))
+}
+
+/// Serves an image the store lists for the job. The name must match a
+/// stored one, so a request cannot reach any other file.
+async fn show_image(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(i64, String)>,
+) -> Result<Response, AppError> {
+    let not_found = || AppError::from(StoreError::NotFound(id));
+    let content_type = match name.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("png") => "image/png",
+        Some("jpg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return Err(not_found()),
+    };
+    if !state.store.images(id)?.contains(&name) {
+        return Err(not_found());
+    }
+    let path = state
+        .data_dir
+        .join("jobs")
+        .join(id.to_string())
+        .join("images")
+        .join(&name);
+    let bytes = tokio::fs::read(path).await.map_err(|_| not_found())?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 async fn answer(

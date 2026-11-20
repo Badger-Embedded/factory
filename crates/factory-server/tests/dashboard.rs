@@ -22,6 +22,8 @@ struct Dashboard {
 struct Reply {
     status: StatusCode,
     location: Option<String>,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
     body: String,
 }
 
@@ -71,11 +73,17 @@ impl Dashboard {
             .headers()
             .get(header::LOCATION)
             .map(|value| value.to_str().unwrap().to_owned());
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|value| value.to_str().unwrap().to_owned());
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         Reply {
             status,
             location,
-            body: String::from_utf8(bytes.to_vec()).unwrap(),
+            content_type,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes: bytes.to_vec(),
         }
     }
 
@@ -1091,4 +1099,93 @@ fn a_settings_record_without_gates_loads_the_default_gates() {
     let settings: factory_server::Settings = serde_json::from_str(stored).unwrap();
     assert_eq!(settings.max_workers, 4);
     assert_eq!(settings.gates, Gates::default());
+}
+
+#[tokio::test]
+async fn the_form_has_the_paste_script_and_a_thumbnail_list() {
+    let page = dashboard().get("/").await;
+    assert!(
+        page.body
+            .contains(r#"<ul class="pasted-images" id="pasted-images">"#)
+    );
+    assert!(page.body.contains(r#"getElementById("request")"#));
+    assert!(page.body.contains("paste"));
+    assert!(page.body.contains("Remove"));
+    assert!(
+        page.body
+            .contains(r#"<textarea id="request" name="request" required"#)
+    );
+    assert!(
+        page.body
+            .contains(r#"<input id="images" type="file" name="images" multiple"#)
+    );
+}
+
+#[tokio::test]
+async fn the_job_page_shows_the_images_next_to_the_request() {
+    let dashboard = dashboard();
+    let id = job_id(
+        &dashboard
+            .post_job("maestro", "Match this", &[("a.png", PNG), ("b.jpg", JPEG)])
+            .await,
+    );
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let request = page.body.find("Match this").unwrap();
+    let first = page
+        .body
+        .find(&format!("src=\"/jobs/{id}/images/image-1.png\""))
+        .unwrap();
+    let second = page
+        .body
+        .find(&format!("src=\"/jobs/{id}/images/image-2.jpg\""))
+        .unwrap();
+    assert!(request < first && first < second);
+}
+
+#[tokio::test]
+async fn a_job_without_images_shows_no_image_list() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(!page.body.contains(r#"<ul class="request-images">"#));
+}
+
+#[tokio::test]
+async fn a_stored_image_is_served_from_its_file() {
+    let dashboard = dashboard();
+    let id = job_id(
+        &dashboard
+            .post_job("maestro", "x", &[("a.png", PNG), ("b.webp", WEBP)])
+            .await,
+    );
+    let png = dashboard
+        .get(&format!("/jobs/{id}/images/image-1.png"))
+        .await;
+    assert_eq!(png.status, StatusCode::OK);
+    assert_eq!(png.content_type.as_deref(), Some("image/png"));
+    assert_eq!(png.bytes, PNG);
+    let webp = dashboard
+        .get(&format!("/jobs/{id}/images/image-2.webp"))
+        .await;
+    assert_eq!(webp.content_type.as_deref(), Some("image/webp"));
+}
+
+#[tokio::test]
+async fn only_the_jobs_own_stored_images_are_served() {
+    let dashboard = dashboard();
+    let id = job_id(&dashboard.post_job("maestro", "x", &[("a.png", PNG)]).await);
+    let other = job_id(&dashboard.post_job("maestro", "y", &[]).await);
+    for uri in [
+        format!("/jobs/{id}/images/image-2.png"),
+        format!("/jobs/{other}/images/image-1.png"),
+        format!("/jobs/{id}/images/..%2F..%2Fjobs.db"),
+        format!("/jobs/{id}/images/image-1.txt"),
+        "/jobs/999/images/image-1.png".to_owned(),
+    ] {
+        assert_eq!(
+            dashboard.get(&uri).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
 }
