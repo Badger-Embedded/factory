@@ -314,6 +314,73 @@ impl SecretStore for UnavailableSecrets {
     }
 }
 
+/// Resolves the Claude subscription token a worker run and the plan usage
+/// fetch use. With the secret store available the token is the stored one, so
+/// a token saved on the settings page takes effect without a restart. With the
+/// store unavailable, because the master key is missing or malformed, it falls
+/// back to the `CLAUDE_CODE_OAUTH_TOKEN` captured at startup, so a lost key
+/// does not stop jobs while the old podman secret still passes the token in.
+pub struct ClaudeToken {
+    secrets: Arc<dyn SecretStore>,
+    /// The startup `CLAUDE_CODE_OAUTH_TOKEN`, trimmed and non-empty, or `None`.
+    /// It is the fallback when the store is unavailable and the source for the
+    /// one-time import.
+    env: Option<String>,
+}
+
+impl ClaudeToken {
+    /// Builds the resolver from the secret store and the startup
+    /// `CLAUDE_CODE_OAUTH_TOKEN`, which the caller trims and drops when empty.
+    #[must_use]
+    pub fn new(secrets: Arc<dyn SecretStore>, env: Option<String>) -> Self {
+        ClaudeToken { secrets, env }
+    }
+
+    /// The token to use now, read afresh on each call, or `None` when there is
+    /// none. With the store available it is the stored token, so the env var is
+    /// ignored once a token is stored; a stored value that will not decrypt
+    /// resolves to `None` and is logged without the value. With the store
+    /// unavailable it is the env fallback.
+    #[must_use]
+    pub fn resolve(&self) -> Option<String> {
+        if self.secrets.available() {
+            match self.secrets.claude_token() {
+                Ok(token) => token,
+                Err(err) => {
+                    tracing::warn!("reading the stored Claude token failed: {err}");
+                    None
+                }
+            }
+        } else {
+            self.env.clone()
+        }
+    }
+
+    /// The one-time import at startup. With the store available, no token
+    /// stored, and a non-empty env value, it stores that value and logs that
+    /// the token was imported, without the token itself. A token already stored
+    /// is kept and the env var ignored, so a later start with a different env
+    /// value does not overwrite it.
+    pub fn import_env_token(&self) {
+        if !self.secrets.available() {
+            return;
+        }
+        let Some(env) = self.env.as_deref() else {
+            return;
+        };
+        match self.secrets.claude_token() {
+            Ok(Some(_)) => {}
+            Ok(None) => match self.secrets.set_claude_token(env) {
+                Ok(()) => tracing::info!(
+                    "imported the Claude token from CLAUDE_CODE_OAUTH_TOKEN into the secret store"
+                ),
+                Err(err) => tracing::warn!("importing the Claude token failed: {err}"),
+            },
+            Err(err) => tracing::warn!("checking for a stored Claude token failed: {err}"),
+        }
+    }
+}
+
 /// The associated data bound into a ciphertext: the project, server and
 /// header, each prefixed with its length so no two different triples ever
 /// build the same bytes. A value copied into another row then fails to

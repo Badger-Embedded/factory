@@ -9,12 +9,14 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use factory_core::{PlanUsage, PlanUsageSnapshot};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+use crate::secrets::ClaudeToken;
 
 /// How often the background task fetches plan usage. It is shorter than
 /// `PLAN_USAGE_STALE_AFTER_SECS`, so one failed fetch does not make the cached
@@ -29,31 +31,37 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?skip_spend=1"
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// A source of the raw usage response body. The real source shells out to
-/// `curl`; tests pass a fake, so they need no network.
+/// `curl`; tests pass a fake, so they need no network. `Ok(None)` means there
+/// is no token to fetch with, so the refresh leaves the cache untouched and the
+/// tile stays hidden.
 pub trait UsageSource {
-    /// Fetches the usage endpoint and returns the response body, or an error
-    /// message with no secret in it.
-    fn fetch(&self) -> impl Future<Output = Result<String, String>> + Send;
+    /// Fetches the usage endpoint and returns the response body, `Ok(None)`
+    /// when there is no token, or an error message with no secret in it.
+    fn fetch(&self) -> impl Future<Output = Result<Option<String>, String>> + Send;
 }
 
 /// Fetches plan usage by running `curl` with the factory's Claude token.
 pub struct CurlUsageSource {
     /// The `curl` binary.
     pub curl: PathBuf,
-    /// The factory's Claude subscription token, from the `claude-token`
-    /// secret the workers already use.
-    pub token: String,
+    /// Resolves the current Claude subscription token on each fetch, so a token
+    /// saved on the settings page is used from the next refresh.
+    pub token: Arc<ClaudeToken>,
 }
 
 impl UsageSource for CurlUsageSource {
-    async fn fetch(&self) -> Result<String, String> {
+    async fn fetch(&self) -> Result<Option<String>, String> {
+        // With no token the fetch is skipped, so the tile stays hidden the way
+        // it does today when no token is set.
+        let Some(token) = self.token.resolve() else {
+            return Ok(None);
+        };
         // curl reads the URL and the auth header from its stdin config, so the
         // token never appears in the process arguments.
         let config = format!(
             "url = \"{USAGE_URL}\"\n\
-             header = \"Authorization: Bearer {}\"\n\
+             header = \"Authorization: Bearer {token}\"\n\
              header = \"anthropic-beta: {OAUTH_BETA}\"\n",
-            self.token
         );
         let mut child = Command::new(&self.curl)
             .arg("--silent")
@@ -78,7 +86,7 @@ impl UsageSource for CurlUsageSource {
             .await
             .map_err(|err| format!("waiting for curl: {err}"))?;
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
         } else {
             Err(format!(
                 "curl failed: {}",
@@ -146,13 +154,16 @@ impl PlanUsageCache {
 /// the cache as errored.
 pub async fn refresh_once<S: UsageSource>(source: &S, cache: &PlanUsageCache) {
     match source.fetch().await {
-        Ok(body) => match PlanUsage::parse(&body) {
+        Ok(Some(body)) => match PlanUsage::parse(&body) {
             Ok(usage) => cache.record_success(usage, now_secs()),
             Err(err) => {
                 tracing::warn!("plan usage did not parse: {err}");
                 cache.record_error();
             }
         },
+        // No token to fetch with: leave the cache as it is so the tile stays
+        // hidden, rather than mark an error.
+        Ok(None) => {}
         Err(err) => {
             tracing::warn!("plan usage fetch failed: {err}");
             cache.record_error();
