@@ -10,14 +10,14 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use factory_core::{Event, Gates};
-use maud::Markup;
+use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::pages;
 use crate::projects::{Projects, StageModels};
 use crate::settings::Settings;
-use crate::store::{ProjectTotals, Store, StoreError};
+use crate::store::{JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
 
 /// The header `tailscale serve` sets to the logged-in user's login name.
@@ -59,6 +59,10 @@ pub fn app(
 ) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/fragments/plan-usage", get(plan_usage_fragment))
+        .route("/fragments/stats", get(stats_fragment))
+        .route("/fragments/lanes", get(lanes_fragment))
+        .route("/fragments/board", get(board_fragment))
         .route("/style.css", get(stylesheet))
         .route("/htmx.min.js", get(htmx))
         .route(
@@ -160,12 +164,32 @@ fn toml_llm_review(state: &AppState, project: &str) -> bool {
     state.projects.get(project).is_some_and(|p| p.llm_review)
 }
 
-async fn index(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<IndexQuery>,
-) -> Result<Markup, AppError> {
-    let selected = match query.project {
+/// The store data the board and its fragments render from. Loading it in one
+/// place keeps a fragment and the full page on the same data.
+struct BoardData {
+    selected: Option<String>,
+    jobs: Vec<JobRow>,
+    costs: HashMap<i64, f64>,
+    totals: ProjectTotals,
+    auto_merge: bool,
+}
+
+impl BoardData {
+    /// The selected project's jobs, in the store's order.
+    fn rows(&self) -> Vec<&JobRow> {
+        match self.selected.as_deref() {
+            Some(project) => self
+                .jobs
+                .iter()
+                .filter(|row| row.project == project)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
+fn load_board(state: &AppState, project: Option<String>) -> Result<BoardData, AppError> {
+    let selected = match project {
         Some(name) if state.projects.get(&name).is_none() => {
             return Err(AppError::BadRequest(format!("unknown project {name:?}")));
         }
@@ -179,20 +203,80 @@ async fn index(
             state.store.project_totals(name)?,
             state
                 .store
-                .project_auto_merge(name, toml_auto_merge(&state, name))?,
+                .project_auto_merge(name, toml_auto_merge(state, name))?,
         ),
         None => (ProjectTotals::default(), false),
     };
+    Ok(BoardData {
+        selected,
+        jobs,
+        costs,
+        totals,
+        auto_merge,
+    })
+}
+
+async fn index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IndexQuery>,
+) -> Result<Markup, AppError> {
+    let data = load_board(&state, query.project)?;
     let plan_usage = state.plan_usage.visible(now_secs());
     Ok(pages::index(
         &user(&headers),
         &state.projects,
-        selected.as_deref(),
-        &jobs,
-        &costs,
-        totals,
+        data.selected.as_deref(),
+        &data.jobs,
+        &data.costs,
+        data.totals,
         plan_usage.as_ref(),
-        auto_merge,
+        data.auto_merge,
+    ))
+}
+
+/// Serves the plan usage tile on its own, from the same cache `index` reads,
+/// so a poll makes no live call to the usage endpoint.
+async fn plan_usage_fragment(State(state): State<AppState>) -> Markup {
+    let plan_usage = state.plan_usage.visible(now_secs());
+    pages::plan_usage(plan_usage.as_ref())
+}
+
+async fn stats_fragment(
+    State(state): State<AppState>,
+    Query(query): Query<IndexQuery>,
+) -> Result<Markup, AppError> {
+    let data = load_board(&state, query.project)?;
+    let Some(project) = data.selected.as_deref() else {
+        return Ok(html! {});
+    };
+    Ok(pages::stats(data.totals, project))
+}
+
+async fn lanes_fragment(
+    State(state): State<AppState>,
+    Query(query): Query<IndexQuery>,
+) -> Result<Markup, AppError> {
+    let data = load_board(&state, query.project)?;
+    let Some(project) = data.selected.as_deref() else {
+        return Ok(html! {});
+    };
+    Ok(pages::lane_counts(&data.rows(), data.auto_merge, project))
+}
+
+async fn board_fragment(
+    State(state): State<AppState>,
+    Query(query): Query<IndexQuery>,
+) -> Result<Markup, AppError> {
+    let data = load_board(&state, query.project)?;
+    let Some(project) = data.selected.as_deref() else {
+        return Ok(html! {});
+    };
+    Ok(pages::board(
+        &data.rows(),
+        &data.costs,
+        data.auto_merge,
+        project,
     ))
 }
 
@@ -441,7 +525,7 @@ async fn retry(
     }
 }
 
-fn query_escape(value: &str) -> String {
+pub(crate) fn query_escape(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
