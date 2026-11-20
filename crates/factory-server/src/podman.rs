@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 
 use factory_core::Event;
 use factory_runner::{
-    BranchSummary, Git, GitHub, Observation, RunReport, SessionRun, WorkerConfig, WorkerRun,
+    BranchSummary, Git, GitHub, Observation, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
     observe, place_images, remove_container, run, run_checks, show_images,
 };
 
 use crate::scheduler::{
-    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, SummaryRequest,
-    WatchReport, WatchRequest,
+    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, RerunRequest,
+    SummaryRequest, WatchReport, WatchRequest,
 };
 use crate::settings::Settings;
 
@@ -207,6 +207,12 @@ impl Executor for PodmanExecutor {
             seen_until,
             merged_by_factory,
         })
+    }
+
+    async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
+        self.github
+            .rerun_failed(&request.repo, request.number)
+            .await
     }
 
     async fn stop(&self, job_id: i64) {
