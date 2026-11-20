@@ -416,6 +416,7 @@ pub fn settings(
                         ("spec", &models.spec),
                         ("plan", &models.plan),
                         ("implement", &models.implement),
+                        ("review", &models.review),
                     ] {
                         div.field {
                             label for={ (name) "-" (stage) } { (stage) }

@@ -18,6 +18,8 @@ pub struct StageModels {
     pub plan: Option<String>,
     #[serde(default)]
     pub implement: Option<String>,
+    #[serde(default)]
+    pub review: Option<String>,
 }
 
 /// One target repository, read from `projects/<name>/project.toml`.
