@@ -11,7 +11,8 @@ mod stream;
 mod worker;
 
 pub use checks::{checks_args, run_checks};
-pub use git::{BranchSummary, Git};
+pub use factory_core::BranchSummary;
+pub use git::Git;
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, Observation, PrState, PrStatus, actions_job_id, observe,
     parse_status,

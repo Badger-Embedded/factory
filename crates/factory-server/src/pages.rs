@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use factory_core::{Ask, Command, Gates, Job, Stage, Task, Turn};
+use factory_core::{Ask, BranchSummary, Command, Gates, Job, Stage, Task, Turn};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::projects::{Project, Projects};
@@ -186,7 +186,7 @@ pub fn settings(user: &str, settings: &Settings, notice: Option<&str>) -> Markup
                         input type="checkbox" name="gate_publish" value="on" checked[settings.gates.publish];
                         " Approve before pushing"
                     }
-                    p.hint { "Applies to jobs created after you save. A job keeps the gates it started with. The publish gate has no effect yet." }
+                    p.hint { "Applies to jobs created after you save. A job keeps the gates it started with." }
                 }
                 h2 { "GitHub" }
                 div.field {
@@ -407,6 +407,12 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
                 }
             }
         }
+        (
+            Stage::Verifying { pr },
+            Turn::User(Ask::PublishApproval {
+                summary: Some(summary),
+            }),
+        ) => publish_card(id, job, *pr, summary),
         (Stage::Failed { reason }, _) => html! {
             div.card.failed {
                 h2 { "Failed" }
@@ -425,7 +431,14 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
 /// dashboard, or, without auto-merge, a review of its open pull request on
 /// GitHub.
 fn needs_user(job: &Job, settings: &Settings) -> bool {
-    matches!(job.turn(), Turn::User(_)) || (in_review(job) && !settings.auto_merge)
+    (matches!(job.turn(), Turn::User(_)) && !collecting(job))
+        || (in_review(job) && !settings.auto_merge)
+}
+
+/// Whether the job waits for the factory to collect what the publish
+/// approval shows.
+fn collecting(job: &Job) -> bool {
+    matches!(job.next_command(), Some(Command::Summarize { .. }))
 }
 
 fn in_review(job: &Job) -> bool {
@@ -438,11 +451,11 @@ fn turn_badge(job: &Job, settings: &Settings) -> Markup {
         (Stage::Failed { .. }, _) => ("bad", "failed"),
         (Stage::Cancelled, _) => ("factory", "cancelled"),
         (Stage::Requested, _) => ("factory", "queued"),
-        (_, Turn::User(_)) => ("you", "needs you"),
+        (_, Turn::User(_)) if !collecting(job) => ("you", "needs you"),
         _ if in_review(job) && settings.auto_merge => ("factory", "merges when green"),
         _ if in_review(job) => ("you", "in review"),
         (_, Turn::Agent(_)) => ("agent", "agent working"),
-        (_, Turn::Factory | Turn::Done) => ("factory", "factory working"),
+        (_, Turn::User(_) | Turn::Factory | Turn::Done) => ("factory", "factory working"),
     };
     html! { span class={ "badge " (class) } { (text) } }
 }
@@ -498,8 +511,13 @@ fn turn_detail(job: &Job, settings: &Settings) -> String {
                     settings.poll_seconds
                 )
             }
-            Some(Command::RunAgent { .. }) | None => "Waiting for a free worker.".into(),
+            Some(Command::RunAgent { .. } | Command::Summarize { .. }) | None => {
+                "Waiting for a free worker.".into()
+            }
         },
+        Turn::User(_) if collecting(job) => {
+            "The factory is collecting the commits and the diff stat for your approval.".into()
+        }
         Turn::User(_) => "Waiting for you.".into(),
         Turn::Done => match job.stage() {
             Stage::Merged => "Every planned pull request is merged.".into(),
@@ -520,5 +538,46 @@ fn task_label(task: &Task) -> &'static str {
         Task::FixCi { .. } => "fixing the CI failure",
         Task::AddressReview { .. } => "addressing review comments",
         Task::Rebase { .. } => "rebasing onto the newest base branch to resolve a conflict",
+    }
+}
+
+fn publish_card(id: i64, job: &Job, pr: usize, summary: &BranchSummary) -> Markup {
+    let planned = &job.plan()[pr];
+    html! {
+        div.card.needs-you {
+            h2 { "Approve before the first push of PR " (pr + 1) " of " (job.plan().len()) }
+            @if let Some(description) = &planned.description {
+                h3 { (description.title) }
+                pre.doc { (description.body) }
+            } @else {
+                p.empty { "The agent wrote no title or description." }
+            }
+            h3 { "Commits" }
+            @if summary.commits.is_empty() {
+                p.empty { "The branch has no commits after the base branch." }
+            } @else {
+                ul.commits {
+                    @for commit in &summary.commits {
+                        li { (commit) }
+                    }
+                }
+            }
+            h3 { "Diff stat" }
+            @if summary.diff_stat.is_empty() {
+                p.empty { "The branch changes no files." }
+            } @else {
+                pre.doc { (summary.diff_stat) }
+            }
+            div.row {
+                form method="post" action={ "/jobs/" (id) "/approve" } {
+                    button.primary { "Approve and push" }
+                }
+                form.grow method="post" action={ "/jobs/" (id) "/changes" } {
+                    textarea name="feedback" required aria-label="What should change"
+                        placeholder="Or say what should change" {}
+                    p { button { "Request changes" } }
+                }
+            }
+        }
     }
 }

@@ -6,7 +6,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    AgentResult, Ask, Event, Gates, PlannedPr, PrDescription, Question, Stage, Task, Turn,
+    AgentResult, Ask, BranchSummary, Event, Gates, PlannedPr, PrDescription, Question, Stage, Task,
+    Turn,
 };
 use factory_server::{Projects, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
@@ -1004,7 +1005,7 @@ async fn the_settings_page_has_a_checkbox_per_gate_with_spec_and_plan_on() {
     assert!(body.contains(r#"name="gate_spec" value="on" checked"#));
     assert!(body.contains(r#"name="gate_plan" value="on" checked"#));
     assert!(!body.contains(r#"name="gate_publish" value="on" checked"#));
-    assert!(body.contains("The publish gate has no effect yet."));
+    assert!(!body.contains("no effect yet"));
 }
 
 #[tokio::test]
@@ -1188,4 +1189,119 @@ async fn only_the_jobs_own_stored_images_are_served() {
             "{uri}"
         );
     }
+}
+
+fn description() -> PrDescription {
+    PrDescription {
+        title: "maestrod: add a reboot endpoint".into(),
+        body: "Adds POST /reboot for the device page.".into(),
+    }
+}
+
+/// A job with the publish gate on whose checks passed, so it waits at the
+/// publish approval for the factory to collect the summary.
+async fn at_publish_gate(dashboard: &Dashboard) -> i64 {
+    dashboard
+        .store
+        .save_settings(&factory_server::Settings {
+            gates: Gates {
+                spec: false,
+                plan: false,
+                publish: true,
+            },
+            ..factory_server::Settings::default()
+        })
+        .unwrap();
+    let id = dashboard.new_job().await;
+    to_spec_approval(dashboard, id);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![PlannedPr {
+            title: "maestrod: add a reboot endpoint".into(),
+            summary: "POST /reboot".into(),
+            number: None,
+            description: None,
+        }])),
+    );
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(description())));
+    dashboard.apply(id, Event::ChecksPassed);
+    id
+}
+
+fn branch_summary() -> BranchSummary {
+    BranchSummary {
+        commits: vec![
+            "abc1234 maestrod: add the endpoint".into(),
+            "def5678 maestrod: test the endpoint".into(),
+        ],
+        diff_stat: " src/main.rs | 4 ++++\n 1 file changed, 4 insertions(+)".into(),
+    }
+}
+
+#[tokio::test]
+async fn the_publish_approval_shows_the_pull_request_and_counts_as_waiting_for_you() {
+    let dashboard = dashboard();
+    let id = at_publish_gate(&dashboard).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(!page.body.contains("Approve and push"));
+    assert!(page.body.contains("collecting the commits"));
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("Nothing needs you right now."));
+
+    dashboard.apply(id, Event::Summarized(branch_summary()));
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    for text in [
+        "Approve before the first push",
+        "maestrod: add a reboot endpoint",
+        "Adds POST /reboot for the device page.",
+        "abc1234 maestrod: add the endpoint",
+        "def5678 maestrod: test the endpoint",
+        "src/main.rs | 4 ++++",
+        "1 file changed, 4 insertions(+)",
+        "Approve and push",
+        "Request changes",
+    ] {
+        assert!(page.body.contains(text), "{text}");
+    }
+    assert!(page.body.contains(&format!("/jobs/{id}/approve")));
+    assert!(page.body.contains(&format!("/jobs/{id}/changes")));
+    let index = dashboard.get("/").await;
+    assert!(!index.body.contains("Nothing needs you right now."));
+    assert!(index.body.contains("needs you"));
+}
+
+#[tokio::test]
+async fn approving_the_publish_gate_lets_the_factory_push() {
+    let dashboard = dashboard();
+    let id = at_publish_gate(&dashboard).await;
+    dashboard.apply(id, Event::Summarized(branch_summary()));
+
+    let reply = dashboard.post(&format!("/jobs/{id}/approve"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::PrOpen { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn requesting_changes_at_the_publish_gate_sends_the_feedback_to_the_agent() {
+    let dashboard = dashboard();
+    let id = at_publish_gate(&dashboard).await;
+    dashboard.apply(id, Event::Summarized(branch_summary()));
+
+    let reply = dashboard
+        .post(
+            &format!("/jobs/{id}/changes"),
+            "feedback=Squash+the+commits",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        dashboard.turn(id),
+        Turn::Agent(Task::Revise {
+            feedback: "Squash the commits".into()
+        })
+    );
 }

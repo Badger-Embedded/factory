@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 
 use factory_core::Event;
 use factory_runner::{
-    Git, GitHub, Observation, RunReport, SessionRun, WorkerConfig, WorkerRun, observe,
-    place_images, remove_container, run, run_checks, show_images,
+    BranchSummary, Git, GitHub, Observation, RunReport, SessionRun, WorkerConfig, WorkerRun,
+    observe, place_images, remove_container, run, run_checks, show_images,
 };
 
 use crate::scheduler::{
-    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, WatchReport, WatchRequest,
+    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, SummaryRequest, WatchReport,
+    WatchRequest,
 };
 use crate::settings::Settings;
 
@@ -145,6 +146,11 @@ impl Executor for PodmanExecutor {
             });
         }
         run_checks(&config, &name, &workspace, &request.command).await
+    }
+
+    async fn summarize(&self, request: SummaryRequest) -> Result<BranchSummary, String> {
+        let workspace = self.job_dir(request.job_id).join("work");
+        self.git.summarize_branch(&workspace, &request.base).await
     }
 
     async fn publish(&self, request: PublishRequest) -> Result<u64, String> {

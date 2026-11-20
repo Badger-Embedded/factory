@@ -4,6 +4,7 @@ use std::process::Stdio;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use factory_core::BranchSummary;
 use tokio::process::Command;
 
 /// Runs git for the factory. The factory holds the GitHub token, and git
@@ -19,15 +20,6 @@ pub struct Git {
     /// The identity the agent's commits carry.
     pub user_name: String,
     pub user_email: String,
-}
-
-/// What a pull request branch would add to its base branch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchSummary {
-    /// One `<short sha> <subject>` entry per commit.
-    pub commits: Vec<String>,
-    /// The `git diff --stat` output. Empty when the branch changes nothing.
-    pub diff_stat: String,
 }
 
 impl Default for Git {
