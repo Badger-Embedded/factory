@@ -1924,7 +1924,7 @@ fn gate_form(gates: &str) -> String {
 async fn the_settings_page_has_a_checkbox_per_gate_with_spec_and_plan_on() {
     let dashboard = dashboard();
     let body = dashboard.settings_pages().await;
-    assert!(body.contains("Approval gates"));
+    assert!(body.contains("Default gates"));
     for name in ["gate_spec", "gate_plan", "gate_publish"] {
         assert!(body.contains(&format!("name=\"{name}\"")), "{name}");
     }
@@ -1989,7 +1989,7 @@ fn factory_form(body: &str) -> &str {
 /// The form on the settings page that posts to `project`'s settings.
 fn project_form<'a>(body: &'a str, project: &str) -> &'a str {
     let start = body
-        .find(&format!(r#"action="/settings/projects/{project}""#))
+        .find(&format!(r#"action="/settings/projects/{project}?stage="#))
         .unwrap();
     let end = start + body[start..].find("</form>").unwrap();
     &body[start..end]
@@ -2027,7 +2027,7 @@ async fn each_project_form_shows_its_own_gates() {
     let body = dashboard.settings_pages().await;
     let form = project_form(&body, "maestro");
     assert!(form.contains(r#"<input type="hidden" name="gates" value="on">"#));
-    assert!(form.contains(r#"name="gate_spec" value="on">"#));
+    assert!(form.contains(r#"name="gate_spec" value="on" data-gate="spec""#));
     assert!(form.contains(r#"name="gate_plan" value="on" checked"#));
     assert!(form.contains(r#"name="gate_publish" value="on" checked"#));
 }
@@ -3193,7 +3193,7 @@ fn a_database_from_before_the_effort_table_opens_and_reads_medium() {
 async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_effective_value() {
     let dashboard = dashboard();
     let page = dashboard.get("/settings/projects/maestro").await;
-    // A select named "<stage>_effort" sits beside each stage's model field.
+    // Each stage's panel has a radio group named "<stage>_effort".
     for stage in ["clarify", "spec", "plan", "implement", "review"] {
         assert!(
             page.body.contains(&format!("name=\"{stage}_effort\"")),
@@ -3206,7 +3206,7 @@ async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_e
     }
     // With nothing saved, every stage preselects the medium default, so the
     // selected option appears once per stage.
-    assert_eq!(page.body.matches("value=\"medium\" selected").count(), 5);
+    assert_eq!(page.body.matches("value=\"medium\" checked").count(), 5);
 
     // A saved level preselects in place of the default.
     dashboard
@@ -3214,10 +3214,10 @@ async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_e
         .save_project_efforts("maestro", &efforts("low", "medium", "high", "xhigh", "max"))
         .unwrap();
     let page = dashboard.get("/settings/projects/maestro").await;
-    assert!(page.body.contains("value=\"low\" selected"));
-    assert!(page.body.contains("value=\"high\" selected"));
-    assert!(page.body.contains("value=\"xhigh\" selected"));
-    assert!(page.body.contains("value=\"max\" selected"));
+    assert!(page.body.contains("value=\"low\" checked"));
+    assert!(page.body.contains("value=\"high\" checked"));
+    assert!(page.body.contains("value=\"xhigh\" checked"));
+    assert!(page.body.contains("value=\"max\" checked"));
 }
 
 #[tokio::test]
@@ -3510,7 +3510,7 @@ fn the_migration_without_stored_settings_does_nothing() {
 async fn the_settings_page_edits_the_models_of_each_project() {
     let dashboard = dashboard();
     let page = dashboard.settings_pages().await;
-    assert!(page.contains("action=\"/settings/projects/maestro\""));
+    assert!(page.contains("action=\"/settings/projects/maestro?stage=clarify\""));
     for stage in ["clarify", "spec", "plan", "implement", "review"] {
         assert!(page.contains(&format!("name=\"{stage}\"")), "{stage}");
     }
@@ -5662,7 +5662,7 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     ] {
         let body = dashboard.get(uri).await.body;
         assert_eq!(body.matches(r#"class="save-bar""#).count(), 1, "{uri}");
-        assert!(body.contains(r#"class="card settings-form""#), "{uri}");
+        assert!(body.contains(r#"class="card settings-form"#), "{uri}");
         assert!(body.contains("beforeunload"), "{uri}");
     }
 }
@@ -5789,8 +5789,10 @@ async fn a_project_page_sums_up_each_server_and_links_its_page() {
     assert!(page.contains("On in 2 of 5 stages"));
     assert!(page.contains("Key stored"));
     assert!(page.contains(r#"href="/settings/projects/maestro/mcp/context7""#));
-    // The project form no longer carries the server's fields.
-    assert!(!page.contains("mcp.context7."));
+    // The project form carries the stage switches, not the server's other
+    // fields.
+    assert!(!page.contains("mcp.context7.enabled"));
+    assert!(!page.contains("mcp.context7.header"));
 
     let other = dashboard.get("/settings/projects/tool").await.body;
     assert!(other.contains("Off"));
@@ -6001,4 +6003,198 @@ async fn deleting_a_server_needs_its_name_typed() {
         .await;
     assert!(reply.body.contains("Deleted."));
     assert!(dashboard.store.mcp_server("context7").unwrap().is_none());
+}
+
+/// Whether the panel `key` on a project page is hidden.
+fn panel_hidden(body: &str, key: &str) -> bool {
+    let start = body
+        .find(&format!(r#"data-panel="{key}""#))
+        .unwrap_or_else(|| panic!("no panel {key}"));
+    let tag_end = start + body[start..].find('>').unwrap();
+    body[start..tag_end].contains("hidden")
+}
+
+/// The `<a>` tag that opens `part` on a project page, up to its `>`.
+fn pipe_node<'a>(body: &'a str, part: &str) -> &'a str {
+    let at = body
+        .find(&format!(r#"data-part="{part}""#))
+        .unwrap_or_else(|| panic!("no node {part}"));
+    let start = body[..at].rfind("<a ").unwrap();
+    let end = at + body[at..].find("</a>").unwrap();
+    &body[start..end]
+}
+
+#[tokio::test]
+async fn the_pipeline_runs_the_stages_in_order_with_the_gates_between() {
+    let body = dashboard().get("/settings/projects/maestro").await.body;
+    let order = [
+        "clarify",
+        "spec",
+        "gate-spec",
+        "plan",
+        "gate-plan",
+        "implement",
+        "gate-publish",
+        "review",
+        "merge",
+    ];
+    let positions: Vec<usize> = order
+        .iter()
+        .map(|part| {
+            body.find(&format!(
+                r#"href="/settings/projects/maestro?stage={part}""#
+            ))
+            .unwrap_or_else(|| panic!("no link to {part}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{positions:?}"
+    );
+    assert!(body.contains(r#"classList.add("pipeline-js")"#));
+}
+
+#[tokio::test]
+async fn the_stage_query_opens_one_panel_and_marks_its_node() {
+    let dashboard = dashboard();
+    let body = dashboard
+        .get("/settings/projects/maestro?stage=gate-plan")
+        .await
+        .body;
+    assert!(!panel_hidden(&body, "gate-plan"));
+    for other in ["clarify", "review", "gate-spec", "merge"] {
+        assert!(panel_hidden(&body, other), "{other}");
+    }
+    assert!(pipe_node(&body, "gate-plan").contains(r#"aria-current="step""#));
+    assert_eq!(body.matches(r#"aria-current="step""#).count(), 1);
+    assert!(body.contains(r#"action="/settings/projects/maestro?stage=gate-plan""#));
+
+    // No value or an unknown one opens the first stage.
+    for uri in [
+        "/settings/projects/maestro",
+        "/settings/projects/maestro?stage=nope",
+        "/settings/projects/maestro?stage=gate-nope",
+    ] {
+        let body = dashboard.get(uri).await.body;
+        assert!(!panel_hidden(&body, "clarify"), "{uri}");
+        assert!(panel_hidden(&body, "implement"), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn each_node_shows_its_model_effort_and_servers() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=fable&spec=&plan=&implement=&review=opus\
+             &clarify_effort=high&gates=on\
+             &mcp.context7.pipeline=on&mcp.context7.stage.clarify=on",
+        )
+        .await;
+    let body = dashboard.get("/settings/projects/maestro").await.body;
+
+    let clarify = pipe_node(&body, "clarify");
+    assert!(clarify.contains(">fable</span>"));
+    assert_eq!(clarify.matches(r#"<i class="on">"#).count(), 3);
+    assert!(clarify.contains(r#"data-server-label="context7.clarify">context7"#));
+
+    let spec = pipe_node(&body, "spec");
+    assert!(spec.contains(">CLI default</span>"));
+    assert!(spec.contains(r#"data-server-label="context7.spec" hidden"#));
+
+    // LLM review is off, so the review stage reads Off whatever its model.
+    let review = pipe_node(&body, "review");
+    assert!(review.contains("pipe-node off"));
+    assert!(review.contains(">Off</span>"));
+
+    let merge = pipe_node(&body, "merge");
+    assert!(merge.contains("You, on GitHub"));
+}
+
+#[tokio::test]
+async fn a_gate_node_shows_when_it_is_on_and_when_it_differs_from_the_default() {
+    let dashboard = dashboard();
+    // The defaults are spec and plan on. maestro turns plan off and publish on.
+    dashboard
+        .store
+        .save_project_gates(
+            "maestro",
+            Gates {
+                spec: true,
+                plan: false,
+                publish: true,
+            },
+        )
+        .unwrap();
+    let body = dashboard
+        .get("/settings/projects/maestro?stage=gate-plan")
+        .await
+        .body;
+    assert!(pipe_node(&body, "gate-spec").contains(r#"class="gate-node on""#));
+    assert!(pipe_node(&body, "gate-plan").contains(r#"class="gate-node changed""#));
+    assert!(pipe_node(&body, "gate-publish").contains(r#"class="gate-node on changed""#));
+
+    let panel = &body[body.find(r#"data-panel="gate-plan""#).unwrap()..];
+    let panel = &panel[..panel.find(r#"data-panel="gate-publish""#).unwrap()];
+    assert!(panel.contains("Factory default: <strong>on</strong>"));
+    assert!(panel.contains(r#"<span class="gate-changed">Changed for maestro. </span>"#));
+    assert!(panel.contains(r#"data-gate-reset="plan""#));
+}
+
+#[tokio::test]
+async fn a_save_comes_back_to_the_open_panel() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro?stage=merge",
+            "clarify=&spec=&plan=&implement=&review=&gates=on&auto_merge=on",
+        )
+        .await;
+    assert!(reply.body.contains("Saved."));
+    assert!(!panel_hidden(&reply.body, "merge"));
+    assert!(
+        reply
+            .body
+            .contains(r#"action="/settings/projects/maestro?stage=merge""#)
+    );
+    assert!(pipe_node(&reply.body, "merge").contains("Automatic"));
+}
+
+#[tokio::test]
+async fn a_pipeline_stage_switch_turns_a_server_on_in_that_stage() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    let post = |stages: &'static str| {
+        let dashboard = &dashboard;
+        async move {
+            dashboard
+                .post(
+                    "/settings/projects/maestro",
+                    &format!(
+                        "clarify=&spec=&plan=&implement=&review=&gates=on&mcp.context7.pipeline=on{stages}"
+                    ),
+                )
+                .await
+        }
+    };
+    let saved = || dashboard.store.project_mcp("maestro", "context7").unwrap();
+
+    // A server that is off and stays off is not written.
+    post("").await;
+    assert!(!saved().enabled);
+
+    // Switching a stage on turns the server on in that stage only.
+    post("&mcp.context7.stage.plan=on&mcp.context7.stage.review=on").await;
+    let settings = saved();
+    assert!(settings.enabled);
+    assert!(settings.stages.plan && settings.stages.review);
+    assert!(!settings.stages.clarify && !settings.stages.spec && !settings.stages.implement);
+
+    // Switching every stage off stops the server and keeps its stages.
+    post("").await;
+    let settings = saved();
+    assert!(!settings.enabled);
+    assert!(settings.stages.plan && settings.stages.review);
 }
