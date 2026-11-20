@@ -37,6 +37,14 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// The `clientInfo.name` the check sends, so a server's logs show who called.
 const CLIENT_NAME: &str = "factory";
 
+/// The `clientInfo.version` the check sends. The MCP schema requires it, and a
+/// server that validates the request, such as Composio's, rejects an
+/// `initialize` without it.
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The most characters of a server's JSON-RPC error message the result shows.
+const MAX_ERROR_MESSAGE: usize = 300;
+
 /// What the check found. It carries no header value, so a result rendered into
 /// the page, written to a log or put in an error leaks no credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +68,12 @@ pub enum CheckOutcome {
         status: u16,
         location: Option<String>,
     },
-    /// A 2xx reply that did not parse as an `initialize` response.
+    /// A 2xx reply carrying a JSON-RPC error instead of a result. `message` is
+    /// the server's own text, cut to [`MAX_ERROR_MESSAGE`] characters, with
+    /// every header value the check sent replaced by `[redacted]`.
+    RpcError { code: i64, message: String },
+    /// A 2xx reply that parsed as neither an `initialize` response nor a
+    /// JSON-RPC error.
     NotMcp,
 }
 
@@ -150,7 +163,7 @@ impl HttpMcpChecker {
             "params": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": { "name": CLIENT_NAME },
+                "clientInfo": { "name": CLIENT_NAME, "version": CLIENT_VERSION },
             },
         });
         let mut request = self
@@ -197,8 +210,12 @@ impl HttpMcpChecker {
             .get("mcp-session-id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        match read_initialize(response).await {
-            Some(init) => {
+        match read_reply(response).await {
+            Some(Reply::Error { code, message }) => CheckOutcome::RpcError {
+                code,
+                message: redact(&message, headers),
+            },
+            Some(Reply::Init(init)) => {
                 if let Some(id) = session_id {
                     self.end_session(url, headers, &id).await;
                 }
@@ -223,6 +240,29 @@ impl HttpMcpChecker {
     }
 }
 
+/// What a JSON-RPC response to `initialize` held.
+enum Reply {
+    Init(Initialize),
+    Error { code: i64, message: String },
+}
+
+/// Cuts a server's error message to [`MAX_ERROR_MESSAGE`] characters and
+/// replaces each header value the check sent. A server may echo the request
+/// back, and the result is shown to anyone who can open the settings page.
+fn redact(message: &str, headers: &[(String, String)]) -> String {
+    let mut text = message.to_owned();
+    for (_, value) in headers {
+        if !value.is_empty() {
+            text = text.replace(value.as_str(), "[redacted]");
+        }
+    }
+    if text.chars().count() > MAX_ERROR_MESSAGE {
+        text = text.chars().take(MAX_ERROR_MESSAGE).collect();
+        text.push_str("...");
+    }
+    text
+}
+
 /// A parsed `initialize` result: its protocol version and the server's own
 /// name and version, when it gives them.
 struct Initialize {
@@ -231,11 +271,11 @@ struct Initialize {
     protocol_version: String,
 }
 
-/// Reads the response body, up to [`MAX_BODY`], and parses an `initialize`
-/// reply from it. The body may be plain JSON or an SSE stream; the first
-/// `data:` event that carries a JSON-RPC response with a `result.protocolVersion`
-/// counts. Returns `None` when no such reply arrives.
-async fn read_initialize(mut response: reqwest::Response) -> Option<Initialize> {
+/// Reads the response body, up to [`MAX_BODY`], and parses a reply from it.
+/// The body may be plain JSON or an SSE stream. The first `data:` event that
+/// carries a JSON-RPC error or a `result.protocolVersion` counts. Returns
+/// `None` when no such reply arrives.
+async fn read_reply(mut response: reqwest::Response) -> Option<Reply> {
     let mut buffer = Vec::new();
     loop {
         match response.chunk().await {
@@ -246,7 +286,7 @@ async fn read_initialize(mut response: reqwest::Response) -> Option<Initialize> 
                     buffer.truncate(MAX_BODY);
                 }
                 if let Ok(text) = std::str::from_utf8(&buffer)
-                    && let Some(init) = extract_initialize(text)
+                    && let Some(init) = extract_reply(text)
                 {
                     return Some(init);
                 }
@@ -256,18 +296,16 @@ async fn read_initialize(mut response: reqwest::Response) -> Option<Initialize> 
             }
             // The stream ended: a final parse covers a body that arrived whole.
             Ok(None) => {
-                return std::str::from_utf8(&buffer)
-                    .ok()
-                    .and_then(extract_initialize);
+                return std::str::from_utf8(&buffer).ok().and_then(extract_reply);
             }
             Err(_) => return None,
         }
     }
 }
 
-/// Finds an `initialize` reply in `body`, read as plain JSON or as SSE. For SSE
+/// Finds a reply in `body`, read as plain JSON or as SSE. For SSE
 /// it joins the `data:` lines of each event and parses each event in turn.
-fn extract_initialize(body: &str) -> Option<Initialize> {
+fn extract_reply(body: &str) -> Option<Reply> {
     if let Some(init) = parse_rpc(body) {
         return Some(init);
     }
@@ -292,10 +330,19 @@ fn extract_initialize(body: &str) -> Option<Initialize> {
     }
 }
 
-/// Parses `text` as a JSON-RPC response and reads its `initialize` result. The
-/// result must carry a `protocolVersion` string for the handshake to count.
-fn parse_rpc(text: &str) -> Option<Initialize> {
+/// Parses `text` as a JSON-RPC response. An `error` object is a reply; a
+/// `result` must carry a `protocolVersion` string for the handshake to count.
+fn parse_rpc(text: &str) -> Option<Reply> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
+    if let Some(error) = value.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        return Some(Reply::Error { code, message });
+    }
     let result = value.get("result")?;
     let protocol_version = result.get("protocolVersion")?.as_str()?.to_owned();
     let server_info = result.get("serverInfo");
@@ -307,9 +354,9 @@ fn parse_rpc(text: &str) -> Option<Initialize> {
         .and_then(|info| info.get("version"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    Some(Initialize {
+    Some(Reply::Init(Initialize {
         server_name,
         server_version,
         protocol_version,
-    })
+    }))
 }

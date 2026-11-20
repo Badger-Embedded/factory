@@ -5094,6 +5094,27 @@ async fn a_refused_check_names_a_header_with_no_stored_value() {
 }
 
 #[tokio::test]
+async fn a_json_rpc_error_shows_the_servers_message_escaped() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard.checker.set(CheckOutcome::RpcError {
+        code: -32603,
+        message: "clientInfo.version <b>missing</b>".to_owned(),
+    });
+
+    let reply = dashboard
+        .post("/settings/projects/maestro/mcp/context7/check", "")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("JSON-RPC error -32603"));
+    assert!(
+        reply
+            .body
+            .contains("clientInfo.version &lt;b&gt;missing&lt;/b&gt;")
+    );
+}
+
+#[tokio::test]
 async fn the_check_route_404s_for_an_unknown_project_or_server() {
     let dashboard = dashboard();
     add_context7(&dashboard).await;

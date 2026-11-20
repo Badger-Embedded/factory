@@ -106,6 +106,60 @@ async fn not_mcp(State(fake): State<Arc<Fake>>, request: Request) -> Response {
         .into_response()
 }
 
+/// Answers like a server that validates `initialize` strictly: a JSON-RPC
+/// error over SSE when `clientInfo.version` is missing, the result otherwise.
+/// The error echoes the request's `x-key` header, as a server may.
+async fn strict(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    let key = request
+        .headers()
+        .get("x-key")
+        .map(|value| value.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let data = if body["params"]["clientInfo"]["version"].is_string() {
+        INIT_JSON.to_owned()
+    } else {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32603, "message": format!("clientInfo.version missing, key {key}")},
+        })
+        .to_string()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(axum::body::Body::from(format!(
+            ": connected\n\nevent: message\ndata: {data}\n\n"
+        )))
+        .unwrap()
+}
+
+/// Always answers with a JSON-RPC error that echoes the `x-key` header.
+async fn rpc_error(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    let key = request
+        .headers()
+        .get("x-key")
+        .map(|value| value.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32602, "message": format!("bad key {key} {}", "x".repeat(400))},
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 async fn redirect(State(fake): State<Arc<Fake>>, request: Request) -> Response {
     record(&fake, &request);
     (
@@ -129,6 +183,8 @@ async fn start_fake() -> (Arc<Fake>, String) {
         .route("/sse", get(mcp_sse).post(mcp_sse))
         .route("/unauth", any(unauthorized))
         .route("/nonmcp", any(not_mcp))
+        .route("/strict", any(strict))
+        .route("/rpcerror", any(rpc_error))
         .route("/redirect", any(redirect))
         .route("/slow", any(slow))
         .with_state(Arc::clone(&fake));
@@ -216,6 +272,44 @@ async fn a_non_mcp_2xx_body_is_not_an_mcp_reply() {
         .check(&format!("{base}/nonmcp"), Vec::new())
         .await;
     assert_eq!(outcome, CheckOutcome::NotMcp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_initialize_request_carries_a_client_version() {
+    let (_fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(&format!("{base}/strict"), Vec::new())
+        .await;
+    assert_eq!(
+        outcome,
+        CheckOutcome::Ok {
+            server_name: Some("fake".to_owned()),
+            server_version: Some("9.9".to_owned()),
+            protocol_version: "2025-06-18".to_owned(),
+        },
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_json_rpc_error_is_reported_cut_and_without_header_values() {
+    let (_fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(
+            &format!("{base}/rpcerror"),
+            headers(&[("x-key", "sk-secret-123")]),
+        )
+        .await;
+    let CheckOutcome::RpcError { code, message } = outcome else {
+        panic!("expected a JSON-RPC error, got {outcome:?}");
+    };
+    assert_eq!(code, -32602);
+    assert!(message.starts_with("bad key [redacted] x"), "{message}");
+    assert!(!message.contains("sk-secret-123"));
+    assert_eq!(
+        message.chars().count(),
+        303,
+        "300 characters and an ellipsis"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
