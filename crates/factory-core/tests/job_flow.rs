@@ -777,6 +777,7 @@ fn the_gate_takes_no_approval_before_checks_pass_and_no_summary_after() {
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Summarized(summary()));
     assert!(job.apply(Event::Summarized(summary())).is_err());
+}
 
 #[test]
 fn merged_failed_and_cancelled_jobs_are_finished() {

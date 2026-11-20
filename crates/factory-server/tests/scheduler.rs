@@ -789,6 +789,7 @@ async fn the_publish_gate_holds_the_push_until_the_user_approves() {
         store.get(id).unwrap().job.stage(),
         &Stage::CiAndReview { pr: 0 }
     );
+}
 
 mod purge {
     use super::*;
