@@ -378,6 +378,11 @@ select:focus, textarea:focus, button:focus-visible { outline: var(--focus-ring);
 
 .field { margin-bottom: var(--space-14); }
 
+.field > .label { display: block; font-weight: var(--weight-semibold); margin: 0 0 var(--space-6); }
+.mcp-header-row { display: flex; gap: var(--space-8); align-items: center; margin-bottom: var(--space-8); }
+.mcp-header-row > .grow { flex: 1 1 auto; }
+.mcp-headers + .add-header { margin-bottom: var(--space-6); }
+
 button {
   font: inherit;
   font-weight: var(--weight-semibold);

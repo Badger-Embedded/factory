@@ -23,6 +23,12 @@ pub const STYLESHEET: &str = include_str!("../static/style.css");
 pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
+const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
+
+/// The characters a header name may hold, as an HTML `pattern`, so the browser
+/// refuses `Authorization: x` before the form posts. It matches the server's
+/// `is_token_char`; the server still validates, so the pattern is only a hint.
+const HEADER_NAME_PATTERN: &str = "[A-Za-z0-9!#$%&'*+.^_`|~-]+";
 /// Keeps the log scroll place and a half-typed form across a poll's swap. It
 /// runs once on the job page, outside every swapped region, so a swap never
 /// re-runs or removes it.
@@ -473,8 +479,46 @@ pub fn settings(
             @for project in projects {
                 (project_form(project, secrets_available))
             }
+            script { (PreEscaped(MCP_HEADER_ROWS)) }
         },
     )
+}
+
+/// The header-name rows a server form shares: one text box per stored name, each
+/// with a Remove button, then one empty box for a new name, then an "Add header"
+/// button and the given `hint`. The names post as a repeated `header` field. The
+/// box's `pattern` refuses anything but an HTTP header name in the browser, so a
+/// pasted `Authorization: x` is caught before the form posts; the server
+/// validates again. "Add header" and "Remove" run `MCP_HEADER_ROWS`. Without
+/// JavaScript the form still works: you add one name per save and remove a name
+/// by clearing its box.
+fn header_rows(names: &[String], hint: &Markup) -> Markup {
+    html! {
+        div.field {
+            span.label { "Header names" }
+            div.mcp-headers {
+                @for name in names {
+                    (header_row(name))
+                }
+                (header_row(""))
+            }
+            button.add-header type="button" { "Add header" }
+            (hint)
+        }
+    }
+}
+
+/// One header-name row: a text box named `header` and a Remove button.
+fn header_row(value: &str) -> Markup {
+    html! {
+        div.mcp-header-row {
+            input.grow type="text" name="header" placeholder="Authorization"
+                pattern=(HEADER_NAME_PATTERN) aria-label="Header name"
+                title="Only the header name, with no colon or value."
+                value=(value);
+            button.remove-header type="button" { "Remove" }
+        }
+    }
 }
 
 /// The "MCP servers" section: one edit form per registered server, then a form
@@ -513,11 +557,9 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
                     placeholder="https://mcp.context7.com/mcp";
                 p.hint { "An https URL to the server's streamable-HTTP endpoint." }
             }
-            div.field {
-                label for="mcp-new-headers" { "Header names" }
-                textarea #mcp-new-headers name="headers" placeholder="Authorization" {}
-                p.hint { "Optional, one per line. Each project gives its own value for these, such as an API key. A keyless server needs none." }
-            }
+            (header_rows(&[], &html! {
+                p.hint { "Only the header name, such as " code { "Authorization" } ", with no colon or value. Each project enters its own value in its settings below, stored encrypted. A keyless server needs none." }
+            }))
             button.primary { "Add server" }
         }
     }
@@ -537,14 +579,10 @@ fn mcp_server_form(server: &McpServer) -> Markup {
                 input id={ "mcp-" (server.name) "-url" }.wide type="url" name="url" required
                     value=(server.url);
             }
-            div.field {
-                label for={ "mcp-" (server.name) "-headers" } { "Header names" }
-                textarea id={ "mcp-" (server.name) "-headers" } name="headers" {
-                    (server.headers.join("\n"))
-                }
-                p.hint { "One per line. Each project gives its own value for these." }
-            }
-            p.hint { "Changing the URL's host or port deletes every project's stored values for this server, so they must be entered again. Changing only the path keeps them." }
+            (header_rows(&server.headers, &html! {
+                p.hint { "Only the header name, with no colon or value. Each project enters its own value in its settings below, stored encrypted." }
+                p.hint { "Removing or renaming a header deletes every project's stored value for it, so a renamed header's value must be entered again under the new name. Changing the URL's host or port deletes every project's stored values for this server. Changing only the path keeps them." }
+            }))
             div.row {
                 button.primary { "Save" }
                 button.danger formaction=(delete) formnovalidate { "Delete" }

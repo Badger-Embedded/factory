@@ -4305,7 +4305,7 @@ async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
     let added = dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
     assert_eq!(added.status, StatusCode::OK);
@@ -4325,7 +4325,7 @@ async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
     let edited = dashboard
         .post(
             "/settings/mcp/context7",
-            "url=https%3A%2F%2Fmcp.context7.com%2Fv2%2Fmcp&headers=",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fv2%2Fmcp&header=",
         )
         .await;
     assert_eq!(edited.status, StatusCode::OK);
@@ -4346,7 +4346,7 @@ async fn an_invalid_mcp_server_is_a_bad_request() {
     let bad_url = dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=http%3A%2F%2Fx.test%2Fmcp&headers=",
+            "name=context7&url=http%3A%2F%2Fx.test%2Fmcp&header=",
         )
         .await;
     assert_eq!(bad_url.status, StatusCode::BAD_REQUEST);
@@ -4354,12 +4354,96 @@ async fn an_invalid_mcp_server_is_a_bad_request() {
     let reserved = dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fx.test%2Fmcp&headers=Host",
+            "name=context7&url=https%3A%2F%2Fx.test%2Fmcp&header=Host",
         )
         .await;
     assert_eq!(reserved.status, StatusCode::BAD_REQUEST);
     // Nothing was stored.
     assert_eq!(dashboard.store.mcp_servers().unwrap(), Vec::new());
+}
+
+#[tokio::test]
+async fn the_add_server_form_has_header_name_rows_not_a_textarea() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/settings").await.body;
+    // The header names live in text boxes posting a repeated `header` field,
+    // with an "Add header" button, and no textarea or `headers` field remains.
+    assert!(page.contains(r#"name="header""#));
+    assert!(page.contains("Add header"));
+    assert!(page.contains("pattern="));
+    assert!(!page.contains(r#"name="headers""#));
+    assert!(!page.contains("<textarea id=\"mcp-new-headers\""));
+}
+
+#[tokio::test]
+async fn header_rows_are_trimmed_deduplicated_and_empty_rows_dropped() {
+    let dashboard = dashboard();
+    // One empty row, a duplicate spelling and a padded value all collapse: the
+    // server stores "Authorization" once and "X-Team" once.
+    let added = dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp\
+             &header=Authorization&header=&header=+authorization+&header=X-Team",
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert_eq!(
+        dashboard
+            .store
+            .mcp_server("context7")
+            .unwrap()
+            .unwrap()
+            .headers,
+        vec!["Authorization".to_owned(), "X-Team".to_owned()],
+    );
+}
+
+#[tokio::test]
+async fn a_header_name_with_a_colon_is_a_bad_request() {
+    let dashboard = dashboard();
+    // A pasted "Authorization: Bearer x" that slips past the browser pattern is
+    // refused by the server, and nothing is stored.
+    let bad = dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fx.test%2Fmcp&header=Authorization%3A+Bearer+x",
+        )
+        .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+    assert_eq!(dashboard.store.mcp_servers().unwrap(), Vec::new());
+}
+
+#[tokio::test]
+async fn an_edit_form_shows_a_filled_row_per_name_and_an_empty_one() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
+        )
+        .await;
+    let page = dashboard.get("/settings").await.body;
+    // The edit form carries the stored name in a text box, ready to edit.
+    assert!(page.contains(r#"value="Authorization""#));
+    assert!(page.contains(r#"name="header""#));
+    // Clearing the one row on save removes the header.
+    let edited = dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=",
+        )
+        .await;
+    assert_eq!(edited.status, StatusCode::OK);
+    assert_eq!(
+        dashboard
+            .store
+            .mcp_server("context7")
+            .unwrap()
+            .unwrap()
+            .headers,
+        Vec::<String>::new(),
+    );
 }
 
 /// Stores a value for maestro's `context7` `Authorization` header with the same
@@ -4395,7 +4479,7 @@ async fn a_projects_form_has_a_block_per_server_defaulting_to_off() {
     dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
     let page = dashboard.get("/settings").await.body;
@@ -4424,7 +4508,7 @@ async fn enabling_a_server_with_no_stage_is_a_bad_request() {
     dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=",
         )
         .await;
     let reply = dashboard
@@ -4448,7 +4532,7 @@ async fn enabling_a_server_with_a_stage_saves_it() {
     dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=",
         )
         .await;
     let reply = dashboard
@@ -4471,7 +4555,7 @@ async fn the_page_never_renders_a_stored_header_value() {
     dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
     store_auth_value(&dashboard, "Bearer sk-secret-xyz");
@@ -4491,7 +4575,7 @@ async fn an_empty_header_field_keeps_the_stored_value_and_clear_deletes_it() {
     dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
     store_auth_value(&dashboard, "Bearer sk-keep");
@@ -4541,7 +4625,7 @@ async fn saving_one_projects_mcp_leaves_other_projects_alone() {
     dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=",
         )
         .await;
     // tool turns the server on for the plan stage.
@@ -4580,7 +4664,7 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
     dashboard
         .post(
             "/settings/mcp",
-            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
 
