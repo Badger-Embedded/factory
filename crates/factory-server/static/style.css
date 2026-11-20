@@ -446,6 +446,21 @@ button:hover { filter: brightness(0.96); }
 .job-main { grid-area: main; min-width: 0; }
 .job-side { grid-area: side; min-width: 0; }
 
+/* The left column is often far taller than the timeline, so pin the side
+   column under the sticky top bar and let it keep its own scroll. The styles
+   go here, not on #job-timeline, because the poll swaps #job-timeline
+   out-of-band while .job-side stays, so the inner scroll position survives a
+   swap. */
+@media (min-width: 901px) {
+  .job-side {
+    position: sticky;
+    top: calc(var(--topbar-height) + var(--space-16));
+    max-height: calc(100vh - var(--topbar-height) - var(--space-16) - var(--space-16));
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+}
+
 @media (max-width: 900px) {
   .job-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "now" "side" "main"; }
 }
