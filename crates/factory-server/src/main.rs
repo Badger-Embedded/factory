@@ -46,8 +46,15 @@ async fn start_mcp_proxy(
     // A proxy-side failure to reach a server records a warning on the job, the
     // same path the runner's init-line check uses, deduped so a server is warned
     // about at most once per run.
-    let warn: WarnFn = Arc::new(move |warning: ProxyWarning| {
-        warnings.record(warning.job, &warning.server, &warning.reason);
+    let warn: WarnFn = Arc::new(move |warning: ProxyWarning| match warning {
+        ProxyWarning::Unavailable {
+            job,
+            server,
+            reason,
+        } => warnings.record(job, &server, &reason),
+        ProxyWarning::ToolBlocked { job, server, tool } => {
+            warnings.record_tool_blocked(job, &server, &tool);
+        }
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("MCP proxy listening on http://{listen}");

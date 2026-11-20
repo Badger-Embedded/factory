@@ -1,5 +1,6 @@
 //! Records an unavailable MCP server as a warning on a job, at most once per
-//! server per run.
+//! server per run, and a call the proxy refused to a tool the project turned
+//! off, at most once per server and tool per run.
 //!
 //! Two paths report that a run could not use a server: the proxy, when it
 //! cannot reach the server, a connection times out or the server answers 5xx;
@@ -9,6 +10,9 @@
 //! All three funnel through [`McpWarnings`], which dedupes per run and writes
 //! the warning: a factory line to the job log and an `mcp-unavailable` row to
 //! `job_events`, neither of which changes the job's stage or turn.
+//!
+//! A refused tool call comes only from the proxy. It writes a factory line to
+//! the job log and an `mcp-tool-blocked` row to `job_events`.
 //!
 //! The dedup is keyed by job. A job runs one agent run at a time, so
 //! [`McpWarnings::begin`] clears the servers warned in the job's previous run
@@ -20,12 +24,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::store::Store;
 
-/// The servers already warned about in each job's current run, and the store
-/// the warning is written to. Shared by the scheduler and the proxy's warning
-/// callback.
+/// What a run already warned about: a server that was unavailable, or a
+/// server and tool whose call the proxy refused.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Warned {
+    Unavailable(String),
+    ToolBlocked(String, String),
+}
+
+/// The servers and tools already warned about in each job's current run, and
+/// the store the warning is written to. Shared by the scheduler and the proxy's
+/// warning callback.
 pub struct McpWarnings {
     store: Arc<Store>,
-    warned: Mutex<HashMap<i64, HashSet<String>>>,
+    warned: Mutex<HashMap<i64, HashSet<Warned>>>,
 }
 
 impl McpWarnings {
@@ -57,18 +69,35 @@ impl McpWarnings {
     /// and an `mcp-unavailable` event; a database error is logged without the
     /// reason, which names no credential anyway.
     pub fn record(&self, job_id: i64, server: &str, reason: &str) {
-        {
-            let mut warned = self.lock();
-            if !warned.entry(job_id).or_default().insert(server.to_owned()) {
-                return;
-            }
+        if !self.first(job_id, Warned::Unavailable(server.to_owned())) {
+            return;
         }
         if let Err(err) = self.store.record_mcp_unavailable(job_id, server, reason) {
             tracing::error!("job {job_id}: recording MCP server {server:?} as unavailable: {err}");
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i64, HashSet<String>>> {
+    /// Records that the proxy refused `job_id`'s call to `tool` of `server`,
+    /// which the project turned off, unless this run already recorded that
+    /// tool. A record writes a job log line and an `mcp-tool-blocked` event.
+    pub fn record_tool_blocked(&self, job_id: i64, server: &str, tool: &str) {
+        if !self.first(
+            job_id,
+            Warned::ToolBlocked(server.to_owned(), tool.to_owned()),
+        ) {
+            return;
+        }
+        if let Err(err) = self.store.record_mcp_tool_blocked(job_id, server, tool) {
+            tracing::error!("job {job_id}: recording a blocked call to {server:?} {tool:?}: {err}");
+        }
+    }
+
+    /// Whether `warning` is new for `job_id`'s run, adding it when it is.
+    fn first(&self, job_id: i64, warning: Warned) -> bool {
+        self.lock().entry(job_id).or_default().insert(warning)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i64, HashSet<Warned>>> {
         // No invariant spans the guard, so recover a poisoned lock rather than
         // fail every later warning.
         self.warned.lock().unwrap_or_else(PoisonError::into_inner)

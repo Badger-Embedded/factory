@@ -14,7 +14,7 @@ use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::check::McpChecker;
+use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::github::{RepoChecker, RepoReport};
 use crate::mcp::{McpError, McpProjectSettings, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
@@ -734,6 +734,7 @@ fn settings_page(
                         enabled: saved.enabled,
                         stages: saved.stages,
                         headers,
+                        tools: state.store.mcp_tools(&name, &server.name)?,
                     })
                 })
                 .collect::<Result<Vec<_>, StoreError>>()?;
@@ -858,7 +859,19 @@ async fn save_project_models(
                 }
             }
         }
-        saves.push((server, settings));
+        // Each shown tool posts a hidden `shown` field and, when it is on, a
+        // ticked `tool` field. A tool the form did not show is left as it is.
+        let shown = format!("{base}.shown.");
+        let tools: Vec<(String, bool)> = form
+            .0
+            .keys()
+            .filter_map(|key| key.strip_prefix(&shown))
+            .map(|tool| {
+                let off = !form.ticked(&format!("{base}.tool.{tool}"));
+                (tool.to_owned(), off)
+            })
+            .collect();
+        saves.push((server, settings, tools));
     }
 
     // Efforts first, so a bad level is rejected before anything is written.
@@ -869,10 +882,13 @@ async fn save_project_models(
         form.ticked("auto_merge"),
         form.ticked("llm_review"),
     )?;
-    for (server, settings) in &saves {
+    for (server, settings, tools) in &saves {
         state
             .store
             .save_project_mcp(&name, &server.name, settings)?;
+        state
+            .store
+            .save_mcp_tool_states(&name, &server.name, tools)?;
         for header in &server.headers {
             let at = SecretRef {
                 project: &name,
@@ -964,12 +980,14 @@ async fn delete_mcp_server(
     settings_page(&state, &headers, Some("Deleted."))
 }
 
-/// Checks a project's connection to one MCP server and returns an HTML fragment
-/// with the result, which htmx swaps into the server block. The check uses the
-/// saved URL and the project's saved header values, resolved the way the proxy
-/// resolves them, so it and a real run send the same headers. Any form field
-/// posted with the request is ignored, so an unsaved value typed into the page
-/// is never sent. The result is not stored.
+/// Checks a project's connection to one MCP server, stores the tools it lists,
+/// and returns the server block's refresh fragment: the result and the tool
+/// list, which htmx swaps in. The check uses the saved URL and the project's
+/// saved header values, resolved the way the proxy resolves them, so it and a
+/// real run send the same headers. Any form field posted with the request is
+/// ignored, so an unsaved value typed into the page is never sent. Only a
+/// complete tool list replaces the stored one; the result itself is not
+/// stored.
 async fn check_mcp_server(
     State(state): State<AppState>,
     Path((project, server)): Path<(String, String)>,
@@ -986,7 +1004,7 @@ async fn check_mcp_server(
     // a run send the same headers. `resolve` returns `None` only for a server
     // that is not registered, which the lookup above has ruled out.
     let upstreams = StoreUpstreams::new(Arc::clone(&state.store), Arc::clone(&state.secrets));
-    let Upstream { url, headers } = upstreams
+    let Upstream { url, headers, .. } = upstreams
         .resolve(&project, &server)
         .ok_or_else(|| AppError::NotFound(format!("no MCP server named {server:?}")))?;
     // A declared header with no resolved value has none stored, or one that
@@ -999,7 +1017,20 @@ async fn check_mcp_server(
         .cloned()
         .collect();
     let outcome = state.checker.check(&url, headers).await;
-    Ok(pages::mcp_check_result(&outcome, &missing))
+    if let CheckOutcome::Ok {
+        tools: ToolList::Listed(tools),
+        ..
+    } = &outcome
+    {
+        state.store.replace_mcp_tools(&project, &server, tools)?;
+    }
+    let tools = state.store.mcp_tools(&project, &server)?;
+    Ok(pages::mcp_refresh(
+        &project,
+        &server,
+        &tools,
+        Some(pages::mcp_check_result(&outcome, &missing)),
+    ))
 }
 
 #[derive(Deserialize)]

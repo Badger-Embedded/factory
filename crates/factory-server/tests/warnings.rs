@@ -71,3 +71,48 @@ fn a_server_is_warned_about_at_most_once_per_run() {
     warnings.record(id, "context7", "the server could not be reached");
     assert_eq!(unavailable(&store, id).len(), 3);
 }
+
+/// The `mcp-tool-blocked` rows of job `id`, in order.
+fn blocked(store: &Store, id: i64) -> Vec<String> {
+    store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event == "mcp-tool-blocked")
+        .map(|event| event.detail.unwrap_or_default())
+        .collect()
+}
+
+#[test]
+fn a_refused_tool_call_is_recorded_once_per_tool_per_run() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let id = store.create("maestro", "alice", "x").unwrap();
+    store.apply(id, Event::Start).unwrap();
+    let before = store.get(id).unwrap().job.stage().clone();
+    let warnings = McpWarnings::new(Arc::clone(&store));
+
+    warnings.begin(id);
+    warnings.record_tool_blocked(id, "context7", "delete");
+    warnings.record_tool_blocked(id, "context7", "delete");
+    assert_eq!(blocked(&store, id), vec!["context7: delete"]);
+    assert_eq!(&store.get(id).unwrap().job.stage().clone(), &before);
+
+    // Another tool, and the server's own unavailable warning, are separate.
+    warnings.record_tool_blocked(id, "context7", "write");
+    warnings.record(id, "context7", "the server answered 503");
+    assert_eq!(blocked(&store, id).len(), 2);
+    assert_eq!(unavailable(&store, id).len(), 1);
+
+    let line = store
+        .logs(id, 10)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.text.contains("MCP tool delete"))
+        .expect("a factory line names the tool");
+    assert_eq!(line.kind, "factory");
+
+    // A new run records the tool afresh.
+    warnings.begin(id);
+    warnings.record_tool_blocked(id, "context7", "delete");
+    assert_eq!(blocked(&store, id).len(), 3);
+}

@@ -18,13 +18,13 @@ mod warnings;
 mod web;
 mod workers;
 
-pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT};
+pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT, ToolList};
 pub use cost::{format_cost, merge_fraction};
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
     check_repo,
 };
-pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages};
+pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
 pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, import_tomls};
 pub use proxy::{ProxyWarning, RunTokens, StoreUpstreams, Upstream, Upstreams, WarnFn, proxy_app};

@@ -1,11 +1,12 @@
-//! The per-project MCP connection check behind the "Check connection" button.
+//! The per-project MCP connection check behind the "Refresh connection"
+//! button.
 //!
 //! A project's server block on the settings page can test the server with the
 //! project's saved header values, the same values the proxy would send. The
-//! check sends one JSON-RPC `initialize` request and reports whether a valid
-//! MCP reply came back. It follows no redirect, so a header value never reaches
-//! another host, and it stores nothing: the result lives only in the fragment
-//! htmx swaps in.
+//! check sends a JSON-RPC `initialize` request and reports whether a valid MCP
+//! reply came back. After a valid reply it lists the server's tools with
+//! `tools/list`, which the dashboard stores for the project. It follows no
+//! redirect, so a header value never reaches another host.
 //!
 //! The HTTP part sits behind the [`McpChecker`] trait, held by the dashboard
 //! the way it holds [`RepoChecker`](crate::github::RepoChecker). Production uses
@@ -17,13 +18,18 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio::time::Instant;
+
+use crate::mcp::McpTool;
 
 /// The connect timeout, the same as the proxy's. The host must accept a
 /// connection within this window.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The whole check's timeout. A server that accepts the connection but does not
-/// answer within this window is reported as a timeout.
+/// The whole check's timeout, the tool listing included. A server that accepts
+/// the connection but does not answer `initialize` within this window is
+/// reported as a timeout; one that answers it but not the listing gets
+/// [`ToolList::Failed`].
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The most of a response body the check reads before it gives up looking for
@@ -42,6 +48,10 @@ const CLIENT_NAME: &str = "factory";
 /// `initialize` without it.
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The most `tools/list` pages the check follows. A server whose cursor never
+/// ends gets [`ToolList::Failed`] rather than an endless loop.
+const MAX_TOOL_PAGES: usize = 100;
+
 /// The most characters of a server's JSON-RPC error message the result shows.
 const MAX_ERROR_MESSAGE: usize = 300;
 
@@ -55,6 +65,7 @@ pub enum CheckOutcome {
         server_name: Option<String>,
         server_version: Option<String>,
         protocol_version: String,
+        tools: ToolList,
     },
     /// The connection could not be made: DNS, a refused connection, or TLS.
     Unreachable,
@@ -75,6 +86,17 @@ pub enum CheckOutcome {
     /// A 2xx reply that parsed as neither an `initialize` response nor a
     /// JSON-RPC error.
     NotMcp,
+}
+
+/// What listing the server's tools after a valid `initialize` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolList {
+    /// Every page of `tools/list`, in the server's order. Empty for a server
+    /// that declares no `tools` capability.
+    Listed(Vec<McpTool>),
+    /// The listing failed or was cut short, with a reason that names no header
+    /// value. The stored list stays as it was.
+    Failed(String),
 }
 
 /// Runs the MCP connection check behind a trait object, so the dashboard holds
@@ -144,18 +166,65 @@ impl McpChecker for HttpMcpChecker {
         headers: Vec<(String, String)>,
     ) -> Pin<Box<dyn Future<Output = CheckOutcome> + Send + 'a>> {
         Box::pin(async move {
-            match tokio::time::timeout(self.total_timeout, self.run(url, &headers)).await {
-                Ok(outcome) => outcome,
-                Err(_elapsed) => CheckOutcome::Timeout,
-            }
+            let deadline = Instant::now() + self.total_timeout;
+            self.run(url, &headers, deadline).await
         })
     }
 }
 
 impl HttpMcpChecker {
-    /// Sends the request and classifies the reply. The caller wraps this in the
-    /// total timeout.
-    async fn run(&self, url: &str, headers: &[(String, String)]) -> CheckOutcome {
+    /// Sends `initialize`, classifies the reply, and lists the tools after a
+    /// valid one, all before `deadline`.
+    async fn run(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        deadline: Instant,
+    ) -> CheckOutcome {
+        let Ok(outcome) = tokio::time::timeout_at(deadline, self.initialize(url, headers)).await
+        else {
+            return CheckOutcome::Timeout;
+        };
+        let (outcome, session) = outcome;
+        let CheckOutcome::Ok {
+            server_name,
+            server_version,
+            protocol_version,
+            ..
+        } = outcome
+        else {
+            return outcome;
+        };
+        let session = session.unwrap_or_default();
+        let tools = if session.has_tools {
+            let listing = self.list_tools(url, headers, &protocol_version, session.id.as_deref());
+            match tokio::time::timeout_at(deadline, listing).await {
+                Ok(tools) => tools,
+                Err(_elapsed) => {
+                    ToolList::Failed("the server did not list its tools in time".to_owned())
+                }
+            }
+        } else {
+            ToolList::Listed(Vec::new())
+        };
+        if let Some(id) = &session.id {
+            let _ = tokio::time::timeout_at(deadline, self.end_session(url, headers, id)).await;
+        }
+        CheckOutcome::Ok {
+            server_name,
+            server_version,
+            protocol_version,
+            tools,
+        }
+    }
+
+    /// Sends `initialize` and classifies the reply. On a valid reply it also
+    /// returns the session the server opened.
+    async fn initialize(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> (CheckOutcome, Option<Session>) {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -181,17 +250,20 @@ impl HttpMcpChecker {
 
         let response = match request.send().await {
             Ok(response) => response,
-            Err(err) if err.is_timeout() => return CheckOutcome::Timeout,
+            Err(err) if err.is_timeout() => return (CheckOutcome::Timeout, None),
             // A refused connection, an unknown host or a TLS failure. The error
             // is not shown, so no header value can leak through it.
-            Err(_) => return CheckOutcome::Unreachable,
+            Err(_) => return (CheckOutcome::Unreachable, None),
         };
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return CheckOutcome::Refused {
-                status: status.as_u16(),
-            };
+            return (
+                CheckOutcome::Refused {
+                    status: status.as_u16(),
+                },
+                None,
+            );
         }
         if !status.is_success() {
             let location = response
@@ -199,10 +271,13 @@ impl HttpMcpChecker {
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            return CheckOutcome::HttpStatus {
-                status: status.as_u16(),
-                location,
-            };
+            return (
+                CheckOutcome::HttpStatus {
+                    status: status.as_u16(),
+                    location,
+                },
+                None,
+            );
         }
 
         let session_id = response
@@ -210,22 +285,125 @@ impl HttpMcpChecker {
             .get("mcp-session-id")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        match read_reply(response).await {
-            Some(Reply::Error { code, message }) => CheckOutcome::RpcError {
-                code,
-                message: redact(&message, headers),
-            },
-            Some(Reply::Init(init)) => {
-                if let Some(id) = session_id {
-                    self.end_session(url, headers, &id).await;
-                }
+        match read_reply(response, parse_rpc).await {
+            Some(Reply::Error { code, message }) => (
+                CheckOutcome::RpcError {
+                    code,
+                    message: redact(&message, headers),
+                },
+                None,
+            ),
+            Some(Reply::Init(init)) => (
                 CheckOutcome::Ok {
                     server_name: init.server_name,
                     server_version: init.server_version,
                     protocol_version: init.protocol_version,
+                    tools: ToolList::Listed(Vec::new()),
+                },
+                Some(Session {
+                    id: session_id,
+                    has_tools: init.has_tools,
+                }),
+            ),
+            None => (CheckOutcome::NotMcp, None),
+        }
+    }
+
+    /// Sends `notifications/initialized`, then pages through `tools/list` by
+    /// its cursor. Each request carries the negotiated protocol version and the
+    /// session id, as the streamable-HTTP transport requires after the
+    /// handshake.
+    async fn list_tools(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        protocol_version: &str,
+        session: Option<&str>,
+    ) -> ToolList {
+        let initialized = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        if let Err(reason) = self
+            .post(url, headers, protocol_version, session, &initialized)
+            .await
+        {
+            return ToolList::Failed(reason);
+        }
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page in 0..MAX_TOOL_PAGES {
+            let mut params = json!({});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": page + 2,
+                "method": "tools/list",
+                "params": params,
+            });
+            let response = match self
+                .post(url, headers, protocol_version, session, &request)
+                .await
+            {
+                Ok(response) => response,
+                Err(reason) => return ToolList::Failed(reason),
+            };
+            match read_reply(response, parse_tools_page).await {
+                Some(Ok(page)) => {
+                    tools.extend(page.tools);
+                    match page.next_cursor {
+                        Some(next) => cursor = Some(next),
+                        None => return ToolList::Listed(tools),
+                    }
+                }
+                Some(Err((code, message))) => {
+                    return ToolList::Failed(format!(
+                        "tools/list returned error {code}: {}",
+                        redact(&message, headers)
+                    ));
+                }
+                None => {
+                    return ToolList::Failed("the tools/list reply was not valid".to_owned());
                 }
             }
-            None => CheckOutcome::NotMcp,
+        }
+        ToolList::Failed(format!(
+            "the server returned more than {MAX_TOOL_PAGES} pages of tools"
+        ))
+    }
+
+    /// POSTs one JSON-RPC message in an open session and returns a 2xx
+    /// response, or a reason that names no header value.
+    async fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        protocol_version: &str,
+        session: Option<&str>,
+        message: &Value,
+    ) -> Result<reqwest::Response, String> {
+        let mut request = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .header("mcp-protocol-version", protocol_version)
+            .body(serde_json::to_vec(message).unwrap_or_default());
+        if let Some(id) = session {
+            request = request.header("mcp-session-id", id);
+        }
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => Ok(response),
+            Ok(response) => Err(format!(
+                "the server answered HTTP {} while listing tools",
+                response.status().as_u16()
+            )),
+            Err(_) => Err("the request to list tools failed".to_owned()),
         }
     }
 
@@ -238,6 +416,20 @@ impl HttpMcpChecker {
         }
         let _ = request.send().await;
     }
+}
+
+/// The session an `initialize` reply opened: the server's `Mcp-Session-Id`,
+/// if it sent one, and whether it declared the `tools` capability.
+#[derive(Default)]
+struct Session {
+    id: Option<String>,
+    has_tools: bool,
+}
+
+/// One page of a `tools/list` result.
+struct ToolsPage {
+    tools: Vec<McpTool>,
+    next_cursor: Option<String>,
 }
 
 /// What a JSON-RPC response to `initialize` held.
@@ -269,13 +461,14 @@ struct Initialize {
     server_name: Option<String>,
     server_version: Option<String>,
     protocol_version: String,
+    has_tools: bool,
 }
 
-/// Reads the response body, up to [`MAX_BODY`], and parses a reply from it.
-/// The body may be plain JSON or an SSE stream. The first `data:` event that
-/// carries a JSON-RPC error or a `result.protocolVersion` counts. Returns
-/// `None` when no such reply arrives.
-async fn read_reply(mut response: reqwest::Response) -> Option<Reply> {
+/// Reads the response body, up to [`MAX_BODY`], and parses a reply from it
+/// with `parse`. The body may be plain JSON or an SSE stream. The first
+/// `data:` event `parse` accepts counts. Returns `None` when no such reply
+/// arrives.
+async fn read_reply<T>(mut response: reqwest::Response, parse: fn(&str) -> Option<T>) -> Option<T> {
     let mut buffer = Vec::new();
     loop {
         match response.chunk().await {
@@ -286,9 +479,9 @@ async fn read_reply(mut response: reqwest::Response) -> Option<Reply> {
                     buffer.truncate(MAX_BODY);
                 }
                 if let Ok(text) = std::str::from_utf8(&buffer)
-                    && let Some(init) = extract_reply(text)
+                    && let Some(reply) = extract_reply(text, parse)
                 {
-                    return Some(init);
+                    return Some(reply);
                 }
                 if capped {
                     return None;
@@ -296,7 +489,9 @@ async fn read_reply(mut response: reqwest::Response) -> Option<Reply> {
             }
             // The stream ended: a final parse covers a body that arrived whole.
             Ok(None) => {
-                return std::str::from_utf8(&buffer).ok().and_then(extract_reply);
+                return std::str::from_utf8(&buffer)
+                    .ok()
+                    .and_then(|text| extract_reply(text, parse));
             }
             Err(_) => return None,
         }
@@ -305,9 +500,9 @@ async fn read_reply(mut response: reqwest::Response) -> Option<Reply> {
 
 /// Finds a reply in `body`, read as plain JSON or as SSE. For SSE
 /// it joins the `data:` lines of each event and parses each event in turn.
-fn extract_reply(body: &str) -> Option<Reply> {
-    if let Some(init) = parse_rpc(body) {
-        return Some(init);
+fn extract_reply<T>(body: &str, parse_rpc: fn(&str) -> Option<T>) -> Option<T> {
+    if let Some(reply) = parse_rpc(body) {
+        return Some(reply);
     }
     let mut data = String::new();
     for line in body.lines() {
@@ -354,9 +549,49 @@ fn parse_rpc(text: &str) -> Option<Reply> {
         .and_then(|info| info.get("version"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let has_tools = result
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("tools"))
+        .is_some_and(|tools| !tools.is_null());
     Some(Reply::Init(Initialize {
         server_name,
         server_version,
         protocol_version,
+        has_tools,
     }))
+}
+
+/// Parses `text` as a `tools/list` response: a page of tools, or a JSON-RPC
+/// error's code and message. A tool with no string `name` is skipped.
+fn parse_tools_page(text: &str) -> Option<Result<ToolsPage, (i64, String)>> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    if let Some(error) = value.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        return Some(Err((code, message)));
+    }
+    let result = value.get("result")?;
+    let tools = result
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|tool| {
+            Some(McpTool {
+                name: tool.get("name")?.as_str()?.to_owned(),
+                description: tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect();
+    let next_cursor = result
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(Ok(ToolsPage { tools, next_cursor }))
 }
