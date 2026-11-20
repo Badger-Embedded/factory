@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, Gates, Job, PlanUsage, Stage, Task, Turn, UsageWindow,
+    Ask, BranchSummary, Command, Gates, Job, PlanUsage, Stage, Task, Turn, UsageWindow, Verdict,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -678,6 +678,7 @@ pub fn job(
             (request_card(id, job, images))
             (spec_region(false, job))
             (plan_region(false, job, repo_url))
+            (reviews_region(false, job))
             (log_region(false, logs))
             @if *job.turn() != Turn::Done {
                 form.footer-actions method="post" action={ "/jobs/" (id) "/cancel" } {
@@ -718,6 +719,7 @@ pub fn job_fragment(
         (status_region(true, row.id, job, settings, auto_merge))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
+        (reviews_region(true, job))
         (log_region(true, logs))
     }
 }
@@ -782,6 +784,14 @@ fn spec_region(oob: bool, job: &Job) -> Markup {
 fn plan_region(oob: bool, job: &Job, repo_url: Option<&str>) -> Markup {
     html! {
         div #job-plan hx-swap-oob=[oob.then_some("true")] { (plan_card(job, repo_url)) }
+    }
+}
+
+/// The LLM review passes, in a region a poll swaps. A pass is added each time
+/// the reviewer runs, so the card grows while a job is live.
+fn reviews_region(oob: bool, job: &Job) -> Markup {
+    html! {
+        div #job-reviews hx-swap-oob=[oob.then_some("true")] { (reviews_card(job)) }
     }
 }
 
@@ -865,6 +875,49 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
                 }
             }
         }
+    }
+}
+
+/// Every review pass the reviewer has run, oldest first, each with its number,
+/// verdict and feedback. The feedback stays on the factory, never on the pull
+/// request. An empty list renders nothing, so the OOB wrapper has a target
+/// before the first pass.
+fn reviews_card(job: &Job) -> Markup {
+    html! {
+        @if !job.reviews().is_empty() {
+            div.card {
+                h2 { "LLM review" }
+                ol.reviews {
+                    @for pass in job.reviews() {
+                        li {
+                            div.review-head {
+                                span.review-number { "Pass " (pass.number) }
+                                span class={ "badge " (verdict_class(pass.verdict)) } {
+                                    (verdict_label(pass.verdict))
+                                }
+                            }
+                            @if let Some(feedback) = &pass.feedback {
+                                pre.doc { (feedback) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn verdict_class(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Approve => "ok",
+        Verdict::Changes => "you",
+    }
+}
+
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Approve => "approved",
+        Verdict::Changes => "changes requested",
     }
 }
 
@@ -985,6 +1038,15 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
                 summary: Some(summary),
             }),
         ) => publish_card(id, job, *pr, summary),
+        (_, Turn::User(Ask::ReviewStopped { reason })) => html! {
+            div.card.needs-you {
+                div.card-head {
+                    span.badge.you { "needs you" }
+                    h2 { "The review stopped before merging" }
+                }
+                p.status-detail { (reason) }
+            }
+        },
         (Stage::Failed { reason, .. }, _) => html! {
             div.card.failed {
                 div.card-head {

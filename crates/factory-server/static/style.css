@@ -432,6 +432,12 @@ button:hover { filter: brightness(0.96); }
 
 .commits { margin: 0 0 var(--space-12); padding-left: var(--space-20); font: var(--font-size-sm)/1.6 var(--mono); }
 
+.reviews { margin: 0; padding: 0; list-style: none; }
+.reviews li { margin-bottom: var(--space-16); }
+.reviews li:last-child { margin-bottom: 0; }
+.review-head { display: flex; align-items: center; gap: var(--space-10); margin-bottom: var(--space-10); }
+.review-number { font-weight: 600; }
+
 .question { margin-bottom: var(--space-16); }
 .question label { display: flex; gap: var(--space-10); align-items: baseline; }
 .question-number {
