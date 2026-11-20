@@ -5,7 +5,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use crate::cost::format_cost;
 use crate::projects::{Project, Projects};
 use crate::settings::Settings;
-use crate::store::{JobRow, LogEntry};
+use crate::store::{JobRow, LogEntry, ProjectTotals};
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
@@ -76,6 +76,7 @@ pub fn index(
     selected: Option<&str>,
     settings: &Settings,
     jobs: &[JobRow],
+    totals: ProjectTotals,
 ) -> Markup {
     let all: Vec<&JobRow> = jobs
         .iter()
@@ -109,9 +110,52 @@ pub fn index(
             } @else {
                 div.card { p.empty { "No projects are configured." } }
             }
+            @if selected.is_some() {
+                (stats(totals))
+            }
             (board(&all, settings))
         },
     )
+}
+
+const NO_VALUE: &str = "–";
+
+/// The stats strip, one tile per figure of the project's totals. A figure
+/// that is zero or would divide by zero shows a dash.
+#[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
+fn stats(totals: ProjectTotals) -> Markup {
+    let created = totals.jobs_created;
+    let merged = totals.jobs_merged;
+    let rate = (created > 0).then(|| format!("{:.0}%", merged as f64 * 100.0 / created as f64));
+    let average = (merged > 0).then(|| format_cost(totals.usd / merged as f64));
+    let tiles = [
+        ("Total API cost", format_cost(totals.usd)),
+        ("Jobs created", count_or_dash(created)),
+        ("Jobs merged", count_or_dash(merged)),
+        ("Merge rate", rate.unwrap_or_else(|| NO_VALUE.to_owned())),
+        (
+            "Cost per merged job",
+            average.unwrap_or_else(|| NO_VALUE.to_owned()),
+        ),
+    ];
+    html! {
+        div.stats {
+            @for (label, value) in tiles {
+                div.card.stat {
+                    div.stat-value { (value) }
+                    div.stat-label { (label) }
+                }
+            }
+        }
+    }
+}
+
+fn count_or_dash(count: i64) -> String {
+    if count > 0 {
+        count.to_string()
+    } else {
+        NO_VALUE.to_owned()
+    }
 }
 
 fn project_selector(projects: &Projects, selected: &str) -> Markup {

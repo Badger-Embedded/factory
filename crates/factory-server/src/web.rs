@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 use crate::pages;
 use crate::projects::Projects;
 use crate::settings::Settings;
-use crate::store::{Store, StoreError};
+use crate::store::{ProjectTotals, Store, StoreError};
 
 /// The header `tailscale serve` sets to the logged-in user's login name.
 pub const USER_HEADER: &str = "Tailscale-User-Login";
@@ -144,12 +144,17 @@ async fn index(
     };
     let jobs = state.store.list()?;
     let settings = state.store.settings()?;
+    let totals = match &selected {
+        Some(name) => state.store.project_totals(name)?,
+        None => ProjectTotals::default(),
+    };
     Ok(pages::index(
         &user(&headers),
         &state.projects,
         selected.as_deref(),
         &settings,
         &jobs,
+        totals,
     ))
 }
 
