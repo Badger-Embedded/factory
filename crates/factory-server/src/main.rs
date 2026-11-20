@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    CurlUsageSource, GhRepos, LocalSecrets, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor,
-    Projects, ProxyWarning, RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams,
-    UnavailableSecrets, Upstreams, WarnFn, WorkerSlots, app, import_tomls, master_key_from_env,
-    proxy_app, refresh_forever,
+    CurlUsageSource, GhRepos, LocalSecrets, McpRuntime, PLAN_USAGE_REFRESH, PlanUsageCache,
+    PodmanExecutor, Projects, ProxyWarning, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
+    StoreUpstreams, UnavailableSecrets, Upstreams, WarnFn, WorkerSlots, app, import_tomls,
+    master_key_from_env, proxy_app, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -83,6 +83,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listen = env::var("FACTORY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let proxy_listen = env::var("FACTORY_PROXY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8081".into());
+    // The base URL a worker reaches the proxy at, over the shared podman
+    // network. The container name resolves to the factory on that network.
+    let proxy_url = env::var("FACTORY_PROXY_URL").unwrap_or_else(|_| "http://factory:8081".into());
+    // The podman network every worker joins, so it can reach the proxy but not
+    // the dashboard, which is published to the host loopback alone. Empty leaves
+    // podman's default network, for a local run with no proxy.
+    let worker_network = trimmed_var("FACTORY_WORKER_NETWORK");
     let data_dir = path_var("FACTORY_DATA", "data");
     let db = env::var_os("FACTORY_DB").map_or_else(|| data_dir.join("factory.db"), PathBuf::from);
 
@@ -113,7 +120,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // credential never enters a worker. It listens on its own port, separate
     // from the dashboard, and honours per-run tokens held only in memory. No
     // token exists until a run issues one, so every request before that is 401.
-    let _run_tokens =
+    let run_tokens =
         start_mcp_proxy(&proxy_listen, Arc::clone(&store), Arc::clone(&secrets)).await?;
 
     // Without podman workers no job takes a slot, so the board shows every
@@ -129,6 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .split_whitespace()
                     .map(str::to_owned)
                     .collect(),
+                network: worker_network.clone(),
                 ..WorkerConfig::default()
             },
             git: git_config(),
@@ -145,6 +153,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arc::new(executor),
             Arc::clone(&wake),
             data_dir.clone(),
+            McpRuntime {
+                tokens: Arc::clone(&run_tokens),
+                secrets: Arc::clone(&secrets),
+                proxy_url: proxy_url.clone(),
+            },
         );
         slots = scheduler.slots();
         tokio::spawn(scheduler.run());

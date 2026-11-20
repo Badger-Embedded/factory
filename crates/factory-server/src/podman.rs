@@ -116,6 +116,7 @@ impl Executor for PodmanExecutor {
             prompt,
             model: request.model,
             effort: request.effort,
+            mcp: request.mcp,
         };
         run(&config, &worker, log).await
     }

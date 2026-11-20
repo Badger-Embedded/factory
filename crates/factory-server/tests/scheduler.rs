@@ -9,9 +9,10 @@ use factory_core::{
 };
 use factory_runner::{Expect, LogLine, Rerun, RunReport};
 use factory_server::{
-    AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Published,
-    ReadyAction, RerunRequest, Scheduler, Settings, StageEfforts, Store, SummaryRequest,
-    WatchReport, WatchRequest, format_cost, ready_action,
+    AgentRequest, ChecksRequest, Executor, LogSink, McpProjectSettings, McpRuntime, McpStages,
+    Project, Projects, PublishRequest, Published, ReadyAction, RerunRequest, RunTokens, Scheduler,
+    SecretStore, Settings, StageEfforts, Store, SummaryRequest, UnavailableSecrets, WatchReport,
+    WatchRequest, format_cost, ready_action,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -181,8 +182,61 @@ fn setup(
         Arc::clone(&executor),
         Arc::new(Notify::new()),
         PathBuf::new(),
+        mcp_runtime(&store).0,
     );
     (store, executor, scheduler)
+}
+
+/// An [`McpRuntime`] with its own token registry, an unavailable secret store
+/// (no master key, so a keyless server still runs), and a proxy URL a test can
+/// look for in a run's MCP config. The registry is returned too, so a test can
+/// check a run's token is issued while it runs and revoked after.
+fn mcp_runtime(store: &Arc<Store>) -> (McpRuntime, Arc<RunTokens>) {
+    let tokens = Arc::new(RunTokens::new());
+    let secrets: Arc<dyn SecretStore> = Arc::new(UnavailableSecrets::new(Arc::clone(store)));
+    let runtime = McpRuntime {
+        tokens: Arc::clone(&tokens),
+        secrets,
+        proxy_url: "http://factory:8081".into(),
+    };
+    (runtime, tokens)
+}
+
+/// Like [`setup`], and also returns the MCP token registry the scheduler issues
+/// run tokens into, for the tests that check the MCP config and its token.
+fn setup_mcp(
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    Arc<RunTokens>,
+) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(respond);
+    let projects: Projects = [(
+        "maestro".to_owned(),
+        Project {
+            repo: "Badger-Embedded/maestro".into(),
+            base: "main".into(),
+            checks: Some("just lint".into()),
+            models: factory_server::StageModels::default(),
+            auto_merge: false,
+            llm_review: false,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let (runtime, tokens) = mcp_runtime(&store);
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        runtime,
+    );
+    (store, executor, scheduler, tokens)
 }
 
 async fn wait_idle(scheduler: &Scheduler<FakeExecutor>) {
@@ -349,6 +403,7 @@ async fn a_project_onboarded_while_running_is_picked_up() {
         Arc::clone(&executor),
         Arc::new(Notify::new()),
         PathBuf::new(),
+        mcp_runtime(&store).0,
     );
 
     let id = store
@@ -942,6 +997,7 @@ async fn a_project_without_checks_publishes_unchecked() {
         Arc::clone(&executor),
         Arc::new(Notify::new()),
         PathBuf::new(),
+        mcp_runtime(&store).0,
     );
     drop(scheduler);
     for event in [
@@ -1011,6 +1067,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
         Arc::clone(&executor),
         Arc::new(Notify::new()),
         PathBuf::new(),
+        mcp_runtime(&store).0,
     );
     step(&fresh).await;
     assert_eq!(executor.published.lock().unwrap().len(), 2);
@@ -1514,6 +1571,7 @@ mod purge {
             FakeExecutor::new(|_| questions()),
             Arc::new(Notify::new()),
             data.path().to_owned(),
+            mcp_runtime(&store).0,
         );
         let db = rusqlite::Connection::open(&path).unwrap();
         Fixture {
@@ -1834,6 +1892,7 @@ async fn a_project_does_not_use_the_models_of_another() {
         Arc::clone(&executor),
         Arc::new(Notify::new()),
         PathBuf::new(),
+        mcp_runtime(&store).0,
     );
     store
         .save_project_models("maestro", &models("maestro-c", "", "", ""))
@@ -2203,6 +2262,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
         Arc::clone(&executor),
         Arc::new(Notify::new()),
         PathBuf::new(),
+        mcp_runtime(&store).0,
     );
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -2373,4 +2433,158 @@ async fn retrying_a_failed_job_watches_the_pull_request_again() {
 
     step(&scheduler).await;
     assert_eq!(executor.watched.lock().unwrap().last().unwrap().number, 50);
+}
+
+fn enabled(stages: McpStages) -> McpProjectSettings {
+    McpProjectSettings {
+        enabled: true,
+        stages,
+    }
+}
+
+fn mcp_stage(request: &AgentRequest) -> Vec<String> {
+    request
+        .mcp
+        .as_ref()
+        .map(|mcp| mcp.servers.clone())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_run_with_no_active_server_carries_no_mcp_config() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    // A server is registered, but the project leaves it off, the default.
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+
+    scheduler.tick().await.unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+
+    assert!(
+        executor.requests()[0].mcp.is_none(),
+        "an off server adds no MCP config"
+    );
+}
+
+#[tokio::test]
+async fn mcp_servers_reach_only_the_runs_of_their_checked_stages() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewApproved,
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    store.save_project_models("maestro", &reviewing()).unwrap();
+
+    // Three keyless servers: one for implement only, one for review only, and
+    // one turned off that nonetheless checks both stages.
+    for name in ["impl-only", "review-only", "off"] {
+        store
+            .create_mcp_server(name, &format!("https://{name}.example/mcp"), &[])
+            .unwrap();
+    }
+    store
+        .save_project_mcp(
+            "maestro",
+            "impl-only",
+            &enabled(McpStages {
+                implement: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    store
+        .save_project_mcp(
+            "maestro",
+            "review-only",
+            &enabled(McpStages {
+                review: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    store
+        .save_project_mcp(
+            "maestro",
+            "off",
+            &McpProjectSettings {
+                enabled: false,
+                stages: McpStages {
+                    implement: true,
+                    review: true,
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+    // The implement run happens inside this helper.
+    let id = to_watching(&store, &executor, &scheduler).await;
+    let implement = executor
+        .requests()
+        .into_iter()
+        .find(|r| r.expect == Expect::Commits)
+        .expect("an implement run");
+    assert_eq!(mcp_stage(&implement), ["impl-only"]);
+
+    // Drive the review run for the same pull request.
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    executor.release(1);
+    step(&scheduler).await;
+    let review = executor
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|r| r.expect == Expect::Review)
+        .expect("a review run");
+    assert_eq!(mcp_stage(&review), ["review-only"]);
+
+    // The off server reaches neither run, though it checks both stages.
+    assert!(!mcp_stage(&implement).contains(&"off".to_string()));
+    assert!(!mcp_stage(&review).contains(&"off".to_string()));
+    let _ = id;
+}
+
+#[tokio::test]
+async fn a_run_token_is_live_during_the_run_and_revoked_after() {
+    let (store, executor, scheduler, tokens) = setup_mcp(|_| questions());
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    store
+        .save_project_mcp(
+            "maestro",
+            "context7",
+            &enabled(McpStages {
+                clarify: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+    let mcp = executor.requests()[0]
+        .mcp
+        .clone()
+        .expect("context7 is active for the clarify run");
+    assert_eq!(mcp.servers, ["context7"]);
+    assert_eq!(mcp.proxy_url, "http://factory:8081");
+    assert!(mcp.token.len() >= 64, "a 256-bit token as hex");
+    // The worker is still running, so the proxy honours its token.
+    assert!(tokens.is_active(&mcp.token));
+
+    executor.release(1);
+    wait_idle(&scheduler).await;
+    // The worker exited, so the factory revoked the token.
+    assert!(!tokens.is_active(&mcp.token));
 }

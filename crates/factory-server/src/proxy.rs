@@ -124,6 +124,14 @@ impl RunTokens {
         self.lock().remove(token);
     }
 
+    /// Whether `token` is still issued. The proxy answers 401 to any token this
+    /// returns `false` for, so a run's token is live only between its issue and
+    /// the revoke when the worker exits.
+    #[must_use]
+    pub fn is_active(&self, token: &str) -> bool {
+        self.lock().contains_key(token)
+    }
+
     fn lookup(&self, token: &str) -> Option<TokenScope> {
         self.lock().get(token).cloned()
     }

@@ -7,13 +7,16 @@ use std::time::Duration;
 use factory_core::{
     BranchSummary, Command, Event, Job, PrDescription, ReviewState, Session, Stage,
 };
-use factory_runner::{Expect, LogLine, Rerun, RunReport, job_prompt};
+use factory_runner::{Expect, LogLine, McpConfig, Rerun, RunReport, job_prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::cost::format_cost;
+use crate::mcp::McpServer;
 use crate::projects::{Project, Projects};
+use crate::proxy::RunTokens;
+use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
 use crate::store::{JobRow, Store, StoreError};
 use crate::workers::{WorkerSlots, unix_now};
@@ -54,6 +57,10 @@ pub struct AgentRequest {
     /// project saved none. `None` is reserved for the runner, which then uses
     /// its own default, so an older server that sends nothing still runs.
     pub effort: Option<String>,
+    /// The MCP servers active for this run's project and stage, with the per-run
+    /// proxy token, or `None` when none is active. The runner passes it to
+    /// `claude --mcp-config`.
+    pub mcp: Option<McpConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +218,37 @@ pub trait Executor: Send + Sync + 'static {
     fn stop(&self, job_id: i64) -> impl Future<Output = ()> + Send;
 }
 
+/// What the scheduler needs to give a run its MCP servers: the token registry
+/// the proxy honours, the secret store it reads to skip a server whose stored
+/// value cannot be decrypted, and the proxy base URL a worker reaches. Held
+/// together so [`Scheduler::new`] takes one argument, and so a build with no
+/// proxy can pass an empty registry and an unreachable URL.
+pub struct McpRuntime {
+    /// The per-run tokens the proxy honours. The scheduler issues one per run
+    /// with an active server and revokes it when the worker exits.
+    pub tokens: Arc<RunTokens>,
+    /// The secret store, read to skip a server whose stored header value does
+    /// not decrypt, so a broken credential does not reach a worker's config.
+    pub secrets: Arc<dyn SecretStore>,
+    /// The proxy's base URL a worker reaches, such as `http://factory:8081`.
+    pub proxy_url: String,
+}
+
+/// Revokes a run's proxy token when the run ends, by success, failure or
+/// cancel. A cancel aborts the run's task, which drops its future, so `Drop` is
+/// the only point that fires in every case. A factory restart drops the whole
+/// token registry, so this only has to cover a live run.
+struct TokenGuard {
+    tokens: Arc<RunTokens>,
+    token: String,
+}
+
+impl Drop for TokenGuard {
+    fn drop(&mut self) {
+        self.tokens.revoke(&self.token);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Holds one of the [`Settings::max_workers`] worker slots.
@@ -240,6 +278,7 @@ pub struct Scheduler<E> {
     /// a pull request, or a retry after a failed step.
     not_before: Mutex<HashMap<i64, Instant>>,
     slots: Arc<WorkerSlots>,
+    mcp: McpRuntime,
 }
 
 impl<E: Executor> Scheduler<E> {
@@ -249,6 +288,7 @@ impl<E: Executor> Scheduler<E> {
         executor: Arc<E>,
         wake: Arc<Notify>,
         data_dir: PathBuf,
+        mcp: McpRuntime,
     ) -> Arc<Self> {
         Arc::new(Scheduler {
             store,
@@ -259,6 +299,7 @@ impl<E: Executor> Scheduler<E> {
             tasks: Mutex::new(HashMap::new()),
             not_before: Mutex::new(HashMap::new()),
             slots: Arc::new(WorkerSlots::new()),
+            mcp,
         })
     }
 
@@ -346,6 +387,7 @@ impl<E: Executor> Scheduler<E> {
                         Expect::Commits | Expect::FixCi => efforts.implement,
                         Expect::Review => efforts.review,
                     };
+                    let mcp = self.mcp_config(row.id, &row.project, expect)?;
                     let request = AgentRequest {
                         job_id: row.id,
                         repo: project.repo.clone(),
@@ -359,6 +401,7 @@ impl<E: Executor> Scheduler<E> {
                         prompt: job_prompt(&job, &task, expect),
                         model,
                         effort: Some(effort),
+                        mcp,
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
@@ -472,6 +515,81 @@ impl<E: Executor> Scheduler<E> {
             self.store.append_factory_log(row.id, &reason)?;
         }
         Ok(())
+    }
+
+    /// The MCP config for an agent run, or `None` when no server is active for
+    /// this project and stage. When one is, it issues a per-run proxy token
+    /// scoped to the job and those servers; [`Scheduler::agent`] revokes it when
+    /// the worker exits. The scheduler reads the registry and the project's
+    /// settings on every run, so a settings change reaches a job in flight at
+    /// its next run.
+    fn mcp_config(
+        &self,
+        job_id: i64,
+        project: &str,
+        expect: Expect,
+    ) -> Result<Option<McpConfig>, StoreError> {
+        let servers = self.active_mcp_servers(project, expect)?;
+        if servers.is_empty() {
+            return Ok(None);
+        }
+        let token = self.mcp.tokens.issue(job_id, project, &servers);
+        Ok(Some(McpConfig {
+            proxy_url: self.mcp.proxy_url.clone(),
+            token,
+            servers,
+        }))
+    }
+
+    /// The servers `project` turns on for the run's `expect` stage, in name
+    /// order. A disabled server, one that does not pick this stage, and one
+    /// whose stored header value cannot be decrypted are all left out.
+    fn active_mcp_servers(&self, project: &str, expect: Expect) -> Result<Vec<String>, StoreError> {
+        let mut active = Vec::new();
+        for server in self.store.mcp_servers()? {
+            let settings = self.store.project_mcp(project, &server.name)?;
+            let in_stage = match expect {
+                Expect::Clarify => settings.stages.clarify,
+                Expect::Spec => settings.stages.spec,
+                Expect::Plan => settings.stages.plan,
+                Expect::Commits | Expect::FixCi => settings.stages.implement,
+                Expect::Review => settings.stages.review,
+            };
+            if settings.enabled && in_stage && self.mcp_secrets_usable(project, &server)? {
+                active.push(server.name);
+            }
+        }
+        Ok(active)
+    }
+
+    /// Whether every stored header value `project` set for `server` decrypts, so
+    /// the proxy can forward the real credential. A header with no stored value
+    /// is fine, so a keyless server such as context7 is always usable. A stored
+    /// value that does not decrypt, or a missing master key with a value stored,
+    /// skips the server, so a broken credential never lands in a worker's
+    /// config. A transient database error propagates and the run waits.
+    fn mcp_secrets_usable(&self, project: &str, server: &McpServer) -> Result<bool, StoreError> {
+        for header in &server.headers {
+            let at = SecretRef {
+                project,
+                server: &server.name,
+                header,
+            };
+            match self.mcp.secrets.get(at) {
+                // Present and decrypts, or not stored at all.
+                Ok(_) => {}
+                // A real database error: leave the run for the next pass.
+                Err(SecretError::Store(err)) => return Err(err),
+                // Unavailable, Decrypt or an unknown backend: unusable only when
+                // a value is actually stored. An unset header stays keyless.
+                Err(_) => {
+                    if self.store.has_secret(at)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn checks(
@@ -629,6 +747,12 @@ impl<E: Executor> Scheduler<E> {
 
     async fn agent(&self, settings: &Settings, request: AgentRequest) {
         let job_id = request.job_id;
+        // The run's proxy token is revoked when this guard drops: at the end of
+        // the run, or when a cancel aborts and drops this future.
+        let _token = request.mcp.as_ref().map(|mcp| TokenGuard {
+            tokens: Arc::clone(&self.mcp.tokens),
+            token: mcp.token.clone(),
+        });
         self.note(
             job_id,
             &format!("Agent run started in session {}.", request.session_id),

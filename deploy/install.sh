@@ -46,6 +46,15 @@ strip_newline claude-token
 podman build --format docker --tag localhost/factory-worker:latest --build-arg "UID=$(id -u)" --file containers/worker/Containerfile .
 podman build --format docker --tag localhost/factory:latest --file containers/factory/Containerfile .
 
+# The podman network the factory container and its workers share, so a worker
+# reaches the MCP proxy by the factory's container name. Created once when
+# missing and left alone otherwise. The factory's Quadlet unit joins it and the
+# factory starts workers on it; the dashboard port is not published to it, so a
+# worker cannot reach the dashboard.
+if ! podman network exists factory; then
+    podman network create factory >/dev/null
+fi
+
 mkdir -p ~/.local/share/factory ~/.config/containers/systemd
 cp deploy/factory.container ~/.config/containers/systemd/factory.container
 systemctl --user daemon-reload
