@@ -259,6 +259,45 @@ async fn the_stylesheet_is_served_as_css() {
 }
 
 #[tokio::test]
+async fn htmx_is_served_from_the_factory_as_javascript() {
+    let dashboard = dashboard();
+    assert!(
+        dashboard
+            .get("/")
+            .await
+            .body
+            .contains("src=\"/htmx.min.js\"")
+    );
+
+    let reply = dashboard.get("/htmx.min.js").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply
+            .content_type
+            .as_deref()
+            .is_some_and(|value| value.contains("javascript")),
+        "content type was {:?}",
+        reply.content_type
+    );
+    assert!(reply.body.contains("htmx"));
+}
+
+#[tokio::test]
+async fn the_dashboard_loads_no_asset_from_an_outside_host() {
+    // The job page links to GitHub with an `<a>`, which the reader clicks. An
+    // outside host matters only for assets the page fetches on load: scripts
+    // and stylesheets.
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    for uri in ["/", "/settings", &format!("/jobs/{id}")] {
+        let body = dashboard.get(uri).await.body;
+        for attr in ["src=\"http", "src=\"//", "rel=\"stylesheet\" href=\"http"] {
+            assert!(!body.contains(attr), "{uri} loads an outside asset: {attr}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn answers_from_the_form_go_back_to_the_agent_in_order() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
@@ -561,7 +600,7 @@ async fn the_job_page_keeps_the_log_scrolled_only_where_the_log_is_shown() {
     let id = dashboard.new_job().await;
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(!page.body.contains("<script"));
+    assert!(!page.body.contains("sessionStorage"));
 
     dashboard.apply(id, Event::Start);
     dashboard

@@ -60,6 +60,7 @@ pub fn app(
     Router::new()
         .route("/", get(index))
         .route("/style.css", get(stylesheet))
+        .route("/htmx.min.js", get(htmx))
         .route(
             "/jobs",
             post(create_job).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
@@ -132,6 +133,13 @@ async fn stylesheet() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         pages::STYLESHEET,
+    )
+}
+
+async fn htmx() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        pages::HTMX,
     )
 }
 
