@@ -19,6 +19,7 @@ Environment=CONTAINER_HOST=unix:///run/podman/podman.sock
 Environment=FACTORY_WORKER_VOLUMES=factory-nix:/nix
 Environment=RUST_LOG=info
 Secret=gh-token,type=env,target=GH_TOKEN
+Secret=claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN
 
 [Service]
 Restart=always
