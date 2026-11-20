@@ -1,6 +1,6 @@
 use factory_core::{
-    AgentResult, Ask, Command, Event, Job, MAX_FAILED_ROUNDS, PlannedPr, PrDescription, Question,
-    Rejected, Session, Stage, Task, Turn,
+    AgentResult, Ask, Command, Event, Gates, Job, MAX_FAILED_ROUNDS, PlannedPr, PrDescription,
+    Question, Rejected, Session, Stage, Task, Turn,
 };
 
 fn ready() -> PrDescription {
@@ -38,7 +38,7 @@ fn assert_runs(job: &Job, session: Session, task: Task) {
 
 /// A job with an approved plan of `titles`, implementing the first one.
 fn implementing(titles: &[&str]) -> Job {
-    let mut job = Job::new("add a reboot button");
+    let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);
     apply(&mut job, Event::Agent(AgentResult::Clarified));
     apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
@@ -60,7 +60,7 @@ fn watching(number: u64) -> Job {
 
 #[test]
 fn request_ends_merged_after_every_planned_pull_request_merges() {
-    let mut job = Job::new("add a reboot button");
+    let mut job = Job::new("add a reboot button", Gates::default());
     assert_eq!(job.stage(), &Stage::Requested);
     assert_eq!(job.next_command(), None);
 
@@ -119,7 +119,7 @@ fn request_ends_merged_after_every_planned_pull_request_merges() {
 
 #[test]
 fn answers_resume_the_session_that_asked() {
-    let mut job = Job::new("add a reboot button");
+    let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);
     let questions = vec![question("Which board?"), question("Confirm first?")];
     apply(
@@ -157,7 +157,7 @@ fn answers_resume_the_session_that_asked() {
 
 #[test]
 fn wrong_number_of_answers_is_rejected_and_leaves_the_job_unchanged() {
-    let mut job = Job::new("add a reboot button");
+    let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);
     apply(
         &mut job,
@@ -177,7 +177,7 @@ fn wrong_number_of_answers_is_rejected_and_leaves_the_job_unchanged() {
 
 #[test]
 fn requested_changes_go_back_to_the_planning_session() {
-    let mut job = Job::new("add a reboot button");
+    let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);
     apply(&mut job, Event::Agent(AgentResult::Clarified));
     apply(&mut job, Event::Agent(AgentResult::Spec("v1".into())));
@@ -222,7 +222,7 @@ fn requested_changes_go_back_to_the_planning_session() {
 
 #[test]
 fn an_empty_plan_is_rejected() {
-    let mut job = Job::new("add a reboot button");
+    let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);
     apply(&mut job, Event::Agent(AgentResult::Clarified));
     apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
@@ -414,7 +414,7 @@ fn an_agent_failure_fails_the_job() {
 
 #[test]
 fn cancel_ends_the_job_and_later_events_are_rejected() {
-    let mut job = Job::new("add a reboot button");
+    let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);
     apply(&mut job, Event::Cancel);
     assert_eq!(job.stage(), &Stage::Cancelled);
@@ -473,4 +473,132 @@ fn a_conflict_is_only_taken_while_the_factory_watches_the_pull_request() {
         })
         .is_err()
     );
+}
+
+const SKIP_SPEC: Gates = Gates {
+    spec: false,
+    plan: true,
+    publish: false,
+};
+const SKIP_PLAN: Gates = Gates {
+    spec: true,
+    plan: false,
+    publish: false,
+};
+const SKIP_BOTH: Gates = Gates {
+    spec: false,
+    plan: false,
+    publish: false,
+};
+
+fn clarified(gates: Gates) -> Job {
+    let mut job = Job::new("add a reboot button", gates);
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    job
+}
+
+#[test]
+fn default_gates_turn_spec_and_plan_on_and_publish_off() {
+    assert_eq!(
+        Gates::default(),
+        Gates {
+            spec: true,
+            plan: true,
+            publish: false
+        }
+    );
+}
+
+#[test]
+fn spec_gate_on_waits_for_approval() {
+    let mut job = clarified(Gates::default());
+    apply(&mut job, Event::Agent(AgentResult::Spec("the spec".into())));
+    assert_eq!(job.turn(), &Turn::User(Ask::SpecApproval));
+    assert_eq!(job.next_command(), None);
+}
+
+#[test]
+fn spec_gate_off_goes_straight_to_the_plan() {
+    let mut job = clarified(SKIP_SPEC);
+    apply(&mut job, Event::Agent(AgentResult::Spec("the spec".into())));
+    assert_eq!(job.spec(), Some("the spec"));
+    assert_eq!(job.stage(), &Stage::Plan);
+    assert_runs(&job, Session::Planning, Task::WritePlan);
+}
+
+#[test]
+fn plan_gate_on_waits_for_approval() {
+    let mut job = clarified(Gates::default());
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    apply(&mut job, Event::Approve);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Plan(vec![planned("only")])),
+    );
+    assert_eq!(job.turn(), &Turn::User(Ask::PlanApproval));
+    assert_eq!(job.next_command(), None);
+}
+
+#[test]
+fn plan_gate_off_starts_the_first_pull_request() {
+    let mut job = clarified(SKIP_PLAN);
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    apply(&mut job, Event::Approve);
+    let plan = vec![planned("refactor"), planned("feature")];
+    apply(&mut job, Event::Agent(AgentResult::Plan(plan.clone())));
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 0 });
+    assert_runs(
+        &job,
+        Session::Pr(0),
+        Task::Implement {
+            pr: plan[0].clone(),
+        },
+    );
+}
+
+#[test]
+fn plan_gate_off_still_rejects_an_empty_plan() {
+    let mut job = clarified(SKIP_PLAN);
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    apply(&mut job, Event::Approve);
+    assert_eq!(
+        job.apply(Event::Agent(AgentResult::Plan(Vec::new()))),
+        Err(Rejected::EmptyPlan)
+    );
+    assert_eq!(job.stage(), &Stage::Plan);
+}
+
+#[test]
+fn a_job_with_every_gate_off_runs_to_merged_without_approval() {
+    let mut job = clarified(SKIP_BOTH);
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Plan(vec![planned("only")])),
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 3 });
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert_eq!(job.turn(), &Turn::Done);
+}
+
+#[test]
+fn a_stored_job_without_gates_loads_with_spec_and_plan_on() {
+    let stored = serde_json::to_value(Job::new("add a reboot button", SKIP_BOTH)).unwrap();
+    let mut old = stored.clone();
+    old.as_object_mut().unwrap().remove("gates").unwrap();
+
+    let mut job: Job = serde_json::from_value(old).unwrap();
+    assert_eq!(job, Job::new("add a reboot button", Gates::default()));
+
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    assert_eq!(job.turn(), &Turn::User(Ask::SpecApproval));
+
+    let with_gates: Job = serde_json::from_value(stored).unwrap();
+    assert_eq!(with_gates, Job::new("add a reboot button", SKIP_BOTH));
 }

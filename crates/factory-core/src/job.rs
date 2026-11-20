@@ -15,6 +15,30 @@ pub struct Job {
     spec: Option<String>,
     plan: Vec<PlannedPr>,
     failed_rounds: u32,
+    #[serde(default)]
+    gates: Gates,
+}
+
+/// Which steps wait for the user. A job stored without gates loads with
+/// `spec` and `plan` on and `publish` off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gates {
+    /// Wait for the user to approve the spec.
+    pub spec: bool,
+    /// Wait for the user to approve the plan.
+    pub plan: bool,
+    /// Stored but not used yet.
+    pub publish: bool,
+}
+
+impl Default for Gates {
+    fn default() -> Self {
+        Gates {
+            spec: true,
+            plan: true,
+            publish: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +234,7 @@ impl std::error::Error for Rejected {}
 
 impl Job {
     #[must_use]
-    pub fn new(request: impl Into<String>) -> Self {
+    pub fn new(request: impl Into<String>, gates: Gates) -> Self {
         Job {
             request: request.into(),
             stage: Stage::Requested,
@@ -218,6 +242,7 @@ impl Job {
             spec: None,
             plan: Vec::new(),
             failed_rounds: 0,
+            gates,
         }
     }
 
@@ -325,7 +350,11 @@ impl Job {
 
             (S::Spec, Turn::Agent(_), E::Agent(AgentResult::Spec(spec))) => {
                 self.spec = Some(spec);
-                (S::Spec, Turn::User(Ask::SpecApproval))
+                if self.gates.spec {
+                    (S::Spec, Turn::User(Ask::SpecApproval))
+                } else {
+                    (S::Plan, Turn::Agent(Task::WritePlan))
+                }
             }
             (S::Spec, Turn::User(Ask::SpecApproval), E::Approve) => {
                 (S::Plan, Turn::Agent(Task::WritePlan))
@@ -336,7 +365,11 @@ impl Job {
                     return Err(Rejected::EmptyPlan);
                 }
                 self.plan = plan;
-                (S::Plan, Turn::User(Ask::PlanApproval))
+                if self.gates.plan {
+                    (S::Plan, Turn::User(Ask::PlanApproval))
+                } else {
+                    self.implement(0)
+                }
             }
             (S::Plan, Turn::User(Ask::PlanApproval), E::Approve) => self.implement(0),
 
