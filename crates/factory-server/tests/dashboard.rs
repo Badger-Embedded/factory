@@ -19,9 +19,6 @@ struct Dashboard {
     router: Router,
     data: tempfile::TempDir,
     usage: Arc<PlanUsageCache>,
-    /// The project files the router reads on each request. Held so the
-    /// directory outlives the dashboard.
-    _projects: tempfile::TempDir,
 }
 
 struct Reply {
@@ -44,14 +41,15 @@ fn dashboard() -> Dashboard {
 }
 
 fn dashboard_for(repo: &str) -> Dashboard {
-    let dir = tempfile::tempdir().unwrap();
-    write_project(
-        dir.path(),
-        "maestro",
-        &format!("repo = \"{repo}\"\nbase = \"main\"\n"),
-    );
-    let projects = Arc::new(Projects::from_dir(dir.path().to_owned()));
     let store = Arc::new(Store::open_in_memory().unwrap());
+    store.create_project("maestro", repo, "main", None).unwrap();
+    dashboard_with(store)
+}
+
+/// A dashboard reading projects from `store`, so a project onboarded in the
+/// store is visible on the next request.
+fn dashboard_with(store: Arc<Store>) -> Dashboard {
+    let projects = Arc::new(Projects::from_store(Arc::clone(&store)));
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
     Dashboard {
@@ -65,13 +63,7 @@ fn dashboard_for(repo: &str) -> Dashboard {
         store,
         data,
         usage,
-        _projects: dir,
     }
-}
-
-fn write_project(dir: &Path, name: &str, toml: &str) {
-    fs::create_dir_all(dir.join(name)).unwrap();
-    fs::write(dir.join(name).join("project.toml"), toml).unwrap();
 }
 
 impl Dashboard {
@@ -535,28 +527,186 @@ fn a_rejected_event_is_not_saved() {
     assert_eq!(store.get(id).unwrap(), before);
 }
 
-#[test]
-fn the_repository_project_files_load() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../projects");
-    let projects = Projects::from_dir(dir);
-    assert_eq!(
-        projects.lookup("maestro").unwrap().unwrap().repo,
-        "Badger-Embedded/maestro"
-    );
+/// Writes a `<dir>/<name>/project.toml` for the import tests.
+fn write_toml(dir: &Path, name: &str, toml: &str) {
+    fs::create_dir_all(dir.join(name)).unwrap();
+    fs::write(dir.join(name).join("project.toml"), toml).unwrap();
 }
 
 #[test]
-fn a_project_file_with_an_unknown_key_fails_to_load() {
+fn the_import_moves_project_files_into_the_database() {
     let dir = tempfile::tempdir().unwrap();
-    write_project(
+    write_toml(
+        dir.path(),
+        "maestro",
+        "repo = \"Badger-Embedded/maestro\"\nbase = \"main\"\n\
+         checks = \"just lint && just test\"\n",
+    );
+    write_toml(
+        dir.path(),
+        "factory",
+        "repo = \"Badger-Embedded/factory\"\nbase = \"dev\"\n\
+         auto_merge = true\nllm_review = true\n[models]\nplan = \"opus\"\n",
+    );
+
+    let store = Store::open_in_memory().unwrap();
+    factory_server::import_tomls(&store, dir.path()).unwrap();
+
+    let maestro = store.project("maestro").unwrap().unwrap();
+    assert_eq!(maestro.repo, "Badger-Embedded/maestro");
+    assert_eq!(maestro.base, "main");
+    assert_eq!(maestro.checks.as_deref(), Some("just lint && just test"));
+    // maestro set no models or flags, so it has no settings rows and reads the
+    // defaults.
+    let none = StageModels::default();
+    assert_eq!(store.project_models("maestro", &none).unwrap(), none);
+    assert!(!store.project_auto_merge("maestro", false).unwrap());
+    assert!(!store.project_llm_review("maestro", false).unwrap());
+
+    let factory = store.project("factory").unwrap().unwrap();
+    assert_eq!(factory.repo, "Badger-Embedded/factory");
+    assert_eq!(factory.base, "dev");
+    assert_eq!(factory.checks, None);
+    assert_eq!(
+        store
+            .project_models("factory", &none)
+            .unwrap()
+            .plan
+            .as_deref(),
+        Some("opus")
+    );
+    assert!(store.project_auto_merge("factory", false).unwrap());
+    assert!(store.project_llm_review("factory", false).unwrap());
+
+    // The files it imported are gone.
+    assert!(!dir.path().join("maestro").join("project.toml").exists());
+    assert!(!dir.path().join("factory").join("project.toml").exists());
+}
+
+#[test]
+fn the_import_runs_once_and_keeps_later_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    write_toml(
+        dir.path(),
+        "maestro",
+        "repo = \"o/maestro\"\nbase = \"main\"\n",
+    );
+    let store = Store::open_in_memory().unwrap();
+    factory_server::import_tomls(&store, dir.path()).unwrap();
+
+    // An operator edits the project's settings after the import.
+    store.save_project_settings("maestro", true, true).unwrap();
+
+    // A rerun, even with the file back on disk, changes nothing: one project
+    // and the edited settings stand.
+    write_toml(
+        dir.path(),
+        "maestro",
+        "repo = \"o/other\"\nbase = \"dev\"\n",
+    );
+    factory_server::import_tomls(&store, dir.path()).unwrap();
+
+    assert_eq!(store.list_projects().unwrap().len(), 1);
+    let maestro = store.project("maestro").unwrap().unwrap();
+    assert_eq!(maestro.repo, "o/maestro");
+    assert_eq!(maestro.base, "main");
+    assert!(store.project_auto_merge("maestro", false).unwrap());
+    assert!(store.project_llm_review("maestro", false).unwrap());
+}
+
+#[test]
+fn the_import_is_a_no_op_without_files() {
+    let store = Store::open_in_memory().unwrap();
+    factory_server::import_tomls(&store, Path::new("/no/such/projects/dir")).unwrap();
+    assert_eq!(store.list_projects().unwrap().len(), 0);
+}
+
+#[test]
+fn a_malformed_project_file_fails_the_import() {
+    let dir = tempfile::tempdir().unwrap();
+    write_toml(
         dir.path(),
         "x",
         "repo = \"a/b\"\nbase = \"main\"\nbranch = \"dev\"\n",
     );
-    let err = Projects::from_dir(dir.path().to_owned())
-        .lookup("x")
-        .unwrap_err();
+    let store = Store::open_in_memory().unwrap();
+    let err = factory_server::import_tomls(&store, dir.path()).unwrap_err();
     assert!(err.to_string().contains("project.toml"));
+    // A failed import wrote no project.
+    assert_eq!(store.list_projects().unwrap().len(), 0);
+}
+
+#[test]
+fn the_import_leaves_the_global_auto_merge_migration_to_apply() {
+    // A database carrying the old global auto-merge, on.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    store_legacy_settings(&path, LEGACY_SETTINGS_ON);
+
+    let files = tempfile::tempdir().unwrap();
+    write_toml(
+        files.path(),
+        "maestro",
+        "repo = \"o/maestro\"\nbase = \"main\"\n",
+    );
+    factory_server::import_tomls(&store, files.path()).unwrap();
+
+    // The import wrote no settings row for maestro, so the migration still
+    // moves the old global auto-merge onto it, as it did for the toml project.
+    store.migrate_global_auto_merge(&["maestro"]).unwrap();
+    assert!(store.project_auto_merge("maestro", false).unwrap());
+}
+
+#[test]
+fn create_project_rejects_a_duplicate_name() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project("maestro", "o/one", "main", None)
+        .unwrap();
+    assert!(matches!(
+        store.create_project("maestro", "o/two", "main", None),
+        Err(StoreError::DuplicateName(name)) if name == "maestro"
+    ));
+    // The rejected call wrote nothing.
+    assert_eq!(store.list_projects().unwrap().len(), 1);
+    assert_eq!(store.project("maestro").unwrap().unwrap().repo, "o/one");
+}
+
+#[test]
+fn create_project_rejects_a_duplicate_repo() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project("maestro", "o/repo", "main", None)
+        .unwrap();
+    assert!(matches!(
+        store.create_project("tool", "o/repo", "main", None),
+        Err(StoreError::DuplicateRepo(repo)) if repo == "o/repo"
+    ));
+    assert_eq!(store.list_projects().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let dashboard = dashboard_with(Arc::clone(&store));
+
+    // No project yet: the new-job form offers none.
+    assert!(!dashboard.get("/").await.body.contains("widgets"));
+
+    // Onboard one while the dashboard runs, as the wizard will.
+    store
+        .create_project("widgets", "acme/widgets", "main", None)
+        .unwrap();
+
+    // It shows on the board selector, the settings page and the new-job form
+    // at once, and a job can be created against it.
+    let index = dashboard.get("/?project=widgets").await;
+    assert_eq!(index.status, StatusCode::OK);
+    assert!(index.body.contains("widgets"));
+    assert!(dashboard.get("/settings").await.body.contains("widgets"));
+    let created = dashboard.post_job("widgets", "A widget change", &[]).await;
+    assert_eq!(created.status, StatusCode::SEE_OTHER);
 }
 
 #[test]
@@ -1171,7 +1321,6 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         router,
         data: tempfile::tempdir().unwrap(),
         usage: Arc::new(PlanUsageCache::new()),
-        _projects: tempfile::tempdir().unwrap(),
     }
     .get(&format!("/jobs/{id}"))
     .await;
@@ -1200,27 +1349,14 @@ async fn links_use_the_repository_from_the_project_file() {
 }
 
 fn two_projects() -> Dashboard {
-    let dir = tempfile::tempdir().unwrap();
-    for name in ["maestro", "tool"] {
-        write_project(dir.path(), name, "repo = \"o/r\"\nbase = \"main\"\n");
-    }
-    let projects = Arc::new(Projects::from_dir(dir.path().to_owned()));
     let store = Arc::new(Store::open_in_memory().unwrap());
-    let data = tempfile::tempdir().unwrap();
-    let usage = Arc::new(PlanUsageCache::new());
-    Dashboard {
-        router: app(
-            store.clone(),
-            projects,
-            Arc::new(Notify::new()),
-            data.path().to_owned(),
-            Arc::clone(&usage),
-        ),
-        store,
-        data,
-        usage,
-        _projects: dir,
-    }
+    store
+        .create_project("maestro", "o/maestro", "main", None)
+        .unwrap();
+    store
+        .create_project("tool", "o/tool", "main", None)
+        .unwrap();
+    dashboard_with(store)
 }
 
 #[tokio::test]
@@ -2347,27 +2483,6 @@ fn project_models_are_stored_and_reloaded() {
 }
 
 #[test]
-fn a_project_file_sets_default_models_and_saved_models_win() {
-    let dir = tempfile::tempdir().unwrap();
-    write_project(
-        dir.path(),
-        "x",
-        "repo = \"a/b\"\nbase = \"main\"\n[models]\nclarify = \"haiku\"\nplan = \"opus\"\n",
-    );
-    let projects = Projects::from_dir(dir.path().to_owned());
-    let defaults = projects.lookup("x").unwrap().unwrap().models;
-    assert_eq!(defaults.clarify.as_deref(), Some("haiku"));
-    assert_eq!(defaults.plan.as_deref(), Some("opus"));
-    assert_eq!(defaults.spec, None);
-
-    let store = Store::open_in_memory().unwrap();
-    assert_eq!(store.project_models("x", &defaults).unwrap(), defaults);
-    let saved = models(None, Some("sonnet"));
-    store.save_project_models("x", &saved).unwrap();
-    assert_eq!(store.project_models("x", &defaults).unwrap(), saved);
-}
-
-#[test]
 fn the_review_model_is_stored_and_reloaded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("factory.db");
@@ -2387,26 +2502,6 @@ fn the_review_model_is_stored_and_reloaded() {
     // Clearing it saves an empty review again.
     store.save_project_models("maestro", &none).unwrap();
     assert_eq!(store.project_models("maestro", &saved).unwrap(), none);
-}
-
-#[test]
-fn a_project_file_sets_a_default_review_model() {
-    let dir = tempfile::tempdir().unwrap();
-    write_project(
-        dir.path(),
-        "x",
-        "repo = \"a/b\"\nbase = \"main\"\n[models]\nreview = \"opus\"\n",
-    );
-    let projects = Projects::from_dir(dir.path().to_owned());
-    let defaults = projects.lookup("x").unwrap().unwrap().models;
-    assert_eq!(defaults.review.as_deref(), Some("opus"));
-
-    let store = Store::open_in_memory().unwrap();
-    assert_eq!(store.project_models("x", &defaults).unwrap(), defaults);
-    // A saved row replaces the toml default, so an empty review clears it.
-    let saved = StageModels::default();
-    store.save_project_models("x", &saved).unwrap();
-    assert_eq!(store.project_models("x", &defaults).unwrap().review, None);
 }
 
 #[test]
@@ -2466,23 +2561,6 @@ fn project_auto_merge_defaults_off_and_a_saved_row_wins() {
 }
 
 #[test]
-fn a_project_file_sets_the_auto_merge_default() {
-    let dir = tempfile::tempdir().unwrap();
-    write_project(
-        dir.path(),
-        "x",
-        "repo = \"a/b\"\nbase = \"main\"\nauto_merge = true\n",
-    );
-    let projects = Projects::from_dir(dir.path().to_owned());
-    assert!(projects.lookup("x").unwrap().unwrap().auto_merge);
-
-    let store = Store::open_in_memory().unwrap();
-    assert!(store.project_auto_merge("x", true).unwrap());
-    store.save_project_auto_merge("x", false).unwrap();
-    assert!(!store.project_auto_merge("x", true).unwrap());
-}
-
-#[test]
 fn project_llm_review_defaults_off_and_a_saved_row_wins() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("factory.db");
@@ -2514,23 +2592,6 @@ fn the_two_project_flags_are_stored_and_read_independently() {
     store.save_project_settings("maestro", false, true).unwrap();
     assert!(!store.project_auto_merge("maestro", true).unwrap());
     assert!(store.project_llm_review("maestro", false).unwrap());
-}
-
-#[test]
-fn a_project_file_sets_the_llm_review_default() {
-    let dir = tempfile::tempdir().unwrap();
-    write_project(
-        dir.path(),
-        "x",
-        "repo = \"a/b\"\nbase = \"main\"\nllm_review = true\n",
-    );
-    let projects = Projects::from_dir(dir.path().to_owned());
-    assert!(projects.lookup("x").unwrap().unwrap().llm_review);
-
-    let store = Store::open_in_memory().unwrap();
-    assert!(store.project_llm_review("x", true).unwrap());
-    store.save_project_settings("x", false, false).unwrap();
-    assert!(!store.project_llm_review("x", true).unwrap());
 }
 
 /// A database written before the `llm_review` column existed: `init` adds the

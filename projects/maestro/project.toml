@@ -1,3 +1,0 @@
-repo = "Badger-Embedded/maestro"
-base = "main"
-checks = "nix develop -c just lint && nix develop -c just test"

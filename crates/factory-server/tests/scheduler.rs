@@ -291,6 +291,42 @@ async fn a_run_result_moves_the_job_and_is_logged() {
 }
 
 #[tokio::test]
+async fn a_project_onboarded_while_running_is_picked_up() {
+    // The scheduler reads projects from the store, so one onboarded after it
+    // starts is visible without a restart.
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(|_| questions());
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(Projects::from_store(Arc::clone(&store))),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+    );
+
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    // Onboard the project while the scheduler is up.
+    store
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            Some("just lint"),
+        )
+        .unwrap();
+
+    scheduler.tick().await.unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+
+    // The job ran against the new project instead of failing as unconfigured.
+    assert_eq!(executor.requests()[0].job_id, id);
+    assert!(matches!(store.get(id).unwrap().job.turn(), Turn::User(_)));
+}
+
+#[tokio::test]
 async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Clarify if request.prompt.contains("answered") => {
