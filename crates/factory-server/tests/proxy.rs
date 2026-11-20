@@ -14,7 +14,7 @@ use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use factory_server::{
-    LocalSecrets, MASTER_KEY_LEN, McpTool, ProxyWarning, RunTokens, SecretRef, SecretStore, Store,
+    LocalSecrets, MASTER_KEY_LEN, McpTool, ProxyEvent, RunTokens, SecretRef, SecretStore, Store,
     StoreUpstreams, Upstream, Upstreams, proxy_app,
 };
 use tokio::net::TcpListener;
@@ -217,11 +217,11 @@ impl Upstreams for FakeUpstreams {
 /// warnings.
 async fn start_proxy(
     upstreams: Arc<dyn Upstreams>,
-) -> (String, Arc<RunTokens>, Arc<Mutex<Vec<ProxyWarning>>>) {
+) -> (String, Arc<RunTokens>, Arc<Mutex<Vec<ProxyEvent>>>) {
     let tokens = Arc::new(RunTokens::new());
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&warnings);
-    let warn = Arc::new(move |warning: ProxyWarning| sink.lock().unwrap().push(warning));
+    let warn = Arc::new(move |warning: ProxyEvent| sink.lock().unwrap().push(warning));
     let app = proxy_app(Arc::clone(&tokens), upstreams, warn);
     let base = serve(app).await;
     (base, tokens, warnings)
@@ -532,7 +532,7 @@ async fn a_server_error_is_relayed_and_warned() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let warnings = warnings.lock().unwrap();
     assert_eq!(warnings.len(), 1);
-    let ProxyWarning::Unavailable {
+    let ProxyEvent::Unavailable {
         job,
         server,
         reason,
@@ -565,7 +565,7 @@ async fn an_unreachable_server_is_warned() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let warnings = warnings.lock().unwrap();
     assert_eq!(warnings.len(), 1);
-    let ProxyWarning::Unavailable { job, server, .. } = &warnings[0] else {
+    let ProxyEvent::Unavailable { job, server, .. } = &warnings[0] else {
         panic!("expected an unavailable warning, got {:?}", warnings[0]);
     };
     assert_eq!(*job, 4);
@@ -633,7 +633,7 @@ async fn store_upstreams_resolves_a_stored_header() {
 /// project. Returns the proxy base, a token for job 3 and the warnings.
 async fn proxy_with_delete_off(
     path: &str,
-) -> (Arc<Fake>, String, String, Arc<Mutex<Vec<ProxyWarning>>>) {
+) -> (Arc<Fake>, String, String, Arc<Mutex<Vec<ProxyEvent>>>) {
     let (fake, fake_base) = start_fake().await;
     let upstreams: Arc<dyn Upstreams> = Arc::new(FakeUpstreams {
         url: format!("{fake_base}{path}"),
@@ -680,7 +680,7 @@ async fn a_call_to_a_turned_off_tool_is_answered_by_the_proxy() {
     assert!(fake.seen().is_empty(), "the call reached the server");
     assert_eq!(
         *warnings.lock().unwrap(),
-        vec![ProxyWarning::ToolBlocked {
+        vec![ProxyEvent::ToolBlocked {
             job: 3,
             server: "context7".to_owned(),
             tool: "delete".to_owned(),
@@ -695,7 +695,131 @@ async fn a_call_to_a_tool_that_is_on_is_forwarded() {
     let response = post_rpc(&proxy, &token, body).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(fake.seen()[0].body, body.as_bytes());
+    // The call is forwarded, so it is recorded. With `delete` off, a call to the
+    // `read` tool that is on still reports one forwarded call and nothing else.
+    assert_eq!(
+        *warnings.lock().unwrap(),
+        vec![ProxyEvent::ToolCalled {
+            job: 3,
+            server: "context7".to_owned(),
+            tool: "read".to_owned(),
+        }],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_call_is_recorded_with_no_tool_off() {
+    let (fake, fake_base) = start_fake().await;
+    let upstreams = fake_upstreams(&format!("{fake_base}/mcp"), &[], &["context7"]);
+    let (proxy, tokens, warnings) = start_proxy(upstreams).await;
+    let token = tokens.issue(7, "maestro", &["context7".to_owned()]);
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve-library-id"}}"#;
+    let response = post_rpc(&proxy, &token, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // With no tool off the body still reaches the server unchanged.
+    assert_eq!(fake.seen()[0].body, body.as_bytes());
+    assert_eq!(
+        *warnings.lock().unwrap(),
+        vec![ProxyEvent::ToolCalled {
+            job: 7,
+            server: "context7".to_owned(),
+            tool: "resolve-library-id".to_owned(),
+        }],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_records_a_forwarded_call_for_each_tool() {
+    let (fake, fake_base) = start_fake().await;
+    let upstreams = fake_upstreams(&format!("{fake_base}/mcp"), &[], &["context7"]);
+    let (proxy, tokens, warnings) = start_proxy(upstreams).await;
+    let token = tokens.issue(7, "maestro", &["context7".to_owned()]);
+    // Two calls and a list in one batch report two forwarded calls, in order.
+    let body = r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve-library-id"}},
+        {"jsonrpc":"2.0","id":2,"method":"tools/list"},
+        {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get-library-docs"}}]"#;
+    let response = post_rpc(&proxy, &token, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fake.seen()[0].body, body.as_bytes());
+    assert_eq!(
+        *warnings.lock().unwrap(),
+        vec![
+            ProxyEvent::ToolCalled {
+                job: 7,
+                server: "context7".to_owned(),
+                tool: "resolve-library-id".to_owned(),
+            },
+            ProxyEvent::ToolCalled {
+                job: 7,
+                server: "context7".to_owned(),
+                tool: "get-library-docs".to_owned(),
+            },
+        ],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_call_bodies_record_nothing() {
+    let (_fake, fake_base) = start_fake().await;
+    let upstreams = fake_upstreams(&format!("{fake_base}/mcp"), &[], &["context7"]);
+    let (proxy, tokens, warnings) = start_proxy(upstreams).await;
+    let token = tokens.issue(7, "maestro", &["context7".to_owned()]);
+    for body in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        "",
+    ] {
+        let response = post_rpc(&proxy, &token, body).await;
+        assert_eq!(response.status(), StatusCode::OK, "{body:?}");
+    }
+    assert!(
+        warnings.lock().unwrap().is_empty(),
+        "a list, an initialize and an empty body record nothing",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_json_body_records_nothing_with_no_tool_off() {
+    let (fake, fake_base) = start_fake().await;
+    let upstreams = fake_upstreams(&format!("{fake_base}/mcp"), &[], &["context7"]);
+    let (proxy, tokens, warnings) = start_proxy(upstreams).await;
+    let token = tokens.issue(7, "maestro", &["context7".to_owned()]);
+    let response = post_rpc(&proxy, &token, "not json").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The body is forwarded as before and nothing is recorded.
+    assert_eq!(fake.seen()[0].body, b"not json");
     assert!(warnings.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_without_a_token_records_nothing() {
+    let (_fake, fake_base) = start_fake().await;
+    let upstreams = fake_upstreams(&format!("{fake_base}/mcp"), &[], &["context7"]);
+    let (proxy, tokens, warnings) = start_proxy(upstreams).await;
+    let valid = tokens.issue(7, "maestro", &["context7".to_owned()]);
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve-library-id"}}"#;
+
+    // A missing token.
+    let response = client()
+        .post(format!("{proxy}/mcp/context7"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // A revoked token.
+    tokens.revoke(&valid);
+    let response = post_rpc(&proxy, &valid, body).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    assert!(
+        warnings.lock().unwrap().is_empty(),
+        "an unauthorized request never reaches the call record",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -15,8 +15,9 @@
 //! The upstream URL and the stored headers come through the [`Upstreams`]
 //! trait, so the proxy can read the registry and the encrypted secret store in
 //! production and a fake in tests. A proxy-side failure to reach a server, a
-//! connect timeout or a 5xx answer goes to a [`WarnFn`] callback, which records
-//! the server as unavailable for the run.
+//! connect timeout or a 5xx answer goes to a [`ProxyEventFn`] callback, which
+//! records the server as unavailable for the run. The same callback records
+//! each tool call the proxy forwards, so the job page can list them.
 //!
 //! A project can turn off single tools of a server. The proxy enforces it,
 //! because the worker could send a `tools/call` with its run token from a shell
@@ -24,7 +25,8 @@
 //! proxy parses each request body as JSON-RPC and answers a `tools/call` of a
 //! turned-off tool itself, without forwarding it. It also removes the turned-off
 //! tools from the server's `tools/list` reply, so the model does not see them.
-//! A refused call goes to the [`WarnFn`] as well.
+//! A refused call goes to the [`ProxyEventFn`] as well, and is never also
+//! recorded as a forwarded call.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -258,10 +260,10 @@ impl Upstreams for StoreUpstreams {
     }
 }
 
-/// Something the proxy reports about a run, which the factory records as a
-/// warning on the job. Neither variant carries a credential.
+/// Something the proxy reports about a run, which the factory records on the
+/// job. No variant carries a credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProxyWarning {
+pub enum ProxyEvent {
     /// The server was unavailable for the run, with a short reason.
     Unavailable {
         job: i64,
@@ -274,31 +276,43 @@ pub enum ProxyWarning {
         server: String,
         tool: String,
     },
+    /// The proxy forwarded a call to a tool. One event per `tools/call` it
+    /// lets through, whether or not the project turned any tool off.
+    ToolCalled {
+        job: i64,
+        server: String,
+        tool: String,
+    },
 }
 
 /// The callback the proxy calls when it cannot reach a server, a connection
-/// times out, a server answers 5xx, or it refuses a turned-off tool's call.
-pub type WarnFn = Arc<dyn Fn(ProxyWarning) + Send + Sync>;
+/// times out, a server answers 5xx, it refuses a turned-off tool's call, or it
+/// forwards a tool call.
+pub type ProxyEventFn = Arc<dyn Fn(ProxyEvent) + Send + Sync>;
 
 #[derive(Clone)]
 struct ProxyState {
     tokens: Arc<RunTokens>,
     upstreams: Arc<dyn Upstreams>,
     client: reqwest::Client,
-    warn: WarnFn,
+    report: ProxyEventFn,
 }
 
 /// The proxy router. It listens on the factory's MCP port, separate from the
 /// dashboard, and serves `/mcp/<server>` with any method the streamable-HTTP
 /// transport uses. `tokens` gates each request, `upstreams` resolves the
-/// server, and `warn` records a server the proxy could not reach or a call it
-/// refused.
+/// server, and `report` records a server the proxy could not reach, a call it
+/// refused, or a call it forwarded.
 ///
 /// # Panics
 ///
 /// Panics if the HTTP client cannot be built, which needs no network and
 /// happens only on a broken TLS backend.
-pub fn proxy_app(tokens: Arc<RunTokens>, upstreams: Arc<dyn Upstreams>, warn: WarnFn) -> Router {
+pub fn proxy_app(
+    tokens: Arc<RunTokens>,
+    upstreams: Arc<dyn Upstreams>,
+    report: ProxyEventFn,
+) -> Router {
     // No redirect is followed, so a 3xx cannot carry the project's headers to
     // another host; it is returned to the worker as-is. A connect timeout
     // bounds the wait to reach a server; there is no total timeout, so a
@@ -312,7 +326,7 @@ pub fn proxy_app(tokens: Arc<RunTokens>, upstreams: Arc<dyn Upstreams>, warn: Wa
         tokens,
         upstreams,
         client,
-        warn,
+        report,
     };
     Router::new()
         .route("/mcp/{server}", any(proxy))
@@ -342,7 +356,7 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
         Err((status, message)) => return (status, message).into_response(),
     };
     let Some(upstream) = state.upstreams.resolve(&scope.project, &server) else {
-        (state.warn)(ProxyWarning::Unavailable {
+        (state.report)(ProxyEvent::Unavailable {
             job: scope.job,
             server,
             reason: "the server is no longer registered".to_owned(),
@@ -378,6 +392,19 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
         Err(response) => return *response,
     };
 
+    // The request is going upstream, so record every tool it calls. `screen`
+    // already refused and reported any call to a turned-off tool, so a call
+    // reported here is one the proxy forwards. The reading is lenient: a body
+    // that is not JSON, or a `tools/call` with no string name, records nothing,
+    // and the request is forwarded as before.
+    for tool in tool_calls(&body) {
+        (state.report)(ProxyEvent::ToolCalled {
+            job: scope.job,
+            server: server.clone(),
+            tool,
+        });
+    }
+
     let mut url = upstream.url;
     url.push_str(&suffix);
     if let Some(query) = query {
@@ -395,7 +422,7 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
     {
         Ok(response) => {
             if response.status().is_server_error() {
-                (state.warn)(ProxyWarning::Unavailable {
+                (state.report)(ProxyEvent::Unavailable {
                     job: scope.job,
                     server,
                     reason: format!("the server answered {}", response.status()),
@@ -416,7 +443,7 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
             } else {
                 "the request to the server failed"
             };
-            (state.warn)(ProxyWarning::Unavailable {
+            (state.report)(ProxyEvent::Unavailable {
                 job: scope.job,
                 server,
                 reason: reason.to_owned(),
@@ -444,7 +471,7 @@ fn screen(
         Inspection::Forward { list_id } => Ok(list_id),
         Inspection::Blocked { tool, id } => {
             let response = tool_off_response(&tool, &id);
-            (state.warn)(ProxyWarning::ToolBlocked {
+            (state.report)(ProxyEvent::ToolBlocked {
                 job,
                 server: server.to_owned(),
                 tool,
@@ -452,7 +479,7 @@ fn screen(
             Err(Box::new(response))
         }
         Inspection::BlockedBatch { tool } => {
-            (state.warn)(ProxyWarning::ToolBlocked {
+            (state.report)(ProxyEvent::ToolBlocked {
                 job,
                 server: server.to_owned(),
                 tool,
@@ -603,6 +630,25 @@ fn inspect(body: &[u8], disabled: &HashSet<String>) -> Inspection {
             }
         },
         _ => Inspection::Malformed,
+    }
+}
+
+/// Every tool a request body calls, for the forwarded-call record. A single
+/// JSON-RPC object holds one `tools/call`; a batch array holds several. The
+/// reading is lenient, so it is safe to run on a body `screen` passed without
+/// reading: a body that is not JSON, and a `tools/call` with no string tool
+/// name, yield nothing, and the request is forwarded exactly as before.
+fn tool_calls(body: &[u8]) -> Vec<String> {
+    let Ok(message) = serde_json::from_slice::<Value>(body) else {
+        return Vec::new();
+    };
+    match &message {
+        Value::Array(batch) => batch
+            .iter()
+            .filter_map(|item| called_tool(item).ok().flatten())
+            .collect(),
+        Value::Object(_) => called_tool(&message).ok().flatten().into_iter().collect(),
+        _ => Vec::new(),
     }
 }
 

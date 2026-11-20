@@ -28,7 +28,9 @@ pub use github::{
 pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
 pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, import_tomls};
-pub use proxy::{ProxyWarning, RunTokens, StoreUpstreams, Upstream, Upstreams, WarnFn, proxy_app};
+pub use proxy::{
+    ProxyEvent, ProxyEventFn, RunTokens, StoreUpstreams, Upstream, Upstreams, proxy_app,
+};
 pub use scheduler::{
     AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, McpRuntime, PublishRequest,
     Published, ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest,
