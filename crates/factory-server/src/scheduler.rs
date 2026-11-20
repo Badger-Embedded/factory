@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use factory_core::{BranchSummary, Command, Event, Job, PrDescription, Session, Stage};
-use factory_runner::{Expect, LogLine, RunReport, prompt};
+use factory_runner::{Expect, LogLine, RunReport, job_prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -266,12 +266,12 @@ impl<E: Executor> Scheduler<E> {
                         repo: project.repo.clone(),
                         base: project.base.clone(),
                         branch: match session {
-                            Session::Planning => None,
+                            Session::Planning | Session::Spec | Session::Plan => None,
                             Session::Pr(pr) => Some(branch_name(row.id, pr)),
                         },
                         session_id: self.store.session_uuid(row.id, session)?,
                         expect,
-                        prompt: prompt(&task, expect),
+                        prompt: job_prompt(&job, &task, expect),
                         model,
                     };
                     let scheduler = Arc::clone(self);

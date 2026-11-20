@@ -55,9 +55,9 @@ requested → clarifying → spec ✋ → plan ✋ → implementing → verifyin
 ```
 
 - **clarifying.** The agent reads the repository and asks questions. A headless run cannot wait for answers, so the run ends with its questions as structured output. The dashboard shows them, and the next run resumes the same session with your answers.
-- **spec.** The agent writes the goal, scope, what is out of scope, and acceptance criteria.
-- **plan.** The agent splits the work into pull requests. A large refactor gets its own pull request first, as maestro's `CONTRIBUTING.md` requires.
-- **implementing.** One worker session per pull request. The worker commits in the job workspace and stops when the commits are ready.
+- **spec.** The agent writes the goal, scope, what is out of scope, and acceptance criteria. The run starts a new session. Its prompt holds the request and the answers to the clarifying questions.
+- **plan.** The agent splits the work into pull requests. A large refactor gets its own pull request first, as maestro's `CONTRIBUTING.md` requires. The run starts a new session. Its prompt holds the request, the answers and the approved spec.
+- **implementing.** One worker session per pull request. The prompt holds the request, the answers, the approved spec, the titles of all planned pull requests and the summary of this one. The worker commits in the job workspace and stops when the commits are ready.
 - **verifying.** The factory runs the project's checks in the worker and the comment review. Failures go back to the session.
 - **publish.** With the publish gate on, the job stays in verifying once the checks pass and the factory collects the branch's commits and diff stat from the checkout. The dashboard shows them with the pull request title and description. Approve moves the job to pr-open. Request changes sends your feedback to the pull request's session, then the checks run again and the job returns here. A revision does not count toward the 5 failed rounds. The factory pushes nothing before you approve.
 - **pr-open.** The factory pushes the branch and opens the pull request as moonthebot.
@@ -68,6 +68,7 @@ The state machine is pure logic with no I/O, so it can be tested without podman 
 ## Running Claude Code in a worker
 
 - One `claude -p` run per stage, with `--output-format stream-json` for the live log. The factory picks the session's UUID and passes it with `--session-id` on the first run, so it knows the ID even if it dies during the run. Later runs pass `--resume <session-id>`.
+- **Fresh sessions.** The clarify, spec, plan and implement runs each start their own session, one for clarifying, one for the spec, one for the plan and one per planned pull request. Each prompt is self-contained, because the session has seen none of the earlier stages. The job stores the request, the answers, the approved spec and the plan for this. Only a gate revision, a check fix, a CI fix, a review fix or a rebase resumes the session of its own stage. Each stage can then use its own model, because no resumed session switches models. A job created before this rule has no stored answers and keeps one planning session for clarifying, spec and plan, so its spec and plan runs resume it with the short prompts.
 - Every run ends with `--json-schema` structured output: an `outcome` and the questions, spec or plan that go with it. Each stage allows `questions` and one outcome of its own: `clarified`, `spec`, `plan` or `commits_ready`. Claude Code puts the output in `structured_output` on the final `result` line. A run without it, or with an outcome its stage does not allow, fails the job.
 - The worker is started with `--rm`, so each job gets a Claude Code config directory on the host, mounted at `CLAUDE_CONFIG_DIR`. It keeps the session files that `--resume` reads.
 - The token reaches the worker as `--secret claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN`.

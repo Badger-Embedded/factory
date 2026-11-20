@@ -74,7 +74,7 @@ fn request_ends_merged_after_every_planned_pull_request_merges() {
     );
 
     apply(&mut job, Event::Agent(AgentResult::Clarified));
-    assert_runs(&job, Session::Planning, Task::WriteSpec);
+    assert_runs(&job, Session::Spec, Task::WriteSpec);
 
     apply(&mut job, Event::Agent(AgentResult::Spec("the spec".into())));
     assert_eq!(job.turn(), &Turn::User(Ask::SpecApproval));
@@ -82,7 +82,7 @@ fn request_ends_merged_after_every_planned_pull_request_merges() {
     assert_eq!(job.next_command(), None);
 
     apply(&mut job, Event::Approve);
-    assert_runs(&job, Session::Planning, Task::WritePlan);
+    assert_runs(&job, Session::Plan, Task::WritePlan);
 
     let plan = vec![planned("refactor"), planned("feature")];
     apply(&mut job, Event::Agent(AgentResult::Plan(plan.clone())));
@@ -176,7 +176,7 @@ fn wrong_number_of_answers_is_rejected_and_leaves_the_job_unchanged() {
 }
 
 #[test]
-fn requested_changes_go_back_to_the_planning_session() {
+fn requested_changes_go_back_to_the_stage_session() {
     let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);
     apply(&mut job, Event::Agent(AgentResult::Clarified));
@@ -190,7 +190,7 @@ fn requested_changes_go_back_to_the_planning_session() {
     assert_eq!(job.stage(), &Stage::Spec);
     assert_runs(
         &job,
-        Session::Planning,
+        Session::Spec,
         Task::Revise {
             feedback: "drop the CLI part".into(),
         },
@@ -213,7 +213,7 @@ fn requested_changes_go_back_to_the_planning_session() {
     assert_eq!(job.stage(), &Stage::Plan);
     assert_runs(
         &job,
-        Session::Planning,
+        Session::Plan,
         Task::Revise {
             feedback: "split it".into(),
         },
@@ -524,7 +524,7 @@ fn spec_gate_off_goes_straight_to_the_plan() {
     apply(&mut job, Event::Agent(AgentResult::Spec("the spec".into())));
     assert_eq!(job.spec(), Some("the spec"));
     assert_eq!(job.stage(), &Stage::Plan);
-    assert_runs(&job, Session::Planning, Task::WritePlan);
+    assert_runs(&job, Session::Plan, Task::WritePlan);
 }
 
 #[test]
@@ -806,4 +806,76 @@ fn jobs_that_still_have_a_step_are_not_finished() {
     assert!(!requested.is_finished());
     assert!(!implementing(&["only"]).is_finished());
     assert!(!watching(9).is_finished());
+}
+
+#[test]
+fn spec_and_plan_each_run_in_their_own_session() {
+    let mut job = Job::new("add a reboot button", Gates::default());
+    assert!(job.fresh_sessions());
+    apply(&mut job, Event::Start);
+    assert_runs(
+        &job,
+        Session::Planning,
+        Task::Clarify {
+            request: "add a reboot button".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    assert_runs(&job, Session::Spec, Task::WriteSpec);
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    apply(&mut job, Event::Approve);
+    assert_runs(&job, Session::Plan, Task::WritePlan);
+}
+
+#[test]
+fn the_job_keeps_the_answers_to_the_clarifying_questions() {
+    let mut job = Job::new("add a reboot button", Gates::default());
+    apply(&mut job, Event::Start);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Questions(vec![
+            question("Which board?"),
+            question("Confirm first?"),
+        ])),
+    );
+    apply(&mut job, Event::Answer(vec!["rpi5".into(), "yes".into()]));
+    let answers: Vec<(&str, &str)> = job
+        .answers()
+        .iter()
+        .map(|a| (a.question.as_str(), a.answer.as_str()))
+        .collect();
+    assert_eq!(
+        answers,
+        [("Which board?", "rpi5"), ("Confirm first?", "yes")]
+    );
+}
+
+#[test]
+fn a_rejected_answer_records_nothing() {
+    let mut job = Job::new("add a reboot button", Gates::default());
+    apply(&mut job, Event::Start);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Questions(vec![question("Which board?")])),
+    );
+    assert!(job.apply(Event::Answer(vec![])).is_err());
+    assert_eq!(job.answers(), []);
+}
+
+#[test]
+fn a_stored_job_without_fresh_sessions_keeps_the_planning_session() {
+    let mut stored =
+        serde_json::to_value(Job::new("add a reboot button", Gates::default())).unwrap();
+    let fields = stored.as_object_mut().unwrap();
+    fields.remove("fresh_sessions").unwrap();
+    fields.remove("answers").unwrap();
+
+    let mut job: Job = serde_json::from_value(stored).unwrap();
+    assert!(!job.fresh_sessions());
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    assert_runs(&job, Session::Planning, Task::WriteSpec);
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    apply(&mut job, Event::Approve);
+    assert_runs(&job, Session::Planning, Task::WritePlan);
 }

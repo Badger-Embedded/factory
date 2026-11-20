@@ -501,6 +501,8 @@ impl Store {
     pub fn session_uuid(&self, job_id: i64, session: Session) -> Result<String, StoreError> {
         let key = match session {
             Session::Planning => "planning".to_owned(),
+            Session::Spec => "spec".to_owned(),
+            Session::Plan => "plan".to_owned(),
             Session::Pr(pr) => format!("pr-{pr}"),
         };
         let conn = self.conn();

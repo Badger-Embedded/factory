@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use factory_core::Task;
+use factory_core::{Job, PlannedPr, Task};
 
 use crate::outcome::Expect;
 
@@ -72,4 +72,64 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
          continue, and list the questions."
     );
     text
+}
+
+/// The prompt for one agent run of `job`. A job with fresh sessions starts
+/// its spec, plan and implement runs in a new session, so those prompts
+/// carry what the session has not seen. Every other run uses [`prompt`].
+#[must_use]
+pub fn job_prompt(job: &Job, task: &Task, expect: Expect) -> String {
+    let body = prompt(task, expect);
+    if !job.fresh_sessions() {
+        return body;
+    }
+    let mut context = String::new();
+    match task {
+        Task::WriteSpec => request_section(&mut context, job),
+        Task::WritePlan => {
+            request_section(&mut context, job);
+            spec_section(&mut context, job);
+        }
+        Task::Implement { pr } => {
+            request_section(&mut context, job);
+            spec_section(&mut context, job);
+            plan_section(&mut context, job, pr);
+        }
+        _ => return body,
+    }
+    format!("{context}{body}")
+}
+
+fn request_section(text: &mut String, job: &Job) {
+    let _ = write!(
+        text,
+        "This is a feature request for the repository in the current directory:\n\n{}\n\n",
+        job.request()
+    );
+    if !job.answers().is_empty() {
+        text.push_str("The requester answered these questions about it:\n");
+        for answered in job.answers() {
+            let _ = write!(text, "\nQ: {}\nA: {}\n", answered.question, answered.answer);
+        }
+        text.push('\n');
+    }
+}
+
+fn spec_section(text: &mut String, job: &Job) {
+    let _ = write!(
+        text,
+        "The approved spec:\n\n{}\n\n",
+        job.spec().unwrap_or_default()
+    );
+}
+
+fn plan_section(text: &mut String, job: &Job, current: &PlannedPr) {
+    text.push_str("The approved plan splits the work into these pull requests:\n");
+    for (index, planned) in job.plan().iter().enumerate() {
+        let _ = write!(text, "\n{}. {}", index + 1, planned.title);
+        if planned.title == current.title {
+            text.push_str(" (the one to implement now)");
+        }
+    }
+    text.push_str("\n\n");
 }
