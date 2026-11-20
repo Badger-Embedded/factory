@@ -5,10 +5,12 @@
 //! crash the factory reads the job back and runs the same command again.
 //! Every [`Command`] must therefore be safe to run twice.
 
+mod effort;
 mod job;
 mod names;
 mod usage;
 
+pub use effort::{DEFAULT_EFFORT, EFFORTS};
 pub use job::{
     AgentResult, Answered, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, RetryTarget, ReviewPass,

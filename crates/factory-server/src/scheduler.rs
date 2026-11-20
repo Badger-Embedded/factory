@@ -48,6 +48,9 @@ pub struct AgentRequest {
     pub prompt: String,
     /// The model for the run's stage, or `None` when the project sets none.
     pub model: Option<String>,
+    /// The effort for the run's stage, or `None` to run it at the shared
+    /// default.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +339,7 @@ impl<E: Executor> Scheduler<E> {
                         expect,
                         prompt: job_prompt(&job, &task, expect),
                         model,
+                        effort: None,
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();

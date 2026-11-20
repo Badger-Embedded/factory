@@ -3,7 +3,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    AgentResult, Command, Event, Gates, Job, PlannedPr, PrDescription, Question, Stage, Task,
+    AgentResult, Command, EFFORTS, Event, Gates, Job, PlannedPr, PrDescription, Question, Stage,
+    Task,
 };
 use factory_runner::{
     Expect, LogLine, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
@@ -49,6 +50,7 @@ fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
         expect: Expect::Spec,
         prompt: "Write the spec.".into(),
         model: None,
+        effort: None,
     }
 }
 
@@ -611,6 +613,38 @@ fn podman_args_pass_the_model_to_claude_for_each_stage() {
         assert_eq!(value_after(&args, "--model"), model);
         let image = args.iter().position(|arg| arg == "claude").unwrap();
         assert!(args.iter().position(|arg| arg == "--model").unwrap() > image);
+    }
+}
+
+fn args_with_effort(expect: Expect, effort: Option<&str>) -> Vec<String> {
+    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Resume(SESSION.into()));
+    run.expect = expect;
+    run.effort = effort.map(str::to_owned);
+    strings(&podman_args(&WorkerConfig::default(), &run))
+}
+
+#[test]
+fn podman_args_default_to_medium_effort_for_each_stage() {
+    for expect in [
+        Expect::Clarify,
+        Expect::Spec,
+        Expect::Plan,
+        Expect::Commits,
+        Expect::FixCi,
+        Expect::Review,
+    ] {
+        let args = args_with_effort(expect, None);
+        assert_eq!(value_after(&args, "--effort"), "medium", "{expect:?}");
+        let image = args.iter().position(|arg| arg == "claude").unwrap();
+        assert!(args.iter().position(|arg| arg == "--effort").unwrap() > image);
+    }
+}
+
+#[test]
+fn podman_args_pass_the_set_effort_to_claude() {
+    for effort in EFFORTS {
+        let args = args_with_effort(Expect::Commits, Some(effort));
+        assert_eq!(value_after(&args, "--effort"), effort, "{effort}");
     }
 }
 
