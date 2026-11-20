@@ -8,6 +8,7 @@ use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::projects::{Project, StageEfforts, StageModels};
+use crate::secrets::SecretRef;
 use crate::settings::Settings;
 
 const SCHEMA: &str = "
@@ -96,6 +97,14 @@ CREATE TABLE IF NOT EXISTS pr_watermarks (
     pr INTEGER NOT NULL,
     seen_until TEXT NOT NULL,
     PRIMARY KEY (job_id, pr)
+);
+CREATE TABLE IF NOT EXISTS secrets (
+    project TEXT NOT NULL,
+    server TEXT NOT NULL,
+    header TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    value BLOB NOT NULL,
+    PRIMARY KEY (project, server, header)
 );
 ";
 
@@ -1034,6 +1043,62 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Stores the opaque `value` for a secret under its `backend`, replacing
+    /// any row already keyed by the same project, server and header. The
+    /// encryption lives in the secret backend, so the store treats `value` as
+    /// bytes it never interprets.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn put_secret(
+        &self,
+        at: SecretRef<'_>,
+        backend: &str,
+        value: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO secrets (project, server, header, backend, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (project, server, header)
+             DO UPDATE SET backend = excluded.backend, value = excluded.value",
+            params![at.project, at.server, at.header, backend, value],
+        )?;
+        Ok(())
+    }
+
+    /// The backend and the opaque stored bytes for a secret, or `None` when no
+    /// row is keyed by this project, server and header.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn get_secret(&self, at: SecretRef<'_>) -> Result<Option<(String, Vec<u8>)>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT backend, value FROM secrets
+                 WHERE project = ?1 AND server = ?2 AND header = ?3",
+                params![at.project, at.server, at.header],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Deletes the secret for a project, server and header. A row that is not
+    /// there is fine.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn delete_secret(&self, at: SecretRef<'_>) -> Result<(), StoreError> {
+        self.conn().execute(
+            "DELETE FROM secrets WHERE project = ?1 AND server = ?2 AND header = ?3",
+            params![at.project, at.server, at.header],
+        )?;
+        Ok(())
     }
 
     fn load(conn: &Connection, id: i64) -> Result<JobRow, StoreError> {

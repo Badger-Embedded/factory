@@ -6,7 +6,7 @@ use std::sync::Arc;
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
     CurlUsageSource, GhRepos, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects,
-    RepoChecker, Scheduler, Store, app, import_tomls, refresh_forever,
+    RepoChecker, Scheduler, Store, app, import_tomls, master_key_from_env, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -62,6 +62,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let names = projects.names()?;
     store.migrate_global_auto_merge(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
     let wake = Arc::new(Notify::new());
+
+    // Per-project MCP header values are encrypted under the `factory-master-key`
+    // secret. A missing or malformed key leaves the secret store unavailable
+    // rather than stopping the factory, so the dashboard still runs and reports
+    // secrets as off. The dashboard and the proxy build the store from the key
+    // in later changes.
+    if master_key_from_env().is_some() {
+        tracing::info!("MCP secret store is ready");
+    } else {
+        tracing::warn!("factory-master-key is missing or invalid, MCP header secrets are off");
+    }
 
     if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {
         let executor = PodmanExecutor {

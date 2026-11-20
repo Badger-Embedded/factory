@@ -20,6 +20,9 @@ Environment=FACTORY_WORKER_VOLUMES=factory-nix:/nix
 Environment=RUST_LOG=info
 Secret=gh-token,type=env,target=GH_TOKEN
 Secret=claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN
+# Encrypts per-project MCP header values at rest. The factory container gets
+# it; workers never do, so a stolen worker cannot read a credential.
+Secret=factory-master-key,type=env,target=FACTORY_MASTER_KEY
 
 [Service]
 Restart=always
