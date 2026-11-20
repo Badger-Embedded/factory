@@ -27,6 +27,7 @@ const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
 const SETTINGS_FORM: &str = include_str!("../static/settings-form.js");
 const MCP_TOOLS: &str = include_str!("../static/mcp-tools.js");
+const SETTINGS_PIPELINE: &str = include_str!("../static/settings-pipeline.js");
 
 /// The characters a header name may hold, as an HTML `pattern`, so the browser
 /// refuses `Authorization: x` before the form posts. It matches the server's
@@ -396,6 +397,8 @@ pub struct ProjectSettings {
     pub auto_merge: bool,
     pub llm_review: bool,
     pub gates: Gates,
+    /// The factory's default gates, which the gate panels compare against.
+    pub default_gates: Gates,
     /// One per registered server, in the registry's order.
     pub servers: Vec<ServerSettings>,
 }
@@ -802,6 +805,7 @@ pub fn settings_project(
     user: &str,
     nav: &SettingsNav,
     project: &ProjectSettings,
+    selected: PipelinePart,
     notice: Option<&str>,
 ) -> Markup {
     settings_page(
@@ -812,9 +816,10 @@ pub fn settings_project(
         notice,
         &html! {
             h1 { (project.name) }
-            p.meta { (RUNS_KEEP_VALUES) }
-            (project_form(project))
+            p.meta { "The path a job takes. Select a stage to set its model, effort and MCP servers, or a ✋ to change that approval gate. " (RUNS_KEEP_VALUES) }
+            (project_form(project, selected))
             (project_servers_card(project))
+            script { (PreEscaped(SETTINGS_PIPELINE)) }
         },
     )
 }
@@ -1060,74 +1065,314 @@ fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup 
     }
 }
 
-/// One project's form on its settings page: its two flags, its gates, and a
-/// model field with an effort selector beside it for each of the five stages.
-fn project_form(project: &ProjectSettings) -> Markup {
+/// A part of a project's pipeline that can be selected: a stage, a gate or
+/// merge. It is the `?stage=` value of the project's settings page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelinePart {
+    Stage(&'static str),
+    Gate(&'static str),
+    Merge,
+}
+
+/// The five agent stages, in the order a job runs them.
+const STAGES: [&str; 5] = ["clarify", "spec", "plan", "implement", "review"];
+/// The gate after each stage that has one.
+const GATE_AFTER: [(&str, &str); 3] =
+    [("spec", "spec"), ("plan", "plan"), ("implement", "publish")];
+/// Model aliases the stage panel offers. Any other model ID can be typed.
+const MODEL_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+impl PipelinePart {
+    /// The part named by a `?stage=` value. An unknown or missing value
+    /// selects the first stage.
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        let value = value.unwrap_or_default();
+        if value == "merge" {
+            return PipelinePart::Merge;
+        }
+        if let Some(gate) = value.strip_prefix("gate-")
+            && let Some((_, gate)) = GATE_AFTER.iter().find(|(_, name)| *name == gate)
+        {
+            return PipelinePart::Gate(gate);
+        }
+        PipelinePart::Stage(
+            STAGES
+                .iter()
+                .find(|stage| **stage == value)
+                .copied()
+                .unwrap_or(STAGES[0]),
+        )
+    }
+
+    /// The `?stage=` value of this part.
+    #[must_use]
+    pub fn key(self) -> String {
+        match self {
+            PipelinePart::Stage(stage) => stage.to_owned(),
+            PipelinePart::Gate(gate) => format!("gate-{gate}"),
+            PipelinePart::Merge => "merge".to_owned(),
+        }
+    }
+}
+
+fn gate_label(gate: &str) -> &'static str {
+    match gate {
+        "spec" => "Approve the spec",
+        "plan" => "Approve the plan",
+        _ => "Approve before pushing",
+    }
+}
+
+fn gate_help(gate: &str) -> &'static str {
+    match gate {
+        "spec" => {
+            "The job stops after the spec is written and waits for you to approve it or ask for changes."
+        }
+        "plan" => "The job stops after the plan is written, before any code, and waits for you.",
+        _ => {
+            "The job stops once the checks pass, before the factory pushes the branch and opens the pull request. You see the commits and the diff stat first."
+        }
+    }
+}
+
+fn gate_on(gates: Gates, gate: &str) -> bool {
+    match gate {
+        "spec" => gates.spec,
+        "plan" => gates.plan,
+        _ => gates.publish,
+    }
+}
+
+fn stage_model<'a>(models: &'a StageModels, stage: &str) -> Option<&'a str> {
+    match stage {
+        "clarify" => models.clarify.as_deref(),
+        "spec" => models.spec.as_deref(),
+        "plan" => models.plan.as_deref(),
+        "implement" => models.implement.as_deref(),
+        _ => models.review.as_deref(),
+    }
+}
+
+fn stage_effort<'a>(efforts: &'a StageEfforts, stage: &str) -> &'a str {
+    match stage {
+        "clarify" => &efforts.clarify,
+        "spec" => &efforts.spec,
+        "plan" => &efforts.plan,
+        "implement" => &efforts.implement,
+        _ => &efforts.review,
+    }
+}
+
+fn stage_on(stages: McpStages, stage: &str) -> bool {
+    match stage {
+        "clarify" => stages.clarify,
+        "spec" => stages.spec,
+        "plan" => stages.plan,
+        "implement" => stages.implement,
+        _ => stages.review,
+    }
+}
+
+/// A project's settings drawn as the path a job takes: a node per stage, a
+/// gate between the stages that have one, and merge at the end. Each node is
+/// a `?stage=` link that opens its panel under the pipeline. Every panel is in
+/// the one form and only the selected one shows, so a save posts every field
+/// and a hidden panel's values are kept. `SETTINGS_PIPELINE` switches panels
+/// without a reload and keeps the nodes in step with the fields.
+fn project_form(project: &ProjectSettings, selected: PipelinePart) -> Markup {
     let name = &project.name;
-    let models = &project.models;
-    let efforts = &project.efforts;
-    let auto_merge = project.auto_merge;
-    let llm_review = project.llm_review;
+    let href = |part: PipelinePart| {
+        format!(
+            "/settings/projects/{}?stage={}",
+            crate::web::query_escape(name),
+            part.key()
+        )
+    };
     html! {
-        form.card.settings-form method="post" action={ "/settings/projects/" (name) } {
-            div.field {
-                label.check {
-                    input type="checkbox" name="auto_merge" value="on" checked[auto_merge];
-                    " Merge pull requests when their checks pass"
-                }
-                p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
+        form.card.settings-form.pipeline-form method="post" action=(href(selected)) {
+            input type="hidden" name="gates" value="on";
+            @for server in &project.servers {
+                input type="hidden" name={ "mcp." (server.name) ".pipeline" } value="on";
             }
-            div.field {
-                label.check {
-                    input type="checkbox" name="llm_review" value="on" checked[llm_review];
-                    " Review with an LLM before merge"
-                }
-                p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent." }
-            }
-            div.field {
-                span.label { "Approval gates" }
-                input type="hidden" name="gates" value="on";
-                label.check {
-                    input type="checkbox" name="gate_spec" value="on" checked[project.gates.spec];
-                    " Approve the spec"
-                }
-                label.check {
-                    input type="checkbox" name="gate_plan" value="on" checked[project.gates.plan];
-                    " Approve the plan"
-                }
-                label.check {
-                    input type="checkbox" name="gate_publish" value="on" checked[project.gates.publish];
-                    " Approve before pushing"
-                }
-                p.hint { "Applies to jobs created after you save. A job keeps the gates it started with." }
-            }
-            p.hint { "The model and effort each stage runs with. An empty model means no model; effort is medium unless you change it." }
-            @for (stage, model, effort) in [
-                ("clarify", &models.clarify, &efforts.clarify),
-                ("spec", &models.spec, &efforts.spec),
-                ("plan", &models.plan, &efforts.plan),
-                ("implement", &models.implement, &efforts.implement),
-                ("review", &models.review, &efforts.review),
-            ] {
-                div.row {
-                    div.field {
-                        label for={ (name) "-" (stage) } { (stage) " model" }
-                        input id={ (name) "-" (stage) } type="text" name=(stage)
-                            value=(model.as_deref().unwrap_or_default());
+            ol.pipeline {
+                @for stage in STAGES {
+                    li.pipe-step {
+                        (stage_node(project, stage, selected == PipelinePart::Stage(stage), &href(PipelinePart::Stage(stage))))
                     }
-                    div.field {
-                        label for={ (name) "-" (stage) "-effort" } { (stage) " effort" }
-                        select id={ (name) "-" (stage) "-effort" } name={ (stage) "_effort" } {
-                            @for level in EFFORTS {
-                                option value=(level) selected[level == effort.as_str()] {
-                                    (level)
-                                }
-                            }
+                    @if let Some((_, gate)) = GATE_AFTER.iter().find(|(after, _)| *after == stage) {
+                        li.pipe-link {
+                            (gate_node(project, gate, selected == PipelinePart::Gate(gate), &href(PipelinePart::Gate(gate))))
+                        }
+                    } @else {
+                        li.pipe-link aria-hidden="true" {}
+                    }
+                }
+                li.pipe-step {
+                    a.pipe-node href=(href(PipelinePart::Merge)) data-part="merge"
+                        aria-current=[(selected == PipelinePart::Merge).then_some("step")] {
+                        span.pipe-name { "merge" }
+                        span.pipe-model data-merge-label {
+                            (if project.auto_merge { "Automatic" } else { "You, on GitHub" })
+                        }
+                        span.pipe-sub { "after green CI" }
+                    }
+                }
+            }
+            @for stage in STAGES {
+                (stage_panel(project, stage, selected == PipelinePart::Stage(stage)))
+            }
+            @for (_, gate) in GATE_AFTER {
+                (gate_panel(project, gate, selected == PipelinePart::Gate(gate)))
+            }
+            div.pipe-panel data-panel="merge" hidden[selected != PipelinePart::Merge] {
+                h2 { "Merge" }
+                div.field {
+                    label.check {
+                        input type="checkbox" name="auto_merge" value="on" checked[project.auto_merge];
+                        " Merge pull requests when their checks pass"
+                    }
+                    p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
+                }
+            }
+            datalist #model-aliases {
+                @for alias in MODEL_ALIASES { option value=(alias) {} }
+            }
+            (save_bar(&format!("Save {name}")))
+        }
+    }
+}
+
+fn stage_node(project: &ProjectSettings, stage: &str, selected: bool, href: &str) -> Markup {
+    let off = stage == "review" && !project.llm_review;
+    let model = stage_model(&project.models, stage);
+    let effort = stage_effort(&project.efforts, stage);
+    let level = EFFORTS
+        .iter()
+        .position(|level| *level == effort)
+        .unwrap_or(0);
+    html! {
+        a.pipe-node.off[off] href=(href) data-part=(stage)
+            aria-current=[selected.then_some("step")] {
+            span.pipe-name { (stage) }
+            span.pipe-model.dflt[model.is_none() || off] data-model-label=(stage) {
+                @if off { "Off" } @else { (model.unwrap_or("CLI default")) }
+            }
+            span.pipe-effort data-effort-label=(stage) title={ "effort " (effort) } {
+                @for (index, _) in EFFORTS.iter().enumerate() {
+                    i.on[index <= level] {}
+                }
+            }
+            span.pipe-mcp {
+                @for server in &project.servers {
+                    span data-server-label={ (server.name) "." (stage) }
+                        hidden[!(server.enabled && stage_on(server.stages, stage))] {
+                        (server.name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn gate_node(project: &ProjectSettings, gate: &str, selected: bool, href: &str) -> Markup {
+    let on = gate_on(project.gates, gate);
+    let changed = on != gate_on(project.default_gates, gate);
+    html! {
+        a.gate-node.on[on].changed[changed] href=(href) data-part={ "gate-" (gate) }
+            data-gate-node=(gate) title=(gate_label(gate))
+            aria-current=[selected.then_some("step")] {
+            span aria-hidden="true" { "✋" }
+            span.visually-hidden {
+                (gate_label(gate)) ": " (if on { "on" } else { "off" })
+            }
+        }
+    }
+}
+
+fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool) -> Markup {
+    let name = &project.name;
+    let model = stage_model(&project.models, stage).unwrap_or_default();
+    let effort = stage_effort(&project.efforts, stage);
+    html! {
+        div.pipe-panel data-panel=(stage) hidden[!selected] {
+            h2 { (stage[..1].to_uppercase()) (stage[1..]) " stage" }
+            @if stage == "review" {
+                div.field {
+                    label.check {
+                        input type="checkbox" name="llm_review" value="on" checked[project.llm_review];
+                        " Review with an LLM before merge"
+                    }
+                    p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent. Off, the review stage does not run." }
+                }
+            }
+            div.field {
+                label for={ (name) "-" (stage) } { "Model" }
+                div.model-chips {
+                    button.chip type="button" data-model="" data-model-for=(stage) { "CLI default" }
+                    @for alias in MODEL_ALIASES {
+                        button.chip type="button" data-model=(alias) data-model-for=(stage) { (alias) }
+                    }
+                }
+                input id={ (name) "-" (stage) } type="text" name=(stage) list="model-aliases"
+                    placeholder="CLI default" value=(model) data-model-input=(stage);
+                p.hint { "An alias or any model ID. Empty runs the model the installed claude CLI picks." }
+            }
+            div.field {
+                span.label { "Effort" }
+                div.seg role="radiogroup" aria-label={ (stage) " effort" } {
+                    @for level in EFFORTS {
+                        label {
+                            input type="radio" name={ (stage) "_effort" } value=(level)
+                                checked[level == effort];
+                            span { (level) }
                         }
                     }
                 }
             }
-            (save_bar(&format!("Save {name}")))
+            div.field {
+                span.label { "MCP servers in this stage" }
+                @if project.servers.is_empty() {
+                    p.hint { "No servers yet. " a href="/settings/mcp" { "Add one" } "." }
+                }
+                @for server in &project.servers {
+                    label.check {
+                        input type="checkbox" name={ "mcp." (server.name) ".stage." (stage) } value="on"
+                            checked[server.enabled && stage_on(server.stages, stage)];
+                        " " (server.name)
+                    }
+                    p.hint.indent {
+                        @if server.headers.iter().any(|header| !header.set) {
+                            span.bad { "Key missing. " }
+                        }
+                        a href=(project_mcp_href(name, &server.name)) { "Key and tools for " (server.name) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn gate_panel(project: &ProjectSettings, gate: &str, selected: bool) -> Markup {
+    let on = gate_on(project.gates, gate);
+    let default = gate_on(project.default_gates, gate);
+    html! {
+        div.pipe-panel data-panel={ "gate-" (gate) } hidden[!selected] {
+            h2 { (gate_label(gate)) }
+            div.field {
+                label.check {
+                    input type="checkbox" name={ "gate_" (gate) } value="on" checked[on]
+                        data-gate=(gate) data-default=(if default { "on" } else { "off" });
+                    " The job waits for you here"
+                }
+                p.hint { (gate_help(gate)) }
+                p.hint {
+                    "Factory default: " strong { (if default { "on" } else { "off" }) } ". "
+                    span.gate-changed hidden[on == default] { "Changed for " (project.name) ". " }
+                    button.link-like type="button" data-gate-reset=(gate) { "Use the default" }
+                }
+                p.hint { "Applies to jobs created after you save. A job keeps the gates it started with." }
+            }
         }
     }
 }

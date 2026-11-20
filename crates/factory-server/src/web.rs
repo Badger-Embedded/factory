@@ -847,6 +847,7 @@ fn project_page(
     state: &AppState,
     headers: &HeaderMap,
     name: &str,
+    selected: pages::PipelinePart,
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
     let Some(project) = state.projects.lookup(name)? else {
@@ -856,8 +857,22 @@ fn project_page(
         &user(headers),
         &settings_nav(state)?,
         &project_settings(state, name, &project)?,
+        selected,
         notice,
     ))
+}
+
+/// The `?stage=` value of a project's settings page: the stage, gate or merge
+/// whose panel is open.
+#[derive(Deserialize)]
+struct StageQuery {
+    stage: Option<String>,
+}
+
+impl StageQuery {
+    fn part(&self) -> pages::PipelinePart {
+        pages::PipelinePart::parse(self.stage.as_deref())
+    }
 }
 
 /// Everything a project's settings page shows: its models, efforts, flags and
@@ -880,6 +895,7 @@ fn project_settings(
         auto_merge: state.store.project_auto_merge(name, project.auto_merge)?,
         llm_review: state.store.project_llm_review(name, project.llm_review)?,
         gates: state.store.project_gates(name)?,
+        default_gates: state.store.settings()?.gates,
         servers,
     })
 }
@@ -925,8 +941,9 @@ async fn show_project_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<StageQuery>,
 ) -> Result<Markup, AppError> {
-    project_page(&state, &headers, &name, None)
+    project_page(&state, &headers, &name, query.part(), None)
 }
 
 fn default_effort() -> String {
@@ -984,10 +1001,51 @@ fn save_posted_gates(store: &Store, project: &str, form: &ProjectForm) -> Result
     )
 }
 
+/// Saves the MCP stage switches of a project's pipeline. The form posts a
+/// hidden `mcp.<server>.pipeline` field for each server it shows, and a server
+/// without one is left as it is. A switch on turns the server on in that
+/// stage, and the server runs in exactly the stages switched on. With every
+/// switch off a running server stops, and keeps its stages for the server's
+/// own page. A server that is off and stays off is not written.
+fn save_pipeline_mcp(state: &AppState, project: &str, form: &ProjectForm) -> Result<(), AppError> {
+    for server in state.store.mcp_servers()? {
+        let base = format!("mcp.{}", server.name);
+        if !form.ticked(&format!("{base}.pipeline")) {
+            continue;
+        }
+        let posted = McpStages {
+            clarify: form.ticked(&format!("{base}.stage.clarify")),
+            spec: form.ticked(&format!("{base}.stage.spec")),
+            plan: form.ticked(&format!("{base}.stage.plan")),
+            implement: form.ticked(&format!("{base}.stage.implement")),
+            review: form.ticked(&format!("{base}.stage.review")),
+        };
+        let stored = state.store.project_mcp(project, &server.name)?;
+        let settings = if posted.any() {
+            McpProjectSettings {
+                enabled: true,
+                stages: posted,
+            }
+        } else if stored.enabled {
+            McpProjectSettings {
+                enabled: false,
+                stages: stored.stages,
+            }
+        } else {
+            continue;
+        };
+        state
+            .store
+            .save_project_mcp(project, &server.name, &settings)?;
+    }
+    Ok(())
+}
+
 async fn save_project_models(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<StageQuery>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
     if state.projects.lookup(&name)?.is_none() {
@@ -1018,8 +1076,9 @@ async fn save_project_models(
         form.ticked("llm_review"),
     )?;
     save_posted_gates(&state.store, &name, &form)?;
+    save_pipeline_mcp(&state, &name, &form)?;
     state.wake.notify_one();
-    project_page(&state, &headers, &name, Some("Saved."))
+    project_page(&state, &headers, &name, query.part(), Some("Saved."))
 }
 
 /// One server's settings as a project's page for it shows them.
