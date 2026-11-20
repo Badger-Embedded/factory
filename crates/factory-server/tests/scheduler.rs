@@ -2,11 +2,13 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use factory_core::{AgentResult, Event, PrDescription, Question, Stage, Turn};
+use factory_core::{
+    AgentResult, Ask, BranchSummary, Event, Gates, PrDescription, Question, Stage, Turn,
+};
 use factory_runner::{Expect, LogLine, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Scheduler,
-    Settings, Store, WatchReport, WatchRequest,
+    Settings, Store, SummaryRequest, WatchReport, WatchRequest,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -28,6 +30,7 @@ struct FakeExecutor {
     stopped: Mutex<Vec<i64>>,
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
+    summarized: Mutex<Vec<SummaryRequest>>,
     publishes: Mutex<VecDeque<Result<u64, String>>>,
     published: Mutex<Vec<PublishRequest>>,
     watches: Mutex<VecDeque<Result<WatchReport, String>>>,
@@ -43,6 +46,7 @@ impl FakeExecutor {
             stopped: Mutex::new(Vec::new()),
             checks: Mutex::new(VecDeque::new()),
             checks_run: Mutex::new(Vec::new()),
+            summarized: Mutex::new(Vec::new()),
             publishes: Mutex::new(VecDeque::new()),
             published: Mutex::new(Vec::new()),
             watches: Mutex::new(VecDeque::new()),
@@ -88,6 +92,15 @@ impl Executor for FakeExecutor {
             .unwrap()
             .pop_front()
             .unwrap_or(Ok(Event::ChecksPassed))
+    }
+
+    async fn summarize(&self, request: SummaryRequest) -> Result<BranchSummary, String> {
+        tokio::task::yield_now().await;
+        self.summarized.lock().unwrap().push(request);
+        Ok(BranchSummary {
+            commits: vec!["abc1234 maestrod: add a reboot endpoint".into()],
+            diff_stat: " src/main.rs | 4 ++++".into(),
+        })
     }
 
     async fn publish(&self, request: PublishRequest) -> Result<u64, String> {
@@ -725,5 +738,51 @@ async fn a_conflict_sends_the_agent_to_rebase_on_the_pull_request_branch() {
     assert_eq!(
         store.get(id).unwrap().job.stage(),
         &Stage::Verifying { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn the_publish_gate_holds_the_push_until_the_user_approves() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    store
+        .save_settings(&Settings {
+            poll_seconds: 0,
+            gates: Gates {
+                publish: true,
+                ..Gates::default()
+            },
+            ..Settings::default()
+        })
+        .unwrap();
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+    let summarized = executor.summarized.lock().unwrap().clone();
+    assert_eq!(summarized.len(), 1);
+    assert_eq!(summarized[0].job_id, id);
+    assert_eq!(summarized[0].base, "main");
+    let job = store.get(id).unwrap().job;
+    assert_eq!(
+        job.turn(),
+        &Turn::User(Ask::PublishApproval {
+            summary: Some(BranchSummary {
+                commits: vec!["abc1234 maestrod: add a reboot endpoint".into()],
+                diff_stat: " src/main.rs | 4 ++++".into(),
+            })
+        })
+    );
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+    assert!(executor.published.lock().unwrap().is_empty());
+    assert_eq!(executor.summarized.lock().unwrap().len(), 1);
+
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    assert_eq!(executor.published.lock().unwrap().len(), 1);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
     );
 }

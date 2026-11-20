@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use factory_core::{Command, Event, Job, PrDescription, Session, Stage};
+use factory_core::{BranchSummary, Command, Event, Job, PrDescription, Session, Stage};
 use factory_runner::{Expect, LogLine, RunReport, prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -47,6 +47,13 @@ pub struct ChecksRequest {
     pub base: String,
     /// The project's `checks` command.
     pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryRequest {
+    pub job_id: i64,
+    /// The branch the pull request targets.
+    pub base: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +113,12 @@ pub trait Executor: Send + Sync + 'static {
         settings: &Settings,
         request: ChecksRequest,
     ) -> impl Future<Output = Result<Event, String>> + Send;
+
+    /// Lists the commits and the diff stat the branch adds to its base.
+    fn summarize(
+        &self,
+        request: SummaryRequest,
+    ) -> impl Future<Output = Result<BranchSummary, String>> + Send;
 
     /// Pushes the branch and opens or updates its pull request. Returns the
     /// pull request number.
@@ -250,6 +263,9 @@ impl<E: Executor> Scheduler<E> {
                 Command::RunChecks { .. } => {
                     self.checks(row.id, &project, &settings, workers_free)?;
                 }
+                Command::Summarize { .. } if self.due(row.id) => {
+                    self.summarize(row.id, &project, &settings);
+                }
                 Command::Publish { pr } if self.due(row.id) => {
                     self.publish(row.id, pr, &job, &project, &settings)?;
                 }
@@ -369,6 +385,21 @@ impl<E: Executor> Scheduler<E> {
             }
         });
         Ok(())
+    }
+
+    fn summarize(self: &Arc<Self>, job_id: i64, project: &Project, settings: &Settings) {
+        let request = SummaryRequest {
+            job_id,
+            base: project.base.clone(),
+        };
+        let scheduler = Arc::clone(self);
+        let settings = settings.clone();
+        self.spawn(job_id, Kind::Factory, async move {
+            match scheduler.executor.summarize(request).await {
+                Ok(summary) => scheduler.apply(job_id, Event::Summarized(summary)),
+                Err(err) => scheduler.retry_later(&settings, job_id, &err),
+            }
+        });
     }
 
     fn publish(

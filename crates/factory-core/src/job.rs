@@ -27,7 +27,7 @@ pub struct Gates {
     pub spec: bool,
     /// Wait for the user to approve the plan.
     pub plan: bool,
-    /// Stored but not used yet.
+    /// Wait for the user to approve a pull request before its first push.
     pub publish: bool,
 }
 
@@ -67,9 +67,25 @@ pub enum Turn {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ask {
-    Answers { questions: Vec<Question> },
+    Answers {
+        questions: Vec<Question>,
+    },
     SpecApproval,
     PlanApproval,
+    /// The user approves the first push of a pull request. The summary is
+    /// `None` until the factory has collected it.
+    PublishApproval {
+        summary: Option<BranchSummary>,
+    },
+}
+
+/// What a pull request branch would add to its base branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchSummary {
+    /// One `<short sha> <subject>` entry per commit.
+    pub commits: Vec<String>,
+    /// The `git diff --stat` output. Empty when the branch changes nothing.
+    pub diff_stat: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +163,10 @@ pub enum Command {
     RunChecks {
         pr: usize,
     },
+    /// Collect the branch's commits and diff stat for the publish approval.
+    Summarize {
+        pr: usize,
+    },
     /// Push the pull request's branch and open the pull request if it is not
     /// open yet.
     Publish {
@@ -180,6 +200,8 @@ pub enum Event {
         feedback: String,
     },
     ChecksPassed,
+    /// The factory collected what the publish approval shows.
+    Summarized(BranchSummary),
     ChecksFailed {
         report: String,
     },
@@ -286,6 +308,9 @@ impl Job {
                 task: task.clone(),
             }),
             (Turn::Factory, Stage::Verifying { pr }) => Some(Command::RunChecks { pr: *pr }),
+            (Turn::User(Ask::PublishApproval { summary: None }), Stage::Verifying { pr }) => {
+                Some(Command::Summarize { pr: *pr })
+            }
             (Turn::Factory, Stage::PrOpen { pr }) => Some(Command::Publish { pr: *pr }),
             (Turn::Factory, Stage::CiAndReview { pr }) => self.plan[*pr]
                 .number
@@ -417,8 +442,36 @@ impl Job {
             }
 
             (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => {
+                if self.gates.publish && self.plan[*pr].number.is_none() {
+                    (
+                        S::Verifying { pr: *pr },
+                        Turn::User(Ask::PublishApproval { summary: None }),
+                    )
+                } else {
+                    (S::PrOpen { pr: *pr }, Turn::Factory)
+                }
+            }
+            (
+                S::Verifying { pr },
+                Turn::User(Ask::PublishApproval { summary: None }),
+                E::Summarized(summary),
+            ) => (
+                S::Verifying { pr: *pr },
+                Turn::User(Ask::PublishApproval {
+                    summary: Some(summary),
+                }),
+            ),
+            (S::Verifying { pr }, Turn::User(Ask::PublishApproval { .. }), E::Approve) => {
                 (S::PrOpen { pr: *pr }, Turn::Factory)
             }
+            (
+                S::Verifying { pr },
+                Turn::User(Ask::PublishApproval { .. }),
+                E::RequestChanges { feedback },
+            ) => (
+                S::Verifying { pr: *pr },
+                Turn::Agent(Task::Revise { feedback }),
+            ),
             (S::Verifying { pr }, Turn::Factory, E::ChecksFailed { report }) => {
                 let pr = *pr;
                 self.fail_round(S::Verifying { pr }, Task::FixChecks { report })

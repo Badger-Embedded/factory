@@ -236,6 +236,8 @@ button:hover { filter: brightness(0.96); }
 .plan li { margin-bottom: 10px; }
 .plan .summary { color: var(--muted); }
 
+.commits { margin: 0 0 12px; padding-left: 20px; font: 13px/1.6 var(--mono); }
+
 .question { margin-bottom: 16px; }
 
 .footer-actions { margin-top: 32px; }
