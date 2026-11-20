@@ -41,6 +41,6 @@ just deploy            # origin/main
 just deploy my-branch  # any git ref
 ```
 
-`deploy/deploy.sh` copies the ref's source to `~/factory-src` on `moon.local` and runs `deploy/install.sh` there. That script builds the worker and factory images, installs the Quadlet unit `deploy/factory.container`, restarts `factory.service` and publishes the dashboard on the tailnet with `tailscale serve`. It creates the `gh-token` podman secret from moonthebot's `gh` login when the secret is missing. The `claude-token` secret has to exist already.
+`deploy/deploy.sh` copies the ref's source to `~/factory-src` on `moon.local` and runs `deploy/install.sh` there. That script builds the worker and factory images, installs the Quadlet unit `deploy/factory.container`, restarts `factory.service` and publishes the dashboard on the tailnet with `tailscale serve`. It creates the `gh-token` podman secret from moonthebot's `gh` login when the secret is missing. The factory holds the Claude token in its secret store and you set it on the settings page, so no podman secret is required; when a `claude-token` secret still exists, the unit passes it in so the factory can import it once.
 
 On moon, the factory keeps its database and job directories in `~/.local/share/factory`. Follow its log with `journalctl --user -u factory -f`.

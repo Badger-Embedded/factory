@@ -29,7 +29,10 @@ Environment=FACTORY_PROXY_URL=http://factory:8081
 Environment=FACTORY_WORKER_NETWORK=factory
 Environment=RUST_LOG=info
 Secret=gh-token,type=env,target=GH_TOKEN
-Secret=claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN
+# install.sh adds a Secret=claude-token line here when that podman secret
+# exists. The factory reads the Claude token from its secret store and imports
+# the podman secret on first start, so a fresh install has no such secret, and
+# Quadlet refuses to start a unit that names a missing one.
 # Encrypts per-project MCP header values at rest. The factory container gets
 # it; workers never do, so a stolen worker cannot read a credential.
 Secret=factory-master-key,type=env,target=FACTORY_MASTER_KEY

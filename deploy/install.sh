@@ -33,13 +33,13 @@ if ! podman secret exists factory-master-key; then
     head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n' \
         | podman secret create factory-master-key - >/dev/null
 fi
-if ! podman secret exists claude-token; then
-    echo "The podman secret claude-token is missing." >&2
-    echo "Run 'claude setup-token' and pipe the token into 'podman secret create claude-token -'." >&2
-    exit 1
-fi
 strip_newline gh-token
-strip_newline claude-token
+# The factory reads the Claude token from its secret store and imports this
+# podman secret on first start, so it is no longer required. When it exists,
+# the unit below still passes it in, which gives the factory a token to import.
+if podman secret exists claude-token; then
+    strip_newline claude-token
+fi
 
 # The docker format keeps the Containerfiles' SHELL, which sets pipefail for
 # their curl | sh steps. The OCI format ignores it.
@@ -56,7 +56,13 @@ if ! podman network exists factory; then
 fi
 
 mkdir -p ~/.local/share/factory ~/.config/containers/systemd
-cp deploy/factory.container ~/.config/containers/systemd/factory.container
+unit=~/.config/containers/systemd/factory.container
+cp deploy/factory.container "$unit"
+# Pass the Claude token only when its podman secret exists: Quadlet refuses to
+# start a unit that names a missing secret, and a fresh install has none.
+if podman secret exists claude-token; then
+    sed -i '/^Secret=gh-token,/a Secret=claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN' "$unit"
+fi
 systemctl --user daemon-reload
 systemctl --user restart factory.service
 
