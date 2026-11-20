@@ -221,6 +221,33 @@ impl Dashboard {
             .await
     }
 
+    /// Every settings page joined into one body: the factory pages, the MCP
+    /// servers page, each server's page and each project's page.
+    async fn settings_pages(&self) -> String {
+        let mut uris: Vec<String> = [
+            "/settings/workers",
+            "/settings/gates",
+            "/settings/github",
+            "/settings/claude",
+            "/settings/mcp",
+        ]
+        .map(str::to_owned)
+        .into();
+        for server in self.store.mcp_servers().unwrap() {
+            uris.push(format!("/settings/mcp/{}", server.name));
+        }
+        for (name, _) in self.store.list_projects().unwrap() {
+            uris.push(format!("/settings/projects/{name}"));
+        }
+        let mut body = String::new();
+        for uri in uris {
+            let reply = self.get(&uri).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}");
+            body.push_str(&reply.body);
+        }
+        body
+    }
+
     async fn post(&self, uri: &str, form: &str) -> Reply {
         self.send(
             Request::post(uri)
@@ -413,7 +440,13 @@ async fn the_dashboard_loads_no_asset_from_an_outside_host() {
     // and stylesheets.
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    for uri in ["/", "/settings", &format!("/jobs/{id}")] {
+    for uri in [
+        "/",
+        "/settings/workers",
+        "/settings/mcp",
+        "/settings/projects/maestro",
+        &format!("/jobs/{id}"),
+    ] {
         let body = dashboard.get(uri).await.body;
         for attr in ["src=\"http", "src=\"//", "rel=\"stylesheet\" href=\"http"] {
             assert!(!body.contains(attr), "{uri} loads an outside asset: {attr}");
@@ -881,7 +914,7 @@ async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
     let index = dashboard.get("/?project=widgets").await;
     assert_eq!(index.status, StatusCode::OK);
     assert!(index.body.contains("widgets"));
-    assert!(dashboard.get("/settings").await.body.contains("widgets"));
+    assert!(dashboard.settings_pages().await.contains("widgets"));
     let created = dashboard.post_job("widgets", "A widget change", &[]).await;
     assert_eq!(created.status, StatusCode::SEE_OTHER);
 }
@@ -891,7 +924,7 @@ async fn the_add_a_server_name_field_carries_the_name_rule() {
     // The browser blocks a bad name before submit; the attributes must mirror
     // `validate_name` in mcp.rs, which stays the server-side authority.
     let dashboard = dashboard();
-    let body = dashboard.get("/settings").await.body;
+    let body = dashboard.settings_pages().await;
     let name_input = body
         .split("id=\"mcp-new-name\"")
         .nth(1)
@@ -961,7 +994,7 @@ async fn settings_form_patterns_are_valid_under_the_v_flag() {
             "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     let patterns = pattern_attributes(&page);
     // The name input and at least one header input (add form plus the edit form
     // of the server just saved) render a pattern.
@@ -1171,7 +1204,7 @@ async fn merged(dashboard: &Dashboard) -> i64 {
 #[tokio::test]
 async fn the_settings_page_shows_and_saves_the_stored_settings() {
     let dashboard = dashboard();
-    let page = dashboard.get("/settings").await;
+    let page = dashboard.get("/settings/workers").await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.contains("name=\"max_workers\""));
     assert!(page.body.contains("value=\"2\""));
@@ -1179,10 +1212,13 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
 
     let reply = dashboard
         .post(
-            "/settings",
-            "max_workers=4&poll_seconds=30&worker_image=localhost%2Fw%3A2&worker_memory=6g&worker_cpus=6",
+            "/settings/workers",
+            "max_workers=4&worker_image=localhost%2Fw%3A2&worker_memory=6g&worker_cpus=6",
         )
         .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    let reply = dashboard.post("/settings/github", "poll_seconds=30").await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.body.contains("Saved."));
     assert_eq!(
@@ -1193,11 +1229,7 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
             worker_image: "localhost/w:2".into(),
             worker_memory: "6g".into(),
             worker_cpus: "6".into(),
-            gates: Gates {
-                spec: false,
-                plan: false,
-                publish: false
-            },
+            gates: Gates::default(),
         }
     );
 }
@@ -1207,7 +1239,7 @@ async fn auto_merge_is_a_per_project_setting() {
     let dashboard = dashboard();
     // The per-project form carries the auto-merge toggle, the global form
     // does not.
-    let page = dashboard.get("/settings").await;
+    let page = dashboard.get("/settings/projects/maestro").await;
     assert!(page.body.contains("name=\"auto_merge\""));
     assert!(
         !dashboard
@@ -1228,7 +1260,7 @@ async fn auto_merge_is_a_per_project_setting() {
             .project_auto_merge("maestro", false)
             .unwrap()
     );
-    assert!(dashboard.get("/settings").await.body.contains("checked"));
+    assert!(dashboard.settings_pages().await.contains("checked"));
 
     // Saving again without the checkbox clears it.
     dashboard
@@ -1244,7 +1276,7 @@ async fn auto_merge_is_a_per_project_setting() {
 async fn llm_review_is_a_per_project_setting() {
     let dashboard = dashboard();
     // The per-project form carries the review toggle.
-    let page = dashboard.get("/settings").await;
+    let page = dashboard.get("/settings/projects/maestro").await;
     assert!(page.body.contains("name=\"llm_review\""));
     assert!(
         !dashboard
@@ -1329,13 +1361,23 @@ async fn the_form_saves_auto_merge_and_review_together_and_leaves_other_projects
 async fn bad_settings_are_rejected_and_not_saved() {
     let dashboard = dashboard();
     let before = dashboard.store.settings().unwrap();
-    for form in [
-        "max_workers=2&poll_seconds=5&worker_image=i&worker_memory=3g&worker_cpus=4",
-        "max_workers=2&poll_seconds=60&worker_image=+&worker_memory=3g&worker_cpus=4",
-        "max_workers=-1&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4",
+    for (uri, form) in [
+        ("/settings/github", "poll_seconds=5"),
+        (
+            "/settings/workers",
+            "max_workers=2&worker_image=+&worker_memory=3g&worker_cpus=4",
+        ),
+        (
+            "/settings/workers",
+            "max_workers=-1&worker_image=i&worker_memory=3g&worker_cpus=4",
+        ),
     ] {
-        let reply = dashboard.post("/settings", form).await;
-        assert!(reply.status.is_client_error(), "{form}: {}", reply.status);
+        let reply = dashboard.post(uri, form).await;
+        assert!(
+            reply.status.is_client_error(),
+            "{uri} {form}: {}",
+            reply.status
+        );
     }
     assert_eq!(dashboard.store.settings().unwrap(), before);
 }
@@ -1871,13 +1913,13 @@ async fn the_form_posts_multipart_with_an_image_input() {
 }
 
 fn gate_form(gates: &str) -> String {
-    format!("max_workers=2&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4{gates}")
+    gates.trim_start_matches('&').to_owned()
 }
 
 #[tokio::test]
 async fn the_settings_page_has_a_checkbox_per_gate_with_spec_and_plan_on() {
     let dashboard = dashboard();
-    let body = dashboard.get("/settings").await.body;
+    let body = dashboard.settings_pages().await;
     assert!(body.contains("Approval gates"));
     for name in ["gate_spec", "gate_plan", "gate_publish"] {
         assert!(body.contains(&format!("name=\"{name}\"")), "{name}");
@@ -1893,7 +1935,7 @@ async fn the_gate_checkboxes_save_and_an_absent_box_means_off() {
     let dashboard = dashboard();
     let all = gate_form("&gate_spec=on&gate_plan=on&gate_publish=on");
     assert_eq!(
-        dashboard.post("/settings", &all).await.status,
+        dashboard.post("/settings/gates", &all).await.status,
         StatusCode::OK
     );
     assert_eq!(
@@ -1906,7 +1948,7 @@ async fn the_gate_checkboxes_save_and_an_absent_box_means_off() {
     );
 
     dashboard
-        .post("/settings", &gate_form("&gate_plan=on"))
+        .post("/settings/gates", &gate_form("&gate_plan=on"))
         .await;
     assert_eq!(
         dashboard.store.settings().unwrap().gates,
@@ -1917,7 +1959,7 @@ async fn the_gate_checkboxes_save_and_an_absent_box_means_off() {
         }
     );
 
-    dashboard.post("/settings", &gate_form("")).await;
+    dashboard.post("/settings/gates", &gate_form("")).await;
     let gates = dashboard.store.settings().unwrap().gates;
     assert_eq!(
         gates,
@@ -1927,16 +1969,15 @@ async fn the_gate_checkboxes_save_and_an_absent_box_means_off() {
             publish: false
         }
     );
-    let body = dashboard.get("/settings").await.body;
+    let body = dashboard.settings_pages().await;
     let defaults = factory_form(&body);
     assert!(!defaults.contains(r#"name="gate_spec" value="on" checked"#));
     assert!(!defaults.contains(r#"name="gate_plan" value="on" checked"#));
 }
 
-/// The factory-wide form on the settings page, the first form that posts to
-/// `/settings`.
+/// The default gates form.
 fn factory_form(body: &str) -> &str {
-    let start = body.find(r#"action="/settings""#).unwrap();
+    let start = body.find(r#"action="/settings/gates""#).unwrap();
     let end = start + body[start..].find("</form>").unwrap();
     &body[start..end]
 }
@@ -1960,10 +2001,9 @@ fn no_gates() -> Gates {
 
 #[tokio::test]
 async fn the_settings_page_calls_the_factory_gates_defaults() {
-    let body = dashboard().get("/settings").await.body;
-    let defaults = factory_form(&body);
-    assert!(defaults.contains("Default gates"));
-    assert!(defaults.contains("A project you onboard starts with these."));
+    let body = dashboard().get("/settings/gates").await.body;
+    assert!(body.contains("<h1>Default gates</h1>"));
+    assert!(body.contains("A project you onboard starts with these."));
 }
 
 #[tokio::test]
@@ -1980,7 +2020,7 @@ async fn each_project_form_shows_its_own_gates() {
             },
         )
         .unwrap();
-    let body = dashboard.get("/settings").await.body;
+    let body = dashboard.settings_pages().await;
     let form = project_form(&body, "maestro");
     assert!(form.contains(r#"<input type="hidden" name="gates" value="on">"#));
     assert!(form.contains(r#"name="gate_spec" value="on">"#));
@@ -3148,7 +3188,7 @@ fn a_database_from_before_the_effort_table_opens_and_reads_medium() {
 #[tokio::test]
 async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_effective_value() {
     let dashboard = dashboard();
-    let page = dashboard.get("/settings").await;
+    let page = dashboard.get("/settings/projects/maestro").await;
     // A select named "<stage>_effort" sits beside each stage's model field.
     for stage in ["clarify", "spec", "plan", "implement", "review"] {
         assert!(
@@ -3169,7 +3209,7 @@ async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_e
         .store
         .save_project_efforts("maestro", &efforts("low", "medium", "high", "xhigh", "max"))
         .unwrap();
-    let page = dashboard.get("/settings").await;
+    let page = dashboard.get("/settings/projects/maestro").await;
     assert!(page.body.contains("value=\"low\" selected"));
     assert!(page.body.contains("value=\"high\" selected"));
     assert!(page.body.contains("value=\"xhigh\" selected"));
@@ -3465,7 +3505,7 @@ fn the_migration_without_stored_settings_does_nothing() {
 #[tokio::test]
 async fn the_settings_page_edits_the_models_of_each_project() {
     let dashboard = dashboard();
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(page.contains("action=\"/settings/projects/maestro\""));
     for stage in ["clarify", "spec", "plan", "implement", "review"] {
         assert!(page.contains(&format!("name=\"{stage}\"")), "{stage}");
@@ -4316,9 +4356,8 @@ async fn the_onboard_page_is_linked_and_shows_step_one() {
     assert!(dashboard.get("/").await.body.contains("href=\"/onboard\""));
     assert!(
         dashboard
-            .get("/settings")
+            .settings_pages()
             .await
-            .body
             .contains("href=\"/onboard\"")
     );
 
@@ -4361,7 +4400,7 @@ async fn skipping_step_two_creates_a_project_with_defaults() {
             .body
             .contains("widgets")
     );
-    assert!(dashboard.get("/settings").await.body.contains("widgets"));
+    assert!(dashboard.settings_pages().await.contains("widgets"));
     let created = dashboard.post_job("widgets", "A widget change", &[]).await;
     assert_eq!(created.status, StatusCode::SEE_OTHER);
 }
@@ -4388,7 +4427,7 @@ async fn step_two_values_are_stored_and_shown_on_the_settings_page() {
     assert!(store.project_auto_merge("widgets", false).unwrap());
     assert!(store.project_llm_review("widgets", false).unwrap());
 
-    let settings = dashboard.get("/settings").await.body;
+    let settings = dashboard.settings_pages().await;
     assert!(settings.contains("value=\"opus\""));
     assert!(settings.contains("checked"));
 }
@@ -4627,7 +4666,7 @@ async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
     let dashboard = dashboard();
 
     // The empty section shows before any server is added.
-    let page = dashboard.get("/settings").await;
+    let page = dashboard.get("/settings/mcp").await;
     assert!(page.body.contains("MCP servers"));
     assert!(page.body.contains("No servers yet."));
 
@@ -4695,7 +4734,7 @@ async fn an_invalid_mcp_server_is_a_bad_request() {
 #[tokio::test]
 async fn the_add_server_form_has_header_name_rows_not_a_textarea() {
     let dashboard = dashboard();
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     // The header names live in text boxes posting a repeated `header` field,
     // with an "Add header" button, and no textarea or `headers` field remains.
     assert!(page.contains(r#"name="header""#));
@@ -4755,7 +4794,7 @@ async fn an_edit_form_shows_a_filled_row_per_name_and_an_empty_one() {
             "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     // The edit form carries the stored name in a text box, ready to edit.
     assert!(page.contains(r#"value="Authorization""#));
     assert!(page.contains(r#"name="header""#));
@@ -4814,7 +4853,7 @@ async fn a_projects_form_has_a_block_per_server_defaulting_to_off() {
             "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
         )
         .await;
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     // The project form carries the server's enabled switch, a checkbox per
     // stage, and the declared header as a write-only field showing "not set".
     assert!(page.contains("name=\"mcp.context7.enabled\""));
@@ -4892,7 +4931,7 @@ async fn the_page_never_renders_a_stored_header_value() {
         .await;
     store_auth_value(&dashboard, "Bearer sk-secret-xyz");
 
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(
         !page.contains("sk-secret-xyz"),
         "the stored value leaked into the HTML"
@@ -5001,7 +5040,7 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
         .await;
 
     // The page says the master key is missing.
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(page.contains("master key is missing"));
 
     // A header value cannot be saved, but the enabled and stage choices still can.
@@ -5050,7 +5089,7 @@ fn store_claude_token(dashboard: &Dashboard, value: &str) {
 #[tokio::test]
 async fn the_settings_page_has_a_claude_token_field_in_the_global_section() {
     let dashboard = dashboard();
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(page.contains("Claude token"));
     assert!(page.contains("name=\"claude_token\""));
     assert!(page.contains("action=\"/settings/claude-token\""));
@@ -5063,7 +5102,7 @@ async fn the_claude_token_is_never_rendered_but_its_presence_shows() {
     let dashboard = dashboard();
     store_claude_token(&dashboard, "sk-ant-oat-secret-xyz");
 
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(
         !page.contains("sk-ant-oat-secret-xyz"),
         "the stored token leaked into the HTML"
@@ -5134,7 +5173,7 @@ async fn without_a_master_key_the_claude_token_field_is_disabled_with_a_message(
         Arc::new(UnavailableSecrets::new(Arc::clone(&store))),
     );
 
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     // The field is present but disabled, and the page says why.
     assert!(page.contains("name=\"claude_token\""));
     assert!(page.contains("master key is missing"));
@@ -5173,7 +5212,7 @@ fn store_value_for(dashboard: &Dashboard, project: &str, value: &str) {
 async fn a_project_server_block_has_a_refresh_connection_button() {
     let dashboard = two_projects();
     add_context7(&dashboard).await;
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(page.contains("Refresh connection"));
     assert!(page.contains(r#"hx-post="/settings/projects/maestro/mcp/context7/check""#));
     assert!(page.contains(r#"hx-post="/settings/projects/tool/mcp/context7/check""#));
@@ -5259,7 +5298,7 @@ async fn a_refresh_stores_the_listed_tools_and_shows_them_on() {
     );
     // The tools belong to the project that refreshed.
     assert_eq!(tool_states(&dashboard, "other"), Vec::new());
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(page.contains(r#"name="mcp.context7.tool.resolve-library-id" value="on" checked"#));
 }
 
@@ -5286,7 +5325,7 @@ async fn saving_turns_off_the_shown_tools_left_unchecked() {
             ("c".to_owned(), true, false, false),
         ],
     );
-    let page = dashboard.get("/settings").await.body;
+    let page = dashboard.settings_pages().await;
     assert!(page.contains(r#"name="mcp.context7.tool.b" value="on">"#));
 
     // Checking it again turns it back on.
@@ -5551,4 +5590,156 @@ async fn the_check_route_404s_for_an_unknown_project_or_server() {
     assert_eq!(unknown_server.status, StatusCode::NOT_FOUND);
     // Neither 404 ran a check.
     assert_eq!(dashboard.checker.calls(), 0);
+}
+
+#[tokio::test]
+async fn settings_opens_the_first_project_or_workers_without_one() {
+    let reply = two_projects().get("/settings").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location.as_deref(),
+        Some("/settings/projects/maestro")
+    );
+
+    let empty = dashboard_with(Arc::new(Store::open_in_memory().unwrap()));
+    let reply = empty.get("/settings").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/settings/workers"));
+}
+
+#[tokio::test]
+async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    let body = dashboard.get("/settings/github").await.body;
+    for href in [
+        "/settings/workers",
+        "/settings/gates",
+        "/settings/github",
+        "/settings/claude",
+        "/settings/mcp",
+        "/settings/projects/maestro",
+        "/settings/projects/tool",
+        "/onboard",
+    ] {
+        assert!(body.contains(&format!("href=\"{href}\"")), "{href}");
+    }
+    assert!(body.contains(r#"href="/settings/github" aria-current="page""#));
+    assert_eq!(body.matches(r#"aria-current="page""#).count(), 1);
+
+    // A server's page marks the MCP servers entry.
+    let body = dashboard.get("/settings/mcp/context7").await.body;
+    assert!(body.contains(r#"href="/settings/mcp" aria-current="page""#));
+}
+
+#[tokio::test]
+async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    for uri in [
+        "/settings/workers",
+        "/settings/gates",
+        "/settings/github",
+        "/settings/claude",
+        "/settings/mcp/context7",
+        "/settings/projects/maestro",
+    ] {
+        let body = dashboard.get(uri).await.body;
+        assert_eq!(body.matches(r#"class="save-bar""#).count(), 1, "{uri}");
+        assert!(body.contains(r#"class="card settings-form""#), "{uri}");
+        assert!(body.contains("beforeunload"), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn save_comes_before_delete_and_clear_so_enter_saves() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    let body = dashboard.get("/settings/mcp/context7").await.body;
+    let save = body
+        .find("<button class=\"primary\">Save</button>")
+        .unwrap();
+    let delete = body.find("/settings/mcp/context7/delete").unwrap();
+    assert!(save < delete);
+
+    let body = dashboard.get("/settings/claude").await.body;
+    let save = body.find("Save token").unwrap();
+    let clear = body.find("Clear token").unwrap();
+    assert!(save < clear);
+}
+
+#[tokio::test]
+async fn each_factory_page_saves_only_its_own_fields() {
+    let dashboard = dashboard();
+    dashboard.post("/settings/gates", "gate_publish=on").await;
+    dashboard.post("/settings/github", "poll_seconds=90").await;
+    dashboard
+        .post(
+            "/settings/workers",
+            "max_workers=3&worker_image=i&worker_memory=3g&worker_cpus=2",
+        )
+        .await;
+    let settings = dashboard.store.settings().unwrap();
+    assert_eq!(settings.max_workers, 3);
+    assert_eq!(settings.poll_seconds, 90);
+    assert_eq!(
+        settings.gates,
+        Gates {
+            spec: false,
+            plan: false,
+            publish: true,
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_save_redraws_the_same_page_with_a_notice() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    assert!(reply.body.contains("<h1>maestro</h1>"));
+
+    let reply = dashboard.post("/settings/gates", "").await;
+    assert!(reply.body.contains("Saved."));
+    assert!(reply.body.contains("<h1>Default gates</h1>"));
+
+    add_context7(&dashboard).await;
+    let reply = dashboard.post("/settings/mcp/context7/delete", "").await;
+    assert!(reply.body.contains("Deleted."));
+    assert!(reply.body.contains("<h1>MCP servers</h1>"));
+}
+
+#[tokio::test]
+async fn adding_a_server_opens_its_page() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Added."));
+    assert!(reply.body.contains("<h1>context7</h1>"));
+    let list = dashboard.get("/settings/mcp").await.body;
+    assert!(list.contains(r#"href="/settings/mcp/context7""#));
+}
+
+#[tokio::test]
+async fn an_unknown_project_or_server_page_is_not_found() {
+    let dashboard = dashboard();
+    assert_eq!(
+        dashboard.get("/settings/projects/nope").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        dashboard.get("/settings/mcp/nope").await.status,
+        StatusCode::NOT_FOUND
+    );
 }

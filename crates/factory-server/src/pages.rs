@@ -25,6 +25,7 @@ pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
+const SETTINGS_FORM: &str = include_str!("../static/settings-form.js");
 
 /// The characters a header name may hold, as an HTML `pattern`, so the browser
 /// refuses `Authorization: x` before the form posts. It matches the server's
@@ -416,26 +417,118 @@ pub struct HeaderState {
     pub set: bool,
 }
 
-pub fn settings(
+/// Which settings page is open, so the sidebar marks its entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsPage {
+    Workers,
+    Gates,
+    Github,
+    Claude,
+    Mcp,
+    McpServer(String),
+    Project(String),
+}
+
+/// What the settings sidebar lists besides its fixed entries.
+pub struct SettingsNav {
+    /// Onboarded project names, in name order.
+    pub projects: Vec<String>,
+    /// Registered MCP server names, in the registry's order.
+    pub servers: Vec<String>,
+}
+
+/// A settings page: the sidebar, then `body` under its heading and the
+/// optional `notice`. `SETTINGS_FORM` marks a form with unsaved changes and
+/// asks before the page is left.
+fn settings_page(
     user: &str,
-    settings: &Settings,
-    servers: &[McpServer],
-    projects: &[ProjectSettings],
-    secrets_available: bool,
-    claude_token_set: bool,
+    nav: &SettingsNav,
+    current: &SettingsPage,
+    title: &str,
     notice: Option<&str>,
+    body: &Markup,
 ) -> Markup {
     layout(
         user,
-        "Settings",
+        &format!("{title} · Settings"),
         &html! {
-            h1 { "Settings" }
-            p.meta { "The job loop reads these on every pass. A run that already started keeps the values it started with." }
-            @if let Some(notice) = notice {
-                div.card.saved { (notice) }
+            div.settings {
+                (settings_sidebar(nav, current))
+                div.settings-main {
+                    @if let Some(notice) = notice {
+                        div.card.saved { (notice) }
+                    }
+                    (body)
+                }
             }
-            form.card method="post" action="/settings" {
-                h2 { "Workers" }
+            script { (PreEscaped(SETTINGS_FORM)) }
+        },
+    )
+}
+
+fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
+    let entry = |href: String, label: &str, page: &SettingsPage| {
+        let here = page == current;
+        html! {
+            a.settings-link href=(href) aria-current=[here.then_some("page")] { (label) }
+        }
+    };
+    let in_mcp = matches!(current, SettingsPage::Mcp | SettingsPage::McpServer(_));
+    html! {
+        nav.settings-nav aria-label="Settings" {
+            p.settings-group { "Factory" }
+            (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
+            (entry("/settings/gates".into(), "Default gates", &SettingsPage::Gates))
+            (entry("/settings/github".into(), "GitHub", &SettingsPage::Github))
+            (entry("/settings/claude".into(), "Claude account", &SettingsPage::Claude))
+            p.settings-group { "Integrations" }
+            a.settings-link href="/settings/mcp" aria-current=[in_mcp.then_some("page")] {
+                "MCP servers"
+                span.settings-count { (nav.servers.len()) }
+            }
+            p.settings-group { "Projects" }
+            @for project in &nav.projects {
+                (entry(
+                    format!("/settings/projects/{}", crate::web::query_escape(project)),
+                    project,
+                    &SettingsPage::Project(project.clone()),
+                ))
+            }
+            a.settings-link.settings-add href="/onboard" { "Onboard a project" }
+        }
+    }
+}
+
+/// The bar at the bottom of a settings form with its submit button. It stays in
+/// view as the page scrolls. `SETTINGS_FORM` shows "Unsaved changes" in it once
+/// an input of the form changes.
+fn save_bar(label: &str) -> Markup {
+    html! {
+        div.save-bar {
+            span.save-bar-note { "No unsaved changes." }
+            button.primary { (label) }
+        }
+    }
+}
+
+const RUNS_KEEP_VALUES: &str = "The job loop reads these on every pass. A run that already started keeps the values it started with.";
+
+pub fn settings_workers(
+    user: &str,
+    nav: &SettingsNav,
+    settings: &Settings,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Workers,
+        "Workers",
+        notice,
+        &html! {
+            h1 { "Workers" }
+            p.meta { (RUNS_KEEP_VALUES) }
+            form.card.settings-form method="post" action="/settings/workers" {
                 div.field {
                     label for="max_workers" { "Workers at a time" }
                     input #max_workers type="number" name="max_workers" min="0" required
@@ -460,7 +553,28 @@ pub fn settings(
                             value=(settings.worker_cpus);
                     }
                 }
-                h2 { "Default gates" }
+                (save_bar("Save"))
+            }
+        },
+    )
+}
+
+pub fn settings_gates(
+    user: &str,
+    nav: &SettingsNav,
+    settings: &Settings,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Gates,
+        "Default gates",
+        notice,
+        &html! {
+            h1 { "Default gates" }
+            p.meta { "A project you onboard starts with these. Each project then has its own gates on its own page. Changing a default leaves existing projects alone." }
+            form.card.settings-form method="post" action="/settings/gates" {
                 div.field {
                     label.check {
                         input type="checkbox" name="gate_spec" value="on" checked[settings.gates.spec];
@@ -474,23 +588,121 @@ pub fn settings(
                         input type="checkbox" name="gate_publish" value="on" checked[settings.gates.publish];
                         " Approve before pushing"
                     }
-                    p.hint { "A project you onboard starts with these. Each project then has its own gates, in its settings below. Changing a default leaves existing projects alone." }
                 }
-                h2 { "GitHub" }
+                (save_bar("Save"))
+            }
+        },
+    )
+}
+
+pub fn settings_github(
+    user: &str,
+    nav: &SettingsNav,
+    settings: &Settings,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Github,
+        "GitHub",
+        notice,
+        &html! {
+            h1 { "GitHub" }
+            p.meta { (RUNS_KEEP_VALUES) }
+            form.card.settings-form method="post" action="/settings/github" {
                 div.field {
                     label for="poll_seconds" { "Seconds between looks at a pull request" }
                     input #poll_seconds type="number" name="poll_seconds" min="10" required
                         value=(settings.poll_seconds);
                     p.hint { "Also the wait before retrying a failed push or GitHub call." }
                 }
-                button.primary { "Save" }
+                (save_bar("Save"))
             }
+        },
+    )
+}
+
+pub fn settings_claude(
+    user: &str,
+    nav: &SettingsNav,
+    claude_token_set: bool,
+    secrets_available: bool,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Claude,
+        "Claude account",
+        notice,
+        &html! {
+            h1 { "Claude account" }
             (claude_token_card(claude_token_set, secrets_available))
+        },
+    )
+}
+
+pub fn settings_mcp(
+    user: &str,
+    nav: &SettingsNav,
+    servers: &[McpServer],
+    secrets_available: bool,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Mcp,
+        "MCP servers",
+        notice,
+        &html! {
+            h1 { "MCP servers" }
             (mcp_servers(servers, secrets_available))
-            @for project in projects {
-                (project_form(project, secrets_available))
-            }
             script { (PreEscaped(MCP_HEADER_ROWS)) }
+        },
+    )
+}
+
+pub fn settings_mcp_server(
+    user: &str,
+    nav: &SettingsNav,
+    server: &McpServer,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::McpServer(server.name.clone()),
+        &server.name,
+        notice,
+        &html! {
+            p.crumbs { a href="/settings/mcp" { "MCP servers" } " › " (server.name) }
+            h1 { (server.name) }
+            p.meta { "Shared by every project. Each project stores its own header values on its own page." }
+            (mcp_server_form(server))
+            script { (PreEscaped(MCP_HEADER_ROWS)) }
+        },
+    )
+}
+
+pub fn settings_project(
+    user: &str,
+    nav: &SettingsNav,
+    project: &ProjectSettings,
+    secrets_available: bool,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Project(project.name.clone()),
+        &project.name,
+        notice,
+        &html! {
+            h1 { (project.name) }
+            p.meta { (RUNS_KEEP_VALUES) }
+            (project_form(project, secrets_available))
         },
     )
 }
@@ -532,8 +744,7 @@ fn header_row(value: &str) -> Markup {
     }
 }
 
-/// The account-wide "Claude token" card in the global section, outside the
-/// per-project forms. It shows only whether a token is stored, never the value:
+/// The "Claude token" card on the Claude account page. It shows only whether a token is stored, never the value:
 /// the input carries no `value`, so the token is never in the page source. A
 /// non-empty save replaces the token, an empty save keeps it, and the Clear
 /// button removes it. When the secret store is unavailable the input and Save
@@ -542,7 +753,7 @@ fn header_row(value: &str) -> Markup {
 /// token can still be removed after the master key is lost.
 fn claude_token_card(claude_token_set: bool, secrets_available: bool) -> Markup {
     html! {
-        form.card method="post" action="/settings/claude-token" {
+        form.card.settings-form method="post" action="/settings/claude-token" {
             h2 { "Claude token" }
             p.hint { "The subscription token from " code { "claude setup-token" } ", used for every agent run and the plan usage tile. Stored encrypted and never shown." }
             @if !secrets_available {
@@ -558,29 +769,39 @@ fn claude_token_card(claude_token_set: bool, secrets_available: bool) -> Markup 
                     "Type a new token to replace it. An empty field keeps it."
                 }
             }
-            button.primary disabled[!secrets_available] { "Save token" }
-            button.danger formaction="/settings/claude-token/clear" formnovalidate { "Clear token" }
+            // Save comes before Clear, so Enter in the field saves.
+            div.save-bar {
+                span.save-bar-note { "No unsaved changes." }
+                button.primary disabled[!secrets_available] { "Save token" }
+            }
+            div.danger-zone {
+                button.danger formaction="/settings/claude-token/clear" formnovalidate { "Clear token" }
+            }
         }
     }
 }
 
-/// The "MCP servers" section: one edit form per registered server, then a form
-/// to add one. A project turns a server on and gives its header values in the
-/// project's own settings form, so this section carries no per-project state.
+/// The MCP servers page: a link per registered server to its own page, then a
+/// form to add one. A project turns a server on and gives its header values on
+/// the project's own page, so this page carries no per-project state.
 fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
     html! {
         div.card {
             h2 { "MCP servers" }
-            p.hint { "Remote MCP servers over HTTPS, offered to agent runs. A project turns one on and picks its stages in the project's own settings below. Header values are entered per project." }
+            p.hint { "Remote MCP servers over HTTPS, offered to agent runs. A project turns one on and picks its stages on its own page. Header values are entered per project." }
             @if !secrets_available {
                 p.hint.bad { "The master key is missing, so header values cannot be saved. The factory still runs, and a project's enabled servers and stages still save." }
             }
             @if servers.is_empty() {
                 p.meta { "No servers yet." }
             }
-        }
-        @for server in servers {
-            (mcp_server_form(server))
+            @for server in servers {
+                div.server-row {
+                    span.server-name { (server.name) }
+                    span.hint.server-url { (server.url) }
+                    a.link-button href={ "/settings/mcp/" (crate::web::query_escape(&server.name)) } { "Open" }
+                }
+            }
         }
         form.card method="post" action="/settings/mcp" {
             h2 { "Add a server" }
@@ -604,40 +825,41 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
                 p.hint { "An https URL to the server's streamable-HTTP endpoint." }
             }
             (header_rows(&[], &html! {
-                p.hint { "Only the header name, such as " code { "Authorization" } ", with no colon or value. Each project enters its own value in its settings below, stored encrypted. A keyless server needs none." }
+                p.hint { "Only the header name, such as " code { "Authorization" } ", with no colon or value. Each project enters its own value on its own page, stored encrypted. A keyless server needs none." }
             }))
             button.primary { "Add server" }
         }
     }
 }
 
-/// One server's edit form: its URL and header names, a Save button and a Delete
-/// button that posts the same form to the delete route. The name is fixed,
+/// One server's edit form on its own page: its URL and header names, a Delete
+/// button that posts the same form to the delete route, and the save bar. The name is fixed,
 /// because it keys the stored secrets and the proxy path.
 fn mcp_server_form(server: &McpServer) -> Markup {
     let action = format!("/settings/mcp/{}", server.name);
     let delete = format!("/settings/mcp/{}/delete", server.name);
     html! {
-        form.card method="post" action=(action) {
-            h2 { (server.name) }
+        form.card.settings-form method="post" action=(action) {
             div.field {
                 label for={ "mcp-" (server.name) "-url" } { "URL" }
                 input id={ "mcp-" (server.name) "-url" }.wide type="url" name="url" required
                     value=(server.url);
             }
             (header_rows(&server.headers, &html! {
-                p.hint { "Only the header name, with no colon or value. Each project enters its own value in its settings below, stored encrypted." }
+                p.hint { "Only the header name, with no colon or value. Each project enters its own value on its own page, stored encrypted." }
                 p.hint { "Removing or renaming a header deletes every project's stored value for it, so a renamed header's value must be entered again under the new name. Changing the URL's host or port deletes every project's stored values for this server. Changing only the path keeps them." }
             }))
-            div.row {
-                button.primary { "Save" }
-                button.danger formaction=(delete) formnovalidate { "Delete" }
+            // Save comes before Delete, so Enter in a field saves.
+            (save_bar("Save"))
+            div.danger-zone {
+                button.danger formaction=(delete) formnovalidate { "Delete " (server.name) }
+                p.hint { "Deletes the server from every project and every project's stored values for it." }
             }
         }
     }
 }
 
-/// One project's form on the settings page: its two flags, a model field with
+/// One project's form on its settings page: its two flags, a model field with
 /// an effort selector beside it for each of the five stages, and a block per
 /// registered MCP server. `secrets_available` is false when the master key is
 /// missing, which disables the header value inputs.
@@ -648,8 +870,7 @@ fn project_form(project: &ProjectSettings, secrets_available: bool) -> Markup {
     let auto_merge = project.auto_merge;
     let llm_review = project.llm_review;
     html! {
-        form.card method="post" action={ "/settings/projects/" (name) } {
-            h2 { (name) }
+        form.card.settings-form method="post" action={ "/settings/projects/" (name) } {
             div.field {
                 label.check {
                     input type="checkbox" name="auto_merge" value="on" checked[auto_merge];
@@ -710,7 +931,7 @@ fn project_form(project: &ProjectSettings, secrets_available: bool) -> Markup {
             @for server in &project.servers {
                 (project_server_block(name, server, secrets_available))
             }
-            button.primary { "Save " (name) }
+            (save_bar(&format!("Save {name}")))
         }
     }
 }
