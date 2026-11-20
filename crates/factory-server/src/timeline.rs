@@ -7,6 +7,7 @@ use factory_runner::Expect;
 use maud::{Markup, html};
 
 use crate::cost::format_cost;
+use crate::localtime;
 use crate::pages::task_label;
 use crate::projects::{StageEfforts, StageModels};
 use crate::store::JobEvent;
@@ -227,10 +228,6 @@ fn duration(seconds: i64) -> String {
     }
 }
 
-fn clock(at: &str) -> &str {
-    at.get(11..16).unwrap_or(at)
-}
-
 fn gate(job: &Job, order: usize) -> bool {
     let gates = job.gates();
     let prs = job.plan().len();
@@ -363,12 +360,10 @@ fn step(
         li class=(state.class()) aria-current=[(state == State::Current).then_some("step")] {
             span.node {}
             span.step-name { (step_name(order, job.plan().len())) }
-            span.when title=[step.start.as_deref().map(|at| format!("{at} UTC"))] {
-                (when(step, state))
-            }
+            span.when { (when(step, state)) }
             div.sub {
                 @if let Some(at) = &step.approved {
-                    span.step-tag.ok { "✓ approved " (clock(at)) }
+                    span.step-tag.ok { "✓ approved " (localtime::time(at)) }
                 } @else if gate(job, order) && state != State::Done {
                     span.step-tag.gate title="Waits for your approval" { "✋ approval" }
                 }
@@ -383,7 +378,7 @@ fn step(
                 ul.rounds {
                     @if hidden > 0 { li.earlier { (hidden) " earlier" } }
                     @for note in &step.notes[hidden..] {
-                        li { span { (note.text) } span.when { (clock(&note.at)) } }
+                        li { span { (note.text) } span.when { (localtime::time(&note.at)) } }
                     }
                 }
             }
@@ -391,9 +386,9 @@ fn step(
     }
 }
 
-fn when(step: &Step, state: State) -> String {
+fn when(step: &Step, state: State) -> Markup {
     let Some(start) = &step.start else {
-        return String::new();
+        return html! {};
     };
     let cost = if step.usd > 0.0 {
         format!(" · {}", format_cost(step.usd))
@@ -401,14 +396,13 @@ fn when(step: &Step, state: State) -> String {
         String::new()
     };
     match state {
-        State::Current => {
-            format!(
-                "since {}{cost}",
-                clock(step.visit.as_deref().unwrap_or(start))
-            )
-        }
-        _ if step.seconds > 0 => format!("{} · {}{cost}", clock(start), duration(step.seconds)),
-        _ => format!("{}{cost}", clock(start)),
+        State::Current => html! {
+            "since " (localtime::time(step.visit.as_deref().unwrap_or(start))) (cost)
+        },
+        _ if step.seconds > 0 => html! {
+            (localtime::time(start)) " · " (duration(step.seconds)) (cost)
+        },
+        _ => html! { (localtime::time(start)) (cost) },
     }
 }
 

@@ -3,6 +3,7 @@
 mod check;
 mod cost;
 mod github;
+mod localtime;
 mod mcp;
 mod pages;
 mod podman;

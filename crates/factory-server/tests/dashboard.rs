@@ -617,8 +617,44 @@ async fn the_job_page_shows_the_cost_summed_over_runs() {
             .contains("<span class=\"badge cost\" id=\"job-cost\">$1.25</span>")
     );
     assert!(page.body.contains("requested by alice@example.com"));
-    assert!(page.body.contains(" UTC</p>"));
-    assert!(!page.body.contains(" UTC · "));
+    // The created_at is wrapped so the browser can show it in its own zone.
+    // Without JavaScript it reads the stored UTC time, labelled UTC.
+    assert!(page.body.contains("data-format=\"datetime\""));
+    assert!(page.body.contains("UTC</time></p>"));
+}
+
+/// The job header wraps a known `created_at` in a `<time>` element whose
+/// `datetime` is the stored UTC time in ISO 8601, so `local-time.js` can show
+/// it in the browser's zone, and whose text is that UTC time for a visitor
+/// with JavaScript off.
+#[tokio::test]
+async fn the_job_header_wraps_created_at_in_a_time_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    let dashboard = dashboard_with(Arc::clone(&store));
+    let id = dashboard.new_job().await;
+    set_created_at(&path, id, "2026-11-20 09:15:00");
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains(
+        "<time datetime=\"2026-11-20T09:15:00Z\" data-format=\"datetime\">2026-11-20 09:15:00 UTC</time>"
+    ));
+}
+
+/// Sets a job's stored `created_at` through a second connection, the way the
+/// migration tests write rows the dashboard then reads.
+fn set_created_at(path: &Path, id: i64, at: &str) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute(
+            "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![at, id],
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1089,6 +1125,85 @@ async fn the_job_page_loads_its_update_script_but_the_board_does_not() {
 
     // The board does not; its regions poll on their own.
     assert!(!dashboard.get("/").await.body.contains("sessionStorage"));
+}
+
+/// A distinctive line from `local-time.js`.
+const LOCAL_TIME_MARKER: &str = "time[datetime][data-format]";
+
+/// Both pages that show times inline `local-time.js`, so a swapped-in fragment
+/// is converted to the browser's zone too.
+#[tokio::test]
+async fn the_board_and_the_job_page_load_the_local_time_script() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    assert!(dashboard.get("/").await.body.contains(LOCAL_TIME_MARKER));
+    assert!(
+        dashboard
+            .get(&format!("/jobs/{id}"))
+            .await
+            .body
+            .contains(LOCAL_TIME_MARKER)
+    );
+}
+
+/// The log line time is wrapped as `time-seconds`, in the full page and in the
+/// polled fragment, so a visitor sees it in their own zone either way.
+#[tokio::test]
+async fn the_log_line_time_is_wrapped_in_a_time_element() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    append_a_log_line(&dashboard, id);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("data-format=\"time-seconds\""));
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert!(fragment.body.contains("data-format=\"time-seconds\""));
+}
+
+/// Timeline step times are wrapped as `time`, in the full page and in the
+/// polled fragment.
+#[tokio::test]
+async fn the_timeline_step_time_is_wrapped_in_a_time_element() {
+    let dashboard = dashboard();
+    let id = watching_ci(&dashboard).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("data-format=\"time\""));
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert!(fragment.body.contains("data-format=\"time\""));
+}
+
+/// Wrapping a time for display does not change what is stored: a new job's
+/// `created_at` is still a plain SQLite UTC timestamp, so the retention query
+/// that deletes jobs over 30 days old finds the same jobs as before.
+#[tokio::test]
+async fn storage_and_retention_stay_in_utc() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    let dashboard = dashboard_with(Arc::clone(&store));
+    let id = dashboard.new_job().await;
+
+    // The stored value is the plain timestamp, with no display markup leaked in.
+    let stored: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT created_at FROM jobs WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(!stored.contains("<time"));
+    assert_eq!(stored.len(), "2026-11-20 09:15:00".len());
+
+    // Backdated past the cutoff, the job is due for deletion; recent, it is not.
+    set_created_at(&path, id, "2000-01-01 00:00:00");
+    assert_eq!(store.ids_older_than(30).unwrap(), vec![id]);
+    set_created_at(&path, id, "2999-01-01 00:00:00");
+    assert_eq!(store.ids_older_than(30).unwrap(), Vec::<i64>::new());
 }
 
 #[tokio::test]
@@ -4056,8 +4171,14 @@ async fn the_board_shows_the_plan_usage_tile_with_fable() {
     assert!(tile.contains("Fable"));
     assert!(tile.contains("42% used"));
     assert!(tile.contains("73% used"));
-    assert!(tile.contains("resets 2023-11-14 22:13 UTC"));
-    assert!(tile.contains("resets 2023-11-26 12:00 UTC"));
+    // The reset time is wrapped so the browser shows it in its own zone, with
+    // the stored UTC time as the fallback for a visitor with JavaScript off.
+    assert!(tile.contains(
+        "<time datetime=\"2023-11-14T22:13:00Z\" data-format=\"datetime\">2023-11-14 22:13 UTC</time>"
+    ));
+    assert!(tile.contains(
+        "<time datetime=\"2023-11-26T12:00:00Z\" data-format=\"datetime\">2023-11-26 12:00 UTC</time>"
+    ));
 }
 
 #[tokio::test]
