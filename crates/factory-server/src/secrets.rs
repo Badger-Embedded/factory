@@ -1,13 +1,21 @@
-//! Encrypted storage for per-project MCP header values.
+//! Encrypted storage for the factory's at-rest credentials: per-project MCP
+//! header values and the account-wide Claude token.
 //!
 //! A header value for an MCP server is a credential, so it must not sit in
-//! SQLite as plain text. Access goes through the [`SecretStore`] trait, so a
-//! later external backend such as Vault can replace or sit beside the local
-//! one. [`LocalSecrets`] is the only backend for now: it encrypts each value
-//! with XChaCha20-Poly1305 under a master key that lives outside the database,
-//! and stores the ciphertext in the `secrets` table through [`Store`]. Each
-//! row records its backend, so an external backend can be added without a
-//! schema change for existing rows.
+//! SQLite as plain text. The Claude subscription token from `claude
+//! setup-token` is the same: it is stored here instead of a podman secret, so
+//! an operator can set it from the settings page. Access goes through the
+//! [`SecretStore`] trait, so a later external backend such as Vault can replace
+//! or sit beside the local one. [`LocalSecrets`] is the only backend for now:
+//! it encrypts each value with XChaCha20-Poly1305 under a master key that lives
+//! outside the database, and stores the ciphertext in the `secrets` table
+//! through [`Store`]. Each row records its backend, so an external backend can
+//! be added without a schema change for existing rows.
+//!
+//! The Claude token lives in one reserved row keyed apart from every
+//! project/server/header credential, with its own associated data, so deleting
+//! or renaming an MCP server never touches it and a ciphertext moved between
+//! the token row and an MCP header row fails to decrypt.
 
 use std::fmt;
 use std::sync::Arc;
@@ -115,7 +123,44 @@ pub trait SecretStore: Send + Sync {
     ///
     /// Fails on a storage error.
     fn delete(&self, at: SecretRef<'_>) -> Result<(), SecretError>;
+
+    /// The stored Claude token, or `None` when none is set. This is the
+    /// account-wide subscription token the workers and the plan usage fetch
+    /// use, kept in a reserved row apart from the MCP header values.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable, when the stored value does not
+    /// decrypt, or on a storage error.
+    fn claude_token(&self) -> Result<Option<String>, SecretError>;
+
+    /// Stores `value` as the Claude token, replacing any token already there.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn set_claude_token(&self, value: &str) -> Result<(), SecretError>;
+
+    /// Deletes the stored Claude token. Clearing a token that is not there is
+    /// fine.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error.
+    fn clear_claude_token(&self) -> Result<(), SecretError>;
 }
+
+/// The `secrets` row that holds the account-wide Claude token. Its `server` is
+/// empty, which no MCP server name can be (names are 1 to 32 characters of
+/// `a-z`, `0-9` and `-`), so `DELETE FROM secrets WHERE server = ?` for any
+/// MCP server, including one named `claude`, never matches this row. The
+/// `project` and `header` are fixed too, so the token is one well-known key
+/// that cannot collide with a project/server/header credential.
+const CLAUDE_TOKEN_REF: SecretRef<'static> = SecretRef {
+    project: "",
+    server: "",
+    header: "claude-token",
+};
 
 /// The local encrypted backend. It holds the cipher built from the master key
 /// and writes ciphertext into the `secrets` table through [`Store`]. The key
@@ -135,11 +180,10 @@ impl LocalSecrets {
             store,
         }
     }
-}
 
-impl SecretStore for LocalSecrets {
-    fn put(&self, at: SecretRef<'_>, value: &str) -> Result<(), SecretError> {
-        let aad = associated_data(at);
+    /// Encrypts `value` under `aad` with a fresh nonce and returns the nonce
+    /// followed by the ciphertext, the bytes a `secrets` row holds.
+    fn seal(&self, aad: &[u8], value: &str) -> Result<Vec<u8>, SecretError> {
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = self
             .cipher
@@ -147,13 +191,43 @@ impl SecretStore for LocalSecrets {
                 &nonce,
                 Payload {
                     msg: value.as_bytes(),
-                    aad: &aad,
+                    aad,
                 },
             )
             .map_err(|_| SecretError::Encrypt)?;
         let mut stored = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         stored.extend_from_slice(nonce.as_slice());
         stored.extend_from_slice(&ciphertext);
+        Ok(stored)
+    }
+
+    /// Decrypts a `secrets` row's bytes under `aad`, after checking the backend
+    /// the row records.
+    fn open(&self, backend: &str, stored: &[u8], aad: &[u8]) -> Result<String, SecretError> {
+        if backend != LOCAL_BACKEND {
+            return Err(SecretError::UnknownBackend(backend.to_owned()));
+        }
+        if stored.len() < NONCE_LEN {
+            return Err(SecretError::Decrypt);
+        }
+        let (nonce, ciphertext) = stored.split_at(NONCE_LEN);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| SecretError::Decrypt)?;
+        String::from_utf8(plaintext).map_err(|_| SecretError::Decrypt)
+    }
+}
+
+impl SecretStore for LocalSecrets {
+    fn put(&self, at: SecretRef<'_>, value: &str) -> Result<(), SecretError> {
+        let stored = self.seal(&associated_data(at), value)?;
         self.store.put_secret(at, LOCAL_BACKEND, &stored)?;
         Ok(())
     }
@@ -162,30 +236,30 @@ impl SecretStore for LocalSecrets {
         let Some((backend, stored)) = self.store.get_secret(at)? else {
             return Ok(None);
         };
-        if backend != LOCAL_BACKEND {
-            return Err(SecretError::UnknownBackend(backend));
-        }
-        if stored.len() < NONCE_LEN {
-            return Err(SecretError::Decrypt);
-        }
-        let (nonce, ciphertext) = stored.split_at(NONCE_LEN);
-        let aad = associated_data(at);
-        let plaintext = self
-            .cipher
-            .decrypt(
-                XNonce::from_slice(nonce),
-                Payload {
-                    msg: ciphertext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| SecretError::Decrypt)?;
-        let value = String::from_utf8(plaintext).map_err(|_| SecretError::Decrypt)?;
-        Ok(Some(value))
+        Ok(Some(self.open(&backend, &stored, &associated_data(at))?))
     }
 
     fn delete(&self, at: SecretRef<'_>) -> Result<(), SecretError> {
         self.store.delete_secret(at)?;
+        Ok(())
+    }
+
+    fn claude_token(&self) -> Result<Option<String>, SecretError> {
+        let Some((backend, stored)) = self.store.get_secret(CLAUDE_TOKEN_REF)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open(&backend, &stored, CLAUDE_TOKEN_AAD)?))
+    }
+
+    fn set_claude_token(&self, value: &str) -> Result<(), SecretError> {
+        let stored = self.seal(CLAUDE_TOKEN_AAD, value)?;
+        self.store
+            .put_secret(CLAUDE_TOKEN_REF, LOCAL_BACKEND, &stored)?;
+        Ok(())
+    }
+
+    fn clear_claude_token(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(CLAUDE_TOKEN_REF)?;
         Ok(())
     }
 }
@@ -225,6 +299,19 @@ impl SecretStore for UnavailableSecrets {
         self.store.delete_secret(at)?;
         Ok(())
     }
+
+    fn claude_token(&self) -> Result<Option<String>, SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn set_claude_token(&self, _value: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn clear_claude_token(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(CLAUDE_TOKEN_REF)?;
+        Ok(())
+    }
 }
 
 /// The associated data bound into a ciphertext: the project, server and
@@ -239,6 +326,14 @@ fn associated_data(at: SecretRef<'_>) -> Vec<u8> {
     }
     aad
 }
+
+/// The associated data bound into the Claude token ciphertext. It is a fixed
+/// domain tag, not the length-framed triple [`associated_data`] builds, so a
+/// ciphertext moved between the token row and an MCP header row fails to
+/// decrypt in either direction. The tag's first eight bytes read as a u64 far
+/// larger than any header name's length, so it can never equal an MCP row's
+/// associated data, which starts with the project name's length.
+const CLAUDE_TOKEN_AAD: &[u8] = b"factory:claude-token:v1";
 
 /// The master key from `FACTORY_MASTER_KEY`, the `factory-master-key` podman
 /// secret, as 64 hex characters. `None` when the variable is unset, empty, not
