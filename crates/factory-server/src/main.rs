@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
-use factory_server::{PodmanExecutor, Projects, Scheduler, Store, app};
+use factory_server::{
+    CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, Scheduler,
+    Store, app, refresh_forever,
+};
 use tokio::sync::Notify;
 
 fn path_var(name: &str, default: &str) -> PathBuf {
@@ -14,10 +17,21 @@ fn path_var(name: &str, default: &str) -> PathBuf {
 /// `GH_TOKEN` without surrounding whitespace, or `None` when unset or
 /// empty. A token read from a file or a secret often ends in a newline.
 fn gh_token() -> Option<String> {
-    env::var("GH_TOKEN")
+    trimmed_var("GH_TOKEN")
+}
+
+/// The Claude subscription token the usage fetch needs, from the same
+/// `claude-token` secret the workers get. `None` when unset or empty, so the
+/// plan usage tile stays off.
+fn claude_token() -> Option<String> {
+    trimmed_var("CLAUDE_CODE_OAUTH_TOKEN")
+}
+
+fn trimmed_var(name: &str) -> Option<String> {
+    env::var(name)
         .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn git_config() -> Git {
@@ -74,6 +88,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!("running jobs in podman workers");
     } else {
         tracing::info!("workers are off, set FACTORY_WORKERS=podman to run jobs");
+    }
+
+    if let Some(token) = claude_token() {
+        let source = CurlUsageSource {
+            curl: path_var("FACTORY_CURL", "curl"),
+            token,
+        };
+        tokio::spawn(refresh_forever(source, Arc::new(PlanUsageCache::new())));
+        tracing::info!("refreshing Claude plan usage every {PLAN_USAGE_REFRESH:?}");
+    } else {
+        tracing::info!("no Claude token, the plan usage tile is off");
     }
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;

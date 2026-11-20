@@ -7,6 +7,7 @@ mod projects;
 mod scheduler;
 mod settings;
 mod store;
+mod usage;
 mod web;
 
 pub use cost::{format_cost, merge_fraction};
@@ -18,4 +19,7 @@ pub use scheduler::{
 };
 pub use settings::Settings;
 pub use store::{JobRow, LogEntry, ProjectTotals, Store, StoreError};
+pub use usage::{
+    CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, UsageSource, refresh_forever, refresh_once,
+};
 pub use web::{MAX_IMAGE_BYTES, MAX_IMAGES, USER_HEADER, app};
