@@ -44,6 +44,8 @@ pub struct AgentRequest {
     pub session_id: String,
     pub expect: Expect,
     pub prompt: String,
+    /// The model for the run's stage, or `None` when the project sets none.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +254,13 @@ impl<E: Executor> Scheduler<E> {
                     let Some(expect) = Expect::for_stage(job.stage()) else {
                         continue;
                     };
+                    let models = self.store.project_models(&row.project, &project.models)?;
+                    let model = match expect {
+                        Expect::Clarify => models.clarify,
+                        Expect::Spec => models.spec,
+                        Expect::Plan => models.plan,
+                        Expect::Commits => models.implement,
+                    };
                     let request = AgentRequest {
                         job_id: row.id,
                         repo: project.repo.clone(),
@@ -263,6 +272,7 @@ impl<E: Executor> Scheduler<E> {
                         session_id: self.store.session_uuid(row.id, session)?,
                         expect,
                         prompt: prompt(&task, expect),
+                        model,
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();

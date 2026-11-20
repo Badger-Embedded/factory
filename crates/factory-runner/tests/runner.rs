@@ -46,6 +46,7 @@ fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
         session,
         expect: Expect::Spec,
         prompt: "Write the spec.".into(),
+        model: None,
     }
 }
 
@@ -577,4 +578,36 @@ fn a_prompt_without_images_stays_the_same() {
     assert_eq!(show_images("Write the spec.", &[]), "Write the spec.");
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(place_images(dir.path(), &[]).unwrap(), Vec::<String>::new());
+}
+
+fn args_with_model(model: Option<&str>) -> Vec<String> {
+    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+    run.model = model.map(str::to_owned);
+    strings(&podman_args(&WorkerConfig::default(), &run))
+}
+
+#[test]
+fn podman_args_pass_no_model_flag_when_the_model_is_empty() {
+    for model in [None, Some("")] {
+        let args = args_with_model(model);
+        assert!(!args.iter().any(|arg| arg == "--model"), "{args:?}");
+    }
+}
+
+#[test]
+fn podman_args_pass_the_model_to_claude_for_each_stage() {
+    for (expect, model) in [
+        (Expect::Clarify, "haiku"),
+        (Expect::Spec, "opus"),
+        (Expect::Plan, "sonnet"),
+        (Expect::Commits, "claude-sonnet-5-5"),
+    ] {
+        let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Resume(SESSION.into()));
+        run.expect = expect;
+        run.model = Some(model.into());
+        let args = strings(&podman_args(&WorkerConfig::default(), &run));
+        assert_eq!(value_after(&args, "--model"), model);
+        let image = args.iter().position(|arg| arg == "claude").unwrap();
+        assert!(args.iter().position(|arg| arg == "--model").unwrap() > image);
+    }
 }

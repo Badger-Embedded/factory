@@ -131,6 +131,9 @@ pub struct WorkerRun {
     pub session: SessionRun,
     pub expect: Expect,
     pub prompt: String,
+    /// The value for `claude --model`. `None` and an empty string pass no
+    /// flag, so Claude Code uses its own default.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +213,9 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
         claude.extend(["--plugin-dir", PLUGIN_DIR]);
     }
     args.extend(claude.into_iter().map(OsString::from));
+    if let Some(model) = run.model.as_deref().filter(|model| !model.is_empty()) {
+        args.extend(["--model".into(), model.into()]);
+    }
     args
 }
 
