@@ -1,0 +1,258 @@
+//! Tests for the real MCP connection check client, [`HttpMcpChecker`]. A local
+//! fake MCP server stands in for a real one, so the tests reach only
+//! `127.0.0.1` and open no outside connection. The checker connects over plain
+//! HTTP; production uses the same code path against an `https` server, the way
+//! `tests/proxy.rs` does.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::{HeaderName, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get};
+use factory_server::{CheckOutcome, HttpMcpChecker, McpChecker};
+use tokio::net::TcpListener;
+
+/// One request the fake server received.
+#[derive(Clone)]
+struct Seen {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+}
+
+impl Seen {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+#[derive(Default)]
+struct Fake {
+    seen: Mutex<Vec<Seen>>,
+}
+
+impl Fake {
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// A JSON-RPC `initialize` result, the shape a server answers the handshake
+/// with.
+const INIT_JSON: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"fake","version":"9.9"}}}"#;
+
+fn record(fake: &Fake, request: &Request) {
+    let headers = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    fake.seen.lock().unwrap().push(Seen {
+        method: request.method().to_string(),
+        path: request.uri().path().to_owned(),
+        headers,
+    });
+}
+
+/// Answers the `initialize` POST with JSON and a session id, and records the
+/// DELETE the checker sends to end the session.
+async fn mcp_json(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (HeaderName::from_static("mcp-session-id"), "sess-1"),
+        ],
+        INIT_JSON,
+    )
+        .into_response()
+}
+
+/// Answers with an SSE stream whose first `data:` event carries the result.
+async fn mcp_sse(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    let body = format!("event: message\ndata: {INIT_JSON}\n\n");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn unauthorized(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    (StatusCode::UNAUTHORIZED, "no").into_response()
+}
+
+async fn not_mcp(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"hello":"world"}"#,
+    )
+        .into_response()
+}
+
+async fn redirect(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, "/elsewhere")],
+        "moved",
+    )
+        .into_response()
+}
+
+async fn slow(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    (StatusCode::OK, INIT_JSON).into_response()
+}
+
+async fn start_fake() -> (Arc<Fake>, String) {
+    let fake = Arc::new(Fake::default());
+    let app = Router::new()
+        .route("/mcp", any(mcp_json))
+        .route("/sse", get(mcp_sse).post(mcp_sse))
+        .route("/unauth", any(unauthorized))
+        .route("/nonmcp", any(not_mcp))
+        .route("/redirect", any(redirect))
+        .route("/slow", any(slow))
+        .with_state(Arc::clone(&fake));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (fake, format!("http://{addr}"))
+}
+
+fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_json_reply_is_a_success_and_sends_the_headers_and_ends_the_session() {
+    let (fake, base) = start_fake().await;
+    let checker = HttpMcpChecker::new();
+    let outcome = checker
+        .check(
+            &format!("{base}/mcp"),
+            headers(&[("Authorization", "Bearer real-secret")]),
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        CheckOutcome::Ok {
+            server_name: Some("fake".to_owned()),
+            server_version: Some("9.9".to_owned()),
+            protocol_version: "2025-06-18".to_owned(),
+        },
+    );
+
+    let seen = fake.seen();
+    // The initialize POST carried the project's header, Accept and Content-Type.
+    let init = &seen[0];
+    assert_eq!(init.method, "POST");
+    assert_eq!(init.header("authorization"), Some("Bearer real-secret"));
+    assert_eq!(init.header("content-type"), Some("application/json"));
+    assert!(
+        init.header("accept").unwrap().contains("text/event-stream"),
+        "the Accept header offers SSE",
+    );
+    // A best-effort DELETE ended the session the server opened.
+    let delete = seen
+        .iter()
+        .find(|s| s.method == "DELETE")
+        .expect("the session was ended with a DELETE");
+    assert_eq!(delete.header("mcp-session-id"), Some("sess-1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sse_reply_is_a_success() {
+    let (_fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(&format!("{base}/sse"), Vec::new())
+        .await;
+    assert_eq!(
+        outcome,
+        CheckOutcome::Ok {
+            server_name: Some("fake".to_owned()),
+            server_version: Some("9.9".to_owned()),
+            protocol_version: "2025-06-18".to_owned(),
+        },
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_401_is_refused() {
+    let (_fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(&format!("{base}/unauth"), Vec::new())
+        .await;
+    assert_eq!(outcome, CheckOutcome::Refused { status: 401 });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_mcp_2xx_body_is_not_an_mcp_reply() {
+    let (_fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(&format!("{base}/nonmcp"), Vec::new())
+        .await;
+    assert_eq!(outcome, CheckOutcome::NotMcp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redirect_is_reported_and_not_followed() {
+    let (fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(&format!("{base}/redirect"), Vec::new())
+        .await;
+    assert_eq!(
+        outcome,
+        CheckOutcome::HttpStatus {
+            status: 302,
+            location: Some("/elsewhere".to_owned()),
+        },
+    );
+    // The checker did not follow the redirect to /elsewhere.
+    assert!(
+        fake.seen().iter().all(|s| s.path != "/elsewhere"),
+        "the redirect must not be followed",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_port_is_unreachable() {
+    // Bind then drop, so the port is free and a connect is refused at once.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", dead.local_addr().unwrap());
+    drop(dead);
+    let outcome = HttpMcpChecker::new().check(&url, Vec::new()).await;
+    assert_eq!(outcome, CheckOutcome::Unreachable);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_server_times_out() {
+    let (_fake, base) = start_fake().await;
+    // A short total timeout, so the test need not wait the production window.
+    let checker = HttpMcpChecker::with_timeout(Duration::from_millis(300));
+    let outcome = checker.check(&format!("{base}/slow"), Vec::new()).await;
+    assert_eq!(outcome, CheckOutcome::Timeout);
+}

@@ -1,7 +1,8 @@
 use std::fs;
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -11,9 +12,10 @@ use factory_core::{
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{
-    BranchInfo, GitHubRepos, LocalSecrets, MASTER_KEY_LEN, Permission, PlanUsageCache, Projects,
-    Protection, RepoChecker, RepoInfo, SecretStore, Settings, StageEfforts, StageModels, Store,
-    StoreError, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    BranchInfo, CheckOutcome, GitHubRepos, LocalSecrets, MASTER_KEY_LEN, McpChecker, Permission,
+    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, SecretStore, Settings,
+    StageEfforts, StageModels, Store, StoreError, USER_HEADER, UnavailableSecrets, WorkerSlots,
+    app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -69,6 +71,56 @@ struct Dashboard {
     data: tempfile::TempDir,
     usage: Arc<PlanUsageCache>,
     slots: Arc<WorkerSlots>,
+    checker: Arc<FakeChecker>,
+}
+
+/// A fake [`McpChecker`] the dashboard holds in place of the real HTTP client.
+/// A test sets the outcome it returns and reads the URL and headers it was
+/// handed, so it can assert the handler resolved the saved values.
+/// One recorded check: the URL and the headers the handler resolved for it.
+type Checked = (String, Vec<(String, String)>);
+
+#[derive(Default)]
+struct FakeChecker {
+    outcome: Mutex<Option<CheckOutcome>>,
+    seen: Mutex<Vec<Checked>>,
+}
+
+impl FakeChecker {
+    fn set(&self, outcome: CheckOutcome) {
+        *self.outcome.lock().unwrap() = Some(outcome);
+    }
+
+    /// The headers of the last check, or an empty list if none ran.
+    fn last_headers(&self) -> Vec<(String, String)> {
+        self.seen
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(_, headers)| headers.clone())
+            .unwrap_or_default()
+    }
+
+    fn calls(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+}
+
+impl McpChecker for FakeChecker {
+    fn check<'a>(
+        &'a self,
+        url: &'a str,
+        headers: Vec<(String, String)>,
+    ) -> Pin<Box<dyn Future<Output = CheckOutcome> + Send + 'a>> {
+        self.seen.lock().unwrap().push((url.to_owned(), headers));
+        let outcome = self
+            .outcome
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(CheckOutcome::Unreachable);
+        Box::pin(async move { outcome })
+    }
 }
 
 struct Reply {
@@ -121,6 +173,7 @@ fn dashboard_with_secrets(
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
     let slots = Arc::new(WorkerSlots::new());
+    let checker = Arc::new(FakeChecker::default());
     Dashboard {
         router: app(
             store.clone(),
@@ -131,11 +184,13 @@ fn dashboard_with_secrets(
             github,
             Arc::clone(&slots),
             secrets,
+            Arc::clone(&checker) as Arc<dyn McpChecker>,
         ),
         store,
         data,
         usage,
         slots,
+        checker,
     }
 }
 
@@ -1433,6 +1488,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(FakeRepos::fit()),
         Arc::new(WorkerSlots::new()),
         Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
+        Arc::new(FakeChecker::default()) as Arc<dyn McpChecker>,
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
@@ -1440,6 +1496,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         data: tempfile::tempdir().unwrap(),
         usage: Arc::new(PlanUsageCache::new()),
         slots: Arc::new(WorkerSlots::new()),
+        checker: Arc::new(FakeChecker::default()),
     }
     .get(&format!("/jobs/{id}"))
     .await;
@@ -4699,4 +4756,163 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
         .await;
     assert_eq!(ok.status, StatusCode::OK);
     assert!(store.project_mcp("maestro", "context7").unwrap().enabled);
+}
+
+/// Adds the `context7` server with an `Authorization` header through the form.
+async fn add_context7(dashboard: &Dashboard) {
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
+        )
+        .await;
+}
+
+/// Stores `value` for `project`'s `context7` `Authorization` header with the
+/// same key the dashboard's secret store uses.
+fn store_value_for(dashboard: &Dashboard, project: &str, value: &str) {
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    secrets
+        .put(
+            factory_server::SecretRef {
+                project,
+                server: "context7",
+                header: "Authorization",
+            },
+            value,
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_project_server_block_has_a_check_connection_button() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    let page = dashboard.get("/settings").await.body;
+    assert!(page.contains("Check connection"));
+    assert!(page.contains(r#"hx-post="/settings/projects/maestro/mcp/context7/check""#));
+    // The result area the fragment swaps into is present and empty.
+    assert!(page.contains(r#"id="mcp-check-context7""#));
+}
+
+#[tokio::test]
+async fn a_successful_check_shows_connected_and_sends_the_stored_value() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-stored-xyz");
+    dashboard.checker.set(CheckOutcome::Ok {
+        server_name: Some("context7".to_owned()),
+        server_version: Some("1.2.3".to_owned()),
+        protocol_version: "2025-06-18".to_owned(),
+    });
+
+    let reply = dashboard
+        .post("/settings/projects/maestro/mcp/context7/check", "")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Connected"));
+    assert!(reply.body.contains("context7"));
+    assert!(reply.body.contains("1.2.3"));
+    assert!(reply.body.contains("2025-06-18"));
+    // The project's stored value reached the checker, and never the page.
+    assert_eq!(
+        dashboard.checker.last_headers(),
+        vec![(
+            "Authorization".to_owned(),
+            "Bearer sk-stored-xyz".to_owned()
+        )],
+    );
+    assert!(
+        !reply.body.contains("sk-stored-xyz"),
+        "the stored value leaked into the fragment",
+    );
+}
+
+#[tokio::test]
+async fn each_projects_check_sends_that_projects_value() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-maestro");
+    store_value_for(&dashboard, "tool", "Bearer sk-tool");
+    dashboard.checker.set(CheckOutcome::Ok {
+        server_name: None,
+        server_version: None,
+        protocol_version: "2025-06-18".to_owned(),
+    });
+
+    dashboard
+        .post("/settings/projects/maestro/mcp/context7/check", "")
+        .await;
+    assert_eq!(
+        dashboard.checker.last_headers(),
+        vec![("Authorization".to_owned(), "Bearer sk-maestro".to_owned())],
+    );
+    dashboard
+        .post("/settings/projects/tool/mcp/context7/check", "")
+        .await;
+    assert_eq!(
+        dashboard.checker.last_headers(),
+        vec![("Authorization".to_owned(), "Bearer sk-tool".to_owned())],
+    );
+}
+
+#[tokio::test]
+async fn the_check_ignores_an_unsaved_value_in_the_form() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-saved");
+    dashboard.checker.set(CheckOutcome::Ok {
+        server_name: None,
+        server_version: None,
+        protocol_version: "2025-06-18".to_owned(),
+    });
+
+    // The form posts a different, unsaved value; the handler ignores it and the
+    // checker still gets the saved one.
+    dashboard
+        .post(
+            "/settings/projects/maestro/mcp/context7/check",
+            "mcp.context7.header.Authorization=Bearer%20sk-typed",
+        )
+        .await;
+    assert_eq!(
+        dashboard.checker.last_headers(),
+        vec![("Authorization".to_owned(), "Bearer sk-saved".to_owned())],
+    );
+}
+
+#[tokio::test]
+async fn a_refused_check_names_a_header_with_no_stored_value() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    // No value is stored for Authorization.
+    dashboard.checker.set(CheckOutcome::Refused { status: 401 });
+
+    let reply = dashboard
+        .post("/settings/projects/maestro/mcp/context7/check", "")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("refused the request"));
+    assert!(reply.body.contains("401"));
+    assert!(reply.body.contains("No value stored for: Authorization"));
+    // The check ran with no header, since none is stored.
+    assert_eq!(dashboard.checker.last_headers(), Vec::new());
+}
+
+#[tokio::test]
+async fn the_check_route_404s_for_an_unknown_project_or_server() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+
+    let unknown_project = dashboard
+        .post("/settings/projects/nope/mcp/context7/check", "")
+        .await;
+    assert_eq!(unknown_project.status, StatusCode::NOT_FOUND);
+
+    let unknown_server = dashboard
+        .post("/settings/projects/maestro/mcp/absent/check", "")
+        .await;
+    assert_eq!(unknown_server.status, StatusCode::NOT_FOUND);
+    // Neither 404 ran a check.
+    assert_eq!(dashboard.checker.calls(), 0);
 }

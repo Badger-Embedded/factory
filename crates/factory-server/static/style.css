@@ -595,6 +595,8 @@ input.wide { width: 100%; }
 input[type="number"] { width: 8rem; }
 .hint { color: var(--muted); font-size: var(--font-size-sm); margin: var(--space-4) 0 0; }
 .hint.bad { color: var(--bad); }
+.hint.ok { color: var(--ok); }
+.mcp-check-result:not(:empty) { margin-top: var(--space-8); }
 /* Flag a bad "Add a server" name once the user has typed, not on page load. */
 #mcp-new-name:user-invalid { border-color: var(--bad); }
 #mcp-new-name:user-invalid + .hint { color: var(--bad); }

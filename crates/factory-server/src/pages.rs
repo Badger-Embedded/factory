@@ -7,6 +7,7 @@ use factory_core::{
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::check::CheckOutcome;
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages};
@@ -703,7 +704,98 @@ fn project_server_block(project: &str, server: &ServerSettings, secrets_availabl
                     }
                 }
             }
+            (check_connection(project, &server.name))
         }
+    }
+}
+
+/// The "Check connection" button and its result area in a project's server
+/// block. The button posts to the check route through htmx, which swaps the
+/// returned fragment into the result area, so the page does not reload and the
+/// form's unsaved input survives. `type="button"` keeps it from submitting the
+/// project form. The check uses the saved URL and values, so the hint says to
+/// save before checking new ones.
+fn check_connection(project: &str, server: &str) -> Markup {
+    let route = format!(
+        "/settings/projects/{}/mcp/{}/check",
+        crate::web::query_escape(project),
+        crate::web::query_escape(server),
+    );
+    let result_id = format!("mcp-check-{server}");
+    let target = format!("#{result_id}");
+    html! {
+        div.field.mcp-check {
+            button.secondary type="button"
+                hx-post=(route) hx-target=(target) hx-swap="innerHTML"
+                hx-disabled-elt="this" { "Check connection" }
+            div #(result_id) .mcp-check-result {}
+            p.hint { "Uses the saved URL and values. Save first to check new ones." }
+        }
+    }
+}
+
+/// The fragment the check route returns, swapped into the server block's result
+/// area. It is one line styling the outcome like the page's ok/bad hints, plus
+/// a line naming any declared header the project has no stored value for. It
+/// carries no header value, so nothing a project stored leaks into the page.
+pub fn mcp_check_result(outcome: &CheckOutcome, missing: &[String]) -> Markup {
+    html! {
+        (check_outcome_line(outcome))
+        @if !missing.is_empty() {
+            p.hint { "No value stored for: " (missing.join(", ")) "." }
+        }
+    }
+}
+
+fn check_outcome_line(outcome: &CheckOutcome) -> Markup {
+    match outcome {
+        CheckOutcome::Ok {
+            server_name,
+            server_version,
+            protocol_version,
+        } => {
+            let mut server = String::new();
+            if let Some(name) = server_name {
+                server.push_str(name);
+            }
+            if let Some(version) = server_version {
+                if !server.is_empty() {
+                    server.push(' ');
+                }
+                server.push_str(version);
+            }
+            html! {
+                p.hint.ok {
+                    "Connected"
+                    @if !server.is_empty() { ": " (server) }
+                    ", protocol " (protocol_version) "."
+                }
+            }
+        }
+        CheckOutcome::Unreachable => html! {
+            p.hint.bad { "Could not reach the server: the connection was refused, the host is unknown, or TLS failed." }
+        },
+        CheckOutcome::Timeout => html! {
+            p.hint.bad { "The server did not answer within 15 s." }
+        },
+        CheckOutcome::Refused { status } => html! {
+            p.hint.bad {
+                "The server refused the request (HTTP " (status) "). Check this project's header values."
+            }
+        },
+        CheckOutcome::HttpStatus { status, location } => html! {
+            p.hint.bad {
+                "The server answered HTTP " (status) "."
+                @if let Some(location) = location {
+                    " It redirected to " (location) "; use the final URL as the server's endpoint."
+                }
+            }
+        },
+        CheckOutcome::NotMcp => html! {
+            p.hint.bad {
+                "The server answered, but not with an MCP reply. Check that the URL is the streamable-HTTP endpoint."
+            }
+        },
     }
 }
 

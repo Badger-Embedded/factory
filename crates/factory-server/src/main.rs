@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    CurlUsageSource, GhRepos, LocalSecrets, McpRuntime, McpWarnings, PLAN_USAGE_REFRESH,
-    PlanUsageCache, PodmanExecutor, Projects, ProxyWarning, RepoChecker, RunTokens, Scheduler,
-    SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams, WarnFn, WorkerSlots, app,
-    import_tomls, master_key_from_env, proxy_app, refresh_forever,
+    CurlUsageSource, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker, McpRuntime, McpWarnings,
+    PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, ProxyWarning, RepoChecker,
+    RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams,
+    WarnFn, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -195,12 +195,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         token: gh_token(),
     });
 
+    // The per-project MCP connection check uses a real HTTP client that follows
+    // no redirect and bounds the wait, the same way the proxy's client does.
+    let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::new());
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
     axum::serve(
         listener,
         app(
-            store, projects, wake, data_dir, plan_usage, github, slots, secrets,
+            store, projects, wake, data_dir, plan_usage, github, slots, secrets, checker,
         ),
     )
     .with_graceful_shutdown(async {
