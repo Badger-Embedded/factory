@@ -14,7 +14,8 @@ mod web;
 
 pub use cost::{format_cost, merge_fraction};
 pub use github::{
-    BranchInfo, GhRepos, GitHubRepos, Permission, RepoChecker, RepoInfo, RepoReport, check_repo,
+    BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
+    check_repo,
 };
 pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageModels, import_tomls};

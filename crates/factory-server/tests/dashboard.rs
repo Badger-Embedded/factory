@@ -11,8 +11,8 @@ use factory_core::{
     PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{
-    BranchInfo, GitHubRepos, Permission, PlanUsageCache, Projects, RepoChecker, RepoInfo,
-    StageModels, Store, StoreError, USER_HEADER, app,
+    BranchInfo, GitHubRepos, Permission, PlanUsageCache, Projects, Protection, RepoChecker,
+    RepoInfo, StageModels, Store, StoreError, USER_HEADER, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -36,7 +36,9 @@ impl FakeRepos {
                 allow_squash_merge: true,
                 delete_branch_on_merge: true,
             }),
-            branch: Some(BranchInfo { protected: true }),
+            branch: Some(BranchInfo {
+                protection: Protection::Protected,
+            }),
             ci: true,
         }
     }
@@ -3625,7 +3627,9 @@ async fn warnings_do_not_block_creation() {
             allow_squash_merge: true,
             delete_branch_on_merge: false,
         }),
-        branch: Some(BranchInfo { protected: false }),
+        branch: Some(BranchInfo {
+            protection: Protection::Unprotected,
+        }),
         ci: false,
     });
     let (store, dashboard) = empty_dashboard(github);
