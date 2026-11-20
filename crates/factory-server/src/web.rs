@@ -874,41 +874,52 @@ async fn save_project_models(
     settings_page(&state, &headers, Some("Saved."))
 }
 
-#[derive(Deserialize)]
-struct McpAddForm {
+/// An MCP server form: its `url` and one `header` field per header-name row. The
+/// rows post as a repeated `header` field, so the form parses as a list of pairs
+/// rather than a struct. The Add form also posts a `name`; the edit route takes
+/// the name from its path and ignores any posted one.
+struct McpServerForm {
     name: String,
     url: String,
-    /// Header names, one per line or separated by commas. Empty for a keyless
-    /// server.
-    headers: String,
+    headers: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct McpEditForm {
-    url: String,
-    headers: String,
-}
-
-/// Splits a header-names field into trimmed, non-empty names, in order. The
-/// store validates and deduplicates them.
-fn header_names(raw: &str) -> Vec<String> {
-    raw.split(|c: char| c == ',' || c.is_whitespace())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect()
+impl McpServerForm {
+    /// Reads `name`, `url` and the repeated `header` field out of the posted
+    /// pairs. Each header name is trimmed and an empty one, from a blank row, is
+    /// dropped. The store validates and deduplicates the names.
+    fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        let mut form = McpServerForm {
+            name: String::new(),
+            url: String::new(),
+            headers: Vec::new(),
+        };
+        for (key, value) in pairs {
+            match key.as_str() {
+                "name" => form.name = value,
+                "url" => form.url = value,
+                "header" => {
+                    let name = value.trim();
+                    if !name.is_empty() {
+                        form.headers.push(name.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        form
+    }
 }
 
 async fn add_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<McpAddForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
-    state.store.create_mcp_server(
-        form.name.trim(),
-        form.url.trim(),
-        &header_names(&form.headers),
-    )?;
+    let form = McpServerForm::from_pairs(pairs);
+    state
+        .store
+        .create_mcp_server(form.name.trim(), form.url.trim(), &form.headers)?;
     settings_page(&state, &headers, Some("Saved."))
 }
 
@@ -916,11 +927,12 @@ async fn edit_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Form(form): Form<McpEditForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
+    let form = McpServerForm::from_pairs(pairs);
     state
         .store
-        .edit_mcp_server(&name, form.url.trim(), &header_names(&form.headers))?;
+        .edit_mcp_server(&name, form.url.trim(), &form.headers)?;
     settings_page(&state, &headers, Some("Saved."))
 }
 
