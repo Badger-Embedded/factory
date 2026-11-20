@@ -2032,6 +2032,38 @@ async fn the_job_page_labels_each_step_as_agent_factory_or_gate() {
 }
 
 #[tokio::test]
+async fn the_implementing_step_tag_shows_the_full_model_name() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_models("maestro", &models(None, Some("claude-opus-4-5-20251101")))
+        .unwrap();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![PlannedPr {
+            title: "maestrod: add a reboot endpoint".into(),
+            summary: "POST /reboot".into(),
+            number: None,
+            description: None,
+        }])),
+    );
+    dashboard.post(&format!("/jobs/{id}/approve"), "").await;
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Implementing { pr: 0 }
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains(">implement · claude-opus-4-5-20251101</span>")
+    );
+}
+
+#[tokio::test]
 async fn a_job_without_gates_shows_no_gate_label() {
     let dashboard = dashboard();
     dashboard
