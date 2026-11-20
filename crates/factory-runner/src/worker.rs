@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use factory_core::Event;
+use factory_core::{DEFAULT_EFFORT, Event};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -134,6 +134,10 @@ pub struct WorkerRun {
     /// The value for `claude --model`. `None` and an empty string pass no
     /// flag, so Claude Code uses its own default.
     pub model: Option<String>,
+    /// The value for `claude --effort`. `None`, such as a request from an
+    /// older server, runs at [`DEFAULT_EFFORT`], so a run always passes an
+    /// explicit level.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -216,6 +220,8 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     if let Some(model) = run.model.as_deref().filter(|model| !model.is_empty()) {
         args.extend(["--model".into(), model.into()]);
     }
+    let effort = run.effort.as_deref().unwrap_or(DEFAULT_EFFORT);
+    args.extend(["--effort".into(), effort.into()]);
     args
 }
 
