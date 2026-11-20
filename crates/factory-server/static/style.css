@@ -144,6 +144,13 @@ h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
   margin-bottom: var(--space-16);
 }
 
+.overview {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(14rem, 1fr);
+  gap: var(--space-16);
+  align-items: start;
+}
+.overview .card { margin-bottom: 0; }
 .stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -157,6 +164,15 @@ h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
 .gauge-track { stroke: var(--sunken); }
 .gauge-fill { stroke: var(--ok); }
 .stat-label { color: var(--muted); font-size: var(--font-size-sm); margin-top: var(--space-2); }
+
+.bars { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-12); }
+.bar { display: grid; grid-template-columns: 1fr auto; gap: var(--space-4); font-size: var(--font-size-sm); }
+.bar-track { grid-column: 1 / -1; height: 6px; background: var(--sunken); border-radius: var(--radius-pill); overflow: hidden; }
+.bar-fill { display: block; height: 100%; border-radius: var(--radius-pill); background: var(--factory); }
+.bar-you .bar-fill { background: var(--you); }
+.bar-agent .bar-fill { background: var(--agent); }
+.bar-count { font-weight: var(--weight-semibold); }
+@media (max-width: 760px) { .overview { grid-template-columns: 1fr; } }
 
 .card.needs-you { border-color: var(--you); box-shadow: var(--elevation-bar) var(--you); }
 .card.failed { border-color: var(--bad); box-shadow: var(--elevation-bar) var(--bad); }

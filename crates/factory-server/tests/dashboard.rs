@@ -1827,3 +1827,46 @@ fn merge_fraction_is_zero_without_created_jobs() {
     assert!(fraction.abs() < f64::EPSILON);
     assert!(factory_server::merge_fraction(0, 2).abs() < f64::EPSILON);
 }
+
+fn bar(lane: &str, count: usize, width: &str) -> String {
+    let title = match lane {
+        "you" => "You",
+        "agent" => "Agent",
+        _ => "Factory",
+    };
+    format!(
+        "<li class=\"bar bar-{lane}\"><span class=\"bar-label\">{title}</span><span class=\"bar-count\">{count}</span><span class=\"bar-track\"><span class=\"bar-fill\" style=\"width: {width}\"></span></span></li>"
+    )
+}
+
+#[tokio::test]
+async fn the_lane_bars_count_live_jobs_per_lane() {
+    let dashboard = dashboard();
+    for _ in 0..2 {
+        let id = dashboard.new_job().await;
+        to_spec_approval(&dashboard, id);
+    }
+    dashboard.new_job().await;
+    let merged = dashboard.new_job().await;
+    merge(&dashboard, merged);
+
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("Live jobs by lane"));
+    assert!(body.contains(&bar("you", 2, "100.0%")));
+    assert!(body.contains(&bar("agent", 0, "0.0%")));
+    assert!(body.contains(&bar("factory", 1, "50.0%")));
+    assert!(!body.contains("No live jobs."));
+}
+
+#[tokio::test]
+async fn the_lane_bars_show_an_empty_state_without_live_jobs() {
+    let dashboard = dashboard();
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("No live jobs."));
+    assert!(!body.contains("class=\"bars\""));
+
+    let id = dashboard.new_job().await;
+    merge(&dashboard, id);
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("No live jobs."));
+}
