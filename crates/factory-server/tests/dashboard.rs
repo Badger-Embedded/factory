@@ -152,7 +152,8 @@ async fn bad_requests_create_no_job() {
 async fn the_index_lists_jobs_and_those_waiting_for_the_user() {
     let dashboard = dashboard();
     let page = dashboard.get("/").await;
-    assert!(page.body.contains("<option>maestro</option>"));
+    assert!(page.body.contains("<option selected>maestro</option>"));
+    assert!(page.body.contains("name=\"project\" value=\"maestro\""));
     assert!(page.body.contains("No jobs yet."));
 
     let id = dashboard.new_job().await;
@@ -457,7 +458,7 @@ async fn the_job_page_keeps_the_log_scrolled_only_where_the_log_is_shown() {
     assert!(page.body.contains("sessionStorage"));
     assert!(page.body.contains("http-equiv=\"refresh\" content=\"5\""));
 
-    assert!(!dashboard.get("/").await.body.contains("<script"));
+    assert!(!dashboard.get("/").await.body.contains("sessionStorage"));
 }
 
 fn to_spec_approval_from_clarifying(dashboard: &Dashboard, id: i64) {
@@ -667,4 +668,74 @@ async fn links_use_the_repository_from_the_project_file() {
             .contains(r#"href="https://github.com/someone-else/widgets/pull/3""#)
     );
     assert!(!page.body.contains("Badger-Embedded"));
+}
+
+fn two_projects() -> Dashboard {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["maestro", "tool"] {
+        write_project(dir.path(), name, "repo = \"o/r\"\nbase = \"main\"\n");
+    }
+    let projects = Arc::new(Projects::load(dir.path()).unwrap());
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    Dashboard {
+        router: app(store.clone(), projects, Arc::new(Notify::new())),
+        store,
+    }
+}
+
+#[tokio::test]
+async fn the_index_defaults_to_the_first_project() {
+    let dashboard = two_projects();
+    dashboard.new_job().await;
+    dashboard
+        .post("/jobs", "project=tool&request=Tool+change")
+        .await;
+    let page = dashboard.get("/").await;
+    assert!(page.body.contains("<option selected>maestro</option>"));
+    assert!(page.body.contains("Add a reboot button</a>"));
+    assert!(!page.body.contains("Tool change"));
+}
+
+#[tokio::test]
+async fn both_job_lists_show_only_the_selected_project() {
+    let dashboard = two_projects();
+    let maestro = dashboard.new_job().await;
+    dashboard
+        .post("/jobs", "project=tool&request=Tool+change")
+        .await;
+    to_spec_approval(&dashboard, maestro);
+
+    let page = dashboard.get("/?project=tool").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("<option selected>tool</option>"));
+    assert!(page.body.contains("Tool change"));
+    assert!(!page.body.contains("Add a reboot button</a>"));
+    assert!(page.body.contains("Nothing needs you right now."));
+    assert!(page.body.contains("New request for tool"));
+    assert!(page.body.contains("name=\"project\" value=\"tool\""));
+
+    let page = dashboard.get("/?project=maestro").await;
+    assert!(!page.body.contains("Tool change"));
+    assert!(!page.body.contains("Nothing needs you right now."));
+    assert_eq!(page.body.matches("Add a reboot button</a>").count(), 2);
+}
+
+#[tokio::test]
+async fn an_unknown_project_in_the_index_is_a_bad_request() {
+    let page = dashboard().get("/?project=nope").await;
+    assert_eq!(page.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
+    let page = two_projects().get("/?project=tool").await;
+    let main = page.body.find("<main>").unwrap();
+    let (topbar, rest) = page.body.split_at(main);
+    assert!(topbar.contains("<select id=\"project\" name=\"project\">"));
+    assert!(topbar.contains("<option>maestro</option>"));
+    assert!(topbar.contains("<option selected>tool</option>"));
+    assert!(topbar.contains("<label class=\"visually-hidden\" for=\"project\">Project</label>"));
+    assert!(topbar.contains("<noscript><button>Go</button></noscript>"));
+    assert!(!rest.contains("<select"));
+    assert!(rest.contains("<input type=\"hidden\" name=\"project\" value=\"tool\">"));
 }
