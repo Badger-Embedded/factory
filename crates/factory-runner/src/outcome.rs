@@ -13,6 +13,10 @@ pub enum Expect {
     Commits,
     /// Like `Commits`, and the run may also end with `rerun_ci`.
     FixCi,
+    /// The LLM review pass. It ends with `approve`, or `changes` with
+    /// feedback. The other stages instead end with `questions` or their own
+    /// done outcome.
+    Review,
 }
 
 impl Expect {
@@ -31,16 +35,19 @@ impl Expect {
     }
 
     /// What the run of `task` in `stage` must end with. A `FixCi` task may
-    /// also end with `rerun_ci`.
+    /// also end with `rerun_ci`, and a `Review` task ends with an `approve`
+    /// or `changes` verdict of its own.
     #[must_use]
     pub fn for_task(stage: &Stage, task: &Task) -> Option<Self> {
         match (Self::for_stage(stage)?, task) {
             (Expect::Commits, Task::FixCi { .. }) => Some(Expect::FixCi),
+            (_, Task::Review) => Some(Expect::Review),
             (expect, _) => Some(expect),
         }
     }
 
-    /// The outcomes a run may end with. Every run may end with questions.
+    /// The outcomes a run may end with. Every stage run may end with
+    /// questions; a review run ends with `approve` or `changes`.
     #[must_use]
     pub fn outcomes(self) -> Vec<&'static str> {
         let done = match self {
@@ -48,6 +55,7 @@ impl Expect {
             Expect::Spec => "spec",
             Expect::Plan => "plan",
             Expect::Commits | Expect::FixCi => "commits_ready",
+            Expect::Review => return vec!["approve", "changes"],
         };
         let mut outcomes = vec!["questions", done];
         if self == Expect::FixCi {
@@ -56,9 +64,28 @@ impl Expect {
         outcomes
     }
 
-    /// The JSON Schema passed to `claude --json-schema`.
+    /// The JSON Schema passed to `claude --json-schema`. The review schema
+    /// matches `plugin/schemas/review.json`, which the review skill cites.
     #[must_use]
     pub fn schema(self) -> Value {
+        if self == Expect::Review {
+            return json!({
+                "type": "object",
+                "properties": {
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["approve", "changes"],
+                        "description": "approve when the change is ready to merge, changes when the author must fix something first."
+                    },
+                    "feedback": {
+                        "type": "string",
+                        "description": "With outcome changes: the problems the author must fix, each with its file and line, concrete enough to act on without the diff in view."
+                    }
+                },
+                "required": ["outcome"],
+                "additionalProperties": false
+            });
+        }
         let mut properties = json!({
             "outcome": { "type": "string", "enum": self.outcomes() },
             "questions": {
@@ -101,7 +128,8 @@ impl Expect {
                     "additionalProperties": false
                 });
             }
-            Expect::Clarify => {}
+            // Review returns its own schema above, before this match.
+            Expect::Clarify | Expect::Review => {}
         }
         if self == Expect::FixCi {
             properties["reason"] = json!({
@@ -135,29 +163,76 @@ struct PlanEntry {
     summary: String,
 }
 
-/// Turns a run's final message into the event for the job. A run that
-/// failed, or ended without a valid outcome for `expect`, becomes
-/// [`Event::AgentFailed`].
+#[derive(Deserialize)]
+struct ReviewOutput {
+    outcome: String,
+    feedback: Option<String>,
+}
+
+/// Turns a run's final message into the event for the job. A review run
+/// becomes a review verdict or, when it failed or returned no valid result,
+/// [`Event::ReviewFailed`], so the review fails closed. Every other run
+/// becomes an agent result or [`Event::AgentFailed`].
 #[must_use]
 pub fn event_from_result(expect: Expect, result: &ResultMessage) -> Event {
+    if expect == Expect::Review {
+        return match review_result(result) {
+            Ok(event) => event,
+            Err(reason) => Event::ReviewFailed { reason },
+        };
+    }
     match agent_result(expect, result) {
         Ok(result) => Event::Agent(result),
         Err(reason) => Event::AgentFailed { reason },
     }
 }
 
+/// The error a run that did not end in success carries, or `None` when it
+/// succeeded. `subject` names the run for the message, such as `agent run`.
+fn run_error(result: &ResultMessage, subject: &str) -> Option<String> {
+    if !result.is_error && result.subtype == "success" {
+        return None;
+    }
+    let detail = result
+        .errors
+        .first()
+        .or(result.result.as_ref())
+        .filter(|text| !text.is_empty())
+        .map_or(String::new(), |text| format!(": {text}"));
+    Some(format!(
+        "the {subject} ended with {}{detail}",
+        result.subtype
+    ))
+}
+
+/// Turns a review run's final message into its verdict event. A run that
+/// failed, or ended without a valid `approve`/`changes` result, is an error
+/// the caller turns into [`Event::ReviewFailed`].
+fn review_result(result: &ResultMessage) -> Result<Event, String> {
+    if let Some(reason) = run_error(result, "reviewer run") {
+        return Err(reason);
+    }
+    let output = result
+        .structured_output
+        .clone()
+        .ok_or("the reviewer run ended without structured output")?;
+    let output: ReviewOutput = serde_json::from_value(output)
+        .map_err(|err| format!("the reviewer's structured output does not parse: {err}"))?;
+    match output.outcome.as_str() {
+        "approve" => Ok(Event::ReviewApproved),
+        "changes" => match output.feedback {
+            Some(feedback) if !feedback.trim().is_empty() => Ok(Event::ReviewChanges { feedback }),
+            _ => Err("the reviewer asked for changes but gave no feedback".into()),
+        },
+        other => Err(format!(
+            "the reviewer ended with outcome {other:?}, expected \"approve\" or \"changes\""
+        )),
+    }
+}
+
 fn agent_result(expect: Expect, result: &ResultMessage) -> Result<AgentResult, String> {
-    if result.is_error || result.subtype != "success" {
-        let detail = result
-            .errors
-            .first()
-            .or(result.result.as_ref())
-            .filter(|text| !text.is_empty())
-            .map_or(String::new(), |text| format!(": {text}"));
-        return Err(format!(
-            "the agent run ended with {}{detail}",
-            result.subtype
-        ));
+    if let Some(reason) = run_error(result, "agent run") {
+        return Err(reason);
     }
     let output = result
         .structured_output

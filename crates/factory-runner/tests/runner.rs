@@ -807,3 +807,173 @@ fn the_fix_ci_prompt_says_when_to_rerun() {
     assert!(text.contains("\"rerun_ci\""));
     assert!(text.contains("\"commits_ready\""));
 }
+
+/// A job whose only pull request is open as #`number` and being watched, so
+/// a `StartReview` moves it to a review turn.
+fn watching(number: u64) -> Job {
+    let mut job = approved_job(Job::new("Add a reboot button", Gates::default()));
+    for event in [
+        Event::Approve,
+        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::ChecksPassed,
+        Event::Published { number },
+    ] {
+        job.apply(event).unwrap();
+    }
+    job
+}
+
+fn review_failure_reason(event: Event) -> String {
+    match event {
+        Event::ReviewFailed { reason } => reason,
+        other => panic!("expected ReviewFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_review_task_expects_a_review_verdict() {
+    let expect = Expect::for_task(&Stage::CiAndReview { pr: 0 }, &Task::Review);
+    assert_eq!(expect, Some(Expect::Review));
+}
+
+#[test]
+fn the_review_schema_matches_the_plugin_schema() {
+    let schema = Expect::Review.schema();
+    assert_eq!(
+        schema["properties"]["outcome"]["enum"],
+        json!(["approve", "changes"])
+    );
+    assert!(schema["properties"]["feedback"].is_object());
+    assert_eq!(schema["required"], json!(["outcome"]));
+    assert!(schema["properties"].get("questions").is_none());
+
+    let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .join("plugin/schemas/review.json");
+    let plugin: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(schema, plugin, "the run's schema drifted from the skill's");
+}
+
+#[test]
+fn the_review_prompt_reviews_the_branch_and_keeps_the_worker_read_only() {
+    let text = prompt(&Task::Review, Expect::Review);
+    assert!(text.contains("\"approve\""));
+    assert!(text.contains("\"changes\""));
+    assert!(text.to_lowercase().contains("skill"));
+    assert!(text.contains("Do not change any files"));
+    assert!(text.contains("do not push"));
+}
+
+#[test]
+fn the_first_review_pass_carries_no_earlier_feedback() {
+    let mut job = watching(7);
+    job.apply(Event::StartReview).unwrap();
+    let text = run_prompt(&job, Expect::Review);
+    assert_eq!(text, prompt(&Task::Review, Expect::Review));
+    assert!(!text.contains("earlier version"));
+}
+
+#[test]
+fn a_later_review_pass_restates_the_feedback_and_reviews_only_the_new_commits() {
+    let mut job = watching(7);
+    job.apply(Event::StartReview).unwrap();
+    job.apply(Event::ReviewChanges {
+        feedback: "guard the empty-slice case".into(),
+    })
+    .unwrap();
+    // The agent addresses the review, the checks pass, and the reviewer runs
+    // again on the new head.
+    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+        .unwrap();
+    job.apply(Event::ChecksPassed).unwrap();
+    job.apply(Event::Published { number: 7 }).unwrap();
+    job.apply(Event::StartReview).unwrap();
+
+    let text = run_prompt(&job, Expect::Review);
+    assert!(text.contains("guard the empty-slice case"));
+    assert!(text.contains("commits added since your last review"));
+}
+
+#[test]
+fn a_review_run_reports_the_verdict() {
+    assert_eq!(
+        event_from_result(Expect::Review, &result(Some(json!({"outcome": "approve"})))),
+        Event::ReviewApproved
+    );
+    assert_eq!(
+        event_from_result(
+            Expect::Review,
+            &result(Some(
+                json!({"outcome": "changes", "feedback": "narrow the lock"})
+            ))
+        ),
+        Event::ReviewChanges {
+            feedback: "narrow the lock".into()
+        }
+    );
+}
+
+#[test]
+fn a_review_run_without_a_valid_result_fails_closed() {
+    for output in [
+        json!({"outcome": "changes"}),
+        json!({"outcome": "changes", "feedback": "  "}),
+        json!({"outcome": "approved"}),
+        json!({"feedback": "no outcome"}),
+    ] {
+        let event = event_from_result(Expect::Review, &result(Some(output.clone())));
+        assert!(
+            matches!(event, Event::ReviewFailed { .. }),
+            "{output} gave {event:?}"
+        );
+    }
+    let reason = review_failure_reason(event_from_result(Expect::Review, &result(None)));
+    assert!(reason.contains("without structured output"), "{reason}");
+
+    let mut message = result(None);
+    message.subtype = "error_during_execution".into();
+    message.is_error = true;
+    let reason = review_failure_reason(event_from_result(Expect::Review, &message));
+    assert!(reason.contains("error_during_execution"), "{reason}");
+}
+
+#[test]
+fn a_review_worker_passes_the_model_and_gets_no_github_token() {
+    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Resume(SESSION.into()));
+    run.expect = Expect::Review;
+    run.model = Some("opus".into());
+    let args = strings(&podman_args(&WorkerConfig::default(), &run));
+
+    assert_eq!(value_after(&args, "--model"), "opus");
+    let schema: Value = serde_json::from_str(value_after(&args, "--json-schema")).unwrap();
+    assert_eq!(schema, Expect::Review.schema());
+    assert_eq!(
+        value_after(&args, "--secret"),
+        "claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN"
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("GH_TOKEN") || arg.contains("GITHUB_TOKEN")),
+        "a review worker gets no GitHub credentials"
+    );
+}
+
+#[tokio::test]
+async fn a_review_run_that_dies_without_a_result_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    fs::write(&empty, "").unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &empty, "the worker crashed", 1),
+        ..WorkerConfig::default()
+    };
+    let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
+    worker.expect = Expect::Review;
+
+    let report = run(&config, &worker, |_| {}).await;
+    let reason = review_failure_reason(report.event);
+    assert!(reason.contains("the worker crashed"), "{reason}");
+}

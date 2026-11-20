@@ -286,6 +286,7 @@ impl<E: Executor> Scheduler<E> {
                         Expect::Spec => models.spec,
                         Expect::Plan => models.plan,
                         Expect::Commits | Expect::FixCi => models.implement,
+                        Expect::Review => models.review,
                     };
                     let request = AgentRequest {
                         job_id: row.id,

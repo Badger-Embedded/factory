@@ -227,8 +227,15 @@ pub async fn run(
     run: &WorkerRun,
     mut log: impl FnMut(LogLine),
 ) -> RunReport {
+    // A review run fails closed. A crash or a missing result is a
+    // `ReviewFailed`, so the factory does not merge. Every other run reports
+    // `AgentFailed`.
     let failed = |reason: String| RunReport {
-        event: Event::AgentFailed { reason },
+        event: if run.expect == Expect::Review {
+            Event::ReviewFailed { reason }
+        } else {
+            Event::AgentFailed { reason }
+        },
         session_id: None,
         cost_usd: None,
     };
