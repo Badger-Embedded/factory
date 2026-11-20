@@ -619,7 +619,8 @@ pub fn job(
     auto_merge: bool,
 ) -> Markup {
     let job = &row.job;
-    let repo_url = project.map(|project| format!("https://github.com/{}", project.repo));
+    let repo = project.map(|project| format!("https://github.com/{}", project.repo));
+    let repo_url = repo.as_deref();
     let id = row.id;
     page(
         user,
@@ -627,80 +628,14 @@ pub fn job(
         matches!(job.turn(), Turn::Agent(_)),
         &html! {},
         &html! {
-            div.title-row {
-                h1 { "#" (id) " " (first_line(job.request())) }
-                span.badge.cost { (cost_label(cost_usd)) }
-            }
-            p.meta {
-                @if let Some(url) = &repo_url {
-                    a href=(url) { (row.project) }
-                } @else {
-                    (row.project)
-                }
-                " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
-            }
+            (job_header(id, row, repo_url, cost_usd))
             (steps(job, models))
             (status_card(id, job, settings, auto_merge))
             p.meta { "Approval gates: " (gates_line(job.gates())) }
-            div.card {
-                h2 { "Request" }
-                pre.doc { (job.request()) }
-                @if !images.is_empty() {
-                    ul.request-images {
-                        @for name in images {
-                            li {
-                                a href={ "/jobs/" (id) "/images/" (name) } {
-                                    img src={ "/jobs/" (id) "/images/" (name) } alt=(name);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            @if let Some(spec) = job.spec() {
-                div.card {
-                    h2 { "Spec" }
-                    pre.doc { (spec) }
-                }
-            }
-            @if !job.plan().is_empty() {
-                div.card {
-                    h2 { "Plan" }
-                    ol.plan {
-                        @for pr in job.plan() {
-                            li {
-                                strong { (pr.title) }
-                                @if let Some(number) = pr.number {
-                                    " · "
-                                    @if let Some(url) = &repo_url {
-                                        a href={ (url) "/pull/" (number) } target="_blank" rel="noopener noreferrer" { "#" (number) }
-                                    } @else {
-                                        "#" (number)
-                                    }
-                                }
-                                div.summary { (pr.summary) }
-                            }
-                        }
-                    }
-                }
-            }
-            @if !logs.is_empty() {
-                div.card {
-                    div.card-head {
-                        h2 { "Log" }
-                        span.log-count { (logs.len()) @if logs.len() == 1 { " line" } @else { " lines" } }
-                    }
-                    ol.log {
-                        @for entry in logs {
-                            li class={ "log-" (entry.kind) } {
-                                span.log-at { (entry.at.get(11..).unwrap_or(&entry.at)) }
-                                span.log-text { (entry.text) }
-                            }
-                        }
-                    }
-                    script { (PreEscaped(LOG_SCROLL)) }
-                }
-            }
+            (request_card(id, job, images))
+            (spec_card(job))
+            (plan_card(job, repo_url))
+            (log_card(logs))
             @if *job.turn() != Turn::Done {
                 form.footer-actions method="post" action={ "/jobs/" (id) "/cancel" } {
                     button.danger { "Cancel job" }
@@ -708,6 +643,103 @@ pub fn job(
             }
         },
     )
+}
+
+fn job_header(id: i64, row: &JobRow, repo_url: Option<&str>, cost_usd: f64) -> Markup {
+    let job = &row.job;
+    html! {
+        div.title-row {
+            h1 { "#" (id) " " (first_line(job.request())) }
+            span.badge.cost { (cost_label(cost_usd)) }
+        }
+        p.meta {
+            @if let Some(url) = repo_url {
+                a href=(url) { (row.project) }
+            } @else {
+                (row.project)
+            }
+            " · requested by " (row.requested_by) " · " (row.created_at) " UTC"
+        }
+    }
+}
+
+fn request_card(id: i64, job: &Job, images: &[String]) -> Markup {
+    html! {
+        div.card {
+            h2 { "Request" }
+            pre.doc { (job.request()) }
+            @if !images.is_empty() {
+                ul.request-images {
+                    @for name in images {
+                        li {
+                            a href={ "/jobs/" (id) "/images/" (name) } {
+                                img src={ "/jobs/" (id) "/images/" (name) } alt=(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spec_card(job: &Job) -> Markup {
+    html! {
+        @if let Some(spec) = job.spec() {
+            div.card {
+                h2 { "Spec" }
+                pre.doc { (spec) }
+            }
+        }
+    }
+}
+
+fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
+    html! {
+        @if !job.plan().is_empty() {
+            div.card {
+                h2 { "Plan" }
+                ol.plan {
+                    @for pr in job.plan() {
+                        li {
+                            strong { (pr.title) }
+                            @if let Some(number) = pr.number {
+                                " · "
+                                @if let Some(url) = repo_url {
+                                    a href={ (url) "/pull/" (number) } target="_blank" rel="noopener noreferrer" { "#" (number) }
+                                } @else {
+                                    "#" (number)
+                                }
+                            }
+                            div.summary { (pr.summary) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn log_card(logs: &[LogEntry]) -> Markup {
+    html! {
+        @if !logs.is_empty() {
+            div.card {
+                div.card-head {
+                    h2 { "Log" }
+                    span.log-count { (logs.len()) @if logs.len() == 1 { " line" } @else { " lines" } }
+                }
+                ol.log {
+                    @for entry in logs {
+                        li class={ "log-" (entry.kind) } {
+                            span.log-at { (entry.at.get(11..).unwrap_or(&entry.at)) }
+                            span.log-text { (entry.text) }
+                        }
+                    }
+                }
+                script { (PreEscaped(LOG_SCROLL)) }
+            }
+        }
+    }
 }
 
 fn step_index(stage: &Stage) -> Option<usize> {
