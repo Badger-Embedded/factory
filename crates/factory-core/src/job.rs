@@ -17,6 +17,21 @@ pub struct Job {
     failed_rounds: u32,
     #[serde(default)]
     gates: Gates,
+    /// The answers to the agent's questions, in the order given.
+    #[serde(default)]
+    answers: Vec<Answered>,
+    /// Whether the spec and plan runs start their own sessions with a
+    /// self-contained prompt. A job stored before this field existed loads
+    /// with `false` and keeps resuming its planning session.
+    #[serde(default)]
+    fresh_sessions: bool,
+}
+
+/// A question the agent asked and the requester's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answered {
+    pub question: String,
+    pub answer: String,
 }
 
 /// Which steps wait for the user. A job stored without gates loads with
@@ -146,11 +161,15 @@ pub enum Task {
     },
 }
 
-/// The agent session a run continues. Clarifying, spec and plan share one
-/// session, and each planned pull request gets its own.
+/// The agent session a run uses. Clarifying has one, the spec has one, and
+/// so does the plan. Each planned pull request has its own. A job created
+/// before fresh sessions keeps one `Planning` session for clarifying, spec
+/// and plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Session {
     Planning,
+    Spec,
+    Plan,
     Pr(usize),
 }
 
@@ -265,6 +284,8 @@ impl Job {
             plan: Vec::new(),
             failed_rounds: 0,
             gates,
+            answers: Vec::new(),
+            fresh_sessions: true,
         }
     }
 
@@ -289,6 +310,18 @@ impl Job {
     }
 
     #[must_use]
+    pub fn answers(&self) -> &[Answered] {
+        &self.answers
+    }
+
+    /// Whether the spec, plan and implement runs start a session with a
+    /// self-contained prompt. `false` for a job created before that change.
+    #[must_use]
+    pub fn fresh_sessions(&self) -> bool {
+        self.fresh_sessions
+    }
+
+    #[must_use]
     pub fn spec(&self) -> Option<&str> {
         self.spec.as_deref()
     }
@@ -303,8 +336,8 @@ impl Job {
     #[must_use]
     pub fn next_command(&self) -> Option<Command> {
         match (&self.turn, &self.stage) {
-            (Turn::Agent(task), stage) => Some(Command::RunAgent {
-                session: session_of(stage),
+            (Turn::Agent(task), _) => Some(Command::RunAgent {
+                session: self.session(),
                 task: task.clone(),
             }),
             (Turn::Factory, Stage::Verifying { pr }) => Some(Command::RunChecks { pr: *pr }),
@@ -365,12 +398,15 @@ impl Job {
                         got: answers.len(),
                     });
                 }
+                let questions = questions.clone();
+                self.answers
+                    .extend(questions.iter().zip(&answers).map(|(q, a)| Answered {
+                        question: q.text.clone(),
+                        answer: a.clone(),
+                    }));
                 (
                     stage.clone(),
-                    Turn::Agent(Task::Answer {
-                        questions: questions.clone(),
-                        answers,
-                    }),
+                    Turn::Agent(Task::Answer { questions, answers }),
                 )
             }
 
@@ -522,6 +558,18 @@ impl Job {
         Ok(next)
     }
 
+    fn session(&self) -> Session {
+        match &self.stage {
+            Stage::Implementing { pr }
+            | Stage::Verifying { pr }
+            | Stage::PrOpen { pr }
+            | Stage::CiAndReview { pr } => Session::Pr(*pr),
+            Stage::Spec if self.fresh_sessions => Session::Spec,
+            Stage::Plan if self.fresh_sessions => Session::Plan,
+            _ => Session::Planning,
+        }
+    }
+
     fn implement(&self, pr: usize) -> (Stage, Turn) {
         (
             Stage::Implementing { pr },
@@ -566,15 +614,5 @@ impl Job {
             stage: self.stage.clone(),
             event,
         }
-    }
-}
-
-fn session_of(stage: &Stage) -> Session {
-    match stage {
-        Stage::Implementing { pr }
-        | Stage::Verifying { pr }
-        | Stage::PrOpen { pr }
-        | Stage::CiAndReview { pr } => Session::Pr(*pr),
-        _ => Session::Planning,
     }
 }

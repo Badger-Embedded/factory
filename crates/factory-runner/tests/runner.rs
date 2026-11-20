@@ -2,11 +2,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question, Stage, Task};
+use factory_core::{
+    AgentResult, Command, Event, Gates, Job, PlannedPr, PrDescription, Question, Stage, Task,
+};
 use factory_runner::{
     Expect, LogLine, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
-    event_from_result, parse_line, place_images, podman_args, prompt, remove_container, run,
-    show_images,
+    event_from_result, job_prompt, parse_line, place_images, podman_args, prompt, remove_container,
+    run, show_images,
 };
 use serde_json::{Value, json};
 
@@ -610,4 +612,125 @@ fn podman_args_pass_the_model_to_claude_for_each_stage() {
         let image = args.iter().position(|arg| arg == "claude").unwrap();
         assert!(args.iter().position(|arg| arg == "--model").unwrap() > image);
     }
+}
+
+fn planned(title: &str) -> PlannedPr {
+    PlannedPr {
+        title: title.into(),
+        summary: format!("{title} summary"),
+        number: None,
+        description: None,
+    }
+}
+
+/// A job after the plan is approved, with one answered question.
+fn approved_job(job: Job) -> Job {
+    let mut job = job;
+    let step = |job: &mut Job, event| job.apply(event).unwrap();
+    step(&mut job, Event::Start);
+    step(
+        &mut job,
+        Event::Agent(AgentResult::Questions(vec![Question {
+            text: "Which board?".into(),
+        }])),
+    );
+    step(&mut job, Event::Answer(vec!["rpi5".into()]));
+    step(&mut job, Event::Agent(AgentResult::Clarified));
+    step(
+        &mut job,
+        Event::Agent(AgentResult::Spec("Reboot over HTTP.".into())),
+    );
+    step(&mut job, Event::Approve);
+    step(
+        &mut job,
+        Event::Agent(AgentResult::Plan(vec![
+            planned("maestrod: add a reboot endpoint"),
+            planned("maestro-cli: add a reboot command"),
+        ])),
+    );
+    job
+}
+
+fn run_prompt(job: &Job, expect: Expect) -> String {
+    match job.next_command() {
+        Some(Command::RunAgent { task, .. }) => job_prompt(job, &task, expect),
+        other => panic!("no agent run: {other:?}"),
+    }
+}
+
+#[test]
+fn the_spec_prompt_holds_the_request_and_the_answers() {
+    let mut job = Job::new("Add a reboot button", Gates::default());
+    job.apply(Event::Start).unwrap();
+    job.apply(Event::Agent(AgentResult::Questions(vec![Question {
+        text: "Which board?".into(),
+    }])))
+    .unwrap();
+    job.apply(Event::Answer(vec!["rpi5".into()])).unwrap();
+    job.apply(Event::Agent(AgentResult::Clarified)).unwrap();
+    let text = run_prompt(&job, Expect::Spec);
+    assert!(text.contains("Add a reboot button"));
+    assert!(text.contains("Q: Which board?\nA: rpi5"));
+    assert!(text.contains("Write the spec"));
+}
+
+#[test]
+fn the_plan_prompt_holds_the_spec_text() {
+    let mut job = Job::new("Add a reboot button", Gates::default());
+    job.apply(Event::Start).unwrap();
+    job.apply(Event::Agent(AgentResult::Clarified)).unwrap();
+    job.apply(Event::Agent(AgentResult::Spec("Reboot over HTTP.".into())))
+        .unwrap();
+    job.apply(Event::Approve).unwrap();
+    let text = run_prompt(&job, Expect::Plan);
+    assert!(text.contains("Add a reboot button"));
+    assert!(text.contains("Reboot over HTTP."));
+    assert!(text.contains("Split the work into pull requests"));
+}
+
+#[test]
+fn the_implement_prompt_holds_the_spec_and_its_planned_pull_request() {
+    let mut job = approved_job(Job::new("Add a reboot button", Gates::default()));
+    job.apply(Event::Approve).unwrap();
+    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+        .unwrap();
+    let first = run_prompt_for_pr(&job, 0);
+    assert!(first.contains("Add a reboot button"));
+    assert!(first.contains("Q: Which board?\nA: rpi5"));
+    assert!(first.contains("Reboot over HTTP."));
+    assert!(first.contains("maestrod: add a reboot endpoint summary"));
+    assert!(first.contains("2. maestro-cli: add a reboot command"));
+    assert!(!first.contains("maestro-cli: add a reboot command summary"));
+}
+
+fn run_prompt_for_pr(job: &Job, pr: usize) -> String {
+    let task = Task::Implement {
+        pr: job.plan()[pr].clone(),
+    };
+    job_prompt(job, &task, Expect::Commits)
+}
+
+#[test]
+fn a_job_from_before_fresh_sessions_gets_the_short_prompts() {
+    let job = approved_job(Job::new("Add a reboot button", Gates::default()));
+    let mut stored = serde_json::to_value(&job).unwrap();
+    stored
+        .as_object_mut()
+        .unwrap()
+        .remove("fresh_sessions")
+        .unwrap();
+    let old: Job = serde_json::from_value(stored).unwrap();
+    let text = job_prompt(&old, &Task::WritePlan, Expect::Plan);
+    assert_eq!(text, prompt(&Task::WritePlan, Expect::Plan));
+    assert!(!text.contains("Reboot over HTTP."));
+}
+
+#[test]
+fn a_fix_run_keeps_its_short_prompt() {
+    let job = approved_job(Job::new("Add a reboot button", Gates::default()));
+    let task = Task::FixCi { log: "boom".into() };
+    assert_eq!(
+        job_prompt(&job, &task, Expect::Commits),
+        prompt(&task, Expect::Commits)
+    );
 }

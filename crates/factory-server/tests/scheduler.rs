@@ -269,7 +269,7 @@ async fn a_run_result_moves_the_job_and_is_logged() {
 }
 
 #[tokio::test]
-async fn answers_continue_the_session_and_a_pull_request_gets_its_own() {
+async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Clarify if request.prompt.contains("answered") => {
             Event::Agent(AgentResult::Clarified)
@@ -326,9 +326,17 @@ async fn answers_continue_the_session_and_a_pull_request_gets_its_own() {
         requests[4].branch.as_deref(),
         Some(format!("factory/job-{id}-pr-1").as_str())
     );
-    let planning = &requests[0].session_id;
-    assert!(requests[..4].iter().all(|r| &r.session_id == planning));
-    assert_ne!(&requests[4].session_id, planning);
+    assert_eq!(requests[0].session_id, requests[1].session_id);
+    let ids: std::collections::HashSet<&str> =
+        requests.iter().map(|r| r.session_id.as_str()).collect();
+    assert_eq!(
+        ids.len(),
+        4,
+        "clarify, spec, plan and the pull request each have a session"
+    );
+    assert!(requests[2].prompt.contains("Add a reboot button"));
+    assert!(requests[3].prompt.contains("The approved spec:"));
+    assert!(requests[4].prompt.contains("a: b"));
     assert_eq!(
         store.get(id).unwrap().job.stage(),
         &Stage::Verifying { pr: 0 }
@@ -1469,4 +1477,67 @@ async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_model() {
         .collect();
     assert_eq!(used.len(), 4, "{used:?}");
     assert!(used.iter().all(|model| model == "i"), "{used:?}");
+}
+
+#[tokio::test]
+async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    let executor = FakeExecutor::new(|request| match request.expect {
+        Expect::Clarify => Event::Agent(AgentResult::Clarified),
+        Expect::Spec => Event::Agent(AgentResult::Spec("the spec".into())),
+        _ => Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+            title: "a: b".into(),
+            summary: "c".into(),
+            number: None,
+            description: None,
+        }])),
+    });
+    let projects: Projects = [(
+        "maestro".to_owned(),
+        Project {
+            repo: "Badger-Embedded/maestro".into(),
+            base: "main".into(),
+            checks: None,
+            models: factory_server::StageModels::default(),
+        },
+    )]
+    .into_iter()
+    .collect();
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+    );
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE jobs SET job = json_remove(job, '$.fresh_sessions', '$.answers') WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+    executor.release(10);
+
+    for _ in 0..2 {
+        scheduler.tick().await.unwrap();
+        wait_idle(&scheduler).await;
+    }
+    store.apply(id, Event::Approve).unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+
+    let requests = executor.requests();
+    let expects: Vec<Expect> = requests.iter().map(|r| r.expect).collect();
+    assert_eq!(expects, [Expect::Clarify, Expect::Spec, Expect::Plan]);
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.session_id == requests[0].session_id)
+    );
+    assert!(!requests[2].prompt.contains("The approved spec:"));
 }
