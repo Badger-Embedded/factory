@@ -18,7 +18,10 @@ pub const STYLESHEET: &str = include_str!("../static/style.css");
 pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
-const LOG_SCROLL: &str = include_str!("../static/log-scroll.js");
+/// Keeps the log scroll place and a half-typed form across a poll's swap. It
+/// runs once on the job page, outside every swapped region, so a swap never
+/// re-runs or removes it.
+const JOB_UPDATES: &str = include_str!("../static/job-updates.js");
 
 enum Who {
     Agent(&'static str, fn(&StageModels) -> &Option<String>),
@@ -43,8 +46,8 @@ const STEPS: [(&str, Who); 9] = [
     ("merged", Who::Factory),
 ];
 
-/// Each board region polls its own fragment on this interval, so a state
-/// change on the board shows without a reload.
+/// Each live region polls its own fragment on this interval, so a state change
+/// shows without a reload.
 const POLL_TRIGGER: &str = "every 5s";
 
 fn fragment_url(region: &str, project: &str) -> String {
@@ -64,10 +67,10 @@ fn has_gate(step: &str, gates: Gates) -> bool {
 }
 
 fn layout(user: &str, title: &str, body: &Markup) -> Markup {
-    page(user, title, false, &html! {}, body)
+    page(user, title, &html! {}, body)
 }
 
-fn page(user: &str, title: &str, refresh: bool, nav: &Markup, body: &Markup) -> Markup {
+fn page(user: &str, title: &str, nav: &Markup, body: &Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -75,7 +78,6 @@ fn page(user: &str, title: &str, refresh: bool, nav: &Markup, body: &Markup) -> 
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · factory" }
-                @if refresh { meta http-equiv="refresh" content="5"; }
                 link rel="stylesheet" href="/style.css";
                 script defer src="/htmx.min.js" {}
             }
@@ -132,7 +134,6 @@ pub fn index(
     page(
         user,
         "Jobs",
-        false,
         &nav,
         &html! {
             (plan_usage_region(plan_usage))
@@ -667,24 +668,129 @@ pub fn job(
     page(
         user,
         &format!("Job #{id}"),
-        matches!(job.turn(), Turn::Agent(_)),
         &html! {},
         &html! {
+            (job_poll(false, id, job))
             (job_header(id, row, repo_url, cost_usd))
-            (steps(job, models))
-            (status_card(id, job, settings, auto_merge))
+            (steps_region(false, job, models))
+            (status_region(false, id, job, settings, auto_merge))
             p.meta { "Approval gates: " (gates_line(job.gates())) }
             (request_card(id, job, images))
-            (spec_card(job))
-            (plan_card(job, repo_url))
-            (log_card(logs))
+            (spec_region(false, job))
+            (plan_region(false, job, repo_url))
+            (log_region(false, logs))
             @if *job.turn() != Turn::Done {
                 form.footer-actions method="post" action={ "/jobs/" (id) "/cancel" } {
                     button.danger { "Cancel job" }
                 }
             }
+            script { (PreEscaped(JOB_UPDATES)) }
         },
     )
+}
+
+/// The job page's live regions, re-rendered for a poll as out-of-band swaps.
+/// It renders the same region bodies the full page does, from the same data,
+/// so a swapped region cannot disagree with the page it updates. The poller
+/// only appears here once the job is terminal, to replace itself with a
+/// version that no longer polls; a running job keeps the poller the page set
+/// up, timer and all.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fragment takes each value its handler read"
+)]
+pub fn job_fragment(
+    row: &JobRow,
+    project: Option<&Project>,
+    settings: &Settings,
+    logs: &[LogEntry],
+    cost_usd: f64,
+    models: &StageModels,
+    auto_merge: bool,
+) -> Markup {
+    let job = &row.job;
+    let repo = project.map(|project| format!("https://github.com/{}", project.repo));
+    let repo_url = repo.as_deref();
+    html! {
+        @if terminal(job) { (job_poll(true, row.id, job)) }
+        (cost_badge(true, cost_usd))
+        (steps_region(true, job, models))
+        (status_region(true, row.id, job, settings, auto_merge))
+        (spec_region(true, job))
+        (plan_region(true, job, repo_url))
+        (log_region(true, logs))
+    }
+}
+
+/// Merged, failed and cancelled jobs do not change again, so their page and
+/// its fragments carry no polling attribute.
+fn terminal(job: &Job) -> bool {
+    matches!(
+        job.stage(),
+        Stage::Merged | Stage::Failed { .. } | Stage::Cancelled
+    )
+}
+
+/// The hidden element that polls the job fragment. A running job polls every
+/// `POLL_TRIGGER` and lets htmx apply the out-of-band swaps the response
+/// carries; `hx-swap="none"` keeps it from swapping the response into itself.
+/// A terminal job gets a bare element with no polling attribute, so the loop
+/// stops both on first load and when a running page reaches a terminal stage.
+fn job_poll(oob: bool, id: i64, job: &Job) -> Markup {
+    let polling = !terminal(job);
+    html! {
+        div #job-poll hx-swap-oob=[oob.then_some("true")]
+            hx-get=[polling.then(|| format!("/jobs/{id}/fragment"))]
+            hx-trigger=[polling.then_some(POLL_TRIGGER)]
+            hx-swap=[polling.then_some("none")] {}
+    }
+}
+
+/// The cost pill on the title row. A poll updates it out of band, so the title
+/// stays put while the figure changes.
+fn cost_badge(oob: bool, cost_usd: f64) -> Markup {
+    html! {
+        span #job-cost.badge.cost hx-swap-oob=[oob.then_some("true")] {
+            (cost_label(cost_usd))
+        }
+    }
+}
+
+fn steps_region(oob: bool, job: &Job, models: &StageModels) -> Markup {
+    html! {
+        div #job-steps hx-swap-oob=[oob.then_some("true")] { (steps(job, models)) }
+    }
+}
+
+/// The status and its controls. A poll swaps this region, so the approval or
+/// answer form appears when the job enters a gate. `job-updates.js` skips the
+/// swap while a field here has focus, so a half-typed answer survives a poll.
+fn status_region(oob: bool, id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Markup {
+    html! {
+        div #job-status hx-swap-oob=[oob.then_some("true")] {
+            (status_card(id, job, settings, auto_merge))
+        }
+    }
+}
+
+fn spec_region(oob: bool, job: &Job) -> Markup {
+    html! {
+        div #job-spec hx-swap-oob=[oob.then_some("true")] { (spec_card(job)) }
+    }
+}
+
+fn plan_region(oob: bool, job: &Job, repo_url: Option<&str>) -> Markup {
+    html! {
+        div #job-plan hx-swap-oob=[oob.then_some("true")] { (plan_card(job, repo_url)) }
+    }
+}
+
+/// The log, in a region a poll swaps. `job-updates.js` keeps the reader's
+/// scroll place across the swap: pinned to the bottom, or where they scrolled.
+fn log_region(oob: bool, logs: &[LogEntry]) -> Markup {
+    html! {
+        div #job-log hx-swap-oob=[oob.then_some("true")] { (log_card(logs)) }
+    }
 }
 
 fn job_header(id: i64, row: &JobRow, repo_url: Option<&str>, cost_usd: f64) -> Markup {
@@ -692,7 +798,7 @@ fn job_header(id: i64, row: &JobRow, repo_url: Option<&str>, cost_usd: f64) -> M
     html! {
         div.title-row {
             h1 { "#" (id) " " (first_line(job.request())) }
-            span.badge.cost { (cost_label(cost_usd)) }
+            (cost_badge(false, cost_usd))
         }
         p.meta {
             @if let Some(url) = repo_url {
@@ -778,7 +884,6 @@ fn log_card(logs: &[LogEntry]) -> Markup {
                         }
                     }
                 }
-                script { (PreEscaped(LOG_SCROLL)) }
             }
         }
     }

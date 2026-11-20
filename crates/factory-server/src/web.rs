@@ -70,6 +70,7 @@ pub fn app(
             post(create_job).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .route("/jobs/{id}", get(show_job))
+        .route("/jobs/{id}/fragment", get(job_fragment))
         .route("/jobs/{id}/images/{name}", get(show_image))
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
@@ -409,34 +410,79 @@ fn save_images(state: &AppState, id: i64, uploads: &[Upload]) -> Result<(), AppE
     Ok(())
 }
 
-async fn show_job(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Markup, AppError> {
+/// The store data the job page and its fragment render from, loaded in one
+/// place so the fragment a poll swaps in cannot disagree with the page.
+struct JobData {
+    row: JobRow,
+    settings: Settings,
+    logs: Vec<crate::store::LogEntry>,
+    cost_usd: f64,
+    models: StageModels,
+    auto_merge: bool,
+}
+
+fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
     let row = state.store.get(id)?;
-    let logs = state.store.logs(id, LOG_LINES)?;
     let settings = state.store.settings()?;
-    let project = state.projects.get(&row.project);
-    let images = state.store.images(id)?;
+    let logs = state.store.logs(id, LOG_LINES)?;
     let cost_usd = state.store.cost_usd(id)?;
-    let defaults = project
+    let defaults = state
+        .projects
+        .get(&row.project)
         .map(|project| project.models.clone())
         .unwrap_or_default();
     let models = state.store.project_models(&row.project, &defaults)?;
     let auto_merge = state
         .store
-        .project_auto_merge(&row.project, toml_auto_merge(&state, &row.project))?;
+        .project_auto_merge(&row.project, toml_auto_merge(state, &row.project))?;
+    Ok(JobData {
+        row,
+        settings,
+        logs,
+        cost_usd,
+        models,
+        auto_merge,
+    })
+}
+
+async fn show_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Markup, AppError> {
+    let data = load_job(&state, id)?;
+    let project = state.projects.get(&data.row.project);
+    let images = state.store.images(id)?;
     Ok(pages::job(
         &user(&headers),
-        &row,
+        &data.row,
         project,
-        &settings,
-        &logs,
+        &data.settings,
+        &data.logs,
         &images,
-        cost_usd,
-        &models,
-        auto_merge,
+        data.cost_usd,
+        &data.models,
+        data.auto_merge,
+    ))
+}
+
+/// Serves the job page's live regions on their own, from the same data the
+/// page reads, so a poll makes no write and no GitHub or usage call. htmx
+/// swaps each region into the open page out of band.
+async fn job_fragment(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Markup, AppError> {
+    let data = load_job(&state, id)?;
+    let project = state.projects.get(&data.row.project);
+    Ok(pages::job_fragment(
+        &data.row,
+        project,
+        &data.settings,
+        &data.logs,
+        data.cost_usd,
+        &data.models,
+        data.auto_merge,
     ))
 }
 
