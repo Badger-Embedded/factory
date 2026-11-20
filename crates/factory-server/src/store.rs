@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS project_models (
     plan TEXT,
     implement TEXT
 );
+CREATE TABLE IF NOT EXISTS project_settings (
+    project TEXT PRIMARY KEY,
+    auto_merge INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sessions (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     session TEXT NOT NULL,
@@ -489,6 +493,84 @@ impl Store {
                 models.implement
             ],
         )?;
+        Ok(())
+    }
+
+    /// Whether `project` auto-merges its pull requests, or `default` when no
+    /// row is saved. A saved row replaces the project file default.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_auto_merge(&self, project: &str, default: bool) -> Result<bool, StoreError> {
+        let stored = self
+            .conn()
+            .query_row(
+                "SELECT auto_merge FROM project_settings WHERE project = ?1",
+                [project],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.unwrap_or(default))
+    }
+
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_auto_merge(
+        &self,
+        project: &str,
+        auto_merge: bool,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO project_settings (project, auto_merge) VALUES (?1, ?2)
+             ON CONFLICT (project) DO UPDATE SET auto_merge = excluded.auto_merge",
+            params![project, auto_merge],
+        )?;
+        Ok(())
+    }
+
+    /// Moves the old global auto-merge setting into each project's own
+    /// setting. When the stored settings still carry a global `auto_merge` and
+    /// it was on, every `project` listed that has no saved flag of its own
+    /// inherits it, so those projects keep today's behaviour. The global field
+    /// is then dropped from the stored settings. This runs once: afterwards the
+    /// stored settings no longer carry the field, so a later call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or stored settings that do not parse.
+    pub fn migrate_global_auto_merge(&self, projects: &[&str]) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row("SELECT settings FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(());
+        };
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        let Some(global) = value
+            .as_object_mut()
+            .and_then(|object| object.remove("auto_merge"))
+        else {
+            return Ok(());
+        };
+        if global.as_bool() == Some(true) {
+            for project in projects {
+                tx.execute(
+                    "INSERT OR IGNORE INTO project_settings (project, auto_merge) VALUES (?1, 1)",
+                    [project],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE settings SET settings = ?1 WHERE id = 1",
+            [serde_json::to_string(&value)?],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

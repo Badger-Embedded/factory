@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(Store::open(&db)?);
+    store.migrate_global_auto_merge(&projects.names().collect::<Vec<_>>())?;
     let wake = Arc::new(Notify::new());
 
     if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {

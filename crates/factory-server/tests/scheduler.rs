@@ -169,6 +169,7 @@ fn setup(
             base: "main".into(),
             checks: Some("just lint".into()),
             models: factory_server::StageModels::default(),
+            auto_merge: false,
         },
     )]
     .into_iter()
@@ -756,6 +757,7 @@ async fn a_project_without_checks_publishes_unchecked() {
             base: "main".into(),
             checks: None,
             models: factory_server::StageModels::default(),
+            auto_merge: false,
         },
     )]
     .into_iter()
@@ -825,6 +827,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
                     base: "main".into(),
                     checks: Some("just lint".into()),
                     models: factory_server::StageModels::default(),
+                    auto_merge: false,
                 },
             )]
             .into_iter()
@@ -924,10 +927,10 @@ async fn auto_merge_reaches_the_executor_and_a_factory_merge_is_logged() {
     store
         .save_settings(&Settings {
             poll_seconds: 0,
-            auto_merge: true,
             ..Settings::default()
         })
         .unwrap();
+    store.save_project_auto_merge("maestro", true).unwrap();
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
     step(&scheduler).await;
@@ -1357,6 +1360,7 @@ async fn a_project_does_not_use_the_models_of_another() {
         base: "main".into(),
         checks: None,
         models: factory_server::StageModels::default(),
+        auto_merge: false,
     };
     let projects: Projects = [
         ("maestro".to_owned(), project("Badger-Embedded/maestro")),
@@ -1545,6 +1549,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
             base: "main".into(),
             checks: None,
             models: factory_server::StageModels::default(),
+            auto_merge: false,
         },
     )]
     .into_iter()

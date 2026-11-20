@@ -36,6 +36,11 @@ pub struct Project {
     /// replace them.
     #[serde(default)]
     pub models: StageModels,
+    /// The default for auto-merge: squash-merge a pull request once its checks
+    /// pass and no review comment waits for the agent. A saved settings row
+    /// replaces it. Off by default.
+    #[serde(default)]
+    pub auto_merge: bool,
 }
 
 #[derive(Debug, Clone, Default)]

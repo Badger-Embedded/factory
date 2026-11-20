@@ -140,6 +140,12 @@ struct IndexQuery {
     project: Option<String>,
 }
 
+/// The project's auto-merge default from its project file, false when the
+/// project is unknown. A saved row in `project_settings` replaces it.
+fn toml_auto_merge(state: &AppState, project: &str) -> bool {
+    state.projects.get(project).is_some_and(|p| p.auto_merge)
+}
+
 async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -154,21 +160,25 @@ async fn index(
     };
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
-    let settings = state.store.settings()?;
-    let totals = match &selected {
-        Some(name) => state.store.project_totals(name)?,
-        None => ProjectTotals::default(),
+    let (totals, auto_merge) = match &selected {
+        Some(name) => (
+            state.store.project_totals(name)?,
+            state
+                .store
+                .project_auto_merge(name, toml_auto_merge(&state, name))?,
+        ),
+        None => (ProjectTotals::default(), false),
     };
     let plan_usage = state.plan_usage.visible(now_secs());
     Ok(pages::index(
         &user(&headers),
         &state.projects,
         selected.as_deref(),
-        &settings,
         &jobs,
         &costs,
         totals,
         plan_usage.as_ref(),
+        auto_merge,
     ))
 }
 
@@ -316,6 +326,9 @@ async fn show_job(
         .map(|project| project.models.clone())
         .unwrap_or_default();
     let models = state.store.project_models(&row.project, &defaults)?;
+    let auto_merge = state
+        .store
+        .project_auto_merge(&row.project, toml_auto_merge(&state, &row.project))?;
     Ok(pages::job(
         &user(&headers),
         &row,
@@ -325,6 +338,7 @@ async fn show_job(
         &images,
         cost_usd,
         &models,
+        auto_merge,
     ))
 }
 
@@ -461,7 +475,7 @@ fn settings_page(
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
     let settings = state.store.settings()?;
-    let models = state
+    let projects = state
         .projects
         .names()
         .map(|name| {
@@ -473,10 +487,18 @@ fn settings_page(
             Ok((
                 name.to_owned(),
                 state.store.project_models(name, &defaults)?,
+                state
+                    .store
+                    .project_auto_merge(name, toml_auto_merge(state, name))?,
             ))
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
-    Ok(pages::settings(&user(headers), &settings, &models, notice))
+    Ok(pages::settings(
+        &user(headers),
+        &settings,
+        &projects,
+        notice,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -485,6 +507,8 @@ struct ModelsForm {
     spec: String,
     plan: String,
     implement: String,
+    /// A checkbox: present when ticked.
+    auto_merge: Option<String>,
 }
 
 async fn save_project_models(
@@ -504,6 +528,10 @@ async fn save_project_models(
         implement: model(form.implement),
     };
     state.store.save_project_models(&name, &models)?;
+    state
+        .store
+        .save_project_auto_merge(&name, form.auto_merge.is_some())?;
+    state.wake.notify_one();
     settings_page(&state, &headers, Some("Saved."))
 }
 
@@ -514,8 +542,6 @@ struct SettingsForm {
     worker_image: String,
     worker_memory: String,
     worker_cpus: String,
-    /// A checkbox: present when ticked.
-    auto_merge: Option<String>,
     /// Checkboxes: present when ticked.
     gate_spec: Option<String>,
     gate_plan: Option<String>,
@@ -546,7 +572,6 @@ async fn save_settings(
         worker_image: text(form.worker_image, "the worker image")?,
         worker_memory: text(form.worker_memory, "the worker memory")?,
         worker_cpus: text(form.worker_cpus, "the worker CPUs")?,
-        auto_merge: form.auto_merge.is_some(),
         gates: Gates {
             spec: form.gate_spec.is_some(),
             plan: form.gate_plan.is_some(),

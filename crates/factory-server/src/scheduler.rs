@@ -322,7 +322,9 @@ impl<E: Executor> Scheduler<E> {
                         base: project.base.clone(),
                         number,
                         seen_until: self.store.pr_watermark(row.id, pr)?,
-                        auto_merge: settings.auto_merge,
+                        auto_merge: self
+                            .store
+                            .project_auto_merge(&row.project, project.auto_merge)?,
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
