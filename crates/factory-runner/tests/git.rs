@@ -251,3 +251,64 @@ async fn commits_that_credit_an_ai_tool_are_found() {
         .collect();
     assert_eq!(subjects, ["with footer", "with trailer"]);
 }
+
+#[tokio::test]
+async fn a_branch_summary_lists_the_commits_and_the_diff_stat() {
+    let remote = Remote::new();
+    let work = remote.work();
+    let git_ = remote.git();
+    git_.prepare(&work, "owner/repo", "main", Some("factory/job-7-pr-1"))
+        .await
+        .unwrap();
+    commit(&work, "a", "add a");
+    commit(&work, "b", "add b");
+    // The base moves on after the branch was cut. Its change is not ours.
+    commit(&remote.upstream(), "later", "second");
+    git(&remote.upstream(), &["push", "-q", "origin", "main"]);
+    git(&work, &["fetch", "-q", "origin", "main"]);
+
+    let summary = git_.summarize_branch(&work, "main").await.unwrap();
+    let subjects: Vec<&str> = summary
+        .commits
+        .iter()
+        .map(|entry| entry.split_once(' ').unwrap().1)
+        .collect();
+    assert_eq!(subjects, ["add b", "add a"]);
+    assert_eq!(summary.commits[0].split_once(' ').unwrap().0.len(), 7);
+    assert!(
+        summary.diff_stat.contains(" a | 1 +"),
+        "{}",
+        summary.diff_stat
+    );
+    assert!(
+        summary.diff_stat.contains(" b | 1 +"),
+        "{}",
+        summary.diff_stat
+    );
+    assert!(
+        !summary.diff_stat.contains("later"),
+        "{}",
+        summary.diff_stat
+    );
+    assert!(
+        summary
+            .diff_stat
+            .ends_with("2 files changed, 2 insertions(+)"),
+        "{}",
+        summary.diff_stat
+    );
+}
+
+#[tokio::test]
+async fn a_branch_with_no_commits_ahead_has_an_empty_summary() {
+    let remote = Remote::new();
+    let work = remote.work();
+    let git_ = remote.git();
+    git_.prepare(&work, "owner/repo", "main", Some("factory/job-7-pr-1"))
+        .await
+        .unwrap();
+
+    let summary = git_.summarize_branch(&work, "main").await.unwrap();
+    assert_eq!(summary.commits, Vec::<String>::new());
+    assert_eq!(summary.diff_stat, "");
+}
