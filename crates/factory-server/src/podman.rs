@@ -114,6 +114,7 @@ impl Executor for PodmanExecutor {
             claude_dir,
             expect: request.expect,
             prompt,
+            model: request.model,
         };
         run(&config, &worker, log).await
     }

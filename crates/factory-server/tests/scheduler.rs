@@ -1211,3 +1211,262 @@ mod purge {
         assert_eq!(f.rows("logs", stuck), 1);
     }
 }
+
+fn models(clarify: &str, spec: &str, plan: &str, implement: &str) -> factory_server::StageModels {
+    let some = |name: &str| Some(name.to_owned());
+    factory_server::StageModels {
+        clarify: some(clarify),
+        spec: some(spec),
+        plan: some(plan),
+        implement: some(implement),
+    }
+}
+
+/// Asks once, then clarifies, and answers every other stage in one run.
+fn one_pass(request: &AgentRequest) -> Event {
+    match request.expect {
+        Expect::Clarify if request.prompt.contains("answered") => {
+            Event::Agent(AgentResult::Clarified)
+        }
+        Expect::Clarify => questions(),
+        Expect::Spec => Event::Agent(AgentResult::Spec("spec".into())),
+        Expect::Plan => Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+            title: "a: b".into(),
+            summary: "c".into(),
+            number: None,
+            description: None,
+        }])),
+        Expect::Commits => Event::Agent(AgentResult::CommitsReady(ready())),
+    }
+}
+
+fn model_of(request: &AgentRequest) -> &str {
+    request.model.as_deref().unwrap_or("")
+}
+
+#[tokio::test]
+async fn a_project_without_models_passes_none() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(1);
+
+    step(&scheduler).await;
+    assert_eq!(executor.requests()[0].model, None);
+}
+
+#[tokio::test]
+async fn an_empty_stage_model_passes_none() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_models("maestro", &models("", "s", "p", "i"))
+        .unwrap();
+    store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(1);
+
+    step(&scheduler).await;
+    assert_eq!(executor.requests()[0].model.as_deref(), Some(""));
+}
+
+#[tokio::test]
+async fn each_stage_runs_with_its_own_model() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_models(
+            "maestro",
+            &models("c-model", "s-model", "p-model", "i-model"),
+        )
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(10);
+
+    step(&scheduler).await;
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let used: Vec<&str> = requests.iter().map(model_of).collect();
+    assert_eq!(
+        used,
+        ["c-model", "c-model", "s-model", "p-model", "i-model"]
+    );
+}
+
+#[tokio::test]
+async fn a_project_does_not_use_the_models_of_another() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(|_| questions());
+    let project = |repo: &str| Project {
+        repo: repo.into(),
+        base: "main".into(),
+        checks: None,
+        models: factory_server::StageModels::default(),
+    };
+    let projects: Projects = [
+        ("maestro".to_owned(), project("Badger-Embedded/maestro")),
+        ("factory".to_owned(), project("moonthebot/factory")),
+    ]
+    .into_iter()
+    .collect();
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+    );
+    store
+        .save_project_models("maestro", &models("maestro-c", "", "", ""))
+        .unwrap();
+    store
+        .save_project_models("factory", &models("factory-c", "", "", ""))
+        .unwrap();
+    store.create("maestro", "alice", "One").unwrap();
+    store.create("factory", "alice", "Two").unwrap();
+    executor.release(2);
+
+    step(&scheduler).await;
+    let mut used: Vec<(String, String)> = executor
+        .requests()
+        .iter()
+        .map(|r| (r.repo.clone(), model_of(r).to_owned()))
+        .collect();
+    used.sort();
+    assert_eq!(
+        used,
+        [
+            ("Badger-Embedded/maestro".to_owned(), "maestro-c".to_owned()),
+            ("moonthebot/factory".to_owned(), "factory-c".to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_model_change_at_a_gate_reaches_the_next_run() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_models("maestro", &models("c1", "s1", "p1", "i1"))
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(10);
+
+    step(&scheduler).await;
+    store
+        .save_project_models("maestro", &models("c2", "s2", "p2", "i2"))
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+    store
+        .save_project_models("maestro", &models("c3", "s3", "p3", "i3"))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    store
+        .save_project_models("maestro", &models("c4", "s4", "p4", "i4"))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let used: Vec<&str> = requests.iter().map(model_of).collect();
+    assert_eq!(used, ["c1", "c2", "s2", "p3", "i4"]);
+}
+
+#[tokio::test]
+async fn spec_and_plan_revisions_use_their_stage_model() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_models("maestro", &models("c", "s", "p", "i"))
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    executor.release(10);
+
+    step(&scheduler).await;
+    store
+        .apply(
+            id,
+            Event::RequestChanges {
+                feedback: "Shorter.".into(),
+            },
+        )
+        .unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    store
+        .apply(
+            id,
+            Event::RequestChanges {
+                feedback: "Split it.".into(),
+            },
+        )
+        .unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let used: Vec<&str> = requests.iter().map(model_of).collect();
+    assert_eq!(used, ["s", "s", "p", "p"]);
+    assert!(requests[1].prompt.contains("Shorter."));
+    assert!(requests[3].prompt.contains("Split it."));
+}
+
+#[tokio::test]
+async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_model() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    store
+        .save_project_models("maestro", &models("c", "s", "p", "i"))
+        .unwrap();
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    executor
+        .checks
+        .lock()
+        .unwrap()
+        .push_back(Ok(Event::ChecksFailed {
+            report: "clippy".into(),
+        }));
+
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::FixChecks { .. })
+    ));
+    executor.release(1);
+    step(&scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    for event in [
+        Event::CiFailed { log: "red".into() },
+        Event::ReviewComments {
+            comments: "Needs a test.".into(),
+        },
+    ] {
+        executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+            event: Some(event),
+            seen_until: None,
+            merged_by_factory: false,
+        }));
+        step(&scheduler).await;
+        executor.release(1);
+        step(&scheduler).await;
+        step(&scheduler).await;
+        step(&scheduler).await;
+    }
+
+    let used: Vec<String> = executor
+        .requests()
+        .iter()
+        .map(|r| model_of(r).to_owned())
+        .collect();
+    assert_eq!(used.len(), 4, "{used:?}");
+    assert!(used.iter().all(|model| model == "i"), "{used:?}");
+}
