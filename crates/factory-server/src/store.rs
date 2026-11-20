@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use factory_core::{AgentResult, EFFORTS, Event, Job, Rejected, Session, Stage};
+use factory_core::{AgentResult, EFFORTS, Event, Gates, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS project_settings (
     project TEXT PRIMARY KEY,
     auto_merge INTEGER NOT NULL DEFAULT 0,
     llm_review INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS project_gates (
+    project TEXT PRIMARY KEY,
+    spec INTEGER NOT NULL,
+    plan INTEGER NOT NULL,
+    publish INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS project_efforts (
     project TEXT PRIMARY KEY,
@@ -335,8 +341,10 @@ impl Store {
     }
 
     /// Onboards a project with its `repo`, `base` and optional `checks`. Its
-    /// models and flags start at their defaults; the settings page saves them
-    /// into `project_models` and `project_settings`.
+    /// approval gates start as a copy of the default gates in the settings, so
+    /// a later change to the defaults leaves the project alone. Its models and
+    /// flags start at their defaults; the settings page saves them into
+    /// `project_models` and `project_settings`.
     ///
     /// # Errors
     ///
@@ -370,6 +378,8 @@ impl Store {
             "INSERT INTO projects (name, repo, base, checks) VALUES (?1, ?2, ?3, ?4)",
             params![name, repo, base, checks],
         )?;
+        let gates = Self::settings_in(&tx)?.gates;
+        Self::insert_project_gates(&tx, name, gates)?;
         tx.commit()?;
         Ok(())
     }
@@ -383,7 +393,7 @@ impl Store {
         requested_by: &str,
         request: &str,
     ) -> Result<i64, StoreError> {
-        let gates = self.settings()?.gates;
+        let gates = self.project_gates(project)?;
         let new = Job::new(request, gates);
         let job = serde_json::to_string(&new)?;
         let mut conn = self.conn();
@@ -766,8 +776,11 @@ impl Store {
     ///
     /// Fails on a database error or stored settings that do not parse.
     pub fn settings(&self) -> Result<Settings, StoreError> {
-        let stored: Option<String> = self
-            .conn()
+        Self::settings_in(&self.conn())
+    }
+
+    fn settings_in(conn: &Connection) -> Result<Settings, StoreError> {
+        let stored: Option<String> = conn
             .query_row("SELECT settings FROM settings WHERE id = 1", [], |row| {
                 row.get(0)
             })
@@ -776,6 +789,86 @@ impl Store {
             Some(json) => serde_json::from_str(&json)?,
             None => Settings::default(),
         })
+    }
+
+    /// The approval gates a new job of `project` starts with: the project's
+    /// saved gates, or the default gates in the settings when it has no row.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or stored settings that do not parse.
+    pub fn project_gates(&self, project: &str) -> Result<Gates, StoreError> {
+        let conn = self.conn();
+        let stored = conn
+            .query_row(
+                "SELECT spec, plan, publish FROM project_gates WHERE project = ?1",
+                [project],
+                |row| {
+                    Ok(Gates {
+                        spec: row.get(0)?,
+                        plan: row.get(1)?,
+                        publish: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        match stored {
+            Some(gates) => Ok(gates),
+            None => Ok(Self::settings_in(&conn)?.gates),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_gates(&self, project: &str, gates: Gates) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO project_gates (project, spec, plan, publish) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (project) DO UPDATE SET spec = excluded.spec, plan = excluded.plan,
+                publish = excluded.publish",
+            params![project, gates.spec, gates.plan, gates.publish],
+        )?;
+        Ok(())
+    }
+
+    fn insert_project_gates(
+        conn: &Connection,
+        project: &str,
+        gates: Gates,
+    ) -> Result<(), StoreError> {
+        conn.execute(
+            "INSERT OR IGNORE INTO project_gates (project, spec, plan, publish)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project, gates.spec, gates.plan, gates.publish],
+        )?;
+        Ok(())
+    }
+
+    /// Gives every onboarded project without its own gates a copy of the
+    /// default gates in the settings. Gates were one global setting before, so
+    /// this keeps each existing project's behaviour. A project that has a row
+    /// keeps it, so running this again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or stored settings that do not parse.
+    pub fn migrate_project_gates(&self) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let gates = Self::settings_in(&tx)?.gates;
+        let names = {
+            let mut stmt = tx.prepare(
+                "SELECT name FROM projects
+                 WHERE name NOT IN (SELECT project FROM project_gates)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for name in names {
+            Self::insert_project_gates(&tx, &name, gates)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// # Errors

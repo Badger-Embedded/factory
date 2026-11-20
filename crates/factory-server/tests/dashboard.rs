@@ -1928,8 +1928,169 @@ async fn the_gate_checkboxes_save_and_an_absent_box_means_off() {
         }
     );
     let body = dashboard.get("/settings").await.body;
-    assert!(!body.contains(r#"name="gate_spec" value="on" checked"#));
-    assert!(!body.contains(r#"name="gate_plan" value="on" checked"#));
+    let defaults = factory_form(&body);
+    assert!(!defaults.contains(r#"name="gate_spec" value="on" checked"#));
+    assert!(!defaults.contains(r#"name="gate_plan" value="on" checked"#));
+}
+
+/// The factory-wide form on the settings page, the first form that posts to
+/// `/settings`.
+fn factory_form(body: &str) -> &str {
+    let start = body.find(r#"action="/settings""#).unwrap();
+    let end = start + body[start..].find("</form>").unwrap();
+    &body[start..end]
+}
+
+/// The form on the settings page that posts to `project`'s settings.
+fn project_form<'a>(body: &'a str, project: &str) -> &'a str {
+    let start = body
+        .find(&format!(r#"action="/settings/projects/{project}""#))
+        .unwrap();
+    let end = start + body[start..].find("</form>").unwrap();
+    &body[start..end]
+}
+
+fn no_gates() -> Gates {
+    Gates {
+        spec: false,
+        plan: false,
+        publish: false,
+    }
+}
+
+#[tokio::test]
+async fn the_settings_page_calls_the_factory_gates_defaults() {
+    let body = dashboard().get("/settings").await.body;
+    let defaults = factory_form(&body);
+    assert!(defaults.contains("Default gates"));
+    assert!(defaults.contains("A project you onboard starts with these."));
+}
+
+#[tokio::test]
+async fn each_project_form_shows_its_own_gates() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_gates(
+            "maestro",
+            Gates {
+                spec: false,
+                plan: true,
+                publish: true,
+            },
+        )
+        .unwrap();
+    let body = dashboard.get("/settings").await.body;
+    let form = project_form(&body, "maestro");
+    assert!(form.contains(r#"<input type="hidden" name="gates" value="on">"#));
+    assert!(form.contains(r#"name="gate_spec" value="on">"#));
+    assert!(form.contains(r#"name="gate_plan" value="on" checked"#));
+    assert!(form.contains(r#"name="gate_publish" value="on" checked"#));
+}
+
+#[tokio::test]
+async fn the_project_form_saves_its_gates_and_an_absent_box_means_off() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&gates=on&gate_publish=on",
+        )
+        .await;
+    assert_eq!(
+        dashboard.store.project_gates("maestro").unwrap(),
+        Gates {
+            spec: false,
+            plan: false,
+            publish: true,
+        }
+    );
+    // The factory defaults are untouched.
+    assert_eq!(dashboard.store.settings().unwrap().gates, Gates::default());
+}
+
+#[tokio::test]
+async fn a_project_form_without_the_gates_field_keeps_the_gates() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=",
+        )
+        .await;
+    assert_eq!(
+        dashboard.store.project_gates("maestro").unwrap(),
+        Gates::default()
+    );
+}
+
+#[test]
+fn onboarding_copies_the_default_gates_and_later_defaults_leave_the_project_alone() {
+    let store = Store::open_in_memory().unwrap();
+    let defaults = Gates {
+        spec: true,
+        plan: false,
+        publish: true,
+    };
+    store
+        .save_settings(&factory_server::Settings {
+            gates: defaults,
+            ..factory_server::Settings::default()
+        })
+        .unwrap();
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    assert_eq!(store.project_gates("maestro").unwrap(), defaults);
+
+    store
+        .save_settings(&factory_server::Settings {
+            gates: no_gates(),
+            ..factory_server::Settings::default()
+        })
+        .unwrap();
+    assert_eq!(store.project_gates("maestro").unwrap(), defaults);
+    let id = store.create("maestro", "alice", "a request").unwrap();
+    assert_eq!(store.get(id).unwrap().job.gates(), defaults);
+}
+
+#[test]
+fn the_gates_migration_copies_the_global_gates_into_each_project_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    for (name, repo) in [("maestro", "o/maestro"), ("factory", "o/factory")] {
+        store.create_project(name, repo, "main", None).unwrap();
+    }
+    // A database from before per-project gates has projects but no gate rows.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM project_gates", [])
+        .unwrap();
+    let global = Gates {
+        spec: false,
+        plan: true,
+        publish: true,
+    };
+    store
+        .save_settings(&factory_server::Settings {
+            gates: global,
+            ..factory_server::Settings::default()
+        })
+        .unwrap();
+
+    store.migrate_project_gates().unwrap();
+    assert_eq!(store.project_gates("maestro").unwrap(), global);
+    assert_eq!(store.project_gates("factory").unwrap(), global);
+
+    // A later run keeps a project's own gates.
+    store.save_project_gates("maestro", no_gates()).unwrap();
+    store
+        .save_settings(&factory_server::Settings::default())
+        .unwrap();
+    store.migrate_project_gates().unwrap();
+    assert_eq!(store.project_gates("maestro").unwrap(), no_gates());
+    assert_eq!(store.project_gates("factory").unwrap(), global);
 }
 
 #[tokio::test]
@@ -1940,7 +2101,10 @@ async fn the_job_page_shows_the_gates_the_job_started_with() {
     assert!(page.body.contains("Approval gates: spec, plan"));
 
     dashboard
-        .post("/settings", &gate_form("&gate_publish=on"))
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&gates=on&gate_publish=on",
+        )
         .await;
     let second = dashboard.new_job().await;
     let page = dashboard.get(&format!("/jobs/{second}")).await;
@@ -1948,7 +2112,12 @@ async fn the_job_page_shows_the_gates_the_job_started_with() {
     let page = dashboard.get(&format!("/jobs/{first}")).await;
     assert!(page.body.contains("Approval gates: spec, plan"));
 
-    dashboard.post("/settings", &gate_form("")).await;
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&gates=on",
+        )
+        .await;
     let third = dashboard.new_job().await;
     let page = dashboard.get(&format!("/jobs/{third}")).await;
     assert!(page.body.contains("Approval gates: none"));
@@ -2088,14 +2257,14 @@ fn description() -> PrDescription {
 async fn at_publish_gate(dashboard: &Dashboard) -> i64 {
     dashboard
         .store
-        .save_settings(&factory_server::Settings {
-            gates: Gates {
+        .save_project_gates(
+            "maestro",
+            Gates {
                 spec: false,
                 plan: false,
                 publish: true,
             },
-            ..factory_server::Settings::default()
-        })
+        )
         .unwrap();
     let id = dashboard.new_job().await;
     to_spec_approval(dashboard, id);
@@ -3449,11 +3618,9 @@ async fn the_running_step_shows_the_full_model_name() {
 async fn a_job_without_gates_shows_no_gate_label() {
     let dashboard = dashboard();
     dashboard
-        .post(
-            "/settings",
-            "max_workers=2&poll_seconds=60&worker_image=i&worker_memory=3g&worker_cpus=4",
-        )
-        .await;
+        .store
+        .save_project_gates("maestro", no_gates())
+        .unwrap();
     let id = dashboard.new_job().await;
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;

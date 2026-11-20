@@ -393,6 +393,7 @@ pub struct ProjectSettings {
     pub efforts: StageEfforts,
     pub auto_merge: bool,
     pub llm_review: bool,
+    pub gates: Gates,
     /// One per registered server, in the registry's order.
     pub servers: Vec<ServerSettings>,
 }
@@ -459,7 +460,7 @@ pub fn settings(
                             value=(settings.worker_cpus);
                     }
                 }
-                h2 { "Approval gates" }
+                h2 { "Default gates" }
                 div.field {
                     label.check {
                         input type="checkbox" name="gate_spec" value="on" checked[settings.gates.spec];
@@ -473,7 +474,7 @@ pub fn settings(
                         input type="checkbox" name="gate_publish" value="on" checked[settings.gates.publish];
                         " Approve before pushing"
                     }
-                    p.hint { "Applies to jobs created after you save. A job keeps the gates it started with." }
+                    p.hint { "A project you onboard starts with these. Each project then has its own gates, in its settings below. Changing a default leaves existing projects alone." }
                 }
                 h2 { "GitHub" }
                 div.field {
@@ -662,6 +663,23 @@ fn project_form(project: &ProjectSettings, secrets_available: bool) -> Markup {
                     " Review with an LLM before merge"
                 }
                 p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent." }
+            }
+            div.field {
+                span.label { "Approval gates" }
+                input type="hidden" name="gates" value="on";
+                label.check {
+                    input type="checkbox" name="gate_spec" value="on" checked[project.gates.spec];
+                    " Approve the spec"
+                }
+                label.check {
+                    input type="checkbox" name="gate_plan" value="on" checked[project.gates.plan];
+                    " Approve the plan"
+                }
+                label.check {
+                    input type="checkbox" name="gate_publish" value="on" checked[project.gates.publish];
+                    " Approve before pushing"
+                }
+                p.hint { "Applies to jobs created after you save. A job keeps the gates it started with." }
             }
             p.hint { "The model and effort each stage runs with. An empty model means no model; effort is medium unless you change it." }
             @for (stage, model, effort) in [
