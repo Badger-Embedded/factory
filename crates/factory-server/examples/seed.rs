@@ -112,10 +112,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     ];
 
-    for (request, events) in jobs {
+    // API cost in USD of each job above, in order. The queued job has run no agent.
+    let costs = [0.0, 0.18, 0.41, 0.77, 1.35, 2.62, 4.08, 6.93, 0.52, 0.09];
+
+    for ((request, events), usd) in jobs.into_iter().zip(costs) {
         let id = store.create("maestro", "demo", request)?;
         for event in events {
             store.apply(id, event)?;
+        }
+        if usd > 0.0 {
+            store.add_cost(id, usd)?;
         }
     }
     println!("seeded {}", db.display());
