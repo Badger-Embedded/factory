@@ -301,6 +301,13 @@ pub enum Command {
     WatchPr {
         pr: usize,
         number: u64,
+        /// Report only a merge or close by someone else, and take no other
+        /// action: do not merge, start a review, or send CI failures and
+        /// comments to the agent. Set while the review has stopped and waits
+        /// for the user, so the job moves on when the user merges the pull
+        /// request on GitHub and fails when they close it, but never merges or
+        /// restarts the reviewer on its own.
+        watch_only: bool,
     },
     /// Rerun the failed CI runs of the pull request. The factory logs
     /// `reason`.
@@ -500,9 +507,24 @@ impl Job {
                 Some(Command::Summarize { pr: *pr })
             }
             (Turn::Factory, Stage::PrOpen { pr }) => Some(Command::Publish { pr: *pr }),
-            (Turn::Factory, Stage::CiAndReview { pr }) => self.plan[*pr]
-                .number
-                .map(|number| Command::WatchPr { pr: *pr, number }),
+            (Turn::Factory, Stage::CiAndReview { pr }) => {
+                self.plan[*pr].number.map(|number| Command::WatchPr {
+                    pr: *pr,
+                    number,
+                    watch_only: false,
+                })
+            }
+            // The review stopped and waits for the user. Keep watching the
+            // pull request so the job moves on when the user merges it on
+            // GitHub and fails when they close it, without merging or
+            // restarting the reviewer on its own.
+            (Turn::User(Ask::ReviewStopped { .. }), Stage::CiAndReview { pr }) => {
+                self.plan[*pr].number.map(|number| Command::WatchPr {
+                    pr: *pr,
+                    number,
+                    watch_only: true,
+                })
+            }
             (Turn::RerunCi { reason }, Stage::CiAndReview { pr }) => {
                 self.plan[*pr].number.map(|number| Command::RerunCi {
                     pr: *pr,

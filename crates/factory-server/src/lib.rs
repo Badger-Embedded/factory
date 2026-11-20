@@ -32,7 +32,7 @@ pub use proxy::{ProxyWarning, RunTokens, StoreUpstreams, Upstream, Upstreams, Wa
 pub use scheduler::{
     AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, McpRuntime, PublishRequest,
     Published, ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest,
-    branch_name, ready_action,
+    branch_name, ready_action, watch_only_event,
 };
 pub use secrets::{
     ClaudeToken, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore,

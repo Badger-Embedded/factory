@@ -121,7 +121,11 @@ fn request_ends_merged_after_every_planned_pull_request_merges() {
         assert_eq!(job.plan()[index].number, Some(number));
         assert_eq!(
             job.next_command(),
-            Some(Command::WatchPr { pr: index, number })
+            Some(Command::WatchPr {
+                pr: index,
+                number,
+                watch_only: false,
+            })
         );
         apply(&mut job, Event::Merged);
     }
@@ -930,7 +934,11 @@ fn a_rerun_request_counts_a_round_and_returns_to_watching() {
     apply(&mut job, Event::CiRerun);
     assert_eq!(
         job.next_command(),
-        Some(Command::WatchPr { pr: 0, number: 7 })
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 7,
+            watch_only: false,
+        })
     );
 }
 
@@ -1002,7 +1010,11 @@ fn a_retry_resumes_a_job_that_ran_out_of_ci_rounds() {
     assert_eq!(job.turn(), &Turn::Factory);
     assert_eq!(
         job.next_command(),
-        Some(Command::WatchPr { pr: 0, number: 7 })
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 7,
+            watch_only: false,
+        })
     );
 }
 
@@ -1197,7 +1209,11 @@ fn a_legacy_failed_job_retries_at_its_highest_numbered_pull_request() {
     assert_eq!(legacy.stage(), &Stage::CiAndReview { pr: 1 });
     assert_eq!(
         legacy.next_command(),
-        Some(Command::WatchPr { pr: 1, number: 11 })
+        Some(Command::WatchPr {
+            pr: 1,
+            number: 11,
+            watch_only: false,
+        })
     );
 }
 
@@ -1226,7 +1242,11 @@ fn a_legacy_agent_failure_mid_rebase_retries_at_its_pull_request() {
     assert_eq!(legacy.stage(), &Stage::CiAndReview { pr: 0 });
     assert_eq!(
         legacy.next_command(),
-        Some(Command::WatchPr { pr: 0, number: 75 })
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 75,
+            watch_only: false,
+        })
     );
 }
 
@@ -1344,7 +1364,11 @@ fn an_approved_review_records_the_pass_and_returns_to_watching() {
     );
     assert_eq!(
         job.next_command(),
-        Some(Command::WatchPr { pr: 0, number: 7 })
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 7,
+            watch_only: false,
+        })
     );
 
     apply(&mut job, Event::Merged);
@@ -1447,7 +1471,16 @@ fn the_review_cap_stops_the_job_without_merging() {
             reason: "5 review rounds on one pull request".into(),
         })
     );
-    assert_eq!(job.next_command(), None);
+    // The review stopped, so the factory keeps watching the pull request for a
+    // merge or close by the user, without acting on it.
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 7,
+            watch_only: true,
+        })
+    );
     assert_eq!(job.reviews().len(), MAX_REVIEW_ROUNDS as usize);
     assert!(!job.is_finished());
 }
@@ -1469,12 +1502,76 @@ fn a_reviewer_failure_stops_the_job_without_merging() {
             reason: "reviewer timed out".into(),
         })
     );
-    assert_eq!(job.next_command(), None);
+    // The review stopped, so the factory keeps watching the pull request. The
+    // watch never merges or restarts the reviewer; it only reports a merge or
+    // close by the user.
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 7,
+            watch_only: true,
+        })
+    );
 
-    // The factory never merges on its own, but the user can still merge on
-    // GitHub, and the factory then moves the job on.
+    // The user merges on GitHub, the watch reports it, and the factory moves
+    // the job on.
     apply(&mut job, Event::Merged);
     assert_eq!(job.stage(), &Stage::Merged);
+}
+
+#[test]
+fn a_stopped_review_watches_until_the_next_pull_request() {
+    let mut job = implementing(&["first", "second"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 11 });
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "reviewer crashed".into(),
+        },
+    );
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 11,
+            watch_only: true,
+        })
+    );
+
+    // Merging the first pull request moves the job on to the second.
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 1 });
+}
+
+#[test]
+fn a_stopped_review_fails_when_the_pull_request_is_closed() {
+    let mut job = watching(7);
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "reviewer timed out".into(),
+        },
+    );
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 7,
+            watch_only: true,
+        })
+    );
+
+    apply(&mut job, Event::ClosedUnmerged);
+    assert!(matches!(
+        job.stage(),
+        Stage::Failed { reason, .. }
+            if reason == "the pull request was closed without merging"
+    ));
 }
 
 #[test]

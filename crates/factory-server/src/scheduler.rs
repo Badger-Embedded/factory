@@ -7,7 +7,7 @@ use std::time::Duration;
 use factory_core::{
     BranchSummary, Command, Event, Job, PrDescription, ReviewState, Session, Stage,
 };
-use factory_runner::{Expect, LogLine, McpConfig, Rerun, RunReport, job_prompt};
+use factory_runner::{Expect, LogLine, McpConfig, Observation, Rerun, RunReport, job_prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -99,6 +99,10 @@ pub enum Published {
     AlreadyMerged(u64),
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact about the pull request or the watch mode"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchRequest {
     pub job_id: i64,
@@ -117,6 +121,11 @@ pub struct WatchRequest {
     /// The reviewer has approved the current head. A ready pull request then
     /// merges or waits for the user without another review pass.
     pub review_approved: bool,
+    /// Report only a merge or close by someone else, and take no other action.
+    /// Set while the review has stopped and waits for the user: the watch does
+    /// not merge, start a review, or send CI failures and comments to the
+    /// agent, and it leaves the comment watermark where it is.
+    pub watch_only: bool,
 }
 
 /// What the factory does with a pull request once its checks are green. The
@@ -144,6 +153,26 @@ pub fn ready_action(llm_review: bool, review_approved: bool, auto_merge: bool) -
         ReadyAction::Merge
     } else {
         ReadyAction::Wait
+    }
+}
+
+/// The event a watch reports while the review has stopped and waits for the
+/// user. It reacts only to a merge or close by someone else: the job moves on
+/// when the user merges the pull request on GitHub, and fails when they close
+/// it. Every other observation (green, CI failed, conflict, new comments,
+/// nothing) returns `None`, so the watch takes no action and never merges or
+/// restarts the reviewer on its own. Pure, so the wiring is testable without
+/// podman or GitHub.
+#[must_use]
+pub fn watch_only_event(observation: &Observation) -> Option<Event> {
+    match observation {
+        Observation::Merged => Some(Event::Merged),
+        Observation::Closed => Some(Event::ClosedUnmerged),
+        Observation::Conflicted
+        | Observation::CiFailed(_)
+        | Observation::Comments { .. }
+        | Observation::Ready
+        | Observation::Nothing => None,
     }
 }
 
@@ -458,8 +487,8 @@ impl<E: Executor> Scheduler<E> {
                 Command::Publish { pr } if self.due(row.id) => {
                     self.publish(row.id, pr, &job, &project, &settings)?;
                 }
-                Command::WatchPr { pr, number } if self.due(row.id) => {
-                    self.watch_pr(&row, &job, &project, &settings, pr, number)?;
+                watch @ Command::WatchPr { .. } if self.due(row.id) => {
+                    self.watch_pr(&row, &job, &project, &settings, &watch)?;
                 }
                 Command::RerunCi { number, reason, .. } if self.due(row.id) => {
                     let request = RerunRequest {
@@ -765,20 +794,30 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    /// Spawns the watch of an open pull request. The request carries the
-    /// project's auto-merge and LLM-review flags and whether the current head
-    /// is already reviewed, so the executor can review before merge, merge, or
-    /// wait. Reading the flags here means a settings change reaches a job in
-    /// flight at its next watch.
+    /// Spawns the watch of an open pull request, named by `command`, a
+    /// [`Command::WatchPr`]. The request carries the project's auto-merge and
+    /// LLM-review flags and whether the current head is already reviewed, so
+    /// the executor can review before merge, merge, or wait. Reading the flags
+    /// here means a settings change reaches a job in flight at its next watch.
+    /// A `watch_only` command marks a watch for a stopped review: the executor
+    /// then reports only a merge or close and takes no other action, so the
+    /// flags above do not apply.
     fn watch_pr(
         self: &Arc<Self>,
         row: &JobRow,
         job: &Job,
         project: &Project,
         settings: &Settings,
-        pr: usize,
-        number: u64,
+        command: &Command,
     ) -> Result<(), StoreError> {
+        let &Command::WatchPr {
+            pr,
+            number,
+            watch_only,
+        } = command
+        else {
+            return Ok(());
+        };
         let request = WatchRequest {
             job_id: row.id,
             repo: project.repo.clone(),
@@ -792,6 +831,7 @@ impl<E: Executor> Scheduler<E> {
                 .store
                 .project_llm_review(&row.project, project.llm_review)?,
             review_approved: job.review_state() == ReviewState::Approved,
+            watch_only,
         };
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
