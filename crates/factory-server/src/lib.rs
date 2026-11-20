@@ -19,7 +19,7 @@ pub use scheduler::{
     ready_action,
 };
 pub use settings::Settings;
-pub use store::{JobRow, LogEntry, ProjectTotals, Store, StoreError};
+pub use store::{JobEvent, JobRow, LogEntry, ProjectTotals, Store, StoreError};
 pub use usage::{
     CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, UsageSource, refresh_forever, refresh_once,
 };
