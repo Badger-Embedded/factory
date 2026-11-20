@@ -12,10 +12,10 @@ use factory_core::{
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{
-    BranchInfo, CheckOutcome, GitHubRepos, LocalSecrets, MASTER_KEY_LEN, McpChecker, Permission,
-    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, SecretStore, Settings,
-    StageEfforts, StageModels, Store, StoreError, USER_HEADER, UnavailableSecrets, WorkerSlots,
-    app,
+    BranchInfo, CheckOutcome, GitHubRepos, LocalSecrets, MASTER_KEY_LEN, McpChecker, McpTool,
+    Permission, PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, SecretStore, Settings,
+    StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER, UnavailableSecrets,
+    WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -598,6 +598,30 @@ async fn the_timeline_notes_an_unavailable_mcp_server_under_its_step() {
     let body = dashboard.get(&format!("/jobs/{id}")).await.body;
     let note = body
         .find("MCP server unavailable: context7")
+        .expect("the note renders");
+    let clarifying = body
+        .find("step-name\">clarifying")
+        .expect("the clarifying step");
+    let spec = body.find("step-name\">spec").expect("the spec step");
+    assert!(
+        clarifying < note && note < spec,
+        "the note sits under the clarifying step"
+    );
+}
+
+#[tokio::test]
+async fn the_timeline_notes_a_refused_tool_call_under_its_step() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .record_mcp_tool_blocked(id, "context7", "delete")
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let note = body
+        .find("MCP tool turned off, call refused: context7: delete")
         .expect("the note renders");
     let clarifying = body
         .find("step-name\">clarifying")
@@ -4979,14 +5003,241 @@ fn store_value_for(dashboard: &Dashboard, project: &str, value: &str) {
 }
 
 #[tokio::test]
-async fn a_project_server_block_has_a_check_connection_button() {
-    let dashboard = dashboard();
+async fn a_project_server_block_has_a_refresh_connection_button() {
+    let dashboard = two_projects();
     add_context7(&dashboard).await;
     let page = dashboard.get("/settings").await.body;
-    assert!(page.contains("Check connection"));
+    assert!(page.contains("Refresh connection"));
     assert!(page.contains(r#"hx-post="/settings/projects/maestro/mcp/context7/check""#));
-    // The result area the fragment swaps into is present and empty.
-    assert!(page.contains(r#"id="mcp-check-context7""#));
+    assert!(page.contains(r#"hx-post="/settings/projects/tool/mcp/context7/check""#));
+    // The reply replaces the button's own block, found from the button, so two
+    // projects' blocks for one server never swap into each other.
+    assert!(page.contains(r#"hx-target="closest .mcp-refresh""#));
+    assert!(page.contains("No tools listed yet"));
+}
+
+fn tool(name: &str, description: Option<&str>) -> McpTool {
+    McpTool {
+        name: name.to_owned(),
+        description: description.map(str::to_owned),
+    }
+}
+
+fn listed(tools: &[&str]) -> CheckOutcome {
+    CheckOutcome::Ok {
+        server_name: None,
+        server_version: None,
+        protocol_version: "2025-06-18".to_owned(),
+        tools: ToolList::Listed(tools.iter().map(|name| tool(name, None)).collect()),
+    }
+}
+
+async fn refresh(dashboard: &Dashboard, project: &str) -> Reply {
+    dashboard
+        .post(
+            &format!("/settings/projects/{project}/mcp/context7/check"),
+            "",
+        )
+        .await
+}
+
+/// The tool states `project` has for `context7`, as `(name, offered, disabled, new)`.
+fn tool_states(dashboard: &Dashboard, project: &str) -> Vec<(String, bool, bool, bool)> {
+    dashboard
+        .store
+        .mcp_tools(project, "context7")
+        .unwrap()
+        .into_iter()
+        .map(|tool| (tool.name, tool.offered, tool.disabled, tool.new))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_refresh_stores_the_listed_tools_and_shows_them_on() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard.checker.set(CheckOutcome::Ok {
+        server_name: None,
+        server_version: None,
+        protocol_version: "2025-06-18".to_owned(),
+        tools: ToolList::Listed(vec![
+            tool("resolve-library-id", Some("Finds a <library> id")),
+            tool("query-docs", None),
+        ]),
+    });
+
+    let reply = refresh(&dashboard, "maestro").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Listed 2 tools."));
+    assert!(reply.body.contains(r#"class="mcp-refresh""#));
+    assert!(
+        reply
+            .body
+            .contains(r#"name="mcp.context7.tool.query-docs" value="on" checked"#)
+    );
+    assert!(
+        reply
+            .body
+            .contains(r#"name="mcp.context7.shown.resolve-library-id""#)
+    );
+    assert!(reply.body.contains("Finds a &lt;library&gt; id"));
+    // The first refresh marks nothing new.
+    assert!(!reply.body.contains("(new)"));
+    assert_eq!(
+        tool_states(&dashboard, "maestro"),
+        vec![
+            ("query-docs".to_owned(), true, false, false),
+            ("resolve-library-id".to_owned(), true, false, false),
+        ],
+    );
+    // The tools belong to the project that refreshed.
+    assert_eq!(tool_states(&dashboard, "other"), Vec::new());
+    let page = dashboard.get("/settings").await.body;
+    assert!(page.contains(r#"name="mcp.context7.tool.resolve-library-id" value="on" checked"#));
+}
+
+#[tokio::test]
+async fn saving_turns_off_the_shown_tools_left_unchecked() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard.checker.set(listed(&["a", "b", "c"]));
+    refresh(&dashboard, "maestro").await;
+
+    // `a` is shown and checked, `b` is shown and unchecked, `c` is not shown.
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "mcp.context7.shown.a=on&mcp.context7.tool.a=on&mcp.context7.shown.b=on",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        tool_states(&dashboard, "maestro"),
+        vec![
+            ("a".to_owned(), true, false, false),
+            ("b".to_owned(), true, true, false),
+            ("c".to_owned(), true, false, false),
+        ],
+    );
+    let page = dashboard.get("/settings").await.body;
+    assert!(page.contains(r#"name="mcp.context7.tool.b" value="on">"#));
+
+    // Checking it again turns it back on.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "mcp.context7.shown.b=on&mcp.context7.tool.b=on",
+        )
+        .await;
+    assert!(!tool_states(&dashboard, "maestro")[1].2);
+}
+
+#[tokio::test]
+async fn a_later_refresh_marks_new_tools_and_keeps_a_dropped_one_off() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard.checker.set(listed(&["a", "b"]));
+    refresh(&dashboard, "maestro").await;
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "mcp.context7.shown.a=on&mcp.context7.shown.b=on&mcp.context7.tool.b=on",
+        )
+        .await;
+
+    // The server drops `a` and adds `c`.
+    dashboard.checker.set(listed(&["b", "c"]));
+    let reply = refresh(&dashboard, "maestro").await;
+    assert!(reply.body.contains("(new)"));
+    assert!(reply.body.contains("(no longer offered)"));
+    assert_eq!(
+        tool_states(&dashboard, "maestro"),
+        vec![
+            ("a".to_owned(), false, true, false),
+            ("b".to_owned(), true, false, false),
+            ("c".to_owned(), true, false, true),
+        ],
+    );
+
+    // Offered again, `a` is still off.
+    dashboard.checker.set(listed(&["a", "b", "c"]));
+    refresh(&dashboard, "maestro").await;
+    assert_eq!(
+        tool_states(&dashboard, "maestro"),
+        vec![
+            ("a".to_owned(), true, true, false),
+            ("b".to_owned(), true, false, false),
+            ("c".to_owned(), true, false, false),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_failed_listing_keeps_the_stored_tools() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard.checker.set(listed(&["a"]));
+    refresh(&dashboard, "maestro").await;
+
+    dashboard.checker.set(CheckOutcome::Ok {
+        server_name: None,
+        server_version: None,
+        protocol_version: "2025-06-18".to_owned(),
+        tools: ToolList::Failed("the server did not list its tools in time".to_owned()),
+    });
+    let reply = refresh(&dashboard, "maestro").await;
+    assert!(reply.body.contains("Could not list the tools"));
+    assert!(reply.body.contains(r#"name="mcp.context7.tool.a""#));
+    assert_eq!(
+        tool_states(&dashboard, "maestro"),
+        vec![("a".to_owned(), true, false, false)],
+    );
+
+    // A failed connection keeps them too.
+    dashboard.checker.set(CheckOutcome::Unreachable);
+    refresh(&dashboard, "maestro").await;
+    assert_eq!(tool_states(&dashboard, "maestro").len(), 1);
+}
+
+#[tokio::test]
+async fn an_origin_change_unlists_the_tools_and_a_delete_drops_them() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    dashboard.checker.set(listed(&["a", "b"]));
+    refresh(&dashboard, "maestro").await;
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "mcp.context7.shown.a=on&mcp.context7.shown.b=on&mcp.context7.tool.b=on",
+        )
+        .await;
+
+    // A path change keeps the list as it is.
+    dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fv2&header=Authorization",
+        )
+        .await;
+    assert!(tool_states(&dashboard, "maestro").iter().all(|t| t.1));
+
+    // A new host marks every tool not offered and keeps `a` off.
+    dashboard
+        .post(
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fevil.example%2Fmcp&header=Authorization",
+        )
+        .await;
+    assert_eq!(
+        tool_states(&dashboard, "maestro"),
+        vec![
+            ("a".to_owned(), false, true, false),
+            ("b".to_owned(), false, false, false),
+        ],
+    );
+
+    dashboard.post("/settings/mcp/context7/delete", "").await;
+    assert_eq!(tool_states(&dashboard, "maestro"), Vec::new());
 }
 
 #[tokio::test]
@@ -4998,6 +5249,7 @@ async fn a_successful_check_shows_connected_and_sends_the_stored_value() {
         server_name: Some("context7".to_owned()),
         server_version: Some("1.2.3".to_owned()),
         protocol_version: "2025-06-18".to_owned(),
+        tools: ToolList::Listed(Vec::new()),
     });
 
     let reply = dashboard
@@ -5032,6 +5284,7 @@ async fn each_projects_check_sends_that_projects_value() {
         server_name: None,
         server_version: None,
         protocol_version: "2025-06-18".to_owned(),
+        tools: ToolList::Listed(Vec::new()),
     });
 
     dashboard
@@ -5059,6 +5312,7 @@ async fn the_check_ignores_an_unsaved_value_in_the_form() {
         server_name: None,
         server_version: None,
         protocol_version: "2025-06-18".to_owned(),
+        tools: ToolList::Listed(Vec::new()),
     });
 
     // The form posts a different, unsaved value; the handler ignores it and the

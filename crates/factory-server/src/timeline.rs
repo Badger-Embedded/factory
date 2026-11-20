@@ -156,11 +156,18 @@ fn note(step: &mut Step, event: &JobEvent) {
         Some(detail) => format!("MCP server unavailable: {detail}"),
         None => "MCP server unavailable".to_owned(),
     });
+    // The detail holds "<server>: <tool>", a call the proxy refused because
+    // the project turned the tool off.
+    let blocked = (event.event == "mcp-tool-blocked").then(|| match &event.detail {
+        Some(detail) => format!("MCP tool turned off, call refused: {detail}"),
+        None => "MCP tool turned off, call refused".to_owned(),
+    });
     for text in text
         .map(str::to_owned)
         .into_iter()
         .chain(failure)
         .chain(unavailable)
+        .chain(blocked)
     {
         step.notes.push(Note {
             at: event.at.clone(),

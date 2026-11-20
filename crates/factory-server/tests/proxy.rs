@@ -14,7 +14,7 @@ use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use factory_server::{
-    LocalSecrets, MASTER_KEY_LEN, ProxyWarning, RunTokens, SecretRef, SecretStore, Store,
+    LocalSecrets, MASTER_KEY_LEN, McpTool, ProxyWarning, RunTokens, SecretRef, SecretStore, Store,
     StoreUpstreams, Upstream, Upstreams, proxy_app,
 };
 use tokio::net::TcpListener;
@@ -109,6 +109,36 @@ async fn server_error(State(fake): State<Arc<Fake>>, request: Request) -> Respon
     (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
 }
 
+/// A `tools/list` result with three tools, for the request `id` 4.
+const TOOLS_RESULT: &str = r#"{"jsonrpc":"2.0","id":4,"result":{"tools":[{"name":"read"},{"name":"delete"},{"name":"write"}],"nextCursor":"next"}}"#;
+
+/// Answers any POST with [`TOOLS_RESULT`] as JSON.
+async fn tools_json(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, request).await;
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        TOOLS_RESULT,
+    )
+        .into_response()
+}
+
+/// Answers any POST with an SSE stream: a notification event, then
+/// [`TOOLS_RESULT`] split over two `data:` lines with CRLF line ends.
+async fn tools_sse(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, request).await;
+    let (head, tail) = TOOLS_RESULT.split_at(TOOLS_RESULT.find("\"result\"").unwrap());
+    let body = format!(
+        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}}\n\n\
+         id: 7\r\nevent: message\r\ndata: {head}\r\ndata: {tail}\r\n\r\n"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 async fn record(fake: &Fake, request: Request) {
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();
@@ -145,6 +175,8 @@ async fn start_fake() -> (Arc<Fake>, String) {
         .route("/redirect", any(redirect))
         .route("/target", get(target))
         .route("/error", any(server_error))
+        .route("/tools", any(tools_json))
+        .route("/tools-sse", any(tools_sse))
         .with_state(Arc::clone(&fake));
     let base = serve(app).await;
     (fake, base)
@@ -167,6 +199,7 @@ struct FakeUpstreams {
     url: String,
     headers: Vec<(String, String)>,
     known: HashSet<String>,
+    disabled: HashSet<String>,
 }
 
 impl Upstreams for FakeUpstreams {
@@ -174,6 +207,7 @@ impl Upstreams for FakeUpstreams {
         self.known.contains(server).then(|| Upstream {
             url: self.url.clone(),
             headers: self.headers.clone(),
+            disabled_tools: self.disabled.clone(),
         })
     }
 }
@@ -201,6 +235,7 @@ fn fake_upstreams(url: &str, headers: &[(&str, &str)], known: &[&str]) -> Arc<dy
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect(),
         known: known.iter().map(|name| (*name).to_owned()).collect(),
+        disabled: HashSet::new(),
     })
 }
 
@@ -497,9 +532,17 @@ async fn a_server_error_is_relayed_and_warned() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let warnings = warnings.lock().unwrap();
     assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0].job, 9);
-    assert_eq!(warnings[0].server, "context7");
-    assert!(warnings[0].reason.contains("500"), "{}", warnings[0].reason);
+    let ProxyWarning::Unavailable {
+        job,
+        server,
+        reason,
+    } = &warnings[0]
+    else {
+        panic!("expected an unavailable warning, got {:?}", warnings[0]);
+    };
+    assert_eq!(*job, 9);
+    assert_eq!(server, "context7");
+    assert!(reason.contains("500"), "{reason}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -522,8 +565,11 @@ async fn an_unreachable_server_is_warned() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let warnings = warnings.lock().unwrap();
     assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0].job, 4);
-    assert_eq!(warnings[0].server, "context7");
+    let ProxyWarning::Unavailable { job, server, .. } = &warnings[0] else {
+        panic!("expected an unavailable warning, got {:?}", warnings[0]);
+    };
+    assert_eq!(*job, 4);
+    assert_eq!(server, "context7");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -581,4 +627,218 @@ async fn store_upstreams_resolves_a_stored_header() {
     assert_eq!(keyless.headers, Vec::<(String, String)>::new());
     // An unregistered server does not resolve.
     assert!(upstreams.resolve("maestro", "absent").is_none());
+}
+
+/// The proxy in front of the fake at `path`, with `delete` turned off for the
+/// project. Returns the proxy base, a token for job 3 and the warnings.
+async fn proxy_with_delete_off(
+    path: &str,
+) -> (Arc<Fake>, String, String, Arc<Mutex<Vec<ProxyWarning>>>) {
+    let (fake, fake_base) = start_fake().await;
+    let upstreams: Arc<dyn Upstreams> = Arc::new(FakeUpstreams {
+        url: format!("{fake_base}{path}"),
+        headers: Vec::new(),
+        known: HashSet::from(["context7".to_owned()]),
+        disabled: HashSet::from(["delete".to_owned()]),
+    });
+    let (proxy, tokens, warnings) = start_proxy(upstreams).await;
+    let token = tokens.issue(3, "maestro", &["context7".to_owned()]);
+    (fake, proxy, token, warnings)
+}
+
+async fn post_rpc(proxy: &str, token: &str, body: &str) -> reqwest::Response {
+    client()
+        .post(format!("{proxy}/mcp/context7"))
+        .bearer_auth(token)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.to_owned())
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_to_a_turned_off_tool_is_answered_by_the_proxy() {
+    let (fake, proxy, token, warnings) = proxy_with_delete_off("/mcp").await;
+
+    let response = post_rpc(
+        &proxy,
+        &token,
+        r#"{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"delete","arguments":{}}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(reply["id"], "call-1");
+    assert_eq!(reply["error"]["code"], -32602);
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("delete is turned off"),
+    );
+    assert!(fake.seen().is_empty(), "the call reached the server");
+    assert_eq!(
+        *warnings.lock().unwrap(),
+        vec![ProxyWarning::ToolBlocked {
+            job: 3,
+            server: "context7".to_owned(),
+            tool: "delete".to_owned(),
+        }],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_to_a_tool_that_is_on_is_forwarded() {
+    let (fake, proxy, token, warnings) = proxy_with_delete_off("/mcp").await;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}}"#;
+    let response = post_rpc(&proxy, &token, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fake.seen()[0].body, body.as_bytes());
+    assert!(warnings.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_holding_a_turned_off_call_is_refused() {
+    let (fake, proxy, token, warnings) = proxy_with_delete_off("/mcp").await;
+    let response = post_rpc(
+        &proxy,
+        &token,
+        r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read"}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete"}}]"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(fake.seen().is_empty());
+    assert_eq!(warnings.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_the_proxy_cannot_check_is_refused() {
+    let (fake, proxy, token, _warnings) = proxy_with_delete_off("/mcp").await;
+    for body in [
+        // Not JSON.
+        "not json",
+        // A duplicate key: a server reading the first `name` would call `delete`.
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete","name":"read"}}"#,
+        // A duplicate `method`.
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"ping","params":{"name":"delete"}}"#,
+        // A call with no string tool name.
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":7}}"#,
+        // A method that is not a string.
+        r#"{"jsonrpc":"2.0","id":1,"method":["tools/call"]}"#,
+    ] {
+        let response = post_rpc(&proxy, &token, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert!(fake.seen().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_tool_off_the_body_is_forwarded_unread() {
+    let (fake, fake_base) = start_fake().await;
+    let upstreams = fake_upstreams(&format!("{fake_base}/mcp"), &[], &["context7"]);
+    let (proxy, tokens, _warnings) = start_proxy(upstreams).await;
+    let token = tokens.issue(1, "maestro", &["context7".to_owned()]);
+    let response = post_rpc(&proxy, &token, "not json").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fake.seen()[0].body, b"not json");
+}
+
+fn tool_names(reply: &serde_json::Value) -> Vec<&str> {
+    reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect()
+}
+
+const LIST: &str = r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_json_tools_list_reply_leaves_out_the_turned_off_tools() {
+    let (_fake, proxy, token, _warnings) = proxy_with_delete_off("/tools").await;
+    let response = post_rpc(&proxy, &token, LIST).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(tool_names(&reply), vec!["read", "write"]);
+    assert_eq!(reply["result"]["nextCursor"], "next");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tools_list_reply_to_another_id_is_relayed_unchanged() {
+    let (_fake, proxy, token, _warnings) = proxy_with_delete_off("/tools").await;
+    let response = post_rpc(
+        &proxy,
+        &token,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#,
+    )
+    .await;
+    assert_eq!(response.text().await.unwrap(), TOOLS_RESULT);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_sse_tools_list_reply_leaves_out_the_turned_off_tools() {
+    let (_fake, proxy, token, _warnings) = proxy_with_delete_off("/tools-sse").await;
+    let response = post_rpc(&proxy, &token, LIST).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let body = response.text().await.unwrap();
+    let mut events = body.split("\n\n").filter(|event| !event.is_empty());
+    // The notification passes as it was.
+    assert_eq!(
+        events.next().unwrap(),
+        "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}",
+    );
+    // The response keeps its other lines and carries the filtered list.
+    let response = events.next().unwrap();
+    let mut lines = response.lines();
+    assert_eq!(lines.next(), Some("id: 7"));
+    assert_eq!(lines.next(), Some("event: message"));
+    let data = lines.next().unwrap().strip_prefix("data: ").unwrap();
+    let reply: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(tool_names(&reply), vec!["read", "write"]);
+    assert!(events.next().is_none());
+}
+
+/// The production resolver returns the tools the project turned off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn store_upstreams_returns_the_turned_off_tools() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    let tools: Vec<McpTool> = ["read", "delete"]
+        .into_iter()
+        .map(|name| McpTool {
+            name: name.to_owned(),
+            description: None,
+        })
+        .collect();
+    store
+        .replace_mcp_tools("maestro", "context7", &tools)
+        .unwrap();
+    store
+        .save_mcp_tool_states("maestro", "context7", &[("delete".to_owned(), true)])
+        .unwrap();
+    let secrets = Arc::new(LocalSecrets::new(&[3; MASTER_KEY_LEN], Arc::clone(&store)));
+
+    let upstreams = StoreUpstreams::new(Arc::clone(&store), secrets);
+    let resolved = upstreams.resolve("maestro", "context7").unwrap();
+    assert_eq!(
+        resolved.disabled_tools,
+        HashSet::from(["delete".to_owned()])
+    );
+    // Another project has every tool on.
+    assert!(
+        upstreams
+            .resolve("other", "context7")
+            .unwrap()
+            .disabled_tools
+            .is_empty()
+    );
 }

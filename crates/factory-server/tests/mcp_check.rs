@@ -12,7 +12,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
-use factory_server::{CheckOutcome, HttpMcpChecker, McpChecker};
+use factory_server::{CheckOutcome, HttpMcpChecker, McpChecker, McpTool, ToolList};
 use tokio::net::TcpListener;
 
 /// One request the fake server received.
@@ -176,6 +176,85 @@ async fn slow(State(fake): State<Arc<Fake>>, request: Request) -> Response {
     (StatusCode::OK, INIT_JSON).into_response()
 }
 
+/// The `initialize` result of a server that declares the `tools` capability.
+const INIT_TOOLS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fake"}}}"#;
+
+/// The JSON-RPC method of a request body, and its `params.cursor`.
+async fn method_and_cursor(request: Request) -> (String, Option<String>) {
+    let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    (
+        body["method"].as_str().unwrap_or_default().to_owned(),
+        body["params"]["cursor"].as_str().map(str::to_owned),
+    )
+}
+
+/// A server with two pages of tools: the first as JSON with a cursor, the
+/// second as SSE. `notifications/initialized` gets a 202.
+async fn with_tools(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    if request.method() == "DELETE" {
+        return StatusCode::OK.into_response();
+    }
+    let (method, cursor) = method_and_cursor(request).await;
+    match (method.as_str(), cursor.as_deref()) {
+        ("initialize", _) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (HeaderName::from_static("mcp-session-id"), "sess-2"),
+            ],
+            INIT_TOOLS,
+        )
+            .into_response(),
+        ("notifications/initialized", _) => StatusCode::ACCEPTED.into_response(),
+        ("tools/list", None) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read","description":"Reads"},{"description":"no name"}],"nextCursor":"p2"}}"#,
+        )
+            .into_response(),
+        ("tools/list", Some("p2")) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from(
+                "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"tools\":[{\"name\":\"write\"}]}}\n\n",
+            ))
+            .unwrap(),
+        _ => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+/// A server that declares tools but answers `tools/list` with an error that
+/// echoes the `x-key` header.
+async fn tools_error(State(fake): State<Arc<Fake>>, request: Request) -> Response {
+    record(&fake, &request);
+    let key = request
+        .headers()
+        .get("x-key")
+        .map(|value| value.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let (method, _) = method_and_cursor(request).await;
+    let body = match method.as_str() {
+        "initialize" => INIT_TOOLS.to_owned(),
+        "tools/list" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {"code": -32603, "message": format!("no tools for {key}")},
+        })
+        .to_string(),
+        _ => return StatusCode::ACCEPTED.into_response(),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
 async fn start_fake() -> (Arc<Fake>, String) {
     let fake = Arc::new(Fake::default());
     let app = Router::new()
@@ -187,6 +266,8 @@ async fn start_fake() -> (Arc<Fake>, String) {
         .route("/rpcerror", any(rpc_error))
         .route("/redirect", any(redirect))
         .route("/slow", any(slow))
+        .route("/tools", any(with_tools))
+        .route("/tools-error", any(tools_error))
         .with_state(Arc::clone(&fake));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -219,6 +300,7 @@ async fn a_json_reply_is_a_success_and_sends_the_headers_and_ends_the_session() 
             server_name: Some("fake".to_owned()),
             server_version: Some("9.9".to_owned()),
             protocol_version: "2025-06-18".to_owned(),
+            tools: ToolList::Listed(Vec::new()),
         },
     );
 
@@ -252,6 +334,7 @@ async fn an_sse_reply_is_a_success() {
             server_name: Some("fake".to_owned()),
             server_version: Some("9.9".to_owned()),
             protocol_version: "2025-06-18".to_owned(),
+            tools: ToolList::Listed(Vec::new()),
         },
     );
 }
@@ -286,6 +369,7 @@ async fn the_initialize_request_carries_a_client_version() {
             server_name: Some("fake".to_owned()),
             server_version: Some("9.9".to_owned()),
             protocol_version: "2025-06-18".to_owned(),
+            tools: ToolList::Listed(Vec::new()),
         },
     );
 }
@@ -349,4 +433,76 @@ async fn a_slow_server_times_out() {
     let checker = HttpMcpChecker::with_timeout(Duration::from_millis(300));
     let outcome = checker.check(&format!("{base}/slow"), Vec::new()).await;
     assert_eq!(outcome, CheckOutcome::Timeout);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_check_lists_every_page_of_tools_in_the_session() {
+    let (fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(&format!("{base}/tools"), headers(&[("x-key", "k")]))
+        .await;
+    assert_eq!(
+        outcome,
+        CheckOutcome::Ok {
+            server_name: Some("fake".to_owned()),
+            server_version: None,
+            protocol_version: "2025-03-26".to_owned(),
+            tools: ToolList::Listed(vec![
+                McpTool {
+                    name: "read".to_owned(),
+                    description: Some("Reads".to_owned()),
+                },
+                McpTool {
+                    name: "write".to_owned(),
+                    description: None,
+                },
+            ]),
+        },
+    );
+    // initialize, initialized, two pages, and the DELETE.
+    let seen = fake.seen();
+    assert_eq!(seen.len(), 5);
+    for request in &seen[1..] {
+        assert_eq!(request.header("mcp-session-id"), Some("sess-2"));
+        assert_eq!(request.header("x-key"), Some("k"));
+    }
+    for request in &seen[1..4] {
+        assert_eq!(request.header("mcp-protocol-version"), Some("2025-03-26"));
+    }
+    assert_eq!(seen[4].method, "DELETE");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_without_the_tools_capability_lists_none() {
+    let (fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(&format!("{base}/mcp"), Vec::new())
+        .await;
+    let CheckOutcome::Ok { tools, .. } = outcome else {
+        panic!("expected a success, got {outcome:?}");
+    };
+    assert_eq!(tools, ToolList::Listed(Vec::new()));
+    // Only initialize and the DELETE: no tools/list was sent.
+    assert_eq!(fake.seen().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tools_list_error_fails_the_listing_without_header_values() {
+    let (_fake, base) = start_fake().await;
+    let outcome = HttpMcpChecker::new()
+        .check(
+            &format!("{base}/tools-error"),
+            headers(&[("x-key", "sk-secret-123")]),
+        )
+        .await;
+    let CheckOutcome::Ok {
+        tools: ToolList::Failed(reason),
+        ..
+    } = outcome
+    else {
+        panic!("expected a failed listing, got {outcome:?}");
+    };
+    assert!(reason.contains("-32603"), "{reason}");
+    assert!(reason.contains("[redacted]"), "{reason}");
+    assert!(!reason.contains("sk-secret-123"), "{reason}");
 }

@@ -17,6 +17,14 @@
 //! production and a fake in tests. A proxy-side failure to reach a server, a
 //! connect timeout or a 5xx answer goes to a [`WarnFn`] callback, which records
 //! the server as unavailable for the run.
+//!
+//! A project can turn off single tools of a server. The proxy enforces it,
+//! because the worker could send a `tools/call` with its run token from a shell
+//! and skip any client-side filter. When the server has a tool turned off, the
+//! proxy parses each request body as JSON-RPC and answers a `tools/call` of a
+//! turned-off tool itself, without forwarding it. It also removes the turned-off
+//! tools from the server's `tools/list` reply, so the model does not see them.
+//! A refused call goes to the [`WarnFn`] as well.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -30,6 +38,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::aead::rand_core::RngCore;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::secrets::{SecretRef, SecretStore};
 use crate::store::Store;
@@ -47,6 +59,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// requests are small JSON-RPC messages; the response, which may stream, is
 /// never buffered.
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
+
+/// The most of a `tools/list` reply the proxy buffers to remove turned-off
+/// tools: the whole body for a JSON reply, one event for an SSE reply. A reply
+/// over this is relayed unchanged; the call block still applies to it.
+const MAX_TOOLS_LIST: usize = 4 * 1024 * 1024;
+
+/// The JSON-RPC error code the proxy answers a turned-off tool's call with,
+/// the "invalid params" code the MCP spec uses for an unknown tool.
+const TOOL_OFF_CODE: i64 = -32602;
 
 /// The request headers the proxy forwards to a server. The streamable-HTTP
 /// transport owns these; everything else the worker sends, including its
@@ -159,6 +180,9 @@ impl Default for RunTokens {
 pub struct Upstream {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// The tools the project turned off. The proxy refuses a call to any of
+    /// them and leaves them out of a `tools/list` reply.
+    pub disabled_tools: HashSet<String>,
 }
 
 /// Resolves an in-scope server name to its [`Upstream`] for a project. The
@@ -171,10 +195,12 @@ pub trait Upstreams: Send + Sync {
     fn resolve(&self, project: &str, server: &str) -> Option<Upstream>;
 }
 
-/// The production [`Upstreams`]: the server's URL comes from the registry and
-/// each stored header value from the encrypted secret store. A header with no
-/// stored value, or one that does not decrypt, is left off, so it is never
-/// forwarded.
+/// The production [`Upstreams`]: the server's URL comes from the registry,
+/// each stored header value from the encrypted secret store, and the turned-off
+/// tools from the project's tool settings. A header with no stored value, or
+/// one that does not decrypt, is left off, so it is never forwarded. When the
+/// turned-off tools cannot be read, the server resolves to `None`, so no call
+/// reaches it unchecked.
 pub struct StoreUpstreams {
     store: Arc<Store>,
     secrets: Arc<dyn SecretStore>,
@@ -217,24 +243,41 @@ impl Upstreams for StoreUpstreams {
                 }
             }
         }
+        let disabled_tools = match self.store.disabled_mcp_tools(project, server) {
+            Ok(tools) => tools,
+            Err(err) => {
+                tracing::error!("the MCP proxy could not read the tools {server:?} has off: {err}");
+                return None;
+            }
+        };
         Some(Upstream {
             url: registered.url,
             headers,
+            disabled_tools,
         })
     }
 }
 
-/// A proxy-side reason a server was unavailable for a run: the job, the server,
-/// and a short reason with no credential in it. The factory records it as a
-/// warning on the job.
-pub struct ProxyWarning {
-    pub job: i64,
-    pub server: String,
-    pub reason: String,
+/// Something the proxy reports about a run, which the factory records as a
+/// warning on the job. Neither variant carries a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyWarning {
+    /// The server was unavailable for the run, with a short reason.
+    Unavailable {
+        job: i64,
+        server: String,
+        reason: String,
+    },
+    /// The proxy refused a call to a tool the project turned off.
+    ToolBlocked {
+        job: i64,
+        server: String,
+        tool: String,
+    },
 }
 
 /// The callback the proxy calls when it cannot reach a server, a connection
-/// times out, or a server answers 5xx.
+/// times out, a server answers 5xx, or it refuses a turned-off tool's call.
 pub type WarnFn = Arc<dyn Fn(ProxyWarning) + Send + Sync>;
 
 #[derive(Clone)]
@@ -248,7 +291,8 @@ struct ProxyState {
 /// The proxy router. It listens on the factory's MCP port, separate from the
 /// dashboard, and serves `/mcp/<server>` with any method the streamable-HTTP
 /// transport uses. `tokens` gates each request, `upstreams` resolves the
-/// server, and `warn` records a server the proxy could not reach.
+/// server, and `warn` records a server the proxy could not reach or a call it
+/// refused.
 ///
 /// # Panics
 ///
@@ -298,7 +342,7 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
         Err((status, message)) => return (status, message).into_response(),
     };
     let Some(upstream) = state.upstreams.resolve(&scope.project, &server) else {
-        (state.warn)(ProxyWarning {
+        (state.warn)(ProxyWarning::Unavailable {
             job: scope.job,
             server,
             reason: "the server is no longer registered".to_owned(),
@@ -329,6 +373,11 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
             .into_response();
     };
 
+    let list_id = match screen(&state, scope.job, &server, &body, &upstream.disabled_tools) {
+        Ok(list_id) => list_id,
+        Err(response) => return *response,
+    };
+
     let mut url = upstream.url;
     url.push_str(&suffix);
     if let Some(query) = query {
@@ -346,13 +395,18 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
     {
         Ok(response) => {
             if response.status().is_server_error() {
-                (state.warn)(ProxyWarning {
+                (state.warn)(ProxyWarning::Unavailable {
                     job: scope.job,
                     server,
                     reason: format!("the server answered {}", response.status()),
                 });
             }
-            relay(response)
+            match list_id {
+                Some(id) if response.status().is_success() => {
+                    relay_tools_list(response, id, upstream.disabled_tools)
+                }
+                _ => relay(response),
+            }
         }
         Err(err) => {
             let reason = if err.is_timeout() {
@@ -362,13 +416,62 @@ async fn forward(state: ProxyState, server: String, suffix: String, request: Req
             } else {
                 "the request to the server failed"
             };
-            (state.warn)(ProxyWarning {
+            (state.warn)(ProxyWarning::Unavailable {
                 job: scope.job,
                 server,
                 reason: reason.to_owned(),
             });
             unreachable_response()
         }
+    }
+}
+
+/// Checks `body` against the project's turned-off tools. Returns the request's
+/// `id` when it is a `tools/list` whose reply needs filtering, or the response
+/// the proxy answers with instead of forwarding. With no tool turned off,
+/// every body passes unread.
+fn screen(
+    state: &ProxyState,
+    job: i64,
+    server: &str,
+    body: &[u8],
+    disabled: &HashSet<String>,
+) -> Result<Option<Value>, Box<Response>> {
+    if disabled.is_empty() {
+        return Ok(None);
+    }
+    match inspect(body, disabled) {
+        Inspection::Forward { list_id } => Ok(list_id),
+        Inspection::Blocked { tool, id } => {
+            let response = tool_off_response(&tool, &id);
+            (state.warn)(ProxyWarning::ToolBlocked {
+                job,
+                server: server.to_owned(),
+                tool,
+            });
+            Err(Box::new(response))
+        }
+        Inspection::BlockedBatch { tool } => {
+            (state.warn)(ProxyWarning::ToolBlocked {
+                job,
+                server: server.to_owned(),
+                tool,
+            });
+            Err(Box::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    "the batch calls a tool this project turned off",
+                )
+                    .into_response(),
+            ))
+        }
+        Inspection::Malformed => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "the request body is not a JSON-RPC message the proxy can check",
+            )
+                .into_response(),
+        )),
     }
 }
 
@@ -442,6 +545,352 @@ fn relay(response: reqwest::Response) -> Response {
     builder
         .body(Body::from_stream(response.bytes_stream()))
         .unwrap_or_else(|_| unreachable_response())
+}
+
+/// What the proxy does with a request body when the server has a tool turned
+/// off.
+enum Inspection {
+    /// Forward it. `list_id` is the request's `id` when it is a `tools/list`,
+    /// whose reply the proxy filters.
+    Forward { list_id: Option<Value> },
+    /// A `tools/call` of the turned-off `tool`, answered with an error for `id`.
+    Blocked { tool: String, id: Value },
+    /// A batch with a `tools/call` of the turned-off `tool`.
+    BlockedBatch { tool: String },
+    /// A body that is not JSON, has a duplicate key, or holds a `tools/call`
+    /// with no string tool name. The proxy cannot tell which tool it calls.
+    Malformed,
+}
+
+/// Decides what to do with `body` given the project's turned-off tools.
+///
+/// A JSON object with the same key twice is malformed, because the proxy and
+/// the server could each read a different one and so a different tool name.
+fn inspect(body: &[u8], disabled: &HashSet<String>) -> Inspection {
+    if body.is_empty() {
+        return Inspection::Forward { list_id: None };
+    }
+    if serde_json::from_slice::<UniqueKeys>(body).is_err() {
+        return Inspection::Malformed;
+    }
+    let Ok(message) = serde_json::from_slice::<Value>(body) else {
+        return Inspection::Malformed;
+    };
+    match &message {
+        Value::Array(batch) => {
+            for item in batch {
+                match called_tool(item) {
+                    Err(()) => return Inspection::Malformed,
+                    Ok(Some(tool)) if disabled.contains(&tool) => {
+                        return Inspection::BlockedBatch { tool };
+                    }
+                    Ok(_) => {}
+                }
+            }
+            Inspection::Forward { list_id: None }
+        }
+        Value::Object(_) => match called_tool(&message) {
+            Err(()) => Inspection::Malformed,
+            Ok(Some(tool)) if disabled.contains(&tool) => Inspection::Blocked {
+                tool,
+                id: message.get("id").cloned().unwrap_or(Value::Null),
+            },
+            Ok(_) => {
+                let is_list = message.get("method").and_then(Value::as_str) == Some("tools/list");
+                Inspection::Forward {
+                    list_id: is_list.then(|| message.get("id").cloned().unwrap_or(Value::Null)),
+                }
+            }
+        },
+        _ => Inspection::Malformed,
+    }
+}
+
+/// The tool a JSON-RPC message calls: `Some` for a `tools/call`, `None` for any
+/// other message, and an error for a `method` that is not a string or a
+/// `tools/call` with no string `params.name`.
+fn called_tool(message: &Value) -> Result<Option<String>, ()> {
+    let Some(method) = message.get("method") else {
+        return Ok(None);
+    };
+    if method.as_str().ok_or(())? != "tools/call" {
+        return Ok(None);
+    }
+    message
+        .get("params")
+        .and_then(|params| params.get("name"))
+        .and_then(Value::as_str)
+        .map(|name| Some(name.to_owned()))
+        .ok_or(())
+}
+
+/// A JSON value that fails to deserialize when any object in it has the same
+/// key twice. `serde_json::Value` keeps the last of two equal keys silently.
+struct UniqueKeys;
+
+impl<'de> Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeysVisitor)
+    }
+}
+
+struct UniqueKeysVisitor;
+
+impl<'de> Visitor<'de> for UniqueKeysVisitor {
+    type Value = UniqueKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value with no duplicate object key")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_unit<E>(self) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<UniqueKeys, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(UniqueKeys)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<UniqueKeys, A::Error> {
+        let mut keys = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom("duplicate object key"));
+            }
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(UniqueKeys)
+    }
+}
+
+/// The proxy's own answer to a `tools/call` of a turned-off tool: a JSON-RPC
+/// error for the request's `id`, so the model reads why the call failed.
+fn tool_off_response(tool: &str, id: &Value) -> Response {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": TOOL_OFF_CODE,
+            "message": format!("the tool {tool} is turned off for this project"),
+        },
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Relays a `tools/list` reply with the turned-off tools removed from the
+/// response to the request `id`. A JSON reply is buffered whole; an SSE reply
+/// is rewritten one event at a time, so it still streams. A part over
+/// [`MAX_TOOLS_LIST`] or one that does not parse passes unchanged.
+fn relay_tools_list(response: reqwest::Response, id: Value, disabled: HashSet<String>) -> Response {
+    let is_sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let mut builder = Response::builder().status(response.status());
+    if let Some(headers) = builder.headers_mut() {
+        for (name, value) in response.headers() {
+            if !is_hop_by_hop(name) {
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let filter = ToolFilter { id, disabled };
+        if is_sse {
+            filter.sse(response, tx).await;
+        } else {
+            filter.json(response, tx).await;
+        }
+    });
+    builder
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| unreachable_response())
+}
+
+type Chunks = mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>;
+
+/// Removes turned-off tools from the reply to one `tools/list` request.
+struct ToolFilter {
+    id: Value,
+    disabled: HashSet<String>,
+}
+
+impl ToolFilter {
+    /// Buffers a JSON reply up to [`MAX_TOOLS_LIST`] and sends it filtered. A
+    /// longer reply is sent unchanged as it arrives.
+    async fn json(&self, mut response: reqwest::Response, tx: Chunks) {
+        let mut buffer = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    buffer.extend_from_slice(&chunk);
+                    if buffer.len() > MAX_TOOLS_LIST {
+                        if tx.send(Ok(buffer.into())).await.is_ok() {
+                            pass_through(response, tx).await;
+                        }
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let _ = tx.send(Err(std::io::Error::other(err))).await;
+                    return;
+                }
+            }
+        }
+        let body = self.rewrite(&buffer).unwrap_or(buffer);
+        let _ = tx.send(Ok(body.into())).await;
+    }
+
+    /// Sends an SSE reply event by event, each filtered once its blank-line
+    /// end arrives. When a single event grows past [`MAX_TOOLS_LIST`], the rest
+    /// of the stream is sent unchanged.
+    async fn sse(&self, mut response: reqwest::Response, tx: Chunks) {
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    pending.extend_from_slice(&chunk);
+                    while let Some(end) = event_end(&pending) {
+                        let event: Vec<u8> = pending.drain(..end).collect();
+                        let event = self.rewrite_event(&event).unwrap_or(event);
+                        if tx.send(Ok(event.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    if pending.len() > MAX_TOOLS_LIST {
+                        if tx
+                            .send(Ok(std::mem::take(&mut pending).into()))
+                            .await
+                            .is_ok()
+                        {
+                            pass_through(response, tx).await;
+                        }
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    if !pending.is_empty() {
+                        let _ = tx.send(Ok(pending.into())).await;
+                    }
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(std::io::Error::other(err))).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `body` re-serialized without the turned-off tools, or `None` when it is
+    /// not this request's `tools/list` result.
+    fn rewrite(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let mut message: Value = serde_json::from_slice(body).ok()?;
+        if message.get("id") != Some(&self.id) {
+            return None;
+        }
+        let tools = message
+            .get_mut("result")?
+            .get_mut("tools")?
+            .as_array_mut()?;
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !self.disabled.contains(name))
+        });
+        serde_json::to_vec(&message).ok()
+    }
+
+    /// One SSE event, blank-line end included, rewritten with its `data:`
+    /// lines joined and filtered into one `data:` line. Other lines, such as
+    /// `id:` and `event:`, are kept in order. `None` when the event is not this
+    /// request's `tools/list` result.
+    fn rewrite_event(&self, event: &[u8]) -> Option<Vec<u8>> {
+        let text = std::str::from_utf8(event).ok()?;
+        let mut data = String::new();
+        let mut other = String::new();
+        let mut has_data = false;
+        for line in text.split("\r\n").flat_map(|l| l.split(['\n', '\r'])) {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("data:") {
+                if has_data {
+                    data.push('\n');
+                }
+                has_data = true;
+                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            } else {
+                other.push_str(line);
+                other.push('\n');
+            }
+        }
+        let filtered = self.rewrite(data.as_bytes())?;
+        let mut out = other.into_bytes();
+        out.extend_from_slice(b"data: ");
+        out.extend_from_slice(&filtered);
+        out.extend_from_slice(b"\n\n");
+        Some(out)
+    }
+}
+
+/// Sends the rest of `response` unchanged.
+async fn pass_through(mut response: reqwest::Response, tx: Chunks) {
+    loop {
+        let next = match response.chunk().await {
+            Ok(Some(chunk)) => Ok(chunk),
+            Ok(None) => return,
+            Err(err) => Err(std::io::Error::other(err)),
+        };
+        let failed = next.is_err();
+        if tx.send(next).await.is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// The index just past the first SSE event's blank-line end in `buffer`. SSE
+/// lines end in CRLF, LF or CR, so an event ends at the first of `\r\n\r\n`,
+/// `\n\n` or `\r\r`.
+fn event_end(buffer: &[u8]) -> Option<usize> {
+    [&b"\r\n\r\n"[..], b"\n\n", b"\r\r"]
+        .iter()
+        .filter_map(|end| {
+            buffer
+                .windows(end.len())
+                .position(|window| window == *end)
+                .map(|at| at + end.len())
+        })
+        .min()
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {

@@ -71,6 +71,31 @@ pub struct McpProjectSettings {
     pub stages: McpStages,
 }
 
+/// A tool an MCP server offered in its `tools/list` reply, as the factory keeps
+/// it for the settings page: the name a `tools/call` uses and the server's
+/// description, when it gave one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpTool {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// A stored tool of a project's server, as the settings page lists it.
+// Each flag is a separate fact about the row the page shows on its own.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolState {
+    pub name: String,
+    pub description: Option<String>,
+    /// Whether the last complete `tools/list` reply had the tool.
+    pub offered: bool,
+    /// Whether the project turned the tool off.
+    pub disabled: bool,
+    /// Whether the latest refresh saw the tool for the first time and an
+    /// earlier refresh had already listed the server's tools.
+    pub new: bool,
+}
+
 /// A failure validating or storing an MCP server. The validation variants map
 /// to a 400 in the dashboard; [`McpError::NotFound`] maps to a 404.
 #[derive(Debug)]

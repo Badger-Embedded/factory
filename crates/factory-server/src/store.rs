@@ -7,7 +7,7 @@ use factory_core::{AgentResult, EFFORTS, Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages};
+use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
 use crate::projects::{Project, StageEfforts, StageModels};
 use crate::secrets::SecretRef;
 use crate::settings::Settings;
@@ -121,6 +121,22 @@ CREATE TABLE IF NOT EXISTS project_mcp (
     plan INTEGER NOT NULL DEFAULT 0,
     implement INTEGER NOT NULL DEFAULT 0,
     review INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project, server)
+);
+CREATE TABLE IF NOT EXISTS project_mcp_tools (
+    project TEXT NOT NULL,
+    server TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    description TEXT,
+    offered INTEGER NOT NULL DEFAULT 1,
+    disabled INTEGER NOT NULL DEFAULT 0,
+    first_seen INTEGER NOT NULL,
+    PRIMARY KEY (project, server, tool)
+);
+CREATE TABLE IF NOT EXISTS project_mcp_tool_refreshes (
+    project TEXT NOT NULL,
+    server TEXT NOT NULL,
+    latest INTEGER NOT NULL,
     PRIMARY KEY (project, server)
 );
 ";
@@ -575,6 +591,45 @@ impl Store {
                 format!(
                     "MCP server {server} is unavailable: {reason}. \
                      The run goes on without its tools."
+                )
+            ],
+        )?;
+        Ok(tx.commit()?)
+    }
+
+    /// Records that the MCP proxy refused a call to `tool` of `server`, which
+    /// the job's project turned off. It writes a factory line to the job log and
+    /// an `mcp-tool-blocked` row to `job_events` with `<server>: <tool>` in its
+    /// detail. Neither changes the job's stage or turn.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or an unknown job.
+    pub fn record_mcp_tool_blocked(
+        &self,
+        id: i64,
+        server: &str,
+        tool: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row = Self::load(&tx, id)?;
+        Self::record(
+            &tx,
+            id,
+            "mcp-tool-blocked",
+            &row.job,
+            Some(&format!("{server}: {tool}")),
+            None,
+        )?;
+        tx.execute(
+            "INSERT INTO logs (job_id, kind, text) VALUES (?1, ?2, ?3)",
+            params![
+                id,
+                "factory",
+                format!(
+                    "The agent called the MCP tool {tool} of {server}, which this project \
+                     turned off. The factory refused the call."
                 )
             ],
         )?;
@@ -1253,7 +1308,9 @@ impl Store {
     ///
     /// When the new URL's origin (scheme, host or port) differs from the old
     /// one, every project's stored secret value for this server is deleted, so a
-    /// redirected server cannot collect another project's keys. Otherwise, each
+    /// redirected server cannot collect another project's keys, and every stored
+    /// tool is marked as not offered until the next refresh. Each tool keeps its
+    /// on or off state. Otherwise, each
     /// header name no longer declared has its stored values deleted. Both happen
     /// in the same transaction as the update.
     ///
@@ -1296,6 +1353,10 @@ impl Store {
             }
         } else {
             tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
+            tx.execute(
+                "UPDATE project_mcp_tools SET offered = 0 WHERE server = ?1",
+                [name],
+            )?;
         }
         tx.execute(
             "UPDATE mcp_servers SET url = ?1, headers = ?2 WHERE name = ?3",
@@ -1305,8 +1366,8 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the server `name` with every project's stored secret value for
-    /// it, in one transaction. Deleting a server that is not registered is fine.
+    /// Deletes the server `name` with every project's settings, stored secret
+    /// values and stored tools for it, in one transaction. Deleting a server that is not registered is fine.
     ///
     /// # Errors
     ///
@@ -1316,6 +1377,11 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
         tx.execute("DELETE FROM project_mcp WHERE server = ?1", [name])?;
+        tx.execute("DELETE FROM project_mcp_tools WHERE server = ?1", [name])?;
+        tx.execute(
+            "DELETE FROM project_mcp_tool_refreshes WHERE server = ?1",
+            [name],
+        )?;
         tx.execute("DELETE FROM mcp_servers WHERE name = ?1", [name])?;
         tx.commit()?;
         Ok(())
@@ -1393,6 +1459,129 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// The tools stored for `project`'s use of `server`, sorted by name. Empty
+    /// until a refresh has listed the server's tools.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn mcp_tools(&self, project: &str, server: &str) -> Result<Vec<McpToolState>, StoreError> {
+        let conn = self.conn();
+        let latest: i64 = conn
+            .query_row(
+                "SELECT latest FROM project_mcp_tool_refreshes WHERE project = ?1 AND server = ?2",
+                params![project, server],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let mut stmt = conn.prepare(
+            "SELECT tool, description, offered, disabled, first_seen FROM project_mcp_tools
+             WHERE project = ?1 AND server = ?2 ORDER BY tool",
+        )?;
+        let rows = stmt.query_map(params![project, server], |row| {
+            let first_seen: i64 = row.get(4)?;
+            Ok(McpToolState {
+                name: row.get(0)?,
+                description: row.get(1)?,
+                offered: row.get(2)?,
+                disabled: row.get(3)?,
+                new: latest > 1 && first_seen == latest,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The names of the tools `project` turned off for `server`. The proxy
+    /// refuses a call to any of them.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn disabled_mcp_tools(
+        &self,
+        project: &str,
+        server: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT tool FROM project_mcp_tools
+             WHERE project = ?1 AND server = ?2 AND disabled = 1",
+        )?;
+        let rows = stmt.query_map(params![project, server], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Replaces the stored tool list of `project`'s use of `server` with
+    /// `tools`, the complete reply of one refresh. A listed tool is marked
+    /// offered and its description updated. A stored tool missing from `tools`
+    /// keeps its row, marked not offered, so a tool the project turned off stays
+    /// off if the server offers it again. Each tool keeps its on or off state,
+    /// and a tool seen for the first time starts on.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error. Nothing is written then.
+    pub fn replace_mcp_tools(
+        &self,
+        project: &str,
+        server: &str,
+        tools: &[McpTool],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO project_mcp_tool_refreshes (project, server, latest) VALUES (?1, ?2, 1)
+             ON CONFLICT (project, server) DO UPDATE SET latest = latest + 1",
+            params![project, server],
+        )?;
+        let latest: i64 = tx.query_row(
+            "SELECT latest FROM project_mcp_tool_refreshes WHERE project = ?1 AND server = ?2",
+            params![project, server],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "UPDATE project_mcp_tools SET offered = 0 WHERE project = ?1 AND server = ?2",
+            params![project, server],
+        )?;
+        for tool in tools {
+            tx.execute(
+                "INSERT INTO project_mcp_tools
+                    (project, server, tool, description, offered, disabled, first_seen)
+                 VALUES (?1, ?2, ?3, ?4, 1, 0, ?5)
+                 ON CONFLICT (project, server, tool) DO UPDATE SET
+                    description = excluded.description, offered = 1",
+                params![project, server, tool.name, tool.description, latest],
+            )?;
+        }
+        Ok(tx.commit()?)
+    }
+
+    /// Turns each named tool of `project`'s use of `server` on or off, `true`
+    /// meaning off. A name with no stored row is skipped, so a form that shows
+    /// a tool a later edit cleared writes nothing for it.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error. Nothing is written then.
+    pub fn save_mcp_tool_states(
+        &self,
+        project: &str,
+        server: &str,
+        states: &[(String, bool)],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (tool, disabled) in states {
+            tx.execute(
+                "UPDATE project_mcp_tools SET disabled = ?4
+                 WHERE project = ?1 AND server = ?2 AND tool = ?3",
+                params![project, server, tool, disabled],
+            )?;
+        }
+        Ok(tx.commit()?)
     }
 
     /// Whether a secret value is stored for a project, server and header,

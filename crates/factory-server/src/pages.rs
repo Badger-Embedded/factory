@@ -7,10 +7,10 @@ use factory_core::{
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use crate::check::CheckOutcome;
+use crate::check::{CheckOutcome, ToolList};
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
-use crate::mcp::{McpServer, McpStages};
+use crate::mcp::{McpServer, McpStages, McpToolState};
 use crate::projects::Project;
 use crate::projects::{StageEfforts, StageModels};
 use crate::settings::Settings;
@@ -404,6 +404,8 @@ pub struct ServerSettings {
     pub enabled: bool,
     pub stages: McpStages,
     pub headers: Vec<HeaderState>,
+    /// The tools the last refresh stored, each with its on or off state.
+    pub tools: Vec<McpToolState>,
 }
 
 /// One declared header in a project's server block. `set` is whether a value is
@@ -746,43 +748,112 @@ fn project_server_block(project: &str, server: &ServerSettings, secrets_availabl
                     }
                 }
             }
-            (check_connection(project, &server.name))
+            (mcp_refresh(project, &server.name, &server.tools, None))
         }
     }
 }
 
-/// The "Check connection" button and its result area in a project's server
-/// block. The button posts to the check route through htmx, which swaps the
-/// returned fragment into the result area, so the page does not reload and the
-/// form's unsaved input survives. `type="button"` keeps it from submitting the
+/// The "Refresh connection" button, its result area and the server's tool list
+/// in a project's server block. The button posts to the check route through
+/// htmx, which replaces this whole block with the returned one, so the result
+/// and the refreshed tool list arrive together without a page reload. The rest
+/// of the form keeps its unsaved input; this block's tool checkboxes are drawn
+/// again from the stored state. `type="button"` keeps it from submitting the
 /// project form. The check uses the saved URL and values, so the hint says to
-/// save before checking new ones.
-fn check_connection(project: &str, server: &str) -> Markup {
+/// save before checking new ones. `result` is `None` on the settings page and
+/// the check's outcome in the route's reply.
+pub fn mcp_refresh(
+    project: &str,
+    server: &str,
+    tools: &[McpToolState],
+    result: Option<Markup>,
+) -> Markup {
     let route = format!(
         "/settings/projects/{}/mcp/{}/check",
         crate::web::query_escape(project),
         crate::web::query_escape(server),
     );
-    let result_id = format!("mcp-check-{server}");
-    let target = format!("#{result_id}");
     html! {
-        div.field.mcp-check {
-            button.secondary type="button"
-                hx-post=(route) hx-target=(target) hx-swap="innerHTML"
-                hx-disabled-elt="this" { "Check connection" }
-            div #(result_id) .mcp-check-result {}
-            p.hint { "Uses the saved URL and values. Save first to check new ones." }
+        div.mcp-refresh {
+            div.field.mcp-check {
+                button.secondary type="button"
+                    hx-post=(route) hx-target="closest .mcp-refresh" hx-swap="outerHTML"
+                    hx-disabled-elt="this" { "Refresh connection" }
+                div.mcp-check-result { @if let Some(result) = result { (result) } }
+                p.hint {
+                    "Uses the saved URL and values, and lists the server's tools. "
+                    "Save first to check new values."
+                }
+            }
+            (mcp_tool_list(server, tools))
         }
     }
 }
 
-/// The fragment the check route returns, swapped into the server block's result
-/// area. It is one line styling the outcome like the page's ok/bad hints, plus
-/// a line naming any declared header the project has no stored value for. It
-/// carries no header value, so nothing a project stored leaks into the page.
+/// The most characters of a tool's description the settings page shows.
+const MAX_TOOL_DESCRIPTION: usize = 200;
+
+/// One checkbox per stored tool, checked when the tool is on. Each tool also
+/// posts a hidden `mcp.<server>.shown.<tool>` field, so the save handler turns
+/// off only the shown tools left unchecked. The server name has no `.`, so the
+/// handler splits the tool name back out after the prefix.
+fn mcp_tool_list(server: &str, tools: &[McpToolState]) -> Markup {
+    let base = format!("mcp.{server}");
+    html! {
+        div.field.mcp-tools {
+            @if tools.is_empty() {
+                p.hint { "No tools listed yet. Refresh the connection to list them." }
+            } @else {
+                p.hint {
+                    "The tools this project may call. The factory refuses a call to an "
+                    "unchecked tool. A tool the server adds later starts checked. "
+                    "Refreshing reloads this list and drops unsaved changes to it."
+                }
+                @for tool in tools {
+                    input type="hidden" name={ (base) ".shown." (tool.name) } value="on";
+                    label.check {
+                        input type="checkbox" name={ (base) ".tool." (tool.name) } value="on"
+                            checked[!tool.disabled];
+                        " " code { (tool.name) }
+                        @if tool.new { " (new)" }
+                        @if !tool.offered { " (no longer offered)" }
+                    }
+                    @if let Some(description) = &tool.description {
+                        p.hint { (short_description(description)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn short_description(description: &str) -> String {
+    let line = description.lines().next().unwrap_or_default();
+    if line.chars().count() > MAX_TOOL_DESCRIPTION {
+        let mut cut: String = line.chars().take(MAX_TOOL_DESCRIPTION).collect();
+        cut.push_str("...");
+        cut
+    } else {
+        line.to_owned()
+    }
+}
+
+/// The check's outcome as shown in the server block's result area: one line
+/// styling the outcome like the page's ok/bad hints, a line on the tool
+/// listing, and a line naming any declared header the project has no stored
+/// value for. It carries no header value, so nothing a project stored leaks
+/// into the page.
 pub fn mcp_check_result(outcome: &CheckOutcome, missing: &[String]) -> Markup {
     html! {
         (check_outcome_line(outcome))
+        @if let CheckOutcome::Ok { tools, .. } = outcome {
+            @match tools {
+                ToolList::Listed(tools) => p.hint.ok { "Listed " (tools.len()) " tools." },
+                ToolList::Failed(reason) => p.hint.bad {
+                    "Could not list the tools: " (reason) ". The stored list is unchanged."
+                },
+            }
+        }
         @if !missing.is_empty() {
             p.hint { "No value stored for: " (missing.join(", ")) "." }
         }
@@ -795,6 +866,7 @@ fn check_outcome_line(outcome: &CheckOutcome) -> Markup {
             server_name,
             server_version,
             protocol_version,
+            ..
         } => {
             let mut server = String::new();
             if let Some(name) = server_name {
