@@ -43,5 +43,5 @@ pub use usage::{
     CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, UsageSource, refresh_forever, refresh_once,
 };
 pub use warnings::McpWarnings;
-pub use web::{MAX_IMAGE_BYTES, MAX_IMAGES, USER_HEADER, app};
+pub use web::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, USER_HEADER, app};
 pub use workers::{Slot, WorkerSlots};

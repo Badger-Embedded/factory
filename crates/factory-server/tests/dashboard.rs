@@ -1860,7 +1860,7 @@ async fn an_image_is_checked_by_content_not_name_or_type() {
 async fn an_oversized_image_is_rejected_with_the_limit() {
     let dashboard = dashboard();
     let mut big = PNG.to_vec();
-    big.resize(factory_server::MAX_IMAGE_BYTES + 1, 0);
+    big.resize(factory_server::MAX_ATTACHMENT_BYTES + 1, 0);
     let reply = dashboard
         .post_job("maestro", "x", &[("big.png", &big)])
         .await;
@@ -1868,12 +1868,12 @@ async fn an_oversized_image_is_rejected_with_the_limit() {
     assert!(
         reply
             .body
-            .contains(&factory_server::MAX_IMAGE_BYTES.to_string())
+            .contains(&factory_server::MAX_ATTACHMENT_BYTES.to_string())
     );
     assert_eq!(dashboard.store.list().unwrap().len(), 0);
 
     let mut exact = PNG.to_vec();
-    exact.resize(factory_server::MAX_IMAGE_BYTES, 0);
+    exact.resize(factory_server::MAX_ATTACHMENT_BYTES, 0);
     let reply = dashboard
         .post_job("maestro", "x", &[("ok.png", &exact)])
         .await;
@@ -1883,18 +1883,17 @@ async fn an_oversized_image_is_rejected_with_the_limit() {
 #[tokio::test]
 async fn too_many_images_are_rejected_with_the_limit() {
     let dashboard = dashboard();
-    let images: Vec<(&str, &[u8])> = vec![("a.png", PNG); factory_server::MAX_IMAGES + 1];
+    let images: Vec<(&str, &[u8])> = vec![("a.png", PNG); factory_server::MAX_ATTACHMENTS + 1];
     let reply = dashboard.post_job("maestro", "x", &images).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert!(
-        reply
-            .body
-            .contains(&format!("at most {} images", factory_server::MAX_IMAGES))
-    );
+    assert!(reply.body.contains(&format!(
+        "at most {} images",
+        factory_server::MAX_ATTACHMENTS
+    )));
     assert_eq!(dashboard.store.list().unwrap().len(), 0);
     assert!(!dashboard.data.path().join("jobs").exists());
 
-    let images = &images[..factory_server::MAX_IMAGES];
+    let images = &images[..factory_server::MAX_ATTACHMENTS];
     let reply = dashboard.post_job("maestro", "x", images).await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
 }

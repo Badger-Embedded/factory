@@ -35,13 +35,13 @@ const LOG_LINES: usize = 300;
 /// takes two.
 const MIN_POLL_SECONDS: u64 = 10;
 
-/// Images one request may carry.
-pub const MAX_IMAGES: usize = 5;
-/// Bytes in one image.
-pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+/// Attachments one request may carry.
+pub const MAX_ATTACHMENTS: usize = 5;
+/// Bytes in one attachment.
+pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 /// Bytes of the request text and the other form fields together.
 const MAX_FORM_BYTES: usize = 256 * 1024;
-const MAX_UPLOAD_BYTES: usize = MAX_IMAGES * MAX_IMAGE_BYTES + MAX_FORM_BYTES;
+const MAX_UPLOAD_BYTES: usize = MAX_ATTACHMENTS * MAX_ATTACHMENT_BYTES + MAX_FORM_BYTES;
 
 #[derive(Clone)]
 struct AppState {
@@ -399,30 +399,39 @@ async fn read_text(field: Field<'_>) -> Result<String, AppError> {
     field.text().await.map_err(|err| multipart_error(&err))
 }
 
-/// Reads one image part. Browsers send an empty part with no file name when
-/// no file is chosen, and that part is not an image.
-async fn read_image(mut field: Field<'_>, uploads: &mut Vec<Upload>) -> Result<(), AppError> {
+/// Reads one upload part's bytes. Browsers send an empty part with no file
+/// name when no file is chosen; that part yields `None`. Stops reading once a
+/// part passes the per-attachment limit.
+async fn read_upload(mut field: Field<'_>) -> Result<Option<Vec<u8>>, AppError> {
     let named = field.file_name().is_some_and(|name| !name.is_empty());
     let mut bytes = Vec::new();
     while let Some(chunk) = field.chunk().await.map_err(|err| multipart_error(&err))? {
         bytes.extend_from_slice(&chunk);
-        if bytes.len() > MAX_IMAGE_BYTES {
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
             return Err(AppError::BadRequest(format!(
-                "an image is over the limit of {MAX_IMAGE_BYTES} bytes"
+                "an image is over the limit of {MAX_ATTACHMENT_BYTES} bytes"
             )));
         }
     }
     if bytes.is_empty() && !named {
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(bytes))
+}
+
+/// Classifies one upload's bytes and adds it to `uploads`.
+async fn read_image(field: Field<'_>, uploads: &mut Vec<Upload>) -> Result<(), AppError> {
+    let Some(bytes) = read_upload(field).await? else {
+        return Ok(());
+    };
     let Some(extension) = image_extension(&bytes) else {
         return Err(AppError::BadRequest(
             "an upload is not a PNG, JPEG, GIF or WebP image".into(),
         ));
     };
-    if uploads.len() == MAX_IMAGES {
+    if uploads.len() == MAX_ATTACHMENTS {
         return Err(AppError::BadRequest(format!(
-            "a request takes at most {MAX_IMAGES} images"
+            "a request takes at most {MAX_ATTACHMENTS} images"
         )));
     }
     uploads.push(Upload { extension, bytes });
