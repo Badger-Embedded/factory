@@ -1519,14 +1519,15 @@ async fn cards_keep_the_content_of_the_old_rows() {
 }
 
 #[tokio::test]
-async fn the_board_has_no_forms_or_buttons() {
+async fn only_the_you_lane_has_forms_and_buttons() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     to_spec_approval(&dashboard, id);
     let body = dashboard.get("/").await.body;
     let board = &body[body.find("class=\"board\"").unwrap()..];
-    assert!(!board.contains("<form"));
-    assert!(!board.contains("<button"));
+    assert_eq!(board.matches("<form").count(), 1);
+    assert_eq!(board.matches("<button").count(), 1);
+    assert!(lane_html(&body, "lane-you").contains("<form"));
 }
 
 #[tokio::test]
@@ -1540,4 +1541,113 @@ async fn the_board_counts_only_the_selected_projects_jobs() {
     let body = dashboard.get("/?project=maestro").await.body;
     assert!(body.contains("Factory <span class=\"count\">1</span>"));
     assert!(!body.contains("Tool change"));
+}
+
+fn plan_one() -> Event {
+    Event::Agent(AgentResult::Plan(vec![planned(
+        "maestrod: add a reboot endpoint",
+        None,
+    )]))
+}
+
+#[tokio::test]
+async fn the_board_offers_approve_at_the_spec_gate() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("Approve spec"));
+    assert!(
+        index
+            .body
+            .contains(&format!("action=\"/jobs/{id}/approve\""))
+    );
+}
+
+#[tokio::test]
+async fn the_board_offers_approve_at_the_plan_gate() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, plan_one());
+
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("Approve plan"));
+    assert!(!index.body.contains("Approve spec"));
+}
+
+#[tokio::test]
+async fn the_board_offers_no_approve_for_questions_review_or_other_lanes() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    assert!(!dashboard.get("/").await.body.contains("Approve"));
+
+    dashboard.apply(id, Event::Start);
+    assert!(!dashboard.get("/").await.body.contains("Approve"));
+
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Questions(vec![Question {
+            text: "Which board?".into(),
+        }])),
+    );
+    assert!(!dashboard.get("/").await.body.contains("Approve"));
+    dashboard.apply(id, Event::Answer(vec!["one".into()]));
+    dashboard.apply(id, Event::Agent(AgentResult::Clarified));
+    assert!(!dashboard.get("/").await.body.contains("Approve"));
+
+    dashboard.apply(id, Event::Agent(AgentResult::Spec("s".into())));
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, plan_one());
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 15 });
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("in review"));
+    assert!(!index.body.contains("Approve"));
+}
+
+#[tokio::test]
+async fn the_board_offers_no_approve_at_the_publish_gate() {
+    let dashboard = dashboard();
+    let id = at_publish_gate(&dashboard).await;
+    dashboard.apply(id, Event::Summarized(branch_summary()));
+    assert!(!dashboard.get("/").await.body.contains("Approve spec"));
+    assert!(!dashboard.get("/").await.body.contains("Approve plan"));
+}
+
+#[tokio::test]
+async fn approving_from_the_board_returns_to_the_selected_project() {
+    let dashboard = two_projects();
+    dashboard.post_job("tool", "Tool change", &[]).await;
+    let id = 1;
+    to_spec_approval(&dashboard, id);
+
+    let index = dashboard.get("/?project=tool").await;
+    assert!(index.body.contains("name=\"project\" value=\"tool\""));
+    let reply = dashboard
+        .post(&format!("/jobs/{id}/approve"), "project=tool")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/?project=tool"));
+    assert_eq!(dashboard.store.get(id).unwrap().job.stage(), &Stage::Plan);
+}
+
+#[tokio::test]
+async fn approving_from_the_job_page_still_redirects_to_the_job() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    let reply = dashboard.post(&format!("/jobs/{id}/approve"), "").await;
+    assert_eq!(reply.location, Some(format!("/jobs/{id}")));
+
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    let reply = dashboard
+        .post(&format!("/jobs/{id}/approve"), "project=nope")
+        .await;
+    assert_eq!(reply.location, Some(format!("/jobs/{id}")));
 }
