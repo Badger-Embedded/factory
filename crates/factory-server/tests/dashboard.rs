@@ -11,9 +11,9 @@ use factory_core::{
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{
-    BranchInfo, GitHubRepos, Permission, PlanUsageCache, Projects, Protection, RepoChecker,
-    RepoInfo, Settings, StageEfforts, StageModels, Store, StoreError, USER_HEADER, WorkerSlots,
-    app,
+    BranchInfo, GitHubRepos, LocalSecrets, MASTER_KEY_LEN, Permission, PlanUsageCache, Projects,
+    Protection, RepoChecker, RepoInfo, SecretStore, Settings, StageEfforts, StageModels, Store,
+    StoreError, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -104,8 +104,19 @@ fn dashboard_with(store: Arc<Store>) -> Dashboard {
 }
 
 /// As [`dashboard_with`], with the onboarding checks answered by `github`, so a
-/// test can fail one check.
+/// test can fail one check. Its secret store is a ready [`LocalSecrets`].
 fn dashboard_with_github(store: Arc<Store>, github: Arc<dyn RepoChecker>) -> Dashboard {
+    let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    dashboard_with_secrets(store, github, secrets)
+}
+
+/// As [`dashboard_with_github`], with the secret store given, so a test can use
+/// an [`UnavailableSecrets`] to check the master-key-missing behaviour.
+fn dashboard_with_secrets(
+    store: Arc<Store>,
+    github: Arc<dyn RepoChecker>,
+    secrets: Arc<dyn SecretStore>,
+) -> Dashboard {
     let projects = Arc::new(Projects::from_store(Arc::clone(&store)));
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
@@ -119,6 +130,7 @@ fn dashboard_with_github(store: Arc<Store>, github: Arc<dyn RepoChecker>) -> Das
             Arc::clone(&usage),
             github,
             Arc::clone(&slots),
+            secrets,
         ),
         store,
         data,
@@ -1378,6 +1390,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(PlanUsageCache::new()),
         Arc::new(FakeRepos::fit()),
         Arc::new(WorkerSlots::new()),
+        Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
@@ -4305,4 +4318,259 @@ async fn an_invalid_mcp_server_is_a_bad_request() {
     assert_eq!(reserved.status, StatusCode::BAD_REQUEST);
     // Nothing was stored.
     assert_eq!(dashboard.store.mcp_servers().unwrap(), Vec::new());
+}
+
+/// Stores a value for maestro's `context7` `Authorization` header with the same
+/// key the dashboard's secret store uses, so the dashboard reads it back.
+fn store_auth_value(dashboard: &Dashboard, value: &str) {
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    secrets
+        .put(
+            factory_server::SecretRef {
+                project: "maestro",
+                server: "context7",
+                header: "Authorization",
+            },
+            value,
+        )
+        .unwrap();
+}
+
+fn stored_auth_value(dashboard: &Dashboard) -> Option<String> {
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    secrets
+        .get(factory_server::SecretRef {
+            project: "maestro",
+            server: "context7",
+            header: "Authorization",
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_projects_form_has_a_block_per_server_defaulting_to_off() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+        )
+        .await;
+    let page = dashboard.get("/settings").await.body;
+    // The project form carries the server's enabled switch, a checkbox per
+    // stage, and the declared header as a write-only field showing "not set".
+    assert!(page.contains("name=\"mcp.context7.enabled\""));
+    for stage in ["clarify", "spec", "plan", "implement", "review"] {
+        assert!(
+            page.contains(&format!("name=\"mcp.context7.stage.{stage}\"")),
+            "missing the {stage} checkbox",
+        );
+    }
+    assert!(page.contains("name=\"mcp.context7.header.Authorization\""));
+    assert!(page.contains("name=\"mcp.context7.clear.Authorization\""));
+    assert!(page.contains("placeholder=\"not set\""));
+    // Off by default: the enabled box is not checked and no stage is.
+    assert_eq!(
+        dashboard.store.project_mcp("maestro", "context7").unwrap(),
+        factory_server::McpProjectSettings::default(),
+    );
+}
+
+#[tokio::test]
+async fn enabling_a_server_with_no_stage_is_a_bad_request() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=",
+        )
+        .await;
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&mcp.context7.enabled=on",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("no stage"));
+    // Nothing was stored for the server.
+    assert_eq!(
+        dashboard.store.project_mcp("maestro", "context7").unwrap(),
+        factory_server::McpProjectSettings::default(),
+    );
+}
+
+#[tokio::test]
+async fn enabling_a_server_with_a_stage_saves_it() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=",
+        )
+        .await;
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.clarify=on",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let saved = dashboard.store.project_mcp("maestro", "context7").unwrap();
+    assert!(saved.enabled);
+    assert!(saved.stages.clarify);
+    assert!(!saved.stages.review);
+}
+
+#[tokio::test]
+async fn the_page_never_renders_a_stored_header_value() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+        )
+        .await;
+    store_auth_value(&dashboard, "Bearer sk-secret-xyz");
+
+    let page = dashboard.get("/settings").await.body;
+    assert!(
+        !page.contains("sk-secret-xyz"),
+        "the stored value leaked into the HTML"
+    );
+    // The field shows only that a value is stored.
+    assert!(page.contains("placeholder=\"set\""));
+}
+
+#[tokio::test]
+async fn an_empty_header_field_keeps_the_stored_value_and_clear_deletes_it() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+        )
+        .await;
+    store_auth_value(&dashboard, "Bearer sk-keep");
+
+    // Saving with the header field empty leaves the stored value untouched.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.clarify=on&mcp.context7.header.Authorization=",
+        )
+        .await;
+    assert_eq!(
+        stored_auth_value(&dashboard).as_deref(),
+        Some("Bearer sk-keep")
+    );
+
+    // Typing a new value replaces it.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.clarify=on\
+             &mcp.context7.header.Authorization=Bearer%20sk-new",
+        )
+        .await;
+    assert_eq!(
+        stored_auth_value(&dashboard).as_deref(),
+        Some("Bearer sk-new")
+    );
+
+    // The clear control deletes the stored value.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.clarify=on\
+             &mcp.context7.clear.Authorization=on",
+        )
+        .await;
+    assert_eq!(stored_auth_value(&dashboard), None);
+}
+
+#[tokio::test]
+async fn saving_one_projects_mcp_leaves_other_projects_alone() {
+    let dashboard = two_projects();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=",
+        )
+        .await;
+    // tool turns the server on for the plan stage.
+    dashboard
+        .post(
+            "/settings/projects/tool",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.plan=on",
+        )
+        .await;
+    // Saving maestro's MCP settings does not touch tool's.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.review=on",
+        )
+        .await;
+    let tool = dashboard.store.project_mcp("tool", "context7").unwrap();
+    assert!(tool.enabled && tool.stages.plan && !tool.stages.review);
+    let maestro = dashboard.store.project_mcp("maestro", "context7").unwrap();
+    assert!(maestro.enabled && maestro.stages.review && !maestro.stages.plan);
+}
+
+#[tokio::test]
+async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    let dashboard = dashboard_with_secrets(
+        Arc::clone(&store),
+        Arc::new(FakeRepos::fit()),
+        Arc::new(UnavailableSecrets::new(Arc::clone(&store))),
+    );
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&headers=Authorization",
+        )
+        .await;
+
+    // The page says the master key is missing.
+    let page = dashboard.get("/settings").await.body;
+    assert!(page.contains("master key is missing"));
+
+    // A header value cannot be saved, but the enabled and stage choices still can.
+    let refused = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.clarify=on\
+             &mcp.context7.header.Authorization=Bearer%20sk-x",
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert!(refused.body.contains("unavailable"));
+    // The refused save wrote nothing, since the check runs before any write.
+    assert_eq!(
+        store.project_mcp("maestro", "context7").unwrap(),
+        factory_server::McpProjectSettings::default(),
+    );
+
+    // Without a value field, the enabled and stage choices save.
+    let ok = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=\
+             &mcp.context7.enabled=on&mcp.context7.stage.clarify=on",
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert!(store.project_mcp("maestro", "context7").unwrap().enabled);
 }

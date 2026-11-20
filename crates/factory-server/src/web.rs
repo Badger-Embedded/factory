@@ -15,9 +15,10 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::github::{RepoChecker, RepoReport};
-use crate::mcp::McpError;
-use crate::pages::{self, Workers};
+use crate::mcp::{McpError, McpProjectSettings, McpStages};
+use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, Projects, StageEfforts, StageModels};
+use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
 use crate::store::{JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
@@ -49,6 +50,7 @@ struct AppState {
     plan_usage: Arc<PlanUsageCache>,
     github: Arc<dyn RepoChecker>,
     slots: Arc<WorkerSlots>,
+    secrets: Arc<dyn SecretStore>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -56,7 +58,13 @@ struct AppState {
 /// `<data_dir>/jobs/<id>/images/`. The index page reads `plan_usage` from the
 /// cache the refresh task fills, so it makes no live call to the usage source.
 /// The onboarding wizard runs its repository checks through `github`. The
-/// board shows the worker slots the scheduler fills in `slots`.
+/// board shows the worker slots the scheduler fills in `slots`. Per-project
+/// MCP header values are read and written through `secrets`, which reports
+/// itself unavailable when no master key is present.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dashboard wires each long-lived dependency the handlers share"
+)]
 pub fn app(
     store: Arc<Store>,
     projects: Arc<Projects>,
@@ -65,6 +73,7 @@ pub fn app(
     plan_usage: Arc<PlanUsageCache>,
     github: Arc<dyn RepoChecker>,
     slots: Arc<WorkerSlots>,
+    secrets: Arc<dyn SecretStore>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -100,6 +109,7 @@ pub fn app(
             plan_usage,
             github,
             slots,
+            secrets,
         })
 }
 
@@ -132,6 +142,18 @@ impl From<McpError> for AppError {
             McpError::Store(err) => AppError::Store(err),
             err @ McpError::NotFound(_) => AppError::NotFound(err.to_string()),
             err => AppError::BadRequest(err.to_string()),
+        }
+    }
+}
+
+impl From<SecretError> for AppError {
+    fn from(err: SecretError) -> Self {
+        match err {
+            SecretError::Unavailable => AppError::BadRequest(err.to_string()),
+            SecretError::Store(err) => AppError::Store(err),
+            // Decrypt, Encrypt and UnknownBackend are internal faults. None of
+            // them carries a plaintext value, so the message leaks nothing.
+            err => AppError::Io(err.to_string()),
         }
     }
 }
@@ -675,7 +697,41 @@ fn settings_page(
             let efforts = state.store.project_efforts(&name)?;
             let auto_merge = state.store.project_auto_merge(&name, project.auto_merge)?;
             let llm_review = state.store.project_llm_review(&name, project.llm_review)?;
-            Ok((name, models, efforts, auto_merge, llm_review))
+            let project_servers = servers
+                .iter()
+                .map(|server| {
+                    let saved = state.store.project_mcp(&name, &server.name)?;
+                    let headers = server
+                        .headers
+                        .iter()
+                        .map(|header| {
+                            let at = SecretRef {
+                                project: &name,
+                                server: &server.name,
+                                header,
+                            };
+                            Ok(HeaderState {
+                                name: header.clone(),
+                                set: state.store.has_secret(at)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, StoreError>>()?;
+                    Ok(ServerSettings {
+                        name: server.name.clone(),
+                        enabled: saved.enabled,
+                        stages: saved.stages,
+                        headers,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            Ok(ProjectSettings {
+                name,
+                models,
+                efforts,
+                auto_merge,
+                llm_review,
+                servers: project_servers,
+            })
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
     Ok(pages::settings(
@@ -683,71 +739,137 @@ fn settings_page(
         &settings,
         &servers,
         &projects,
+        state.secrets.available(),
         notice,
     ))
-}
-
-#[derive(Deserialize)]
-struct ModelsForm {
-    clarify: String,
-    spec: String,
-    plan: String,
-    implement: String,
-    review: String,
-    // The effort per stage. A missing field falls back to medium, so a request
-    // from before the selector existed still saves.
-    #[serde(default = "default_effort")]
-    clarify_effort: String,
-    #[serde(default = "default_effort")]
-    spec_effort: String,
-    #[serde(default = "default_effort")]
-    plan_effort: String,
-    #[serde(default = "default_effort")]
-    implement_effort: String,
-    #[serde(default = "default_effort")]
-    review_effort: String,
-    /// Checkboxes: present when ticked.
-    auto_merge: Option<String>,
-    llm_review: Option<String>,
 }
 
 fn default_effort() -> String {
     factory_core::DEFAULT_EFFORT.to_owned()
 }
 
+/// A project form's fields, parsed from the raw pairs. The MCP blocks name one
+/// field per server, so the set of names is not known at compile time; the
+/// pairs are read by name instead of a typed struct.
+struct ProjectForm(HashMap<String, String>);
+
+impl ProjectForm {
+    /// The value of `key`, or `None` when the field is absent. A text field is
+    /// present with its typed value; an unticked checkbox is absent.
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    /// Whether a checkbox named `key` was ticked.
+    fn ticked(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    /// A model field: its trimmed value, or `None` when empty, so an empty
+    /// field clears the stage's model.
+    fn model(&self, key: &str) -> Option<String> {
+        self.get(key)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// An effort field, or the default when the field is absent, so a form
+    /// posted before the selector existed still saves.
+    fn effort(&self, key: &str) -> String {
+        self.get(key).map_or_else(default_effort, str::to_owned)
+    }
+}
+
 async fn save_project_models(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Form(form): Form<ModelsForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
     if state.projects.lookup(&name)?.is_none() {
         return Err(AppError::UnknownProject(name));
     }
-    let model = |value: String| Some(value.trim().to_owned()).filter(|value| !value.is_empty());
+    let form = ProjectForm(pairs.into_iter().collect());
     let models = StageModels {
-        clarify: model(form.clarify),
-        spec: model(form.spec),
-        plan: model(form.plan),
-        implement: model(form.implement),
-        review: model(form.review),
+        clarify: form.model("clarify"),
+        spec: form.model("spec"),
+        plan: form.model("plan"),
+        implement: form.model("implement"),
+        review: form.model("review"),
     };
     let efforts = StageEfforts {
-        clarify: form.clarify_effort,
-        spec: form.spec_effort,
-        plan: form.plan_effort,
-        implement: form.implement_effort,
-        review: form.review_effort,
+        clarify: form.effort("clarify_effort"),
+        spec: form.effort("spec_effort"),
+        plan: form.effort("plan_effort"),
+        implement: form.effort("implement_effort"),
+        review: form.effort("review_effort"),
     };
-    // Efforts first, so a bad level is rejected before anything is written and
-    // the save leaves every table as it was.
+
+    // Read and check every server's MCP settings before any write, so a bad
+    // submit leaves every table as it was. An enabled server needs a stage, and
+    // a header value cannot be set while the secret store is unavailable.
+    let servers = state.store.mcp_servers()?;
+    let mut saves = Vec::new();
+    for server in servers {
+        let base = format!("mcp.{}", server.name);
+        let settings = McpProjectSettings {
+            enabled: form.ticked(&format!("{base}.enabled")),
+            stages: McpStages {
+                clarify: form.ticked(&format!("{base}.stage.clarify")),
+                spec: form.ticked(&format!("{base}.stage.spec")),
+                plan: form.ticked(&format!("{base}.stage.plan")),
+                implement: form.ticked(&format!("{base}.stage.implement")),
+                review: form.ticked(&format!("{base}.stage.review")),
+            },
+        };
+        if settings.enabled && !settings.stages.any() {
+            return Err(McpError::NoStage(server.name).into());
+        }
+        if !state.secrets.available() {
+            for header in &server.headers {
+                if !form
+                    .get(&format!("{base}.header.{header}"))
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(AppError::BadRequest(
+                        "the secret store is unavailable, so a header value cannot be saved".into(),
+                    ));
+                }
+            }
+        }
+        saves.push((server, settings));
+    }
+
+    // Efforts first, so a bad level is rejected before anything is written.
     state.store.save_project_efforts(&name, &efforts)?;
     state.store.save_project_models(&name, &models)?;
     state.store.save_project_settings(
         &name,
-        form.auto_merge.is_some(),
-        form.llm_review.is_some(),
+        form.ticked("auto_merge"),
+        form.ticked("llm_review"),
     )?;
+    for (server, settings) in &saves {
+        state
+            .store
+            .save_project_mcp(&name, &server.name, settings)?;
+        for header in &server.headers {
+            let at = SecretRef {
+                project: &name,
+                server: &server.name,
+                header,
+            };
+            if form.ticked(&format!("mcp.{}.clear.{header}", server.name)) {
+                state.secrets.delete(at)?;
+            } else if let Some(value) = form
+                .get(&format!("mcp.{}.header.{header}", server.name))
+                .filter(|value| !value.is_empty())
+            {
+                state.secrets.put(at, value)?;
+            }
+        }
+    }
     state.wake.notify_one();
     settings_page(&state, &headers, Some("Saved."))
 }

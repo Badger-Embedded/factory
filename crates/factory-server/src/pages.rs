@@ -9,7 +9,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
-use crate::mcp::McpServer;
+use crate::mcp::{McpServer, McpStages};
 use crate::projects::Project;
 use crate::projects::{StageEfforts, StageModels};
 use crate::settings::Settings;
@@ -373,11 +373,40 @@ fn project_selector(names: &[String], selected: &str) -> Markup {
     }
 }
 
+/// A project's block on the settings page: its models, efforts and flags, and
+/// its per-server MCP settings.
+pub struct ProjectSettings {
+    pub name: String,
+    pub models: StageModels,
+    pub efforts: StageEfforts,
+    pub auto_merge: bool,
+    pub llm_review: bool,
+    /// One per registered server, in the registry's order.
+    pub servers: Vec<ServerSettings>,
+}
+
+/// One server's block inside a project's form: whether the project runs it, the
+/// stages it runs in, and the state of each header the server declares.
+pub struct ServerSettings {
+    pub name: String,
+    pub enabled: bool,
+    pub stages: McpStages,
+    pub headers: Vec<HeaderState>,
+}
+
+/// One declared header in a project's server block. `set` is whether a value is
+/// stored; the value itself is never rendered.
+pub struct HeaderState {
+    pub name: String,
+    pub set: bool,
+}
+
 pub fn settings(
     user: &str,
     settings: &Settings,
     servers: &[McpServer],
-    projects: &[(String, StageModels, StageEfforts, bool, bool)],
+    projects: &[ProjectSettings],
+    secrets_available: bool,
     notice: Option<&str>,
 ) -> Markup {
     layout(
@@ -440,9 +469,9 @@ pub fn settings(
                 }
                 button.primary { "Save" }
             }
-            (mcp_servers(servers))
-            @for (name, models, efforts, auto_merge, llm_review) in projects {
-                (project_form(name, models, efforts, *auto_merge, *llm_review))
+            (mcp_servers(servers, secrets_available))
+            @for project in projects {
+                (project_form(project, secrets_available))
             }
         },
     )
@@ -451,11 +480,14 @@ pub fn settings(
 /// The "MCP servers" section: one edit form per registered server, then a form
 /// to add one. A project turns a server on and gives its header values in the
 /// project's own settings form, so this section carries no per-project state.
-fn mcp_servers(servers: &[McpServer]) -> Markup {
+fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
     html! {
         div.card {
             h2 { "MCP servers" }
             p.hint { "Remote MCP servers over HTTPS, offered to agent runs. A project turns one on and picks its stages in the project's own settings below. Header values are entered per project." }
+            @if !secrets_available {
+                p.hint.bad { "The master key is missing, so header values cannot be saved. The factory still runs, and a project's enabled servers and stages still save." }
+            }
             @if servers.is_empty() {
                 p.meta { "No servers yet." }
             }
@@ -516,15 +548,16 @@ fn mcp_server_form(server: &McpServer) -> Markup {
     }
 }
 
-/// One project's form on the settings page: its two flags and a model field
-/// with an effort selector beside it for each of the five stages.
-fn project_form(
-    name: &str,
-    models: &StageModels,
-    efforts: &StageEfforts,
-    auto_merge: bool,
-    llm_review: bool,
-) -> Markup {
+/// One project's form on the settings page: its two flags, a model field with
+/// an effort selector beside it for each of the five stages, and a block per
+/// registered MCP server. `secrets_available` is false when the master key is
+/// missing, which disables the header value inputs.
+fn project_form(project: &ProjectSettings, secrets_available: bool) -> Markup {
+    let name = &project.name;
+    let models = &project.models;
+    let efforts = &project.efforts;
+    let auto_merge = project.auto_merge;
+    let llm_review = project.llm_review;
     html! {
         form.card method="post" action={ "/settings/projects/" (name) } {
             h2 { (name) }
@@ -568,7 +601,65 @@ fn project_form(
                     }
                 }
             }
+            @for server in &project.servers {
+                (project_server_block(name, server, secrets_available))
+            }
             button.primary { "Save " (name) }
+        }
+    }
+}
+
+/// One MCP server's block inside a project's form: an enabled switch, a
+/// checkbox per stage, and a write-only field per declared header. The header
+/// field shows only whether a value is stored, never the value, and its field
+/// is disabled when the secret store is unavailable. The field names carry the
+/// server as `mcp.<server>.…`, which the save handler splits back out.
+fn project_server_block(project: &str, server: &ServerSettings, secrets_available: bool) -> Markup {
+    let base = format!("mcp.{}", server.name);
+    let stages = server.stages;
+    html! {
+        fieldset.mcp-project {
+            legend { (server.name) }
+            div.field {
+                label.check {
+                    input type="checkbox" name={ (base) ".enabled" } value="on"
+                        checked[server.enabled];
+                    " Run this server for " (project)
+                }
+            }
+            div.field {
+                p.hint { "The stages it runs in. An enabled server needs at least one." }
+                @for (stage, on) in [
+                    ("clarify", stages.clarify),
+                    ("spec", stages.spec),
+                    ("plan", stages.plan),
+                    ("implement", stages.implement),
+                    ("review", stages.review),
+                ] {
+                    label.check {
+                        input type="checkbox" name={ (base) ".stage." (stage) } value="on"
+                            checked[on];
+                        " " (stage)
+                    }
+                }
+            }
+            @for header in &server.headers {
+                div.field {
+                    label for={ (base) "-header-" (header.name) } { (header.name) }
+                    input id={ (base) "-header-" (header.name) }.wide type="password"
+                        name={ (base) ".header." (header.name) }
+                        autocomplete="off" placeholder=(if header.set { "set" } else { "not set" })
+                        disabled[!secrets_available];
+                    label.check {
+                        input type="checkbox" name={ (base) ".clear." (header.name) } value="on";
+                        " Clear the stored value"
+                    }
+                    p.hint {
+                        @if header.set { "A value is stored. " } @else { "No value is stored. " }
+                        "Type a new value to replace it. An empty field keeps it."
+                    }
+                }
+            }
         }
     }
 }

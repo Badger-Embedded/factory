@@ -7,7 +7,7 @@ use factory_core::{AgentResult, EFFORTS, Event, Job, Rejected, Session, Stage};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::mcp::{self, McpError, McpServer};
+use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages};
 use crate::projects::{Project, StageEfforts, StageModels};
 use crate::secrets::SecretRef;
 use crate::settings::Settings;
@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     name TEXT PRIMARY KEY,
     url TEXT NOT NULL,
     headers TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_mcp (
+    project TEXT NOT NULL,
+    server TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    clarify INTEGER NOT NULL DEFAULT 0,
+    spec INTEGER NOT NULL DEFAULT 0,
+    plan INTEGER NOT NULL DEFAULT 0,
+    implement INTEGER NOT NULL DEFAULT 0,
+    review INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project, server)
 );
 ";
 
@@ -1262,10 +1273,103 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
-        // Per-project MCP settings are deleted here too once that table lands.
+        tx.execute("DELETE FROM project_mcp WHERE server = ?1", [name])?;
         tx.execute("DELETE FROM mcp_servers WHERE name = ?1", [name])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The settings `project` has for the MCP server `server`, or the default
+    /// (off, no stage) when no row is stored. A project with no row, a newly
+    /// onboarded project and a newly added server all read the default.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_mcp(
+        &self,
+        project: &str,
+        server: &str,
+    ) -> Result<McpProjectSettings, StoreError> {
+        let stored = self
+            .conn()
+            .query_row(
+                "SELECT enabled, clarify, spec, plan, implement, review
+                 FROM project_mcp WHERE project = ?1 AND server = ?2",
+                params![project, server],
+                |row| {
+                    Ok(McpProjectSettings {
+                        enabled: row.get(0)?,
+                        stages: McpStages {
+                            clarify: row.get(1)?,
+                            spec: row.get(2)?,
+                            plan: row.get(3)?,
+                            implement: row.get(4)?,
+                            review: row.get(5)?,
+                        },
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    /// Saves `project`'s settings for `server`, writing only this row. An
+    /// enabled server must have at least one stage; otherwise nothing is written
+    /// and [`McpError::NoStage`] is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::NoStage`] when `settings.enabled` is set with no
+    /// stage. Otherwise fails only on a database error.
+    pub fn save_project_mcp(
+        &self,
+        project: &str,
+        server: &str,
+        settings: &McpProjectSettings,
+    ) -> Result<(), McpError> {
+        if settings.enabled && !settings.stages.any() {
+            return Err(McpError::NoStage(server.to_owned()));
+        }
+        let stages = settings.stages;
+        self.conn().execute(
+            "INSERT INTO project_mcp
+                (project, server, enabled, clarify, spec, plan, implement, review)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (project, server) DO UPDATE SET enabled = excluded.enabled,
+                clarify = excluded.clarify, spec = excluded.spec, plan = excluded.plan,
+                implement = excluded.implement, review = excluded.review",
+            params![
+                project,
+                server,
+                settings.enabled,
+                stages.clarify,
+                stages.spec,
+                stages.plan,
+                stages.implement,
+                stages.review
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a secret value is stored for a project, server and header,
+    /// without decrypting it. The settings page shows "set" or "not set" from
+    /// this, so the state reads the same when the master key is missing.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn has_secret(&self, at: SecretRef<'_>) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM secrets WHERE project = ?1 AND server = ?2 AND header = ?3",
+                params![at.project, at.server, at.header],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     fn load(conn: &Connection, id: i64) -> Result<JobRow, StoreError> {

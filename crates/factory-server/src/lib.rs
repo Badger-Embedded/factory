@@ -20,7 +20,7 @@ pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
     check_repo,
 };
-pub use mcp::{McpError, McpServer};
+pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, import_tomls};
 pub use scheduler::{
@@ -30,7 +30,7 @@ pub use scheduler::{
 };
 pub use secrets::{
     LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore,
-    master_key_from_env,
+    UnavailableSecrets, master_key_from_env,
 };
 pub use settings::Settings;
 pub use store::{JobEvent, JobRow, LogEntry, ProjectTotals, Store, StoreError};
