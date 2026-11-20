@@ -32,6 +32,12 @@ const INLINE: &str = r#"{"user": {"login": "talhahavadar"}, "body": "Use a const
 {"user": {"login": "moonthebot"}, "body": "Done.", "path": "src/main.rs", "line": 42, "created_at": "2026-11-19T12:02:00Z"}
 "#;
 
+/// A test that writes or runs a script holds this lock. A script file that is
+/// still open for writing in a forked child cannot be executed, and the child
+/// lives until its exec, so a parallel test can make the run fail with
+/// "Text file busy".
+static SCRIPTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
@@ -140,6 +146,7 @@ fn actions_job_ids_come_from_job_urls() {
 
 #[tokio::test]
 async fn open_pr_creates_the_pull_request_once_and_then_edits_it() {
+    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let calls = dir.path().join("calls");
     let body = dir.path().join("body");
@@ -195,6 +202,7 @@ esac"#,
 
 #[tokio::test]
 async fn the_failure_report_has_each_failed_jobs_log() {
+    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let gh = script(
         dir.path(),
@@ -227,6 +235,7 @@ async fn the_failure_report_has_each_failed_jobs_log() {
 
 #[test]
 fn checks_run_with_bash_in_the_checkout_without_tokens() {
+    let _serial = SCRIPTS.blocking_lock();
     let config = WorkerConfig {
         volumes: vec!["factory-nix:/nix".into()],
         ..WorkerConfig::default()
@@ -248,6 +257,7 @@ fn checks_run_with_bash_in_the_checkout_without_tokens() {
 
 #[tokio::test]
 async fn check_results_become_events_and_podman_errors_are_retried() {
+    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let run = |code: i32, output: &str| {
         let podman = script(
@@ -310,6 +320,7 @@ fn a_pull_request_without_any_checks_is_not_ready() {
 
 #[tokio::test]
 async fn merge_squashes_and_deletes_the_branch() {
+    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let calls = dir.path().join("calls");
     let gh = script(
