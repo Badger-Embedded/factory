@@ -233,6 +233,53 @@ async fn queued_jobs_wait_for_a_free_worker() {
 }
 
 #[tokio::test]
+async fn worker_runs_hold_numbered_slots_until_they_end() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let ids: Vec<i64> = (0..3)
+        .map(|i| {
+            store
+                .create("maestro", "alice", &format!("request {i}"))
+                .unwrap()
+        })
+        .collect();
+    let slots = scheduler.slots();
+    assert_eq!(slots.busy().len(), 0);
+
+    scheduler.tick().await.unwrap();
+    let busy: Vec<(usize, i64)> = slots
+        .busy()
+        .iter()
+        .map(|slot| (slot.number, slot.job_id))
+        .collect();
+    assert_eq!(busy, [(1, ids[0]), (2, ids[1])]);
+
+    executor.release(2);
+    wait_idle(&scheduler).await;
+    assert_eq!(slots.busy().len(), 0);
+
+    scheduler.tick().await.unwrap();
+    assert_eq!(slots.busy().len(), 1);
+    assert_eq!(slots.busy()[0].number, 1);
+    assert_eq!(slots.busy()[0].job_id, ids[2]);
+    executor.release(1);
+    wait_idle(&scheduler).await;
+    assert_eq!(slots.busy().len(), 0);
+}
+
+#[tokio::test]
+async fn cancelling_a_job_frees_its_slot() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let id = store.create("maestro", "alice", "request").unwrap();
+    scheduler.tick().await.unwrap();
+    assert_eq!(scheduler.slots().busy().len(), 1);
+
+    store.apply(id, Event::Cancel).unwrap();
+    scheduler.tick().await.unwrap();
+    assert_eq!(scheduler.slots().busy().len(), 0);
+    executor.release(1);
+}
+
+#[tokio::test]
 async fn the_worker_limit_comes_from_the_stored_settings() {
     let (store, executor, scheduler) = setup(|_| questions());
     for i in 0..4 {

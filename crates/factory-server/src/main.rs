@@ -6,7 +6,8 @@ use std::sync::Arc;
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
     CurlUsageSource, GhRepos, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects,
-    RepoChecker, Scheduler, Store, app, import_tomls, master_key_from_env, refresh_forever,
+    RepoChecker, Scheduler, Store, WorkerSlots, app, import_tomls, master_key_from_env,
+    refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -74,6 +75,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::warn!("factory-master-key is missing or invalid, MCP header secrets are off");
     }
 
+    // Without podman workers no job takes a slot, so the board shows every
+    // slot idle.
+    let mut slots = Arc::new(WorkerSlots::new());
     if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {
         let executor = PodmanExecutor {
             base: WorkerConfig {
@@ -101,6 +105,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arc::clone(&wake),
             data_dir.clone(),
         );
+        slots = scheduler.slots();
         tokio::spawn(scheduler.run());
         tracing::info!("running jobs in podman workers");
     } else {
@@ -130,7 +135,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!("listening on http://{listen}, database {}", db.display());
     axum::serve(
         listener,
-        app(store, projects, wake, data_dir, plan_usage, github),
+        app(store, projects, wake, data_dir, plan_usage, github, slots),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

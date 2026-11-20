@@ -16,11 +16,12 @@ use tokio::sync::Notify;
 
 use crate::github::{RepoChecker, RepoReport};
 use crate::mcp::McpError;
-use crate::pages;
+use crate::pages::{self, Workers};
 use crate::projects::{Project, Projects, StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
+use crate::workers::WorkerSlots;
 
 /// The header `tailscale serve` sets to the logged-in user's login name.
 pub const USER_HEADER: &str = "Tailscale-User-Login";
@@ -47,13 +48,15 @@ struct AppState {
     data_dir: PathBuf,
     plan_usage: Arc<PlanUsageCache>,
     github: Arc<dyn RepoChecker>,
+    slots: Arc<WorkerSlots>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
 /// job loop looks at the job right away. Uploaded images go under
 /// `<data_dir>/jobs/<id>/images/`. The index page reads `plan_usage` from the
 /// cache the refresh task fills, so it makes no live call to the usage source.
-/// The onboarding wizard runs its repository checks through `github`.
+/// The onboarding wizard runs its repository checks through `github`. The
+/// board shows the worker slots the scheduler fills in `slots`.
 pub fn app(
     store: Arc<Store>,
     projects: Arc<Projects>,
@@ -61,11 +64,13 @@ pub fn app(
     data_dir: PathBuf,
     plan_usage: Arc<PlanUsageCache>,
     github: Arc<dyn RepoChecker>,
+    slots: Arc<WorkerSlots>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/fragments/plan-usage", get(plan_usage_fragment))
         .route("/fragments/stats", get(stats_fragment))
+        .route("/fragments/workers", get(workers_fragment))
         .route("/fragments/board", get(board_fragment))
         .route("/style.css", get(stylesheet))
         .route("/htmx.min.js", get(htmx))
@@ -94,6 +99,7 @@ pub fn app(
             data_dir,
             plan_usage,
             github,
+            slots,
         })
 }
 
@@ -186,6 +192,7 @@ struct BoardData {
     costs: HashMap<i64, f64>,
     totals: ProjectTotals,
     auto_merge: bool,
+    workers: Workers,
 }
 
 impl BoardData {
@@ -230,6 +237,11 @@ fn load_board(state: &AppState, project: Option<String>) -> Result<BoardData, Ap
         costs,
         totals,
         auto_merge,
+        workers: Workers {
+            limit: state.store.settings()?.max_workers,
+            busy: state.slots.busy(),
+            now: now_secs(),
+        },
     })
 }
 
@@ -249,6 +261,7 @@ async fn index(
         data.totals,
         plan_usage.as_ref(),
         data.auto_merge,
+        &data.workers,
     ))
 }
 
@@ -268,6 +281,17 @@ async fn stats_fragment(
         return Ok(html! {});
     };
     Ok(pages::stats(data.totals, project))
+}
+
+async fn workers_fragment(
+    State(state): State<AppState>,
+    Query(query): Query<IndexQuery>,
+) -> Result<Markup, AppError> {
+    let data = load_board(&state, query.project)?;
+    let Some(project) = data.selected.as_deref() else {
+        return Ok(html! {});
+    };
+    Ok(pages::workers(&data.workers, &data.jobs, project))
 }
 
 async fn board_fragment(

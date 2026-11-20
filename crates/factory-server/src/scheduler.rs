@@ -16,6 +16,7 @@ use crate::cost::format_cost;
 use crate::projects::{Project, Projects};
 use crate::settings::Settings;
 use crate::store::{JobRow, Store, StoreError};
+use crate::workers::{WorkerSlots, unix_now};
 
 /// How often the loop looks at the jobs when nothing wakes it.
 const POLL: Duration = Duration::from_secs(5);
@@ -238,6 +239,7 @@ pub struct Scheduler<E> {
     /// Jobs whose factory step waits until the given time: the next look at
     /// a pull request, or a retry after a failed step.
     not_before: Mutex<HashMap<i64, Instant>>,
+    slots: Arc<WorkerSlots>,
 }
 
 impl<E: Executor> Scheduler<E> {
@@ -256,7 +258,14 @@ impl<E: Executor> Scheduler<E> {
             data_dir,
             tasks: Mutex::new(HashMap::new()),
             not_before: Mutex::new(HashMap::new()),
+            slots: Arc::new(WorkerSlots::new()),
         })
+    }
+
+    /// The worker slots this scheduler fills, for the dashboard to show.
+    #[must_use]
+    pub fn slots(&self) -> Arc<WorkerSlots> {
+        Arc::clone(&self.slots)
     }
 
     /// Runs the loop forever. A notification on `wake` starts the next pass
@@ -414,6 +423,7 @@ impl<E: Executor> Scheduler<E> {
                     && let Some(task) = tasks.remove(&row.id)
                 {
                     task.handle.abort();
+                    self.slots.free(row.id);
                     unwanted.push(row.id);
                 }
             }
@@ -759,8 +769,12 @@ impl<E: Executor> Scheduler<E> {
     ) {
         let scheduler = Arc::clone(self);
         let mut tasks = self.tasks();
+        if kind == Kind::Worker {
+            self.slots.take(job_id, unix_now());
+        }
         let handle = tokio::spawn(async move {
             work.await;
+            scheduler.slots.free(job_id);
             scheduler.tasks().remove(&job_id);
             scheduler.wake.notify_one();
         });
