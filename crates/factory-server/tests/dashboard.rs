@@ -6,8 +6,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Event, Gates, PlannedPr, PrDescription, Question, Stage, Task,
-    Turn,
+    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, PlannedPr, PrDescription,
+    Question, Stage, Task, Turn,
 };
 use factory_server::{Projects, StageModels, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
@@ -2077,4 +2077,97 @@ async fn a_job_without_gates_shows_no_gate_label() {
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("step-tag agent"));
     assert!(!page.body.contains("step-tag gate"));
+}
+
+/// A job that failed because it used up its failed rounds while watching the
+/// one pull request #7.
+async fn failed_out_of_rounds(dashboard: &Dashboard) -> i64 {
+    let id = dashboard.new_job().await;
+    to_spec_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 7 });
+    for _ in 1..MAX_FAILED_ROUNDS {
+        dashboard.apply(id, Event::CiFailed { log: "fail".into() });
+        dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+        dashboard.apply(id, Event::ChecksPassed);
+        dashboard.apply(id, Event::Published { number: 7 });
+    }
+    dashboard.apply(id, Event::CiFailed { log: "last".into() });
+    assert!(matches!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+    id
+}
+
+#[tokio::test]
+async fn the_retry_endpoint_resumes_a_failed_job_and_logs_it() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location, Some(format!("/jobs/{id}")));
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("Retried the job from the dashboard."));
+}
+
+#[tokio::test]
+async fn retrying_from_the_board_returns_to_the_selected_project() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let reply = dashboard
+        .post(&format!("/jobs/{id}/retry"), "project=maestro")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/?project=maestro"));
+}
+
+#[tokio::test]
+async fn the_failure_card_shows_a_retry_button_for_a_retryable_job() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains(&format!("/jobs/{id}/retry")));
+    assert!(page.body.contains("Retry"));
+}
+
+#[tokio::test]
+async fn an_agent_failure_offers_no_retry_button_and_rejects_retry() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The job failed"));
+    assert!(!page.body.contains(&format!("/jobs/{id}/retry")));
+
+    let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
 }
