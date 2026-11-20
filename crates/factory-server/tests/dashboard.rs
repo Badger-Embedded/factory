@@ -6,8 +6,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, PlanUsage, PlannedPr,
-    PrDescription, Question, Stage, Task, Turn,
+    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlanUsage,
+    PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{PlanUsageCache, Projects, StageModels, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
@@ -958,6 +958,138 @@ async fn a_pull_request_in_review_waits_for_the_user() {
     assert!(page.body.contains("Auto-merge is on"));
     let index = dashboard.get("/").await;
     assert!(index.body.contains("Nothing needs you right now."));
+}
+
+/// Drives a job to a green pull request and starts a reviewer run, so the
+/// next event is a review verdict. The job is in `ci-and-review` on a review
+/// turn.
+fn to_review_turn(dashboard: &Dashboard, id: i64) {
+    to_spec_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 15 });
+    dashboard.apply(id, Event::StartReview);
+}
+
+#[tokio::test]
+async fn the_job_page_shows_an_approved_review_pass() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+    dashboard.apply(id, Event::ReviewApproved);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("LLM review"));
+    assert!(page.body.contains("Pass 1"));
+    assert!(page.body.contains("approved"));
+    // An approval carries no feedback, so no changes text appears.
+    assert!(!page.body.contains("changes requested"));
+}
+
+#[tokio::test]
+async fn the_job_page_shows_review_changes_feedback_escaped() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+    dashboard.apply(
+        id,
+        Event::ReviewChanges {
+            feedback: "Guard <main> against a null reboot".into(),
+        },
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("Pass 1"));
+    assert!(page.body.contains("changes requested"));
+    // The feedback text is HTML-escaped, so angle brackets cannot inject markup.
+    assert!(
+        page.body
+            .contains("Guard &lt;main&gt; against a null reboot")
+    );
+    assert!(!page.body.contains("Guard <main> against a null reboot"));
+}
+
+#[tokio::test]
+async fn the_job_page_lists_every_pass_and_the_cap_reason() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+    // Ask for changes until the review cap stops the job.
+    for n in 1..=MAX_REVIEW_ROUNDS {
+        dashboard.apply(
+            id,
+            Event::ReviewChanges {
+                feedback: format!("Round {n} feedback"),
+            },
+        );
+        if n < MAX_REVIEW_ROUNDS {
+            dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+            dashboard.apply(id, Event::ChecksPassed);
+            dashboard.apply(id, Event::Published { number: 15 });
+            dashboard.apply(id, Event::StartReview);
+        }
+    }
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    for n in 1..=MAX_REVIEW_ROUNDS {
+        assert!(page.body.contains(&format!("Pass {n}")), "pass {n} missing");
+        assert!(
+            page.body.contains(&format!("Round {n} feedback")),
+            "round {n} feedback missing"
+        );
+    }
+    // At the cap the job goes to you with the reason, and does not merge.
+    assert!(page.body.contains("class=\"badge you\">needs you"));
+    assert!(page.body.contains("The review stopped before merging"));
+    assert!(page.body.contains("5 review rounds on one pull request"));
+}
+
+#[tokio::test]
+async fn the_job_page_shows_a_failed_review_run_reason() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+    dashboard.apply(
+        id,
+        Event::ReviewFailed {
+            reason: "the reviewer run timed out".into(),
+        },
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("class=\"badge you\">needs you"));
+    assert!(page.body.contains("The review stopped before merging"));
+    assert!(page.body.contains("the reviewer run timed out"));
+    // A failed run records no pass, so the passes card does not render.
+    assert!(!page.body.contains("LLM review"));
+}
+
+#[tokio::test]
+async fn the_job_page_has_no_review_card_without_passes() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(!page.body.contains("LLM review"));
+}
+
+#[tokio::test]
+async fn the_job_fragment_swaps_the_review_passes() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+    dashboard.apply(id, Event::ReviewApproved);
+
+    // A poll updates the passes out of band, so a new pass shows without a
+    // reload.
+    let reply = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("id=\"job-reviews\""));
+    assert!(reply.body.contains("Pass 1"));
 }
 
 fn planned(title: &str, number: Option<u64>) -> PlannedPr {
