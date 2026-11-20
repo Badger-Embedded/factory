@@ -415,10 +415,10 @@ fn lane_cards(
                     li.card.job {
                         div.job-head {
                             span.id { "#" (row.id) }
-                            a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
-                                (first_line(row.job.request()))
-                            }
                             (turn_badge(&row.job, settings))
+                        }
+                        a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
+                            (first_line(row.job.request()))
                         }
                         div.job-sub {
                             span { (stage_label(&row.job)) }
