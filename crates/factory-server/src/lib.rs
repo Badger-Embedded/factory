@@ -18,7 +18,7 @@ pub use github::{
     check_repo,
 };
 pub use podman::PodmanExecutor;
-pub use projects::{ImportError, Project, Projects, StageModels, import_tomls};
+pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, import_tomls};
 pub use scheduler::{
     AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, PublishRequest, Published,
     ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest, branch_name,

@@ -48,8 +48,10 @@ pub struct AgentRequest {
     pub prompt: String,
     /// The model for the run's stage, or `None` when the project sets none.
     pub model: Option<String>,
-    /// The effort for the run's stage, or `None` to run it at the shared
-    /// default.
+    /// The effort for the run's stage. The scheduler reads the project's saved
+    /// effort on every run and always fills this in, with the default when the
+    /// project saved none. `None` is reserved for the runner, which then uses
+    /// its own default, so an older server that sends nothing still runs.
     pub effort: Option<String>,
 }
 
@@ -327,6 +329,14 @@ impl<E: Executor> Scheduler<E> {
                         Expect::Commits | Expect::FixCi => models.implement,
                         Expect::Review => models.review,
                     };
+                    let efforts = self.store.project_efforts(&row.project)?;
+                    let effort = match expect {
+                        Expect::Clarify => efforts.clarify,
+                        Expect::Spec => efforts.spec,
+                        Expect::Plan => efforts.plan,
+                        Expect::Commits | Expect::FixCi => efforts.implement,
+                        Expect::Review => efforts.review,
+                    };
                     let request = AgentRequest {
                         job_id: row.id,
                         repo: project.repo.clone(),
@@ -339,7 +349,7 @@ impl<E: Executor> Scheduler<E> {
                         expect,
                         prompt: job_prompt(&job, &task, expect),
                         model,
-                        effort: None,
+                        effort: Some(effort),
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
