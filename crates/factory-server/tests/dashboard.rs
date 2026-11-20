@@ -213,12 +213,11 @@ async fn bad_requests_create_no_job() {
 }
 
 #[tokio::test]
-async fn the_index_lists_jobs_and_those_waiting_for_the_user() {
+async fn the_index_lists_jobs_and_flags_those_waiting_for_the_user() {
     let dashboard = dashboard();
     let page = dashboard.get("/").await;
     assert!(page.body.contains("<option selected>maestro</option>"));
     assert!(page.body.contains("name=\"project\" value=\"maestro\""));
-    assert!(page.body.contains("No jobs yet."));
 
     let id = dashboard.new_job().await;
     let page = dashboard.get("/").await;
@@ -773,7 +772,7 @@ async fn the_index_defaults_to_the_first_project() {
 }
 
 #[tokio::test]
-async fn both_job_lists_show_only_the_selected_project() {
+async fn the_board_shows_only_the_selected_project() {
     let dashboard = two_projects();
     let maestro = dashboard.new_job().await;
     dashboard.post_job("tool", "Tool change", &[]).await;
@@ -791,7 +790,7 @@ async fn both_job_lists_show_only_the_selected_project() {
     let page = dashboard.get("/?project=maestro").await;
     assert!(!page.body.contains("Tool change"));
     assert!(!page.body.contains("Nothing needs you right now."));
-    assert_eq!(page.body.matches("Add a reboot button</a>").count(), 2);
+    assert_eq!(page.body.matches("Add a reboot button</a>").count(), 1);
 }
 
 #[tokio::test]
@@ -1304,4 +1303,241 @@ async fn requesting_changes_at_the_publish_gate_sends_the_feedback_to_the_agent(
             feedback: "Squash the commits".into()
         })
     );
+}
+
+/// The text of the lane `class` on the index page, up to the next lane.
+fn lane_html<'a>(body: &'a str, class: &str) -> &'a str {
+    let marker = format!("class=\"lane {class}\"");
+    let start = body.find(&marker).unwrap_or_else(|| panic!("no {class}"));
+    let rest = &body[start + marker.len()..];
+    &rest[..rest.find("class=\"lane ").unwrap_or(rest.len())]
+}
+
+/// The lanes that list job `id`.
+fn lanes_of(body: &str, id: i64) -> Vec<&'static str> {
+    let link = format!("href=\"/jobs/{id}\"");
+    ["lane-you", "lane-agent", "lane-factory", "lane-done"]
+        .into_iter()
+        .filter(|class| lane_html(body, class).contains(&link))
+        .collect()
+}
+
+async fn assert_lane(dashboard: &Dashboard, id: i64, lane: &str) {
+    let body = dashboard.get("/").await.body;
+    assert_eq!(lanes_of(&body, id), [lane], "job {id}");
+}
+
+fn plan_of_one() -> Vec<PlannedPr> {
+    vec![planned("maestrod: add a reboot endpoint", None)]
+}
+
+#[tokio::test]
+async fn every_stage_and_turn_lands_in_exactly_one_lane() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    assert_lane(&dashboard, id, "lane-factory").await;
+
+    let steps = [
+        (Event::Start, "lane-agent"),
+        (
+            Event::Agent(AgentResult::Questions(vec![Question {
+                text: "Which?".into(),
+            }])),
+            "lane-you",
+        ),
+        (Event::Answer(vec!["This".into()]), "lane-agent"),
+        (Event::Agent(AgentResult::Clarified), "lane-agent"),
+        (Event::Agent(AgentResult::Spec("Goal.".into())), "lane-you"),
+        (Event::Approve, "lane-agent"),
+        (Event::Agent(AgentResult::Plan(plan_of_one())), "lane-you"),
+        (Event::Approve, "lane-agent"),
+        (
+            Event::Agent(AgentResult::CommitsReady(ready())),
+            "lane-factory",
+        ),
+        (Event::ChecksPassed, "lane-factory"),
+        (Event::Published { number: 7 }, "lane-you"),
+        (
+            Event::ReviewComments {
+                comments: "Rename it".into(),
+            },
+            "lane-agent",
+        ),
+        (
+            Event::Agent(AgentResult::CommitsReady(ready())),
+            "lane-factory",
+        ),
+        (Event::ChecksPassed, "lane-factory"),
+        (Event::Published { number: 7 }, "lane-you"),
+        (Event::Merged, "lane-done"),
+    ];
+    for (event, lane) in steps {
+        dashboard.apply(id, event.clone());
+        let stage = dashboard.store.get(id).unwrap().job.stage().clone();
+        let body = dashboard.get("/").await.body;
+        assert_eq!(lanes_of(&body, id), [lane], "after {event:?} in {stage:?}");
+    }
+}
+
+#[tokio::test]
+async fn failed_and_cancelled_jobs_land_in_done() {
+    let dashboard = dashboard();
+    let failed = dashboard.new_job().await;
+    dashboard.apply(failed, Event::Start);
+    dashboard.apply(
+        failed,
+        Event::AgentFailed {
+            reason: "boom".into(),
+        },
+    );
+    let cancelled = dashboard.new_job().await;
+    dashboard.apply(cancelled, Event::Cancel);
+    assert_lane(&dashboard, failed, "lane-done").await;
+    assert_lane(&dashboard, cancelled, "lane-done").await;
+}
+
+#[tokio::test]
+async fn the_publish_gate_waits_in_factory_then_you() {
+    let dashboard = dashboard();
+    let id = at_publish_gate(&dashboard).await;
+    assert_lane(&dashboard, id, "lane-factory").await;
+    dashboard.apply(id, Event::Summarized(branch_summary()));
+    assert_lane(&dashboard, id, "lane-you").await;
+}
+
+#[tokio::test]
+async fn a_pull_request_in_review_moves_to_factory_with_auto_merge() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 3 });
+    assert_lane(&dashboard, id, "lane-you").await;
+    dashboard
+        .store
+        .save_settings(&factory_server::Settings {
+            auto_merge: true,
+            ..factory_server::Settings::default()
+        })
+        .unwrap();
+    assert_lane(&dashboard, id, "lane-factory").await;
+}
+
+#[tokio::test]
+async fn the_board_replaces_the_two_lists() {
+    let body = dashboard().get("/").await.body;
+    assert!(!body.contains("Waiting for you"));
+    assert!(!body.contains("All jobs"));
+    assert!(!body.contains("No jobs yet."));
+    for title in ["You", "Agent", "Factory", "Done"] {
+        assert!(
+            body.contains(&format!("{title} <span class=\"count\">0</span>")),
+            "{title}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_lanes_say_so() {
+    let body = dashboard().get("/").await.body;
+    for (class, message) in [
+        ("lane-you", "Nothing needs you right now."),
+        ("lane-agent", "No agent is working."),
+        ("lane-factory", "The factory has nothing to do."),
+        ("lane-done", "No finished jobs."),
+    ] {
+        assert!(lane_html(&body, class).contains(message), "{class}");
+    }
+
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Cancel);
+    let body = dashboard.get("/").await.body;
+    assert!(!lane_html(&body, "lane-done").contains("No finished jobs."));
+    assert!(lane_html(&body, "lane-factory").contains("The factory has nothing to do."));
+}
+
+#[tokio::test]
+async fn lanes_show_their_job_counts() {
+    let dashboard = dashboard();
+    let a = dashboard.new_job().await;
+    let b = dashboard.new_job().await;
+    let c = dashboard.new_job().await;
+    to_spec_approval(&dashboard, a);
+    to_spec_approval(&dashboard, b);
+    dashboard.apply(c, Event::Cancel);
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains("You <span class=\"count\">2</span>"));
+    assert!(body.contains("Agent <span class=\"count\">0</span>"));
+    assert!(body.contains("Factory <span class=\"count\">0</span>"));
+    assert!(body.contains("Done <span class=\"count\">1</span>"));
+}
+
+#[tokio::test]
+async fn done_is_a_collapsed_details_element_that_shows_its_count() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Cancel);
+    let body = dashboard.get("/").await.body;
+    assert!(body.contains(
+        "<details class=\"lane lane-done\"><summary>Done <span class=\"count\">1</span></summary>"
+    ));
+    assert!(!body.contains("<details open"));
+    assert!(!body.contains("details class=\"lane lane-done\" open"));
+    for other in ["lane-you", "lane-agent", "lane-factory"] {
+        assert!(body.contains(&format!("<section class=\"lane {other}\">")));
+    }
+}
+
+#[tokio::test]
+async fn each_lane_lists_the_newest_job_first() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    let body = dashboard.get("/").await.body;
+    let lane = lane_html(&body, "lane-factory");
+    let older = lane.find(&format!("href=\"/jobs/{first}\"")).unwrap();
+    let newer = lane.find(&format!("href=\"/jobs/{second}\"")).unwrap();
+    assert!(newer < older);
+}
+
+#[tokio::test]
+async fn cards_keep_the_content_of_the_old_rows() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let body = dashboard.get("/").await.body;
+    let lane = lane_html(&body, "lane-factory");
+    assert!(lane.contains(&format!("#{id}")));
+    assert!(lane.contains("Add a reboot button</a>"));
+    assert!(lane.contains("class=\"badge factory\">queued"));
+    assert!(lane.contains("maestro · "));
+    assert!(lane.contains("alice@example.com"));
+}
+
+#[tokio::test]
+async fn the_board_has_no_forms_or_buttons() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    let body = dashboard.get("/").await.body;
+    let board = &body[body.find("class=\"board\"").unwrap()..];
+    assert!(!board.contains("<form"));
+    assert!(!board.contains("<button"));
+}
+
+#[tokio::test]
+async fn the_board_counts_only_the_selected_projects_jobs() {
+    let dashboard = two_projects();
+    dashboard.new_job().await;
+    dashboard.post_job("tool", "Tool change", &[]).await;
+    dashboard.post_job("tool", "Another tool change", &[]).await;
+    let body = dashboard.get("/?project=tool").await.body;
+    assert!(body.contains("Factory <span class=\"count\">2</span>"));
+    let body = dashboard.get("/?project=maestro").await.body;
+    assert!(body.contains("Factory <span class=\"count\">1</span>"));
+    assert!(!body.contains("Tool change"));
 }
