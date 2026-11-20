@@ -29,7 +29,12 @@ const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
 /// The characters a header name may hold, as an HTML `pattern`, so the browser
 /// refuses `Authorization: x` before the form posts. It matches the server's
 /// `is_token_char`; the server still validates, so the pattern is only a hint.
-const HEADER_NAME_PATTERN: &str = "[A-Za-z0-9!#$%&'*+.^_`|~-]+";
+///
+/// A browser compiles `pattern` as a `RegExp` with the `v` flag, where `-` and
+/// `|` are syntax characters inside a `[...]` class and must be escaped. An
+/// invalid pattern is silently ignored, so an unescaped `|` or trailing `-`
+/// here would turn off the check with no error.
+const HEADER_NAME_PATTERN: &str = r"[A-Za-z0-9!#$%&'*+.^_`\|~\-]+";
 /// Keeps the log scroll place and a half-typed form across a poll's swap. It
 /// runs once on the job page, outside every swapped region, so a swap never
 /// re-runs or removes it.
@@ -580,8 +585,11 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
                 label for="mcp-new-name" { "Name" }
                 // The pattern and maxlength mirror `validate_name` in mcp.rs, so
                 // the browser blocks a bad name before submit. Change both together.
+                // A browser compiles `pattern` with the `v` flag, where `-` and `|`
+                // are syntax inside a `[...]` class and must be escaped; an invalid
+                // pattern is silently ignored, so the trailing `-` is written `\-`.
                 input #mcp-new-name type="text" name="name" required
-                    pattern="[a-z0-9-]{1,32}" maxlength="32"
+                    pattern=r"[a-z0-9\-]{1,32}" maxlength="32"
                     title="1 to 32 characters of a-z, 0-9 and -"
                     autocapitalize="none" autocomplete="off" spellcheck="false";
                 p.hint { "1 to 32 characters of a-z, 0-9 and -. It is the key in a run's MCP config and part of the proxy path." }

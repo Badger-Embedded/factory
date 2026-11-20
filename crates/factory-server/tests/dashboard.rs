@@ -873,10 +873,92 @@ async fn the_add_a_server_name_field_carries_the_name_rule() {
         .nth(1)
         .and_then(|rest| rest.split('>').next())
         .expect("the Add a server form has a Name input");
-    assert!(name_input.contains("pattern=\"[a-z0-9-]{1,32}\""));
+    assert!(name_input.contains("pattern=\"[a-z0-9\\-]{1,32}\""));
     assert!(name_input.contains("maxlength=\"32\""));
     assert!(name_input.contains("required"));
     assert!(name_input.contains("title="));
+}
+
+/// Collects every `pattern="..."` attribute value in a page, in order.
+fn pattern_attributes(page: &str) -> Vec<String> {
+    page.match_indices("pattern=\"")
+        .filter_map(|(start, marker)| {
+            let rest = &page[start + marker.len()..];
+            rest.split('"').next().map(str::to_owned)
+        })
+        .collect()
+}
+
+/// Reports whether every `-` or `|` inside a `[...]` class is escaped, as the
+/// `v` flag a browser compiles `pattern` with demands. A single `|` and a `-`
+/// that cannot form a range (at a class edge) are syntax under `v`; the HTML
+/// spec says to ignore an invalid pattern, so an unescaped one turns the check
+/// off with no error. A range dash (`a-z`) stays literal and is left alone.
+fn class_metachars_escaped(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '|' if in_class => return false,
+            '-' if in_class => {
+                let at_class_edge =
+                    chars.get(i - 1) == Some(&'[') || matches!(chars.get(i + 1), Some(&']') | None);
+                if at_class_edge {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
+#[tokio::test]
+async fn settings_form_patterns_are_valid_under_the_v_flag() {
+    // A browser compiles an HTML `pattern` as a RegExp with the `v` flag, where
+    // an unescaped `-` or `|` inside a `[...]` class is a syntax error. An
+    // invalid pattern is silently ignored, so it would stop blocking bad input
+    // with no visible sign. Every pattern the Settings page renders (the server
+    // name, and the header name on the add form and each server's edit form)
+    // must escape those. This fails against the #96 patterns `[a-z0-9-]{1,32}`
+    // and `[A-Za-z0-9!#$%&'*+.^_`|~-]+`.
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/mcp",
+            "name=context7&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=Authorization",
+        )
+        .await;
+    let page = dashboard.get("/settings").await.body;
+    let patterns = pattern_attributes(&page);
+    // The name input and at least one header input (add form plus the edit form
+    // of the server just saved) render a pattern.
+    assert!(patterns.len() >= 2, "patterns rendered: {patterns:?}");
+    for pattern in &patterns {
+        assert!(
+            class_metachars_escaped(pattern),
+            "pattern leaves a `-` or `|` unescaped inside a class: {pattern}"
+        );
+    }
+}
+
+#[test]
+fn class_metachars_escaped_catches_the_pr_96_patterns() {
+    // The #96 patterns this test must reject, and the fixed forms it must pass.
+    assert!(!class_metachars_escaped("[a-z0-9-]{1,32}"));
+    assert!(!class_metachars_escaped("[A-Za-z0-9!#$%&'*+.^_`|~-]+"));
+    assert!(class_metachars_escaped(r"[a-z0-9\-]{1,32}"));
+    assert!(class_metachars_escaped(r"[A-Za-z0-9!#$%&'*+.^_`\|~\-]+"));
+    // A range dash stays literal and is not flagged.
+    assert!(class_metachars_escaped("[a-z0-9]+"));
 }
 
 #[test]
@@ -4427,7 +4509,9 @@ async fn the_add_server_form_has_header_name_rows_not_a_textarea() {
     // with an "Add header" button, and no textarea or `headers` field remains.
     assert!(page.contains(r#"name="header""#));
     assert!(page.contains("Add header"));
-    assert!(page.contains("pattern="));
+    // The header-name pattern escapes `|` and the trailing `-`, as the `v` flag
+    // a browser compiles it with requires.
+    assert!(page.contains(r"\|~\-]+"));
     assert!(!page.contains(r#"name="headers""#));
     assert!(!page.contains("<textarea id=\"mcp-new-headers\""));
 }
