@@ -734,3 +734,76 @@ fn a_fix_run_keeps_its_short_prompt() {
         prompt(&task, Expect::Commits)
     );
 }
+
+#[test]
+fn a_fix_ci_run_may_end_with_rerun_ci() {
+    let stage = Stage::CiAndReview { pr: 0 };
+    let fix_ci = Task::FixCi { log: "log".into() };
+    let expect = Expect::for_task(&stage, &fix_ci).unwrap();
+    assert_eq!(expect, Expect::FixCi);
+    assert_eq!(
+        Expect::for_task(
+            &stage,
+            &Task::Revise {
+                feedback: "x".into()
+            }
+        ),
+        Some(Expect::Commits)
+    );
+    assert_eq!(
+        event_from_result(
+            expect,
+            &result(Some(
+                json!({"outcome": "rerun_ci", "reason": "the runner lost its network"})
+            ))
+        ),
+        Event::Agent(AgentResult::RerunCi {
+            reason: "the runner lost its network".into()
+        })
+    );
+}
+
+#[test]
+fn rerun_ci_fails_a_run_that_is_not_fix_ci() {
+    let output = json!({"outcome": "rerun_ci", "reason": "flaky"});
+    for expect in [Expect::Clarify, Expect::Spec, Expect::Plan, Expect::Commits] {
+        let reason = failure_reason(event_from_result(expect, &result(Some(output.clone()))));
+        assert!(reason.contains("\"rerun_ci\""), "{reason}");
+    }
+}
+
+#[test]
+fn rerun_ci_needs_a_reason() {
+    for output in [
+        json!({"outcome": "rerun_ci"}),
+        json!({"outcome": "rerun_ci", "reason": "  "}),
+    ] {
+        let reason = failure_reason(event_from_result(Expect::FixCi, &result(Some(output))));
+        assert!(reason.contains("no reason"), "{reason}");
+    }
+}
+
+#[test]
+fn only_the_fix_ci_schema_lists_rerun_ci() {
+    let schema = Expect::FixCi.schema();
+    assert_eq!(
+        schema["properties"]["outcome"]["enum"],
+        json!(["questions", "commits_ready", "rerun_ci"])
+    );
+    assert!(schema["properties"]["reason"].is_object());
+    assert!(schema["properties"]["pull_request"].is_object());
+    let commits = Expect::Commits.schema();
+    assert_eq!(
+        commits["properties"]["outcome"]["enum"],
+        json!(["questions", "commits_ready"])
+    );
+    assert!(commits["properties"].get("reason").is_none());
+}
+
+#[test]
+fn the_fix_ci_prompt_says_when_to_rerun() {
+    let text = prompt(&Task::FixCi { log: "boom".into() }, Expect::FixCi);
+    assert!(text.contains("boom"));
+    assert!(text.contains("\"rerun_ci\""));
+    assert!(text.contains("\"commits_ready\""));
+}

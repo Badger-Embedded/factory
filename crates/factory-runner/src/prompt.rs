@@ -50,7 +50,13 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
              Fix the failures and commit."
         ),
         Task::FixCi { log } => {
-            format!("CI failed on the pull request:\n\n{log}\n\nFix the failure and commit.")
+            format!(
+                "CI failed on the pull request:\n\n{log}\n\n\
+                 If the failure comes from the code, fix it and commit. If the log shows a \
+                 failure unrelated to this branch, such as a flaky test or a network error, \
+                 and there is nothing to commit, end with outcome \"rerun_ci\" and a reason \
+                 that cites the log. The factory then reruns the failed CI runs."
+            )
         }
         Task::Rebase { base } => format!(
             "The pull request no longer merges cleanly into {base}. The factory fetched \
@@ -64,7 +70,8 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
              Address them and commit."
         ),
     };
-    let [questions, done] = expect.outcomes();
+    let outcomes = expect.outcomes();
+    let (questions, done) = (outcomes[0], outcomes[1]);
     let _ = write!(
         text,
         "\n\nEnd the run with the structured output. Use outcome \"{done}\" when the task is \
