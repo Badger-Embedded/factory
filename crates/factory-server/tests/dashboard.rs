@@ -726,8 +726,10 @@ async fn the_job_page_links_a_numbered_pull_request() {
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(
         page.body
-            .contains(r#"<a href="https://github.com/Badger-Embedded/maestro/pull/7">#7</a>"#)
+            .contains(r#"<a href="https://github.com/Badger-Embedded/maestro/pull/7" target="_blank" rel="noopener noreferrer">#7</a>"#)
     );
+    assert_eq!(page.body.matches("target=").count(), 1);
+    assert_eq!(page.body.matches("noopener").count(), 1);
 }
 
 #[tokio::test]

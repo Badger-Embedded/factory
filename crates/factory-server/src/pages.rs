@@ -548,7 +548,7 @@ pub fn job(
                                 @if let Some(number) = pr.number {
                                     " · "
                                     @if let Some(url) = &repo_url {
-                                        a href={ (url) "/pull/" (number) } { "#" (number) }
+                                        a href={ (url) "/pull/" (number) } target="_blank" rel="noopener noreferrer" { "#" (number) }
                                     } @else {
                                         "#" (number)
                                     }
