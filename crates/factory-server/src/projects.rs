@@ -43,6 +43,10 @@ pub struct Project {
     /// replaces it. Off by default.
     #[serde(default)]
     pub auto_merge: bool,
+    /// The default for the LLM review before merge. A saved settings row
+    /// replaces it. Off by default.
+    #[serde(default)]
+    pub llm_review: bool,
 }
 
 #[derive(Debug, Clone, Default)]

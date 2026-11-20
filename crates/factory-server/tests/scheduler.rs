@@ -170,6 +170,7 @@ fn setup(
             checks: Some("just lint".into()),
             models: factory_server::StageModels::default(),
             auto_merge: false,
+            llm_review: false,
         },
     )]
     .into_iter()
@@ -758,6 +759,7 @@ async fn a_project_without_checks_publishes_unchecked() {
             checks: None,
             models: factory_server::StageModels::default(),
             auto_merge: false,
+            llm_review: false,
         },
     )]
     .into_iter()
@@ -828,6 +830,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
                     checks: Some("just lint".into()),
                     models: factory_server::StageModels::default(),
                     auto_merge: false,
+                    llm_review: false,
                 },
             )]
             .into_iter()
@@ -1362,6 +1365,7 @@ async fn a_project_does_not_use_the_models_of_another() {
         checks: None,
         models: factory_server::StageModels::default(),
         auto_merge: false,
+        llm_review: false,
     };
     let projects: Projects = [
         ("maestro".to_owned(), project("Badger-Embedded/maestro")),
@@ -1551,6 +1555,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
             checks: None,
             models: factory_server::StageModels::default(),
             auto_merge: false,
+            llm_review: false,
         },
     )]
     .into_iter()

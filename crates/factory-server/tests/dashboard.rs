@@ -699,6 +699,91 @@ async fn auto_merge_is_a_per_project_setting() {
 }
 
 #[tokio::test]
+async fn llm_review_is_a_per_project_setting() {
+    let dashboard = dashboard();
+    // The per-project form carries the review toggle.
+    let page = dashboard.get("/settings").await;
+    assert!(page.body.contains("name=\"llm_review\""));
+    assert!(
+        !dashboard
+            .store
+            .project_llm_review("maestro", false)
+            .unwrap()
+    );
+
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&llm_review=on",
+        )
+        .await;
+    assert!(
+        dashboard
+            .store
+            .project_llm_review("maestro", false)
+            .unwrap()
+    );
+
+    // Saving again without the checkbox clears it.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=",
+        )
+        .await;
+    assert!(!dashboard.store.project_llm_review("maestro", true).unwrap());
+}
+
+#[tokio::test]
+async fn the_form_saves_auto_merge_and_review_together_and_leaves_other_projects_alone() {
+    let dashboard = two_projects();
+    // maestro gets both flags on, tool is left untouched.
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&auto_merge=on&llm_review=on",
+        )
+        .await;
+    assert!(
+        dashboard
+            .store
+            .project_auto_merge("maestro", false)
+            .unwrap()
+    );
+    assert!(
+        dashboard
+            .store
+            .project_llm_review("maestro", false)
+            .unwrap()
+    );
+    // Saving maestro wrote no row for tool: it still reads its defaults.
+    assert!(!dashboard.store.project_auto_merge("tool", false).unwrap());
+    assert!(!dashboard.store.project_llm_review("tool", false).unwrap());
+
+    // Turning tool's review on leaves maestro's flags as they were.
+    dashboard
+        .post(
+            "/settings/projects/tool",
+            "clarify=&spec=&plan=&implement=&review=&llm_review=on",
+        )
+        .await;
+    assert!(dashboard.store.project_llm_review("tool", false).unwrap());
+    assert!(!dashboard.store.project_auto_merge("tool", true).unwrap());
+    assert!(
+        dashboard
+            .store
+            .project_auto_merge("maestro", false)
+            .unwrap()
+    );
+    assert!(
+        dashboard
+            .store
+            .project_llm_review("maestro", false)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn bad_settings_are_rejected_and_not_saved() {
     let dashboard = dashboard();
     let before = dashboard.store.settings().unwrap();
@@ -2145,6 +2230,82 @@ fn a_project_file_sets_the_auto_merge_default() {
     assert!(store.project_auto_merge("x", true).unwrap());
     store.save_project_auto_merge("x", false).unwrap();
     assert!(!store.project_auto_merge("x", true).unwrap());
+}
+
+#[test]
+fn project_llm_review_defaults_off_and_a_saved_row_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let store = Store::open(&path).unwrap();
+        // No row yet: the project file default decides.
+        assert!(!store.project_llm_review("maestro", false).unwrap());
+        assert!(store.project_llm_review("maestro", true).unwrap());
+        store.save_project_settings("maestro", false, true).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    // A saved row replaces the default, whichever way the default points.
+    assert!(store.project_llm_review("maestro", false).unwrap());
+    store
+        .save_project_settings("maestro", false, false)
+        .unwrap();
+    assert!(!store.project_llm_review("maestro", true).unwrap());
+    // Each project keeps its own value.
+    assert!(!store.project_llm_review("other", false).unwrap());
+}
+
+#[test]
+fn the_two_project_flags_are_stored_and_read_independently() {
+    let store = Store::open_in_memory().unwrap();
+    store.save_project_settings("maestro", true, false).unwrap();
+    assert!(store.project_auto_merge("maestro", false).unwrap());
+    assert!(!store.project_llm_review("maestro", true).unwrap());
+
+    store.save_project_settings("maestro", false, true).unwrap();
+    assert!(!store.project_auto_merge("maestro", true).unwrap());
+    assert!(store.project_llm_review("maestro", false).unwrap());
+}
+
+#[test]
+fn a_project_file_sets_the_llm_review_default() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(
+        dir.path(),
+        "x",
+        "repo = \"a/b\"\nbase = \"main\"\nllm_review = true\n",
+    );
+    let projects = Projects::load(dir.path()).unwrap();
+    assert!(projects.get("x").unwrap().llm_review);
+
+    let store = Store::open_in_memory().unwrap();
+    assert!(store.project_llm_review("x", true).unwrap());
+    store.save_project_settings("x", false, false).unwrap();
+    assert!(!store.project_llm_review("x", true).unwrap());
+}
+
+/// A database written before the `llm_review` column existed: `init` adds the
+/// column and every project reads off.
+#[test]
+fn an_old_project_settings_table_gains_the_llm_review_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE project_settings (project TEXT PRIMARY KEY, auto_merge INTEGER NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_settings (project, auto_merge) VALUES ('maestro', 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    // The saved auto-merge survives and review reads off for the old row.
+    assert!(store.project_auto_merge("maestro", false).unwrap());
+    assert!(!store.project_llm_review("maestro", true).unwrap());
 }
 
 /// An old settings record with the global `auto_merge` on, as written before

@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS project_models (
 );
 CREATE TABLE IF NOT EXISTS project_settings (
     project TEXT PRIMARY KEY,
-    auto_merge INTEGER NOT NULL
+    auto_merge INTEGER NOT NULL DEFAULT 0,
+    llm_review INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
@@ -173,6 +174,20 @@ impl Store {
         )?;
         if has_review == 0 {
             conn.execute("ALTER TABLE project_models ADD COLUMN review TEXT", [])?;
+        }
+        // `llm_review` joined `project_settings` after auto-merge shipped, so
+        // add it to a table that predates it. A fresh database already has the
+        // column from SCHEMA. The default is off, so existing projects stay off.
+        let has_llm_review: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('project_settings') WHERE name = 'llm_review'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_llm_review == 0 {
+            conn.execute(
+                "ALTER TABLE project_settings ADD COLUMN llm_review INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         Ok(Store {
             conn: Mutex::new(conn),
@@ -541,6 +556,47 @@ impl Store {
             "INSERT INTO project_settings (project, auto_merge) VALUES (?1, ?2)
              ON CONFLICT (project) DO UPDATE SET auto_merge = excluded.auto_merge",
             params![project, auto_merge],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `project` runs an LLM review before merge, or `default` when no
+    /// row is saved. A saved row replaces the project file default.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_llm_review(&self, project: &str, default: bool) -> Result<bool, StoreError> {
+        let stored = self
+            .conn()
+            .query_row(
+                "SELECT llm_review FROM project_settings WHERE project = ?1",
+                [project],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.unwrap_or(default))
+    }
+
+    /// Saves a project's auto-merge and LLM-review flags together, so the one
+    /// settings form writes the whole row. A saved row replaces the project
+    /// file defaults as a whole.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_settings(
+        &self,
+        project: &str,
+        auto_merge: bool,
+        llm_review: bool,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO project_settings (project, auto_merge, llm_review)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (project) DO UPDATE SET auto_merge = excluded.auto_merge,
+                llm_review = excluded.llm_review",
+            params![project, auto_merge, llm_review],
         )?;
         Ok(())
     }
