@@ -47,6 +47,7 @@ fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
         workspace: dir.join("work"),
         claude_dir: dir.join("claude"),
         session,
+        token: "sk-ant-oat01-token".into(),
         expect: Expect::Spec,
         prompt: "Write the spec.".into(),
         model: None,
@@ -66,16 +67,18 @@ fn value_after<'a>(args: &'a [String], flag: &str) -> &'a str {
     &args[index + 1]
 }
 
-/// A podman stand-in that records its arguments, prints `stdout`, writes
-/// `stderr` and exits with `code`.
+/// A podman stand-in that records its arguments and the Claude token from its
+/// environment, prints `stdout`, writes `stderr` and exits with `code`.
 fn fake_podman(dir: &Path, stdout: &Path, stderr: &str, code: i32) -> PathBuf {
     let script = dir.join("podman");
     let args = dir.join("args");
+    let token = dir.join("token");
     fs::write(
         &script,
         format!(
-            "#!/bin/bash\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\nprintf '%s' '{stderr}' >&2\nexit {code}\n",
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' \"$CLAUDE_CODE_OAUTH_TOKEN\" > '{}'\ncat '{}'\nprintf '%s' '{stderr}' >&2\nexit {code}\n",
             args.display(),
+            token.display(),
             stdout.display()
         ),
     )
@@ -334,9 +337,13 @@ fn podman_args_give_the_worker_its_token_limits_and_mounts() {
     assert_eq!(value_after(&args, "--name"), "factory-job-7-run-3");
     assert_eq!(value_after(&args, "--memory"), "3g");
     assert_eq!(value_after(&args, "--cpus"), "4");
-    assert_eq!(
-        value_after(&args, "--secret"),
-        "claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN"
+    // The token passes through podman's environment, named by an `--env` with no
+    // value. It is never a `--secret` and never appears in the arguments.
+    assert_eq!(value_after(&args, "--env"), "CLAUDE_CODE_OAUTH_TOKEN");
+    assert!(!args.iter().any(|arg| arg == "--secret"));
+    assert!(
+        !args.iter().any(|arg| arg.contains("sk-ant-oat01-token")),
+        "the token must not appear in the arguments"
     );
     for volume in [
         "/jobs/7/work:/work",
@@ -420,6 +427,32 @@ async fn a_finished_run_reports_its_event_session_cost_and_log() {
 }
 
 #[tokio::test]
+async fn the_token_reaches_the_worker_environment_not_its_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &fixture("spec-run.jsonl"), "", 0),
+        ..WorkerConfig::default()
+    };
+    let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
+    worker.token = "sk-ant-oat01-secret".into();
+
+    run(&config, &worker, |_| {}).await;
+
+    // podman saw the token in its environment, so it passes it to the container,
+    // but the token is in none of the arguments.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("token")).unwrap(),
+        "sk-ant-oat01-secret"
+    );
+    let args = fs::read_to_string(dir.path().join("args")).unwrap();
+    assert!(
+        !args.contains("sk-ant-oat01-secret"),
+        "the token must not appear in the arguments: {args}"
+    );
+    assert!(args.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+}
+
+#[tokio::test]
 async fn a_run_reports_each_mcp_server_the_init_line_shows_as_not_connected() {
     let dir = tempfile::tempdir().unwrap();
     let config = WorkerConfig {
@@ -454,7 +487,7 @@ async fn a_worker_that_dies_without_a_result_fails_with_its_stderr() {
         podman: fake_podman(
             dir.path(),
             &empty,
-            "Error: no secret with name or id \"claude-token\"",
+            "Error: short-name resolution enforced but cannot prompt without a TTY",
             125,
         ),
         ..WorkerConfig::default()
@@ -469,7 +502,7 @@ async fn a_worker_that_dies_without_a_result_fails_with_its_stderr() {
 
     let reason = failure_reason(report.event);
     assert!(reason.contains("125"), "{reason}");
-    assert!(reason.contains("no secret with name"), "{reason}");
+    assert!(reason.contains("short-name resolution"), "{reason}");
     assert_eq!(report.session_id, None);
 }
 
@@ -1099,10 +1132,8 @@ fn a_review_worker_passes_the_model_and_gets_no_github_token() {
     assert_eq!(value_after(&args, "--model"), "opus");
     let schema: Value = serde_json::from_str(value_after(&args, "--json-schema")).unwrap();
     assert_eq!(schema, Expect::Review.schema());
-    assert_eq!(
-        value_after(&args, "--secret"),
-        "claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN"
-    );
+    assert_eq!(value_after(&args, "--env"), "CLAUDE_CODE_OAUTH_TOKEN");
+    assert!(!args.iter().any(|arg| arg == "--secret"));
     assert!(
         !args
             .iter()

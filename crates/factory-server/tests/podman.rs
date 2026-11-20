@@ -1,0 +1,99 @@
+//! Tests for the podman executor's token gate: a run with no resolvable token
+//! fails with "no Claude token is set" before it prepares a checkout or starts
+//! a container, and a token saved between runs reaches the next run with no
+//! restart. The failure keeps the task as its retry target, so the Retry button
+//! reruns it; that core behaviour is covered in factory-core's job-flow tests.
+//!
+//! The store runs in memory and no podman runs: the token gate returns before
+//! any container, and the follow-on run fails at the checkout because git
+//! points at a missing binary.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use factory_core::Event;
+use factory_runner::{Expect, Git, GitHub, WorkerConfig};
+use factory_server::{
+    AgentRequest, ClaudeToken, Executor, LocalSecrets, MASTER_KEY_LEN, PodmanExecutor, SecretStore,
+    Settings, Store,
+};
+
+fn executor(token: Arc<ClaudeToken>, data_dir: PathBuf) -> PodmanExecutor {
+    PodmanExecutor {
+        base: WorkerConfig::default(),
+        // A missing git binary makes the checkout step fail, so a run that gets
+        // past the token gate fails there with a different reason.
+        git: Git {
+            git: PathBuf::from("/nonexistent/git"),
+            ..Git::default()
+        },
+        github: GitHub::default(),
+        data_dir,
+        token,
+    }
+}
+
+fn request() -> AgentRequest {
+    AgentRequest {
+        job_id: 7,
+        repo: "owner/name".into(),
+        base: "main".into(),
+        branch: None,
+        session_id: "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10".into(),
+        expect: Expect::Spec,
+        prompt: "Write the spec.".into(),
+        model: None,
+        effort: None,
+        mcp: None,
+    }
+}
+
+fn reason(report: factory_runner::RunReport) -> String {
+    match report.event {
+        Event::AgentFailed { reason } => reason,
+        other => panic!("expected AgentFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_run_with_no_token_fails_before_any_container() {
+    let store = Arc::new(Store::open_in_memory().expect("open store"));
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    let token = Arc::new(ClaudeToken::new(secrets, None));
+    let data_dir = tempfile::tempdir().unwrap();
+    let executor = executor(token, data_dir.path().to_path_buf());
+
+    let report = executor
+        .run_agent(&Settings::default(), request(), Box::new(|_| {}))
+        .await;
+
+    assert_eq!(reason(report), "no Claude token is set");
+    // The gate returns before the checkout is prepared, so no job directory and
+    // no container were created.
+    assert!(!data_dir.path().join("jobs").join("7").exists());
+}
+
+#[tokio::test]
+async fn a_token_saved_between_runs_reaches_the_next_run() {
+    let store = Arc::new(Store::open_in_memory().expect("open store"));
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    let token = Arc::new(ClaudeToken::new(Arc::clone(&secrets), None));
+    let data_dir = tempfile::tempdir().unwrap();
+    let executor = executor(Arc::clone(&token), data_dir.path().to_path_buf());
+
+    // No token yet: the run fails at the gate.
+    let first = executor
+        .run_agent(&Settings::default(), request(), Box::new(|_| {}))
+        .await;
+    assert_eq!(reason(first), "no Claude token is set");
+
+    // Save a token, as the settings page would. The next run resolves it, gets
+    // past the gate, and fails later at the checkout instead.
+    secrets.set_claude_token("sk-ant-oat01-saved").unwrap();
+    let second = executor
+        .run_agent(&Settings::default(), request(), Box::new(|_| {}))
+        .await;
+    assert_ne!(reason(second), "no Claude token is set");
+}

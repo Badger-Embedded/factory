@@ -70,6 +70,20 @@ fn git_config() -> Git {
     }
 }
 
+fn worker_base(network: Option<String>) -> WorkerConfig {
+    WorkerConfig {
+        podman: path_var("FACTORY_PODMAN", "podman"),
+        plugin_dir: env::var_os("FACTORY_PLUGIN_DIR").map(PathBuf::from),
+        volumes: env::var("FACTORY_WORKER_VOLUMES")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        network,
+        ..WorkerConfig::default()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
@@ -142,17 +156,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut slots = Arc::new(WorkerSlots::new());
     if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {
         let executor = PodmanExecutor {
-            base: WorkerConfig {
-                podman: path_var("FACTORY_PODMAN", "podman"),
-                plugin_dir: env::var_os("FACTORY_PLUGIN_DIR").map(PathBuf::from),
-                volumes: env::var("FACTORY_WORKER_VOLUMES")
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect(),
-                network: worker_network.clone(),
-                ..WorkerConfig::default()
-            },
+            base: worker_base(worker_network.clone()),
             git: git_config(),
             github: GitHub {
                 gh: path_var("FACTORY_GH", "gh"),
@@ -160,6 +164,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ..GitHub::default()
             },
             data_dir: data_dir.clone(),
+            token: Arc::clone(&claude_token),
         };
         let scheduler = Scheduler::new(
             Arc::clone(&store),

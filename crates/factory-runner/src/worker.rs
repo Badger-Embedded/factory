@@ -36,8 +36,6 @@ pub struct WorkerConfig {
     pub image: String,
     pub memory: String,
     pub cpus: String,
-    /// The podman secret that holds the token from `claude setup-token`.
-    pub token_secret: String,
     /// The factory plugin on the host, mounted read-only.
     pub plugin_dir: Option<PathBuf>,
     /// More `--volume` values for every worker, such as a named volume for
@@ -58,7 +56,6 @@ impl Default for WorkerConfig {
             image: "localhost/factory-worker:latest".into(),
             memory: "3g".into(),
             cpus: "4".into(),
-            token_secret: "claude-token".into(),
             plugin_dir: None,
             volumes: Vec::new(),
             network: None,
@@ -179,6 +176,13 @@ pub struct WorkerRun {
     /// session files between runs, so `--resume` finds them.
     pub claude_dir: PathBuf,
     pub session: SessionRun,
+    /// The Claude subscription token the factory resolved when this run
+    /// started. [`run`] sets it as `CLAUDE_CODE_OAUTH_TOKEN` in the podman
+    /// process environment and [`podman_args`] passes `--env
+    /// CLAUDE_CODE_OAUTH_TOKEN` with no value, so the token never appears in the
+    /// `podman` arguments, the job log or an error message. A token saved on the
+    /// settings page reaches the next run this way, with no factory restart.
+    pub token: String,
     pub expect: Expect,
     pub prompt: String,
     /// The value for `claude --model`. `None` and an empty string pass no
@@ -230,11 +234,11 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
         &config.memory,
         "--cpus",
         &config.cpus,
-        "--secret",
-        &format!(
-            "{},type=env,target=CLAUDE_CODE_OAUTH_TOKEN",
-            config.token_secret
-        ),
+        // Pass the Claude token through from the podman process environment,
+        // where `run` sets it, with no value here. The token then stays out of
+        // the arguments, the job log and any error message.
+        "--env",
+        "CLAUDE_CODE_OAUTH_TOKEN",
         "--env",
         &format!("CLAUDE_CONFIG_DIR={CLAUDE_DIR}"),
         "--workdir",
@@ -329,6 +333,10 @@ pub async fn run(
     };
     let mut child = match Command::new(&config.podman)
         .args(podman_args(config, run))
+        // The token reaches the container through podman's own environment and
+        // the `--env CLAUDE_CODE_OAUTH_TOKEN` pass-through, not as an argument,
+        // so it is absent from the process list.
+        .env("CLAUDE_CODE_OAUTH_TOKEN", &run.token)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
