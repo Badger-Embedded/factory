@@ -140,6 +140,11 @@ impl From<serde_json::Error> for McpError {
 
 /// Checks a server name against `[a-z0-9-]{1,32}`.
 ///
+/// The "Add a server" form carries the same rule as an HTML `pattern` on
+/// `#mcp-new-name` in pages.rs, so the browser blocks a bad name before
+/// submit. Change both together. This check stays the authority: a name from
+/// curl or a stale page that skips the browser still gets rejected here.
+///
 /// # Errors
 ///
 /// Returns [`McpError::BadName`] when the name is empty, longer than 32

@@ -807,6 +807,23 @@ async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
     assert_eq!(created.status, StatusCode::SEE_OTHER);
 }
 
+#[tokio::test]
+async fn the_add_a_server_name_field_carries_the_name_rule() {
+    // The browser blocks a bad name before submit; the attributes must mirror
+    // `validate_name` in mcp.rs, which stays the server-side authority.
+    let dashboard = dashboard();
+    let body = dashboard.get("/settings").await.body;
+    let name_input = body
+        .split("id=\"mcp-new-name\"")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .expect("the Add a server form has a Name input");
+    assert!(name_input.contains("pattern=\"[a-z0-9-]{1,32}\""));
+    assert!(name_input.contains("maxlength=\"32\""));
+    assert!(name_input.contains("required"));
+    assert!(name_input.contains("title="));
+}
+
 #[test]
 fn settings_default_until_saved() {
     let store = Store::open_in_memory().unwrap();
