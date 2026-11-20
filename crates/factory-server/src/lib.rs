@@ -12,7 +12,9 @@ mod usage;
 mod web;
 
 pub use cost::{format_cost, merge_fraction};
-pub use github::{BranchInfo, GhRepos, GitHubRepos, Permission, RepoInfo, RepoReport, check_repo};
+pub use github::{
+    BranchInfo, GhRepos, GitHubRepos, Permission, RepoChecker, RepoInfo, RepoReport, check_repo,
+};
 pub use podman::PodmanExecutor;
 pub use projects::{ImportError, Project, Projects, StageModels, import_tomls};
 pub use scheduler::{

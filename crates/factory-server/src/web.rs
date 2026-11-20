@@ -14,6 +14,7 @@ use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
+use crate::github::{RepoChecker, RepoReport};
 use crate::pages;
 use crate::projects::{Project, Projects, StageModels};
 use crate::settings::Settings;
@@ -44,18 +45,21 @@ struct AppState {
     wake: Arc<Notify>,
     data_dir: PathBuf,
     plan_usage: Arc<PlanUsageCache>,
+    github: Arc<dyn RepoChecker>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
 /// job loop looks at the job right away. Uploaded images go under
 /// `<data_dir>/jobs/<id>/images/`. The index page reads `plan_usage` from the
 /// cache the refresh task fills, so it makes no live call to the usage source.
+/// The onboarding wizard runs its repository checks through `github`.
 pub fn app(
     store: Arc<Store>,
     projects: Arc<Projects>,
     wake: Arc<Notify>,
     data_dir: PathBuf,
     plan_usage: Arc<PlanUsageCache>,
+    github: Arc<dyn RepoChecker>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -65,6 +69,7 @@ pub fn app(
         .route("/fragments/board", get(board_fragment))
         .route("/style.css", get(stylesheet))
         .route("/htmx.min.js", get(htmx))
+        .route("/onboard", get(show_onboard).post(submit_onboard))
         .route(
             "/jobs",
             post(create_job).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
@@ -85,6 +90,7 @@ pub fn app(
             wake,
             data_dir,
             plan_usage,
+            github,
         })
 }
 
@@ -722,6 +728,185 @@ async fn save_settings(
     state.store.save_settings(&settings)?;
     state.wake.notify_one();
     settings_page(&state, &headers, Some("Saved."))
+}
+
+/// The base branch an empty field defaults to.
+const DEFAULT_BASE: &str = "main";
+
+#[derive(Deserialize)]
+struct OnboardForm {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    base: String,
+    #[serde(default)]
+    checks: String,
+    // Step 2, optional. Empty means the stage runs on the default model.
+    #[serde(default)]
+    clarify: String,
+    #[serde(default)]
+    spec: String,
+    #[serde(default)]
+    plan: String,
+    #[serde(default)]
+    implement: String,
+    #[serde(default)]
+    review: String,
+    /// Checkboxes: present when ticked.
+    auto_merge: Option<String>,
+    llm_review: Option<String>,
+    /// The button that was pressed: `check`, `create` or `skip`.
+    #[serde(default)]
+    action: String,
+}
+
+async fn show_onboard(headers: HeaderMap) -> Markup {
+    let view = pages::OnboardView {
+        name: "",
+        repo: "",
+        base: DEFAULT_BASE,
+        checks: "",
+        models: &StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    };
+    pages::onboard(&user(&headers), &view, None)
+}
+
+/// Runs the checks, and on `create` or `skip` with no error, onboards the
+/// project and redirects to its board. The checks run again here, not only in
+/// the earlier `check` step, so a project is never created while a required
+/// check fails and a rejection writes no row.
+async fn submit_onboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<OnboardForm>,
+) -> Result<Response, AppError> {
+    let name = form.name.trim();
+    let repo = form.repo.trim();
+    let base_field = form.base.trim();
+    let base = if base_field.is_empty() {
+        DEFAULT_BASE
+    } else {
+        base_field
+    };
+    let checks = form.checks.trim();
+    let effective_name = onboard_name(name, repo);
+    let model = |value: &str| Some(value.trim().to_owned()).filter(|value| !value.is_empty());
+    let models = StageModels {
+        clarify: model(&form.clarify),
+        spec: model(&form.spec),
+        plan: model(&form.plan),
+        implement: model(&form.implement),
+        review: model(&form.review),
+    };
+    let auto_merge = form.auto_merge.is_some();
+    let llm_review = form.llm_review.is_some();
+
+    let mut report = onboard_report(&state, effective_name, repo, base).await?;
+
+    if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
+        let checks = (!checks.is_empty()).then_some(checks);
+        match state
+            .store
+            .create_project(effective_name, repo, base, checks)
+        {
+            Ok(()) => {
+                if form.action == "create" {
+                    if models != StageModels::default() {
+                        state.store.save_project_models(effective_name, &models)?;
+                    }
+                    if auto_merge || llm_review {
+                        state.store.save_project_settings(
+                            effective_name,
+                            auto_merge,
+                            llm_review,
+                        )?;
+                    }
+                }
+                state.wake.notify_one();
+                return Ok(
+                    Redirect::to(&format!("/?project={}", query_escape(effective_name)))
+                        .into_response(),
+                );
+            }
+            // The pre-check caught a duplicate already, but a project onboarded
+            // between the check and here would reach this. Show it like any
+            // other blocking error, so no row is written twice.
+            Err(err @ (StoreError::DuplicateName(_) | StoreError::DuplicateRepo(_))) => {
+                report.errors.push(err.to_string());
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let view = pages::OnboardView {
+        name,
+        repo,
+        base: base_field,
+        checks,
+        models: &models,
+        auto_merge,
+        llm_review,
+    };
+    Ok(pages::onboard(&user(&headers), &view, Some(&report)).into_response())
+}
+
+/// The name a project is created under: the typed name, or the repository name
+/// when the name field is empty.
+fn onboard_name<'a>(name: &'a str, repo: &'a str) -> &'a str {
+    if name.is_empty() {
+        repo.rsplit('/').next().unwrap_or(repo)
+    } else {
+        name
+    }
+}
+
+/// Whether `name` is a valid project key: non-empty, and only letters, digits,
+/// dash, underscore and dot, so it is safe in a URL path and a query.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// The repository checks plus the name and repo uniqueness rules. A GitHub call
+/// that could not run becomes a blocking error, so the operator sees it and can
+/// retry rather than the page returning a 500.
+async fn onboard_report(
+    state: &AppState,
+    name: &str,
+    repo: &str,
+    base: &str,
+) -> Result<RepoReport, AppError> {
+    let mut report = match state.github.check(repo, base).await {
+        Ok(report) => report,
+        Err(err) => RepoReport {
+            errors: vec![format!("The repository checks could not run: {err}")],
+            warnings: Vec::new(),
+        },
+    };
+    if !valid_name(name) {
+        report.errors.insert(
+            0,
+            format!(
+                "The project name {name:?} is empty or has a character other than a letter, digit, dash, underscore or dot."
+            ),
+        );
+    } else if state.store.project(name)?.is_some() {
+        report
+            .errors
+            .insert(0, format!("A project named {name:?} already exists."));
+    }
+    if state.projects.list()?.iter().any(|(_, p)| p.repo == repo) {
+        report
+            .errors
+            .push(format!("The repository {repo} is already onboarded."));
+    }
+    Ok(report)
 }
 
 async fn cancel(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Redirect, AppError> {

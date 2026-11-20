@@ -7,11 +7,13 @@
 //! identity", for why the bot holds Write and not Admin.
 //!
 //! The GitHub calls sit behind [`GitHubRepos`]. [`GhRepos`] runs `gh api` with
-//! the factory's token; tests pass a fake, so they need no network. Nothing
-//! calls [`check_repo`] yet; the onboarding wizard is a later change.
+//! the factory's token; tests pass a fake, so they need no network. The
+//! onboarding wizard holds a [`RepoChecker`], so it runs [`check_repo`] without
+//! naming the concrete GitHub type.
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 
 use serde::Deserialize;
@@ -157,6 +159,30 @@ pub async fn check_repo(
         ));
     }
     Ok(report)
+}
+
+/// Runs the onboarding checks behind a trait object, so the dashboard holds one
+/// without naming the concrete GitHub type. [`GitHubRepos`] returns
+/// `impl Future`, which a trait object cannot, so this wraps [`check_repo`] in a
+/// boxed future. Every [`GitHubRepos`] gets it, so the real [`GhRepos`] and a
+/// test fake both serve as the dashboard's checker.
+pub trait RepoChecker: Send + Sync {
+    /// As [`check_repo`].
+    fn check<'a>(
+        &'a self,
+        repo: &'a str,
+        base: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>>;
+}
+
+impl<T: GitHubRepos + Send + Sync> RepoChecker for T {
+    fn check<'a>(
+        &'a self,
+        repo: &'a str,
+        base: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
+        Box::pin(check_repo(self, repo, base))
+    }
 }
 
 /// Whether `repo` is `owner/name` with two non-empty parts and only characters

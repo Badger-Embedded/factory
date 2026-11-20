@@ -7,6 +7,7 @@ use factory_core::{
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::cost::{format_cost, merge_fraction};
+use crate::github::RepoReport;
 use crate::projects::Project;
 use crate::projects::StageModels;
 use crate::settings::Settings;
@@ -87,6 +88,7 @@ fn page(user: &str, title: &str, nav: &Markup, body: &Markup) -> Markup {
                         a.brand href="/" { span.brand-mark aria-hidden="true" {} "factory" }
                         div.topbar-end {
                             (nav)
+                            a.nav href="/onboard" { "Onboard" }
                             a.nav href="/settings" { "Settings" }
                             @if !user.is_empty() { span.user { (user) } }
                         }
@@ -169,7 +171,10 @@ pub fn index(
                 }
                 (board(&all, costs, auto_merge, selected))
             } @else {
-                div.card { p.empty { "No projects are configured." } }
+                div.card {
+                    p.empty { "No projects are configured." }
+                    p { a.nav href="/onboard" { "Onboard a project" } }
+                }
             }
         },
     )
@@ -473,6 +478,127 @@ pub fn settings(
             }
         },
     )
+}
+
+/// The values the onboarding form holds on a redraw, so a failed submit keeps
+/// what the operator typed.
+pub struct OnboardView<'a> {
+    /// The project name as typed. Empty means the repository name is used.
+    pub name: &'a str,
+    pub repo: &'a str,
+    pub base: &'a str,
+    pub checks: &'a str,
+    pub models: &'a StageModels,
+    pub auto_merge: bool,
+    pub llm_review: bool,
+}
+
+/// The onboarding wizard. Step 1 is the project, step 2 the optional models and
+/// flags. The second step appears only after the checks in `report` pass, so
+/// the operator cannot create a project the checks reject. Before the first
+/// submit `report` is `None` and only step 1 shows.
+pub fn onboard(user: &str, view: &OnboardView<'_>, report: Option<&RepoReport>) -> Markup {
+    let show_step2 = report.is_some_and(|report| report.errors.is_empty());
+    layout(
+        user,
+        "Onboard a project",
+        &html! {
+            h1 { "Onboard a project" }
+            p.meta { "The factory checks the repository as the bot before it creates anything. It creates no project while a required check fails." }
+            form.card method="post" action="/onboard" {
+                h2 { "Project" }
+                div.field {
+                    label for="repo" { "Repository" }
+                    input #repo.wide type="text" name="repo" required
+                        placeholder="owner/name" value=(view.repo);
+                    p.hint { "The GitHub repository as owner/name, such as Badger-Embedded/maestro." }
+                }
+                div.field {
+                    label for="name" { "Name" }
+                    input #name type="text" name="name" value=(view.name)
+                        placeholder="defaults to the repository name";
+                    p.hint { "The key jobs use. Letters, digits, dash, underscore and dot." }
+                }
+                div.field {
+                    label for="base" { "Base branch" }
+                    input #base type="text" name="base" value=(view.base) placeholder="main";
+                    p.hint { "The branch pull requests target. Defaults to main." }
+                }
+                div.field {
+                    label for="checks" { "Local checks command (optional)" }
+                    input #checks.wide type="text" name="checks" value=(view.checks);
+                    p.hint { "The factory runs this with bash in the worker, in the job's checkout, before it pushes, such as nix develop -c just lint && nix develop -c just test. It is separate from GitHub's CI on the pull request. Leave it empty to push without local checks." }
+                }
+                @if let Some(report) = report {
+                    (onboard_results(report))
+                }
+                @if show_step2 {
+                    h2 { "Optional settings" }
+                    p.hint { "The model each stage runs with, and the merge flags. Empty means the default. Skip to create with the defaults a project starts with." }
+                    @for (stage, value) in [
+                        ("clarify", &view.models.clarify),
+                        ("spec", &view.models.spec),
+                        ("plan", &view.models.plan),
+                        ("implement", &view.models.implement),
+                        ("review", &view.models.review),
+                    ] {
+                        div.field {
+                            label for={ "model-" (stage) } { (stage) }
+                            input id={ "model-" (stage) } type="text" name=(stage)
+                                value=(value.as_deref().unwrap_or_default());
+                        }
+                    }
+                    div.field {
+                        label.check {
+                            input type="checkbox" name="auto_merge" value="on" checked[view.auto_merge];
+                            " Merge pull requests when their checks pass"
+                        }
+                    }
+                    div.field {
+                        label.check {
+                            input type="checkbox" name="llm_review" value="on" checked[view.llm_review];
+                            " Review with an LLM before merge"
+                        }
+                    }
+                }
+                div.form-actions {
+                    @if show_step2 {
+                        button.primary name="action" value="create" { "Create project" }
+                        button name="action" value="skip" { "Skip extras and create" }
+                        button name="action" value="check" { "Re-run checks" }
+                    } @else {
+                        button.primary name="action" value="check" { "Run checks" }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// The checks panel under step 1: the required checks that failed, or a line
+/// that they passed, then any warnings, which do not block creation.
+fn onboard_results(report: &RepoReport) -> Markup {
+    html! {
+        div.checks {
+            h3 { "Checks" }
+            @if report.errors.is_empty() {
+                p.check-ok { "All required checks passed." }
+            } @else {
+                ul.check-errors {
+                    @for error in &report.errors {
+                        li { (error) }
+                    }
+                }
+            }
+            @if !report.warnings.is_empty() {
+                ul.check-warnings {
+                    @for warning in &report.warnings {
+                        li { (warning) }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn gates_line(gates: Gates) -> String {
