@@ -409,6 +409,7 @@ struct JobData {
     project: Option<Project>,
     settings: Settings,
     logs: Vec<crate::store::LogEntry>,
+    events: Vec<crate::store::JobEvent>,
     cost_usd: f64,
     models: StageModels,
     auto_merge: bool,
@@ -419,6 +420,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
     let project = state.projects.lookup(&row.project)?;
     let settings = state.store.settings()?;
     let logs = state.store.logs(id, LOG_LINES)?;
+    let events = state.store.events(id)?;
     let cost_usd = state.store.cost_usd(id)?;
     let defaults = project
         .as_ref()
@@ -434,6 +436,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         project,
         settings,
         logs,
+        events,
         cost_usd,
         models,
         auto_merge,
@@ -453,6 +456,7 @@ async fn show_job(
         data.project.as_ref(),
         &data.settings,
         &data.logs,
+        &data.events,
         &images,
         data.cost_usd,
         &data.models,
@@ -473,6 +477,7 @@ async fn job_fragment(
         data.project.as_ref(),
         &data.settings,
         &data.logs,
+        &data.events,
         data.cost_usd,
         &data.models,
         data.auto_merge,

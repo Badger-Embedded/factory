@@ -10,7 +10,8 @@ use crate::cost::{format_cost, merge_fraction};
 use crate::projects::Project;
 use crate::projects::StageModels;
 use crate::settings::Settings;
-use crate::store::{JobRow, LogEntry, ProjectTotals};
+use crate::store::{JobEvent, JobRow, LogEntry, ProjectTotals};
+use crate::timeline::timeline;
 
 pub const STYLESHEET: &str = include_str!("../static/style.css");
 /// htmx 2.0.4, vendored so the dashboard loads no script from a CDN. The
@@ -23,29 +24,6 @@ const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 /// re-runs or removes it.
 const JOB_UPDATES: &str = include_str!("../static/job-updates.js");
 
-enum Who {
-    Agent(&'static str, fn(&StageModels) -> &Option<String>),
-    Factory,
-}
-
-const STEPS: [(&str, Who); 9] = [
-    ("requested", Who::Factory),
-    (
-        "clarifying",
-        Who::Agent("clarify", |models| &models.clarify),
-    ),
-    ("spec", Who::Agent("spec", |models| &models.spec)),
-    ("plan", Who::Agent("plan", |models| &models.plan)),
-    (
-        "implementing",
-        Who::Agent("implement", |models| &models.implement),
-    ),
-    ("verifying", Who::Factory),
-    ("pr-open", Who::Factory),
-    ("ci-and-review", Who::Factory),
-    ("merged", Who::Factory),
-];
-
 /// Each live region polls its own fragment on this interval, so a state change
 /// shows without a reload.
 const POLL_TRIGGER: &str = "every 5s";
@@ -55,15 +33,6 @@ fn fragment_url(region: &str, project: &str) -> String {
         "/fragments/{region}?project={}",
         crate::web::query_escape(project)
     )
-}
-
-fn has_gate(step: &str, gates: Gates) -> bool {
-    match step {
-        "spec" => gates.spec,
-        "plan" => gates.plan,
-        "pr-open" => gates.publish,
-        _ => false,
-    }
 }
 
 fn layout(user: &str, title: &str, body: &Markup) -> Markup {
@@ -659,6 +628,7 @@ pub fn job(
     project: Option<&Project>,
     settings: &Settings,
     logs: &[LogEntry],
+    events: &[JobEvent],
     images: &[String],
     cost_usd: f64,
     models: &StageModels,
@@ -675,17 +645,23 @@ pub fn job(
         &html! {
             (job_poll(false, id, job))
             (job_header(id, row, repo_url, cost_usd))
-            (steps_region(false, job, models))
-            (status_region(false, id, job, settings, auto_merge))
-            p.meta { "Approval gates: " (gates_line(job.gates())) }
-            (request_card(id, job, images))
-            (spec_region(false, job))
-            (plan_region(false, job, repo_url))
-            (reviews_region(false, job))
-            (log_region(false, logs))
-            @if *job.turn() != Turn::Done {
-                form.footer-actions method="post" action={ "/jobs/" (id) "/cancel" } {
-                    button.danger { "Cancel job" }
+            div.job-layout {
+                div.job-now {
+                    (status_region(false, id, job, settings, auto_merge))
+                    p.meta { "Approval gates: " (gates_line(job.gates())) }
+                }
+                aside.job-side { (timeline_region(false, job, events, models)) }
+                div.job-main {
+                    (request_card(id, job, images))
+                    (spec_region(false, job))
+                    (plan_region(false, job, repo_url))
+                    (reviews_region(false, job))
+                    (log_region(false, logs))
+                    @if *job.turn() != Turn::Done {
+                        form.footer-actions method="post" action={ "/jobs/" (id) "/cancel" } {
+                            button.danger { "Cancel job" }
+                        }
+                    }
                 }
             }
             script { (PreEscaped(JOB_UPDATES)) }
@@ -708,6 +684,7 @@ pub fn job_fragment(
     project: Option<&Project>,
     settings: &Settings,
     logs: &[LogEntry],
+    events: &[JobEvent],
     cost_usd: f64,
     models: &StageModels,
     auto_merge: bool,
@@ -718,7 +695,7 @@ pub fn job_fragment(
     html! {
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd))
-        (steps_region(true, job, models))
+        (timeline_region(true, job, events, models))
         (status_region(true, row.id, job, settings, auto_merge))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
@@ -761,9 +738,12 @@ fn cost_badge(oob: bool, cost_usd: f64) -> Markup {
     }
 }
 
-fn steps_region(oob: bool, job: &Job, models: &StageModels) -> Markup {
+/// The timeline, in a region a poll swaps. It sits in the side column.
+fn timeline_region(oob: bool, job: &Job, events: &[JobEvent], models: &StageModels) -> Markup {
     html! {
-        div #job-steps hx-swap-oob=[oob.then_some("true")] { (steps(job, models)) }
+        div #job-timeline hx-swap-oob=[oob.then_some("true")] {
+            (timeline(job, events, models))
+        }
     }
 }
 
@@ -938,51 +918,6 @@ fn log_card(logs: &[LogEntry]) -> Markup {
                             span.log-at { (entry.at.get(11..).unwrap_or(&entry.at)) }
                             span.log-text { (entry.text) }
                         }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn step_index(stage: &Stage) -> Option<usize> {
-    Some(match stage {
-        Stage::Requested => 0,
-        Stage::Clarifying => 1,
-        Stage::Spec => 2,
-        Stage::Plan => 3,
-        Stage::Implementing { .. } => 4,
-        Stage::Verifying { .. } => 5,
-        Stage::PrOpen { .. } => 6,
-        Stage::CiAndReview { .. } => 7,
-        Stage::Merged => 8,
-        Stage::Cancelled | Stage::Failed { .. } => return None,
-    })
-}
-
-fn steps(job: &Job, models: &StageModels) -> Markup {
-    let Some(current) = step_index(job.stage()) else {
-        return html! {};
-    };
-    let merged = *job.stage() == Stage::Merged;
-    html! {
-        ol.steps aria-label="Job stages" {
-            @for (i, (step, who)) in STEPS.iter().enumerate() {
-                @let class = if i < current || merged { "done" } else if i == current { "current" } else { "" };
-                li class=(class) aria-current=[(i == current).then_some("step")] {
-                    span.step-name { (step) }
-                    @match who {
-                        Who::Agent(stage, model) => {
-                            span.step-tag.agent title="Agent stage and its model" {
-                                (stage) " · " (model(models).as_deref().unwrap_or("default"))
-                            }
-                        }
-                        Who::Factory => {
-                            span.step-tag.factory title="Run by the factory" { "factory" }
-                        }
-                    }
-                    @if has_gate(step, job.gates()) {
-                        span.step-tag.gate title="Waits for your approval" { "✋ approval" }
                     }
                 }
             }
@@ -1182,7 +1117,7 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
     }
 }
 
-fn task_label(task: &Task) -> &'static str {
+pub(crate) fn task_label(task: &Task) -> &'static str {
     match task {
         Task::Clarify { .. } => "reading the repository",
         Task::WriteSpec => "writing the spec",
