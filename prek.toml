@@ -76,6 +76,14 @@ entry = "actionlint"
 files = '^\.github/workflows/.*\.ya?ml$'
 
 [[repos.hooks]]
+id = "install-test"
+name = "install.sh self-test"
+language = "system"
+entry = "deploy/install-test.sh"
+files = '^deploy/(install\.sh|install-test\.sh|factory\.container)$'
+pass_filenames = false
+
+[[repos.hooks]]
 id = "tests-accompany-changes"
 name = "code changes come with tests"
 language = "system"
