@@ -561,7 +561,10 @@ pub fn job(
             }
             @if !logs.is_empty() {
                 div.card {
-                    h2 { "Log" }
+                    div.card-head {
+                        h2 { "Log" }
+                        span.log-count { (logs.len()) @if logs.len() == 1 { " line" } @else { " lines" } }
+                    }
                     ol.log {
                         @for entry in logs {
                             li class={ "log-" (entry.kind) } {
@@ -616,10 +619,16 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
     match (job.stage(), job.turn()) {
         (_, Turn::User(Ask::Answers { questions })) => html! {
             form.card.needs-you method="post" action={ "/jobs/" (id) "/answers" } {
-                h2 { "The agent has questions" }
+                div.card-head {
+                    span.badge.you { "needs you" }
+                    h2 { "The agent has questions" }
+                }
                 @for (i, question) in questions.iter().enumerate() {
                     div.question {
-                        label for={ "answer_" (i) } { (question.text) }
+                        label for={ "answer_" (i) } {
+                            span.question-number { (i + 1) }
+                            span { (question.text) }
+                        }
                         textarea id={ "answer_" (i) } name={ "answer_" (i) } required {}
                     }
                 }
@@ -634,8 +643,11 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
             };
             html! {
                 div.card.needs-you {
-                    h2 { "Review the " (what) " below" }
-                    div.row {
+                    div.card-head {
+                        span.badge.you { "needs you" }
+                        h2 { "Review the " (what) " below" }
+                    }
+                    div.row.actions {
                         form method="post" action={ "/jobs/" (id) "/approve" } {
                             button.primary { "Approve " (what) }
                         }
@@ -656,13 +668,17 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
         ) => publish_card(id, job, *pr, summary),
         (Stage::Failed { reason }, _) => html! {
             div.card.failed {
-                h2 { "Failed" }
-                p.empty { (reason) }
+                div.card-head {
+                    span.badge.bad { "failed" }
+                    h2 { "The job failed" }
+                }
+                p.failure-reason { (reason) }
             }
         },
         _ => html! {
-            div.card {
-                (turn_badge(job, settings)) " " (turn_detail(job, settings))
+            div.card.status {
+                (turn_badge(job, settings))
+                span.status-detail { (turn_detail(job, settings)) }
             }
         },
     }
@@ -794,7 +810,10 @@ fn publish_card(id: i64, job: &Job, pr: usize, summary: &BranchSummary) -> Marku
     let planned = &job.plan()[pr];
     html! {
         div.card.needs-you {
-            h2 { "Approve before the first push of PR " (pr + 1) " of " (job.plan().len()) }
+            div.card-head {
+                span.badge.you { "needs you" }
+                h2 { "Approve before the first push of PR " (pr + 1) " of " (job.plan().len()) }
+            }
             @if let Some(description) = &planned.description {
                 h3 { (description.title) }
                 pre.doc { (description.body) }
@@ -815,9 +834,9 @@ fn publish_card(id: i64, job: &Job, pr: usize, summary: &BranchSummary) -> Marku
             @if summary.diff_stat.is_empty() {
                 p.empty { "The branch changes no files." }
             } @else {
-                pre.doc { (summary.diff_stat) }
+                pre.doc.diff-stat { (summary.diff_stat) }
             }
-            div.row {
+            div.row.actions {
                 form method="post" action={ "/jobs/" (id) "/approve" } {
                     button.primary { "Approve and push" }
                 }
