@@ -114,11 +114,51 @@ pub fn index(
                 div.card { p.empty { "No projects are configured." } }
             }
             @if selected.is_some() {
-                (stats(totals))
+                div.overview {
+                    (stats(totals))
+                    (lane_counts(&all, settings))
+                }
             }
             (board(&all, costs, settings))
         },
     )
+}
+
+/// A bar list of the live jobs per lane. Done jobs are not live. The longest
+/// bar is the lane with the most jobs, and the others scale against it.
+#[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
+fn lane_counts(rows: &[&JobRow], settings: &Settings) -> Markup {
+    let counts: Vec<(Lane, usize)> = Lane::ALL
+        .into_iter()
+        .filter(|lane| *lane != Lane::Done)
+        .map(|lane| {
+            let count = rows
+                .iter()
+                .filter(|row| status(&row.job, settings).lane == lane)
+                .count();
+            (lane, count)
+        })
+        .collect();
+    let longest = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
+    html! {
+        section.card.lane-counts {
+            h2 { "Live jobs by lane" }
+            @if longest == 0 {
+                p.empty { "No live jobs." }
+            } @else {
+                ul.bars {
+                    @for (lane, count) in counts {
+                        @let width = format!("{:.1}%", count as f64 / longest as f64 * 100.0);
+                        li class={ "bar bar-" (lane.name()) } {
+                            span.bar-label { (lane.title()) }
+                            span.bar-count { (count) }
+                            span.bar-track { span.bar-fill style={ "width: " (width) } {} }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 const NO_VALUE: &str = "–";
@@ -304,6 +344,15 @@ impl Lane {
             Lane::Agent => "Agent",
             Lane::Factory => "Factory",
             Lane::Done => "Done",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Lane::You => "you",
+            Lane::Agent => "agent",
+            Lane::Factory => "factory",
+            Lane::Done => "done",
         }
     }
 
