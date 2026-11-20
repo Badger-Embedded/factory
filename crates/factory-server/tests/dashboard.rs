@@ -1220,7 +1220,7 @@ async fn the_job_page_shows_a_failed_review_run_reason() {
     assert!(page.body.contains("The review stopped before merging"));
     assert!(page.body.contains("the reviewer run timed out"));
     // A failed run records no pass, so the passes card does not render.
-    assert!(!page.body.contains("LLM review"));
+    assert!(page.body.contains("<div id=\"job-reviews\"></div>"));
 }
 
 #[tokio::test]
@@ -2794,33 +2794,44 @@ async fn models_for_an_unknown_project_are_not_saved() {
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn the_job_page_labels_each_step_as_agent_factory_or_gate() {
-    let dashboard = dashboard();
-    dashboard
-        .store
-        .save_project_models(
-            "maestro",
-            &StageModels {
-                spec: Some("opus".into()),
-                ..StageModels::default()
-            },
-        )
-        .unwrap();
-    let id = dashboard.new_job().await;
-
-    let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(page.body.contains(">spec · opus</span>"));
-    assert!(page.body.contains(">clarify · default</span>"));
-    assert!(page.body.contains(">implement · default</span>"));
-    assert!(page.body.contains("step-tag factory"));
-    assert!(page.body.contains(">factory</span>"));
-    assert_eq!(page.body.matches("step-tag gate").count(), 2);
-    assert!(page.body.contains("✋ approval"));
+/// The `<li>` of the timeline step `name`, from its opening tag to the next
+/// step's. Panics when the page has no such step.
+fn timeline_step<'a>(body: &'a str, name: &str) -> &'a str {
+    let timeline = &body[body.find("id=\"job-timeline\"").unwrap()..];
+    let label = format!("<span class=\"step-name\">{name}</span>");
+    let at = timeline.find(&label).unwrap();
+    let start = timeline[..at].rfind("<li").unwrap();
+    let end = timeline[at..]
+        .find("<li class=")
+        .map_or(timeline.len(), |end| at + end);
+    &timeline[start..end]
 }
 
 #[tokio::test]
-async fn the_implementing_step_tag_shows_the_full_model_name() {
+async fn the_timeline_marks_the_running_step_with_its_model_and_task() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_models("maestro", &models(Some("opus"), None))
+        .unwrap();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let clarifying = timeline_step(&page.body, "clarifying");
+    assert!(clarifying.contains("class=\"current\""));
+    assert!(clarifying.contains("aria-current=\"step\""));
+    assert!(clarifying.contains(">opus</span>"));
+    assert!(clarifying.contains("reading the repository"));
+    assert!(clarifying.contains("since "));
+    assert!(timeline_step(&page.body, "requested").contains("class=\"done\""));
+    assert!(timeline_step(&page.body, "spec").contains("class=\"pending\""));
+    assert_eq!(page.body.matches("step-tag gate").count(), 2);
+    assert!(page.body.contains("the planned pull requests"));
+}
+
+#[tokio::test]
+async fn the_running_step_shows_the_full_model_name() {
     let dashboard = dashboard();
     dashboard
         .store
@@ -2831,24 +2842,17 @@ async fn the_implementing_step_tag_shows_the_full_model_name() {
     dashboard.apply(id, Event::Approve);
     dashboard.apply(
         id,
-        Event::Agent(AgentResult::Plan(vec![PlannedPr {
-            title: "maestrod: add a reboot endpoint".into(),
-            summary: "POST /reboot".into(),
-            number: None,
-            description: None,
-        }])),
+        Event::Agent(AgentResult::Plan(vec![planned(
+            "maestrod: add a reboot endpoint",
+            None,
+        )])),
     );
     dashboard.post(&format!("/jobs/{id}/approve"), "").await;
-    assert_eq!(
-        dashboard.store.get(id).unwrap().job.stage(),
-        &Stage::Implementing { pr: 0 }
-    );
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(
-        page.body
-            .contains(">implement · claude-opus-4-5-20251101</span>")
-    );
+    let implementing = timeline_step(&page.body, "implementing");
+    assert!(implementing.contains(">claude-opus-4-5-20251101</span>"));
+    assert!(implementing.contains("implementing the pull request"));
 }
 
 #[tokio::test]
@@ -2863,8 +2867,124 @@ async fn a_job_without_gates_shows_no_gate_label() {
     let id = dashboard.new_job().await;
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert!(page.body.contains("step-tag agent"));
+    assert!(page.body.contains("id=\"job-timeline\""));
     assert!(!page.body.contains("step-tag gate"));
+}
+
+#[tokio::test]
+async fn an_approved_gate_shows_when_it_was_approved() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard
+        .post(&format!("/jobs/{id}/changes"), "feedback=shorter")
+        .await;
+    dashboard.apply(id, Event::Agent(AgentResult::Spec("Goal: short.".into())));
+    dashboard.post(&format!("/jobs/{id}/approve"), "").await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let spec = timeline_step(&page.body, "spec");
+    assert!(spec.contains("class=\"done\""));
+    assert!(spec.contains("✓ approved "));
+    assert!(!spec.contains("step-tag gate"));
+    assert!(spec.contains("You asked for changes"));
+    let plan = timeline_step(&page.body, "plan");
+    assert!(plan.contains("class=\"current\""));
+    assert!(plan.contains("step-tag gate"));
+}
+
+#[tokio::test]
+async fn each_planned_pull_request_has_its_own_group() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![
+            planned("store: add the table", None),
+            planned("pages: show it", None),
+        ])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.store.add_cost(id, 1.25).unwrap();
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 81 });
+    dashboard.apply(id, Event::CiFailed { log: "red".into() });
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 81 });
+    dashboard.apply(id, Event::Merged);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let timeline = &page.body[page.body.find("id=\"job-timeline\"").unwrap()..];
+    let first = timeline.find("PR 1 of 2 · #81").unwrap();
+    let second = timeline.find("PR 2 of 2").unwrap();
+    assert!(first < second);
+    // The merged pull request's group is collapsed, the running one open.
+    let groups: Vec<&str> = timeline
+        .split("<details class=\"pr-group\"")
+        .skip(1)
+        .collect();
+    assert_eq!(groups.len(), 2);
+    assert!(!groups[0].starts_with(" open"));
+    assert!(groups[0].contains("store: add the table"));
+    assert!(groups[0].contains("CI failed"));
+    assert!(groups[0].contains("$1.25"));
+    assert!(groups[1].starts_with(" open"));
+    assert!(groups[1].contains("class=\"current\""));
+}
+
+#[tokio::test]
+async fn a_failed_job_marks_the_step_it_failed_in() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let step = timeline_step(&page.body, "ci-and-review");
+    assert!(step.contains("class=\"failed\""));
+    assert!(step.contains("5 failed check or CI rounds on one pull request"));
+    assert_eq!(
+        step.matches("CI failed").count(),
+        MAX_FAILED_ROUNDS as usize
+    );
+    assert!(timeline_step(&page.body, "merged").contains("class=\"pending\""));
+}
+
+#[tokio::test]
+async fn a_job_from_before_the_history_shows_its_steps_without_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    let dashboard = dashboard_with(store);
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM job_events", [])
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let clarifying = timeline_step(&page.body, "clarifying");
+    assert!(clarifying.contains("class=\"done\""));
+    assert!(clarifying.contains("<span class=\"when\"></span>"));
+    assert!(timeline_step(&page.body, "spec").contains("class=\"current\""));
+}
+
+#[tokio::test]
+async fn the_job_fragment_swaps_the_timeline() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let reply = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert!(
+        reply
+            .body
+            .contains("<div id=\"job-timeline\" hx-swap-oob=\"true\">")
+    );
 }
 
 /// A job that failed because it used up its failed rounds while watching the

@@ -7,6 +7,7 @@ mod projects;
 mod scheduler;
 mod settings;
 mod store;
+mod timeline;
 mod usage;
 mod web;
 
