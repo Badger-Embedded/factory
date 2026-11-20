@@ -356,8 +356,24 @@ button:hover { filter: brightness(0.96); }
 .steps li.done { border-top-color: var(--ok); }
 .steps li.current { border-top-color: var(--accent); color: var(--text); font-weight: var(--weight-semibold); }
 
+.steps li { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-4); }
+.step-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.step-tag {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: var(--weight-semibold);
+  line-height: 1.6;
+  border-radius: var(--radius-pill);
+  padding: 0 var(--space-8);
+}
+.step-tag.agent { color: var(--agent); background: var(--agent-bg); }
+.step-tag.factory { color: var(--factory); background: var(--factory-bg); }
+.step-tag.gate { color: var(--you); background: var(--you-bg); }
+
 @media (max-width: 640px) {
   .steps li:not(.current) { font-size: 0; }
+  .steps li:not(.current) .step-tag { display: none; }
   .steps li.current { overflow: visible; }
 }
 
