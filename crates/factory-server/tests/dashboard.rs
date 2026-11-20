@@ -9,7 +9,7 @@ use factory_core::{
     AgentResult, Ask, BranchSummary, Event, Gates, PlannedPr, PrDescription, Question, Stage, Task,
     Turn,
 };
-use factory_server::{Projects, Store, StoreError, USER_HEADER, app};
+use factory_server::{Projects, StageModels, Store, StoreError, USER_HEADER, app};
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -1880,4 +1880,103 @@ async fn the_lane_bars_show_an_empty_state_without_live_jobs() {
     merge(&dashboard, id);
     let body = dashboard.get("/").await.body;
     assert!(body.contains("No live jobs."));
+}
+
+fn models(clarify: Option<&str>, implement: Option<&str>) -> StageModels {
+    StageModels {
+        clarify: clarify.map(str::to_owned),
+        spec: None,
+        plan: None,
+        implement: implement.map(str::to_owned),
+    }
+}
+
+#[test]
+fn project_models_are_stored_and_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let none = StageModels::default();
+    let saved = models(Some("opus"), Some("sonnet"));
+    {
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.project_models("maestro", &none).unwrap(), none);
+        store.save_project_models("maestro", &saved).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.project_models("maestro", &none).unwrap(), saved);
+    assert_eq!(store.project_models("other", &none).unwrap(), none);
+}
+
+#[test]
+fn a_project_file_sets_default_models_and_saved_models_win() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(
+        dir.path(),
+        "x",
+        "repo = \"a/b\"\nbase = \"main\"\n[models]\nclarify = \"haiku\"\nplan = \"opus\"\n",
+    );
+    let projects = Projects::load(dir.path()).unwrap();
+    let defaults = projects.get("x").unwrap().models.clone();
+    assert_eq!(defaults.clarify.as_deref(), Some("haiku"));
+    assert_eq!(defaults.plan.as_deref(), Some("opus"));
+    assert_eq!(defaults.spec, None);
+
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.project_models("x", &defaults).unwrap(), defaults);
+    let saved = models(None, Some("sonnet"));
+    store.save_project_models("x", &saved).unwrap();
+    assert_eq!(store.project_models("x", &defaults).unwrap(), saved);
+}
+
+#[tokio::test]
+async fn the_settings_page_edits_the_models_of_each_project() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/settings").await.body;
+    assert!(page.contains("action=\"/settings/projects/maestro\""));
+    for stage in ["clarify", "spec", "plan", "implement"] {
+        assert!(page.contains(&format!("name=\"{stage}\"")), "{stage}");
+    }
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=+opus+&spec=&plan=&implement=sonnet",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    assert!(reply.body.contains("value=\"opus\""));
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap(),
+        models(Some("opus"), Some("sonnet"))
+    );
+
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=",
+        )
+        .await;
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &models(Some("x"), None))
+            .unwrap(),
+        StageModels::default()
+    );
+}
+
+#[tokio::test]
+async fn models_for_an_unknown_project_are_not_saved() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/nope",
+            "clarify=a&spec=&plan=&implement=",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
 }

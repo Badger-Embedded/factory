@@ -6,6 +6,20 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// The model each stage of a job runs with. `None` means no model is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageModels {
+    #[serde(default)]
+    pub clarify: Option<String>,
+    #[serde(default)]
+    pub spec: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub implement: Option<String>,
+}
+
 /// One target repository, read from `projects/<name>/project.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +32,10 @@ pub struct Project {
     /// checkout, before it pushes. Without it, the factory pushes unchecked.
     #[serde(default)]
     pub checks: Option<String>,
+    /// Defaults for the project's models. Models saved on the settings page
+    /// replace them.
+    #[serde(default)]
+    pub models: StageModels,
 }
 
 #[derive(Debug, Clone, Default)]

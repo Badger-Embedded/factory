@@ -148,6 +148,7 @@ fn setup(
             repo: "Badger-Embedded/maestro".into(),
             base: "main".into(),
             checks: Some("just lint".into()),
+            models: factory_server::StageModels::default(),
         },
     )]
     .into_iter()
@@ -726,6 +727,7 @@ async fn a_project_without_checks_publishes_unchecked() {
             repo: "o/bare".into(),
             base: "main".into(),
             checks: None,
+            models: factory_server::StageModels::default(),
         },
     )]
     .into_iter()
@@ -794,6 +796,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
                     repo: "Badger-Embedded/maestro".into(),
                     base: "main".into(),
                     checks: Some("just lint".into()),
+                    models: factory_server::StageModels::default(),
                 },
             )]
             .into_iter()

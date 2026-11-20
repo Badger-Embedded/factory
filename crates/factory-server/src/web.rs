@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::pages;
-use crate::projects::Projects;
+use crate::projects::{Projects, StageModels};
 use crate::settings::Settings;
 use crate::store::{ProjectTotals, Store, StoreError};
 
@@ -66,6 +66,7 @@ pub fn app(
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(show_settings).post(save_settings))
+        .route("/settings/projects/{name}", post(save_project_models))
         .with_state(AppState {
             store,
             projects,
@@ -86,6 +87,7 @@ fn user(headers: &HeaderMap) -> String {
 enum AppError {
     BadRequest(String),
     Io(String),
+    UnknownProject(String),
     Store(StoreError),
 }
 
@@ -99,6 +101,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            AppError::UnknownProject(name) => (StatusCode::NOT_FOUND, format!("no project {name}")),
             AppError::Io(message) => {
                 tracing::error!("{message}");
                 (StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -408,8 +411,59 @@ async fn show_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
+    settings_page(&state, &headers, None)
+}
+
+fn settings_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
     let settings = state.store.settings()?;
-    Ok(pages::settings(&user(&headers), &settings, None))
+    let models = state
+        .projects
+        .names()
+        .map(|name| {
+            let defaults = state
+                .projects
+                .get(name)
+                .map(|project| project.models.clone())
+                .unwrap_or_default();
+            Ok((
+                name.to_owned(),
+                state.store.project_models(name, &defaults)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(pages::settings(&user(headers), &settings, &models, notice))
+}
+
+#[derive(Deserialize)]
+struct ModelsForm {
+    clarify: String,
+    spec: String,
+    plan: String,
+    implement: String,
+}
+
+async fn save_project_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<ModelsForm>,
+) -> Result<Markup, AppError> {
+    if state.projects.get(&name).is_none() {
+        return Err(AppError::UnknownProject(name));
+    }
+    let model = |value: String| Some(value.trim().to_owned()).filter(|value| !value.is_empty());
+    let models = StageModels {
+        clarify: model(form.clarify),
+        spec: model(form.spec),
+        plan: model(form.plan),
+        implement: model(form.implement),
+    };
+    state.store.save_project_models(&name, &models)?;
+    settings_page(&state, &headers, Some("Saved."))
 }
 
 #[derive(Deserialize)]
@@ -460,7 +514,7 @@ async fn save_settings(
     };
     state.store.save_settings(&settings)?;
     state.wake.notify_one();
-    Ok(pages::settings(&user(&headers), &settings, Some("Saved.")))
+    settings_page(&state, &headers, Some("Saved."))
 }
 
 async fn cancel(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Redirect, AppError> {
