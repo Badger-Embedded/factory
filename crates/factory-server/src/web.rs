@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 
 use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::github::{RepoChecker, RepoReport};
-use crate::mcp::{McpError, McpProjectSettings, McpStages};
+use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, Projects, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
@@ -119,6 +119,10 @@ pub fn app(
             get(show_mcp_server).post(edit_mcp_server),
         )
         .route("/settings/mcp/{name}/delete", post(delete_mcp_server))
+        .route(
+            "/settings/projects/{project}/mcp/{server}",
+            get(show_project_mcp).post(save_project_mcp),
+        )
         .route(
             "/settings/projects/{project}/mcp/{server}/check",
             post(check_mcp_server),
@@ -797,13 +801,44 @@ fn mcp_server_page(
     name: &str,
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
+    mcp_server_page_with(state, headers, name, notice, None, None)
+}
+
+/// A server's page, with a held-back edit or a problem to show when given.
+fn mcp_server_page_with(
+    state: &AppState,
+    headers: &HeaderMap,
+    name: &str,
+    notice: Option<&str>,
+    pending: Option<&pages::PendingEdit>,
+    problem: Option<&str>,
+) -> Result<Markup, AppError> {
     let Some(server) = state.store.mcp_server(name)? else {
         return Err(AppError::NotFound(format!("no MCP server named {name:?}")));
     };
+    let usage = state
+        .projects
+        .names()?
+        .into_iter()
+        .map(|project| {
+            let settings = server_settings(state, &project, server.clone())?;
+            Ok(pages::ServerUsage {
+                project,
+                enabled: settings.enabled,
+                stages: settings.stages,
+                headers: settings.headers,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
     Ok(pages::settings_mcp_server(
         &user(headers),
         &settings_nav(state)?,
-        &server,
+        &pages::ServerPage {
+            server: &server,
+            usage: &usage,
+            pending,
+            problem,
+        },
         notice,
     ))
 }
@@ -821,7 +856,6 @@ fn project_page(
         &user(headers),
         &settings_nav(state)?,
         &project_settings(state, name, &project)?,
-        state.secrets.available(),
         notice,
     ))
 }
@@ -837,31 +871,7 @@ fn project_settings(
         .store
         .mcp_servers()?
         .into_iter()
-        .map(|server| {
-            let saved = state.store.project_mcp(name, &server.name)?;
-            let headers = server
-                .headers
-                .iter()
-                .map(|header| {
-                    let at = SecretRef {
-                        project: name,
-                        server: &server.name,
-                        header,
-                    };
-                    Ok(HeaderState {
-                        name: header.clone(),
-                        set: state.store.has_secret(at)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, StoreError>>()?;
-            Ok(ServerSettings {
-                tools: state.store.mcp_tools(name, &server.name)?,
-                name: server.name,
-                enabled: saved.enabled,
-                stages: saved.stages,
-                headers,
-            })
-        })
+        .map(|server| server_settings(state, name, server))
         .collect::<Result<Vec<_>, StoreError>>()?;
     Ok(ProjectSettings {
         name: name.to_owned(),
@@ -999,54 +1009,6 @@ async fn save_project_models(
         review: form.effort("review_effort"),
     };
 
-    // Read and check every server's MCP settings before any write, so a bad
-    // submit leaves every table as it was. An enabled server needs a stage, and
-    // a header value cannot be set while the secret store is unavailable.
-    let servers = state.store.mcp_servers()?;
-    let mut saves = Vec::new();
-    for server in servers {
-        let base = format!("mcp.{}", server.name);
-        let settings = McpProjectSettings {
-            enabled: form.ticked(&format!("{base}.enabled")),
-            stages: McpStages {
-                clarify: form.ticked(&format!("{base}.stage.clarify")),
-                spec: form.ticked(&format!("{base}.stage.spec")),
-                plan: form.ticked(&format!("{base}.stage.plan")),
-                implement: form.ticked(&format!("{base}.stage.implement")),
-                review: form.ticked(&format!("{base}.stage.review")),
-            },
-        };
-        if settings.enabled && !settings.stages.any() {
-            return Err(McpError::NoStage(server.name).into());
-        }
-        if !state.secrets.available() {
-            for header in &server.headers {
-                if !form
-                    .get(&format!("{base}.header.{header}"))
-                    .unwrap_or("")
-                    .is_empty()
-                {
-                    return Err(AppError::BadRequest(
-                        "the secret store is unavailable, so a header value cannot be saved".into(),
-                    ));
-                }
-            }
-        }
-        // Each shown tool posts a hidden `shown` field and, when it is on, a
-        // ticked `tool` field. A tool the form did not show is left as it is.
-        let shown = format!("{base}.shown.");
-        let tools: Vec<(String, bool)> = form
-            .0
-            .keys()
-            .filter_map(|key| key.strip_prefix(&shown))
-            .map(|tool| {
-                let off = !form.ticked(&format!("{base}.tool.{tool}"));
-                (tool.to_owned(), off)
-            })
-            .collect();
-        saves.push((server, settings, tools));
-    }
-
     // Efforts first, so a bad level is rejected before anything is written.
     state.store.save_project_efforts(&name, &efforts)?;
     state.store.save_project_models(&name, &models)?;
@@ -1056,31 +1018,155 @@ async fn save_project_models(
         form.ticked("llm_review"),
     )?;
     save_posted_gates(&state.store, &name, &form)?;
-    for (server, settings, tools) in &saves {
-        state
-            .store
-            .save_project_mcp(&name, &server.name, settings)?;
-        state
-            .store
-            .save_mcp_tool_states(&name, &server.name, tools)?;
-        for header in &server.headers {
+    state.wake.notify_one();
+    project_page(&state, &headers, &name, Some("Saved."))
+}
+
+/// One server's settings as a project's page for it shows them.
+fn server_settings(
+    state: &AppState,
+    project: &str,
+    server: McpServer,
+) -> Result<ServerSettings, StoreError> {
+    let saved = state.store.project_mcp(project, &server.name)?;
+    let headers = server
+        .headers
+        .iter()
+        .map(|header: &String| {
             let at = SecretRef {
-                project: &name,
+                project,
                 server: &server.name,
                 header,
             };
-            if form.ticked(&format!("mcp.{}.clear.{header}", server.name)) {
-                state.secrets.delete(at)?;
-            } else if let Some(value) = form
-                .get(&format!("mcp.{}.header.{header}", server.name))
-                .filter(|value| !value.is_empty())
-            {
-                state.secrets.put(at, value)?;
-            }
+            Ok(HeaderState {
+                name: header.clone(),
+                set: state.store.has_secret(at)?,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(ServerSettings {
+        tools: state.store.mcp_tools(project, &server.name)?,
+        name: server.name,
+        enabled: saved.enabled,
+        stages: saved.stages,
+        headers,
+    })
+}
+
+/// The project and server named in a project's MCP route, or a 404.
+fn project_and_server(
+    state: &AppState,
+    project: &str,
+    server: &str,
+) -> Result<McpServer, AppError> {
+    if state.projects.lookup(project)?.is_none() {
+        return Err(AppError::UnknownProject(project.to_owned()));
+    }
+    state
+        .store
+        .mcp_server(server)?
+        .ok_or_else(|| AppError::NotFound(format!("no MCP server named {server:?}")))
+}
+
+fn project_mcp_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    server: &str,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let registered = project_and_server(state, project, server)?;
+    Ok(pages::settings_project_mcp(
+        &user(headers),
+        &settings_nav(state)?,
+        project,
+        &server_settings(state, project, registered)?,
+        state.secrets.available(),
+        notice,
+    ))
+}
+
+async fn show_project_mcp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, server)): Path<(String, String)>,
+) -> Result<Markup, AppError> {
+    project_mcp_page(&state, &headers, &project, &server, None)
+}
+
+/// Saves a project's settings for one server: whether it runs, its stages, its
+/// header values and its tools. Everything is checked before any write, so a
+/// rejected submit changes nothing. An enabled server needs a stage, and a
+/// header value cannot be set while the secret store is unavailable.
+async fn save_project_mcp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, server)): Path<(String, String)>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Result<Markup, AppError> {
+    let registered = project_and_server(&state, &project, &server)?;
+    let form = ProjectForm(pairs.into_iter().collect());
+    let base = format!("mcp.{}", registered.name);
+    let settings = McpProjectSettings {
+        enabled: form.ticked(&format!("{base}.enabled")),
+        stages: McpStages {
+            clarify: form.ticked(&format!("{base}.stage.clarify")),
+            spec: form.ticked(&format!("{base}.stage.spec")),
+            plan: form.ticked(&format!("{base}.stage.plan")),
+            implement: form.ticked(&format!("{base}.stage.implement")),
+            review: form.ticked(&format!("{base}.stage.review")),
+        },
+    };
+    if settings.enabled && !settings.stages.any() {
+        return Err(McpError::NoStage(registered.name).into());
+    }
+    let value = |header: &str| {
+        form.get(&format!("{base}.header.{header}"))
+            .filter(|value| !value.is_empty())
+    };
+    if !state.secrets.available()
+        && registered
+            .headers
+            .iter()
+            .any(|header| value(header).is_some())
+    {
+        return Err(AppError::BadRequest(
+            "the secret store is unavailable, so a header value cannot be saved".into(),
+        ));
+    }
+    // Each shown tool posts a hidden `shown` field and, when it is on, a ticked
+    // `tool` field. A tool the form did not show is left as it is.
+    let shown = format!("{base}.shown.");
+    let tools: Vec<(String, bool)> = form
+        .0
+        .keys()
+        .filter_map(|key| key.strip_prefix(&shown))
+        .map(|tool| {
+            let off = !form.ticked(&format!("{base}.tool.{tool}"));
+            (tool.to_owned(), off)
+        })
+        .collect();
+
+    state
+        .store
+        .save_project_mcp(&project, &registered.name, &settings)?;
+    state
+        .store
+        .save_mcp_tool_states(&project, &registered.name, &tools)?;
+    for header in &registered.headers {
+        let at = SecretRef {
+            project: &project,
+            server: &registered.name,
+            header,
+        };
+        if form.ticked(&format!("{base}.clear.{header}")) {
+            state.secrets.delete(at)?;
+        } else if let Some(value) = value(header) {
+            state.secrets.put(at, value)?;
         }
     }
     state.wake.notify_one();
-    project_page(&state, &headers, &name, Some("Saved."))
+    project_mcp_page(&state, &headers, &project, &server, Some("Saved."))
 }
 
 /// An MCP server form: its `url` and one `header` field per header-name row. The
@@ -1091,6 +1177,8 @@ struct McpServerForm {
     name: String,
     url: String,
     headers: Vec<String>,
+    /// Set when the operator confirmed an edit that deletes stored values.
+    confirm: bool,
 }
 
 impl McpServerForm {
@@ -1102,11 +1190,13 @@ impl McpServerForm {
             name: String::new(),
             url: String::new(),
             headers: Vec::new(),
+            confirm: false,
         };
         for (key, value) in pairs {
             match key.as_str() {
                 "name" => form.name = value,
                 "url" => form.url = value,
+                "confirm" => form.confirm = true,
                 "header" => {
                     let name = value.trim();
                     if !name.is_empty() {
@@ -1139,17 +1229,39 @@ async fn edit_mcp_server(
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
     let form = McpServerForm::from_pairs(pairs);
-    state
-        .store
-        .edit_mcp_server(&name, form.url.trim(), &form.headers)?;
+    let url = form.url.trim();
+    // An edit that deletes stored values waits for the operator to confirm it.
+    let deletes = state.store.mcp_edit_deletes(&name, url, &form.headers)?;
+    if !deletes.is_empty() && !form.confirm {
+        let pending = pages::PendingEdit {
+            url: url.to_owned(),
+            headers: form.headers,
+            deletes,
+        };
+        return mcp_server_page_with(&state, &headers, &name, None, Some(&pending), None);
+    }
+    state.store.edit_mcp_server(&name, url, &form.headers)?;
     mcp_server_page(&state, &headers, &name, Some("Saved."))
 }
 
+#[derive(Deserialize)]
+struct DeleteServerForm {
+    #[serde(default)]
+    confirm_name: String,
+}
+
+/// Deletes a server once the operator typed its name. Any other name redraws
+/// the server's page with the problem and deletes nothing.
 async fn delete_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Form(form): Form<DeleteServerForm>,
 ) -> Result<Markup, AppError> {
+    if form.confirm_name.trim() != name {
+        let problem = format!("Nothing was deleted. Type {name} to delete the server.");
+        return mcp_server_page_with(&state, &headers, &name, None, None, Some(&problem));
+    }
     state.store.delete_mcp_server(&name)?;
     mcp_page(&state, &headers, Some("Deleted."))
 }

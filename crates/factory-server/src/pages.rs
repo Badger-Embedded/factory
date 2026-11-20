@@ -26,6 +26,7 @@ const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
 const SETTINGS_FORM: &str = include_str!("../static/settings-form.js");
+const MCP_TOOLS: &str = include_str!("../static/mcp-tools.js");
 
 /// The characters a header name may hold, as an HTML `pattern`, so the browser
 /// refuses `Authorization: x` before the form posts. It matches the server's
@@ -664,12 +665,44 @@ pub fn settings_mcp(
     )
 }
 
+/// One project's use of a server, for the "Used by" list on the server's page.
+pub struct ServerUsage {
+    pub project: String,
+    pub enabled: bool,
+    pub stages: McpStages,
+    pub headers: Vec<HeaderState>,
+}
+
+/// A server edit held back because saving it deletes stored values. The page
+/// shows the posted `url` and `headers` and names each value it deletes, as
+/// `(project, header)`, with a button that saves anyway.
+pub struct PendingEdit {
+    pub url: String,
+    pub headers: Vec<String>,
+    pub deletes: Vec<(String, String)>,
+}
+
+/// The state of a server's page beyond the server itself.
+pub struct ServerPage<'a> {
+    pub server: &'a McpServer,
+    pub usage: &'a [ServerUsage],
+    pub pending: Option<&'a PendingEdit>,
+    /// A problem with the last submit, such as a delete with the wrong name.
+    pub problem: Option<&'a str>,
+}
+
 pub fn settings_mcp_server(
     user: &str,
     nav: &SettingsNav,
-    server: &McpServer,
+    page: &ServerPage<'_>,
     notice: Option<&str>,
 ) -> Markup {
+    let server = page.server;
+    let stored: usize = page
+        .usage
+        .iter()
+        .map(|usage| usage.headers.iter().filter(|header| header.set).count())
+        .sum();
     settings_page(
         user,
         nav,
@@ -680,17 +713,95 @@ pub fn settings_mcp_server(
             p.crumbs { a href="/settings/mcp" { "MCP servers" } " › " (server.name) }
             h1 { (server.name) }
             p.meta { "Shared by every project. Each project stores its own header values on its own page." }
-            (mcp_server_form(server))
+            @if let Some(problem) = page.problem {
+                div.card.failed { (problem) }
+            }
+            (mcp_server_form(server, page.pending))
+            (server_usage_card(&server.name, page.usage))
+            form.card.danger-card method="post" action={ "/settings/mcp/" (crate::web::query_escape(&server.name)) "/delete" } {
+                h2 { "Delete " (server.name) }
+                p.hint {
+                    "Removes the server from every project and deletes the "
+                    (stored) " stored "
+                    (if stored == 1 { "value" } else { "values" })
+                    " for it. Type the server's name to confirm."
+                }
+                div.row {
+                    input.grow type="text" name="confirm_name" aria-label="Server name"
+                        autocomplete="off" autocapitalize="none" spellcheck="false"
+                        placeholder=(server.name);
+                    button.danger { "Delete " (server.name) }
+                }
+            }
             script { (PreEscaped(MCP_HEADER_ROWS)) }
         },
     )
+}
+
+/// The "Used by" card: each project with whether it runs the server, in how
+/// many stages, and which of its header values are stored, with a link to the
+/// project's page for the server.
+fn server_usage_card(server: &str, usage: &[ServerUsage]) -> Markup {
+    html! {
+        div.card {
+            h2 { "Used by" }
+            @if usage.is_empty() {
+                p.meta { "No project is onboarded yet." }
+            }
+            @for entry in usage {
+                div.server-row {
+                    span.server-name { (entry.project) }
+                    span.hint.server-url { (usage_line(entry.enabled, entry.stages)) }
+                    (header_badges(&entry.headers))
+                    a.link-button href=(project_mcp_href(&entry.project, server)) { "Open" }
+                }
+            }
+        }
+    }
+}
+
+fn project_mcp_href(project: &str, server: &str) -> String {
+    format!(
+        "/settings/projects/{}/mcp/{}",
+        crate::web::query_escape(project),
+        crate::web::query_escape(server)
+    )
+}
+
+fn usage_line(enabled: bool, stages: McpStages) -> String {
+    if !enabled {
+        return "Off".into();
+    }
+    let on = [
+        stages.clarify,
+        stages.spec,
+        stages.plan,
+        stages.implement,
+        stages.review,
+    ]
+    .into_iter()
+    .filter(|on| *on)
+    .count();
+    format!("On in {on} of 5 stages")
+}
+
+/// A badge per declared header: stored, or missing.
+fn header_badges(headers: &[HeaderState]) -> Markup {
+    html! {
+        @for header in headers {
+            @if header.set {
+                span.badge.ok title=(header.name) { "Key stored" }
+            } @else {
+                span.badge.you title=(header.name) { "Key missing" }
+            }
+        }
+    }
 }
 
 pub fn settings_project(
     user: &str,
     nav: &SettingsNav,
     project: &ProjectSettings,
-    secrets_available: bool,
     notice: Option<&str>,
 ) -> Markup {
     settings_page(
@@ -702,7 +813,74 @@ pub fn settings_project(
         &html! {
             h1 { (project.name) }
             p.meta { (RUNS_KEEP_VALUES) }
-            (project_form(project, secrets_available))
+            (project_form(project))
+            (project_servers_card(project))
+        },
+    )
+}
+
+/// The MCP servers card on a project's page: each server with its state for
+/// this project and a link to the project's page for it.
+fn project_servers_card(project: &ProjectSettings) -> Markup {
+    html! {
+        div.card {
+            h2 { "MCP servers" }
+            @if project.servers.is_empty() {
+                p.meta { "No servers yet. " a href="/settings/mcp" { "Add one" } "." }
+            }
+            @for server in &project.servers {
+                @let on = server.tools.iter().filter(|tool| !tool.disabled).count();
+                div.server-row {
+                    span.server-name { (server.name) }
+                    span.hint.server-url {
+                        (usage_line(server.enabled, server.stages))
+                        @if !server.tools.is_empty() {
+                            " · " (on) " of " (server.tools.len()) " tools on"
+                        }
+                    }
+                    (header_badges(&server.headers))
+                    a.link-button href=(project_mcp_href(&project.name, &server.name)) { "Configure" }
+                }
+            }
+        }
+    }
+}
+
+/// A project's page for one MCP server: whether it runs, its stages, its
+/// header values, the connection check and the tool list, in one form.
+pub fn settings_project_mcp(
+    user: &str,
+    nav: &SettingsNav,
+    project: &str,
+    server: &ServerSettings,
+    secrets_available: bool,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Project(project.to_owned()),
+        &format!("{} for {project}", server.name),
+        notice,
+        &html! {
+            p.crumbs {
+                a href={ "/settings/projects/" (crate::web::query_escape(project)) } { (project) }
+                " › MCP › " (server.name)
+            }
+            h1 { (server.name) " for " (project) }
+            p.meta {
+                "The server's URL and header names are on "
+                a href={ "/settings/mcp/" (crate::web::query_escape(&server.name)) } { "its own page" }
+                ". The values here are this project's alone."
+            }
+            @if !secrets_available {
+                p.hint.bad { "The master key is missing, so header values cannot be saved. The enabled switch, stages and tools still save." }
+            }
+            form.card.settings-form method="post" action=(project_mcp_href(project, &server.name)) {
+                (project_server_block(project, server, secrets_available))
+                (save_bar("Save"))
+            }
+            script { (PreEscaped(MCP_TOOLS)) }
         },
     )
 }
@@ -835,35 +1013,56 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
 /// One server's edit form on its own page: its URL and header names, a Delete
 /// button that posts the same form to the delete route, and the save bar. The name is fixed,
 /// because it keys the stored secrets and the proxy path.
-fn mcp_server_form(server: &McpServer) -> Markup {
+fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup {
     let action = format!("/settings/mcp/{}", server.name);
-    let delete = format!("/settings/mcp/{}/delete", server.name);
+    let url = pending.map_or(server.url.as_str(), |pending| pending.url.as_str());
+    let headers = pending.map_or(server.headers.as_slice(), |pending| {
+        pending.headers.as_slice()
+    });
+    let label = pending.map_or_else(
+        || "Save".to_owned(),
+        |pending| match pending.deletes.len() {
+            1 => "Save and delete 1 value".to_owned(),
+            n => format!("Save and delete {n} values"),
+        },
+    );
     html! {
         form.card.settings-form method="post" action=(action) {
+            @if let Some(pending) = pending {
+                div.confirm {
+                    p { strong { "Not saved yet." } " Saving this change deletes these stored values, and each project must enter them again:" }
+                    ul {
+                        @for (project, header) in &pending.deletes {
+                            li { (project) ": " code { (header) } }
+                        }
+                    }
+                    input type="hidden" name="confirm" value="on";
+                }
+            }
             div.field {
                 label for={ "mcp-" (server.name) "-url" } { "URL" }
                 input id={ "mcp-" (server.name) "-url" }.wide type="url" name="url" required
-                    value=(server.url);
+                    value=(url);
             }
-            (header_rows(&server.headers, &html! {
+            (header_rows(headers, &html! {
                 p.hint { "Only the header name, with no colon or value. Each project enters its own value on its own page, stored encrypted." }
-                p.hint { "Removing or renaming a header deletes every project's stored value for it, so a renamed header's value must be entered again under the new name. Changing the URL's host or port deletes every project's stored values for this server. Changing only the path keeps them." }
+                p.hint { "Removing or renaming a header deletes every project's stored value for it, and changing the URL's host or port deletes all of them. The page asks before it saves such a change. Changing only the path keeps them." }
             }))
-            // Save comes before Delete, so Enter in a field saves.
-            (save_bar("Save"))
-            div.danger-zone {
-                button.danger formaction=(delete) formnovalidate { "Delete " (server.name) }
-                p.hint { "Deletes the server from every project and every project's stored values for it." }
+            @if pending.is_some() {
+                div.save-bar.dirty {
+                    span.save-bar-note { "Unsaved changes." }
+                    button.primary { (label) }
+                }
+            } @else {
+                (save_bar(&label))
             }
         }
     }
 }
 
-/// One project's form on its settings page: its two flags, a model field with
-/// an effort selector beside it for each of the five stages, and a block per
-/// registered MCP server. `secrets_available` is false when the master key is
-/// missing, which disables the header value inputs.
-fn project_form(project: &ProjectSettings, secrets_available: bool) -> Markup {
+/// One project's form on its settings page: its two flags, its gates, and a
+/// model field with an effort selector beside it for each of the five stages.
+fn project_form(project: &ProjectSettings) -> Markup {
     let name = &project.name;
     let models = &project.models;
     let efforts = &project.efforts;
@@ -928,9 +1127,6 @@ fn project_form(project: &ProjectSettings, secrets_available: bool) -> Markup {
                     }
                 }
             }
-            @for server in &project.servers {
-                (project_server_block(name, server, secrets_available))
-            }
             (save_bar(&format!("Save {name}")))
         }
     }
@@ -945,8 +1141,7 @@ fn project_server_block(project: &str, server: &ServerSettings, secrets_availabl
     let base = format!("mcp.{}", server.name);
     let stages = server.stages;
     html! {
-        fieldset.mcp-project {
-            legend { (server.name) }
+        div.mcp-project {
             div.field {
                 label.check {
                     input type="checkbox" name={ (base) ".enabled" } value="on"
@@ -1048,17 +1243,31 @@ fn mcp_tool_list(server: &str, tools: &[McpToolState]) -> Markup {
                     "unchecked tool. A tool the server adds later starts checked. "
                     "Refreshing reloads this list and drops unsaved changes to it."
                 }
-                @for tool in tools {
-                    input type="hidden" name={ (base) ".shown." (tool.name) } value="on";
-                    label.check {
-                        input type="checkbox" name={ (base) ".tool." (tool.name) } value="on"
-                            checked[!tool.disabled];
-                        " " code { (tool.name) }
-                        @if tool.new { " (new)" }
-                        @if !tool.offered { " (no longer offered)" }
+                // `MCP_TOOLS` shows these controls and runs them. Without it they
+                // stay hidden and each box is set by hand.
+                div.mcp-tool-controls {
+                    input.grow.mcp-tool-filter type="search" aria-label="Filter tools"
+                        placeholder={ "Filter " (tools.len()) " tools" };
+                    span.hint.mcp-tool-count {
+                        (tools.iter().filter(|tool| !tool.disabled).count())
+                        " of " (tools.len()) " on"
                     }
-                    @if let Some(description) = &tool.description {
-                        p.hint { (short_description(description)) }
+                    button.mcp-tools-all type="button" { "All on" }
+                    button.mcp-tools-none type="button" { "All off" }
+                }
+                @for tool in tools {
+                    div.mcp-tool data-tool=(tool.name.to_lowercase()) {
+                        input type="hidden" name={ (base) ".shown." (tool.name) } value="on";
+                        label.check {
+                            input type="checkbox" name={ (base) ".tool." (tool.name) } value="on"
+                                checked[!tool.disabled];
+                            " " code { (tool.name) }
+                            @if tool.new { " " span.badge.agent { "new" } }
+                            @if !tool.offered { " " span.badge.factory { "no longer offered" } }
+                        }
+                        @if let Some(description) = &tool.description {
+                            p.hint { (short_description(description)) }
+                        }
                     }
                 }
             }
