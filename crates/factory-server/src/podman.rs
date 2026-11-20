@@ -109,6 +109,22 @@ impl Executor for PodmanExecutor {
             tracing::warn!("removing {name}: {err}");
         }
         let workspace = self.job_dir(request.job_id).join("work");
+        let attributed = self
+            .git
+            .attributed_commits(&workspace, &request.base)
+            .await?;
+        if !attributed.is_empty() {
+            return Ok(Event::ChecksFailed {
+                report: format!(
+                    "These commits credit an AI tool in their message, and GitHub would \
+                     copy that into the squash commit on {}:\n\n{}\n\nReword them without \
+                     the Co-Authored-By trailer or the \"Generated with\" line, for example \
+                     with git rebase -i or git commit --amend.",
+                    request.base,
+                    attributed.join("\n")
+                ),
+            });
+        }
         run_checks(&config, &name, &workspace, &request.command).await
     }
 

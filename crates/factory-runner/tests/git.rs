@@ -213,3 +213,41 @@ async fn every_pull_request_run_fetches_the_newest_base() {
     );
     assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "agent work");
 }
+
+#[tokio::test]
+async fn commits_that_credit_an_ai_tool_are_found() {
+    let remote = Remote::new();
+    let work = remote.work();
+    let git_ = remote.git();
+    git_.prepare(&work, "owner/repo", "main", Some("factory/job-7-pr-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        git_.attributed_commits(&work, "main").await.unwrap(),
+        Vec::<String>::new()
+    );
+
+    commit(&work, "a", "clean change");
+    commit(
+        &work,
+        "b",
+        "with trailer\n\nBody.\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>",
+    );
+    commit(
+        &work,
+        "c",
+        "with footer\n\n\u{1f916} Generated with [Claude Code](https://claude.com/claude-code)",
+    );
+    commit(
+        &work,
+        "d",
+        "human co-author\n\nCo-authored-by: Alice <alice@example.com>",
+    );
+
+    let found = git_.attributed_commits(&work, "main").await.unwrap();
+    let subjects: Vec<&str> = found
+        .iter()
+        .map(|entry| entry.split_once(' ').unwrap().1)
+        .collect();
+    assert_eq!(subjects, ["with footer", "with trailer"]);
+}
