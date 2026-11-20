@@ -198,6 +198,20 @@ pub struct RunReport {
     pub event: Event,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    /// The active MCP servers Claude Code could not connect to, read from the
+    /// `mcp_servers` list in the stream-json `system`/`init` line. Each causes a
+    /// warning on the job. Empty for a run with no active server, or one whose
+    /// servers all connected.
+    pub mcp_unavailable: Vec<McpUnavailable>,
+}
+
+/// An active MCP server that was not `connected` in the run's `init` line: its
+/// name and a short reason with no credential in it. The factory records it as
+/// a warning on the job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpUnavailable {
+    pub server: String,
+    pub reason: String,
 }
 
 /// The arguments after `podman` for one run.
@@ -311,6 +325,7 @@ pub async fn run(
         },
         session_id: None,
         cost_usd: None,
+        mcp_unavailable: Vec::new(),
     };
     let mut child = match Command::new(&config.podman)
         .args(podman_args(config, run))
@@ -339,6 +354,7 @@ pub async fn run(
     });
 
     let mut result: Option<ResultMessage> = None;
+    let mut mcp_unavailable: Vec<McpUnavailable> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -346,6 +362,19 @@ pub async fn run(
                 match item {
                     StreamItem::Log(line) => log(line),
                     StreamItem::Result(message) => result = Some(message),
+                    StreamItem::Init(servers) => {
+                        for server in servers {
+                            if server.status != "connected" {
+                                mcp_unavailable.push(McpUnavailable {
+                                    reason: format!(
+                                        "the agent reported it as {}",
+                                        status_label(&server.status)
+                                    ),
+                                    server: server.name,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -358,13 +387,27 @@ pub async fn run(
             event: event_from_result(run.expect, &result),
             session_id: result.session_id.clone(),
             cost_usd: result.total_cost_usd,
+            mcp_unavailable,
         };
     }
     let status = status.map_or_else(|err| err.to_string(), |status| status.to_string());
-    failed(format!(
-        "the worker exited ({status}) without a result{}",
-        tail(&stderr)
-    ))
+    RunReport {
+        mcp_unavailable,
+        ..failed(format!(
+            "the worker exited ({status}) without a result{}",
+            tail(&stderr)
+        ))
+    }
+}
+
+/// A readable label for an MCP server's reported status. An empty status, which
+/// a server can leave out of the `init` line, reads as "not connected".
+fn status_label(status: &str) -> &str {
+    if status.is_empty() {
+        "not connected"
+    } else {
+        status
+    }
 }
 
 fn tail(stderr: &str) -> String {

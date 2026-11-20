@@ -19,6 +19,7 @@ use crate::proxy::RunTokens;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
 use crate::store::{JobRow, Store, StoreError};
+use crate::warnings::McpWarnings;
 use crate::workers::{WorkerSlots, unix_now};
 
 /// How often the loop looks at the jobs when nothing wakes it.
@@ -232,6 +233,30 @@ pub struct McpRuntime {
     pub secrets: Arc<dyn SecretStore>,
     /// The proxy's base URL a worker reaches, such as `http://factory:8081`.
     pub proxy_url: String,
+    /// Records an unavailable MCP server as a warning on the job. The scheduler
+    /// reports a server it skipped for an undecryptable secret and the servers
+    /// the runner read as not connected; the proxy shares this recorder too, so
+    /// a server is warned about at most once per run.
+    pub warnings: Arc<McpWarnings>,
+}
+
+/// A server left out of a run because a stored header value would not decrypt,
+/// with the reason the run records as its warning.
+type SkippedServer = (String, String);
+
+/// The MCP servers chosen for one agent run: the config the worker gets, and
+/// the servers left out because a stored header value would not decrypt, each
+/// with a reason the run records as a warning.
+struct McpSelection {
+    config: Option<McpConfig>,
+    skipped: Vec<SkippedServer>,
+}
+
+/// The servers active for a run and the servers skipped for an undecryptable
+/// secret, as [`Scheduler::active_mcp_servers`] sorts them.
+struct ActiveServers {
+    active: Vec<String>,
+    skipped: Vec<SkippedServer>,
 }
 
 /// Revokes a run's proxy token when the run ends, by success, failure or
@@ -246,6 +271,20 @@ struct TokenGuard {
 impl Drop for TokenGuard {
     fn drop(&mut self) {
         self.tokens.revoke(&self.token);
+    }
+}
+
+/// Clears a run's MCP warning dedup state when the run ends, by success,
+/// failure or cancel. A cancel aborts the run's task and drops its future, so
+/// `Drop` is the only point that fires in every case, like [`TokenGuard`].
+struct WarnGuard {
+    warnings: Arc<McpWarnings>,
+    job_id: i64,
+}
+
+impl Drop for WarnGuard {
+    fn drop(&mut self) {
+        self.warnings.end(self.job_id);
     }
 }
 
@@ -387,7 +426,7 @@ impl<E: Executor> Scheduler<E> {
                         Expect::Commits | Expect::FixCi => efforts.implement,
                         Expect::Review => efforts.review,
                     };
-                    let mcp = self.mcp_config(row.id, &row.project, expect)?;
+                    let selection = self.mcp_config(row.id, &row.project, expect)?;
                     let request = AgentRequest {
                         job_id: row.id,
                         repo: project.repo.clone(),
@@ -401,12 +440,13 @@ impl<E: Executor> Scheduler<E> {
                         prompt: job_prompt(&job, &task, expect),
                         model,
                         effort: Some(effort),
-                        mcp,
+                        mcp: selection.config,
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
+                    let skipped = selection.skipped;
                     self.spawn(row.id, Kind::Worker, async move {
-                        scheduler.agent(&settings, request).await;
+                        scheduler.agent(&settings, request, skipped).await;
                     });
                 }
                 Command::RunChecks { .. } => {
@@ -517,35 +557,43 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    /// The MCP config for an agent run, or `None` when no server is active for
-    /// this project and stage. When one is, it issues a per-run proxy token
-    /// scoped to the job and those servers; [`Scheduler::agent`] revokes it when
-    /// the worker exits. The scheduler reads the registry and the project's
-    /// settings on every run, so a settings change reaches a job in flight at
-    /// its next run.
+    /// The MCP config for an agent run, with the servers skipped because a
+    /// stored header value would not decrypt. The config is `None` when no
+    /// server is active for this project and stage. When one is, it issues a
+    /// per-run proxy token scoped to the job and those servers;
+    /// [`Scheduler::agent`] revokes it when the worker exits. The scheduler
+    /// reads the registry and the project's settings on every run, so a settings
+    /// change reaches a job in flight at its next run.
     fn mcp_config(
         &self,
         job_id: i64,
         project: &str,
         expect: Expect,
-    ) -> Result<Option<McpConfig>, StoreError> {
-        let servers = self.active_mcp_servers(project, expect)?;
-        if servers.is_empty() {
-            return Ok(None);
-        }
-        let token = self.mcp.tokens.issue(job_id, project, &servers);
-        Ok(Some(McpConfig {
-            proxy_url: self.mcp.proxy_url.clone(),
-            token,
-            servers,
-        }))
+    ) -> Result<McpSelection, StoreError> {
+        let ActiveServers { active, skipped } = self.active_mcp_servers(project, expect)?;
+        let config = (!active.is_empty()).then(|| {
+            let token = self.mcp.tokens.issue(job_id, project, &active);
+            McpConfig {
+                proxy_url: self.mcp.proxy_url.clone(),
+                token,
+                servers: active,
+            }
+        });
+        Ok(McpSelection { config, skipped })
     }
 
     /// The servers `project` turns on for the run's `expect` stage, in name
-    /// order. A disabled server, one that does not pick this stage, and one
-    /// whose stored header value cannot be decrypted are all left out.
-    fn active_mcp_servers(&self, project: &str, expect: Expect) -> Result<Vec<String>, StoreError> {
+    /// order, and the servers left out because a stored header value cannot be
+    /// decrypted, each with a reason for the run's warning. A disabled server
+    /// and one that does not pick this stage are left out of both, so they cause
+    /// no warning.
+    fn active_mcp_servers(
+        &self,
+        project: &str,
+        expect: Expect,
+    ) -> Result<ActiveServers, StoreError> {
         let mut active = Vec::new();
+        let mut skipped = Vec::new();
         for server in self.store.mcp_servers()? {
             let settings = self.store.project_mcp(project, &server.name)?;
             let in_stage = match expect {
@@ -555,11 +603,19 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Commits | Expect::FixCi => settings.stages.implement,
                 Expect::Review => settings.stages.review,
             };
-            if settings.enabled && in_stage && self.mcp_secrets_usable(project, &server)? {
+            if !(settings.enabled && in_stage) {
+                continue;
+            }
+            if self.mcp_secrets_usable(project, &server)? {
                 active.push(server.name);
+            } else {
+                skipped.push((
+                    server.name,
+                    "a stored header value could not be decrypted".to_owned(),
+                ));
             }
         }
-        Ok(active)
+        Ok(ActiveServers { active, skipped })
     }
 
     /// Whether every stored header value `project` set for `server` decrypts, so
@@ -745,7 +801,7 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    async fn agent(&self, settings: &Settings, request: AgentRequest) {
+    async fn agent(&self, settings: &Settings, request: AgentRequest, skipped: Vec<SkippedServer>) {
         let job_id = request.job_id;
         // The run's proxy token is revoked when this guard drops: at the end of
         // the run, or when a cancel aborts and drops this future.
@@ -753,6 +809,20 @@ impl<E: Executor> Scheduler<E> {
             tokens: Arc::clone(&self.mcp.tokens),
             token: mcp.token.clone(),
         });
+        // Forget the servers warned about in this job's previous run before this
+        // one reports any, and clear this run's set when the guard drops, so a
+        // server is warned about at most once per run. Begun before the worker
+        // starts, so a proxy warning during the run shares the same set.
+        self.mcp.warnings.begin(job_id);
+        let _warn = WarnGuard {
+            warnings: Arc::clone(&self.mcp.warnings),
+            job_id,
+        };
+        // A server skipped because its stored header value would not decrypt
+        // never reaches the worker, so it gets its warning here, before the run.
+        for (server, reason) in &skipped {
+            self.mcp.warnings.record(job_id, server, reason);
+        }
         self.note(
             job_id,
             &format!("Agent run started in session {}.", request.session_id),
@@ -764,6 +834,14 @@ impl<E: Executor> Scheduler<E> {
             }
         });
         let report = self.executor.run_agent(settings, request, sink).await;
+        // Each active server the agent read as not connected in the run's init
+        // line gets its warning, deduped against a proxy warning for the same
+        // server already recorded during the run.
+        for unavailable in &report.mcp_unavailable {
+            self.mcp
+                .warnings
+                .record(job_id, &unavailable.server, &unavailable.reason);
+        }
         if let Some(usd) = report.cost_usd
             && let Err(err) = self.store.add_cost(job_id, usd)
         {

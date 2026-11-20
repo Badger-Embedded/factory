@@ -530,6 +530,31 @@ async fn the_job_page_shows_the_cost_summed_over_runs() {
 }
 
 #[tokio::test]
+async fn the_timeline_notes_an_unavailable_mcp_server_under_its_step() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    // Start moves the job to clarifying, the step the warning should sit under.
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .record_mcp_unavailable(id, "context7", "the server could not be reached")
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let note = body
+        .find("MCP server unavailable: context7")
+        .expect("the note renders");
+    let clarifying = body
+        .find("step-name\">clarifying")
+        .expect("the clarifying step");
+    let spec = body.find("step-name\">spec").expect("the spec step");
+    assert!(
+        clarifying < note && note < spec,
+        "the note sits under the clarifying step"
+    );
+}
+
+#[tokio::test]
 async fn a_job_without_cost_shows_a_dash() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;

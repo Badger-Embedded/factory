@@ -539,6 +539,48 @@ impl Store {
         Ok(tx.commit()?)
     }
 
+    /// Records that MCP `server` was unavailable for job `id`, with `reason`.
+    /// It writes a factory line to the job log and an `mcp-unavailable` row to
+    /// `job_events` in one transaction, the way [`Store::add_cost`] writes a
+    /// `cost` row. Neither changes the job's stage or turn. The row carries the
+    /// server and reason in its `detail`, so the timeline shows it as a note
+    /// under the step the job was in. The reason names no credential.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on a
+    /// database error.
+    pub fn record_mcp_unavailable(
+        &self,
+        id: i64,
+        server: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row = Self::load(&tx, id)?;
+        Self::record(
+            &tx,
+            id,
+            "mcp-unavailable",
+            &row.job,
+            Some(&format!("{server}: {reason}")),
+            None,
+        )?;
+        tx.execute(
+            "INSERT INTO logs (job_id, kind, text) VALUES (?1, ?2, ?3)",
+            params![
+                id,
+                "factory",
+                format!(
+                    "MCP server {server} is unavailable: {reason}. \
+                     The run goes on without its tools."
+                )
+            ],
+        )?;
+        Ok(tx.commit()?)
+    }
+
     fn record(
         tx: &Transaction<'_>,
         id: i64,

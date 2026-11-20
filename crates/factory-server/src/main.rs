@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    CurlUsageSource, GhRepos, LocalSecrets, McpRuntime, PLAN_USAGE_REFRESH, PlanUsageCache,
-    PodmanExecutor, Projects, ProxyWarning, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
-    StoreUpstreams, UnavailableSecrets, Upstreams, WarnFn, WorkerSlots, app, import_tomls,
-    master_key_from_env, proxy_app, refresh_forever,
+    CurlUsageSource, GhRepos, LocalSecrets, McpRuntime, McpWarnings, PLAN_USAGE_REFRESH,
+    PlanUsageCache, PodmanExecutor, Projects, ProxyWarning, RepoChecker, RunTokens, Scheduler,
+    SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams, WarnFn, WorkerSlots, app,
+    import_tomls, master_key_from_env, proxy_app, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -45,16 +45,15 @@ async fn start_mcp_proxy(
     listen: &str,
     store: Arc<Store>,
     secrets: Arc<dyn SecretStore>,
+    warnings: Arc<McpWarnings>,
 ) -> Result<Arc<RunTokens>, Box<dyn Error>> {
     let run_tokens = Arc::new(RunTokens::new());
     let upstreams: Arc<dyn Upstreams> = Arc::new(StoreUpstreams::new(store, secrets));
-    let warn: WarnFn = Arc::new(|warning: ProxyWarning| {
-        tracing::warn!(
-            job = warning.job,
-            server = warning.server,
-            "MCP server unavailable: {}",
-            warning.reason
-        );
+    // A proxy-side failure to reach a server records a warning on the job, the
+    // same path the runner's init-line check uses, deduped so a server is warned
+    // about at most once per run.
+    let warn: WarnFn = Arc::new(move |warning: ProxyWarning| {
+        warnings.record(warning.job, &warning.server, &warning.reason);
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("MCP proxy listening on http://{listen}");
@@ -116,12 +115,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(UnavailableSecrets::new(Arc::clone(&store)))
     };
 
+    // An unreachable MCP server does not fail a run; it records a warning on the
+    // job. The proxy and the scheduler share this recorder so a server is warned
+    // about at most once per run.
+    let mcp_warnings = Arc::new(McpWarnings::new(Arc::clone(&store)));
+
     // The MCP proxy stands between a worker and a remote MCP server, so a
     // credential never enters a worker. It listens on its own port, separate
     // from the dashboard, and honours per-run tokens held only in memory. No
     // token exists until a run issues one, so every request before that is 401.
-    let run_tokens =
-        start_mcp_proxy(&proxy_listen, Arc::clone(&store), Arc::clone(&secrets)).await?;
+    let run_tokens = start_mcp_proxy(
+        &proxy_listen,
+        Arc::clone(&store),
+        Arc::clone(&secrets),
+        Arc::clone(&mcp_warnings),
+    )
+    .await?;
 
     // Without podman workers no job takes a slot, so the board shows every
     // slot idle.
@@ -157,6 +166,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 tokens: Arc::clone(&run_tokens),
                 secrets: Arc::clone(&secrets),
                 proxy_url: proxy_url.clone(),
+                warnings: Arc::clone(&mcp_warnings),
             },
         );
         slots = scheduler.slots();

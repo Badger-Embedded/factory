@@ -13,6 +13,7 @@ mod settings;
 mod store;
 mod timeline;
 mod usage;
+mod warnings;
 mod web;
 mod workers;
 
@@ -39,5 +40,6 @@ pub use store::{JobEvent, JobRow, LogEntry, ProjectTotals, Store, StoreError};
 pub use usage::{
     CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, UsageSource, refresh_forever, refresh_once,
 };
+pub use warnings::McpWarnings;
 pub use web::{MAX_IMAGE_BYTES, MAX_IMAGES, USER_HEADER, app};
 pub use workers::{Slot, WorkerSlots};
