@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, PrDescription, Question,
-    Stage, Turn,
+    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
+    PrDescription, Question, ReviewState, Stage, Turn,
 };
 use factory_runner::{Expect, LogLine, Rerun, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Published,
-    RerunRequest, Scheduler, Settings, Store, SummaryRequest, WatchReport, WatchRequest,
-    format_cost,
+    ReadyAction, RerunRequest, Scheduler, Settings, Store, SummaryRequest, WatchReport,
+    WatchRequest, format_cost, ready_action,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -305,7 +305,7 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
             description: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
-        Expect::Review => unreachable!("the scheduler runs no review until its wiring lands"),
+        Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
     });
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -1042,6 +1042,286 @@ async fn the_publish_gate_holds_the_push_until_the_user_approves() {
     );
 }
 
+/// The project reviews before merge and squash-merges on approval.
+fn reviewing() -> factory_server::StageModels {
+    factory_server::StageModels {
+        review: Some("review-model".into()),
+        ..Default::default()
+    }
+}
+
+/// Takes a job to a pull request the factory is watching in ci-and-review,
+/// through the project's checks and a publish.
+async fn to_watching(
+    store: &Store,
+    executor: &FakeExecutor,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+) -> i64 {
+    let id = to_commits_ready(store, executor, scheduler).await;
+    step(scheduler).await; // checks pass -> pr-open
+    step(scheduler).await; // publish -> ci-and-review
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+    id
+}
+
+/// Queues a watch that finds the pull request green, so the next watch
+/// returns the event the factory decided on for a ready pull request.
+fn green(executor: &FakeExecutor, event: Event) {
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(event),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+}
+
+#[test]
+fn a_ready_pull_request_reviews_before_it_merges_or_waits() {
+    // Review off: auto-merge alone decides a merge or a wait, as before.
+    assert_eq!(ready_action(false, false, true), ReadyAction::Merge);
+    assert_eq!(ready_action(false, false, false), ReadyAction::Wait);
+    // Review on and the head not yet approved: review first, whatever
+    // auto-merge says.
+    assert_eq!(ready_action(true, false, true), ReadyAction::Review);
+    assert_eq!(ready_action(true, false, false), ReadyAction::Review);
+    // Review on and the head approved: merge or wait like a project with no
+    // review.
+    assert_eq!(ready_action(true, true, true), ReadyAction::Merge);
+    assert_eq!(ready_action(true, true, false), ReadyAction::Wait);
+}
+
+#[tokio::test]
+async fn the_watch_carries_the_review_flag_and_the_head_review_state() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    store.save_project_settings("maestro", false, true).unwrap();
+    to_watching(&store, &executor, &scheduler).await;
+
+    step(&scheduler).await;
+    let watched = executor.watched.lock().unwrap()[0].clone();
+    assert!(watched.llm_review);
+    assert!(!watched.review_approved);
+}
+
+#[tokio::test]
+async fn an_approved_review_lets_an_auto_merge_go_through() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewApproved,
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    store.save_project_models("maestro", &reviewing()).unwrap();
+    let id = to_watching(&store, &executor, &scheduler).await;
+
+    // CI is green: the factory starts the review instead of merging.
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::Review)
+    ));
+
+    // The reviewer reads the branch in a session of its own, with the review
+    // model, and does not merge.
+    executor.release(1);
+    step(&scheduler).await;
+    let requests = executor.requests();
+    let review = requests.last().unwrap();
+    assert_eq!(review.expect, Expect::Review);
+    assert_eq!(review.model.as_deref(), Some("review-model"));
+    assert_eq!(
+        review.branch.as_deref(),
+        Some(format!("factory/job-{id}-pr-1").as_str())
+    );
+    assert_ne!(review.session_id, requests[0].session_id);
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.reviews().len(), 1);
+    assert_eq!(job.reviews()[0].verdict, factory_core::Verdict::Approve);
+
+    // The head is approved now, so the next watch merges.
+    green(&executor, Event::Merged);
+    step(&scheduler).await;
+    assert!(
+        executor
+            .watched
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .review_approved
+    );
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Implementing { pr: 1 }
+    );
+}
+
+#[tokio::test]
+async fn with_auto_merge_off_the_review_runs_and_the_factory_does_not_merge() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewApproved,
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", false, true).unwrap();
+    let id = to_watching(&store, &executor, &scheduler).await;
+
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    executor.release(1);
+    step(&scheduler).await;
+    assert_eq!(store.get(id).unwrap().job.reviews().len(), 1);
+
+    // The head is approved and auto-merge is off. A plain watch (no event)
+    // leaves the job watching, and the flags it carries tell the executor the
+    // head is reviewed, so `ready_action` would wait rather than merge.
+    step(&scheduler).await;
+    let watched = executor.watched.lock().unwrap().last().unwrap().clone();
+    assert!(watched.llm_review);
+    assert!(watched.review_approved);
+    assert!(!watched.auto_merge);
+    assert_eq!(
+        ready_action(
+            watched.llm_review,
+            watched.review_approved,
+            watched.auto_merge
+        ),
+        ReadyAction::Wait
+    );
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert!(matches!(job.turn(), Turn::Factory));
+}
+
+#[tokio::test]
+async fn requested_changes_go_to_the_implement_session_and_review_again() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewChanges {
+            feedback: "src/main.rs:10: handle the error".into(),
+        },
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    let id = to_watching(&store, &executor, &scheduler).await;
+
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    executor.release(1);
+    step(&scheduler).await; // review asks for changes
+
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.reviews()[0].verdict, factory_core::Verdict::Changes);
+    assert!(matches!(
+        job.turn(),
+        Turn::Agent(factory_core::Task::AddressReview { comments })
+            if comments.contains("handle the error")
+    ));
+    let review = executor.requests().last().unwrap().clone();
+    let review_session = review.session_id.clone();
+
+    // The fix runs in the implement session, not the review session, and its
+    // prompt carries the feedback.
+    executor.release(1);
+    step(&scheduler).await;
+    let fix = executor.requests().last().unwrap().clone();
+    assert_eq!(fix.expect, Expect::Commits);
+    assert_ne!(fix.session_id, review_session);
+    assert!(fix.prompt.contains("handle the error"), "{}", fix.prompt);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Verifying { pr: 0 }
+    );
+
+    // After the push the head is unapproved again, so a green pull request
+    // starts another review.
+    step(&scheduler).await; // checks pass -> pr-open
+    step(&scheduler).await; // publish -> ci-and-review
+    assert_eq!(
+        store.get(id).unwrap().job.review_state(),
+        ReviewState::Pending
+    );
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::Review)
+    ));
+}
+
+#[tokio::test]
+async fn a_reviewer_failure_stops_the_job_for_the_user_without_merging() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewFailed {
+            reason: "the reviewer run ended without structured output".into(),
+        },
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    let id = to_watching(&store, &executor, &scheduler).await;
+
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    executor.release(1);
+    step(&scheduler).await; // reviewer fails
+
+    let job = store.get(id).unwrap().job;
+    assert!(matches!(
+        job.turn(),
+        Turn::User(Ask::ReviewStopped { reason }) if reason.contains("structured output")
+    ));
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+
+    // The job waits for the user: nothing runs and it does not merge.
+    green(&executor, Event::Merged);
+    step(&scheduler).await;
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+    assert_eq!(executor.watches.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_review_cap_sends_the_job_to_the_user() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewChanges {
+            feedback: "one more thing".into(),
+        },
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    let id = to_watching(&store, &executor, &scheduler).await;
+
+    for round in 1..=MAX_REVIEW_ROUNDS {
+        green(&executor, Event::StartReview);
+        step(&scheduler).await;
+        executor.release(1);
+        step(&scheduler).await; // review asks for changes
+        if round == MAX_REVIEW_ROUNDS {
+            break;
+        }
+        // Address the review, then go green again for the next pass.
+        executor.release(1);
+        step(&scheduler).await; // fix commits -> verifying
+        step(&scheduler).await; // checks -> pr-open
+        step(&scheduler).await; // publish -> ci-and-review
+    }
+
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.reviews().len(), MAX_REVIEW_ROUNDS as usize);
+    assert!(matches!(
+        job.turn(),
+        Turn::User(Ask::ReviewStopped { reason }) if reason.contains("review rounds")
+    ));
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+}
+
 mod purge {
     use super::*;
     use factory_server::FINISHED_JOB_DAYS;
@@ -1297,7 +1577,7 @@ fn one_pass(request: &AgentRequest) -> Event {
             description: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
-        Expect::Review => unreachable!("the scheduler runs no review until its wiring lands"),
+        Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
     }
 }
 

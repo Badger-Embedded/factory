@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use factory_core::{BranchSummary, Command, Event, Job, PrDescription, Session, Stage};
+use factory_core::{
+    BranchSummary, Command, Event, Job, PrDescription, ReviewState, Session, Stage,
+};
 use factory_runner::{Expect, LogLine, Rerun, RunReport, job_prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -94,6 +96,41 @@ pub struct WatchRequest {
     pub seen_until: Option<String>,
     /// Merge the pull request when it is ready.
     pub auto_merge: bool,
+    /// Run the LLM review before any merge. When it is on and the current head
+    /// is not yet approved, a ready pull request starts a review instead of
+    /// merging or waiting.
+    pub llm_review: bool,
+    /// The reviewer has approved the current head. A ready pull request then
+    /// merges or waits for the user without another review pass.
+    pub review_approved: bool,
+}
+
+/// What the factory does with a pull request once its checks are green. The
+/// review runs before any merge, so a reviewing project whose current head is
+/// not yet approved reviews first. Pure, so the wiring is testable without
+/// podman or GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyAction {
+    /// Start the LLM review of the current head.
+    Review,
+    /// Squash-merge the pull request.
+    Merge,
+    /// Leave the pull request for the user to merge on GitHub.
+    Wait,
+}
+
+/// Decides [`ReadyAction`] from the project's flags and the head's review
+/// state. The review comes first: a reviewing project reviews an unapproved
+/// head before it merges or waits.
+#[must_use]
+pub fn ready_action(llm_review: bool, review_approved: bool, auto_merge: bool) -> ReadyAction {
+    if llm_review && !review_approved {
+        ReadyAction::Review
+    } else if auto_merge {
+        ReadyAction::Merge
+    } else {
+        ReadyAction::Wait
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,21 +354,7 @@ impl<E: Executor> Scheduler<E> {
                     self.publish(row.id, pr, &job, &project, &settings)?;
                 }
                 Command::WatchPr { pr, number } if self.due(row.id) => {
-                    let request = WatchRequest {
-                        job_id: row.id,
-                        repo: project.repo.clone(),
-                        base: project.base.clone(),
-                        number,
-                        seen_until: self.store.pr_watermark(row.id, pr)?,
-                        auto_merge: self
-                            .store
-                            .project_auto_merge(&row.project, project.auto_merge)?,
-                    };
-                    let scheduler = Arc::clone(self);
-                    let settings = settings.clone();
-                    self.spawn(row.id, Kind::Factory, async move {
-                        scheduler.watch(&settings, pr, request).await;
-                    });
+                    self.watch_pr(&row, &job, &project, &settings, pr, number)?;
                 }
                 Command::RerunCi { number, reason, .. } if self.due(row.id) => {
                     let request = RerunRequest {
@@ -528,6 +551,42 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
+    /// Spawns the watch of an open pull request. The request carries the
+    /// project's auto-merge and LLM-review flags and whether the current head
+    /// is already reviewed, so the executor can review before merge, merge, or
+    /// wait. Reading the flags here means a settings change reaches a job in
+    /// flight at its next watch.
+    fn watch_pr(
+        self: &Arc<Self>,
+        row: &JobRow,
+        job: &Job,
+        project: &Project,
+        settings: &Settings,
+        pr: usize,
+        number: u64,
+    ) -> Result<(), StoreError> {
+        let request = WatchRequest {
+            job_id: row.id,
+            repo: project.repo.clone(),
+            base: project.base.clone(),
+            number,
+            seen_until: self.store.pr_watermark(row.id, pr)?,
+            auto_merge: self
+                .store
+                .project_auto_merge(&row.project, project.auto_merge)?,
+            llm_review: self
+                .store
+                .project_llm_review(&row.project, project.llm_review)?,
+            review_approved: job.review_state() == ReviewState::Approved,
+        };
+        let scheduler = Arc::clone(self);
+        let settings = settings.clone();
+        self.spawn(row.id, Kind::Factory, async move {
+            scheduler.watch(&settings, pr, request).await;
+        });
+        Ok(())
+    }
+
     async fn agent(&self, settings: &Settings, request: AgentRequest) {
         let job_id = request.job_id;
         self.note(
@@ -567,6 +626,12 @@ impl<E: Executor> Scheduler<E> {
                     self.note(
                         job_id,
                         &format!("Merged #{number}: its checks passed and auto-merge is on."),
+                    );
+                }
+                if event == Event::StartReview {
+                    self.note(
+                        job_id,
+                        &format!("#{number} is green; reviewing it before the merge."),
                     );
                 }
                 let result = match &seen_until {

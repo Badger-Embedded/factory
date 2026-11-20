@@ -8,8 +8,8 @@ use factory_runner::{
 };
 
 use crate::scheduler::{
-    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, RerunRequest,
-    SummaryRequest, WatchReport, WatchRequest,
+    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, ReadyAction,
+    RerunRequest, SummaryRequest, WatchReport, WatchRequest, ready_action,
 };
 use crate::settings::Settings;
 
@@ -179,11 +179,19 @@ impl Executor for PodmanExecutor {
         let status = self.github.status(&request.repo, request.number).await?;
         let mut merged_by_factory = false;
         let (event, seen_until) = match observe(&status, request.seen_until.as_deref()) {
-            Observation::Ready if request.auto_merge => {
-                self.github.merge(&request.repo, request.number).await?;
-                merged_by_factory = true;
-                (Some(Event::Merged), None)
-            }
+            Observation::Ready => match ready_action(
+                request.llm_review,
+                request.review_approved,
+                request.auto_merge,
+            ) {
+                ReadyAction::Review => (Some(Event::StartReview), None),
+                ReadyAction::Merge => {
+                    self.github.merge(&request.repo, request.number).await?;
+                    merged_by_factory = true;
+                    (Some(Event::Merged), None)
+                }
+                ReadyAction::Wait => (None, None),
+            },
             Observation::Merged => (Some(Event::Merged), None),
             Observation::Closed => (Some(Event::ClosedUnmerged), None),
             Observation::Conflicted => (
@@ -200,7 +208,7 @@ impl Executor for PodmanExecutor {
                 Some(Event::ReviewComments { comments: text }),
                 Some(seen_until),
             ),
-            Observation::Ready | Observation::Nothing => (None, None),
+            Observation::Nothing => (None, None),
         };
         Ok(WatchReport {
             event,
