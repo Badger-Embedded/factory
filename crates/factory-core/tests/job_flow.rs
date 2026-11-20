@@ -58,6 +58,19 @@ fn watching(number: u64) -> Job {
     job
 }
 
+/// Fails the CI of the watched pull request `number` until the job runs out
+/// of its failed rounds. Each round fixes nothing new, so the job keeps
+/// returning to the watched pull request until the last round fails it.
+fn fail_ci_until_out_of_rounds(job: &mut Job, number: u64) {
+    for _ in 1..MAX_FAILED_ROUNDS {
+        apply(job, Event::CiFailed { log: "fail".into() });
+        apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(job, Event::ChecksPassed);
+        apply(job, Event::Published { number });
+    }
+    apply(job, Event::CiFailed { log: "last".into() });
+}
+
 #[test]
 fn request_ends_merged_after_every_planned_pull_request_merges() {
     let mut job = Job::new("add a reboot button", Gates::default());
@@ -407,9 +420,11 @@ fn an_agent_failure_fails_the_job() {
     assert_eq!(
         job.stage(),
         &Stage::Failed {
-            reason: "usage limit".into()
+            reason: "usage limit".into(),
+            retry: None,
         }
     );
+    assert!(!job.can_retry());
 }
 
 #[test]
@@ -967,4 +982,163 @@ fn the_fifth_failed_round_fails_the_job_when_it_is_a_rerun() {
 
     assert!(matches!(job.stage(), Stage::Failed { .. }));
     assert_eq!(job.next_command(), None);
+}
+
+#[test]
+fn a_retry_resumes_a_job_that_ran_out_of_ci_rounds() {
+    let mut job = watching(7);
+    fail_ci_until_out_of_rounds(&mut job, 7);
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert!(job.can_retry());
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr { pr: 0, number: 7 })
+    );
+}
+
+#[test]
+fn a_retry_resumes_a_job_that_ran_out_of_check_rounds() {
+    let mut job = implementing(&["only"]);
+    for _ in 0..MAX_FAILED_ROUNDS {
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::ChecksFailed {
+                report: "fail".into(),
+            },
+        );
+    }
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert!(job.can_retry());
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(job.next_command(), Some(Command::RunChecks { pr: 0 }));
+}
+
+#[test]
+fn a_retried_job_fails_again_after_five_more_rounds_and_retries_again() {
+    let mut job = watching(7);
+    fail_ci_until_out_of_rounds(&mut job, 7);
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+
+    // The retry reset the failed rounds, so it takes five more to fail again.
+    fail_ci_until_out_of_rounds(&mut job, 7);
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert!(job.can_retry());
+}
+
+#[test]
+fn retry_is_rejected_for_a_failure_that_cannot_resume() {
+    for mut job in [closed_unmerged_job(), agent_failed_job(), cancelled_job()] {
+        assert!(!job.can_retry());
+        let before = job.clone();
+        assert!(matches!(
+            job.apply(Event::Retry),
+            Err(Rejected::Unexpected { .. })
+        ));
+        assert_eq!(job, before);
+    }
+}
+
+#[test]
+fn retry_is_rejected_for_a_merged_job() {
+    let mut job = watching(9);
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert!(!job.can_retry());
+    assert!(job.apply(Event::Retry).is_err());
+}
+
+#[test]
+fn retry_is_rejected_while_the_job_still_runs() {
+    let mut job = watching(9);
+    assert!(!job.can_retry());
+    let before = job.clone();
+    assert!(job.apply(Event::Retry).is_err());
+    assert_eq!(job, before);
+}
+
+fn closed_unmerged_job() -> Job {
+    let mut job = watching(9);
+    apply(&mut job, Event::ClosedUnmerged);
+    job
+}
+
+fn agent_failed_job() -> Job {
+    let mut job = implementing(&["only"]);
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+    job
+}
+
+fn cancelled_job() -> Job {
+    let mut job = implementing(&["only"]);
+    apply(&mut job, Event::Cancel);
+    job
+}
+
+/// Drops the retry target from a failed job's JSON, so it loads like a job
+/// stored before the target existed.
+fn without_retry_target(job: &Job) -> Job {
+    let mut value: serde_json::Value = serde_json::to_value(job).unwrap();
+    value["stage"]["Failed"]
+        .as_object_mut()
+        .unwrap()
+        .remove("retry");
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn a_legacy_failed_job_retries_at_its_highest_numbered_pull_request() {
+    let mut job = implementing(&["first", "second"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 10 });
+    apply(&mut job, Event::Merged);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 11 });
+    fail_ci_until_out_of_rounds(&mut job, 11);
+
+    let mut legacy = without_retry_target(&job);
+    assert!(matches!(legacy.stage(), Stage::Failed { .. }));
+    assert!(legacy.can_retry());
+
+    apply(&mut legacy, Event::Retry);
+    assert_eq!(legacy.stage(), &Stage::CiAndReview { pr: 1 });
+    assert_eq!(
+        legacy.next_command(),
+        Some(Command::WatchPr { pr: 1, number: 11 })
+    );
+}
+
+#[test]
+fn a_legacy_failed_job_with_no_pull_request_number_is_not_retryable() {
+    let mut job = implementing(&["only"]);
+    for _ in 0..MAX_FAILED_ROUNDS {
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::ChecksFailed {
+                report: "fail".into(),
+            },
+        );
+    }
+    assert_eq!(job.plan()[0].number, None);
+
+    let mut legacy = without_retry_target(&job);
+    assert!(matches!(legacy.stage(), Stage::Failed { .. }));
+    assert!(!legacy.can_retry());
+    assert!(legacy.apply(Event::Retry).is_err());
 }

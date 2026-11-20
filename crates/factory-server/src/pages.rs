@@ -706,13 +706,20 @@ fn status_card(id: i64, job: &Job, settings: &Settings) -> Markup {
                 summary: Some(summary),
             }),
         ) => publish_card(id, job, *pr, summary),
-        (Stage::Failed { reason }, _) => html! {
+        (Stage::Failed { reason, .. }, _) => html! {
             div.card.failed {
                 div.card-head {
                     span.badge.bad { "failed" }
                     h2 { "The job failed" }
                 }
                 p.failure-reason { (reason) }
+                @if job.can_retry() {
+                    div.row.actions {
+                        form method="post" action={ "/jobs/" (id) "/retry" } {
+                            button.primary { "Retry" }
+                        }
+                    }
+                }
             }
         },
         _ => html! {

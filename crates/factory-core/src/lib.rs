@@ -9,5 +9,5 @@ mod job;
 
 pub use job::{
     AgentResult, Answered, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
-    PlannedPr, PrDescription, Question, Rejected, Session, Stage, Task, Turn,
+    PlannedPr, PrDescription, Question, Rejected, RetryTarget, Session, Stage, Task, Turn,
 };

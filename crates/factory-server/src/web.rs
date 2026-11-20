@@ -63,6 +63,7 @@ pub fn app(
         .route("/jobs/{id}/images/{name}", get(show_image))
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
+        .route("/jobs/{id}/retry", post(retry))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(show_settings).post(save_settings))
@@ -368,6 +369,24 @@ async fn approve(
     Form(form): Form<ApproveForm>,
 ) -> Result<Redirect, AppError> {
     let redirect = apply(&state, id, Event::Approve)?;
+    match form
+        .project
+        .filter(|name| state.projects.get(name).is_some())
+    {
+        Some(name) => Ok(Redirect::to(&format!("/?project={}", query_escape(&name)))),
+        None => Ok(redirect),
+    }
+}
+
+async fn retry(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(form): Form<ApproveForm>,
+) -> Result<Redirect, AppError> {
+    let redirect = apply(&state, id, Event::Retry)?;
+    state
+        .store
+        .append_factory_log(id, "Retried the job from the dashboard.")?;
     match form
         .project
         .filter(|name| state.projects.get(name).is_some())

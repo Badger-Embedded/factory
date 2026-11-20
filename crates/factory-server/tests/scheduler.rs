@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Event, Gates, PrDescription, Question, Stage, Turn,
+    AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, PrDescription, Question,
+    Stage, Turn,
 };
 use factory_runner::{Expect, LogLine, Rerun, RunReport};
 use factory_server::{
@@ -399,7 +400,7 @@ async fn a_failed_run_fails_the_job() {
 
     assert!(matches!(
         store.get(id).unwrap().job.stage(),
-        Stage::Failed { reason } if reason.contains("125")
+        Stage::Failed { reason, .. } if reason.contains("125")
     ));
     scheduler.tick().await.unwrap();
     assert_eq!(scheduler.running(), Vec::<i64>::new());
@@ -440,7 +441,7 @@ async fn a_job_for_an_unknown_project_fails() {
     assert_eq!(executor.requests().len(), 0);
     assert!(matches!(
         store.get(id).unwrap().job.stage(),
-        Stage::Failed { reason } if reason.contains("\"gone\"")
+        Stage::Failed { reason, .. } if reason.contains("\"gone\"")
     ));
 }
 
@@ -1689,4 +1690,39 @@ async fn the_watch_after_a_rerun_waits_for_the_poll_interval() {
     step(&scheduler).await;
     assert_eq!(executor.rerun_requests.lock().unwrap().len(), 1);
     assert_eq!(executor.watched.lock().unwrap().len(), watches);
+}
+
+#[tokio::test]
+async fn retrying_a_failed_job_watches_the_pull_request_again() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    store.apply(id, Event::ChecksPassed).unwrap();
+    store.apply(id, Event::Published { number: 50 }).unwrap();
+    for _ in 1..MAX_FAILED_ROUNDS {
+        store
+            .apply(id, Event::CiFailed { log: "fail".into() })
+            .unwrap();
+        store
+            .apply(id, Event::Agent(AgentResult::CommitsReady(ready())))
+            .unwrap();
+        store.apply(id, Event::ChecksPassed).unwrap();
+        store.apply(id, Event::Published { number: 50 }).unwrap();
+    }
+    store
+        .apply(id, Event::CiFailed { log: "last".into() })
+        .unwrap();
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+
+    store.apply(id, Event::Retry).unwrap();
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+
+    step(&scheduler).await;
+    assert_eq!(executor.watched.lock().unwrap().last().unwrap().number, 50);
 }
