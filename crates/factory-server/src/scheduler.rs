@@ -43,6 +43,8 @@ pub struct AgentRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksRequest {
     pub job_id: i64,
+    /// The branch the pull request targets.
+    pub base: String,
     /// The project's `checks` command.
     pub command: String,
 }
@@ -336,11 +338,19 @@ impl<E: Executor> Scheduler<E> {
         }
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
+        let base = project.base.clone();
         self.spawn(job_id, Kind::Worker, async move {
             scheduler.note(job_id, &format!("Running the checks: {command}"));
             let result = scheduler
                 .executor
-                .run_checks(&settings, ChecksRequest { job_id, command })
+                .run_checks(
+                    &settings,
+                    ChecksRequest {
+                        job_id,
+                        base,
+                        command,
+                    },
+                )
                 .await;
             match result {
                 Ok(event) => {

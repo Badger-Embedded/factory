@@ -97,6 +97,26 @@ impl Git {
         .map(|_| ())
     }
 
+    /// The commits on the checked-out branch, after `origin/<base>`, whose
+    /// message credits an AI tool, as `<short sha> <subject>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when `git log` fails.
+    pub async fn attributed_commits(&self, work: &Path, base: &str) -> Result<Vec<String>, String> {
+        let range = format!("origin/{base}..HEAD");
+        let log = self
+            .run(work, &["log", "--format=%h %s%x1f%B%x1e", &range], false)
+            .await?;
+        Ok(log
+            .split('\u{1e}')
+            .filter_map(|entry| {
+                let (head, body) = entry.trim().split_once('\u{1f}')?;
+                body.lines().any(credits_ai).then(|| head.trim().to_owned())
+            })
+            .collect())
+    }
+
     async fn clone_into(&self, work: &Path, repo: &str, base: &str) -> Result<(), String> {
         if work.exists() {
             fs::remove_dir_all(work)
@@ -151,4 +171,13 @@ impl Git {
             ))
         }
     }
+}
+
+/// Whether a commit message line credits an AI tool: a co-author trailer
+/// for Claude or Anthropic, or Claude Code's "Generated with" footer.
+fn credits_ai(line: &str) -> bool {
+    let line = line.trim().to_ascii_lowercase();
+    (line.starts_with("co-authored-by:") && (line.contains("claude") || line.contains("anthropic")))
+        || line.contains("generated with [claude")
+        || line.contains("generated with claude")
 }

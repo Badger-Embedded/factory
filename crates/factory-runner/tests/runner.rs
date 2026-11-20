@@ -318,6 +318,11 @@ fn podman_args_give_the_worker_its_token_limits_and_mounts() {
     assert!(!args.iter().any(|arg| arg == "--resume"));
     assert_eq!(value_after(&args, "--plugin-dir"), "/factory-plugin");
     assert_eq!(value_after(&args, "--output-format"), "stream-json");
+    let settings: Value = serde_json::from_str(value_after(&args, "--settings")).unwrap();
+    assert_eq!(
+        settings["attribution"],
+        json!({"commit": "", "pr": "", "sessionUrl": false})
+    );
     assert_eq!(value_after(&args, "-p"), "Write the spec.");
     let schema: Value = serde_json::from_str(value_after(&args, "--json-schema")).unwrap();
     assert_eq!(schema, Expect::Spec.schema());

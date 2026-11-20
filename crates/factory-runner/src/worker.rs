@@ -19,6 +19,14 @@ pub const PLUGIN_DIR: &str = "/factory-plugin";
 
 const MAX_STDERR: usize = 4096;
 
+/// Settings for every agent run. Claude Code adds a `Co-Authored-By`
+/// trailer to commits and a footer to pull request descriptions unless
+/// `attribution` empties them, and GitHub copies a branch's co-author
+/// trailers into the squash commit on the base branch. Empty strings work
+/// on every Claude Code version; `"attribution": false` makes versions
+/// before 2.1.281 skip the whole settings value.
+pub const AGENT_SETTINGS: &str = r#"{"attribution":{"commit":"","pr":"","sessionUrl":false}}"#;
+
 /// Settings shared by every worker.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -193,6 +201,8 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
         "bypassPermissions",
         "--json-schema",
         schema.as_str(),
+        "--settings",
+        AGENT_SETTINGS,
         session_flag,
         session_id.as_str(),
     ];
