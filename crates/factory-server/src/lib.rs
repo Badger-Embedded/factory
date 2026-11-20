@@ -9,7 +9,7 @@ mod settings;
 mod store;
 mod web;
 
-pub use cost::format_cost;
+pub use cost::{format_cost, merge_fraction};
 pub use podman::PodmanExecutor;
 pub use projects::{Project, Projects, ProjectsError};
 pub use scheduler::{

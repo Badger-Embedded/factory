@@ -45,6 +45,7 @@
   --font-size-base: 15px;
   --font-size-lg: 17px;
   --font-size-xl: 22px;
+  --font-size-kpi: 32px;
   --weight-semibold: 600;
   --weight-bold: 700;
 
@@ -145,12 +146,16 @@ h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: var(--space-16);
   margin-bottom: var(--space-16);
 }
 .stats .card { margin-bottom: 0; }
-.stat-value { font-size: var(--font-size-xl); font-weight: var(--weight-semibold); letter-spacing: -0.01em; }
+.stat-value { font-size: var(--font-size-kpi); font-weight: var(--weight-semibold); letter-spacing: -0.01em; }
+.gauge-arc { display: block; width: 100%; max-width: 160px; margin-bottom: var(--space-4); }
+.gauge-track, .gauge-fill { fill: none; stroke-width: 8; }
+.gauge-track { stroke: var(--sunken); }
+.gauge-fill { stroke: var(--ok); }
 .stat-label { color: var(--muted); font-size: var(--font-size-sm); margin-top: var(--space-2); }
 
 .card.needs-you { border-color: var(--you); box-shadow: var(--elevation-bar) var(--you); }
