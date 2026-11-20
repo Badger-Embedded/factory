@@ -1,6 +1,8 @@
 use std::future::{Future, ready};
 
-use factory_server::{BranchInfo, GitHubRepos, Permission, RepoInfo, check_repo};
+use factory_server::{
+    BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoInfo, check_repo,
+};
 
 /// A fake GitHub that answers each call from stored values, so the checks run
 /// without the network. `fail` turns every call into an error, to test the
@@ -50,7 +52,9 @@ fn fit() -> Fake {
             allow_squash_merge: true,
             delete_branch_on_merge: true,
         }),
-        branch: Some(BranchInfo { protected: true }),
+        branch: Some(BranchInfo {
+            protection: Protection::Protected,
+        }),
         ci: true,
         fail: None,
     }
@@ -144,7 +148,9 @@ async fn admin_access_is_only_a_warning() {
 #[tokio::test]
 async fn an_unprotected_base_branch_is_only_a_warning() {
     let fake = Fake {
-        branch: Some(BranchInfo { protected: false }),
+        branch: Some(BranchInfo {
+            protection: Protection::Unprotected,
+        }),
         ..fit()
     };
     let report = check_repo(&fake, "Badger-Embedded/maestro", "main")
@@ -188,5 +194,80 @@ async fn a_failed_github_call_is_an_error_not_a_report() {
     assert_eq!(
         result,
         Err("gh api repos/Badger-Embedded/maestro failed: HTTP 500".into())
+    );
+}
+
+#[tokio::test]
+async fn unreadable_branch_rules_are_only_a_warning() {
+    let fake = Fake {
+        branch: Some(BranchInfo {
+            protection: Protection::Unknown {
+                reason: "Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)".into(),
+            },
+        }),
+        ..fit()
+    };
+    let report = check_repo(&fake, "Badger-Embedded/maestro", "main")
+        .await
+        .unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("could not check whether the base branch \"main\""));
+    assert!(report.warnings[0].contains("Upgrade to GitHub Pro"));
+}
+
+/// A `gh` stand-in that answers each `gh api <path>` the way GitHub answers
+/// for a private repository on a free plan: the rules endpoint returns 403.
+/// `forbid` names one more path that returns 403.
+fn fake_gh(dir: &std::path::Path, forbid: &str) -> GhRepos {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("gh");
+    let script = format!(
+        r#"#!/bin/sh
+forbidden() {{
+  echo 'gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)' >&2
+  exit 1
+}}
+[ "$2" = "{forbid}" ] && forbidden
+case "$2" in
+  repos/o/r) echo '{{"permissions":{{"push":true}},"allow_squash_merge":true,"delete_branch_on_merge":true}}' ;;
+  repos/o/r/branches/main) echo '{{"protected":false}}' ;;
+  repos/o/r/rules/branches/main) forbidden ;;
+  repos/o/r/actions/workflows) echo '{{"total_count":1}}' ;;
+  *) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+esac
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    GhRepos {
+        gh: path,
+        token: None,
+    }
+}
+
+#[tokio::test]
+async fn gh_reads_a_forbidden_rules_endpoint_as_unknown_protection() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(dir.path(), "");
+    let report = check_repo(&gh, "o/r", "main").await.unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        report.warnings,
+        vec![
+            "The factory could not check whether the base branch \"main\" has protection or a ruleset. GitHub answered: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+                .to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn gh_still_fails_on_a_forbidden_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = fake_gh(dir.path(), "repos/o/r");
+    let err = check_repo(&gh, "o/r", "main").await.unwrap_err();
+    assert!(
+        err.starts_with("gh api repos/o/r failed: Upgrade to GitHub Pro"),
+        "{err}"
     );
 }

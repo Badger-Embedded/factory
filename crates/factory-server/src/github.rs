@@ -75,8 +75,19 @@ pub struct RepoInfo {
 /// The state of the base branch that the checks read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchInfo {
-    /// The branch has branch protection or a ruleset that applies to it.
-    pub protected: bool,
+    pub protection: Protection,
+}
+
+/// Whether branch protection or a ruleset applies to the base branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Protection {
+    Protected,
+    Unprotected,
+    /// GitHub refused to show the branch's rules, for example with HTTP 403
+    /// for a private repository on a free plan. `reason` is GitHub's message.
+    Unknown {
+        reason: String,
+    },
 }
 
 /// The outcome of [`check_repo`]: the checks that failed and the warnings that
@@ -145,10 +156,14 @@ pub async fn check_repo(
             "The bot has Admin access to {repo}. The design asks for Write, so a ruleset's Admin bypass does not apply to it."
         ));
     }
-    if base_branch.is_some_and(|branch| !branch.protected) {
-        report.warnings.push(format!(
+    match base_branch.map(|branch| branch.protection) {
+        Some(Protection::Unprotected) => report.warnings.push(format!(
             "The base branch \"{base}\" has no protection or ruleset."
-        ));
+        )),
+        Some(Protection::Unknown { reason }) => report.warnings.push(format!(
+            "The factory could not check whether the base branch \"{base}\" has protection or a ruleset. GitHub answered: {reason}"
+        )),
+        Some(Protection::Protected) | None => {}
     }
     if !gh.has_ci(repo).await? {
         report.warnings.push(format!("{repo} has no CI workflow."));
@@ -250,6 +265,8 @@ struct WorkflowsJson {
 enum ApiOutcome {
     Found(String),
     NotFound,
+    /// HTTP 403, with gh's message.
+    Forbidden(String),
 }
 
 impl GitHubRepos for GhRepos {
@@ -257,6 +274,9 @@ impl GitHubRepos for GhRepos {
         let body = match self.api(&format!("repos/{repo}")).await? {
             ApiOutcome::Found(body) => body,
             ApiOutcome::NotFound => return Ok(None),
+            ApiOutcome::Forbidden(message) => {
+                return Err(format!("gh api repos/{repo} failed: {message}"));
+            }
         };
         let json: RepoJson =
             serde_json::from_str(&body).map_err(|err| format!("gh api repos/{repo}: {err}"))?;
@@ -278,28 +298,42 @@ impl GitHubRepos for GhRepos {
         let body = match self.api(&format!("repos/{repo}/branches/{branch}")).await? {
             ApiOutcome::Found(body) => body,
             ApiOutcome::NotFound => return Ok(None),
+            ApiOutcome::Forbidden(message) => {
+                return Err(format!(
+                    "gh api repos/{repo}/branches/{branch} failed: {message}"
+                ));
+            }
         };
         let json: BranchJson = serde_json::from_str(&body)
             .map_err(|err| format!("gh api repos/{repo}/branches/{branch}: {err}"))?;
-        // A ruleset protects a branch without setting `protected`, so the
-        // branch is protected when either the branch protection or a ruleset
-        // applies to it.
-        let rules = match self
+        if json.protected {
+            return Ok(Some(BranchInfo {
+                protection: Protection::Protected,
+            }));
+        }
+        // A ruleset protects a branch without setting `protected`.
+        let protection = match self
             .api(&format!("repos/{repo}/rules/branches/{branch}"))
             .await?
         {
-            ApiOutcome::Found(body) => !body.trim().trim_start_matches('[').trim().is_empty(),
-            ApiOutcome::NotFound => false,
+            ApiOutcome::Found(body) if !body.trim().trim_start_matches('[').trim().is_empty() => {
+                Protection::Protected
+            }
+            ApiOutcome::Found(_) | ApiOutcome::NotFound => Protection::Unprotected,
+            ApiOutcome::Forbidden(reason) => Protection::Unknown { reason },
         };
-        Ok(Some(BranchInfo {
-            protected: json.protected || rules,
-        }))
+        Ok(Some(BranchInfo { protection }))
     }
 
     async fn has_ci(&self, repo: &str) -> Result<bool, String> {
         let body = match self.api(&format!("repos/{repo}/actions/workflows")).await? {
             ApiOutcome::Found(body) => body,
             ApiOutcome::NotFound => return Ok(false),
+            ApiOutcome::Forbidden(message) => {
+                return Err(format!(
+                    "gh api repos/{repo}/actions/workflows failed: {message}"
+                ));
+            }
         };
         let json: WorkflowsJson = serde_json::from_str(&body)
             .map_err(|err| format!("gh api repos/{repo}/actions/workflows: {err}"))?;
@@ -309,8 +343,10 @@ impl GitHubRepos for GhRepos {
 
 impl GhRepos {
     /// Runs `gh api <path>`. A 404 is [`ApiOutcome::NotFound`], because the
-    /// checks read it as "missing", not as a failure. Any other non-zero exit
-    /// is an error with gh's stderr.
+    /// checks read it as "missing", not as a failure. A 403 is
+    /// [`ApiOutcome::Forbidden`], so a check that GitHub withholds on the
+    /// repository's plan can become a warning. Any other non-zero exit is an
+    /// error with gh's stderr.
     async fn api(&self, path: &str) -> Result<ApiOutcome, String> {
         let mut command = Command::new(&self.gh);
         command
@@ -335,6 +371,11 @@ impl GhRepos {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("HTTP 404") {
             Ok(ApiOutcome::NotFound)
+        } else if stderr.contains("HTTP 403") {
+            let message = stderr.trim();
+            Ok(ApiOutcome::Forbidden(
+                message.strip_prefix("gh: ").unwrap_or(message).to_owned(),
+            ))
         } else {
             Err(format!("gh api {path} failed: {}", stderr.trim()))
         }
