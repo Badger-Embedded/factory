@@ -46,7 +46,9 @@ impl Git {
     /// existing one is left as it is, so planning runs keep reading the same
     /// commit. With a branch, an existing local branch is checked out with
     /// the agent's commits on it, and a new one starts from the newest
-    /// `origin/<base>`.
+    /// `origin/<base>`. A rebase a stopped run left unfinished is aborted
+    /// first, which returns the branch to its commits before the rebase, so
+    /// the next run can start the rebase again.
     ///
     /// # Errors
     ///
@@ -65,6 +67,12 @@ impl Git {
             return Ok(());
         };
         self.run(work, &["fetch", "origin", base], true).await?;
+        if ["rebase-merge", "rebase-apply"]
+            .iter()
+            .any(|dir| work.join(".git").join(dir).exists())
+        {
+            self.run(work, &["rebase", "--abort"], false).await?;
+        }
         let local = format!("refs/heads/{branch}");
         if self
             .run(work, &["rev-parse", "--verify", "--quiet", &local], false)

@@ -142,6 +142,35 @@ async fn a_pull_request_branch_starts_from_the_newest_base_and_keeps_its_commits
 }
 
 #[tokio::test]
+async fn a_rebase_left_unfinished_is_aborted() {
+    let remote = Remote::new();
+    let work = remote.work();
+    let git_ = remote.git();
+    let branch = "factory/job-7-pr-1";
+    git_.prepare(&work, "owner/repo", "main", Some(branch))
+        .await
+        .unwrap();
+    commit(&work, "README", "agent edit");
+    commit(&remote.upstream(), "README", "upstream edit");
+    git(&remote.upstream(), &["push", "-q", "origin", "main"]);
+    git(&work, &["fetch", "-q", "origin", "main"]);
+    let conflict = Command::new("git")
+        .args(["rebase", "origin/main"])
+        .current_dir(&work)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success(), "the rebase should conflict");
+
+    git_.prepare(&work, "owner/repo", "main", Some(branch))
+        .await
+        .unwrap();
+    assert_eq!(git(&work, &["branch", "--show-current"]), branch);
+    assert_eq!(git(&work, &["log", "-1", "--format=%s"]), "agent edit");
+    assert_eq!(git(&work, &["status", "--porcelain"]), "");
+}
+
+#[tokio::test]
 async fn push_publishes_the_branch() {
     let remote = Remote::new();
     let work = remote.work();
