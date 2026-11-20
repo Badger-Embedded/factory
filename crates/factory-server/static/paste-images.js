@@ -13,24 +13,48 @@
     input.files = transfer.files;
   }
 
+  // A document icon for a text file, an archive icon for a name ending in
+  // .zip. The server's byte check, not this guess, decides what is accepted.
+  function iconFor(file) {
+    var zip = /\.zip$/i.test(file.name);
+    var icon = document.createElement("span");
+    icon.className = "file-icon-preview";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = zip ? "🗄" : "📄";
+    return icon;
+  }
+
   function render() {
     list.textContent = "";
     files.forEach(function (file, index) {
       var item = document.createElement("li");
-      var img = document.createElement("img");
-      img.src = URL.createObjectURL(file);
-      img.alt = "Attached image " + (index + 1);
+      var objectUrl = null;
+      if (file.type.indexOf("image/") === 0) {
+        var img = document.createElement("img");
+        objectUrl = URL.createObjectURL(file);
+        img.src = objectUrl;
+        img.alt = "Attached image " + (index + 1);
+        item.appendChild(img);
+      } else {
+        var tile = document.createElement("span");
+        tile.className = "file-tile";
+        tile.appendChild(iconFor(file));
+        var name = document.createElement("span");
+        name.className = "file-name";
+        name.textContent = file.name;
+        tile.appendChild(name);
+        item.appendChild(tile);
+      }
       var remove = document.createElement("button");
       remove.type = "button";
       remove.textContent = "Remove";
-      remove.setAttribute("aria-label", "Remove image " + (index + 1));
+      remove.setAttribute("aria-label", "Remove attachment " + (index + 1));
       remove.addEventListener("click", function () {
-        URL.revokeObjectURL(img.src);
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
         files.splice(index, 1);
         sync();
         render();
       });
-      item.appendChild(img);
       item.appendChild(remove);
       list.appendChild(item);
     });

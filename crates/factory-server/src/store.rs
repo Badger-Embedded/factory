@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS job_images (
     name TEXT NOT NULL,
     PRIMARY KEY (job_id, name)
 );
+CREATE TABLE IF NOT EXISTS job_files (
+    job_id INTEGER NOT NULL REFERENCES jobs (id),
+    name TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    PRIMARY KEY (job_id, name)
+);
 CREATE TABLE IF NOT EXISTS job_costs (
     job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
     usd REAL NOT NULL
@@ -146,6 +152,15 @@ CREATE TABLE IF NOT EXISTS project_mcp_tool_refreshes (
     PRIMARY KEY (project, server)
 );
 ";
+
+/// A file attached to a request. `name` is the generated name on disk, such
+/// as `file-1.txt`; `original_name` is the browser's file name, shown on the
+/// job page, used for the download name and listed in the prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFile {
+    pub name: String,
+    pub original_name: String,
+}
 
 /// One line of a job's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,6 +483,7 @@ impl Store {
         let tx = conn.transaction()?;
         for table in [
             "job_images",
+            "job_files",
             "job_costs",
             "job_events",
             "pr_watermarks",
@@ -535,6 +551,24 @@ impl Store {
             tx.execute(
                 "INSERT INTO job_images (job_id, name) VALUES (?1, ?2)",
                 params![id, name],
+            )?;
+        }
+        Ok(tx.commit()?)
+    }
+
+    /// Records the generated name and original name of each file saved for
+    /// job `id`, in upload order. The bytes live under the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn add_files(&self, id: i64, files: &[JobFile]) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for file in files {
+            tx.execute(
+                "INSERT INTO job_files (job_id, name, original_name) VALUES (?1, ?2, ?3)",
+                params![id, file.name, file.original_name],
             )?;
         }
         Ok(tx.commit()?)
@@ -767,6 +801,25 @@ impl Store {
         let mut stmt =
             conn.prepare("SELECT name FROM job_images WHERE job_id = ?1 ORDER BY rowid")?;
         let rows = stmt.query_map([id], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The files saved for job `id`, in upload order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn files(&self, id: i64) -> Result<Vec<JobFile>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, original_name FROM job_files WHERE job_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([id], |row| {
+            Ok(JobFile {
+                name: row.get(0)?,
+                original_name: row.get(1)?,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

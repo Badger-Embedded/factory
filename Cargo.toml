@@ -11,3 +11,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+
+# Keep line tables for panic locations but drop full DWARF, so the statically
+# linked test binaries fit the build disk. A full `cargo test --workspace`
+# otherwise links more debug info than the worker's volume holds.
+[profile.dev]
+debug = "line-tables-only"

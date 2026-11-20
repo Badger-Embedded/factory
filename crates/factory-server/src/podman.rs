@@ -5,7 +5,7 @@ use std::sync::Arc;
 use factory_core::Event;
 use factory_runner::{
     BranchSummary, Git, GitHub, Observation, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
-    observe, place_images, remove_container, run, run_checks, show_images,
+    observe, place_files, place_images, remove_container, run, run_checks, show_files, show_images,
 };
 
 use crate::scheduler::{
@@ -14,6 +14,7 @@ use crate::scheduler::{
 };
 use crate::secrets::ClaudeToken;
 use crate::settings::Settings;
+use crate::store::Store;
 
 /// Runs agents in podman worker containers.
 ///
@@ -35,6 +36,9 @@ pub struct PodmanExecutor {
     /// applies to the next run with no factory restart. When it resolves none,
     /// the run fails with "no Claude token is set" before any container starts.
     pub token: Arc<ClaudeToken>,
+    /// Reads each job's attached files, so a fresh-session run lists them in
+    /// the prompt with the original names the store holds.
+    pub store: Arc<Store>,
 }
 
 fn failed(reason: String) -> RunReport {
@@ -53,6 +57,23 @@ impl PodmanExecutor {
 
     fn job_dir(&self, job_id: i64) -> PathBuf {
         self.data_dir.join("jobs").join(job_id.to_string())
+    }
+
+    /// Each file saved for a job as its path under `job_dir` and the original
+    /// name the store holds, in upload order. A job without files has an empty
+    /// list.
+    fn job_files(
+        &self,
+        job_id: i64,
+        job_dir: &Path,
+    ) -> Result<Vec<(PathBuf, String)>, crate::store::StoreError> {
+        let dir = job_dir.join("files");
+        Ok(self
+            .store
+            .files(job_id)?
+            .into_iter()
+            .map(|file| (dir.join(&file.name), file.original_name))
+            .collect())
     }
 
     fn worker_config(&self, settings: &Settings) -> WorkerConfig {
@@ -120,6 +141,14 @@ impl Executor for PodmanExecutor {
             match place_images(&workspace, &job_images(&job_dir)) {
                 Ok(paths) => prompt = show_images(&prompt, &paths),
                 Err(err) => return failed(format!("could not place the images: {err}")),
+            }
+            let files = match self.job_files(request.job_id, &job_dir) {
+                Ok(files) => files,
+                Err(err) => return failed(format!("could not read the files: {err}")),
+            };
+            match place_files(&workspace, &files) {
+                Ok(placed) => prompt = show_files(&prompt, &placed),
+                Err(err) => return failed(format!("could not place the files: {err}")),
             }
         }
         let worker = WorkerRun {
