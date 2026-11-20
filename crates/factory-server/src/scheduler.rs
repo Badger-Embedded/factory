@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use factory_core::{BranchSummary, Command, Event, Job, PrDescription, Session, Stage};
-use factory_runner::{Expect, LogLine, RunReport, job_prompt};
+use factory_runner::{Expect, LogLine, Rerun, RunReport, job_prompt};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -96,6 +96,13 @@ pub struct WatchRequest {
     pub auto_merge: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerunRequest {
+    pub job_id: i64,
+    pub repo: String,
+    pub number: u64,
+}
+
 /// What a look at a pull request found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchReport {
@@ -150,6 +157,11 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         request: WatchRequest,
     ) -> impl Future<Output = Result<WatchReport, String>> + Send;
+
+    /// Reruns the failed CI runs of the pull request. It returns after
+    /// GitHub stops reporting the old failure, so the next watch does not
+    /// count it again.
+    fn rerun(&self, request: RerunRequest) -> impl Future<Output = Result<Rerun, String>> + Send;
 
     /// Stops whatever runs for job `job_id`. Called when the job no longer
     /// wants the run, such as after a cancel.
@@ -316,6 +328,18 @@ impl<E: Executor> Scheduler<E> {
                     let settings = settings.clone();
                     self.spawn(row.id, Kind::Factory, async move {
                         scheduler.watch(&settings, pr, request).await;
+                    });
+                }
+                Command::RerunCi { number, reason, .. } if self.due(row.id) => {
+                    let request = RerunRequest {
+                        job_id: row.id,
+                        repo: project.repo.clone(),
+                        number,
+                    };
+                    let scheduler = Arc::clone(self);
+                    let settings = settings.clone();
+                    self.spawn(row.id, Kind::Factory, async move {
+                        scheduler.rerun(&settings, request, &reason).await;
                     });
                 }
                 _ => {}
@@ -549,6 +573,31 @@ impl<E: Executor> Scheduler<E> {
                 self.report(job_id, result.map(|_| ()));
             }
             Ok(WatchReport { event: None, .. }) => {}
+            Err(err) => self.retry_later(settings, job_id, &err),
+        }
+    }
+
+    async fn rerun(&self, settings: &Settings, request: RerunRequest, reason: &str) {
+        let job_id = request.job_id;
+        let number = request.number;
+        self.note(
+            job_id,
+            &format!("The agent asked to rerun CI on #{number}: {reason}"),
+        );
+        match self.executor.rerun(request).await {
+            Ok(rerun) => {
+                let text = match rerun {
+                    Rerun::Started(ids) => {
+                        format!("Reran {} failed CI run(s) on #{number}.", ids.len())
+                    }
+                    Rerun::NothingToRerun => {
+                        format!("#{number} has no failed Actions run to rerun.")
+                    }
+                };
+                self.note(job_id, &text);
+                self.wait(settings, job_id);
+                self.apply(job_id, Event::CiRerun);
+            }
             Err(err) => self.retry_later(settings, job_id, &err),
         }
     }

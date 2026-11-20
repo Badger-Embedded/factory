@@ -6,10 +6,11 @@ use std::time::Duration;
 use factory_core::{
     AgentResult, Ask, BranchSummary, Event, Gates, PrDescription, Question, Stage, Turn,
 };
-use factory_runner::{Expect, LogLine, RunReport};
+use factory_runner::{Expect, LogLine, Rerun, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, LogSink, Project, Projects, PublishRequest, Published,
-    Scheduler, Settings, Store, SummaryRequest, WatchReport, WatchRequest, format_cost,
+    RerunRequest, Scheduler, Settings, Store, SummaryRequest, WatchReport, WatchRequest,
+    format_cost,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -37,6 +38,8 @@ struct FakeExecutor {
     published: Mutex<Vec<PublishRequest>>,
     watches: Mutex<VecDeque<Result<WatchReport, String>>>,
     watched: Mutex<Vec<WatchRequest>>,
+    reruns: Mutex<VecDeque<Result<Rerun, String>>>,
+    rerun_requests: Mutex<Vec<RerunRequest>>,
 }
 
 impl FakeExecutor {
@@ -54,6 +57,8 @@ impl FakeExecutor {
             published: Mutex::new(Vec::new()),
             watches: Mutex::new(VecDeque::new()),
             watched: Mutex::new(Vec::new()),
+            reruns: Mutex::new(VecDeque::new()),
+            rerun_requests: Mutex::new(Vec::new()),
         })
     }
 
@@ -128,6 +133,16 @@ impl Executor for FakeExecutor {
                 seen_until: None,
                 merged_by_factory: false,
             }))
+    }
+
+    async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
+        tokio::task::yield_now().await;
+        self.rerun_requests.lock().unwrap().push(request);
+        self.reruns
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(Rerun::Started(vec![7])))
     }
 
     async fn stop(&self, job_id: i64) {
@@ -1568,4 +1583,110 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
             .all(|r| r.session_id == requests[0].session_id)
     );
     assert!(!requests[2].prompt.contains("The approved spec:"));
+}
+
+/// Takes a job to the rerun turn of a pull request with a failed CI.
+async fn to_rerun(
+    store: &Store,
+    executor: &FakeExecutor,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+) -> i64 {
+    let id = to_commits_ready(store, executor, scheduler).await;
+    step(scheduler).await;
+    step(scheduler).await;
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::CiFailed {
+            log: "flaky test".into(),
+        }),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+    step(scheduler).await;
+    executor.release(1);
+    step(scheduler).await;
+    id
+}
+
+fn rerun_responder(request: &AgentRequest) -> Event {
+    match request.expect {
+        Expect::FixCi => Event::Agent(AgentResult::RerunCi {
+            reason: "the failure was a network timeout".into(),
+        }),
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    }
+}
+
+#[tokio::test]
+async fn a_rerun_request_reaches_the_executor_and_its_reason_is_logged() {
+    let (store, executor, scheduler) = setup(rerun_responder);
+    quick_polls(&store);
+    let id = to_rerun(&store, &executor, &scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::RerunCi { .. }
+    ));
+
+    step(&scheduler).await;
+    let requests = executor.rerun_requests.lock().unwrap().clone();
+    assert_eq!(
+        requests,
+        vec![RerunRequest {
+            job_id: id,
+            repo: "Badger-Embedded/maestro".into(),
+            number: 12,
+        }]
+    );
+    let texts: Vec<String> = store
+        .logs(id, 50)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("the failure was a network timeout")),
+        "{texts:?}"
+    );
+    assert_eq!(store.get(id).unwrap().job.turn(), &Turn::Factory);
+}
+
+#[tokio::test]
+async fn a_failed_rerun_is_tried_again() {
+    let (store, executor, scheduler) = setup(rerun_responder);
+    quick_polls(&store);
+    let id = to_rerun(&store, &executor, &scheduler).await;
+    executor
+        .reruns
+        .lock()
+        .unwrap()
+        .push_back(Err("gh: rate limited".into()));
+
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::RerunCi { .. }
+    ));
+    step(&scheduler).await;
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), 2);
+    assert_eq!(store.get(id).unwrap().job.turn(), &Turn::Factory);
+}
+
+#[tokio::test]
+async fn the_watch_after_a_rerun_waits_for_the_poll_interval() {
+    let (store, executor, scheduler) = setup(rerun_responder);
+    quick_polls(&store);
+    to_rerun(&store, &executor, &scheduler).await;
+    let watches = executor.watched.lock().unwrap().len();
+    store
+        .save_settings(&Settings {
+            poll_seconds: 3600,
+            ..Settings::default()
+        })
+        .unwrap();
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), 1);
+    assert_eq!(executor.watched.lock().unwrap().len(), watches);
 }
