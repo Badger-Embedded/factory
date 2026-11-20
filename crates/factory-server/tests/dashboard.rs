@@ -1547,6 +1547,12 @@ async fn cards_show_the_id_title_badge_stage_and_requester() {
     assert!(lane.contains("Add a reboot button</a>"));
     assert!(lane.contains("class=\"badge factory\">queued"));
     assert!(lane.contains("<span>requested</span>"));
+    let at = |needle: &str| lane.find(needle).unwrap();
+    assert!(at("class=\"id\"") < at("class=\"badge factory\""));
+    assert!(at("class=\"badge factory\"") < at("class=\"title\""));
+    assert!(at("class=\"title\"") < at("<span>requested</span>"));
+    assert!(at("<span>requested</span>") < at("class=\"requester\""));
+    assert!(at("class=\"requester\"") < at("class=\"cost\""));
     assert!(!lane.contains("maestro"));
     assert!(lane.contains("alice@example.com"));
 }
