@@ -34,7 +34,7 @@ pub use scheduler::{
     branch_name, ready_action,
 };
 pub use secrets::{
-    LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore,
+    ClaudeToken, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore,
     UnavailableSecrets, master_key_from_env,
 };
 pub use settings::Settings;

@@ -13,16 +13,20 @@ const SAMPLE: &str = r#"{
 
 /// A source that returns a fixed result, so a test drives the cache without a
 /// network call.
-struct Fake(Result<String, String>);
+struct Fake(Result<Option<String>, String>);
 
 impl UsageSource for Fake {
-    fn fetch(&self) -> impl std::future::Future<Output = Result<String, String>> {
+    fn fetch(&self) -> impl std::future::Future<Output = Result<Option<String>, String>> {
         std::future::ready(self.0.clone())
     }
 }
 
 fn ok(body: &str) -> Fake {
-    Fake(Ok(body.to_owned()))
+    Fake(Ok(Some(body.to_owned())))
+}
+
+fn none() -> Fake {
+    Fake(Ok(None))
 }
 
 fn err() -> Fake {
@@ -86,6 +90,27 @@ async fn a_success_after_an_error_shows_the_tile_again() {
 
     refresh_once(&err(), &cache).await;
     refresh_once(&ok(SAMPLE), &cache).await;
+
+    assert!(cache.visible(now()).is_some());
+}
+
+#[tokio::test]
+async fn no_token_leaves_the_tile_hidden() {
+    let cache = PlanUsageCache::new();
+
+    refresh_once(&none(), &cache).await;
+
+    assert!(cache.visible(now()).is_none());
+}
+
+#[tokio::test]
+async fn no_token_does_not_blank_a_shown_tile() {
+    let cache = PlanUsageCache::new();
+
+    refresh_once(&ok(SAMPLE), &cache).await;
+    // A refresh with no token leaves the last success in place, unlike an
+    // error, so a transient gap does not hide a fresh tile.
+    refresh_once(&none(), &cache).await;
 
     assert!(cache.visible(now()).is_some());
 }

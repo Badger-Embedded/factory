@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    CurlUsageSource, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker, McpRuntime, McpWarnings,
-    PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, ProxyWarning, RepoChecker,
-    RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams,
-    WarnFn, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app, refresh_forever,
+    ClaudeToken, CurlUsageSource, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker, McpRuntime,
+    McpWarnings, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, ProxyWarning,
+    RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets,
+    Upstreams, WarnFn, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
+    refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -20,13 +21,6 @@ fn path_var(name: &str, default: &str) -> PathBuf {
 /// empty. A token read from a file or a secret often ends in a newline.
 fn gh_token() -> Option<String> {
     trimmed_var("GH_TOKEN")
-}
-
-/// The Claude subscription token the usage fetch needs, from the same
-/// `claude-token` secret the workers get. `None` when unset or empty, so the
-/// plan usage tile stays off.
-fn claude_token() -> Option<String> {
-    trimmed_var("CLAUDE_CODE_OAUTH_TOKEN")
 }
 
 fn trimmed_var(name: &str) -> Option<String> {
@@ -115,6 +109,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(UnavailableSecrets::new(Arc::clone(&store)))
     };
 
+    // The Claude token comes from the secret store when it is available, and
+    // from `CLAUDE_CODE_OAUTH_TOKEN` when it is not. The one-time import moves
+    // the env token into the store on the first start that finds the store
+    // empty, so the podman secret needs no manual step. Once a token is stored
+    // the env var is ignored.
+    let claude_token = Arc::new(ClaudeToken::new(
+        Arc::clone(&secrets),
+        trimmed_var("CLAUDE_CODE_OAUTH_TOKEN"),
+    ));
+    claude_token.import_env_token();
+
     // An unreachable MCP server does not fail a run; it records a warning on the
     // job. The proxy and the scheduler share this recorder so a server is warned
     // about at most once per run.
@@ -176,17 +181,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!("workers are off, set FACTORY_WORKERS=podman to run jobs");
     }
 
+    // The usage fetch resolves the current token on each refresh, so a token
+    // saved on the settings page is used from the next one. With no token the
+    // fetch is skipped and the tile stays hidden.
     let plan_usage = Arc::new(PlanUsageCache::new());
-    if let Some(token) = claude_token() {
-        let source = CurlUsageSource {
-            curl: path_var("FACTORY_CURL", "curl"),
-            token,
-        };
-        tokio::spawn(refresh_forever(source, Arc::clone(&plan_usage)));
-        tracing::info!("refreshing Claude plan usage every {PLAN_USAGE_REFRESH:?}");
-    } else {
-        tracing::info!("no Claude token, the plan usage tile is off");
-    }
+    let source = CurlUsageSource {
+        curl: path_var("FACTORY_CURL", "curl"),
+        token: Arc::clone(&claude_token),
+    };
+    tokio::spawn(refresh_forever(source, Arc::clone(&plan_usage)));
+    tracing::info!("refreshing Claude plan usage every {PLAN_USAGE_REFRESH:?}");
 
     // The onboarding wizard runs its repository checks as the bot, with the
     // same `gh` and token the factory uses for pull requests.
