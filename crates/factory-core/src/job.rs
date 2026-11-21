@@ -187,11 +187,32 @@ pub enum Ask {
         summary: Option<BranchSummary>,
     },
     /// The review stopped without an approval: it used up its rounds or a
-    /// reviewer run failed. `reason` says which. The job does not merge and
-    /// waits for the user.
+    /// reviewer run failed. `reason` says which in words; `stop` records the
+    /// case for the retry, so the retry never parses `reason`. The job does
+    /// not merge and waits for the user.
     ReviewStopped {
         reason: String,
+        /// Why the review stopped, which decides where a retry resumes. A job
+        /// stored before this field existed, like #28, loads with the
+        /// default and retries as a reviewer-run failure.
+        #[serde(default)]
+        stop: ReviewStop,
     },
+}
+
+/// Why a review stopped, which a [`Event::Retry`] uses to resume the job.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewStop {
+    /// A reviewer run failed: usage limit, crash, timeout, or missing or
+    /// invalid output. Retry reruns the reviewer in the same review session,
+    /// leaving the review and failed round counts as they are. The default,
+    /// so a job stored before the field existed retries this way.
+    #[default]
+    ReviewerFailed,
+    /// The review reached [`MAX_REVIEW_ROUNDS`]. Retry clears the review
+    /// rounds and sends `feedback`, the last pass's, to the implement session
+    /// as [`Task::AddressReview`], giving the pull request five fresh rounds.
+    CapReached { feedback: String },
 }
 
 /// What a pull request branch would add to its base branch.
@@ -558,15 +579,7 @@ impl Job {
         use Stage as S;
 
         if let E::Retry = event {
-            return match self.retry_step() {
-                Some((stage, turn)) => {
-                    if !matches!(turn, Turn::Agent(_)) {
-                        self.failed_rounds = 0;
-                    }
-                    Ok((stage, turn))
-                }
-                None => Err(self.unexpected(E::Retry)),
-            };
+            return self.retry();
         }
 
         if self.is_finished() {
@@ -839,7 +852,10 @@ impl Job {
                     let reason = format!("{MAX_REVIEW_ROUNDS} review rounds on one pull request");
                     (
                         S::CiAndReview { pr },
-                        Turn::User(Ask::ReviewStopped { reason }),
+                        Turn::User(Ask::ReviewStopped {
+                            reason,
+                            stop: ReviewStop::CapReached { feedback },
+                        }),
                     )
                 } else {
                     (
@@ -850,7 +866,10 @@ impl Job {
             }
             (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewFailed { reason }) => (
                 S::CiAndReview { pr: *pr },
-                Turn::User(Ask::ReviewStopped { reason }),
+                Turn::User(Ask::ReviewStopped {
+                    reason,
+                    stop: ReviewStop::ReviewerFailed,
+                }),
             ),
             (_, _, event) => return Err(self.unexpected(event)),
         };
@@ -901,13 +920,59 @@ impl Job {
         }
     }
 
-    /// Whether a [`Event::Retry`] would resume the job. True for a job that
-    /// failed because it used up its failed rounds or an agent run failed:
-    /// one with a retry target, or a legacy job recognised by its reason that
-    /// has a pull request number. False for every other failure, and for a
+    /// Applies [`Event::Retry`]. A stopped review resumes by its case; every
+    /// other job defers to [`Job::retry_step`]. On `Err` the job is unchanged.
+    fn retry(&mut self) -> Result<(Stage, Turn), Rejected> {
+        if let (Stage::CiAndReview { pr }, Turn::User(Ask::ReviewStopped { stop, .. })) =
+            (&self.stage, &self.turn)
+        {
+            let pr = *pr;
+            if self.plan[pr].number.is_none() {
+                return Err(self.unexpected(Event::Retry));
+            }
+            return Ok(match stop.clone() {
+                // A reviewer run failed, so rerun the reviewer in the same
+                // review session. The round counts stay as they are.
+                ReviewStop::ReviewerFailed => {
+                    (Stage::CiAndReview { pr }, Turn::Agent(Task::Review))
+                }
+                // The review hit its cap, so hand the last feedback back to
+                // the implement session and give the pull request five fresh
+                // review rounds.
+                ReviewStop::CapReached { feedback } => {
+                    self.review_rounds = 0;
+                    (
+                        Stage::CiAndReview { pr },
+                        Turn::Agent(Task::AddressReview { comments: feedback }),
+                    )
+                }
+            });
+        }
+
+        match self.retry_step() {
+            Some((stage, turn)) => {
+                if !matches!(turn, Turn::Agent(_)) {
+                    self.failed_rounds = 0;
+                }
+                Ok((stage, turn))
+            }
+            None => Err(self.unexpected(Event::Retry)),
+        }
+    }
+
+    /// Whether a [`Event::Retry`] would resume the job. True for a stopped
+    /// review on a pull request that has a number, and for a job that failed
+    /// because it used up its failed rounds or an agent run failed: one with a
+    /// retry target, or a legacy job recognised by its reason that has a pull
+    /// request number. False for every other failure or user ask, and for a
     /// legacy job with no pull request number.
     #[must_use]
     pub fn can_retry(&self) -> bool {
+        if let (Stage::CiAndReview { pr }, Turn::User(Ask::ReviewStopped { .. })) =
+            (&self.stage, &self.turn)
+        {
+            return self.plan[*pr].number.is_some();
+        }
         self.retry_step().is_some()
     }
 

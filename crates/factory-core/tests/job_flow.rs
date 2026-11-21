@@ -1,7 +1,7 @@
 use factory_core::{
     AgentResult, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, RetryTarget, ReviewPass,
-    ReviewState, Session, Stage, Task, Turn, Verdict,
+    ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -1469,6 +1469,9 @@ fn the_review_cap_stops_the_job_without_merging() {
         job.turn(),
         &Turn::User(Ask::ReviewStopped {
             reason: "5 review rounds on one pull request".into(),
+            stop: ReviewStop::CapReached {
+                feedback: "again".into(),
+            },
         })
     );
     // The review stopped, so the factory keeps watching the pull request for a
@@ -1500,6 +1503,7 @@ fn a_reviewer_failure_stops_the_job_without_merging() {
         job.turn(),
         &Turn::User(Ask::ReviewStopped {
             reason: "reviewer timed out".into(),
+            stop: ReviewStop::ReviewerFailed,
         })
     );
     // The review stopped, so the factory keeps watching the pull request. The
@@ -1574,6 +1578,169 @@ fn a_stopped_review_fails_when_the_pull_request_is_closed() {
     ));
 }
 
+/// The job's review rounds on the current pull request, read back from its
+/// JSON since the state machine keeps the counter private.
+fn review_rounds(job: &Job) -> u64 {
+    serde_json::to_value(job).unwrap()["review_rounds"]
+        .as_u64()
+        .unwrap()
+}
+
+/// A job stopped at the review cap on the watched pull request `number`, its
+/// last pass asking for `feedback`.
+fn capped_review(number: u64, feedback: &str) -> Job {
+    let mut job = watching(number);
+    for _ in 1..MAX_REVIEW_ROUNDS {
+        review_changes_round(&mut job, number);
+    }
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: feedback.into(),
+        },
+    );
+    assert!(matches!(job.turn(), Turn::User(Ask::ReviewStopped { .. })));
+    job
+}
+
+#[test]
+fn a_retry_after_a_reviewer_failure_reruns_the_reviewer() {
+    let mut job = watching(7);
+    // Fail one review round first, so the kept counts are not zero.
+    review_changes_round(&mut job, 7);
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "reviewer timed out".into(),
+        },
+    );
+    assert!(job.can_retry());
+    let rounds = review_rounds(&job);
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_runs(&job, Session::Review(0), Task::Review);
+    // The reviewer reruns with the review and failed round counts unchanged.
+    assert_eq!(review_rounds(&job), rounds);
+}
+
+#[test]
+fn a_retry_at_the_review_cap_addresses_the_last_feedback_with_fresh_rounds() {
+    let mut job = capped_review(7, "tighten the error path");
+    assert_eq!(review_rounds(&job), u64::from(MAX_REVIEW_ROUNDS));
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_runs(
+        &job,
+        Session::Pr(0),
+        Task::AddressReview {
+            comments: "tighten the error path".into(),
+        },
+    );
+    // The review rounds are cleared, so the pull request gets five fresh ones.
+    assert_eq!(review_rounds(&job), 0);
+
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    for _ in 1..MAX_REVIEW_ROUNDS {
+        review_changes_round(&mut job, 7);
+    }
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "again".into(),
+        },
+    );
+    assert!(matches!(job.turn(), Turn::User(Ask::ReviewStopped { .. })));
+}
+
+#[test]
+fn a_stopped_review_with_no_pull_request_number_cannot_retry() {
+    // Reach ci-and-review without the pull request ever being opened, then
+    // stop the review. The watch and the retry both need a number.
+    let mut job = implementing(&["only"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "reviewer timed out".into(),
+        },
+    );
+    assert!(job.can_retry());
+
+    // Drop the number from the stored job, as if the pull request were never
+    // opened, and the retry is rejected with the job left as it is.
+    let mut value: serde_json::Value = serde_json::to_value(&job).unwrap();
+    value["plan"][0]["number"] = serde_json::Value::Null;
+    let mut job: Job = serde_json::from_value(value).unwrap();
+    assert!(!job.can_retry());
+    let before = job.clone();
+    assert!(matches!(
+        job.apply(Event::Retry),
+        Err(Rejected::Unexpected { .. })
+    ));
+    assert_eq!(job, before);
+}
+
+#[test]
+fn a_retry_is_rejected_at_every_other_user_ask() {
+    let mut spec = Job::new("add a reboot button", Gates::default());
+    apply(&mut spec, Event::Start);
+    apply(&mut spec, Event::Agent(AgentResult::Clarified));
+    apply(&mut spec, Event::Agent(AgentResult::Spec("spec".into())));
+    assert_eq!(spec.turn(), &Turn::User(Ask::SpecApproval));
+
+    let mut answers = Job::new("add a reboot button", Gates::default());
+    apply(&mut answers, Event::Start);
+    apply(
+        &mut answers,
+        Event::Agent(AgentResult::Questions(vec![question("Which board?")])),
+    );
+
+    for mut job in [spec, answers] {
+        assert!(!job.can_retry());
+        let before = job.clone();
+        assert!(job.apply(Event::Retry).is_err());
+        assert_eq!(job, before);
+    }
+}
+
+#[test]
+fn a_job_stored_in_review_stopped_without_the_stop_field_retries_as_a_reviewer_failure() {
+    // Job #28 stopped before the `stop` field existed: its ReviewStopped ask
+    // has only a reason. It loads as a reviewer failure and reruns the
+    // reviewer.
+    let mut job = watching(7);
+    apply(&mut job, Event::StartReview);
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "You've hit your 5-hour limit".into(),
+        },
+    );
+    let mut value: serde_json::Value = serde_json::to_value(&job).unwrap();
+    value["turn"]["User"]["ReviewStopped"]
+        .as_object_mut()
+        .unwrap()
+        .remove("stop")
+        .unwrap();
+
+    let mut old: Job = serde_json::from_value(value).unwrap();
+    assert!(old.can_retry());
+    apply(&mut old, Event::Retry);
+    assert_eq!(old.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_runs(&old, Session::Review(0), Task::Review);
+}
+
 #[test]
 fn the_review_cap_and_the_failed_round_cap_are_independent() {
     // Spend four of each cap on the same pull request. Neither counter moves
@@ -1606,6 +1773,9 @@ fn the_review_cap_and_the_failed_round_cap_are_independent() {
         review_capped.turn(),
         &Turn::User(Ask::ReviewStopped {
             reason: "5 review rounds on one pull request".into(),
+            stop: ReviewStop::CapReached {
+                feedback: "again".into(),
+            },
         })
     );
 }

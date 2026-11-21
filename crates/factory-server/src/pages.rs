@@ -2370,13 +2370,20 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
                 summary: Some(summary),
             }),
         ) => publish_card(id, job, *pr, summary),
-        (_, Turn::User(Ask::ReviewStopped { reason })) => html! {
+        (_, Turn::User(Ask::ReviewStopped { reason, .. })) => html! {
             div.card.needs-you {
                 div.card-head {
                     span.badge.you { "needs you" }
                     h2 { "The review stopped before merging" }
                 }
                 p.status-detail { (reason) }
+                @if job.can_retry() {
+                    div.row.actions {
+                        form method="post" action={ "/jobs/" (id) "/retry" } {
+                            button.primary { "Retry" }
+                        }
+                    }
+                }
             }
         },
         (Stage::Failed { reason, .. }, _) => html! {
