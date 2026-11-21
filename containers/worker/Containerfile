@@ -33,7 +33,7 @@ RUN apt-get update \
 # build fails if the code-mode host is missing or the installed version does
 # not match CODEX_VERSION. /etc/codex/skills/factory points Codex at the
 # factory's review skills without the --plugin-dir flag Claude uses; the symlink
-# resolves once the plugin is copied below.
+# resolves once the agents directory is copied below.
 ARG CODEX_VERSION=0.165.0
 ARG CODEX_ASSET=codex-package-x86_64-unknown-linux-musl
 RUN curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${CODEX_ASSET}.tar.gz" -o /tmp/codex.tar.gz \
@@ -45,7 +45,7 @@ RUN curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${CODEX_
     && ver="$(codex --version)" \
     && grep -qw "${CODEX_VERSION}" <<<"$ver" \
     && mkdir -p /etc/codex/skills \
-    && ln -s /factory-plugin/skills /etc/codex/skills/factory
+    && ln -s /factory-agents/skills /etc/codex/skills/factory
 
 USER worker
 ENV HOME=/home/worker \
@@ -61,6 +61,6 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 
 # The factory's own skills. A reviewer run loads them with --plugin-dir; the
 # reviewed repository's skills still load alongside them.
-COPY --chown=worker:worker plugin /factory-plugin
+COPY --chown=worker:worker agents /factory-agents
 
 WORKDIR /work

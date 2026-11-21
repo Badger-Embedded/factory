@@ -17,7 +17,7 @@ You review the commits a branch adds on top of its base, before the factory merg
 
 - Correctness. The change does what it claims, and the edge cases hold. Trace the new code paths rather than trust the description.
 - Tests. New behaviour has a test, as CONTRIBUTING.md asks. A test that cannot fail, or that restates the implementation, does not count.
-- The repository's rules. Read its CLAUDE.md and CONTRIBUTING.md and hold the change to them.
+- The repository's rules. Read its agent instructions, `AGENTS.md` and `CLAUDE.md` where it carries them, both when it has both, and CONTRIBUTING.md, and hold the change to them.
 - Comments. Apply the comment-review skill to the comments the diff adds.
 - Scope. The branch carries one change. An unrelated fix belongs in its own pull request.
 

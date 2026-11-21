@@ -435,7 +435,7 @@ fn the_implement_prompt_carries_the_planning_notes() {
 #[test]
 fn podman_args_give_the_worker_its_token_limits_and_mounts() {
     let config = WorkerConfig {
-        plugin_dir: Some(PathBuf::from("/srv/factory/plugin")),
+        agents_dir: Some(PathBuf::from("/srv/factory/agents")),
         volumes: vec!["factory-nix:/nix".into()],
         ..WorkerConfig::default()
     };
@@ -459,14 +459,14 @@ fn podman_args_give_the_worker_its_token_limits_and_mounts() {
     for volume in [
         "/jobs/7/work:/work",
         "/jobs/7/claude:/claude",
-        "/srv/factory/plugin:/factory-plugin:ro",
+        "/srv/factory/agents:/factory-agents:ro",
         "factory-nix:/nix",
     ] {
         assert!(args.iter().any(|arg| arg == volume), "missing {volume}");
     }
     assert_eq!(value_after(&args, "--session-id"), SESSION);
     assert!(!args.iter().any(|arg| arg == "--resume"));
-    assert_eq!(value_after(&args, "--plugin-dir"), "/factory-plugin");
+    assert_eq!(value_after(&args, "--plugin-dir"), "/factory-agents");
     assert_eq!(value_after(&args, "--output-format"), "stream-json");
     let settings: Value = serde_json::from_str(value_after(&args, "--settings")).unwrap();
     assert_eq!(
@@ -1235,7 +1235,7 @@ fn a_review_task_expects_a_review_verdict() {
 }
 
 #[test]
-fn the_review_schema_matches_the_plugin_schema() {
+fn the_review_schema_matches_the_bundled_schema() {
     let schema = Expect::Review.schema();
     assert_eq!(
         schema["properties"]["outcome"]["enum"],
@@ -1249,9 +1249,9 @@ fn the_review_schema_matches_the_plugin_schema() {
         .ancestors()
         .nth(2)
         .unwrap()
-        .join("plugin/schemas/review.json");
-    let plugin: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
-    assert_eq!(schema, plugin, "the run's schema drifted from the skill's");
+        .join("agents/schemas/review.json");
+    let bundled: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(schema, bundled, "the run's schema drifted from the skill's");
 }
 
 #[test]
@@ -1293,11 +1293,11 @@ fn the_review_prompt_names_the_method_for_each_agent() {
     // skill's path to keep it off a reviewed repository's own `review` skill.
     let claude = prompt(&Task::Review, Expect::Review, Agent::Claude);
     assert!(claude.contains("CLAUDE.md"));
-    assert!(!claude.contains("/factory-plugin/skills/review/SKILL.md"));
+    assert!(!claude.contains("/factory-agents/skills/review/SKILL.md"));
 
     let codex = prompt(&Task::Review, Expect::Review, Agent::Codex);
     assert!(codex.contains("AGENTS.md"));
-    assert!(codex.contains("/factory-plugin/skills/review/SKILL.md"));
+    assert!(codex.contains("/factory-agents/skills/review/SKILL.md"));
 }
 
 #[test]
@@ -1346,7 +1346,7 @@ fn a_later_review_pass_carries_the_answers_given_since_the_last_pass() {
     let mut job = watching(7);
     job.apply(start_review()).unwrap();
     job.apply(Event::ReviewChanges {
-        feedback: "read FACTORY_PLUGIN_DIR as a fallback".into(),
+        feedback: "add an env var fallback".into(),
     })
     .unwrap();
     // The agent asks the requester instead of following the feedback.

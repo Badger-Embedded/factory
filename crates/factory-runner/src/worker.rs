@@ -13,8 +13,8 @@ use crate::stream::LogLine;
 
 /// Where the job's checkout appears inside the worker.
 pub const WORK_DIR: &str = "/work";
-/// Where the factory plugin appears inside the worker.
-pub const PLUGIN_DIR: &str = "/factory-plugin";
+/// Where the factory's bundled agent material appears inside the worker.
+pub const AGENTS_DIR: &str = "/factory-agents";
 
 const MAX_STDERR: usize = 4096;
 
@@ -27,8 +27,8 @@ pub struct WorkerConfig {
     pub image: String,
     pub memory: String,
     pub cpus: String,
-    /// The factory plugin on the host, mounted read-only.
-    pub plugin_dir: Option<PathBuf>,
+    /// The factory's bundled agent material on the host, mounted read-only.
+    pub agents_dir: Option<PathBuf>,
     /// More `--volume` values for every worker, such as a named volume for
     /// the nix store that all workers share.
     pub volumes: Vec<String>,
@@ -47,7 +47,7 @@ impl Default for WorkerConfig {
             image: "localhost/factory-worker:latest".into(),
             memory: "3g".into(),
             cpus: "4".into(),
-            plugin_dir: None,
+            agents_dir: None,
             volumes: Vec::new(),
             network: None,
         }
@@ -234,8 +234,8 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     };
     mount(&run.workspace, WORK_DIR, "");
     mount(&run.config_dir, backend.config_dir(), "");
-    if let Some(plugin) = &config.plugin_dir {
-        mount(plugin, PLUGIN_DIR, ":ro");
+    if let Some(agents) = &config.agents_dir {
+        mount(agents, AGENTS_DIR, ":ro");
     }
     for volume in &config.volumes {
         args.push("--volume".into());

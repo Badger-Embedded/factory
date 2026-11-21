@@ -470,7 +470,7 @@ pub struct PodmanLogin {
 impl PodmanLogin {
     /// Builds the spawner from the worker podman config. Only the binary and
     /// the network are used; the login mounts no job directory and passes no
-    /// plugin or worker volumes.
+    /// agents or worker volumes.
     #[must_use]
     pub fn new(config: WorkerConfig) -> Self {
         PodmanLogin { config }

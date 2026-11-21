@@ -20,7 +20,7 @@ Then open <http://127.0.0.1:8080>. Without `tailscale serve` in front, the dashb
 | `FACTORY_IMPORT_PROJECTS` | `projects` | Directory of `<name>/project.toml` files to import once into the database. Read only on the first start of a database with no projects, then its files are deleted. Projects otherwise live in the database and are onboarded from the UI. |
 | `FACTORY_WORKERS` | unset | `podman` runs jobs in podman workers. Unset, jobs wait in `requested`. |
 | `FACTORY_PODMAN` | `podman` | The podman binary. Set `CONTAINER_HOST` to use a remote podman service. |
-| `FACTORY_PLUGIN_DIR` | unset | The factory plugin, mounted read-only into workers |
+| `FACTORY_AGENTS_DIR` | unset | The factory's bundled agent material, mounted read-only into workers |
 | `FACTORY_WORKER_VOLUMES` | unset | Space-separated `--volume` values for every worker, such as `factory-nix:/nix` |
 | `GH_TOKEN` | unset | GitHub token the factory clones, pushes and opens pull requests with. Workers never get it. |
 | `FACTORY_GH` | `gh` | The GitHub CLI |

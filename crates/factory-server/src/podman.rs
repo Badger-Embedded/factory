@@ -28,7 +28,7 @@ use crate::usage::PlanUsageCache;
 /// checkout and the agent's config directory, named by the registry, holds the
 /// job's sessions.
 pub struct PodmanExecutor {
-    /// The podman binary, secret and plugin directory. The image and limits
+    /// The podman binary, secret and agents directory. The image and limits
     /// come from [`Settings`] on each run.
     pub base: WorkerConfig,
     /// Prepares each job's checkout. It holds the GitHub token, which never

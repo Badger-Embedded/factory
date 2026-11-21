@@ -100,7 +100,7 @@ fn codex_device_login(
 fn worker_base(network: Option<String>) -> WorkerConfig {
     WorkerConfig {
         podman: path_var("FACTORY_PODMAN", "podman"),
-        plugin_dir: env::var_os("FACTORY_PLUGIN_DIR").map(PathBuf::from),
+        agents_dir: env::var_os("FACTORY_AGENTS_DIR").map(PathBuf::from),
         volumes: env::var("FACTORY_WORKER_VOLUMES")
             .unwrap_or_default()
             .split_whitespace()

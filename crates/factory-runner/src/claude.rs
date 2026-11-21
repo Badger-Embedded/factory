@@ -15,7 +15,7 @@ use factory_core::Agent;
 use crate::agent::{AgentBackend, AgentItem, Credential, RunResult};
 use crate::outcome::{Expect, event_from_result};
 use crate::stream::{StreamItem, parse_line};
-use crate::worker::{McpConfig, McpUnavailable, PLUGIN_DIR, SessionRun, WorkerConfig, WorkerRun};
+use crate::worker::{AGENTS_DIR, McpConfig, McpUnavailable, SessionRun, WorkerConfig, WorkerRun};
 
 /// The Claude Code config directory inside the worker, mounted from the job's
 /// `claude` directory on the host. It keeps the session files `--resume` reads.
@@ -79,9 +79,9 @@ impl AgentBackend for ClaudeAgent {
             session_flag.into(),
             session_id.clone(),
         ];
-        if config.plugin_dir.is_some() {
+        if config.agents_dir.is_some() {
             claude.push("--plugin-dir".into());
-            claude.push(PLUGIN_DIR.into());
+            claude.push(AGENTS_DIR.into());
         }
         if let Some(model) = run.model.as_deref().filter(|model| !model.is_empty()) {
             claude.push("--model".into());
