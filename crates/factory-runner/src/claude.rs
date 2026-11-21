@@ -12,7 +12,7 @@ use std::path::Path;
 
 use factory_core::Agent;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, RunResult};
+use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult};
 use crate::outcome::{Expect, event_from_result};
 use crate::stream::{StreamItem, parse_line};
 use crate::worker::{AGENTS_DIR, McpConfig, McpUnavailable, SessionRun, WorkerConfig, WorkerRun};
@@ -29,12 +29,26 @@ const CONFIG_DIR: &str = "/claude";
 /// settings value.
 const AGENT_SETTINGS: &str = r#"{"attribution":{"commit":"","pr":"","sessionUrl":false}}"#;
 
+/// The review-method paragraph for a Claude run. Claude loads the factory's
+/// review skill through `--plugin-dir`, so the wording names the skill rather
+/// than a path.
+const REVIEW_METHOD: &str = "The factory's review skill describes the method. The repository you \
+     are reviewing may carry its own review, lint or project skills; use them, since they know \
+     rules this prompt does not.\n\n";
+
 /// Claude Code, run with the `claude -p` CLI in the worker.
 pub struct ClaudeAgent;
 
 impl AgentBackend for ClaudeAgent {
     fn credential(&self) -> Credential {
         Credential::Env("CLAUDE_CODE_OAUTH_TOKEN")
+    }
+
+    fn prompt_style(&self) -> PromptStyle {
+        PromptStyle {
+            rules_doc: Agent::Claude.rules_doc(),
+            review_method: REVIEW_METHOD,
+        }
     }
 
     fn config_dir_env(&self) -> &'static str {

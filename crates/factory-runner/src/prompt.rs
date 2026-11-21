@@ -2,11 +2,20 @@ use std::fmt::Write;
 
 use factory_core::{Agent, Answered, Job, PlannedPr, Task, Verdict};
 
+use crate::agent::{PromptStyle, backend};
 use crate::outcome::Expect;
 
-/// The prompt for one agent run. `agent` picks the repository instructions file
-/// the prompt names, `CLAUDE.md` for Claude and `AGENTS.md` for Codex, and the
-/// review method a review run follows.
+/// The per-harness wording for `agent`, taken from its backend, so this module
+/// names no harness.
+fn style(agent: Agent) -> PromptStyle {
+    backend(agent)
+        .expect("the run's agent has a worker backend")
+        .prompt_style()
+}
+
+/// The prompt for one agent run. `agent` picks the per-harness wording from its
+/// backend: the repository instructions file the prompt names and the sentence
+/// a review run follows to find its method.
 #[must_use]
 pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
     let mut text = match task {
@@ -49,7 +58,7 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
                  your work on the current branch. Do not push or open a pull request. The \
                  factory does that with the title and description you return, so write them \
                  the way CONTRIBUTING.md asks.",
-                agent.rules_doc()
+                style(agent).rules_doc
             );
             text
         }
@@ -154,6 +163,7 @@ impl<'a> ReviewContext<'a> {
 /// request, answers, spec and plan, and a later pass gets only the answers
 /// given since, with the feedback it asked for when it asked for changes.
 fn review_prompt(context: &ReviewContext, agent: Agent) -> String {
+    let style = style(agent);
     let mut text = context.decisions.clone();
     let _ = write!(
         text,
@@ -161,26 +171,12 @@ fn review_prompt(context: &ReviewContext, agent: Agent) -> String {
          against the base branch the checkout is on. Check the change for correctness and \
          for the repository's own rules in {} and CONTRIBUTING.md. Do not change any \
          files and do not push.\n\n",
-        agent.rules_doc()
+        style.rules_doc
     );
     if !context.decisions.is_empty() {
         text.push_str(DECISIONS_RULE);
     }
-    // Claude loads the factory's review skill through `--plugin-dir`; Codex has
-    // no such flag and finds skills by name, so its prompt names the method's
-    // path to keep it from a reviewed repository's own skill called `review`.
-    match agent {
-        Agent::Claude => text.push_str(
-            "The factory's review skill describes the method. The repository you are reviewing \
-             may carry its own review, lint or project skills; use them, since they know rules \
-             this prompt does not.\n\n",
-        ),
-        Agent::Codex => text.push_str(
-            "Follow the method in /factory-agents/skills/review/SKILL.md, not any skill named \
-             review in the repository you are reviewing. That repository may carry its own lint \
-             or project skills; use them, since they know rules this prompt does not.\n\n",
-        ),
-    }
+    text.push_str(style.review_method);
     if !context.new_answers.is_empty() {
         text.push_str("Since your last review, the requester answered these questions:\n");
         for answered in context.new_answers {

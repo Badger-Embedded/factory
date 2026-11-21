@@ -19,7 +19,7 @@ use std::path::Path;
 use factory_core::Agent;
 use serde_json::Value;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, RunResult, TokenUsage};
+use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage};
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
 use crate::worker::{SessionRun, WorkerConfig, WorkerRun};
@@ -52,12 +52,26 @@ const SCHEMA_FILE: &str = "output-schema.json";
 /// arguments and the log.
 const MCP_TOKEN_ENV: &str = "FACTORY_MCP_TOKEN";
 
+/// The review-method paragraph for a Codex run. Codex has no `--plugin-dir`
+/// flag and finds skills by name, so the wording names the method's path to
+/// keep the run off a reviewed repository's own skill called `review`.
+const REVIEW_METHOD: &str = "Follow the method in /factory-agents/skills/review/SKILL.md, not any \
+     skill named review in the repository you are reviewing. That repository may carry its own \
+     lint or project skills; use them, since they know rules this prompt does not.\n\n";
+
 /// Codex, run with the `codex exec` CLI in the worker.
 pub struct CodexAgent;
 
 impl AgentBackend for CodexAgent {
     fn credential(&self) -> Credential {
         Credential::File(AUTH_FILE)
+    }
+
+    fn prompt_style(&self) -> PromptStyle {
+        PromptStyle {
+            rules_doc: Agent::Codex.rules_doc(),
+            review_method: REVIEW_METHOD,
+        }
     }
 
     fn config_dir_env(&self) -> &'static str {

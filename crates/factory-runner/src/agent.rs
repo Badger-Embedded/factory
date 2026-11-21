@@ -39,12 +39,32 @@ pub enum Credential {
     File(&'static str),
 }
 
+/// The per-harness wording a prompt carries, so [`prompt`](crate::prompt) names
+/// no harness. The backend returns it, next to the command line and parser that
+/// already sit behind [`AgentBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptStyle {
+    /// The repository instructions file this harness reads, `CLAUDE.md` for
+    /// Claude and `AGENTS.md` for Codex. A prompt that tells the agent to follow
+    /// the repository's rules names this file.
+    pub rules_doc: &'static str,
+    /// The paragraph a review run reads to find its method. Claude loads the
+    /// factory's review skill through `--plugin-dir`, so its wording names the
+    /// skill; Codex has no such flag, so its wording names the skill's path.
+    pub review_method: &'static str,
+}
+
 /// What everything agent-specific hides behind, so the worker names no one
 /// agent. The Claude implementation is [`ClaudeAgent`].
 pub trait AgentBackend: Sync {
     /// How the backend takes its credential: an environment variable for Claude,
     /// a file in the config directory for Codex.
     fn credential(&self) -> Credential;
+
+    /// The per-harness wording a prompt carries: the rules file this harness
+    /// reads and the sentence a review run follows to find its method. It keeps
+    /// [`prompt`](crate::prompt) from naming a harness.
+    fn prompt_style(&self) -> PromptStyle;
 
     /// The environment variable that points the agent at its config directory
     /// inside the worker.
