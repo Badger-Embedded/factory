@@ -7,12 +7,12 @@ use factory_core::{
     AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PrDescription, Question, ReviewState, Stage, Turn,
 };
-use factory_runner::{Expect, LogLine, McpUnavailable, Rerun, RunReport};
+use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, LogSink, McpProjectSettings, McpRuntime, McpStages,
     McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction, RerunRequest,
     RunTokens, Scheduler, SecretRef, SecretStore, Settings, StageEfforts, Store, SummaryRequest,
-    UnavailableSecrets, WatchReport, WatchRequest, format_cost, ready_action,
+    UnavailableSecrets, WatchReport, WatchRequest, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -1520,14 +1520,83 @@ async fn a_reviewer_failure_stops_the_job_for_the_user_without_merging() {
     ));
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
 
-    // The job waits for the user: nothing runs and it does not merge.
+    // The factory keeps watching the pull request, but the watch is passive:
+    // it carries `watch_only`, so the executor reports only a merge or close
+    // and never merges or restarts the reviewer, even though auto-merge is on.
+    step(&scheduler).await;
+    let watched = executor.watched.lock().unwrap().last().unwrap().clone();
+    assert!(watched.watch_only);
+    assert!(watched.auto_merge);
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::ReviewStopped { .. })
+    ));
+
+    // The user merges on GitHub. The next watch reports it, and the factory
+    // moves the job on to the next pull request.
     green(&executor, Event::Merged);
     step(&scheduler).await;
     assert_eq!(
         store.get(id).unwrap().job.stage(),
-        &Stage::CiAndReview { pr: 0 }
+        &Stage::Implementing { pr: 1 }
     );
-    assert_eq!(executor.watches.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_stopped_review_fails_when_its_pull_request_is_closed() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewFailed {
+            reason: "the reviewer run ended without structured output".into(),
+        },
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    let id = to_watching(&store, &executor, &scheduler).await;
+
+    green(&executor, Event::StartReview);
+    step(&scheduler).await;
+    executor.release(1);
+    step(&scheduler).await; // reviewer fails -> review stopped
+
+    // The user closes the pull request without merging. The watch reports it
+    // and the job fails closed.
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::ClosedUnmerged),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { reason, .. }
+            if reason == "the pull request was closed without merging"
+    ));
+}
+
+#[test]
+fn watch_only_reports_only_a_merge_or_close() {
+    // A merge or close by the user is the only thing a stopped-review watch
+    // acts on.
+    assert_eq!(watch_only_event(&Observation::Merged), Some(Event::Merged));
+    assert_eq!(
+        watch_only_event(&Observation::Closed),
+        Some(Event::ClosedUnmerged)
+    );
+    // Everything else leaves the job in review-stopped. In particular a ready
+    // pull request reports nothing, whatever auto-merge says, because the
+    // watch never reaches `ready_action`.
+    assert_eq!(watch_only_event(&Observation::Ready), None);
+    assert_eq!(watch_only_event(&Observation::Conflicted), None);
+    assert_eq!(watch_only_event(&Observation::CiFailed(Vec::new())), None);
+    assert_eq!(
+        watch_only_event(&Observation::Comments {
+            text: "please fix".into(),
+            seen_until: "2026-11-20T00:00:00Z".into(),
+        }),
+        None
+    );
+    assert_eq!(watch_only_event(&Observation::Nothing), None);
 }
 
 #[tokio::test]

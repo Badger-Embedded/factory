@@ -11,7 +11,7 @@ use factory_runner::{
 
 use crate::scheduler::{
     AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, ReadyAction,
-    RerunRequest, SummaryRequest, WatchReport, WatchRequest, ready_action,
+    RerunRequest, SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
 };
 use crate::secrets::ClaudeToken;
 use crate::settings::Settings;
@@ -228,8 +228,20 @@ impl Executor for PodmanExecutor {
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
         let status = self.github.status(&request.repo, request.number).await?;
+        let observation = observe(&status, request.seen_until.as_deref());
+        // The review stopped and waits for the user. Report only a merge or
+        // close by someone else; take no other action and leave the watermark
+        // where it is, so comments posted meanwhile are picked up once the job
+        // goes back to watching normally.
+        if request.watch_only {
+            return Ok(WatchReport {
+                event: watch_only_event(&observation),
+                seen_until: None,
+                merged_by_factory: false,
+            });
+        }
         let mut merged_by_factory = false;
-        let (event, seen_until) = match observe(&status, request.seen_until.as_deref()) {
+        let (event, seen_until) = match observation {
             Observation::Ready => match ready_action(
                 request.llm_review,
                 request.review_approved,
