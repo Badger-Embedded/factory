@@ -657,6 +657,11 @@ impl<E: Executor> Scheduler<E> {
         let (session_id, agent) = self.store.session_uuid(row.id, session, agent)?;
         let agent_session = self.store.agent_session(row.id, session)?;
         let selection = self.mcp_config(row.id, &row.project, expect)?;
+        let mcp_servers = selection
+            .config
+            .as_ref()
+            .map(|config| config.servers.as_slice())
+            .unwrap_or_default();
         let request = AgentRequest {
             job_id: row.id,
             repo: project.repo.clone(),
@@ -669,7 +674,7 @@ impl<E: Executor> Scheduler<E> {
             agent_session,
             agent,
             expect,
-            prompt: job_prompt(job, task, expect, agent),
+            prompt: job_prompt(job, task, expect, agent, mcp_servers),
             model,
             effort: Some(effort),
             mcp: selection.config,

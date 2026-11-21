@@ -1047,7 +1047,7 @@ fn approved_job(job: Job) -> Job {
 
 fn run_prompt(job: &Job, expect: Expect) -> String {
     match job.next_command() {
-        Some(Command::RunAgent { task, .. }) => job_prompt(job, &task, expect, Agent::Claude),
+        Some(Command::RunAgent { task, .. }) => job_prompt(job, &task, expect, Agent::Claude, &[]),
         other => panic!("no agent run: {other:?}"),
     }
 }
@@ -1101,7 +1101,7 @@ fn run_prompt_for_pr(job: &Job, pr: usize) -> String {
     let task = Task::Implement {
         pr: job.plan()[pr].clone(),
     };
-    job_prompt(job, &task, Expect::Commits, Agent::Claude)
+    job_prompt(job, &task, Expect::Commits, Agent::Claude, &[])
 }
 
 #[test]
@@ -1114,7 +1114,7 @@ fn a_job_from_before_fresh_sessions_gets_the_short_prompts() {
         .remove("fresh_sessions")
         .unwrap();
     let old: Job = serde_json::from_value(stored).unwrap();
-    let text = job_prompt(&old, &Task::WritePlan, Expect::Plan, Agent::Claude);
+    let text = job_prompt(&old, &Task::WritePlan, Expect::Plan, Agent::Claude, &[]);
     assert_eq!(text, prompt(&Task::WritePlan, Expect::Plan, Agent::Claude));
     assert!(!text.contains("Reboot over HTTP."));
 }
@@ -1124,7 +1124,7 @@ fn a_fix_run_keeps_its_short_prompt() {
     let job = approved_job(Job::new("Add a reboot button", Gates::default()));
     let task = Task::FixCi { log: "boom".into() };
     assert_eq!(
-        job_prompt(&job, &task, Expect::Commits, Agent::Claude),
+        job_prompt(&job, &task, Expect::Commits, Agent::Claude, &[]),
         prompt(&task, Expect::Commits, Agent::Claude)
     );
 }
@@ -1298,6 +1298,60 @@ fn the_review_prompt_names_the_method_for_each_agent() {
     let codex = prompt(&Task::Review, Expect::Review, Agent::Codex);
     assert!(codex.contains("AGENTS.md"));
     assert!(codex.contains("/factory-agents/skills/review/SKILL.md"));
+}
+
+/// The paragraph a run gets when it has active MCP servers, for each harness
+/// and both a stage prompt and the review prompt.
+const MCP_PARAGRAPH: &str = "This run has these MCP servers: `a`, `b`. Before you start, load the \
+     tools each one exposes and read what they do, so you know them when a later step needs one.";
+
+#[test]
+fn the_mcp_paragraph_names_the_servers_for_a_stage_prompt() {
+    let job = approved_job(Job::new("Add a reboot button", Gates::default()));
+    let task = Task::Implement {
+        pr: job.plan()[0].clone(),
+    };
+    let servers = ["a".to_owned(), "b".to_owned()];
+    for agent in [Agent::Claude, Agent::Codex] {
+        let text = job_prompt(&job, &task, Expect::Commits, agent, &servers);
+        assert!(
+            text.contains(MCP_PARAGRAPH),
+            "the {agent:?} stage prompt is missing the MCP paragraph"
+        );
+    }
+}
+
+#[test]
+fn the_mcp_paragraph_names_the_servers_for_the_review_prompt() {
+    let mut job = watching(7);
+    job.apply(start_review()).unwrap();
+    let servers = ["a".to_owned(), "b".to_owned()];
+    for agent in [Agent::Claude, Agent::Codex] {
+        let text = job_prompt(&job, &Task::Review, Expect::Review, agent, &servers);
+        assert!(
+            text.contains(MCP_PARAGRAPH),
+            "the {agent:?} review prompt is missing the MCP paragraph"
+        );
+    }
+}
+
+#[test]
+fn a_prompt_with_no_mcp_server_gets_no_paragraph() {
+    let job = approved_job(Job::new("Add a reboot button", Gates::default()));
+    let task = Task::Implement {
+        pr: job.plan()[0].clone(),
+    };
+    let with = job_prompt(
+        &job,
+        &task,
+        Expect::Commits,
+        Agent::Claude,
+        &["a".to_owned(), "b".to_owned()],
+    );
+    let without = job_prompt(&job, &task, Expect::Commits, Agent::Claude, &[]);
+    assert!(without.contains("Implement this pull request"));
+    assert!(!without.contains("MCP servers"));
+    assert_eq!(with, format!("{without}\n\n{MCP_PARAGRAPH}"));
 }
 
 #[test]
