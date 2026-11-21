@@ -5529,6 +5529,162 @@ async fn a_failed_card_without_a_retry_target_shows_no_button() {
 }
 
 #[tokio::test]
+async fn a_failed_row_shows_a_dismiss_button_next_to_retry() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let body = dashboard.get("/").await.body;
+    let lane = lane_html(&body, "inbox-failed");
+    assert!(lane.contains(&format!("action=\"/jobs/{id}/retry\"")));
+    assert!(lane.contains(">Retry</button>"));
+    assert!(lane.contains(&format!("action=\"/jobs/{id}/dismiss\"")));
+    assert!(lane.contains(">Dismiss</button>"));
+    assert!(lane.contains("name=\"project\" value=\"maestro\""));
+}
+
+#[tokio::test]
+async fn a_failed_row_that_cannot_retry_shows_only_dismiss() {
+    let dashboard = dashboard();
+    let id = failed_without_retry(&dashboard).await;
+
+    let body = dashboard.get("/").await.body;
+    let lane = lane_html(&body, "inbox-failed");
+    assert!(!lane.contains("/retry"));
+    assert!(!lane.contains("Retry"));
+    assert!(lane.contains(&format!("action=\"/jobs/{id}/dismiss\"")));
+    assert!(lane.contains(">Dismiss</button>"));
+}
+
+#[tokio::test]
+async fn a_dismissed_job_moves_to_done_with_a_dismissed_badge_and_no_button() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+    dashboard.apply(id, Event::Dismiss);
+
+    let body = dashboard.get("/").await.body;
+    assert_eq!(lanes_of(&body, id), ["inbox-done"]);
+    let done = lane_html(&body, "inbox-done");
+    assert!(done.contains(">dismissed</span>"));
+    assert!(!done.contains("5 failed check or CI rounds on one pull request"));
+    assert!(!done.contains("/dismiss"));
+    assert!(!done.contains("/retry"));
+    assert!(!body.contains("inbox-failed"));
+}
+
+#[tokio::test]
+async fn dismissing_from_the_board_returns_to_the_selected_project() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let reply = dashboard
+        .post(&format!("/jobs/{id}/dismiss"), "project=maestro")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/?project=maestro"));
+    assert!(dashboard.store.get(id).unwrap().job.is_dismissed());
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("Dismissed the job from the dashboard."));
+}
+
+#[tokio::test]
+async fn dismissing_from_the_job_page_redirects_to_the_job() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let reply = dashboard.post(&format!("/jobs/{id}/dismiss"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location, Some(format!("/jobs/{id}")));
+}
+
+#[tokio::test]
+async fn the_failure_card_dismiss_button_toggles_with_the_state() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The job failed"));
+    assert!(page.body.contains(&format!("action=\"/jobs/{id}/retry\"")));
+    assert!(
+        page.body
+            .contains(&format!("action=\"/jobs/{id}/dismiss\""))
+    );
+
+    dashboard.apply(id, Event::Dismiss);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The job was dismissed"));
+    assert!(page.body.contains(">dismissed</span>"));
+    assert!(
+        page.body
+            .contains("5 failed check or CI rounds on one pull request")
+    );
+    assert!(page.body.contains(&format!("action=\"/jobs/{id}/retry\"")));
+    assert!(
+        !page
+            .body
+            .contains(&format!("action=\"/jobs/{id}/dismiss\""))
+    );
+}
+
+#[tokio::test]
+async fn a_dismissed_job_that_cannot_retry_keeps_the_reason_but_no_button() {
+    let dashboard = dashboard();
+    let id = failed_without_retry(&dashboard).await;
+    dashboard.apply(id, Event::Dismiss);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The job was dismissed"));
+    assert!(
+        page.body
+            .contains("the pull request was closed without merging")
+    );
+    assert!(!page.body.contains(&format!("action=\"/jobs/{id}/retry\"")));
+    assert!(
+        !page
+            .body
+            .contains(&format!("action=\"/jobs/{id}/dismiss\""))
+    );
+}
+
+#[tokio::test]
+async fn dismissing_a_non_failed_or_dismissed_job_is_rejected() {
+    let dashboard = dashboard();
+
+    let live = dashboard.new_job().await;
+    to_spec_approval(&dashboard, live);
+    let reply = dashboard.post(&format!("/jobs/{live}/dismiss"), "").await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+
+    let merged = dashboard.new_job().await;
+    merge(&dashboard, merged);
+    let reply = dashboard.post(&format!("/jobs/{merged}/dismiss"), "").await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+
+    let failed = failed_out_of_rounds(&dashboard).await;
+    dashboard.apply(failed, Event::Dismiss);
+    let reply = dashboard.post(&format!("/jobs/{failed}/dismiss"), "").await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert!(dashboard.store.get(failed).unwrap().job.is_dismissed());
+}
+
+#[tokio::test]
+async fn retrying_a_dismissed_job_clears_the_dismissal_and_leaves_done() {
+    let dashboard = dashboard();
+    let id = failed_out_of_rounds(&dashboard).await;
+    dashboard.apply(id, Event::Dismiss);
+
+    let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let job = dashboard.store.get(id).unwrap().job;
+    assert!(!job.is_dismissed());
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+
+    let body = dashboard.get("/").await.body;
+    assert_ne!(lanes_of(&body, id), ["inbox-done"]);
+}
+
+#[tokio::test]
 async fn a_failed_job_still_counts_as_finished_for_the_30_day_expiry() {
     let dashboard = dashboard();
     let id = failed_out_of_rounds(&dashboard).await;
