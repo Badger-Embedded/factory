@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use factory_server::{
-    LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore, Store,
-    UnavailableSecrets,
+    CodexAuthError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef,
+    SecretStore, Store, UnavailableSecrets, validate_codex_auth,
 };
 
 fn store() -> Arc<Store> {
@@ -296,6 +296,227 @@ fn an_unavailable_store_reports_the_token_unavailable() {
     ));
     // Clearing still works, so a token can be removed after the key is lost.
     secrets.clear_claude_token().expect("clear");
+}
+
+/// A minimal subscription `auth.json`, the shape a `ChatGPT` Plus or Pro `codex
+/// login` writes: an object with string tokens and a `last_refresh`.
+fn auth_json(access: &str, refresh: &str) -> String {
+    format!(
+        r#"{{"tokens":{{"access_token":"{access}","refresh_token":"{refresh}","account_id":"acc-1"}},"last_refresh":"2026-11-21T00:00:00Z"}}"#
+    )
+}
+
+#[test]
+fn codex_auth_round_trips() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+
+    assert!(secrets.codex_auth().expect("read empty").is_none());
+
+    let first = auth_json("access-first", "refresh-first");
+    secrets.set_codex_auth(&first).expect("set");
+    assert_eq!(
+        secrets.codex_auth().expect("read stored").as_deref(),
+        Some(first.as_str()),
+    );
+
+    // Setting again replaces the login in place.
+    let second = auth_json("access-second", "refresh-second");
+    secrets.set_codex_auth(&second).expect("replace");
+    assert_eq!(
+        secrets.codex_auth().expect("read replaced").as_deref(),
+        Some(second.as_str()),
+    );
+
+    secrets.clear_codex_auth().expect("clear");
+    assert!(secrets.codex_auth().expect("read cleared").is_none());
+    // Clearing a login that is not there is fine.
+    secrets.clear_codex_auth().expect("clear again");
+}
+
+#[test]
+fn codex_auth_row_holds_no_plaintext() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    let value = auth_json("access-plaintext", "refresh-plaintext");
+
+    secrets.set_codex_auth(&value).expect("set");
+
+    let (backend, stored) = store
+        .get_secret(at("", "", "codex-auth"))
+        .expect("raw row")
+        .expect("row exists");
+    assert_eq!(backend, LOCAL_BACKEND);
+    assert!(
+        !contains(&stored, b"access-plaintext") && !contains(&stored, b"refresh-plaintext"),
+        "no token from the login may appear in the stored bytes",
+    );
+}
+
+#[test]
+fn deleting_an_mcp_server_named_codex_keeps_the_login() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    store
+        .create_mcp_server(
+            "codex",
+            "https://mcp.example.com/mcp",
+            &headers(&["Authorization"]),
+        )
+        .expect("create server");
+    secrets
+        .put(
+            at("maestro", "codex", "Authorization"),
+            "Bearer header-value",
+        )
+        .expect("store the server header");
+    let login = auth_json("access-token", "refresh-token");
+    secrets.set_codex_auth(&login).expect("set login");
+
+    store.delete_mcp_server("codex").expect("delete server");
+
+    assert_eq!(
+        secrets.codex_auth().expect("read login").as_deref(),
+        Some(login.as_str()),
+        "deleting an MCP server named codex must leave the login",
+    );
+    assert!(
+        secrets
+            .get(at("maestro", "codex", "Authorization"))
+            .expect("read header")
+            .is_none(),
+        "the server's own header value is gone with the server",
+    );
+}
+
+#[test]
+fn a_ciphertext_moved_between_the_codex_claude_and_header_rows_fails() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    let header = at("maestro", "context7", "Authorization");
+    let claude = at("", "", "claude-token");
+    let codex = at("", "", "codex-auth");
+
+    secrets
+        .put(header, "Bearer sk-header")
+        .expect("store header");
+    secrets
+        .set_claude_token("sk-ant-oat01-token")
+        .expect("set token");
+    secrets
+        .set_codex_auth(&auth_json("access-token", "refresh-token"))
+        .expect("set login");
+
+    // Read every reserved row's raw bytes, then plant each one in each of the
+    // other two rows and confirm it fails to decrypt there. Every ordered pair
+    // among the three rows is covered, so a ciphertext cannot be moved in any
+    // direction.
+    let raw = |reference| {
+        store
+            .get_secret(reference)
+            .expect("raw row")
+            .expect("row exists")
+    };
+    let rows = [("header", header), ("claude", claude), ("codex", codex)];
+    for (source_name, source) in rows {
+        let (backend, bytes) = raw(source);
+        for (dest_name, dest) in rows {
+            if dest_name == source_name {
+                continue;
+            }
+            store
+                .put_secret(dest, &backend, &bytes)
+                .expect("plant the moved ciphertext");
+            let moved = match dest_name {
+                "header" => secrets.get(dest),
+                "claude" => secrets.claude_token(),
+                "codex" => secrets.codex_auth(),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(moved, Err(SecretError::Decrypt)),
+                "the {source_name} ciphertext must not decrypt in the {dest_name} row",
+            );
+            // Put the destination's own value back so the next source reads the
+            // real ciphertext rather than the planted one.
+            let restore = match dest_name {
+                "header" => secrets.put(dest, "Bearer sk-header"),
+                "claude" => secrets.set_claude_token("sk-ant-oat01-token"),
+                "codex" => secrets.set_codex_auth(&auth_json("access-token", "refresh-token")),
+                _ => unreachable!(),
+            };
+            restore.expect("restore the destination row");
+        }
+    }
+}
+
+#[test]
+fn an_unavailable_store_reports_the_codex_login_unavailable() {
+    let store = store();
+    let secrets = UnavailableSecrets::new(Arc::clone(&store));
+
+    assert!(matches!(
+        secrets.codex_auth(),
+        Err(SecretError::Unavailable)
+    ));
+    assert!(matches!(
+        secrets.set_codex_auth(&auth_json("access-token", "refresh-token")),
+        Err(SecretError::Unavailable)
+    ));
+    // Clearing still works, so a login can be removed after the key is lost.
+    secrets.clear_codex_auth().expect("clear");
+}
+
+#[test]
+fn validate_codex_auth_accepts_a_subscription_login() {
+    validate_codex_auth(&auth_json("access-token", "refresh-token")).expect("valid login");
+}
+
+#[test]
+fn validate_codex_auth_refuses_non_subscription_files() {
+    // Not JSON, and a JSON value that is not an object, both land on NotJsonObject.
+    assert_eq!(
+        validate_codex_auth("not json at all"),
+        Err(CodexAuthError::NotJsonObject),
+    );
+    assert_eq!(
+        validate_codex_auth("\"just-a-string\""),
+        Err(CodexAuthError::NotJsonObject),
+    );
+    // An API key file has no tokens object.
+    assert_eq!(
+        validate_codex_auth(r#"{"OPENAI_API_KEY":"sk-proj-abc"}"#),
+        Err(CodexAuthError::AccessToken),
+    );
+    // A refresh token but no access token.
+    assert_eq!(
+        validate_codex_auth(r#"{"tokens":{"refresh_token":"r"}}"#),
+        Err(CodexAuthError::AccessToken),
+    );
+    // An access token but no refresh token, as a Business access-token file.
+    assert_eq!(
+        validate_codex_auth(r#"{"tokens":{"access_token":"a"}}"#),
+        Err(CodexAuthError::RefreshToken),
+    );
+    // A non-string token is refused, not accepted on presence alone.
+    assert_eq!(
+        validate_codex_auth(r#"{"tokens":{"access_token":"a","refresh_token":42}}"#),
+        Err(CodexAuthError::RefreshToken),
+    );
+}
+
+#[test]
+fn a_codex_auth_error_never_echoes_the_input() {
+    // The message names the missing field and carries no part of the input, so
+    // the settings page can show it without leaking a token.
+    let secret = "sk-proj-super-secret-value";
+    let message = validate_codex_auth(&format!(r#"{{"OPENAI_API_KEY":"{secret}"}}"#))
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        !message.contains(secret),
+        "the error must not echo the input: {message:?}",
+    );
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

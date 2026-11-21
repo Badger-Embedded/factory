@@ -1,10 +1,12 @@
 //! Encrypted storage for the factory's at-rest credentials: per-project MCP
-//! header values and the account-wide Claude token.
+//! header values, the account-wide Claude token and the account-wide Codex
+//! login.
 //!
 //! A header value for an MCP server is a credential, so it must not sit in
 //! SQLite as plain text. The Claude subscription token from `claude
-//! setup-token` is the same: it is stored here instead of a podman secret, so
-//! an operator can set it from the settings page. Access goes through the
+//! setup-token` is the same, and so is the Codex `auth.json` a `ChatGPT` Plus or
+//! Pro login writes: both are stored here instead of a podman secret, so an
+//! operator can set them from the settings page. Access goes through the
 //! [`SecretStore`] trait, so a later external backend such as Vault can replace
 //! or sit beside the local one. [`LocalSecrets`] is the only backend for now:
 //! it encrypts each value with XChaCha20-Poly1305 under a master key that lives
@@ -12,10 +14,11 @@
 //! through [`Store`]. Each row records its backend, so an external backend can
 //! be added without a schema change for existing rows.
 //!
-//! The Claude token lives in one reserved row keyed apart from every
-//! project/server/header credential, with its own associated data, so deleting
-//! or renaming an MCP server never touches it and a ciphertext moved between
-//! the token row and an MCP header row fails to decrypt.
+//! The Claude token and the Codex login each live in one reserved row keyed
+//! apart from every project/server/header credential and from each other, with
+//! its own associated data, so deleting or renaming an MCP server never touches
+//! either and a ciphertext moved between the Claude token row, the Codex row
+//! and an MCP header row fails to decrypt.
 
 use std::fmt;
 use std::sync::Arc;
@@ -148,6 +151,34 @@ pub trait SecretStore: Send + Sync {
     ///
     /// Fails on a storage error.
     fn clear_claude_token(&self) -> Result<(), SecretError>;
+
+    /// The stored Codex `auth.json`, or `None` when none is set. This is the
+    /// account-wide `ChatGPT` Plus or Pro login the workers use, kept in its own
+    /// reserved row apart from both the MCP header values and the Claude token.
+    /// The bytes are the file as last written: the caller parses them.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable, when the stored value does not
+    /// decrypt, or on a storage error.
+    fn codex_auth(&self) -> Result<Option<String>, SecretError>;
+
+    /// Stores `value` as the Codex login, replacing any login already there.
+    /// The caller validates it with [`validate_codex_auth`] first; the store
+    /// keeps the bytes as given.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn set_codex_auth(&self, value: &str) -> Result<(), SecretError>;
+
+    /// Deletes the stored Codex login. Clearing a login that is not there is
+    /// fine.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error.
+    fn clear_codex_auth(&self) -> Result<(), SecretError>;
 }
 
 /// The `secrets` row that holds the account-wide Claude token. Its `server` is
@@ -160,6 +191,17 @@ const CLAUDE_TOKEN_REF: SecretRef<'static> = SecretRef {
     project: "",
     server: "",
     header: "claude-token",
+};
+
+/// The `secrets` row that holds the account-wide Codex `auth.json`. Like
+/// [`CLAUDE_TOKEN_REF`] its `server` is empty, which no MCP server name can be,
+/// so `DELETE FROM secrets WHERE server = ?` for any MCP server, including one
+/// named `codex`, never matches it. Its `header` differs from the Claude
+/// token's, so the two reserved rows never collide.
+const CODEX_AUTH_REF: SecretRef<'static> = SecretRef {
+    project: "",
+    server: "",
+    header: "codex-auth",
 };
 
 /// The local encrypted backend. It holds the cipher built from the master key
@@ -262,6 +304,25 @@ impl SecretStore for LocalSecrets {
         self.store.delete_secret(CLAUDE_TOKEN_REF)?;
         Ok(())
     }
+
+    fn codex_auth(&self) -> Result<Option<String>, SecretError> {
+        let Some((backend, stored)) = self.store.get_secret(CODEX_AUTH_REF)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open(&backend, &stored, CODEX_AUTH_AAD)?))
+    }
+
+    fn set_codex_auth(&self, value: &str) -> Result<(), SecretError> {
+        let stored = self.seal(CODEX_AUTH_AAD, value)?;
+        self.store
+            .put_secret(CODEX_AUTH_REF, LOCAL_BACKEND, &stored)?;
+        Ok(())
+    }
+
+    fn clear_codex_auth(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(CODEX_AUTH_REF)?;
+        Ok(())
+    }
 }
 
 /// The backend used in place of [`LocalSecrets`] when no usable master key is
@@ -310,6 +371,19 @@ impl SecretStore for UnavailableSecrets {
 
     fn clear_claude_token(&self) -> Result<(), SecretError> {
         self.store.delete_secret(CLAUDE_TOKEN_REF)?;
+        Ok(())
+    }
+
+    fn codex_auth(&self) -> Result<Option<String>, SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn set_codex_auth(&self, _value: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn clear_codex_auth(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(CODEX_AUTH_REF)?;
         Ok(())
     }
 }
@@ -401,6 +475,76 @@ fn associated_data(at: SecretRef<'_>) -> Vec<u8> {
 /// larger than any header name's length, so it can never equal an MCP row's
 /// associated data, which starts with the project name's length.
 const CLAUDE_TOKEN_AAD: &[u8] = b"factory:claude-token:v1";
+
+/// The associated data bound into the Codex login ciphertext. It is a fixed
+/// domain tag distinct from [`CLAUDE_TOKEN_AAD`] and from the length-framed
+/// triple [`associated_data`] builds, so a ciphertext moved between the Codex
+/// row, the Claude token row and an MCP header row fails to decrypt in every
+/// direction. Its first eight bytes read as a u64 far larger than any header
+/// name's length, so it can never equal an MCP row's associated data.
+const CODEX_AUTH_AAD: &[u8] = b"factory:codex-auth:v1";
+
+/// Why a pasted or captured file was refused as a Codex subscription login.
+/// None of these variants carry any part of the input, so a logged or
+/// displayed error never echoes a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexAuthError {
+    /// The input did not parse as a JSON object. An API key file, a Business
+    /// access token or any non-JSON text lands here.
+    NotJsonObject,
+    /// `tokens.access_token` is missing or is not a string.
+    AccessToken,
+    /// `tokens.refresh_token` is missing or is not a string.
+    RefreshToken,
+}
+
+impl fmt::Display for CodexAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CodexAuthError::NotJsonObject => {
+                write!(f, "the Codex login must be the JSON object from auth.json")
+            }
+            CodexAuthError::AccessToken => {
+                write!(f, "the Codex login has no string at tokens.access_token")
+            }
+            CodexAuthError::RefreshToken => {
+                write!(f, "the Codex login has no string at tokens.refresh_token")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CodexAuthError {}
+
+/// Checks that `input` is a subscription `auth.json`: a JSON object with string
+/// values at `tokens.access_token` and `tokens.refresh_token`. A `ChatGPT` Plus
+/// or Pro `codex login` writes exactly that. An API key file, a Business access
+/// token or any other shape is refused. The error names the missing field and
+/// never carries any part of `input`, so the settings page can show it without
+/// leaking a token.
+///
+/// # Errors
+///
+/// Returns [`CodexAuthError`] when `input` is not such an object.
+pub fn validate_codex_auth(input: &str) -> Result<(), CodexAuthError> {
+    let value: serde_json::Value =
+        serde_json::from_str(input).map_err(|_| CodexAuthError::NotJsonObject)?;
+    let object = value.as_object().ok_or(CodexAuthError::NotJsonObject)?;
+    let tokens = object.get("tokens");
+    let has_string = |key: &str| {
+        tokens
+            .and_then(|tokens| tokens.get(key))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    };
+    if !has_string("access_token") {
+        return Err(CodexAuthError::AccessToken);
+    }
+    if !has_string("refresh_token") {
+        return Err(CodexAuthError::RefreshToken);
+    }
+    Ok(())
+}
 
 /// The master key from `FACTORY_MASTER_KEY`, the `factory-master-key` podman
 /// secret, as 64 hex characters. `None` when the variable is unset, empty, not
