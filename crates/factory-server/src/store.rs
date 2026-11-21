@@ -496,6 +496,30 @@ impl Store {
         Ok(tx.commit()?)
     }
 
+    /// Deletes the `work/` and `claude/` directories of merged job `id` under
+    /// `<data_dir>/jobs/<id>`, to free disk, and keeps everything else: the job
+    /// row, its other tables, and the `images/` and `files/` directories.
+    /// Returns whether either directory existed and was removed, so the caller
+    /// logs the cleanup only on the pass that freed something. A directory that
+    /// is already gone counts as success and is not reported as removed.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a file system error. Any directory removed before the error
+    /// stays gone, so a later call finishes the cleanup.
+    pub fn clean_merged_job(&self, id: i64, data_dir: &Path) -> Result<bool, StoreError> {
+        let dir = data_dir.join("jobs").join(id.to_string());
+        let mut removed = false;
+        for sub in ["work", "claude"] {
+            match std::fs::remove_dir_all(dir.join(sub)) {
+                Ok(()) => removed = true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(StoreError::Io(err)),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Applies `event` to job `id` and saves the result in one transaction.
     ///
     /// # Errors
