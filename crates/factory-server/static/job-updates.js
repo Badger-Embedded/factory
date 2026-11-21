@@ -29,29 +29,8 @@
     place(first);
   }
 
-  // The tool-call card groups calls per server, each group a collapsed
-  // disclosure. A poll swaps the card out of band, which would reset every
-  // group, so record which servers are open before the swap and reopen them
-  // after. Collapsed groups stay collapsed because only the open ones are kept.
-  var openServers = null;
-  function mcpCard() {
-    return document.querySelector("#job-mcp-calls");
-  }
-  function rememberOpenGroups() {
-    var card = mcpCard();
-    if (!card) return;
-    openServers = {};
-    card.querySelectorAll("details.mcp-call-group[open]").forEach(function (d) {
-      openServers[d.getAttribute("data-server")] = true;
-    });
-  }
-  function reopenGroups() {
-    var card = mcpCard();
-    if (!card || !openServers) return;
-    card.querySelectorAll("details.mcp-call-group").forEach(function (d) {
-      if (openServers[d.getAttribute("data-server")]) d.open = true;
-    });
-  }
+  // The tool-call card's open groups are kept across a swap by
+  // `details-state.js`, which handles every keyed disclosure on the page.
 
   function typingIn(el) {
     var active = document.activeElement;
@@ -75,10 +54,6 @@
         top = el.scrollTop;
       }
     }
-    // Remember which server groups are open before the card is replaced.
-    if (target.id === "job-mcp-calls") {
-      rememberOpenGroups();
-    }
   });
 
   document.body.addEventListener("htmx:oobAfterSwap", function (e) {
@@ -86,9 +61,6 @@
     if (e.detail.target.id === "job-log") {
       var el = logEl();
       if (el) place(el);
-    }
-    if (e.detail.target.id === "job-mcp-calls") {
-      reopenGroups();
     }
   });
 
