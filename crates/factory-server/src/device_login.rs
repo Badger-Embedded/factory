@@ -121,16 +121,26 @@ struct State {
 pub struct DeviceLogin {
     secrets: Arc<dyn SecretStore>,
     spawner: Arc<dyn LoginSpawner>,
+    /// The directory each login's `CODEX_HOME` is made in. The factory hands
+    /// this path to podman, so it must have the same path on the host as in the
+    /// factory container, as the data directory does; the container's `/tmp`
+    /// does not exist on the host.
+    scratch: PathBuf,
     timeout: Duration,
     state: Arc<Mutex<State>>,
 }
 
 impl DeviceLogin {
-    /// Builds the coordinator from the secret store the login is saved to and
-    /// the spawner that runs the container.
+    /// Builds the coordinator from the secret store the login is saved to, the
+    /// spawner that runs the container, and the directory each login's
+    /// `CODEX_HOME` is made in.
     #[must_use]
-    pub fn new(secrets: Arc<dyn SecretStore>, spawner: Arc<dyn LoginSpawner>) -> Self {
-        Self::with_timeout(secrets, spawner, LOGIN_TIMEOUT)
+    pub fn new(
+        secrets: Arc<dyn SecretStore>,
+        spawner: Arc<dyn LoginSpawner>,
+        scratch: PathBuf,
+    ) -> Self {
+        Self::with_timeout(secrets, spawner, scratch, LOGIN_TIMEOUT)
     }
 
     /// As [`DeviceLogin::new`], with the timeout given, so a test can end a
@@ -139,11 +149,13 @@ impl DeviceLogin {
     pub fn with_timeout(
         secrets: Arc<dyn SecretStore>,
         spawner: Arc<dyn LoginSpawner>,
+        scratch: PathBuf,
         timeout: Duration,
     ) -> Self {
         DeviceLogin {
             secrets,
             spawner,
+            scratch,
             timeout,
             state: Arc::new(Mutex::new(State {
                 view: LoginView::Idle,
@@ -158,15 +170,21 @@ impl DeviceLogin {
     }
 
     /// Starts a login in a container from `image`, unless one is already
-    /// running, in which case the running one is left alone. A fresh host
-    /// directory becomes the container's `CODEX_HOME`; the run task writes
-    /// `auth.json` there, reads it back and deletes the directory when it ends.
+    /// running, in which case the running one is left alone. A fresh directory
+    /// under the scratch directory becomes the container's `CODEX_HOME`; the
+    /// container writes `auth.json` there, and the run task reads it back and
+    /// deletes the directory when it ends.
     pub async fn start(&self, image: String) {
         let mut state = self.state.lock().await;
         if state.view.active() {
             return;
         }
-        let dir = match tempfile::tempdir() {
+        let dir = std::fs::create_dir_all(&self.scratch).and_then(|()| {
+            tempfile::Builder::new()
+                .prefix("codex-login-")
+                .tempdir_in(&self.scratch)
+        });
+        let dir = match dir {
             Ok(dir) => dir,
             Err(err) => {
                 state.view = LoginView::Failed {

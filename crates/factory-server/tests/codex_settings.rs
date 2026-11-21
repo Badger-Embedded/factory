@@ -53,6 +53,7 @@ struct Script {
 struct FakeSpawner {
     script: Mutex<Option<Script>>,
     spawned: Mutex<Vec<String>>,
+    homes: Mutex<Vec<PathBuf>>,
     killed: Arc<Mutex<Vec<String>>>,
     finish: Arc<Notify>,
 }
@@ -75,6 +76,11 @@ impl FakeSpawner {
     fn spawned(&self) -> Vec<String> {
         self.spawned.lock().unwrap().clone()
     }
+
+    /// The `CODEX_HOME` host directory each login was started with.
+    fn homes(&self) -> Vec<PathBuf> {
+        self.homes.lock().unwrap().clone()
+    }
 }
 
 impl LoginSpawner for FakeSpawner {
@@ -85,6 +91,7 @@ impl LoginSpawner for FakeSpawner {
         codex_home: PathBuf,
     ) -> Pin<Box<dyn Future<Output = std::io::Result<Box<dyn LoginProcess>>> + Send + '_>> {
         self.spawned.lock().unwrap().push(name.clone());
+        self.homes.lock().unwrap().push(codex_home.clone());
         let script = self.script.lock().unwrap().clone();
         let finish = Arc::clone(&self.finish);
         let killed = Arc::clone(&self.killed);
@@ -172,7 +179,7 @@ struct Harness {
     store: Arc<Store>,
     secrets: Arc<dyn SecretStore>,
     spawner: Arc<FakeSpawner>,
-    _data: tempfile::TempDir,
+    data: tempfile::TempDir,
 }
 
 /// The login timeout for the tests that are not about the timeout. It is long
@@ -212,6 +219,7 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
     let device_login = Arc::new(DeviceLogin::with_timeout(
         Arc::clone(&secrets),
         Arc::clone(&spawner) as Arc<dyn LoginSpawner>,
+        data.path().join("codex-login"),
         timeout,
     ));
     let router = app(
@@ -232,7 +240,7 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
         store: Arc::clone(store),
         secrets,
         spawner,
-        _data: data,
+        data,
     }
 }
 
@@ -397,6 +405,35 @@ async fn device_login_shows_the_url_and_code_then_signs_in() {
         harness.secrets.codex_auth().unwrap().as_deref(),
         Some(login.as_str())
     );
+}
+
+/// The factory runs in a container and starts the login through the host's
+/// podman socket, so the `CODEX_HOME` it mounts must be a path the host has:
+/// one under the data directory, not the container's `/tmp`.
+#[tokio::test]
+async fn the_login_home_is_made_under_the_data_directory() {
+    let harness = harness();
+    harness.spawner.set(Script {
+        lines: vec!["Open https://auth.openai.com/device and enter WDJB-MJHT".to_owned()],
+        outcome: Outcome::Success(auth("2026-11-28T00:00:00Z")),
+    });
+
+    harness.post("/settings/agents/codex/login", "").await;
+    harness.poll_fragment("WDJB-MJHT").await;
+
+    let homes = harness.spawner.homes();
+    assert_eq!(homes.len(), 1);
+    assert!(
+        homes[0].starts_with(harness.data.path().join("codex-login")),
+        "{} is not under the data directory",
+        homes[0].display()
+    );
+    assert!(homes[0].join("config.toml").is_file());
+
+    // The run task deletes the directory once the login ends.
+    harness.spawner.finish();
+    harness.poll_fragment("Signed in").await;
+    assert!(!homes[0].exists());
 }
 
 #[tokio::test]
