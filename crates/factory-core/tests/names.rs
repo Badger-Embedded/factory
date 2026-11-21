@@ -1,4 +1,4 @@
-use factory_core::{AgentResult, Ask, Event, Gates, Job, Stage, Task, Turn};
+use factory_core::{AgentResult, Ask, Event, Gates, Job, ReviewStop, Stage, Task, Turn};
 
 #[test]
 fn stages_name_themselves_like_the_job_page() {
@@ -37,7 +37,11 @@ fn a_turn_names_its_actor_and_what_it_does() {
     );
     assert_eq!(Turn::User(Ask::PlanApproval).name(), "user:plan-approval");
     assert_eq!(
-        Turn::User(Ask::ReviewStopped { reason: "r".into() }).name(),
+        Turn::User(Ask::ReviewStopped {
+            reason: "r".into(),
+            stop: ReviewStop::ReviewerFailed,
+        })
+        .name(),
         "user:review-stopped"
     );
     assert_eq!(Turn::Factory.name(), "factory");

@@ -1516,7 +1516,7 @@ async fn a_reviewer_failure_stops_the_job_for_the_user_without_merging() {
     let job = store.get(id).unwrap().job;
     assert!(matches!(
         job.turn(),
-        Turn::User(Ask::ReviewStopped { reason }) if reason.contains("structured output")
+        Turn::User(Ask::ReviewStopped { reason, .. }) if reason.contains("structured output")
     ));
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
 
@@ -1630,7 +1630,7 @@ async fn the_review_cap_sends_the_job_to_the_user() {
     assert_eq!(job.reviews().len(), MAX_REVIEW_ROUNDS as usize);
     assert!(matches!(
         job.turn(),
-        Turn::User(Ask::ReviewStopped { reason }) if reason.contains("review rounds")
+        Turn::User(Ask::ReviewStopped { reason, .. }) if reason.contains("review rounds")
     ));
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
 }

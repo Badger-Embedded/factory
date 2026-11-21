@@ -1794,6 +1794,38 @@ async fn the_job_page_shows_a_failed_review_run_reason() {
 }
 
 #[tokio::test]
+async fn a_stopped_review_offers_a_retry_that_moves_the_job_on() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+    dashboard.apply(
+        id,
+        Event::ReviewFailed {
+            reason: "the reviewer run timed out".into(),
+        },
+    );
+
+    // The review-stopped card offers a Retry that posts to the retry route.
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The review stopped before merging"));
+    assert!(page.body.contains(&format!("action=\"/jobs/{id}/retry\"")));
+    assert!(page.body.contains(">Retry<"));
+    assert!(matches!(
+        dashboard.turn(id),
+        Turn::User(Ask::ReviewStopped { .. })
+    ));
+
+    // Posting it reruns the reviewer, so the job leaves the review-stopped ask.
+    let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert!(!matches!(
+        dashboard.turn(id),
+        Turn::User(Ask::ReviewStopped { .. })
+    ));
+    assert_eq!(dashboard.turn(id), Turn::Agent(Task::Review));
+}
+
+#[tokio::test]
 async fn the_job_page_has_no_review_card_without_passes() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
