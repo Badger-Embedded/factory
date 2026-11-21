@@ -229,7 +229,6 @@ pub fn job_prompt(
     text
 }
 
-/// The prompt body before the MCP paragraph. See [`job_prompt`].
 fn job_body(job: &Job, task: &Task, expect: Expect, agent: Agent) -> String {
     if let Task::Review = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
@@ -255,13 +254,6 @@ fn job_body(job: &Job, task: &Task, expect: Expect, agent: Agent) -> String {
     format!("{context}{body}")
 }
 
-/// Appends the MCP paragraph to `text` when the run has at least one active
-/// server. Claude Code keeps an MCP server's tools behind its search step and
-/// loads a tool's schema only when the model asks for it, so an agent never
-/// reaches a tool nothing names. Listing the servers up front, so the agent
-/// loads their tools before it starts, is what lets a later step use one. The
-/// wording is the same for every harness and stage, because the set of servers
-/// can change between runs.
 fn append_mcp(text: &mut String, servers: &[String]) {
     if servers.is_empty() {
         return;

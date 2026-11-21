@@ -1300,8 +1300,6 @@ fn the_review_prompt_names_the_method_for_each_agent() {
     assert!(codex.contains("/factory-agents/skills/review/SKILL.md"));
 }
 
-/// The paragraph a run gets when it has active MCP servers, for each harness
-/// and both a stage prompt and the review prompt.
 const MCP_PARAGRAPH: &str = "This run has these MCP servers: `a`, `b`. Before you start, load the \
      tools each one exposes and read what they do, so you know them when a later step needs one.";
 

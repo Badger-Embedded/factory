@@ -3114,6 +3114,10 @@ async fn a_run_with_no_active_server_carries_no_mcp_config() {
         executor.requests()[0].mcp.is_none(),
         "an off server adds no MCP config"
     );
+    assert!(
+        !executor.requests()[0].prompt.contains("MCP servers"),
+        "a run with no active server gets no MCP paragraph"
+    );
 }
 
 #[tokio::test]
@@ -3176,6 +3180,14 @@ async fn mcp_servers_reach_only_the_runs_of_their_checked_stages() {
         .find(|r| r.expect == Expect::Commits)
         .expect("an implement run");
     assert_eq!(mcp_stage(&implement), ["impl-only"]);
+    assert!(
+        implement
+            .prompt
+            .contains("This run has these MCP servers: `impl-only`."),
+        "the implement prompt names its active server"
+    );
+    assert!(!implement.prompt.contains("review-only"));
+    assert!(!implement.prompt.contains("`off`"));
 
     // Drive the review run for the same pull request.
     green(&executor, start_review());
@@ -3189,6 +3201,14 @@ async fn mcp_servers_reach_only_the_runs_of_their_checked_stages() {
         .find(|r| r.expect == Expect::Review)
         .expect("a review run");
     assert_eq!(mcp_stage(&review), ["review-only"]);
+    assert!(
+        review
+            .prompt
+            .contains("This run has these MCP servers: `review-only`."),
+        "the review prompt names its active server"
+    );
+    assert!(!review.prompt.contains("impl-only"));
+    assert!(!review.prompt.contains("`off`"));
 
     // The off server reaches neither run, though it checks both stages.
     assert!(!mcp_stage(&implement).contains(&"off".to_string()));
@@ -3283,8 +3303,10 @@ async fn a_server_whose_secret_cannot_be_decrypted_is_skipped_with_a_warning() {
 
     scheduler.tick().await.unwrap();
     wait_for_requests(&executor, 1).await;
-    // The server was skipped, so the run carries no MCP config.
+    // The server was skipped, so the run carries no MCP config and no paragraph
+    // names it.
     assert!(executor.requests()[0].mcp.is_none());
+    assert!(!executor.requests()[0].prompt.contains("MCP servers"));
     executor.release(1);
     wait_idle(&scheduler).await;
 
