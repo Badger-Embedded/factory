@@ -103,6 +103,8 @@ impl Executor for FakeExecutor {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_default(),
+            credential: None,
+            token_usage: None,
         }
     }
 
