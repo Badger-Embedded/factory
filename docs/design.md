@@ -104,6 +104,7 @@ Each job moves through these states. Each ✋ is an approval gate. A job has the
 requested → clarifying → spec ✋ → plan ✋ → implementing → verifying → publish ✋ → pr-open → ci-and-review → merged
 ```
 
+- **requested.** The job waits here for a free worker, which the board shows as queued. While it waits, its requester can change the request text. `Event::Edit` replaces the text and applies only at `(requested, factory)`, so a job that has already started rejects it. The scheduler's `Start` copies the current text into the clarify task.
 - **clarifying.** The agent reads the repository and asks questions. A headless run cannot wait for answers, so the run ends with its questions as structured output. The dashboard shows them, and the next run resumes the same session with your answers.
 - **spec.** The agent writes the goal, scope, what is out of scope, and acceptance criteria. The run starts a new session. Its prompt holds the request and the answers to the clarifying questions.
 - **plan.** The agent splits the work into pull requests. A large refactor gets its own pull request first, as maestro's `CONTRIBUTING.md` requires. The run starts a new session. Its prompt holds the request, the answers and the approved spec.
