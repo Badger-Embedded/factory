@@ -31,8 +31,24 @@ fn the_worker_image_pins_a_codex_release() {
         "Codex is not installed from an openai/codex release"
     );
     assert!(
-        text.contains("codex-x86_64-unknown-linux-musl"),
-        "the Containerfile does not fetch the x86_64 Linux release asset"
+        text.contains("codex-package-x86_64-unknown-linux-musl"),
+        "the Containerfile does not fetch the x86_64 Linux release package"
+    );
+}
+
+/// Codex runs its shell and workspace tools through `codex-code-mode-host`,
+/// which it looks for next to its own binary. The bare `codex` asset lacks it,
+/// and every command Codex tries then fails.
+#[test]
+fn the_image_installs_the_codex_code_mode_host() {
+    let text = containerfile();
+    assert!(
+        text.contains("test -x /opt/codex/bin/codex-code-mode-host"),
+        "the build does not check for the code-mode host"
+    );
+    assert!(
+        text.contains("ln -s /opt/codex/bin/codex /usr/local/bin/codex"),
+        "codex on PATH does not point into the package, so it will not find its host"
     );
 }
 
