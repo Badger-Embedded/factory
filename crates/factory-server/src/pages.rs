@@ -2160,12 +2160,15 @@ fn mcp_calls_region(oob: bool, job: &Job, events: &[JobEvent]) -> Markup {
     }
 }
 
-/// Every MCP tool call the proxy recorded for the job, oldest first, each with
-/// its server and tool, the stage and turn the job was in, and a badge for a
-/// forwarded or a refused call. It reads the `job_events` the page already
-/// loads, so it needs no extra query. An `mcp-unavailable` row stays a timeline
-/// note and is not listed here. The card renders only once the job has a call
-/// or a refused call, so the OOB wrapper has a target before the first one.
+/// Every MCP tool call the proxy recorded for the job, grouped by server, with
+/// the servers in order of each server's first call and the calls oldest first
+/// inside a group. A server with one call is a plain row; a server with more is
+/// a collapsed group, see [`mcp_call_group`]. It reads the `job_events` the page
+/// already loads, so it needs no extra query. An `mcp-unavailable` row stays a
+/// timeline note and is not listed here. The header counts every call across
+/// servers and, when any, the refused ones. The card renders only once the job
+/// has a call or a refused call, so the OOB wrapper has a target before the
+/// first one.
 fn mcp_calls_card(job: &Job, events: &[JobEvent]) -> Markup {
     let rows: Vec<&JobEvent> = events
         .iter()
@@ -2175,6 +2178,16 @@ fn mcp_calls_card(job: &Job, events: &[JobEvent]) -> Markup {
         .iter()
         .filter(|event| event.event == "mcp-tool-blocked")
         .count();
+    // Group the rows by server, keeping the servers in order of their first
+    // call and the calls oldest first within a server.
+    let mut groups: Vec<(&str, Vec<&JobEvent>)> = Vec::new();
+    for event in &rows {
+        let (server, _) = split_detail(event.detail.as_deref());
+        match groups.iter_mut().find(|(name, _)| *name == server) {
+            Some((_, calls)) => calls.push(event),
+            None => groups.push((server, vec![event])),
+        }
+    }
     html! {
         @if !rows.is_empty() {
             div.card {
@@ -2186,8 +2199,8 @@ fn mcp_calls_card(job: &Job, events: &[JobEvent]) -> Markup {
                     }
                 }
                 ol.mcp-calls {
-                    @for event in rows {
-                        li { (mcp_call_row(job, event)) }
+                    @for (server, calls) in &groups {
+                        li { (mcp_call_group(job, server, calls)) }
                     }
                 }
             }
@@ -2195,15 +2208,62 @@ fn mcp_calls_card(job: &Job, events: &[JobEvent]) -> Markup {
     }
 }
 
-/// One recorded MCP call: its time, the server and tool split from the row's
-/// `detail` at the first `": "`, the stage and turn the job was in, and a badge
-/// that says whether the proxy forwarded or refused the call.
-fn mcp_call_row(job: &Job, event: &JobEvent) -> Markup {
+/// One server's MCP calls. A server with a single call renders as a plain row
+/// showing the server and tool, with no disclosure and no badge. A server with
+/// two or more renders as a collapsed `<details>`: the summary shows the mono
+/// server name, a counter badge with the call count, a bad-style `N refused`
+/// badge when any call was refused, and the latest call's time. Expanding it
+/// shows the server's calls as rows that drop the server name the summary
+/// already carries. `job-updates.js` reopens a group a poll left open, keyed by
+/// the `data-server` name.
+fn mcp_call_group(job: &Job, server: &str, calls: &[&JobEvent]) -> Markup {
+    let [single] = calls else {
+        let refused = calls
+            .iter()
+            .filter(|event| event.event == "mcp-tool-blocked")
+            .count();
+        let latest = calls.last().expect("a group has at least one call");
+        return html! {
+            details.mcp-call-group data-server=(server) {
+                summary.mcp-call {
+                    div.mcp-call-main {
+                        span.mcp-call-tool { (server) }
+                    }
+                    div.mcp-call-aside {
+                        span.badge.neutral { (calls.len()) }
+                        @if refused > 0 {
+                            span.badge.bad { (refused) " refused" }
+                        }
+                        span.when { (crate::localtime::time(&latest.at)) }
+                    }
+                }
+                ol.mcp-call-list {
+                    @for call in calls {
+                        li.mcp-call { (mcp_call_body(job, call, false)) }
+                    }
+                }
+            }
+        };
+    };
+    html! {
+        div.mcp-call { (mcp_call_body(job, single, true)) }
+    }
+}
+
+/// One recorded MCP call: the tool, with its server when `with_server` is set
+/// and the server and tool split from the row's `detail` at the first `": "`,
+/// the stage and turn the job was in, the call's time, and a badge that says
+/// whether the proxy forwarded or refused the call. A call inside a server
+/// group drops the server, which its summary already shows.
+fn mcp_call_body(job: &Job, event: &JobEvent, with_server: bool) -> Markup {
     let (server, tool) = split_detail(event.detail.as_deref());
     let refused = event.event == "mcp-tool-blocked";
     html! {
         div.mcp-call-main {
-            span.mcp-call-tool { (server) " · " (tool) }
+            span.mcp-call-tool {
+                @if with_server { (server) " · " }
+                (tool)
+            }
             span.mcp-call-where { (event_stage_label(job, event)) " · " (turn_label(&event.turn)) }
         }
         div.mcp-call-aside {
