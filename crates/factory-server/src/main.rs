@@ -1,6 +1,6 @@
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
@@ -82,11 +82,18 @@ fn git_config() -> Git {
 
 /// The Codex device login the settings page drives. It runs
 /// `codex login --device-auth` in a worker-image container, so it needs the
-/// podman binary and the worker network, not a job mount.
-fn codex_device_login(secrets: &Arc<dyn SecretStore>, network: Option<String>) -> Arc<DeviceLogin> {
+/// podman binary and the worker network, not a job mount. The login's
+/// `CODEX_HOME` is made under the data directory, which has the same path on
+/// the host as in the factory container, so podman can mount it.
+fn codex_device_login(
+    secrets: &Arc<dyn SecretStore>,
+    network: Option<String>,
+    data_dir: &Path,
+) -> Arc<DeviceLogin> {
     Arc::new(DeviceLogin::new(
         Arc::clone(secrets),
         Arc::new(PodmanLogin::new(worker_base(network))),
+        data_dir.join("codex-login"),
     ))
 }
 
@@ -238,7 +245,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // no redirect and bounds the wait, the same way the proxy's client does.
     let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::new());
 
-    let device_login = codex_device_login(&secrets, worker_network.clone());
+    let device_login = codex_device_login(&secrets, worker_network.clone(), &data_dir);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());

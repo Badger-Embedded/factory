@@ -213,7 +213,11 @@ fn dashboard_with_secrets(
         Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
         Arc::new(CodexLogin::new(Arc::clone(&secrets))),
     ));
-    let device_login = Arc::new(DeviceLogin::new(Arc::clone(&secrets), Arc::new(NoLogin)));
+    let device_login = Arc::new(DeviceLogin::new(
+        Arc::clone(&secrets),
+        Arc::new(NoLogin),
+        std::env::temp_dir(),
+    ));
     Dashboard {
         router: app(
             store.clone(),
@@ -2148,6 +2152,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(DeviceLogin::new(
             Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
             Arc::new(NoLogin),
+            std::env::temp_dir(),
         )),
     );
     let page = Dashboard {
