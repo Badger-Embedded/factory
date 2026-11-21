@@ -16,6 +16,4 @@ pub use job::{
     MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, RetryTarget, ReviewPass,
     ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
 };
-pub use usage::{
-    ModelWindow, PLAN_USAGE_STALE_AFTER_SECS, ParseError, PlanUsage, PlanUsageSnapshot, UsageWindow,
-};
+pub use usage::{ParseError, PlanUsage, PlanUsageSnapshot, UsageWindow};

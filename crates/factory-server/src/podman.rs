@@ -16,6 +16,7 @@ use crate::scheduler::{
 };
 use crate::settings::Settings;
 use crate::store::Store;
+use crate::usage::PlanUsageCache;
 
 /// Runs agents in podman worker containers.
 ///
@@ -41,6 +42,8 @@ pub struct PodmanExecutor {
     /// Reads each job's attached files, so a fresh-session run lists them in
     /// the prompt with the original names the store holds.
     pub store: Arc<Store>,
+    /// Takes each plan usage report a run makes, for the board tile.
+    pub plan_usage: Arc<PlanUsageCache>,
 }
 
 fn failed(reason: String) -> RunReport {
@@ -177,7 +180,10 @@ impl Executor for PodmanExecutor {
             effort: request.effort,
             mcp: request.mcp,
         };
-        run(&config, &worker, log).await
+        run(&config, &worker, log, |usage| {
+            self.plan_usage.record_now(usage);
+        })
+        .await
     }
 
     async fn run_checks(

@@ -104,6 +104,7 @@ impl AgentBackend for ClaudeAgent {
             .into_iter()
             .flat_map(|item| match item {
                 StreamItem::Log(line) => vec![AgentItem::Log(line)],
+                StreamItem::PlanUsage(usage) => vec![AgentItem::PlanUsage(usage)],
                 StreamItem::Result(message) => vec![AgentItem::Result(RunResult {
                     event: event_from_result(expect, &message),
                     session_id: message.session_id.clone(),

@@ -46,9 +46,7 @@ pub use secrets::{
 };
 pub use settings::Settings;
 pub use store::{JobEvent, JobFile, JobRow, LogEntry, ProjectTotals, Store, StoreError};
-pub use usage::{
-    CurlUsageSource, PLAN_USAGE_REFRESH, PlanUsageCache, UsageSource, refresh_forever, refresh_once,
-};
+pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;
 pub use web::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, USER_HEADER, app};
 pub use workers::{Slot, WorkerSlots};

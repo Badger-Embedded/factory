@@ -215,6 +215,7 @@ a.worker-job:hover { color: var(--accent); }
 .usage-fill { display: block; height: 100%; border-radius: var(--radius-pill); background: var(--agent); }
 .usage-percent { font-variant-numeric: tabular-nums; }
 .usage-reset { color: var(--muted); font-size: var(--font-size-xs); }
+.usage-as-of { text-transform: none; letter-spacing: 0; font-weight: normal; }
 
 .composer {
   background: var(--surface);

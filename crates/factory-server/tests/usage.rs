@@ -1,136 +1,57 @@
-use factory_core::PLAN_USAGE_STALE_AFTER_SECS;
-use factory_server::{PlanUsageCache, UsageSource, refresh_once};
+use factory_core::{PlanUsage, UsageWindow};
+use factory_server::PlanUsageCache;
 
-/// A `?skip_spend=1` body like the one the spike documented, with Fable in the
-/// `model_scoped` array.
-const SAMPLE: &str = r#"{
-    "five_hour": { "utilization": 0.42, "resets_at": 1763660000, "status": "allowed" },
-    "seven_day": { "utilization": 0.73, "resets_at": 1764200000 },
-    "model_scoped": [
-        { "display_name": "Fable", "utilization": 0.55, "resets_at": 1764200000 }
-    ]
-}"#;
-
-/// A source that returns a fixed result, so a test drives the cache without a
-/// network call.
-struct Fake(Result<Option<String>, String>);
-
-impl UsageSource for Fake {
-    fn fetch(&self) -> impl std::future::Future<Output = Result<Option<String>, String>> {
-        std::future::ready(self.0.clone())
+fn window(utilization: f64) -> UsageWindow {
+    UsageWindow {
+        utilization,
+        resets_at: 4_102_444_800,
     }
 }
 
-fn ok(body: &str) -> Fake {
-    Fake(Ok(Some(body.to_owned())))
+#[test]
+fn an_empty_cache_has_no_snapshot() {
+    assert!(PlanUsageCache::new().snapshot().is_none());
 }
 
-fn none() -> Fake {
-    Fake(Ok(None))
-}
-
-fn err() -> Fake {
-    Fake(Err(
-        "curl failed: The requested URL returned error: 429".into()
-    ))
-}
-
-#[tokio::test]
-async fn a_successful_fetch_fills_the_cache() {
+#[test]
+fn a_report_fills_the_cache_with_its_time() {
     let cache = PlanUsageCache::new();
+    let usage = PlanUsage {
+        five_hour: Some(window(0.4)),
+        seven_day: Some(window(0.7)),
+        fable: None,
+    };
 
-    refresh_once(&ok(SAMPLE), &cache).await;
+    cache.record(usage.clone(), 1_000);
 
-    let usage = cache
-        .visible(now())
-        .expect("the tile shows after a success");
-    assert_eq!(usage.five_hour.utilization, 0.42);
-    assert_eq!(usage.seven_day.utilization, 0.73);
-    assert_eq!(
-        usage
-            .model_window("Fable")
-            .expect("Fable window")
-            .window
-            .utilization,
-        0.55
+    let snapshot = cache.snapshot().expect("a snapshot after a report");
+    assert_eq!(snapshot.usage, usage);
+    assert_eq!(snapshot.reported_at, 1_000);
+}
+
+#[test]
+fn a_later_report_keeps_the_windows_it_leaves_out() {
+    let cache = PlanUsageCache::new();
+    cache.record(
+        PlanUsage {
+            five_hour: Some(window(0.4)),
+            seven_day: Some(window(0.7)),
+            fable: Some(window(0.1)),
+        },
+        1_000,
     );
-}
 
-#[tokio::test]
-async fn a_failed_fetch_hides_the_tile() {
-    let cache = PlanUsageCache::new();
+    cache.record(
+        PlanUsage {
+            five_hour: Some(window(0.5)),
+            ..PlanUsage::default()
+        },
+        2_000,
+    );
 
-    refresh_once(&err(), &cache).await;
-
-    assert!(cache.visible(now()).is_none());
-}
-
-#[tokio::test]
-async fn an_unparseable_body_hides_the_tile() {
-    let cache = PlanUsageCache::new();
-
-    refresh_once(&ok("not json"), &cache).await;
-
-    assert!(cache.visible(now()).is_none());
-}
-
-#[tokio::test]
-async fn an_error_after_a_success_hides_the_tile() {
-    let cache = PlanUsageCache::new();
-
-    refresh_once(&ok(SAMPLE), &cache).await;
-    refresh_once(&err(), &cache).await;
-
-    assert!(cache.visible(now()).is_none());
-}
-
-#[tokio::test]
-async fn a_success_after_an_error_shows_the_tile_again() {
-    let cache = PlanUsageCache::new();
-
-    refresh_once(&err(), &cache).await;
-    refresh_once(&ok(SAMPLE), &cache).await;
-
-    assert!(cache.visible(now()).is_some());
-}
-
-#[tokio::test]
-async fn no_token_leaves_the_tile_hidden() {
-    let cache = PlanUsageCache::new();
-
-    refresh_once(&none(), &cache).await;
-
-    assert!(cache.visible(now()).is_none());
-}
-
-#[tokio::test]
-async fn no_token_does_not_blank_a_shown_tile() {
-    let cache = PlanUsageCache::new();
-
-    refresh_once(&ok(SAMPLE), &cache).await;
-    // A refresh with no token leaves the last success in place, unlike an
-    // error, so a transient gap does not hide a fresh tile.
-    refresh_once(&none(), &cache).await;
-
-    assert!(cache.visible(now()).is_some());
-}
-
-#[tokio::test]
-async fn a_stale_success_hides_the_tile() {
-    let cache = PlanUsageCache::new();
-
-    refresh_once(&ok(SAMPLE), &cache).await;
-    let later = now() + PLAN_USAGE_STALE_AFTER_SECS + 1;
-
-    assert!(cache.visible(later).is_none());
-}
-
-fn now() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    )
-    .unwrap()
+    let snapshot = cache.snapshot().unwrap();
+    assert_eq!(snapshot.usage.five_hour, Some(window(0.5)));
+    assert_eq!(snapshot.usage.seven_day, Some(window(0.7)));
+    assert_eq!(snapshot.usage.fable, Some(window(0.1)));
+    assert_eq!(snapshot.reported_at, 2_000);
 }

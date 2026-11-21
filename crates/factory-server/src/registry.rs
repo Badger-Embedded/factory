@@ -30,8 +30,7 @@ const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 
 /// What the server needs for each agent, built once at startup and shared by
 /// the executor and the settings pages. It holds the [`ClaudeToken`] resolver
-/// so a run reads the current token; the plan usage tile keeps its own handle
-/// on the same resolver and is not part of the registry.
+/// so a run reads the current token.
 pub struct AgentRegistry {
     claude_token: Arc<ClaudeToken>,
 }
