@@ -3,8 +3,9 @@
 //! `codex exec --json` at the pinned `rust-v0.165.0`; see `codex_image.rs` for
 //! the image side.
 
+mod support;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use factory_core::{Agent, AgentResult, Event};
@@ -520,21 +521,18 @@ fn a_session_resumes_once_codex_wrote_its_rollout_file() {
 /// and rewrites the mounted `auth.json` with `refreshed`, simulating Codex
 /// refreshing its login mid-run.
 fn fake_podman(dir: &Path, stdout: &Path, refreshed: &str) -> PathBuf {
-    let script = dir.join("podman");
     let args = dir.join("args");
     let auth = dir.join("codex").join("auth.json");
-    fs::write(
-        &script,
-        format!(
+    support::executable(
+        dir,
+        "podman",
+        &format!(
             "#!/bin/bash\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\nprintf '%s' '{refreshed}' > '{}'\nexit 0\n",
             args.display(),
             stdout.display(),
             auth.display(),
         ),
     )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    script
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
+mod support;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
@@ -71,21 +72,18 @@ fn value_after<'a>(args: &'a [String], flag: &str) -> &'a str {
 /// A podman stand-in that records its arguments and the Claude token from its
 /// environment, prints `stdout`, writes `stderr` and exits with `code`.
 fn fake_podman(dir: &Path, stdout: &Path, stderr: &str, code: i32) -> PathBuf {
-    let script = dir.join("podman");
     let args = dir.join("args");
     let token = dir.join("token");
-    fs::write(
-        &script,
-        format!(
+    support::executable(
+        dir,
+        "podman",
+        &format!(
             "#!/bin/bash\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' \"$CLAUDE_CODE_OAUTH_TOKEN\" > '{}'\ncat '{}'\nprintf '%s' '{stderr}' >&2\nexit {code}\n",
             args.display(),
             token.display(),
             stdout.display()
         ),
     )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    script
 }
 
 fn fixture(name: &str) -> PathBuf {

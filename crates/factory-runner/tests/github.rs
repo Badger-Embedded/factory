@@ -1,5 +1,6 @@
+mod support;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use factory_core::{Event, PrDescription};
@@ -33,17 +34,8 @@ const INLINE: &str = r#"{"user": {"login": "talhahavadar"}, "body": "Use a const
 {"user": {"login": "moonthebot"}, "body": "Done.", "path": "src/main.rs", "line": 42, "created_at": "2026-11-19T12:02:00Z"}
 "#;
 
-/// A test that writes or runs a script holds this lock. A script file that is
-/// still open for writing in a forked child cannot be executed, and the child
-/// lives until its exec, so a parallel test can make the run fail with
-/// "Text file busy".
-static SCRIPTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    support::executable(dir, name, &format!("#!/bin/bash\n{body}\n"))
 }
 
 fn description() -> PrDescription {
@@ -148,7 +140,6 @@ fn actions_job_ids_come_from_job_urls() {
 
 #[tokio::test]
 async fn open_pr_creates_the_pull_request_once_and_then_edits_it() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let calls = dir.path().join("calls");
     let body = dir.path().join("body");
@@ -207,7 +198,6 @@ esac"#,
 
 #[tokio::test]
 async fn the_failure_report_has_each_failed_jobs_log() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let gh = script(
         dir.path(),
@@ -240,7 +230,6 @@ async fn the_failure_report_has_each_failed_jobs_log() {
 
 #[test]
 fn checks_run_with_bash_in_the_checkout_without_tokens() {
-    let _serial = SCRIPTS.blocking_lock();
     let config = WorkerConfig {
         volumes: vec!["factory-nix:/nix".into()],
         ..WorkerConfig::default()
@@ -262,7 +251,6 @@ fn checks_run_with_bash_in_the_checkout_without_tokens() {
 
 #[tokio::test]
 async fn check_results_become_events_and_podman_errors_are_retried() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let run = |code: i32, output: &str| {
         let podman = script(
@@ -325,7 +313,6 @@ fn a_pull_request_without_any_checks_is_not_ready() {
 
 #[tokio::test]
 async fn merged_pr_finds_the_merged_pull_request_for_a_branch() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let calls = dir.path().join("calls");
     let gh = script(
@@ -362,7 +349,6 @@ esac"#,
 
 #[tokio::test]
 async fn merge_squashes_and_deletes_the_branch() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let calls = dir.path().join("calls");
     let gh = script(
@@ -459,7 +445,6 @@ fn quick(gh: PathBuf) -> GitHub {
 
 #[tokio::test]
 async fn rerun_failed_reruns_each_failed_run_and_no_passed_one() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("SUCCESS"), RUNS);
 
@@ -483,7 +468,6 @@ async fn rerun_failed_reruns_each_failed_run_and_no_passed_one() {
 
 #[tokio::test]
 async fn rerun_failed_reports_when_no_run_failed() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let runs = r#"[{"databaseId": 45, "conclusion": "success"}]"#;
     let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), runs);
@@ -496,7 +480,6 @@ async fn rerun_failed_reports_when_no_run_failed() {
 
 #[tokio::test]
 async fn rerun_failed_waits_until_the_old_failure_is_gone() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), RUNS);
     // GitHub still reports the failure, so every poll reads it.
@@ -542,13 +525,11 @@ async fn edit_and_count_reruns(before: &str) -> usize {
 
 #[tokio::test]
 async fn editing_a_pr_with_failed_checks_reruns_them_after_the_edit() {
-    let _serial = SCRIPTS.lock().await;
     assert_eq!(edit_and_count_reruns(&check("FAILURE")).await, 2);
 }
 
 #[tokio::test]
 async fn editing_a_pr_whose_checks_did_not_fail_reruns_nothing() {
-    let _serial = SCRIPTS.lock().await;
     assert_eq!(edit_and_count_reruns(&check("SUCCESS")).await, 0);
     let pending =
         r#"{"state": "OPEN", "statusCheckRollup": [{"name": "x", "status": "IN_PROGRESS"}]}"#;
@@ -558,7 +539,6 @@ async fn editing_a_pr_whose_checks_did_not_fail_reruns_nothing() {
 
 #[tokio::test]
 async fn a_failed_rerun_does_not_fail_the_edit() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (gh, _) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), "not json");
     let number = quick(gh)
