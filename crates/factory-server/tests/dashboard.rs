@@ -2253,6 +2253,18 @@ async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
     assert!(rest.contains("<input type=\"hidden\" name=\"project\" value=\"tool\">"));
 }
 
+#[tokio::test]
+async fn the_picker_sits_after_the_brand_and_before_the_nav() {
+    let page = two_projects().get("/?project=tool").await;
+    let brand = page.body.find("class=\"brand\"").unwrap();
+    let picker = page.body.find("<select id=\"project\"").unwrap();
+    let topbar_end = page.body.find("class=\"topbar-end\"").unwrap();
+    let onboard = page.body.find("href=\"/onboard\"").unwrap();
+    assert!(brand < picker, "the picker comes after the brand");
+    assert!(picker < topbar_end, "the picker comes before .topbar-end");
+    assert!(picker < onboard, "the picker comes before the Onboard link");
+}
+
 fn saved_images(dashboard: &Dashboard, id: i64) -> Vec<String> {
     let dir = dashboard
         .data

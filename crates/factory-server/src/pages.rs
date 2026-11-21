@@ -116,9 +116,11 @@ fn page(user: &str, title: &str, nav: &Markup, body: &Markup) -> Markup {
             body {
                 div.topbar {
                     div.topbar-inner {
-                        a.brand href="/" { span.brand-mark aria-hidden="true" {} "factory" }
-                        div.topbar-end {
+                        div.topbar-start {
+                            a.brand href="/" { span.brand-mark aria-hidden="true" {} "factory" }
                             (nav)
+                        }
+                        div.topbar-end {
                             a.nav href="/onboard" { "Onboard" }
                             a.nav href="/settings" { "Settings" }
                             @if !user.is_empty() { span.user { (user) } }
