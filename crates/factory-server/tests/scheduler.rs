@@ -4,16 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use factory_core::{
-    Agent, AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
-    MAX_REVIEW_ROUNDS, PrDescription, Question, ReviewState, Stage, Turn,
+    Agent, AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
+    PrDescription, Question, ReviewState, Stage, Turn,
 };
 use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunReport};
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, JobFile, LogSink, McpProjectSettings, McpRuntime,
     McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
-    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, Settings, StageEfforts, Store,
-    SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, format_cost, ready_action,
-    watch_only_event,
+    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, Settings, StageAgents,
+    StageEfforts, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest,
+    format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -2331,7 +2331,7 @@ async fn a_project_without_effort_runs_every_stage_at_medium() {
     // Clarify, the clarify answer, spec, plan and implement all run at medium.
     let requests = executor.requests();
     let used: Vec<&str> = requests.iter().map(effort_of).collect();
-    assert_eq!(used, [DEFAULT_EFFORT; 5]);
+    assert_eq!(used, [Agent::Claude.default_effort(); 5]);
 }
 
 #[tokio::test]
@@ -2341,6 +2341,7 @@ async fn each_stage_runs_with_its_saved_effort() {
         .save_project_efforts(
             "maestro",
             &stage_efforts("low", "high", "xhigh", "max", "medium"),
+            &StageAgents::default(),
         )
         .unwrap();
     let id = store.create("maestro", "alice", "Add a button").unwrap();
@@ -2364,7 +2365,11 @@ async fn each_stage_runs_with_its_saved_effort() {
 async fn an_effort_change_reaches_the_next_run() {
     let (store, executor, scheduler) = setup(one_pass);
     store
-        .save_project_efforts("maestro", &stage_efforts("low", "low", "low", "low", "low"))
+        .save_project_efforts(
+            "maestro",
+            &stage_efforts("low", "low", "low", "low", "low"),
+            &StageAgents::default(),
+        )
         .unwrap();
     let id = store.create("maestro", "alice", "Add a button").unwrap();
     executor.release(10);
@@ -2374,6 +2379,7 @@ async fn an_effort_change_reaches_the_next_run() {
         .save_project_efforts(
             "maestro",
             &stage_efforts("high", "high", "high", "high", "high"),
+            &StageAgents::default(),
         )
         .unwrap();
     store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
@@ -2398,6 +2404,7 @@ async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_effort() {
         .save_project_efforts(
             "maestro",
             &stage_efforts("low", "low", "low", "high", "low"),
+            &StageAgents::default(),
         )
         .unwrap();
     let id = to_commits_ready(&store, &executor, &scheduler).await;
@@ -2457,6 +2464,7 @@ async fn the_review_run_uses_the_review_effort() {
         .save_project_efforts(
             "maestro",
             &stage_efforts("low", "low", "low", "low", "xhigh"),
+            &StageAgents::default(),
         )
         .unwrap();
     to_watching(&store, &executor, &scheduler).await;

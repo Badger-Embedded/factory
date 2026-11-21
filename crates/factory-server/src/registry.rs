@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use factory_core::{Agent, EFFORTS};
+use factory_core::Agent;
 use factory_runner::backend;
 
 use crate::secrets::ClaudeToken;
@@ -110,14 +110,17 @@ impl AgentEntry<'_> {
         }
     }
 
-    /// The effort levels the stage panel offers for the agent. An agent that
-    /// cannot run offers none.
+    /// The effort levels the stage panel offers for the agent, lowest first.
     #[must_use]
     pub fn efforts(&self) -> &'static [&'static str] {
-        match self.agent {
-            Agent::Claude => &EFFORTS,
-            Agent::Codex => &[],
-        }
+        self.agent.efforts()
+    }
+
+    /// The effort level the stage panel preselects for the agent when a project
+    /// saved none.
+    #[must_use]
+    pub fn default_effort(&self) -> &'static str {
+        self.agent.default_effort()
     }
 
     /// The worker image the agent runs in, or `None` for an agent that cannot

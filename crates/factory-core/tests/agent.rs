@@ -1,4 +1,4 @@
-use factory_core::{Agent, DEFAULT_AGENT, DEFAULT_EFFORT, EFFORTS};
+use factory_core::{Agent, DEFAULT_AGENT};
 
 #[test]
 fn an_id_round_trips_through_parsing() {
@@ -35,8 +35,43 @@ fn only_claude_can_run_today() {
 }
 
 #[test]
-fn the_effort_list_and_default_are_unchanged() {
-    assert_eq!(EFFORTS, ["low", "medium", "high", "xhigh", "max"]);
-    assert_eq!(DEFAULT_EFFORT, "medium");
-    assert!(EFFORTS.contains(&DEFAULT_EFFORT));
+fn claude_effort_levels_and_default_are_unchanged() {
+    assert_eq!(
+        Agent::Claude.efforts(),
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+    assert_eq!(Agent::Claude.default_effort(), "medium");
+}
+
+#[test]
+fn codex_has_its_own_effort_levels_and_default() {
+    assert_eq!(
+        Agent::Codex.efforts(),
+        ["minimal", "low", "medium", "high", "xhigh"]
+    );
+    assert_eq!(Agent::Codex.default_effort(), "medium");
+}
+
+#[test]
+fn every_agent_accepts_its_own_default_and_levels() {
+    for agent in Agent::ALL {
+        assert!(
+            agent.accepts_effort(agent.default_effort()),
+            "{} rejects its own default",
+            agent.id()
+        );
+        for level in agent.efforts() {
+            assert!(
+                agent.accepts_effort(level),
+                "{} rejects {level}",
+                agent.id()
+            );
+        }
+    }
+}
+
+#[test]
+fn an_agent_refuses_a_level_another_agent_owns() {
+    assert!(!Agent::Claude.accepts_effort("minimal"));
+    assert!(!Agent::Codex.accepts_effort("max"));
 }

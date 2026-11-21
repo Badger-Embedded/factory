@@ -10,7 +10,7 @@ mod job;
 mod names;
 mod usage;
 
-pub use agent::{Agent, DEFAULT_AGENT, DEFAULT_EFFORT, EFFORTS, UnknownAgent};
+pub use agent::{Agent, DEFAULT_AGENT, UnknownAgent};
 pub use job::{
     AgentResult, Answered, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, RetryTarget, ReviewPass,

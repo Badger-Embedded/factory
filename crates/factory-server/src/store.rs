@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, DEFAULT_AGENT, EFFORTS, Event, Gates, Job, Rejected, Session, Stage,
+    Agent, AgentResult, DEFAULT_AGENT, Event, Gates, Job, Rejected, Session, Stage,
 };
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -1163,10 +1163,10 @@ impl Store {
         Ok(())
     }
 
-    /// The effort levels saved for `project`, or the default of
-    /// [`DEFAULT_EFFORT`](factory_core::DEFAULT_EFFORT) for every stage when no
-    /// row is saved. A project in a database made before this table existed has
-    /// no row and so reads every stage at the default.
+    /// The effort levels saved for `project`, or the default agent's default
+    /// effort for every stage when no row is saved, see
+    /// [`StageEfforts::default`]. A project in a database made before this table
+    /// existed has no row and so reads every stage at that default.
     ///
     /// # Errors
     ///
@@ -1191,31 +1191,51 @@ impl Store {
         Ok(stored.unwrap_or_default())
     }
 
-    /// Saves `project`'s effort for all five stages, writing only this
-    /// project's row. Every level must be one the `claude` CLI accepts, see
-    /// [`EFFORTS`]; a value outside that set is rejected and nothing is
-    /// written.
+    /// Checks that each stage's effort is a level the stage's agent accepts,
+    /// without writing. The save handler calls this before it writes the agents,
+    /// efforts and models, so a rejected level leaves all three unchanged. The
+    /// agents are those saved in the same submit, so the level is validated
+    /// against the agent it will run on.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::InvalidEffort`] for a level outside the allowed
-    /// set, before any write. Otherwise fails only on a database error.
+    /// Returns [`StoreError::InvalidAgent`] for the first stage whose agent id
+    /// matches no agent, or [`StoreError::InvalidEffort`] for the first stage
+    /// whose level the stage's agent does not accept.
+    pub fn check_efforts(efforts: &StageEfforts, agents: &StageAgents) -> Result<(), StoreError> {
+        for (level, agent_id) in [
+            (&efforts.clarify, &agents.clarify),
+            (&efforts.spec, &agents.spec),
+            (&efforts.plan, &agents.plan),
+            (&efforts.implement, &agents.implement),
+            (&efforts.review, &agents.review),
+        ] {
+            let agent =
+                Agent::from_id(agent_id).map_err(|_| StoreError::InvalidAgent(agent_id.clone()))?;
+            if !agent.accepts_effort(level) {
+                return Err(StoreError::InvalidEffort(level.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Saves `project`'s effort for all five stages, writing only this
+    /// project's row. Each level must be one its stage's agent accepts, see
+    /// [`Store::check_efforts`]; a value outside the agent's set is rejected and
+    /// nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidAgent`] or [`StoreError::InvalidEffort`] for
+    /// a level a stage's agent does not accept, before any write. Otherwise
+    /// fails only on a database error.
     pub fn save_project_efforts(
         &self,
         project: &str,
         efforts: &StageEfforts,
+        agents: &StageAgents,
     ) -> Result<(), StoreError> {
-        for level in [
-            &efforts.clarify,
-            &efforts.spec,
-            &efforts.plan,
-            &efforts.implement,
-            &efforts.review,
-        ] {
-            if !EFFORTS.contains(&level.as_str()) {
-                return Err(StoreError::InvalidEffort(level.clone()));
-            }
-        }
+        Self::check_efforts(efforts, agents)?;
         self.conn().execute(
             "INSERT INTO project_efforts (project, clarify, spec, plan, implement, review)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)

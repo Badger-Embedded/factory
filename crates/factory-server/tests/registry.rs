@@ -40,6 +40,7 @@ fn the_claude_entry_carries_its_image_and_suggestions() {
         ["fable", "opus", "sonnet", "haiku"]
     );
     assert_eq!(claude.efforts(), ["low", "medium", "high", "xhigh", "max"]);
+    assert_eq!(claude.default_effort(), "medium");
 
     let settings = Settings {
         worker_image: "localhost/factory-worker:latest".into(),
@@ -76,7 +77,13 @@ fn the_codex_entry_is_listed_but_cannot_run() {
     assert_eq!(codex.settings_url(), None);
     assert_eq!(codex.host_config_dir(), None);
     assert_eq!(codex.model_suggestions(), [""; 0]);
-    assert_eq!(codex.efforts(), [""; 0]);
+    // Codex cannot run yet, but it carries its own effort levels so the stage
+    // panel can offer them.
+    assert_eq!(
+        codex.efforts(),
+        ["minimal", "low", "medium", "high", "xhigh"]
+    );
+    assert_eq!(codex.default_effort(), "medium");
     assert_eq!(codex.image(&Settings::default()), None);
     // Codex cannot run even with a Claude token stored.
     assert!(codex.credential().is_err());

@@ -1249,6 +1249,12 @@ fn project_settings(
             id: entry.id().to_owned(),
             display_name: entry.display_name().to_owned(),
             available: entry.available(),
+            efforts: entry
+                .efforts()
+                .iter()
+                .map(|&level| level.to_owned())
+                .collect(),
+            default_effort: entry.default_effort().to_owned(),
         })
         .collect();
     Ok(ProjectSettings {
@@ -1318,7 +1324,7 @@ async fn show_project_settings(
 }
 
 fn default_effort() -> String {
-    factory_core::DEFAULT_EFFORT.to_owned()
+    factory_core::DEFAULT_AGENT.default_effort().to_owned()
 }
 
 fn default_agent() -> String {
@@ -1456,9 +1462,11 @@ async fn save_project_models(
     };
 
     // Validate the agents and the efforts before any write, so a rejected agent
-    // or effort stores none of the agents, efforts or models.
+    // or effort stores none of the agents, efforts or models. Each effort is
+    // checked against the agent its stage is being saved with.
     Store::check_agents(&agents)?;
-    state.store.save_project_efforts(&name, &efforts)?;
+    Store::check_efforts(&efforts, &agents)?;
+    state.store.save_project_efforts(&name, &efforts, &agents)?;
     state.store.save_project_agents(&name, &agents)?;
     state.store.save_project_models(&name, &models)?;
     state.store.save_project_settings(
