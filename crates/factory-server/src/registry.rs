@@ -9,37 +9,56 @@
 //! [`podman`](crate::podman) and the settings pages read one place instead of
 //! naming Claude.
 //!
-//! Claude is the one agent that runs. Its credential is the subscription token
-//! the [`ClaudeToken`] resolver reads afresh on each run, its image is the
-//! `worker_image` setting, and its config directory and stdout parser live in
-//! `factory-runner` behind [`factory_runner::backend`]. Codex is in the registry
-//! as the place the next agent goes: it has no credential, image or settings
-//! page, and [`AgentEntry::credential`] and [`AgentEntry::image`] report that it
-//! cannot run.
+//! Both agents run. Claude's credential is the subscription token the
+//! [`ClaudeToken`] resolver reads afresh on each run; Codex's is the stored
+//! `auth.json` the [`CodexLogin`] coordinator resolves. Both run in the
+//! `worker_image` setting, since one image carries both, and each config
+//! directory and stdout parser lives in `factory-runner` behind
+//! [`factory_runner::backend`]. The registry also hands the executor the
+//! [`CodexLogin`] coordinator, which keeps the login Codex refreshes mid-run.
 
 use std::sync::Arc;
 
 use factory_core::Agent;
 use factory_runner::backend;
 
+use crate::codex::CodexLogin;
 use crate::secrets::ClaudeToken;
 use crate::settings::Settings;
 
 /// Model aliases the Claude stage panel offers. Any other model id can be typed.
 const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 
+/// Model aliases the Codex stage panel offers. The pinned Codex CLI
+/// (`rust-v0.165.0`) defaults to the `gpt-6.1-sol` family, so the suggestions
+/// track it; any other model id can be typed.
+const CODEX_MODELS: [&str; 2] = ["gpt-6.1-sol", "gpt-6.1-codex"];
+
 /// What the server needs for each agent, built once at startup and shared by
 /// the executor and the settings pages. It holds the [`ClaudeToken`] resolver
 /// so a run reads the current token.
 pub struct AgentRegistry {
     claude_token: Arc<ClaudeToken>,
+    codex_login: Arc<CodexLogin>,
 }
 
 impl AgentRegistry {
-    /// Builds the registry from the Claude token resolver.
+    /// Builds the registry from the Claude token resolver and the Codex login
+    /// coordinator.
     #[must_use]
-    pub fn new(claude_token: Arc<ClaudeToken>) -> Self {
-        AgentRegistry { claude_token }
+    pub fn new(claude_token: Arc<ClaudeToken>, codex_login: Arc<CodexLogin>) -> Self {
+        AgentRegistry {
+            claude_token,
+            codex_login,
+        }
+    }
+
+    /// The Codex login coordinator, which the executor uses to serialise runs
+    /// while the stored login is due for a refresh and to keep the file Codex
+    /// rewrites mid-run.
+    #[must_use]
+    pub fn codex_login(&self) -> &Arc<CodexLogin> {
+        &self.codex_login
     }
 
     /// The entry for one agent.
@@ -58,8 +77,8 @@ impl AgentRegistry {
 }
 
 /// One agent's registry entry. It answers what the server needs to run the
-/// agent and to draw its controls. An entry for an agent that cannot run, such
-/// as Codex, reports no credential, image or settings page.
+/// agent and to draw its controls: the credential, the worker image, the host
+/// config directory, the settings page and the stage-panel suggestions.
 pub struct AgentEntry<'a> {
     agent: Agent,
     registry: &'a AgentRegistry,
@@ -96,7 +115,7 @@ impl AgentEntry<'_> {
     pub fn settings_url(&self) -> Option<&'static str> {
         match self.agent {
             Agent::Claude => Some("/settings/agents/claude"),
-            Agent::Codex => None,
+            Agent::Codex => Some("/settings/agents/codex"),
         }
     }
 
@@ -106,7 +125,7 @@ impl AgentEntry<'_> {
     pub fn model_suggestions(&self) -> &'static [&'static str] {
         match self.agent {
             Agent::Claude => &CLAUDE_MODELS,
-            Agent::Codex => &[],
+            Agent::Codex => &CODEX_MODELS,
         }
     }
 
@@ -129,32 +148,29 @@ impl AgentEntry<'_> {
     #[must_use]
     pub fn image(&self, settings: &Settings) -> Option<String> {
         match self.agent {
-            Agent::Claude => Some(settings.worker_image.clone()),
-            Agent::Codex => None,
+            // One worker image carries both agents, so both run in the
+            // `worker_image` setting edited on the Workers page.
+            Agent::Claude | Agent::Codex => Some(settings.worker_image.clone()),
         }
     }
 
     /// The config directory's name under the job directory on the host, where
-    /// the agent's session files live, or `None` for an agent that cannot run.
-    /// Codex has a backend now, so this gates on [`available`](Self::available)
-    /// to stay `None` until the agent is wired to run.
+    /// the agent's session files live, or `None` for an agent with no backend.
     #[must_use]
     pub fn host_config_dir(&self) -> Option<&'static str> {
-        if !self.available() {
-            return None;
-        }
         backend(self.agent).map(factory_runner::AgentBackend::host_config_dir)
     }
 
     /// The credential a run passes to the worker, or the reason the run cannot
     /// start without it. Claude resolves the subscription token afresh and fails
-    /// with "no Claude token is set" when none is stored or in the environment,
-    /// so a run gates on the credential before any container starts.
+    /// with "no Claude token is set" when none is stored or in the environment;
+    /// Codex resolves the stored `auth.json` and fails with "no Codex login is
+    /// set". A run gates on the credential before any container starts, so a
+    /// token or login saved on the settings page reaches the next run.
     ///
     /// # Errors
     ///
-    /// Returns the failure reason when no credential is available, or when the
-    /// agent cannot run.
+    /// Returns the failure reason when no credential is available.
     pub fn credential(&self) -> Result<String, String> {
         match self.agent {
             Agent::Claude => self
@@ -162,7 +178,7 @@ impl AgentEntry<'_> {
                 .claude_token
                 .resolve()
                 .ok_or_else(|| "no Claude token is set".to_owned()),
-            Agent::Codex => Err(format!("{} cannot run yet", self.agent.display_name())),
+            Agent::Codex => self.registry.codex_login.credential(),
         }
     }
 }

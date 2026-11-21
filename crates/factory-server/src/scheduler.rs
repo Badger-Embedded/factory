@@ -668,7 +668,7 @@ impl<E: Executor> Scheduler<E> {
             agent_session,
             agent,
             expect,
-            prompt: job_prompt(job, task, expect),
+            prompt: job_prompt(job, task, expect, agent),
             model,
             effort: Some(effort),
             mcp: selection.config,

@@ -29,9 +29,15 @@ fn claude_is_the_default_agent() {
 }
 
 #[test]
-fn only_claude_can_run_today() {
+fn both_agents_can_run() {
     assert!(Agent::Claude.available());
-    assert!(!Agent::Codex.available());
+    assert!(Agent::Codex.available());
+}
+
+#[test]
+fn each_agent_names_the_rules_file_it_reads() {
+    assert_eq!(Agent::Claude.rules_doc(), "CLAUDE.md");
+    assert_eq!(Agent::Codex.rules_doc(), "AGENTS.md");
 }
 
 #[test]

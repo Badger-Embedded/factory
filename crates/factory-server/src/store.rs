@@ -541,12 +541,13 @@ impl Store {
         Ok(tx.commit()?)
     }
 
-    /// Deletes the `work/` and `claude/` directories of merged job `id` under
-    /// `<data_dir>/jobs/<id>`, to free disk, and keeps everything else: the job
-    /// row, its other tables, and the `images/` and `files/` directories.
-    /// Returns whether either directory existed and was removed, so the caller
-    /// logs the cleanup only on the pass that freed something. A directory that
-    /// is already gone counts as success and is not reported as removed.
+    /// Deletes the `work/` checkout and the `claude/` and `codex/` session
+    /// directories of merged job `id` under `<data_dir>/jobs/<id>`, to free
+    /// disk, and keeps everything else: the job row, its other tables, and the
+    /// `images/` and `files/` directories. Returns whether any directory existed
+    /// and was removed, so the caller logs the cleanup only on the pass that
+    /// freed something. A directory that is already gone counts as success and
+    /// is not reported as removed.
     ///
     /// # Errors
     ///
@@ -555,7 +556,7 @@ impl Store {
     pub fn clean_merged_job(&self, id: i64, data_dir: &Path) -> Result<bool, StoreError> {
         let dir = data_dir.join("jobs").join(id.to_string());
         let mut removed = false;
-        for sub in ["work", "claude"] {
+        for sub in ["work", "claude", "codex"] {
             match std::fs::remove_dir_all(dir.join(sub)) {
                 Ok(()) => removed = true,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

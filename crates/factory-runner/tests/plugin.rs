@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use factory_core::Task;
+use factory_core::{Agent, Task};
 use factory_runner::{Expect, prompt};
 use serde_json::{Value, json};
 
@@ -83,7 +83,7 @@ fn the_worker_image_bundles_the_plugin() {
 
 #[test]
 fn the_review_prompt_lets_the_agent_use_repository_skills() {
-    let text = prompt(&Task::Review, Expect::Commits);
+    let text = prompt(&Task::Review, Expect::Commits, Agent::Claude);
     assert!(text.contains("\"approve\""));
     assert!(text.contains("\"changes\""));
     assert!(

@@ -356,6 +356,7 @@ fn the_answer_prompt_pairs_questions_with_answers() {
             answers: vec!["rpi5".into(), "yes".into()],
         },
         Expect::Clarify,
+        Agent::Claude,
     );
     assert!(text.contains("Q: Which board?\nA: rpi5"));
     assert!(text.contains("Q: Confirm first?\nA: yes"));
@@ -370,7 +371,7 @@ fn every_prompt_names_the_outcome_that_ends_the_task() {
         number: None,
         description: None,
     };
-    let text = prompt(&Task::Implement { pr }, Expect::Commits);
+    let text = prompt(&Task::Implement { pr }, Expect::Commits, Agent::Claude);
     assert!(text.contains("maestrod: add a reboot endpoint"));
     assert!(text.contains("\"commits_ready\""));
     assert!(text.contains("Do not push"));
@@ -641,6 +642,7 @@ fn the_rebase_prompt_names_the_fetched_base() {
             base: "main".into(),
         },
         Expect::Commits,
+        Agent::Claude,
     );
     assert!(text.contains("origin/main"));
     assert!(text.contains("Do not push"));
@@ -714,6 +716,7 @@ fn the_clarify_prompt_lists_the_images_and_asks_the_agent_to_look() {
             request: "Add a reboot button".into(),
         },
         Expect::Clarify,
+        Agent::Claude,
     );
     let paths = vec![
         "/work/.git/factory-images/image-1.png".to_owned(),
@@ -789,6 +792,7 @@ fn the_clarify_prompt_lists_the_files_with_their_names_and_unzip_steps() {
             request: "Add a reboot button".into(),
         },
         Expect::Clarify,
+        Agent::Claude,
     );
     let files = vec![
         PlacedFile {
@@ -987,7 +991,7 @@ fn approved_job(job: Job) -> Job {
 
 fn run_prompt(job: &Job, expect: Expect) -> String {
     match job.next_command() {
-        Some(Command::RunAgent { task, .. }) => job_prompt(job, &task, expect),
+        Some(Command::RunAgent { task, .. }) => job_prompt(job, &task, expect, Agent::Claude),
         other => panic!("no agent run: {other:?}"),
     }
 }
@@ -1041,7 +1045,7 @@ fn run_prompt_for_pr(job: &Job, pr: usize) -> String {
     let task = Task::Implement {
         pr: job.plan()[pr].clone(),
     };
-    job_prompt(job, &task, Expect::Commits)
+    job_prompt(job, &task, Expect::Commits, Agent::Claude)
 }
 
 #[test]
@@ -1054,8 +1058,8 @@ fn a_job_from_before_fresh_sessions_gets_the_short_prompts() {
         .remove("fresh_sessions")
         .unwrap();
     let old: Job = serde_json::from_value(stored).unwrap();
-    let text = job_prompt(&old, &Task::WritePlan, Expect::Plan);
-    assert_eq!(text, prompt(&Task::WritePlan, Expect::Plan));
+    let text = job_prompt(&old, &Task::WritePlan, Expect::Plan, Agent::Claude);
+    assert_eq!(text, prompt(&Task::WritePlan, Expect::Plan, Agent::Claude));
     assert!(!text.contains("Reboot over HTTP."));
 }
 
@@ -1064,8 +1068,8 @@ fn a_fix_run_keeps_its_short_prompt() {
     let job = approved_job(Job::new("Add a reboot button", Gates::default()));
     let task = Task::FixCi { log: "boom".into() };
     assert_eq!(
-        job_prompt(&job, &task, Expect::Commits),
-        prompt(&task, Expect::Commits)
+        job_prompt(&job, &task, Expect::Commits, Agent::Claude),
+        prompt(&task, Expect::Commits, Agent::Claude)
     );
 }
 
@@ -1136,7 +1140,11 @@ fn only_the_fix_ci_schema_lists_rerun_ci() {
 
 #[test]
 fn the_fix_ci_prompt_says_when_to_rerun() {
-    let text = prompt(&Task::FixCi { log: "boom".into() }, Expect::FixCi);
+    let text = prompt(
+        &Task::FixCi { log: "boom".into() },
+        Expect::FixCi,
+        Agent::Claude,
+    );
     assert!(text.contains("boom"));
     assert!(text.contains("\"rerun_ci\""));
     assert!(text.contains("\"commits_ready\""));
@@ -1192,7 +1200,7 @@ fn the_review_schema_matches_the_plugin_schema() {
 
 #[test]
 fn the_review_prompt_reviews_the_branch_and_keeps_the_worker_read_only() {
-    let text = prompt(&Task::Review, Expect::Review);
+    let text = prompt(&Task::Review, Expect::Review, Agent::Claude);
     assert!(text.contains("\"approve\""));
     assert!(text.contains("\"changes\""));
     assert!(text.to_lowercase().contains("skill"));
@@ -1201,11 +1209,46 @@ fn the_review_prompt_reviews_the_branch_and_keeps_the_worker_read_only() {
 }
 
 #[test]
+fn a_prompt_names_the_rules_file_the_agent_reads() {
+    let pr = PlannedPr {
+        title: "maestrod: add a reboot endpoint".into(),
+        summary: "POST /reboot".into(),
+        number: None,
+        description: None,
+    };
+    let claude = prompt(
+        &Task::Implement { pr: pr.clone() },
+        Expect::Commits,
+        Agent::Claude,
+    );
+    assert!(claude.contains("CLAUDE.md"));
+    assert!(!claude.contains("AGENTS.md"));
+
+    let codex = prompt(&Task::Implement { pr }, Expect::Commits, Agent::Codex);
+    assert!(codex.contains("AGENTS.md"));
+    assert!(!codex.contains("CLAUDE.md"));
+}
+
+#[test]
+fn the_review_prompt_names_the_method_for_each_agent() {
+    // Claude loads the factory's review skill through --plugin-dir, so its
+    // prompt names the skill. Codex has no such flag, so its prompt names the
+    // skill's path to keep it off a reviewed repository's own `review` skill.
+    let claude = prompt(&Task::Review, Expect::Review, Agent::Claude);
+    assert!(claude.contains("CLAUDE.md"));
+    assert!(!claude.contains("/factory-plugin/skills/review/SKILL.md"));
+
+    let codex = prompt(&Task::Review, Expect::Review, Agent::Codex);
+    assert!(codex.contains("AGENTS.md"));
+    assert!(codex.contains("/factory-plugin/skills/review/SKILL.md"));
+}
+
+#[test]
 fn the_first_review_pass_carries_no_earlier_feedback() {
     let mut job = watching(7);
     job.apply(Event::StartReview).unwrap();
     let text = run_prompt(&job, Expect::Review);
-    assert_eq!(text, prompt(&Task::Review, Expect::Review));
+    assert_eq!(text, prompt(&Task::Review, Expect::Review, Agent::Claude));
     assert!(!text.contains("earlier version"));
 }
 

@@ -1,10 +1,9 @@
 //! The agents a stage can run on.
 //!
-//! The factory runs every stage with an agent. Claude Code is the one agent
-//! that runs today; Codex stands in the registry as the place the next agent
-//! goes, marked unavailable until it is built. Each agent has a stable id that
-//! the server stores per stage, a display name for the dashboard, and a flag
-//! for whether it can run. A stage with no saved agent runs on [`DEFAULT_AGENT`].
+//! The factory runs every stage with an agent. Claude Code and Codex both run.
+//! Each agent has a stable id that the server stores per stage, a display name
+//! for the dashboard, and a flag for whether it can run. A stage with no saved
+//! agent runs on [`DEFAULT_AGENT`].
 //!
 //! Each agent carries its own effort levels and default, because the CLIs do not
 //! agree: Claude's `--effort` takes `low` through `max`, and Codex's
@@ -19,7 +18,7 @@ use std::fmt;
 pub enum Agent {
     /// Claude Code, the one agent that runs today.
     Claude,
-    /// Codex, listed in the registry but not yet built.
+    /// Codex, run with the `codex exec` CLI in a worker.
     Codex,
 }
 
@@ -58,12 +57,25 @@ impl Agent {
         }
     }
 
-    /// Whether the agent can run a stage. Only Claude can today.
+    /// Whether the agent can run a stage. Both agents run now.
     #[must_use]
+    #[allow(clippy::match_same_arms)]
     pub fn available(self) -> bool {
         match self {
             Agent::Claude => true,
-            Agent::Codex => false,
+            Agent::Codex => true,
+        }
+    }
+
+    /// The file a target repository keeps its instructions in for this agent.
+    /// Claude reads `CLAUDE.md`; Codex reads `AGENTS.md`. A prompt that tells
+    /// the agent to follow the repository's rules names this file, so each
+    /// agent is pointed at the one it actually reads.
+    #[must_use]
+    pub fn rules_doc(self) -> &'static str {
+        match self {
+            Agent::Claude => "CLAUDE.md",
+            Agent::Codex => "AGENTS.md",
         }
     }
 

@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRegistry, ClaudeToken, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker, McpRuntime,
-    McpWarnings, PlanUsageCache, PodmanExecutor, Projects, ProxyEvent, ProxyEventFn, RepoChecker,
-    RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams,
-    WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
+    AgentRegistry, ClaudeToken, CodexLogin, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker,
+    McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, Projects, ProxyEvent, ProxyEventFn,
+    RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets,
+    Upstreams, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
 };
 use tokio::sync::Notify;
 
@@ -144,10 +144,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ));
     claude_token.import_env_token();
 
+    // The Codex login is the account-wide `auth.json` in the secret store. The
+    // coordinator resolves it for a run, serialises runs while it is due for a
+    // refresh, and keeps the file Codex rewrites mid-run.
+    let codex_login = Arc::new(CodexLogin::new(Arc::clone(&secrets)));
+
     // The registry maps each agent to its credential, worker image and config
     // directory. The executor runs agents through it; the plan usage fetch keeps
     // its own handle on the Claude token.
-    let agents = Arc::new(AgentRegistry::new(Arc::clone(&claude_token)));
+    let agents = Arc::new(AgentRegistry::new(
+        Arc::clone(&claude_token),
+        Arc::clone(&codex_login),
+    ));
 
     // An unreachable MCP server does not fail a run; it records a warning on the
     // job. The proxy and the scheduler share this recorder so a server is warned
