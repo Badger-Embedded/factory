@@ -754,6 +754,92 @@ async fn mcp_tool_call_rows_do_not_change_the_timeline() {
 }
 
 #[tokio::test]
+async fn a_job_with_no_mcp_calls_has_no_mcp_card() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(!body.contains("MCP tool calls"));
+    // The out-of-band wrapper is still there, empty, so a poll can fill it.
+    assert!(body.contains("<div id=\"job-mcp-calls\"></div>"));
+}
+
+#[tokio::test]
+async fn the_job_page_lists_mcp_tool_calls_oldest_first() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "context7", "resolve-library-id")
+        .unwrap();
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "context7", "get-library-docs")
+        .unwrap();
+    dashboard
+        .store
+        .record_mcp_tool_blocked(id, "context7", "delete")
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(body.contains("MCP tool calls"));
+    // The header counts every row and the refused ones.
+    assert!(body.contains("3 calls"));
+    assert!(body.contains("1 refused"));
+
+    // Each row shows its server and tool.
+    let first = body.find("resolve-library-id").expect("the first call");
+    let second = body.find("get-library-docs").expect("the second call");
+    let third = body.find("context7 · delete").expect("the refused call");
+    assert!(first < second && second < third, "rows are oldest first");
+
+    // The stage the job was in, from the timeline's labels.
+    assert!(body.contains("clarifying"));
+
+    // A forwarded call is neutral and a refused one is bad.
+    assert_eq!(body.matches("class=\"badge neutral\">called").count(), 2);
+    assert!(body.contains("class=\"badge bad\">refused: tool turned off"));
+}
+
+#[tokio::test]
+async fn an_mcp_tool_name_is_escaped() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "context7", "<script>alert(1)</script>")
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!body.contains("<script>alert(1)</script>"));
+}
+
+#[tokio::test]
+async fn the_job_fragment_swaps_the_mcp_calls() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "context7", "resolve-library-id")
+        .unwrap();
+
+    // A poll updates the card out of band, so a call shows without a reload.
+    let reply = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply
+            .body
+            .contains("<div id=\"job-mcp-calls\" hx-swap-oob=\"true\">")
+    );
+    assert!(reply.body.contains("resolve-library-id"));
+}
+
+#[tokio::test]
 async fn a_job_without_cost_shows_a_dash() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;

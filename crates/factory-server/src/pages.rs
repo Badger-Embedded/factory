@@ -1996,6 +1996,7 @@ pub fn job(
                     (spec_region(false, job))
                     (plan_region(false, job, repo_url))
                     (reviews_region(false, job))
+                    (mcp_calls_region(false, job, events))
                     (log_region(false, logs))
                     @if *job.turn() != Turn::Done {
                         form.footer-actions method="post" action={ "/jobs/" (id) "/cancel" } {
@@ -2042,6 +2043,7 @@ pub fn job_fragment(
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
         (reviews_region(true, job))
+        (mcp_calls_region(true, job, events))
         (log_region(true, logs))
     }
 }
@@ -2123,6 +2125,121 @@ fn plan_region(oob: bool, job: &Job, repo_url: Option<&str>) -> Markup {
 fn reviews_region(oob: bool, job: &Job) -> Markup {
     html! {
         div #job-reviews hx-swap-oob=[oob.then_some("true")] { (reviews_card(job)) }
+    }
+}
+
+/// The MCP tool calls a job made, in a region a poll swaps. The proxy records
+/// a row per call, so the card grows while a job runs and a call appears
+/// without a reload.
+fn mcp_calls_region(oob: bool, job: &Job, events: &[JobEvent]) -> Markup {
+    html! {
+        div #job-mcp-calls hx-swap-oob=[oob.then_some("true")] { (mcp_calls_card(job, events)) }
+    }
+}
+
+/// Every MCP tool call the proxy recorded for the job, oldest first, each with
+/// its server and tool, the stage and turn the job was in, and a badge for a
+/// forwarded or a refused call. It reads the `job_events` the page already
+/// loads, so it needs no extra query. An `mcp-unavailable` row stays a timeline
+/// note and is not listed here. The card renders only once the job has a call
+/// or a refused call, so the OOB wrapper has a target before the first one.
+fn mcp_calls_card(job: &Job, events: &[JobEvent]) -> Markup {
+    let rows: Vec<&JobEvent> = events
+        .iter()
+        .filter(|event| event.event == "mcp-tool-call" || event.event == "mcp-tool-blocked")
+        .collect();
+    let refused = rows
+        .iter()
+        .filter(|event| event.event == "mcp-tool-blocked")
+        .count();
+    html! {
+        @if !rows.is_empty() {
+            div.card {
+                div.card-head {
+                    h2 { "MCP tool calls" }
+                    span.log-count {
+                        (rows.len()) " " (plural(rows.len(), "call"))
+                        @if refused > 0 { " · " (refused) " refused" }
+                    }
+                }
+                ol.mcp-calls {
+                    @for event in rows {
+                        li { (mcp_call_row(job, event)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One recorded MCP call: its time, the server and tool split from the row's
+/// `detail` at the first `": "`, the stage and turn the job was in, and a badge
+/// that says whether the proxy forwarded or refused the call.
+fn mcp_call_row(job: &Job, event: &JobEvent) -> Markup {
+    let (server, tool) = split_detail(event.detail.as_deref());
+    let refused = event.event == "mcp-tool-blocked";
+    html! {
+        div.mcp-call-main {
+            span.mcp-call-tool { (server) " · " (tool) }
+            span.mcp-call-where { (event_stage_label(job, event)) " · " (turn_label(&event.turn)) }
+        }
+        div.mcp-call-aside {
+            @if refused {
+                span.badge.bad { "refused: tool turned off" }
+            } @else {
+                span.badge.neutral { "called" }
+            }
+            span.when { (crate::localtime::time(&event.at)) }
+        }
+    }
+}
+
+/// Splits an MCP row's `detail`, `"<server>: <tool>"`, at the first `": "`.
+/// A detail with no separator is taken as the tool with no server.
+fn split_detail(detail: Option<&str>) -> (&str, &str) {
+    match detail {
+        Some(detail) => detail.split_once(": ").unwrap_or(("", detail)),
+        None => ("", ""),
+    }
+}
+
+/// The stage a recorded event left the job in, with the pull request number
+/// when the stage works on one, like the timeline's step labels.
+fn event_stage_label(job: &Job, event: &JobEvent) -> String {
+    match event.pr {
+        Some(pr) => format!("{} · PR {} of {}", event.stage, pr + 1, job.plan().len()),
+        None => event.stage.clone(),
+    }
+}
+
+/// A readable label for the turn a recorded event left the job in, from the
+/// stored `Turn::name` string. An agent turn reads like the timeline's actor
+/// row, through the same wording as [`task_label`].
+fn turn_label(turn: &str) -> &'static str {
+    match turn {
+        "agent:clarify" => "reading the repository",
+        "agent:write-spec" => "writing the spec",
+        "agent:write-plan" => "writing the plan",
+        "agent:implement" => "implementing the pull request",
+        "agent:answer" => "reading your answers",
+        "agent:revise" => "revising after your feedback",
+        "agent:fix-checks" => "fixing failed checks",
+        "agent:fix-ci" => "fixing the CI failure",
+        "agent:address-review" => "addressing review comments",
+        "agent:rebase" => "rebasing onto the newest base branch to resolve a conflict",
+        "agent:review" => "reviewing the pull request",
+        "factory" | "rerun-ci" => "factory",
+        _ => "waiting for you",
+    }
+}
+
+/// `word` with an `s` unless `n` is 1, for a count label such as "1 call" or
+/// "3 calls".
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_owned()
+    } else {
+        format!("{word}s")
     }
 }
 
