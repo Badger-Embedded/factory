@@ -568,6 +568,34 @@ button:hover { filter: brightness(0.96); }
 .review-head { display: flex; align-items: center; gap: var(--space-10); margin-bottom: var(--space-10); }
 .review-number { font-weight: 600; }
 
+.badge.neutral { color: var(--muted); background: var(--sunken); }
+
+.mcp-calls { margin: 0; padding: 0; list-style: none; }
+.mcp-calls li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-12);
+  padding: var(--space-8) 0;
+  border-top: var(--border-width) solid var(--border);
+}
+.mcp-calls li:first-child { border-top: 0; }
+.mcp-call-main { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; flex: 1; }
+.mcp-call-tool { font-family: var(--mono); font-size: var(--font-size-sm); overflow-wrap: anywhere; }
+.mcp-call-where { color: var(--muted); font-size: var(--font-size-xs); }
+.mcp-call-aside {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-10);
+  flex: none;
+  margin-left: auto;
+}
+.mcp-call-aside .when {
+  color: var(--muted);
+  font: var(--font-size-xs) var(--mono);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .question { margin-bottom: var(--space-16); }
 .question label { display: flex; gap: var(--space-10); align-items: baseline; }
 .question-number {
