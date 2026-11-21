@@ -41,6 +41,7 @@ fn request() -> AgentRequest {
         base: "main".into(),
         branch: None,
         session_id: "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10".into(),
+        agent: factory_core::DEFAULT_AGENT,
         expect: Expect::Spec,
         prompt: "Write the spec.".into(),
         model: None,

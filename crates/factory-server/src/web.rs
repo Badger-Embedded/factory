@@ -18,7 +18,7 @@ use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::github::{RepoChecker, RepoReport};
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
-use crate::projects::{Project, Projects, StageEfforts, StageModels};
+use crate::projects::{Project, Projects, StageAgents, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
@@ -211,7 +211,7 @@ impl IntoResponse for AppError {
             AppError::Store(err @ StoreError::Rejected(_)) => {
                 (StatusCode::CONFLICT, err.to_string())
             }
-            AppError::Store(err @ StoreError::InvalidEffort(_)) => {
+            AppError::Store(err @ (StoreError::InvalidEffort(_) | StoreError::InvalidAgent(_))) => {
                 (StatusCode::BAD_REQUEST, err.to_string())
             }
             AppError::Store(err) => {
@@ -1066,10 +1066,21 @@ fn project_settings(
         .into_iter()
         .map(|server| server_settings(state, name, server))
         .collect::<Result<Vec<_>, StoreError>>()?;
+    let agents = state
+        .registry
+        .entries()
+        .map(|entry| pages::AgentChoice {
+            id: entry.id().to_owned(),
+            display_name: entry.display_name().to_owned(),
+            available: entry.available(),
+        })
+        .collect();
     Ok(ProjectSettings {
         name: name.to_owned(),
         models: state.store.project_models(name, &project.models)?,
         efforts: state.store.project_efforts(name)?,
+        agents,
+        agent_selection: state.store.project_agents(name)?,
         auto_merge: state.store.project_auto_merge(name, project.auto_merge)?,
         llm_review: state.store.project_llm_review(name, project.llm_review)?,
         gates: state.store.project_gates(name)?,
@@ -1134,6 +1145,10 @@ fn default_effort() -> String {
     factory_core::DEFAULT_EFFORT.to_owned()
 }
 
+fn default_agent() -> String {
+    factory_core::DEFAULT_AGENT.id().to_owned()
+}
+
 /// A project form's fields, parsed from the raw pairs. The MCP blocks name one
 /// field per server, so the set of names is not known at compile time; the
 /// pairs are read by name instead of a typed struct.
@@ -1164,6 +1179,12 @@ impl ProjectForm {
     /// posted before the selector existed still saves.
     fn effort(&self, key: &str) -> String {
         self.get(key).map_or_else(default_effort, str::to_owned)
+    }
+
+    /// An agent field, or the default agent when the field is absent, so a form
+    /// posted before the selector existed still saves.
+    fn agent(&self, key: &str) -> String {
+        self.get(key).map_or_else(default_agent, str::to_owned)
     }
 }
 
@@ -1250,9 +1271,19 @@ async fn save_project_models(
         implement: form.effort("implement_effort"),
         review: form.effort("review_effort"),
     };
+    let agents = StageAgents {
+        clarify: form.agent("clarify_agent"),
+        spec: form.agent("spec_agent"),
+        plan: form.agent("plan_agent"),
+        implement: form.agent("implement_agent"),
+        review: form.agent("review_agent"),
+    };
 
-    // Efforts first, so a bad level is rejected before anything is written.
+    // Validate the agents and the efforts before any write, so a rejected agent
+    // or effort stores none of the agents, efforts or models.
+    Store::check_agents(&agents)?;
     state.store.save_project_efforts(&name, &efforts)?;
+    state.store.save_project_agents(&name, &agents)?;
     state.store.save_project_models(&name, &models)?;
     state.store.save_project_settings(
         &name,

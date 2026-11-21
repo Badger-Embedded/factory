@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_core::{DEFAULT_AGENT, Event};
+use factory_core::Event;
 use factory_runner::{
     BranchSummary, Git, GitHub, Observation, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
     backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
@@ -106,7 +106,7 @@ impl Executor for PodmanExecutor {
         request: AgentRequest,
         log: LogSink,
     ) -> RunReport {
-        let agent = DEFAULT_AGENT;
+        let agent = request.agent;
         let entry = self.registry.entry(agent);
         // Resolve the credential before preparing the checkout or starting a
         // container. With none, the run fails here; the agent failure keeps the

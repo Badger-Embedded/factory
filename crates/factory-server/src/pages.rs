@@ -12,7 +12,7 @@ use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages, McpToolState};
 use crate::projects::Project;
-use crate::projects::{StageEfforts, StageModels};
+use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{JobEvent, JobFile, JobRow, LogEntry, ProjectTotals};
 use crate::timeline::timeline;
@@ -370,6 +370,12 @@ pub struct ProjectSettings {
     pub name: String,
     pub models: StageModels,
     pub efforts: StageEfforts,
+    /// Every registered agent, in the registry's order, for the stage panel's
+    /// agent control. Claude is selectable; Codex is shown disabled.
+    pub agents: Vec<AgentChoice>,
+    /// The agent each stage runs on, preselected in the control. A project with
+    /// no saved agents reads the default for every stage.
+    pub agent_selection: StageAgents,
     pub auto_merge: bool,
     pub llm_review: bool,
     pub gates: Gates,
@@ -377,6 +383,15 @@ pub struct ProjectSettings {
     pub default_gates: Gates,
     /// One per registered server, in the registry's order.
     pub servers: Vec<ServerSettings>,
+}
+
+/// One agent the stage panel's agent control offers: its stable id, the name
+/// the control shows, and whether it can be selected. An agent that cannot run,
+/// such as Codex, is shown disabled and marked "Not available yet".
+pub struct AgentChoice {
+    pub id: String,
+    pub display_name: String,
+    pub available: bool,
 }
 
 /// One server's block inside a project's form: whether the project runs it, the
@@ -1163,6 +1178,16 @@ fn stage_effort<'a>(efforts: &'a StageEfforts, stage: &str) -> &'a str {
     }
 }
 
+fn stage_agent<'a>(agents: &'a StageAgents, stage: &str) -> &'a str {
+    match stage {
+        "clarify" => &agents.clarify,
+        "spec" => &agents.spec,
+        "plan" => &agents.plan,
+        "implement" => &agents.implement,
+        _ => &agents.review,
+    }
+}
+
 fn stage_on(stages: McpStages, stage: &str) -> bool {
     match stage {
         "clarify" => stages.clarify,
@@ -1293,6 +1318,7 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool) -> Markup
     let name = &project.name;
     let model = stage_model(&project.models, stage).unwrap_or_default();
     let effort = stage_effort(&project.efforts, stage);
+    let agent = stage_agent(&project.agent_selection, stage);
     html! {
         div.pipe-panel data-panel=(stage) hidden[!selected] {
             h2 { (stage[..1].to_uppercase()) (stage[1..]) " stage" }
@@ -1304,6 +1330,22 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool) -> Markup
                     }
                     p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent. Off, the review stage does not run." }
                 }
+            }
+            div.field {
+                span.label { "Agent" }
+                div.seg role="radiogroup" aria-label={ (stage) " agent" } {
+                    @for choice in &project.agents {
+                        label.disabled[!choice.available] {
+                            input type="radio" name={ (stage) "_agent" } value=(choice.id)
+                                checked[choice.id == agent] disabled[!choice.available];
+                            span { (choice.display_name) }
+                            @if !choice.available {
+                                span.tag { "Not available yet" }
+                            }
+                        }
+                    }
+                }
+                p.hint { "The agent that runs this stage. A run already in flight keeps the agent it started on." }
             }
             div.field {
                 label for={ (name) "-" (stage) } { "Model" }

@@ -8,14 +8,15 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
-    MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Stage, Task, Turn,
+    Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, DEFAULT_EFFORT, Event, Gates,
+    MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session,
+    Stage, Task, Turn,
 };
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, GitHubRepos, LocalSecrets,
     MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection,
-    RepoChecker, RepoInfo, SecretStore, Settings, StageEfforts, StageModels, Store, StoreError,
-    ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    RepoChecker, RepoInfo, SecretStore, Settings, StageAgents, StageEfforts, StageModels, Store,
+    StoreError, ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -3901,6 +3902,258 @@ async fn an_invalid_effort_submission_is_rejected_and_stores_nothing() {
     assert_eq!(
         dashboard.store.project_efforts("maestro").unwrap(),
         StageEfforts::default()
+    );
+}
+
+fn agents(clarify: &str, spec: &str, plan: &str, implement: &str, review: &str) -> StageAgents {
+    StageAgents {
+        clarify: clarify.into(),
+        spec: spec.into(),
+        plan: plan.into(),
+        implement: implement.into(),
+        review: review.into(),
+    }
+}
+
+#[test]
+fn a_project_without_agents_reads_claude_for_every_stage() {
+    let store = Store::open_in_memory().unwrap();
+    let claude = StageAgents::default();
+    assert_eq!(claude.clarify, DEFAULT_AGENT.id());
+    assert_eq!(claude.review, DEFAULT_AGENT.id());
+    assert_eq!(store.project_agents("maestro").unwrap(), claude);
+}
+
+#[test]
+fn project_agents_are_stored_and_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let saved = agents("claude", "claude", "claude", "claude", "claude");
+    {
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.project_agents("maestro").unwrap(),
+            StageAgents::default()
+        );
+        store.save_project_agents("maestro", &saved).unwrap();
+    }
+    // The saved agents survive a reopen, and another project is untouched.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.project_agents("maestro").unwrap(), saved);
+    assert_eq!(
+        store.project_agents("other").unwrap(),
+        StageAgents::default()
+    );
+}
+
+#[test]
+fn saving_one_projects_agents_leaves_other_projects_alone() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_project_agents("maestro", &StageAgents::default())
+        .unwrap();
+    store
+        .save_project_agents("factory", &StageAgents::default())
+        .unwrap();
+    // A stray row for one project does not change the other's read.
+    assert_eq!(
+        store.project_agents("factory").unwrap(),
+        StageAgents::default()
+    );
+    assert_eq!(
+        store.project_agents("maestro").unwrap(),
+        StageAgents::default()
+    );
+}
+
+#[test]
+fn an_unavailable_or_unknown_agent_is_rejected_and_not_stored() {
+    let store = Store::open_in_memory().unwrap();
+    // Codex is registered but cannot run, so it is refused like an unknown id.
+    for bad in ["codex", "gemini"] {
+        let submitted = agents("claude", bad, "claude", "claude", "claude");
+        let err = store
+            .save_project_agents("maestro", &submitted)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::InvalidAgent(id) if id == bad),
+            "{err:?}"
+        );
+    }
+    // Nothing was written, so the project still reads the default agent.
+    assert_eq!(
+        store.project_agents("maestro").unwrap(),
+        StageAgents::default()
+    );
+}
+
+#[test]
+fn a_database_from_before_the_agent_table_opens_and_reads_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    // A database as it was before `project_agents` existed: a project but no
+    // agent table at all.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                name TEXT PRIMARY KEY,
+                repo TEXT NOT NULL UNIQUE,
+                base TEXT NOT NULL,
+                checks TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO projects (name, repo, base) VALUES ('maestro', 'o/n', 'main');",
+        )
+        .unwrap();
+    }
+    // Opening the store creates the table, so the old project reads Claude and a
+    // new agent can be saved.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.project_agents("maestro").unwrap(),
+        StageAgents::default()
+    );
+    let saved = agents("claude", "claude", "claude", "claude", "claude");
+    store.save_project_agents("maestro", &saved).unwrap();
+    assert_eq!(store.project_agents("maestro").unwrap(), saved);
+}
+
+#[test]
+fn a_sessions_table_without_the_agent_column_opens_and_resumes_on_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    // A `sessions` table as it was before `agent` joined it, with one row.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                job_id INTEGER NOT NULL,
+                session TEXT NOT NULL,
+                uuid TEXT NOT NULL,
+                PRIMARY KEY (job_id, session)
+            );
+            INSERT INTO sessions (job_id, session, uuid)
+                VALUES (1, 'planning', 'fixed-uuid');",
+        )
+        .unwrap();
+    }
+    // Opening the store adds the column with a Claude default, so the old
+    // session resumes on Claude even when the stage now names another agent.
+    let store = Store::open(&path).unwrap();
+    let (uuid, agent) = store
+        .session_uuid(1, Session::Planning, Agent::Codex)
+        .unwrap();
+    assert_eq!(uuid, "fixed-uuid");
+    assert_eq!(agent, Agent::Claude);
+}
+
+#[test]
+fn a_resumed_session_keeps_the_agent_it_started_on() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    // A fresh session records the stage's agent.
+    let (first, started) = store
+        .session_uuid(id, Session::Planning, Agent::Claude)
+        .unwrap();
+    assert_eq!(started, Agent::Claude);
+    // The stage's agent changes, but the next run of the same session reads the
+    // agent that began it, not the stage's current one.
+    let (again, resumed) = store
+        .session_uuid(id, Session::Planning, Agent::Codex)
+        .unwrap();
+    assert_eq!(again, first);
+    assert_eq!(resumed, Agent::Claude);
+    // A different session that starts after the change records the new agent.
+    let (_, other) = store.session_uuid(id, Session::Spec, Agent::Codex).unwrap();
+    assert_eq!(other, Agent::Codex);
+}
+
+#[tokio::test]
+async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_disabled() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    // Each stage's panel has a radio group named "<stage>_agent".
+    for stage in ["clarify", "spec", "plan", "implement", "review"] {
+        assert!(
+            page.body.contains(&format!("name=\"{stage}_agent\"")),
+            "missing the {stage} agent selector",
+        );
+    }
+    // Claude is selectable and preselected in every stage, so the checked
+    // Claude radio appears once per stage.
+    assert_eq!(
+        page.body.matches("value=\"claude\" checked").count(),
+        5,
+        "Claude should be preselected in all five stages",
+    );
+    // Codex is listed but disabled and marked, and never selected.
+    assert!(page.body.contains("value=\"codex\""));
+    assert!(page.body.contains("Not available yet"));
+    assert!(!page.body.contains("value=\"codex\" checked"));
+}
+
+#[tokio::test]
+async fn saving_the_form_persists_the_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .unwrap();
+    let dashboard = dashboard_with(Arc::clone(&store));
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&\
+             clarify_effort=medium&spec_effort=medium&plan_effort=medium&\
+             implement_effort=medium&review_effort=medium&\
+             clarify_agent=claude&spec_agent=claude&plan_agent=claude&\
+             implement_agent=claude&review_agent=claude",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    drop(dashboard);
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.project_agents("maestro").unwrap(),
+        agents("claude", "claude", "claude", "claude", "claude")
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_agent_submission_is_rejected_and_stores_nothing() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=opus&spec=&plan=&implement=&review=&\
+             clarify_effort=medium&spec_effort=high&plan_effort=medium&\
+             implement_effort=medium&review_effort=medium&\
+             clarify_agent=claude&spec_agent=codex&plan_agent=claude&\
+             implement_agent=claude&review_agent=claude",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    // Agents are validated before any write, so the model and effort submitted
+    // alongside the rejected agent are not stored either.
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap(),
+        StageModels::default()
+    );
+    assert_eq!(
+        dashboard.store.project_efforts("maestro").unwrap(),
+        StageEfforts::default()
+    );
+    assert_eq!(
+        dashboard.store.project_agents("maestro").unwrap(),
+        StageAgents::default()
     );
 }
 
