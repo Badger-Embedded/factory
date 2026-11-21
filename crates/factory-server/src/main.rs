@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRegistry, ClaudeToken, CodexLogin, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker,
-    McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, Projects, ProxyEvent, ProxyEventFn,
-    RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets,
-    Upstreams, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
+    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, GhRepos, HttpMcpChecker, LocalSecrets,
+    McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin, Projects,
+    ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
+    StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
+    master_key_from_env, proxy_app,
 };
 use tokio::sync::Notify;
 
@@ -79,6 +80,16 @@ fn git_config() -> Git {
     }
 }
 
+/// The Codex device login the settings page drives. It runs
+/// `codex login --device-auth` in a worker-image container, so it needs the
+/// podman binary and the worker network, not a job mount.
+fn codex_device_login(secrets: &Arc<dyn SecretStore>, network: Option<String>) -> Arc<DeviceLogin> {
+    Arc::new(DeviceLogin::new(
+        Arc::clone(secrets),
+        Arc::new(PodmanLogin::new(worker_base(network))),
+    ))
+}
+
 fn worker_base(network: Option<String>) -> WorkerConfig {
     WorkerConfig {
         podman: path_var("FACTORY_PODMAN", "podman"),
@@ -94,6 +105,10 @@ fn worker_base(network: Option<String>) -> WorkerConfig {
 }
 
 #[tokio::main]
+#[allow(
+    clippy::too_many_lines,
+    reason = "main wires each long-lived dependency once before it serves"
+)]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
 
@@ -223,12 +238,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // no redirect and bounds the wait, the same way the proxy's client does.
     let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::new());
 
+    let device_login = codex_device_login(&secrets, worker_network.clone());
+
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
     axum::serve(
         listener,
         app(
-            store, projects, wake, data_dir, plan_usage, github, slots, secrets, checker, agents,
+            store,
+            projects,
+            wake,
+            data_dir,
+            plan_usage,
+            github,
+            slots,
+            secrets,
+            checker,
+            agents,
+            device_login,
         ),
     )
     .with_graceful_shutdown(async {

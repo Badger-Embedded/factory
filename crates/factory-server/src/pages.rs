@@ -758,6 +758,178 @@ pub fn settings_claude(
     )
 }
 
+/// Whether a Codex login is stored and, when it is, the time Codex last
+/// refreshed it, as a `YYYY-MM-DD HH:MM:SS` string for the dashboard time
+/// helper. The token itself never leaves the handler.
+pub struct CodexAccount {
+    pub stored: bool,
+    pub last_refresh: Option<String>,
+}
+
+pub fn settings_codex(
+    user: &str,
+    nav: &SettingsNav,
+    account: &CodexAccount,
+    login: &crate::device_login::LoginView,
+    secrets_available: bool,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Agent("codex".to_owned()),
+        "Codex",
+        notice,
+        &html! {
+            h1 { "Codex" }
+            (codex_account_card(account))
+            (codex_login_card(login, secrets_available))
+            (codex_auth_card(account.stored, secrets_available))
+        },
+    )
+}
+
+/// The card that states whether a login is stored and when Codex last refreshed
+/// it. It never shows the file, a token or the account id.
+fn codex_account_card(account: &CodexAccount) -> Markup {
+    html! {
+        div.card {
+            h2 { "ChatGPT login" }
+            p.hint {
+                "The factory runs Codex on a ChatGPT Plus or Pro subscription. The login should \
+                 belong to the factory alone: a file copied from a laptop shares its refresh token \
+                 with that laptop's Codex, and a refresh on one side can sign the other out."
+            }
+            @if account.stored {
+                p.meta {
+                    "A login is stored."
+                    @if let Some(at) = &account.last_refresh {
+                        " Last refreshed " (crate::localtime::date_time(at)) "."
+                    }
+                }
+            } @else {
+                p.meta { "No login is stored." }
+            }
+        }
+    }
+}
+
+/// The "Sign in with `ChatGPT`" card. It starts the device login and holds the
+/// fragment that polls for the URL, the code, success or a failure reason. The
+/// button is disabled when the store is unavailable, since the login could not
+/// be saved.
+fn codex_login_card(login: &crate::device_login::LoginView, secrets_available: bool) -> Markup {
+    html! {
+        div.card {
+            h2 { "Sign in with ChatGPT" }
+            p.hint {
+                "The factory starts a container that runs " code { "codex login --device-auth" }
+                ". Open the link it shows and enter the code to sign the factory in."
+            }
+            @if !secrets_available {
+                p.hint.bad { "The master key is missing, so a login cannot be saved. Clear still works." }
+            }
+            (codex_login_fragment(login, secrets_available))
+        }
+    }
+}
+
+/// The login area the page polls every five seconds while a login runs. It
+/// stops polling once the login is signed in or failed, so a terminal state
+/// stays put.
+pub fn codex_login_fragment(
+    login: &crate::device_login::LoginView,
+    secrets_available: bool,
+) -> Markup {
+    use crate::device_login::LoginView;
+    let polling = login.active();
+    html! {
+        div.codex-login #codex-login
+            hx-get="/settings/agents/codex/login/fragment"
+            hx-trigger=[polling.then_some(POLL_TRIGGER)]
+            hx-swap="outerHTML"
+        {
+            @match login {
+                LoginView::Idle => {
+                    form method="post" action="/settings/agents/codex/login" {
+                        button.primary disabled[!secrets_available] { "Sign in with ChatGPT" }
+                    }
+                }
+                LoginView::Starting => {
+                    p.meta { "Starting the login container…" }
+                    (codex_login_cancel())
+                }
+                LoginView::Waiting { url, code } => {
+                    p { "Open " a href=(url) target="_blank" rel="noopener" { (url) } " and enter this code:" }
+                    p.code-prompt { code { (code) } }
+                    p.meta { "Waiting for you to finish in the browser…" }
+                    (codex_login_cancel())
+                }
+                LoginView::SignedIn => {
+                    p.good { "Signed in." }
+                    form method="post" action="/settings/agents/codex/login" {
+                        button.primary disabled[!secrets_available] { "Sign in again" }
+                    }
+                }
+                LoginView::Failed { reason } => {
+                    p.bad { "The login did not finish." }
+                    pre.login-reason { (reason) }
+                    form method="post" action="/settings/agents/codex/login" {
+                        button.primary disabled[!secrets_available] { "Try again" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The Cancel button shown while a login runs. It removes the container.
+fn codex_login_cancel() -> Markup {
+    html! {
+        form method="post" action="/settings/agents/codex/login/cancel" {
+            button.danger { "Cancel" }
+        }
+    }
+}
+
+/// The paste card, the fallback for when device login fails: an operator runs
+/// `codex login` on a trusted machine and pastes the contents of its
+/// `auth.json`. The textarea carries no value, so a stored login is never in the
+/// page source. An empty save keeps the stored login and Clear removes it.
+fn codex_auth_card(stored: bool, secrets_available: bool) -> Markup {
+    html! {
+        form.card.settings-form method="post" action="/settings/agents/codex/auth" {
+            h2 { "Paste a login" }
+            p.hint {
+                "Run " code { "codex login" } " on a machine with a browser and paste the contents \
+                 of its " code { "~/.codex/auth.json" } " here. Stored encrypted and never shown."
+            }
+            @if !secrets_available {
+                p.hint.bad { "The master key is missing, so a login cannot be saved here." }
+            }
+            div.field {
+                label for="codex-auth" { "auth.json" }
+                textarea #codex-auth.wide name="auth" rows="6"
+                    autocomplete="off" spellcheck="false"
+                    placeholder=(if stored { "set" } else { "not set" })
+                    disabled[!secrets_available] {}
+                p.hint {
+                    @if stored { "A login is stored. " } @else { "No login is stored. " }
+                    "Paste a new one to replace it. An empty field keeps it."
+                }
+            }
+            // Save comes before Clear, so Enter in the field saves.
+            div.save-bar {
+                span.save-bar-note { "No unsaved changes." }
+                button.primary disabled[!secrets_available] { "Save login" }
+            }
+            div.danger-zone {
+                button.danger formaction="/settings/agents/codex/auth/clear" formnovalidate { "Clear login" }
+            }
+        }
+    }
+}
+
 pub fn settings_mcp(
     user: &str,
     nav: &SettingsNav,
