@@ -43,6 +43,10 @@ const HEADER_NAME_PATTERN: &str = r"[A-Za-z0-9!#$%&'*+.^_`\|~\-]+";
 /// re-runs or removes it.
 const JOB_UPDATES: &str = include_str!("../static/job-updates.js");
 const LOCAL_TIME: &str = include_str!("../static/local-time.js");
+/// Reopens a `<details>` a poll swap would close, keyed by its `data-key`. It
+/// runs once per page, outside every swapped region, and covers the board's
+/// "Show N older" and the job page's MCP tool-call groups.
+const DETAILS_STATE: &str = include_str!("../static/details-state.js");
 
 /// Each live region polls its own fragment on this interval, so a state change
 /// shows without a reload.
@@ -145,6 +149,7 @@ pub fn index(
                     p { a.nav href="/onboard" { "Onboard a project" } }
                 }
             }
+            script { (PreEscaped(DETAILS_STATE)) }
             script { (PreEscaped(LOCAL_TIME)) }
         },
     )
@@ -1900,7 +1905,7 @@ pub fn board(
                         h2 { (section.title()) " " span.count { (jobs.len()) } }
                         @if section == Section::Done && jobs.len() > DONE_SHOWN {
                             (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge))
-                            details.older {
+                            details.older data-key=(section.name()) {
                                 summary { "Show " (jobs.len() - DONE_SHOWN) " older" }
                                 (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge))
                             }
@@ -2097,6 +2102,7 @@ pub fn job(
                 }
             }
             script { (PreEscaped(JOB_UPDATES)) }
+            script { (PreEscaped(DETAILS_STATE)) }
             script { (PreEscaped(LOCAL_TIME)) }
         },
     )
@@ -2282,8 +2288,8 @@ fn mcp_calls_card(job: &Job, events: &[JobEvent]) -> Markup {
 /// server name, a counter badge with the call count, a bad-style `N refused`
 /// badge when any call was refused, and the latest call's time. Expanding it
 /// shows the server's calls as rows that drop the server name the summary
-/// already carries. `job-updates.js` reopens a group a poll left open, keyed by
-/// the `data-server` name.
+/// already carries. `details-state.js` reopens a group a poll left open, keyed
+/// by the group's `data-key`.
 fn mcp_call_group(job: &Job, server: &str, calls: &[&JobEvent]) -> Markup {
     let [single] = calls else {
         let refused = calls
@@ -2292,7 +2298,7 @@ fn mcp_call_group(job: &Job, server: &str, calls: &[&JobEvent]) -> Markup {
             .count();
         let latest = calls.last().expect("a group has at least one call");
         return html! {
-            details.mcp-call-group data-server=(server) {
+            details.mcp-call-group data-server=(server) data-key=(server) {
                 summary.mcp-call {
                     div.mcp-call-main {
                         span.mcp-call-tool { (server) }

@@ -847,10 +847,14 @@ async fn the_job_page_groups_mcp_tool_calls_oldest_first() {
     assert!(body.contains("3 calls"));
     assert!(body.contains("1 refused"));
 
-    // The three calls are one collapsed group for the one server.
+    // The three calls are one collapsed group for the one server, and it
+    // carries a stable key so `details-state.js` can reopen it after a swap.
     assert!(body.contains("data-server=\"context7\""));
+    assert!(body.contains(
+        "<details class=\"mcp-call-group\" data-server=\"context7\" data-key=\"context7\">"
+    ));
     assert_eq!(body.matches("<details").count(), 1);
-    assert!(!body.contains("<details class=\"mcp-call-group\" data-server=\"context7\" open"));
+    assert!(!body.contains("data-key=\"context7\" open"));
 
     // The expanded rows hold the tools in recording order, with the server
     // dropped since the summary shows it.
@@ -3618,7 +3622,12 @@ async fn done_shows_five_jobs_and_collapses_the_older_ones() {
     let body = dashboard.get("/").await.body;
     let done = lane_html(&body, "inbox-done");
     assert!(done.contains("Done <span class=\"count\">7</span>"));
-    let older = &done[done.find("<details class=\"older\">").unwrap()..];
+    // The disclosure carries a stable key, so `details-state.js` can reopen it
+    // across a poll swap.
+    let open = done
+        .find("<details class=\"older\" data-key=\"done\">")
+        .expect("details.older carries its key");
+    let older = &done[open..];
     assert!(older.contains("<summary>Show 2 older</summary>"));
     // Newest first, so the two oldest jobs are the collapsed ones.
     for id in &ids[..2] {
@@ -3627,7 +3636,23 @@ async fn done_shows_five_jobs_and_collapses_the_older_ones() {
     for id in &ids[2..] {
         assert!(!older.contains(&format!("href=\"/jobs/{id}\"")), "{id}");
     }
-    assert!(!done.contains("<details class=\"older\" open"));
+    // The server renders it closed; the script opens it only in the browser.
+    assert!(!done.contains("<details class=\"older\" data-key=\"done\" open"));
+}
+
+#[tokio::test]
+async fn the_board_and_job_page_serve_the_details_state_script() {
+    // The script keeps an open <details> open across a poll swap. It is inlined
+    // once per page, outside every swapped region.
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    for uri in ["/", &format!("/jobs/{id}")] {
+        let body = dashboard.get(uri).await.body;
+        assert!(
+            body.contains("details[data-key]"),
+            "{uri} does not inline details-state.js"
+        );
+    }
 }
 
 #[tokio::test]
