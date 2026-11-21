@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use factory_core::{Event, Gates};
+use factory_core::{Event, Gates, Stage};
 use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -99,6 +99,12 @@ pub fn app(
             post(create_job).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .route("/jobs/{id}", get(show_job))
+        .route(
+            "/jobs/{id}/edit",
+            get(show_edit)
+                .post(save_edit)
+                .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         .route("/jobs/{id}/fragment", get(job_fragment))
         .route("/jobs/{id}/images/{name}", get(show_image))
         .route("/jobs/{id}/files/{name}", get(show_file))
@@ -775,6 +781,167 @@ async fn show_file(
         bytes,
     )
         .into_response())
+}
+
+/// Shows the edit form for a job still queued in `requested`. A job that has
+/// already started, or any job in a later stage, redirects to the job page, so
+/// the form only ever opens on an editable request.
+async fn show_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    let row = state.store.get(id)?;
+    if *row.job.stage() != Stage::Requested {
+        return Ok(job_redirect(id).into_response());
+    }
+    let images = state.store.images(id)?;
+    let files = state.store.files(id)?;
+    Ok(pages::edit_request(&user(&headers), id, &row.job, &images, &files).into_response())
+}
+
+/// Saves an edit to a queued request. It applies the New request form's rules
+/// to the new text and uploads, rejects an unknown `remove` name, then writes
+/// the kept-then-new attachment set to the job's `staging/` directory and hands
+/// it to [`Store::edit_request`], which swaps it in under the connection lock.
+/// A job that already started gets a 409 from the store and nothing changes.
+async fn save_edit(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    mut form: Multipart,
+) -> Result<Redirect, AppError> {
+    let mut request = None;
+    let mut removes: Vec<String> = Vec::new();
+    let mut attachments = Vec::new();
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|err| multipart_error(&err))?
+    {
+        match field.name() {
+            Some("request") => request = Some(read_text(field).await?),
+            Some("remove") => removes.push(read_text(field).await?),
+            Some("images") => read_attachment(field, &mut attachments).await?,
+            _ => {}
+        }
+    }
+    let request = request.unwrap_or_default();
+    let request = request.trim();
+    if request.is_empty() {
+        return Err(AppError::BadRequest("the request is empty".into()));
+    }
+    if request.len() > MAX_FORM_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "the request is over the limit of {MAX_FORM_BYTES} bytes"
+        )));
+    }
+
+    // The kept set: the stored attachments the form did not mark for removal.
+    // An unknown `remove` name is a 400, so a stale form cannot drop a file
+    // that is no longer there or reach a name the job never had.
+    let images = state.store.images(id)?;
+    let files = state.store.files(id)?;
+    let stored: HashSet<&str> = images
+        .iter()
+        .map(String::as_str)
+        .chain(files.iter().map(|file| file.name.as_str()))
+        .collect();
+    for name in &removes {
+        if !stored.contains(name.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "no attachment named {name:?}"
+            )));
+        }
+    }
+    let dropped: HashSet<&str> = removes.iter().map(String::as_str).collect();
+    let kept_images: Vec<&String> = images
+        .iter()
+        .filter(|name| !dropped.contains(name.as_str()))
+        .collect();
+    let kept_files: Vec<&JobFile> = files
+        .iter()
+        .filter(|file| !dropped.contains(file.name.as_str()))
+        .collect();
+    if kept_images.len() + kept_files.len() + attachments.len() > MAX_ATTACHMENTS {
+        return Err(AppError::BadRequest(format!(
+            "a request takes at most {MAX_ATTACHMENTS} attachments"
+        )));
+    }
+
+    // The final set reads the kept attachments' bytes, in their old order,
+    // then the new uploads, so the staging write renumbers both from 1.
+    let job_dir = state.data_dir.join("jobs").join(id.to_string());
+    let mut combined = Vec::new();
+    for name in &kept_images {
+        let bytes = read_stored(&job_dir.join("images").join(name))?;
+        combined.push(Attachment::Image {
+            extension: image_ext(name)?,
+            bytes,
+        });
+    }
+    for file in &kept_files {
+        let bytes = read_stored(&job_dir.join("files").join(&file.name))?;
+        combined.push(Attachment::File {
+            extension: file_ext(&file.name)?,
+            name: Some(file.original_name.clone()),
+            bytes,
+        });
+    }
+    combined.extend(attachments);
+
+    let staging_dir = job_dir.join("staging");
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    let (image_names, new_files) = match write_numbered_attachments(&staging_dir, &combined) {
+        Ok(set) => set,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(err);
+        }
+    };
+
+    let result = state.store.edit_request(
+        id,
+        request.to_owned(),
+        &state.data_dir,
+        &image_names,
+        &new_files,
+    );
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    result?;
+    state.wake.notify_one();
+    Ok(job_redirect(id))
+}
+
+/// Reads a stored attachment's bytes, mapping a read failure to a 500, since a
+/// file the tables list should be on disk.
+fn read_stored(path: &std::path::Path) -> Result<Vec<u8>, AppError> {
+    std::fs::read(path)
+        .map_err(|err| AppError::Io(format!("cannot read a saved attachment: {err}")))
+}
+
+/// The extension of a stored image name, one of the server-generated set. A
+/// name the server never wrote is a 500 rather than a silent miss.
+fn image_ext(name: &str) -> Result<&'static str, AppError> {
+    match name.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("png") => Ok("png"),
+        Some("jpg") => Ok("jpg"),
+        Some("gif") => Ok("gif"),
+        Some("webp") => Ok("webp"),
+        _ => Err(AppError::Io(format!(
+            "stored image {name} has no known extension"
+        ))),
+    }
+}
+
+/// The extension of a stored file name, a text file or a ZIP archive.
+fn file_ext(name: &str) -> Result<&'static str, AppError> {
+    match name.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("txt") => Ok("txt"),
+        Some("zip") => Ok("zip"),
+        _ => Err(AppError::Io(format!(
+            "stored file {name} has no known extension"
+        ))),
+    }
 }
 
 async fn answer(

@@ -9,10 +9,11 @@ use factory_core::{
 };
 use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunReport};
 use factory_server::{
-    AgentRequest, ChecksRequest, Executor, LogSink, McpProjectSettings, McpRuntime, McpStages,
-    McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction, RerunRequest,
-    RunTokens, Scheduler, SecretRef, SecretStore, Settings, StageEfforts, Store, SummaryRequest,
-    UnavailableSecrets, WatchReport, WatchRequest, format_cost, ready_action, watch_only_event,
+    AgentRequest, ChecksRequest, Executor, JobFile, LogSink, McpProjectSettings, McpRuntime,
+    McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
+    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, Settings, StageEfforts, Store,
+    SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, format_cost, ready_action,
+    watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -3046,4 +3047,109 @@ async fn a_run_token_is_live_during_the_run_and_revoked_after() {
     wait_idle(&scheduler).await;
     // The worker exited, so the factory revoked the token.
     assert!(!tokens.is_active(&mcp.token));
+}
+
+#[tokio::test]
+async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
+    use std::fs;
+
+    let data = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(|_| questions());
+    let projects: Projects = [(
+        "maestro".to_owned(),
+        Project {
+            repo: "Badger-Embedded/maestro".into(),
+            base: "main".into(),
+            checks: Some("just lint".into()),
+            models: factory_server::StageModels::default(),
+            auto_merge: false,
+            llm_review: false,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        data.path().to_owned(),
+        mcp_runtime(&store).0,
+    );
+
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+
+    // The initial attachment set, placed the way the web handler places it.
+    let job_dir = data.path().join("jobs").join(id.to_string());
+    fs::create_dir_all(job_dir.join("images")).unwrap();
+    fs::write(job_dir.join("images").join("image-1.png"), b"one").unwrap();
+    fs::write(job_dir.join("images").join("image-2.png"), b"two").unwrap();
+    store
+        .add_images(id, &["image-1.png".into(), "image-2.png".into()])
+        .unwrap();
+    fs::create_dir_all(job_dir.join("files")).unwrap();
+    fs::write(job_dir.join("files").join("file-1.txt"), b"notes").unwrap();
+    store
+        .add_files(
+            id,
+            &[JobFile {
+                name: "file-1.txt".into(),
+                original_name: "notes.txt".into(),
+            }],
+        )
+        .unwrap();
+
+    // Drop image-1, keep image-2 (renumbered to image-1), add a new image-2,
+    // and keep the file. The caller writes this final set to `staging/` first.
+    let staging = job_dir.join("staging");
+    fs::create_dir_all(staging.join("images")).unwrap();
+    fs::write(staging.join("images").join("image-1.png"), b"two").unwrap();
+    fs::write(staging.join("images").join("image-2.png"), b"three").unwrap();
+    fs::create_dir_all(staging.join("files")).unwrap();
+    fs::write(staging.join("files").join("file-1.txt"), b"notes").unwrap();
+    store
+        .edit_request(
+            id,
+            "Add a shutdown button".into(),
+            data.path(),
+            &["image-1.png".into(), "image-2.png".into()],
+            &[JobFile {
+                name: "file-1.txt".into(),
+                original_name: "notes.txt".into(),
+            }],
+        )
+        .unwrap();
+    let _ = fs::remove_dir_all(&staging);
+
+    // The post-edit set a run reads: the renumbered kept image, the new one,
+    // and the kept file. The removed image's bytes are gone.
+    assert_eq!(store.images(id).unwrap(), ["image-1.png", "image-2.png"]);
+    assert_eq!(
+        fs::read(job_dir.join("images").join("image-1.png")).unwrap(),
+        b"two"
+    );
+    assert_eq!(
+        fs::read(job_dir.join("images").join("image-2.png")).unwrap(),
+        b"three"
+    );
+    let mut on_disk: Vec<String> = fs::read_dir(job_dir.join("images"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    on_disk.sort();
+    assert_eq!(on_disk, ["image-1.png", "image-2.png"]);
+    assert_eq!(store.files(id).unwrap().len(), 1);
+
+    scheduler.tick().await.unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+
+    let request = &executor.requests()[0];
+    assert_eq!(request.job_id, id);
+    assert_eq!(request.expect, Expect::Clarify);
+    assert!(request.prompt.contains("Add a shutdown button"));
+    assert!(!request.prompt.contains("Add a reboot button"));
 }

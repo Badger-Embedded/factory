@@ -144,6 +144,10 @@ impl Reply {
 const BOUNDARY: &str = "factory-test-boundary";
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000";
+/// Two more valid PNGs with distinct bytes, so an edit test can tell a kept
+/// image from a new one by its contents.
+const PNG_B: &[u8] = b"\x89PNG\r\n\x1a\n1111";
+const PNG_C: &[u8] = b"\x89PNG\r\n\x1a\n2222";
 const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0];
 const GIF: &[u8] = b"GIF89a0000";
 const WEBP: &[u8] = b"RIFF\x04\0\0\0WEBPVP8 ";
@@ -308,6 +312,54 @@ impl Dashboard {
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
         self.send(
             Request::post("/jobs")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .header(USER_HEADER, "alice@example.com")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// Posts an edit to `/jobs/{id}/edit` as multipart: the new request text,
+    /// one `remove` part per stored name to drop, and one `images` part per new
+    /// upload, the way the edit form posts.
+    async fn post_edit(
+        &self,
+        id: i64,
+        request: &str,
+        removes: &[&str],
+        images: &[(&str, &[u8])],
+    ) -> Reply {
+        let mut body = Vec::new();
+        let mut part = |disposition: String, content: &[u8]| {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\n{disposition}\r\n\r\n").as_bytes());
+            body.extend_from_slice(content);
+            body.extend_from_slice(b"\r\n");
+        };
+        part(
+            "Content-Disposition: form-data; name=\"request\"".into(),
+            request.as_bytes(),
+        );
+        for name in removes {
+            part(
+                "Content-Disposition: form-data; name=\"remove\"".into(),
+                name.as_bytes(),
+            );
+        }
+        for (file_name, bytes) in images {
+            part(
+                format!(
+                    "Content-Disposition: form-data; name=\"images\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream"
+                ),
+                bytes,
+            );
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        self.send(
+            Request::post(format!("/jobs/{id}/edit"))
                 .header(
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={BOUNDARY}"),
@@ -2337,6 +2389,262 @@ async fn the_form_posts_multipart_with_an_image_input() {
     let page = dashboard().get("/").await;
     assert!(page.body.contains("multipart/form-data"));
     assert!(page.body.contains(r#"name="images""#));
+}
+
+/// The on-disk file names under `<job>/<sub>`, sorted. An absent directory
+/// reads as empty.
+fn saved_names(dashboard: &Dashboard, id: i64, sub: &str) -> Vec<String> {
+    let dir = dashboard
+        .data
+        .path()
+        .join("jobs")
+        .join(id.to_string())
+        .join(sub);
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn job_dir_file(dashboard: &Dashboard, id: i64, sub: &str, name: &str) -> Vec<u8> {
+    fs::read(
+        dashboard
+            .data
+            .path()
+            .join("jobs")
+            .join(id.to_string())
+            .join(sub)
+            .join(name),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_edit_form_shows_the_text_and_a_remove_box_per_attachment() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job(
+            "maestro",
+            "Add a reboot button",
+            &[("a.png", PNG), ("b.txt", TEXT)],
+        )
+        .await;
+    let id = job_id(&reply);
+
+    let page = dashboard.get(&format!("/jobs/{id}/edit")).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Add a reboot button"));
+    assert!(page.body.contains(r#"name="remove" value="image-1.png""#));
+    assert!(page.body.contains(r#"name="remove" value="file-1.txt""#));
+    assert!(page.body.contains(r#"name="images""#));
+}
+
+#[tokio::test]
+async fn the_edit_form_redirects_once_the_job_has_started() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+
+    let page = dashboard.get(&format!("/jobs/{id}/edit")).await;
+    assert_eq!(page.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        page.location.as_deref(),
+        Some(format!("/jobs/{id}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn an_edit_with_no_attachment_change_replaces_only_the_text() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let reply = dashboard
+        .post_edit(id, "Add a shutdown button", &[], &[])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location.as_deref(),
+        Some(format!("/jobs/{id}").as_str())
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("Add a shutdown button"));
+    assert!(!page.body.contains("Add a reboot button"));
+
+    let events = dashboard.store.events(id).unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.event, "edit");
+    assert_eq!(last.stage, "requested");
+}
+
+#[tokio::test]
+async fn an_edit_removes_an_image_and_renumbers_the_rest() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job(
+            "maestro",
+            "Match this",
+            &[("a.png", PNG), ("b.png", PNG_B), ("c.txt", TEXT)],
+        )
+        .await;
+    let id = job_id(&reply);
+
+    let reply = dashboard
+        .post_edit(id, "Match this", &["image-1.png"], &[("new.png", PNG_C)])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+
+    // The kept image-2 becomes image-1, the new upload becomes image-2.
+    assert_eq!(
+        dashboard.store.images(id).unwrap(),
+        ["image-1.png", "image-2.png"]
+    );
+    assert_eq!(
+        saved_names(&dashboard, id, "images"),
+        ["image-1.png", "image-2.png"]
+    );
+    assert_eq!(job_dir_file(&dashboard, id, "images", "image-1.png"), PNG_B);
+    assert_eq!(job_dir_file(&dashboard, id, "images", "image-2.png"), PNG_C);
+
+    // The kept file is untouched and keeps its original name.
+    let files = dashboard.store.files(id).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].name, "file-1.txt");
+    assert_eq!(files[0].original_name, "c.txt");
+    assert_eq!(saved_names(&dashboard, id, "files"), ["file-1.txt"]);
+}
+
+#[tokio::test]
+async fn an_edit_removes_a_file_and_adds_a_zip() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job("maestro", "x", &[("old.txt", TEXT)])
+        .await;
+    let id = job_id(&reply);
+
+    let reply = dashboard
+        .post_edit(id, "x", &["file-1.txt"], &[("bundle.zip", ZIP)])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+
+    let files = dashboard.store.files(id).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].name, "file-1.zip");
+    assert_eq!(files[0].original_name, "bundle.zip");
+    assert_eq!(saved_names(&dashboard, id, "files"), ["file-1.zip"]);
+    assert_eq!(job_dir_file(&dashboard, id, "files", "file-1.zip"), ZIP);
+}
+
+#[tokio::test]
+async fn an_edit_that_breaks_a_rule_changes_nothing() {
+    // The text, the removes and the new uploads of one rejected edit.
+    type Case<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, &'a [u8])>);
+
+    let big_text = "x".repeat(256 * 1024 + 1);
+    let mut big_image = PNG.to_vec();
+    big_image.resize(factory_server::MAX_ATTACHMENT_BYTES + 1, 0);
+    let pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".as_slice();
+
+    let cases: Vec<Case> = vec![
+        ("  ", vec![], vec![]),
+        (big_text.as_str(), vec![], vec![]),
+        ("x", vec![], vec![("d.png", PNG), ("e.png", PNG_B)]),
+        ("x", vec![], vec![("big.png", big_image.as_slice())]),
+        ("x", vec![], vec![("doc.pdf", pdf)]),
+        ("x", vec!["image-9.png"], vec![]),
+    ];
+
+    for (text, removes, images) in cases {
+        let dashboard = dashboard();
+        let reply = dashboard
+            .post_job(
+                "maestro",
+                "Keep me",
+                &[
+                    ("a.png", PNG),
+                    ("b.png", PNG_B),
+                    ("c.txt", TEXT),
+                    ("d.txt", TEXT),
+                ],
+            )
+            .await;
+        let id = job_id(&reply);
+        let before_images = dashboard.store.images(id).unwrap();
+        let before_files = dashboard.store.files(id).unwrap();
+
+        let reply = dashboard.post_edit(id, text, &removes, &images).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "text {text:?}");
+
+        assert_eq!(dashboard.store.get(id).unwrap().job.request(), "Keep me");
+        assert_eq!(dashboard.store.images(id).unwrap(), before_images);
+        assert_eq!(dashboard.store.files(id).unwrap(), before_files);
+        assert_eq!(
+            saved_names(&dashboard, id, "images"),
+            ["image-1.png", "image-2.png"]
+        );
+        assert_eq!(
+            saved_names(&dashboard, id, "files"),
+            ["file-1.txt", "file-2.txt"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edit_after_the_job_starts_is_a_conflict() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_job("maestro", "Add a reboot button", &[("a.png", PNG)])
+        .await;
+    let id = job_id(&reply);
+    dashboard.apply(id, Event::Start);
+
+    let reply = dashboard
+        .post_edit(
+            id,
+            "Add a shutdown button",
+            &["image-1.png"],
+            &[("b.png", PNG_B)],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.request(),
+        "Add a reboot button"
+    );
+    assert_eq!(dashboard.store.images(id).unwrap(), ["image-1.png"]);
+    assert_eq!(saved_names(&dashboard, id, "images"), ["image-1.png"]);
+    assert_eq!(job_dir_file(&dashboard, id, "images", "image-1.png"), PNG);
+}
+
+#[tokio::test]
+async fn only_a_queued_job_offers_an_edit_link() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains(&format!("/jobs/{id}/edit")));
+
+    dashboard.apply(id, Event::Start);
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(!page.body.contains(&format!("/jobs/{id}/edit")));
+}
+
+#[tokio::test]
+async fn the_timeline_notes_an_edit() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard
+        .post_edit(id, "Add a shutdown button", &[], &[])
+        .await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("You edited the request"));
 }
 
 fn gate_form(gates: &str) -> String {
