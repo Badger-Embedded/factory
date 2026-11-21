@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -968,6 +969,7 @@ impl<E: Executor> Scheduler<E> {
         // dies after that line resumes on it.
         let session_store = Arc::clone(&self.store);
         let session_uuid = request.session_id.clone();
+        let cost_session = request.session_id.clone();
         let session: SessionSink = Box::new(move |id| {
             if let Err(err) = session_store.set_agent_session(&session_uuid, &id) {
                 tracing::error!("job {job_id}: {err}");
@@ -988,26 +990,33 @@ impl<E: Executor> Scheduler<E> {
                 .warnings
                 .record(job_id, &unavailable.server, &unavailable.reason);
         }
-        self.record_run_cost(job_id, model.as_deref(), &report);
+        self.record_run_cost(job_id, &cost_session, model.as_deref(), &report);
         self.apply(job_id, report.event);
     }
 
     /// Records the cost of a finished agent run and notes it on the job log. A
-    /// run that reports a dollar figure, such as Claude's, records it as it is. A
+    /// run that reports a dollar figure, such as Claude's, reports the total of
+    /// the session whose factory UUID is `session`, so the run records the
+    /// increase over the total stored for it. A
     /// run that reports token counts instead, such as Codex's, is estimated from
     /// the price table for the model it ran: with a price row the estimate counts
     /// toward the job and project totals and is marked estimated, and with no row
     /// for the model, or no model at all, the run adds no cost and the log names
     /// the model. The token counts go to the log either way.
-    fn record_run_cost(&self, job_id: i64, model: Option<&str>, report: &RunReport) {
-        if let Some(usd) = report.cost_usd {
-            if let Err(err) = self.store.add_cost(job_id, usd, false) {
-                tracing::error!("job {job_id}: {err}");
+    fn record_run_cost(&self, job_id: i64, session: &str, model: Option<&str>, report: &RunReport) {
+        if let Some(total) = report.cost_usd {
+            match self.store.add_session_cost(job_id, session, total) {
+                Ok(usd) => {
+                    let mut text =
+                        format!("Agent run finished, {} at API prices", format_cost(usd));
+                    if format_cost(usd) != format_cost(total) {
+                        let _ = write!(text, ", {} for the session so far", format_cost(total));
+                    }
+                    text.push('.');
+                    self.note(job_id, &text);
+                }
+                Err(err) => tracing::error!("job {job_id}: {err}"),
             }
-            self.note(
-                job_id,
-                &format!("Agent run finished, {} at API prices.", format_cost(usd)),
-            );
             return;
         }
         let Some(usage) = report.token_usage else {
