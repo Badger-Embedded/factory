@@ -8,6 +8,7 @@
 mod agent;
 mod checks;
 mod claude;
+mod codex;
 mod files;
 mod git;
 mod github;
@@ -17,7 +18,7 @@ mod prompt;
 mod stream;
 mod worker;
 
-pub use agent::{AgentBackend, AgentItem, RunResult, backend};
+pub use agent::{AgentBackend, AgentItem, Credential, RunResult, TokenUsage, backend};
 pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
 pub use files::{PlacedFile, place_files, show_files};
@@ -27,7 +28,7 @@ pub use github::{
     observe, parse_status,
 };
 pub use images::{place_images, show_images};
-pub use outcome::{Expect, event_from_result};
+pub use outcome::{Expect, event_from_output, event_from_result, failed_event};
 pub use prompt::{job_prompt, prompt};
 pub use stream::{LogLine, McpServerStatus, ResultMessage, StreamItem, parse_line};
 pub use worker::{

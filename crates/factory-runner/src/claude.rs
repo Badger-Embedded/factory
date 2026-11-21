@@ -12,7 +12,7 @@ use std::path::Path;
 
 use factory_core::Agent;
 
-use crate::agent::{AgentBackend, AgentItem, RunResult};
+use crate::agent::{AgentBackend, AgentItem, Credential, RunResult};
 use crate::outcome::{Expect, event_from_result};
 use crate::stream::{StreamItem, parse_line};
 use crate::worker::{McpConfig, McpUnavailable, PLUGIN_DIR, SessionRun, WorkerConfig, WorkerRun};
@@ -33,8 +33,8 @@ const AGENT_SETTINGS: &str = r#"{"attribution":{"commit":"","pr":"","sessionUrl"
 pub struct ClaudeAgent;
 
 impl AgentBackend for ClaudeAgent {
-    fn credential_env(&self) -> &'static str {
-        "CLAUDE_CODE_OAUTH_TOKEN"
+    fn credential(&self) -> Credential {
+        Credential::Env("CLAUDE_CODE_OAUTH_TOKEN")
     }
 
     fn config_dir_env(&self) -> &'static str {

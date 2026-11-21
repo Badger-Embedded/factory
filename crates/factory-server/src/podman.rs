@@ -52,6 +52,8 @@ fn failed(reason: String) -> RunReport {
         session_id: None,
         cost_usd: None,
         mcp_unavailable: Vec::new(),
+        credential: None,
+        token_usage: None,
     }
 }
 

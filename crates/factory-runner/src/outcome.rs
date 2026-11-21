@@ -144,13 +144,61 @@ impl Expect {
             "additionalProperties": false
         })
     }
+
+    /// The schema Codex gets through `codex exec --output-schema`. The strict
+    /// structured output format lists every property in `required` and forbids
+    /// extra keys on every object, so a property a stage may leave out is made
+    /// nullable here and the outcome resolution reads a `null` as absent. The
+    /// outcomes and shapes are otherwise those of [`schema`](Self::schema);
+    /// Claude's `--json-schema` value does not change.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`schema`](Self::schema) does not return a JSON object with a
+    /// `properties` object, which it always does.
+    #[must_use]
+    pub fn strict_schema(self) -> Value {
+        let mut schema = self.schema();
+        let object = schema.as_object_mut().expect("the schema is a JSON object");
+        let keys: Vec<Value> = object["properties"]
+            .as_object()
+            .expect("the schema has properties")
+            .keys()
+            .map(|key| Value::from(key.clone()))
+            .collect();
+        object.insert("required".into(), Value::Array(keys));
+        for (name, property) in object["properties"]
+            .as_object_mut()
+            .expect("the schema has properties")
+        {
+            // `outcome` is always present, so it stays non-nullable; every other
+            // property a stage may leave out becomes nullable.
+            if name != "outcome" {
+                make_nullable(property);
+            }
+        }
+        schema
+    }
+}
+
+/// Adds `"null"` to a property's `type`, so a strict schema can require the
+/// property while still letting a stage leave it empty. Nested objects and
+/// array items keep their own `required` and `additionalProperties`, which the
+/// normal schema already sets strictly.
+fn make_nullable(property: &mut Value) {
+    if let Some(ty) = property.get_mut("type")
+        && let Some(name) = ty.as_str()
+    {
+        *ty = json!([name, "null"]);
+    }
 }
 
 #[derive(Deserialize)]
 struct Output {
     outcome: String,
-    #[serde(default)]
-    questions: Vec<String>,
+    // `Option` so a strict Codex schema's `null`, which it writes for a property
+    // the stage left out, reads the same as Claude omitting the key.
+    questions: Option<Vec<String>>,
     spec: Option<String>,
     plan: Option<Vec<PlanEntry>>,
     pull_request: Option<PrDescription>,
@@ -169,19 +217,49 @@ struct ReviewOutput {
     feedback: Option<String>,
 }
 
-/// Turns a run's final message into the event for the job. A review run
+/// The failure event for a run of `expect`. A review run fails closed as
+/// [`Event::ReviewFailed`], so the factory does not merge; every other run is
+/// [`Event::AgentFailed`]. Both the podman run loop and the Codex parser build
+/// their failures through this, so a review never resolves to an agent failure.
+#[must_use]
+pub fn failed_event(expect: Expect, reason: String) -> Event {
+    if expect == Expect::Review {
+        Event::ReviewFailed { reason }
+    } else {
+        Event::AgentFailed { reason }
+    }
+}
+
+/// Turns a Claude run's final message into the event for the job. A review run
 /// becomes a review verdict or, when it failed or returned no valid result,
 /// [`Event::ReviewFailed`], so the review fails closed. Every other run
 /// becomes an agent result or [`Event::AgentFailed`].
 #[must_use]
 pub fn event_from_result(expect: Expect, result: &ResultMessage) -> Event {
     if expect == Expect::Review {
-        return match review_result(result) {
+        if let Some(reason) = run_error(result, "reviewer run") {
+            return Event::ReviewFailed { reason };
+        }
+    } else if let Some(reason) = run_error(result, "agent run") {
+        return Event::AgentFailed { reason };
+    }
+    event_from_output(expect, result.structured_output.clone())
+}
+
+/// Turns the structured output an agent produced into the event for the job.
+/// Claude reads it from the `result` line's `structured_output`; Codex reads it
+/// from the text of its last `agent_message`. `None` is the run ending with no
+/// output. A review run becomes a verdict or [`Event::ReviewFailed`]; every
+/// other run an agent result or [`Event::AgentFailed`].
+#[must_use]
+pub fn event_from_output(expect: Expect, output: Option<Value>) -> Event {
+    if expect == Expect::Review {
+        return match review_output(output) {
             Ok(event) => event,
             Err(reason) => Event::ReviewFailed { reason },
         };
     }
-    match agent_result(expect, result) {
+    match agent_output(expect, output) {
         Ok(result) => Event::Agent(result),
         Err(reason) => Event::AgentFailed { reason },
     }
@@ -205,17 +283,11 @@ fn run_error(result: &ResultMessage, subject: &str) -> Option<String> {
     ))
 }
 
-/// Turns a review run's final message into its verdict event. A run that
-/// failed, or ended without a valid `approve`/`changes` result, is an error
-/// the caller turns into [`Event::ReviewFailed`].
-fn review_result(result: &ResultMessage) -> Result<Event, String> {
-    if let Some(reason) = run_error(result, "reviewer run") {
-        return Err(reason);
-    }
-    let output = result
-        .structured_output
-        .clone()
-        .ok_or("the reviewer run ended without structured output")?;
+/// Turns a review run's structured output into its verdict event. Output that
+/// is missing, or not a valid `approve`/`changes` result, is an error the
+/// caller turns into [`Event::ReviewFailed`].
+fn review_output(output: Option<Value>) -> Result<Event, String> {
+    let output = output.ok_or("the reviewer run ended without structured output")?;
     let output: ReviewOutput = serde_json::from_value(output)
         .map_err(|err| format!("the reviewer's structured output does not parse: {err}"))?;
     match output.outcome.as_str() {
@@ -230,25 +302,19 @@ fn review_result(result: &ResultMessage) -> Result<Event, String> {
     }
 }
 
-fn agent_result(expect: Expect, result: &ResultMessage) -> Result<AgentResult, String> {
-    if let Some(reason) = run_error(result, "agent run") {
-        return Err(reason);
-    }
-    let output = result
-        .structured_output
-        .clone()
-        .ok_or("the agent run ended without structured output")?;
+fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, String> {
+    let output = output.ok_or("the agent run ended without structured output")?;
     let output: Output = serde_json::from_value(output)
         .map_err(|err| format!("the agent's structured output does not parse: {err}"))?;
 
     match (expect, output.outcome.as_str()) {
         (_, "questions") => {
-            if output.questions.is_empty() {
+            let questions = output.questions.unwrap_or_default();
+            if questions.is_empty() {
                 return Err("the agent ended with questions but asked none".into());
             }
             Ok(AgentResult::Questions(
-                output
-                    .questions
+                questions
                     .into_iter()
                     .map(|text| Question { text })
                     .collect(),

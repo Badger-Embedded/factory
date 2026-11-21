@@ -1,0 +1,593 @@
+//! The Codex backend: its command line, its secrecy, its strict schema and its
+//! JSON Lines parser. The parser tests read fixtures captured in the shape of
+//! `codex exec --json` at the pinned `rust-v0.165.0`; see `codex_image.rs` for
+//! the image side.
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use factory_core::{Agent, AgentResult, Event};
+use factory_runner::{
+    AgentItem, Expect, LogLine, McpConfig, RunResult, SessionRun, TokenUsage, WorkerConfig,
+    WorkerRun, backend, run,
+};
+use serde_json::Value;
+
+const THREAD: &str = "019abd3c-1f2a-7bc4-9d6e-2a1b3c4d5e6f";
+/// A subscription `auth.json`, shaped like the one `codex login` writes. Only
+/// its bytes matter here: the backend never parses it.
+const AUTH: &str = r#"{"tokens":{"access_token":"at-1","refresh_token":"rt-1"},"last_refresh":"2026-11-20T00:00:00Z"}"#;
+
+fn codex_run(dir: &Path, session: SessionRun) -> WorkerRun {
+    WorkerRun {
+        name: "factory-job-7-run-1".into(),
+        agent: Agent::Codex,
+        workspace: dir.join("work"),
+        config_dir: dir.join("codex"),
+        session,
+        token: AUTH.into(),
+        expect: Expect::Spec,
+        prompt: "Write the spec.".into(),
+        model: None,
+        effort: None,
+        mcp: None,
+    }
+}
+
+fn strings(args: &[std::ffi::OsString]) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn value_after<'a>(args: &'a [String], flag: &str) -> &'a str {
+    let index = args.iter().position(|arg| arg == flag).unwrap();
+    &args[index + 1]
+}
+
+/// Every value passed after an `--env` flag.
+fn env_names(args: &[String]) -> Vec<&str> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == "--env")
+        .map(|(index, _)| args[index + 1].as_str())
+        .collect()
+}
+
+fn codex_args(run: &WorkerRun) -> Vec<String> {
+    strings(&factory_runner::podman_args(&WorkerConfig::default(), run))
+}
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+#[test]
+fn a_new_session_runs_codex_exec_with_the_schema_bypass_and_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = codex_args(&codex_run(dir.path(), SessionRun::Start(THREAD.into())));
+
+    // The agent invocation sits after the image.
+    let codex = args.iter().position(|arg| arg == "codex").unwrap();
+    assert_eq!(args[codex + 1], "exec");
+    assert!(!args.iter().any(|arg| arg == "resume"), "a new session");
+    assert!(args.iter().any(|arg| arg == "--json"));
+    assert!(
+        args.iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+        "the container is the sandbox"
+    );
+    assert_eq!(
+        value_after(&args, "--output-schema"),
+        "/codex/output-schema.json"
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg == "model_reasoning_effort=medium"),
+        "the default effort is passed as a config override: {args:?}"
+    );
+    // CODEX_HOME points Codex at the mounted config directory.
+    assert!(args.iter().any(|arg| arg == "CODEX_HOME=/codex"));
+    assert!(
+        args.iter()
+            .any(|arg| *arg == format!("{}/codex:/codex", dir.path().display())),
+        "the config directory is mounted at CODEX_HOME: {args:?}"
+    );
+    // The prompt is the last argument.
+    assert_eq!(args.last().unwrap(), "Write the spec.");
+}
+
+#[test]
+fn a_resumed_session_names_the_thread_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = codex_args(&codex_run(dir.path(), SessionRun::Resume(THREAD.into())));
+
+    let exec = args.iter().position(|arg| arg == "exec").unwrap();
+    assert_eq!(args[exec + 1], "resume");
+    assert_eq!(args[exec + 2], THREAD);
+    assert!(args.iter().any(|arg| arg == "--json"));
+}
+
+#[test]
+fn an_empty_model_passes_no_model_flag_and_a_set_one_is_passed() {
+    let dir = tempfile::tempdir().unwrap();
+    for model in [None, Some("")] {
+        let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+        run.model = model.map(str::to_owned);
+        let args = codex_args(&run);
+        assert!(!args.iter().any(|arg| arg == "--model"), "{args:?}");
+    }
+    let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+    run.model = Some("gpt-5.1-codex".into());
+    assert_eq!(value_after(&codex_args(&run), "--model"), "gpt-5.1-codex");
+}
+
+#[test]
+fn each_codex_effort_is_passed_as_a_config_override() {
+    let dir = tempfile::tempdir().unwrap();
+    for effort in Agent::Codex.efforts() {
+        let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+        run.effort = Some((*effort).to_owned());
+        let args = codex_args(&run);
+        assert!(
+            args.iter()
+                .any(|arg| *arg == format!("model_reasoning_effort={effort}")),
+            "{effort}: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = codex_run(dir.path(), SessionRun::Resume(THREAD.into()));
+    run.mcp = Some(McpConfig {
+        proxy_url: "http://factory:8081".into(),
+        token: "d34db33f-run-token".into(),
+        servers: vec!["context7".into(), "docs".into()],
+    });
+    let args = codex_args(&run);
+
+    // Each active server becomes a config override pointed at the proxy, and the
+    // token is named, not spelled out.
+    for server in ["context7", "docs"] {
+        assert!(
+            args.iter().any(|arg| *arg
+                == format!("mcp_servers.{server}.url=\"http://factory:8081/mcp/{server}\"")),
+            "missing url override for {server}: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| *arg
+                == format!("mcp_servers.{server}.bearer_token_env_var=\"FACTORY_MCP_TOKEN\"")),
+            "missing bearer env override for {server}: {args:?}"
+        );
+    }
+    // The run token reaches the container by name only.
+    assert!(env_names(&args).contains(&"FACTORY_MCP_TOKEN"));
+    assert!(
+        !args.iter().any(|arg| arg.contains("d34db33f-run-token")),
+        "the MCP run token must not appear in the arguments: {args:?}"
+    );
+    // The login is a file credential, so no part of it, and no credential
+    // `--env`, appears.
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("rt-1") || arg.contains("at-1")),
+        "no part of auth.json may appear in the arguments: {args:?}"
+    );
+    assert!(
+        !env_names(&args).contains(&"CODEX_ACCESS_TOKEN"),
+        "a subscription login passes no credential env"
+    );
+}
+
+#[test]
+fn a_run_with_no_active_server_passes_no_mcp_flags_or_token() {
+    let dir = tempfile::tempdir().unwrap();
+    for mcp in [None, Some(Vec::new())] {
+        let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+        run.mcp = mcp.map(|servers| McpConfig {
+            proxy_url: "http://factory:8081".into(),
+            token: "unused".into(),
+            servers,
+        });
+        let args = codex_args(&run);
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("mcp_servers.")),
+            "{args:?}"
+        );
+        assert!(!env_names(&args).contains(&"FACTORY_MCP_TOKEN"), "{args:?}");
+    }
+}
+
+#[test]
+fn a_claude_run_is_unchanged_by_the_codex_backend() {
+    // Claude keeps its environment credential and carries its MCP token in the
+    // config argument, not an env var, so the Codex change touches none of it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = WorkerRun {
+        name: "factory-job-7-run-1".into(),
+        agent: Agent::Claude,
+        workspace: dir.path().join("work"),
+        config_dir: dir.path().join("claude"),
+        session: SessionRun::Start(THREAD.into()),
+        token: "sk-ant-oat01-token".into(),
+        expect: Expect::Spec,
+        prompt: "Write the spec.".into(),
+        model: None,
+        effort: None,
+        mcp: Some(McpConfig {
+            proxy_url: "http://factory:8081".into(),
+            token: "run-token".into(),
+            servers: vec!["context7".into()],
+        }),
+    };
+    let args = strings(&factory_runner::podman_args(&WorkerConfig::default(), &run));
+
+    assert!(env_names(&args).contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+    assert!(
+        !env_names(&args).contains(&"FACTORY_MCP_TOKEN"),
+        "Claude's MCP token stays in the config argument"
+    );
+    let config: Value = serde_json::from_str(value_after(&args, "--mcp-config")).unwrap();
+    assert_eq!(
+        config["mcpServers"]["context7"]["headers"]["Authorization"],
+        "Bearer run-token"
+    );
+    run.mcp = None;
+    assert!(
+        strings(&factory_runner::podman_args(&WorkerConfig::default(), &run))
+            .iter()
+            .any(|arg| arg == "claude"),
+        "a Claude run still runs claude"
+    );
+}
+
+#[test]
+fn every_codex_schema_variant_is_strict() {
+    for expect in [
+        Expect::Clarify,
+        Expect::Spec,
+        Expect::Plan,
+        Expect::Commits,
+        Expect::FixCi,
+        Expect::Review,
+    ] {
+        let schema = expect.strict_schema();
+        assert_objects_strict(&schema, expect);
+    }
+}
+
+/// Every object in the schema lists each of its properties in `required` and
+/// forbids extra keys, as the strict structured output format demands.
+fn assert_objects_strict(value: &Value, expect: Expect) {
+    if value.get("type").and_then(type_has_object).unwrap_or(false) {
+        let properties = value["properties"].as_object().unwrap();
+        let required: Vec<&str> = value["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        for key in properties.keys() {
+            assert!(
+                required.contains(&key.as_str()),
+                "{expect:?}: {key} is not required"
+            );
+        }
+        assert_eq!(
+            value["additionalProperties"],
+            Value::Bool(false),
+            "{expect:?}: additionalProperties is not false"
+        );
+        for property in properties.values() {
+            assert_objects_strict(property, expect);
+        }
+    }
+    if let Some(items) = value.get("items") {
+        assert_objects_strict(items, expect);
+    }
+}
+
+/// Whether a `type` value, a string or an array of them, includes `"object"`.
+fn type_has_object(ty: &Value) -> Option<bool> {
+    match ty {
+        Value::String(name) => Some(name == "object"),
+        Value::Array(names) => Some(names.iter().any(|name| name == "object")),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_null_optional_field_resolves_the_same_as_an_absent_one() {
+    use factory_runner::event_from_output;
+    // Spec: a null spec is as empty as an absent one; a null questions list is
+    // as absent as none.
+    let null = event_from_output(
+        Expect::Spec,
+        Some(serde_json::json!({"outcome": "spec", "questions": null, "spec": null})),
+    );
+    let absent = event_from_output(Expect::Spec, Some(serde_json::json!({"outcome": "spec"})));
+    assert!(matches!(null, Event::AgentFailed { .. }));
+    assert_eq!(format!("{null:?}"), format!("{absent:?}"));
+
+    let null_questions = event_from_output(
+        Expect::Clarify,
+        Some(serde_json::json!({"outcome": "questions", "questions": null})),
+    );
+    assert!(matches!(null_questions, Event::AgentFailed { .. }));
+}
+
+#[test]
+fn the_parser_reads_a_spec_run_into_logs_a_thread_id_usage_and_a_result() {
+    let codex = backend(Agent::Codex).unwrap();
+    let text = fs::read_to_string(fixture("codex-spec-run.jsonl")).unwrap();
+    let items: Vec<AgentItem> = text
+        .lines()
+        .flat_map(|line| codex.parse(Expect::Spec, line))
+        .collect();
+
+    let logs: Vec<&LogLine> = items
+        .iter()
+        .filter_map(|item| match item {
+            AgentItem::Log(line) => Some(line),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        logs,
+        [
+            &LogLine::Tool {
+                name: "exec".into(),
+                summary: "rg -n reboot software".into(),
+            },
+            &LogLine::Tool {
+                name: "mcp__context7__get-library-docs".into(),
+                summary: String::new(),
+            },
+            &LogLine::Text(
+                r#"{"outcome":"spec","questions":null,"spec":"Goal: reboot the DUT from its page."}"#
+                    .into()
+            ),
+        ]
+    );
+
+    let session: Vec<&String> = items
+        .iter()
+        .filter_map(|item| match item {
+            AgentItem::Session(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(session, [&THREAD.to_owned()]);
+
+    let usage: Vec<&TokenUsage> = items
+        .iter()
+        .filter_map(|item| match item {
+            AgentItem::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage,
+        [&TokenUsage {
+            input_tokens: 1200,
+            cached_input_tokens: 400,
+            output_tokens: 350,
+            reasoning_output_tokens: 120,
+        }]
+    );
+
+    let result = items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            AgentItem::Result(result) => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        result,
+        &RunResult {
+            event: Event::Agent(AgentResult::Spec(
+                "Goal: reboot the DUT from its page.".into()
+            )),
+            session_id: None,
+            cost_usd: None,
+        }
+    );
+}
+
+#[test]
+fn the_parser_sums_usage_over_several_turns() {
+    let codex = backend(Agent::Codex).unwrap();
+    let turn = |input: i64| {
+        format!(
+            r#"{{"type":"turn.completed","usage":{{"input_tokens":{input},"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":1}}}}"#
+        )
+    };
+    let mut total = TokenUsage::default();
+    for line in [turn(100), turn(200)] {
+        for item in codex.parse(Expect::Commits, &line) {
+            if let AgentItem::Usage(usage) = item {
+                total = total.plus(usage);
+            }
+        }
+    }
+    assert_eq!(
+        total,
+        TokenUsage {
+            input_tokens: 300,
+            cached_input_tokens: 20,
+            output_tokens: 10,
+            reasoning_output_tokens: 2,
+        }
+    );
+}
+
+#[test]
+fn a_message_that_is_not_valid_json_fails_the_run() {
+    let codex = backend(Agent::Codex).unwrap();
+    let line = r#"{"type":"item.completed","item":{"id":"x","type":"agent_message","text":"Sorry, I could not do it."}}"#;
+    let result = codex
+        .parse(Expect::Spec, line)
+        .into_iter()
+        .find_map(|item| match item {
+            AgentItem::Result(result) => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    match result.event {
+        Event::AgentFailed { reason } => assert!(reason.contains("not valid JSON"), "{reason}"),
+        other => panic!("expected AgentFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_turn_failure_without_a_message_fails_the_run_and_a_review_fails_closed() {
+    let codex = backend(Agent::Codex).unwrap();
+    let text = fs::read_to_string(fixture("codex-exec-auth-failure.jsonl")).unwrap();
+
+    // Outside review, the fatal error becomes an agent failure carrying Codex's
+    // message, used because no agent message arrived.
+    let failure = |expect: Expect| {
+        text.lines()
+            .flat_map(|line| codex.parse(expect, line))
+            .filter_map(|item| match item {
+                AgentItem::Failure(event) => Some(event),
+                _ => None,
+            })
+            .last()
+            .unwrap()
+    };
+    match failure(Expect::Commits) {
+        Event::AgentFailed { reason } => assert!(reason.contains("401 Unauthorized"), "{reason}"),
+        other => panic!("expected AgentFailed, got {other:?}"),
+    }
+    // A review run fails closed with the same cause.
+    assert!(matches!(
+        failure(Expect::Review),
+        Event::ReviewFailed { .. }
+    ));
+}
+
+#[test]
+fn a_review_without_a_valid_verdict_fails_closed() {
+    let codex = backend(Agent::Codex).unwrap();
+    let text = fs::read_to_string(fixture("codex-review-no-verdict.jsonl")).unwrap();
+    let result = text
+        .lines()
+        .flat_map(|line| codex.parse(Expect::Review, line))
+        .filter_map(|item| match item {
+            AgentItem::Result(result) => Some(result),
+            _ => None,
+        })
+        .last()
+        .unwrap();
+    assert!(matches!(result.event, Event::ReviewFailed { .. }));
+}
+
+#[test]
+fn a_session_resumes_once_codex_wrote_its_rollout_file() {
+    let codex = backend(Agent::Codex).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        codex.session_for(dir.path(), THREAD),
+        SessionRun::Start(THREAD.into())
+    );
+
+    // Codex nests rollout files under a dated path inside `sessions`.
+    let day = dir.path().join("sessions/2026/11/21");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(day.join("another-thread.jsonl"), "").unwrap();
+    assert_eq!(
+        codex.session_for(dir.path(), THREAD),
+        SessionRun::Start(THREAD.into())
+    );
+
+    fs::write(day.join(format!("{THREAD}.jsonl")), "").unwrap();
+    assert_eq!(
+        codex.session_for(dir.path(), THREAD),
+        SessionRun::Resume(THREAD.into())
+    );
+}
+
+/// A podman stand-in that records its arguments, prints the fixture at `stdout`,
+/// and rewrites the mounted `auth.json` with `refreshed`, simulating Codex
+/// refreshing its login mid-run.
+fn fake_podman(dir: &Path, stdout: &Path, refreshed: &str) -> PathBuf {
+    let script = dir.join("podman");
+    let args = dir.join("args");
+    let auth = dir.join("codex").join("auth.json");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}'\nprintf '%s' '{refreshed}' > '{}'\nexit 0\n",
+            args.display(),
+            stdout.display(),
+            auth.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[tokio::test]
+async fn a_run_reports_the_thread_id_usage_and_reads_the_refreshed_login_back() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("codex")).unwrap();
+    fs::write(dir.path().join("codex/auth.json"), AUTH).unwrap();
+    let refreshed = r#"{"tokens":{"access_token":"at-2","refresh_token":"rt-2"},"last_refresh":"2026-11-28T00:00:00Z"}"#;
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &fixture("codex-spec-run.jsonl"), refreshed),
+        ..WorkerConfig::default()
+    };
+
+    let mut log = Vec::new();
+    let report = run(
+        &config,
+        &codex_run(dir.path(), SessionRun::Start(THREAD.into())),
+        |line| log.push(line),
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(
+        report.event,
+        Event::Agent(AgentResult::Spec(
+            "Goal: reboot the DUT from its page.".into()
+        ))
+    );
+    // Codex's final message carries no session id, so the thread id from
+    // thread.started fills it in.
+    assert_eq!(report.session_id.as_deref(), Some(THREAD));
+    // Codex reports no dollar cost; the summed usage lets the executor estimate.
+    assert_eq!(report.cost_usd, None);
+    assert_eq!(
+        report.token_usage,
+        Some(TokenUsage {
+            input_tokens: 1200,
+            cached_input_tokens: 400,
+            output_tokens: 350,
+            reasoning_output_tokens: 120,
+        })
+    );
+    // The login the worker refreshed is read back for the executor to keep.
+    assert_eq!(report.credential.as_deref(), Some(refreshed));
+
+    // The backend wrote its config and schema into the config directory before
+    // the run.
+    let config_toml = fs::read_to_string(dir.path().join("codex/config.toml")).unwrap();
+    assert!(config_toml.contains("cli_auth_credentials_store = \"file\""));
+    assert!(!config_toml.contains("project_doc_fallback_filenames"));
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join("codex/output-schema.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(schema, Expect::Spec.strict_schema());
+}

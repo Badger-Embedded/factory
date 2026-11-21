@@ -136,8 +136,13 @@ impl AgentEntry<'_> {
 
     /// The config directory's name under the job directory on the host, where
     /// the agent's session files live, or `None` for an agent that cannot run.
+    /// Codex has a backend now, so this gates on [`available`](Self::available)
+    /// to stay `None` until the agent is wired to run.
     #[must_use]
     pub fn host_config_dir(&self) -> Option<&'static str> {
+        if !self.available() {
+            return None;
+        }
         backend(self.agent).map(factory_runner::AgentBackend::host_config_dir)
     }
 

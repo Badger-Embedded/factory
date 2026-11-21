@@ -15,17 +15,36 @@ use std::path::Path;
 use factory_core::{Agent, Event, PlanUsage};
 
 use crate::claude::ClaudeAgent;
+use crate::codex::CodexAgent;
 use crate::outcome::Expect;
 use crate::stream::LogLine;
 use crate::worker::{McpUnavailable, SessionRun, WorkerConfig, WorkerRun};
 
+/// How a backend takes its subscription credential. Claude reads a token from
+/// an environment variable; Codex reads its `auth.json` from a file in its
+/// config directory, which it rewrites when it refreshes the tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// The agent reads the credential from this environment variable.
+    /// [`run`](crate::worker::run) sets it in podman's own process environment
+    /// from the run's token and [`podman_args`](crate::worker::podman_args)
+    /// passes `--env <name>` with no value, so the secret stays out of the
+    /// arguments and the log.
+    Env(&'static str),
+    /// The agent reads the credential from this file in its config directory.
+    /// The executor writes it before the run; [`run`](crate::worker::run) reads
+    /// it back into the run report afterwards, so the executor can keep a login
+    /// the agent refreshed. No `--env` passes it, because the mounted config
+    /// directory carries it.
+    File(&'static str),
+}
+
 /// What everything agent-specific hides behind, so the worker names no one
 /// agent. The Claude implementation is [`ClaudeAgent`].
 pub trait AgentBackend: Sync {
-    /// The credential environment variable, passed to the container as `--env
-    /// NAME` with no value and set by [`run`](crate::worker::run) in the podman
-    /// process environment, so the secret never enters the arguments.
-    fn credential_env(&self) -> &'static str;
+    /// How the backend takes its credential: an environment variable for Claude,
+    /// a file in the config directory for Codex.
+    fn credential(&self) -> Credential;
 
     /// The environment variable that points the agent at its config directory
     /// inside the worker.
@@ -43,6 +62,27 @@ pub trait AgentBackend: Sync {
     /// mounts. A session that left no transcript starts again under the same id,
     /// so a run that died before the agent wrote anything begins afresh.
     fn session_for(&self, host_config_dir: &Path, id: &str) -> SessionRun;
+
+    /// Writes any files the run needs into its config directory before the
+    /// worker starts, such as Codex's `config.toml` and output schema. Claude
+    /// needs none, so the default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a file cannot be written.
+    fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
+        let _ = run;
+        Ok(())
+    }
+
+    /// Secret values the run passes into the container through podman's process
+    /// environment, named by `--env <name>` with no value so they stay out of
+    /// the arguments and the log. Codex passes its MCP run token here; Claude
+    /// puts its MCP token in the config argument instead and returns none.
+    fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
+        let _ = run;
+        Vec::new()
+    }
 
     /// The command and its arguments after the image: the whole agent
     /// invocation the worker runs.
@@ -65,8 +105,43 @@ pub enum AgentItem {
     /// The plan usage the agent reported for the account its credential
     /// belongs to.
     PlanUsage(PlanUsage),
-    /// The run's final result.
+    /// The session id the agent chose for itself, such as Codex's thread id,
+    /// which the factory resumes with. Claude never emits this, because it runs
+    /// under the factory's own UUID.
+    Session(String),
+    /// The token usage of one completed turn, which the run sums over every
+    /// turn. Codex reports this; Claude reports a cost instead.
+    Usage(TokenUsage),
+    /// The run's final result, resolved from the agent's structured output.
     Result(RunResult),
+    /// The agent failed a turn or hit a fatal stream error without a final
+    /// result. The run uses this only when no [`Result`](AgentItem::Result)
+    /// arrived, so a final message still wins, matching the spec.
+    Failure(Event),
+}
+
+/// The token counts of a Codex run, summed over its `turn.completed` lines. The
+/// executor turns these into an estimated cost from a price table. Claude
+/// reports a dollar cost instead and produces none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
+
+impl TokenUsage {
+    /// This run's totals plus one more turn's.
+    #[must_use]
+    pub fn plus(self, turn: TokenUsage) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.input_tokens + turn.input_tokens,
+            cached_input_tokens: self.cached_input_tokens + turn.cached_input_tokens,
+            output_tokens: self.output_tokens + turn.output_tokens,
+            reasoning_output_tokens: self.reasoning_output_tokens + turn.reasoning_output_tokens,
+        }
+    }
 }
 
 /// An agent run's final result, read from its last stdout line.
@@ -80,12 +155,13 @@ pub struct RunResult {
     pub cost_usd: Option<f64>,
 }
 
-/// The backend for `agent`, or `None` when no runner implements it yet. Only
-/// Claude runs today; Codex stands in the registry without a backend.
+/// The backend for `agent`. Both agents now have one: [`ClaudeAgent`] and
+/// [`CodexAgent`]. It returns [`Option`] so a future agent registered before
+/// its backend lands can report `None`.
 #[must_use]
 pub fn backend(agent: Agent) -> Option<&'static dyn AgentBackend> {
     match agent {
         Agent::Claude => Some(&ClaudeAgent),
-        Agent::Codex => None,
+        Agent::Codex => Some(&CodexAgent),
     }
 }
