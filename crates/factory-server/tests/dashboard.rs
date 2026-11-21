@@ -701,8 +701,8 @@ async fn a_cancelled_job_offers_no_cancel_button() {
 async fn the_job_page_shows_the_cost_summed_over_runs() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    dashboard.store.add_cost(id, 0.5).unwrap();
-    dashboard.store.add_cost(id, 0.75).unwrap();
+    dashboard.store.add_cost(id, 0.5, false).unwrap();
+    dashboard.store.add_cost(id, 0.75, false).unwrap();
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(
@@ -714,6 +714,19 @@ async fn the_job_page_shows_the_cost_summed_over_runs() {
     // Without JavaScript it reads the stored UTC time, labelled UTC.
     assert!(page.body.contains("data-format=\"datetime\""));
     assert!(page.body.contains("UTC</time></p>"));
+}
+
+#[tokio::test]
+async fn the_cost_pill_marks_a_total_that_includes_an_estimate() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 0.5, false).unwrap();
+    dashboard.store.add_cost(id, 0.25, true).unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    // The pill carries a ≈ and a title that names the Codex estimate.
+    assert!(page.body.contains("≈ $0.75"));
+    assert!(page.body.contains("Includes an estimate for Codex runs."));
 }
 
 /// The job header wraps a known `created_at` in a `<time>` element whose
@@ -804,7 +817,7 @@ async fn mcp_tool_call_rows_do_not_change_the_timeline() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     dashboard.apply(id, Event::Start);
-    dashboard.store.add_cost(id, 1.5).unwrap();
+    dashboard.store.add_cost(id, 1.5, false).unwrap();
 
     // The timeline region, from its id to the end of the side column.
     let timeline = |body: &str| {
@@ -1040,7 +1053,7 @@ async fn a_job_without_cost_shows_a_dash() {
 async fn a_cancelled_job_still_shows_its_cost() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    dashboard.store.add_cost(id, 2.0).unwrap();
+    dashboard.store.add_cost(id, 2.0, false).unwrap();
     dashboard.post(&format!("/jobs/{id}/cancel"), "").await;
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
@@ -3968,8 +3981,8 @@ async fn the_stats_strip_shows_the_stored_totals() {
     dashboard.new_job().await;
     merge(&dashboard, first);
     merge(&dashboard, second);
-    dashboard.store.add_cost(first, 1.0).unwrap();
-    dashboard.store.add_cost(second, 2.5).unwrap();
+    dashboard.store.add_cost(first, 1.0, false).unwrap();
+    dashboard.store.add_cost(second, 2.5, false).unwrap();
 
     let body = dashboard.get("/").await.body;
     assert!(body.contains(&tile("$3.50", "Total API cost")));
@@ -3995,7 +4008,7 @@ async fn the_stats_strip_shows_dashes_for_a_project_without_jobs() {
 async fn jobs_without_a_merge_show_dashes_for_the_ratios() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    dashboard.store.add_cost(id, 2.0).unwrap();
+    dashboard.store.add_cost(id, 2.0, false).unwrap();
 
     let body = dashboard.get("/").await.body;
     assert!(body.contains(&tile("$2.00", "Total API cost")));
@@ -4021,8 +4034,8 @@ async fn the_stats_strip_follows_the_selected_project() {
 async fn a_board_card_shows_the_job_cost() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    dashboard.store.add_cost(id, 0.5).unwrap();
-    dashboard.store.add_cost(id, 0.75).unwrap();
+    dashboard.store.add_cost(id, 0.5, false).unwrap();
+    dashboard.store.add_cost(id, 0.75, false).unwrap();
 
     let index = dashboard.get("/").await;
     assert!(index.body.contains("<span class=\"cost\">$1.25</span>"));
@@ -4051,7 +4064,7 @@ async fn the_approve_button_on_a_card_still_posts() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     to_spec_approval(&dashboard, id);
-    dashboard.store.add_cost(id, 1.0).unwrap();
+    dashboard.store.add_cost(id, 1.0, false).unwrap();
 
     let index = dashboard.get("/").await;
     assert!(index.body.contains("<span class=\"cost\">$1.00</span>"));
@@ -5224,7 +5237,7 @@ async fn each_planned_pull_request_has_its_own_group() {
         ])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.store.add_cost(id, 1.25).unwrap();
+    dashboard.store.add_cost(id, 1.25, false).unwrap();
     dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 81 });

@@ -384,6 +384,14 @@ select:focus, textarea:focus, button:focus-visible { outline: var(--focus-ring);
 .mcp-header-row > .grow { flex: 1 1 auto; }
 .mcp-headers + .add-header { margin-bottom: var(--space-6); }
 
+.codex-prices { display: flex; flex-direction: column; gap: var(--space-12); margin-bottom: var(--space-16); }
+.price-row, .price-add { display: flex; flex-wrap: wrap; gap: var(--space-12); align-items: flex-end; }
+.price-row > .field, .price-add > .field { margin-bottom: 0; }
+.price-row input[type="number"], .price-add input[type="number"] { width: 7rem; }
+.price-model { align-self: center; min-width: 9rem; }
+.price-actions { display: flex; gap: var(--space-8); align-items: flex-end; }
+.price-add { border-top: 1px solid var(--border); padding-top: var(--space-16); margin-top: var(--space-8); }
+
 button {
   font: inherit;
   font-weight: var(--weight-semibold);

@@ -169,6 +169,7 @@ impl McpChecker for NoChecker {
 
 struct Harness {
     router: Router,
+    store: Arc<Store>,
     secrets: Arc<dyn SecretStore>,
     spawner: Arc<FakeSpawner>,
     _data: tempfile::TempDir,
@@ -228,6 +229,7 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
     );
     Harness {
         router,
+        store: Arc::clone(store),
         secrets,
         spawner,
         _data: data,
@@ -496,6 +498,93 @@ async fn a_login_that_never_finishes_times_out() {
     let failed = harness.poll_fragment("did not finish").await;
     assert!(failed.contains("fifteen minutes"));
     assert!(harness.secrets.codex_auth().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_price_table_starts_empty() {
+    let harness = harness();
+    let page = harness.get("/settings/agents/codex").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Model prices"));
+    assert!(page.body.contains("No model prices are set"));
+    assert_eq!(harness.store.codex_prices().unwrap(), []);
+}
+
+#[tokio::test]
+async fn a_price_is_added_edited_and_deleted() {
+    let harness = harness();
+
+    // Add a model price.
+    let add = harness
+        .post(
+            "/settings/agents/codex/prices",
+            "model=gpt-6.1-sol&input=1.25&cached_input=0.125&output=10",
+        )
+        .await;
+    assert_eq!(add.status, StatusCode::OK);
+    assert!(add.body.contains("Saved."));
+    assert!(add.body.contains("gpt-6.1-sol"));
+    let stored = harness.store.codex_price("gpt-6.1-sol").unwrap().unwrap();
+    assert!((stored.input_usd_per_mtok - 1.25).abs() < 1e-9);
+    assert!((stored.cached_input_usd_per_mtok - 0.125).abs() < 1e-9);
+    assert!((stored.output_usd_per_mtok - 10.0).abs() < 1e-9);
+
+    // Saving the same model again edits the row rather than adding a second.
+    let edit = harness
+        .post(
+            "/settings/agents/codex/prices",
+            "model=gpt-6.1-sol&input=2&cached_input=0.2&output=12",
+        )
+        .await;
+    assert_eq!(edit.status, StatusCode::OK);
+    assert_eq!(harness.store.codex_prices().unwrap().len(), 1);
+    let edited = harness.store.codex_price("gpt-6.1-sol").unwrap().unwrap();
+    assert!((edited.input_usd_per_mtok - 2.0).abs() < 1e-9);
+
+    // Delete it.
+    let delete = harness
+        .post("/settings/agents/codex/prices/delete", "model=gpt-6.1-sol")
+        .await;
+    assert_eq!(delete.status, StatusCode::OK);
+    assert!(delete.body.contains("Deleted."));
+    assert!(harness.store.codex_price("gpt-6.1-sol").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_invalid_price_is_refused_and_stores_nothing() {
+    let harness = harness();
+
+    // A blank model is refused.
+    let blank = harness
+        .post(
+            "/settings/agents/codex/prices",
+            "model=&input=1&cached_input=1&output=1",
+        )
+        .await;
+    assert_eq!(blank.status, StatusCode::OK);
+    assert!(blank.body.contains("must not be empty"));
+
+    // A non-numeric price is refused and names the field.
+    let bad = harness
+        .post(
+            "/settings/agents/codex/prices",
+            "model=gpt-6.1-sol&input=cheap&cached_input=1&output=1",
+        )
+        .await;
+    assert_eq!(bad.status, StatusCode::OK);
+    assert!(bad.body.contains("input price"));
+    assert_eq!(harness.store.codex_prices().unwrap(), []);
+
+    // A negative price is refused too.
+    let negative = harness
+        .post(
+            "/settings/agents/codex/prices",
+            "model=gpt-6.1-sol&input=1&cached_input=1&output=-1",
+        )
+        .await;
+    assert_eq!(negative.status, StatusCode::OK);
+    assert!(negative.body.contains("output price"));
+    assert_eq!(harness.store.codex_prices().unwrap(), []);
 }
 
 /// Percent-encodes a form value the way the browser posts the paste field.

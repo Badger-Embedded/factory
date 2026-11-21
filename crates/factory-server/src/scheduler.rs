@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::cost::format_cost;
+use crate::cost::{codex_cost, format_cost};
 use crate::mcp::McpServer;
 use crate::projects::{Project, Projects, StageAgents};
 use crate::proxy::RunTokens;
@@ -973,6 +973,9 @@ impl<E: Executor> Scheduler<E> {
                 tracing::error!("job {job_id}: {err}");
             }
         });
+        // The model the run passed, kept before the request moves into the run,
+        // so a Codex run can look up its price by it afterwards.
+        let model = request.model.clone();
         let report = self
             .executor
             .run_agent(settings, request, sink, session)
@@ -985,16 +988,72 @@ impl<E: Executor> Scheduler<E> {
                 .warnings
                 .record(job_id, &unavailable.server, &unavailable.reason);
         }
-        if let Some(usd) = report.cost_usd
-            && let Err(err) = self.store.add_cost(job_id, usd)
-        {
-            tracing::error!("job {job_id}: {err}");
-        }
-        let cost = report.cost_usd.map_or(String::new(), |usd| {
-            format!(", {} at API prices", format_cost(usd))
-        });
-        self.note(job_id, &format!("Agent run finished{cost}."));
+        self.record_run_cost(job_id, model.as_deref(), &report);
         self.apply(job_id, report.event);
+    }
+
+    /// Records the cost of a finished agent run and notes it on the job log. A
+    /// run that reports a dollar figure, such as Claude's, records it as it is. A
+    /// run that reports token counts instead, such as Codex's, is estimated from
+    /// the price table for the model it ran: with a price row the estimate counts
+    /// toward the job and project totals and is marked estimated, and with no row
+    /// for the model, or no model at all, the run adds no cost and the log names
+    /// the model. The token counts go to the log either way.
+    fn record_run_cost(&self, job_id: i64, model: Option<&str>, report: &RunReport) {
+        if let Some(usd) = report.cost_usd {
+            if let Err(err) = self.store.add_cost(job_id, usd, false) {
+                tracing::error!("job {job_id}: {err}");
+            }
+            self.note(
+                job_id,
+                &format!("Agent run finished, {} at API prices.", format_cost(usd)),
+            );
+            return;
+        }
+        let Some(usage) = report.token_usage else {
+            self.note(job_id, "Agent run finished.");
+            return;
+        };
+        let tokens = format!(
+            "{} input tokens ({} cached), {} output tokens",
+            usage.input_tokens, usage.cached_input_tokens, usage.output_tokens
+        );
+        let price = model.and_then(|model| match self.store.codex_price(model) {
+            Ok(price) => price,
+            Err(err) => {
+                tracing::error!("job {job_id}: reading the Codex price failed: {err}");
+                None
+            }
+        });
+        match (model, price) {
+            (Some(model), Some(price)) => {
+                let usd = codex_cost(usage, &price);
+                if let Err(err) = self.store.add_cost(job_id, usd, true) {
+                    tracing::error!("job {job_id}: {err}");
+                }
+                self.note(
+                    job_id,
+                    &format!(
+                        "Codex run finished, an estimated {} from the {model} price. {tokens}.",
+                        format_cost(usd)
+                    ),
+                );
+            }
+            (Some(model), None) => self.note(
+                job_id,
+                &format!(
+                    "Codex run finished. No price is set for the model {model}, \
+                     so no cost was added. {tokens}."
+                ),
+            ),
+            (None, _) => self.note(
+                job_id,
+                &format!(
+                    "Codex run finished. The run passed no model, so no price is set \
+                     and no cost was added. {tokens}."
+                ),
+            ),
+        }
     }
 
     async fn watch(&self, settings: &Settings, pr: usize, request: WatchRequest) {
