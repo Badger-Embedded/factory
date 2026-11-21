@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             store.apply(id, event)?;
         }
         if usd > 0.0 {
-            store.add_cost(id, usd)?;
+            store.add_cost(id, usd, false)?;
         }
     }
     println!("seeded {}", db.display());

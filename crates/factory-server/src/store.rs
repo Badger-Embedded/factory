@@ -114,7 +114,14 @@ CREATE TABLE IF NOT EXISTS job_events (
     pr INTEGER,
     turn TEXT NOT NULL,
     detail TEXT,
-    usd REAL
+    usd REAL,
+    estimated INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS codex_prices (
+    model TEXT PRIMARY KEY,
+    input_usd_per_mtok REAL NOT NULL,
+    cached_input_usd_per_mtok REAL NOT NULL,
+    output_usd_per_mtok REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS job_events_by_job ON job_events (job_id, id);
 CREATE TABLE IF NOT EXISTS pr_watermarks (
@@ -203,6 +210,10 @@ pub struct JobEvent {
     pub detail: Option<String>,
     /// The cost of an agent run, on `cost` entries.
     pub usd: Option<f64>,
+    /// Whether this `cost` entry is an estimate the factory computed, such as a
+    /// Codex run's cost from the price table, rather than a figure the agent
+    /// reported. Always false on other entries.
+    pub estimated: bool,
 }
 
 /// What a project has used since the totals were introduced. Deleting a job
@@ -214,6 +225,22 @@ pub struct ProjectTotals {
     pub jobs_created: i64,
     /// Jobs that reached `Merged`. A job with several pull requests counts once.
     pub jobs_merged: i64,
+}
+
+/// One model's Codex prices, in USD per million tokens. The factory estimates a
+/// Codex run's cost from the row for the model it ran, since Codex reports token
+/// counts and no dollar figure. An operator keeps the table on the Codex
+/// settings page, so a price change needs no code change or deploy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexPrice {
+    /// The model id the run passes, such as `gpt-6.1-sol`.
+    pub model: String,
+    /// USD per million uncached input tokens.
+    pub input_usd_per_mtok: f64,
+    /// USD per million cached input tokens.
+    pub cached_input_usd_per_mtok: f64,
+    /// USD per million output tokens.
+    pub output_usd_per_mtok: f64,
 }
 
 /// The jobs, kept in SQLite. Each job is stored as JSON in one row.
@@ -357,6 +384,24 @@ impl Store {
         )?;
         if has_agent_session == 0 {
             conn.execute("ALTER TABLE sessions ADD COLUMN agent_session TEXT", [])?;
+        }
+        // `estimated` marks a cost row the factory estimated rather than read
+        // from the agent, such as a Codex run's cost from the price table, so the
+        // job page can flag a total that includes an estimate. It joined
+        // `job_events` after the table shipped, so add it to one that predates it.
+        // A fresh database already has the column from SCHEMA. The default is 0,
+        // so every earlier row, all of them reported costs, reads as not
+        // estimated.
+        let has_estimated: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('job_events') WHERE name = 'estimated'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_estimated == 0 {
+            conn.execute(
+                "ALTER TABLE job_events ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         Ok(Store {
             conn: Mutex::new(conn),
@@ -727,17 +772,21 @@ impl Store {
     }
 
     /// Adds `usd` to the running API cost of job `id` and to the totals of
-    /// its project.
+    /// its project. `estimated` marks the `cost` row as a figure the factory
+    /// estimated, such as a Codex run's cost from the price table, rather than
+    /// one the agent reported, so the job page can flag a total that includes an
+    /// estimate. The amount counts the same in both the job total and the
+    /// project totals.
     ///
     /// # Errors
     ///
     /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on
     /// a database error.
-    pub fn add_cost(&self, id: i64, usd: f64) -> Result<(), StoreError> {
+    pub fn add_cost(&self, id: i64, usd: f64, estimated: bool) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let row = Self::load(&tx, id)?;
-        Self::record(&tx, id, "cost", &row.job, None, Some(usd))?;
+        Self::record_cost(&tx, id, "cost", &row.job, None, Some(usd), estimated)?;
         tx.execute(
             "INSERT INTO job_costs (job_id, usd) VALUES (?1, ?2)
              ON CONFLICT (job_id) DO UPDATE SET usd = usd + excluded.usd",
@@ -872,10 +921,25 @@ impl Store {
         detail: Option<&str>,
         usd: Option<f64>,
     ) -> Result<(), StoreError> {
+        Self::record_cost(tx, id, event, job, detail, usd, false)
+    }
+
+    /// The general form of [`Self::record`] that also sets the `estimated` flag,
+    /// used for a `cost` row the factory estimated rather than read from the
+    /// agent. Every other caller records a figure that is not an estimate.
+    fn record_cost(
+        tx: &Transaction<'_>,
+        id: i64,
+        event: &str,
+        job: &Job,
+        detail: Option<&str>,
+        usd: Option<f64>,
+        estimated: bool,
+    ) -> Result<(), StoreError> {
         let stage = job.stage();
         tx.execute(
-            "INSERT INTO job_events (job_id, event, stage, pr, turn, detail, usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO job_events (job_id, event, stage, pr, turn, detail, usd, estimated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 event,
@@ -883,7 +947,8 @@ impl Store {
                 stage.pr().map(|pr| i64::try_from(pr).unwrap_or(i64::MAX)),
                 job.turn().name(),
                 detail,
-                usd
+                usd,
+                estimated
             ],
         )?;
         Ok(())
@@ -898,7 +963,7 @@ impl Store {
     pub fn events(&self, id: i64) -> Result<Vec<JobEvent>, StoreError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT at, event, stage, pr, turn, detail, usd FROM job_events
+            "SELECT at, event, stage, pr, turn, detail, usd, estimated FROM job_events
              WHERE job_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([id], |row| {
@@ -907,6 +972,7 @@ impl Store {
                 at: row.get(0)?,
                 event: row.get(1)?,
                 stage: row.get(2)?,
+                estimated: row.get(7)?,
                 pr: pr.and_then(|pr| usize::try_from(pr).ok()),
                 turn: row.get(4)?,
                 detail: row.get(5)?,
@@ -973,6 +1039,112 @@ impl Store {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
         Ok(costs)
+    }
+
+    /// Whether any of job `id`'s cost rows is an estimate, such as a Codex run's
+    /// cost from the price table. The job page shows a `≈` on the total when so.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn has_estimated_cost(&self, id: i64) -> Result<bool, StoreError> {
+        let found: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM job_events
+                 WHERE job_id = ?1 AND event = 'cost' AND estimated = 1 LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Every Codex price row, by model id. The table starts empty, so a fresh
+    /// install reads none.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn codex_prices(&self) -> Result<Vec<CodexPrice>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT model, input_usd_per_mtok, cached_input_usd_per_mtok, output_usd_per_mtok
+             FROM codex_prices ORDER BY model",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CodexPrice {
+                model: row.get(0)?,
+                input_usd_per_mtok: row.get(1)?,
+                cached_input_usd_per_mtok: row.get(2)?,
+                output_usd_per_mtok: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The Codex price for `model`, or `None` when the table has no row for it.
+    /// The executor reads it to estimate a run's cost; with no row the run adds
+    /// no cost.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn codex_price(&self, model: &str) -> Result<Option<CodexPrice>, StoreError> {
+        let price = self
+            .conn()
+            .query_row(
+                "SELECT model, input_usd_per_mtok, cached_input_usd_per_mtok, output_usd_per_mtok
+                 FROM codex_prices WHERE model = ?1",
+                [model],
+                |row| {
+                    Ok(CodexPrice {
+                        model: row.get(0)?,
+                        input_usd_per_mtok: row.get(1)?,
+                        cached_input_usd_per_mtok: row.get(2)?,
+                        output_usd_per_mtok: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(price)
+    }
+
+    /// Adds `price` or replaces the row for its model, so a save on the settings
+    /// page both adds a new model and edits an existing one. The next Codex run
+    /// reads the price afresh, so a change applies with no restart.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_codex_price(&self, price: &CodexPrice) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO codex_prices
+                 (model, input_usd_per_mtok, cached_input_usd_per_mtok, output_usd_per_mtok)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (model) DO UPDATE SET
+                 input_usd_per_mtok = excluded.input_usd_per_mtok,
+                 cached_input_usd_per_mtok = excluded.cached_input_usd_per_mtok,
+                 output_usd_per_mtok = excluded.output_usd_per_mtok",
+            params![
+                price.model,
+                price.input_usd_per_mtok,
+                price.cached_input_usd_per_mtok,
+                price.output_usd_per_mtok
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the Codex price for `model`. A model with no row is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn delete_codex_price(&self, model: &str) -> Result<(), StoreError> {
+        self.conn()
+            .execute("DELETE FROM codex_prices WHERE model = ?1", [model])?;
+        Ok(())
     }
 
     /// The image file names saved for job `id`, in upload order.

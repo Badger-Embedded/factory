@@ -14,7 +14,7 @@ use crate::mcp::{McpServer, McpStages, McpToolState};
 use crate::projects::Project;
 use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
-use crate::store::{JobEvent, JobFile, JobRow, LogEntry, ProjectTotals};
+use crate::store::{CodexPrice, JobEvent, JobFile, JobRow, LogEntry, ProjectTotals};
 use crate::timeline::timeline;
 use crate::workers::Slot;
 
@@ -771,6 +771,7 @@ pub fn settings_codex(
     nav: &SettingsNav,
     account: &CodexAccount,
     login: &crate::device_login::LoginView,
+    prices: &[CodexPrice],
     secrets_available: bool,
     notice: Option<&str>,
 ) -> Markup {
@@ -785,9 +786,103 @@ pub fn settings_codex(
             (codex_account_card(account))
             (codex_login_card(login, secrets_available))
             (codex_auth_card(account.stored, secrets_available))
+            (codex_prices_card(prices))
         },
     )
 }
+
+/// The Codex price table: one row per model with its USD-per-million-token input,
+/// cached input and output prices, each editable, plus a form to add a model.
+/// The factory estimates a Codex run's cost from the row for the model it ran,
+/// so a price change here needs no code change or deploy. The table starts empty,
+/// and a run on a model with no row adds no cost.
+fn codex_prices_card(prices: &[CodexPrice]) -> Markup {
+    html! {
+        div.card {
+            h2 { "Model prices" }
+            p.hint {
+                "Prices in USD per million tokens. The factory estimates a Codex run's cost from \
+                 the row for the model it ran, since Codex reports token counts and no dollar \
+                 figure. A change applies to runs after it, with no restart. A run on a model with \
+                 no row here adds no cost."
+            }
+            @if prices.is_empty() {
+                p.meta { "No model prices are set." }
+            } @else {
+                div.codex-prices {
+                    @for price in prices {
+                        (codex_price_row(price))
+                    }
+                }
+            }
+            (codex_price_add())
+        }
+    }
+}
+
+/// The three price fields for a model, shared by the edit rows and the add form.
+/// `values` prefills the inputs when editing an existing row.
+fn codex_price_fields(values: Option<&CodexPrice>) -> Markup {
+    let field = |name: &str, label: &str, value: Option<f64>| {
+        html! {
+            div.field {
+                label { (label) }
+                input type="number" step="any" min="0" required
+                    name=(name) value=[value] {}
+            }
+        }
+    };
+    html! {
+        (field("input", "Input", values.map(|price| price.input_usd_per_mtok)))
+        (field("cached_input", "Cached input", values.map(|price| price.cached_input_usd_per_mtok)))
+        (field("output", "Output", values.map(|price| price.output_usd_per_mtok)))
+    }
+}
+
+/// One model's row in the price table: its id, the three editable prices, and
+/// Save and Delete buttons. Save upserts the row; Delete removes it.
+fn codex_price_row(price: &CodexPrice) -> Markup {
+    html! {
+        form.price-row method="post" action="/settings/agents/codex/prices" {
+            input type="hidden" name="model" value=(price.model);
+            div.price-model { code { (price.model) } }
+            (codex_price_fields(Some(price)))
+            div.price-actions {
+                button.primary { "Save" }
+                button.danger formaction="/settings/agents/codex/prices/delete" formnovalidate { "Delete" }
+            }
+        }
+    }
+}
+
+/// The form that adds a model to the price table. It posts to the same upsert
+/// route, so typing a model that already has a row edits that row.
+fn codex_price_add() -> Markup {
+    html! {
+        form.price-add method="post" action="/settings/agents/codex/prices" {
+            h3 { "Add a model" }
+            div.field {
+                label for="codex-price-model" { "Model" }
+                input #codex-price-model type="text" name="model" required
+                    autocomplete="off" spellcheck="false" list="codex-price-models"
+                    placeholder="gpt-6.1-sol" {}
+                datalist #codex-price-models {
+                    @for model in CODEX_PRICE_MODELS {
+                        option value=(model) {}
+                    }
+                }
+            }
+            (codex_price_fields(None))
+            div.save-bar {
+                button.primary { "Add price" }
+            }
+        }
+    }
+}
+
+/// Codex model ids suggested in the add form's datalist. They track the pinned
+/// CLI's `gpt-6` family, and any other id can still be typed.
+const CODEX_PRICE_MODELS: [&str; 2] = ["gpt-6.1-sol", "gpt-6.1-codex"];
 
 /// The card that states whether a login is stored and when Codex last refreshed
 /// it. It never shows the file, a token or the account id.
@@ -2328,6 +2423,14 @@ fn cost_label(usd: f64) -> String {
     }
 }
 
+/// Whether any of the job's cost rows is an estimate, read from the events the
+/// page already loaded, so the cost pill can flag a total that includes one.
+fn any_estimated(events: &[JobEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| event.event == "cost" && event.estimated)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the page takes each value its handler read"
@@ -2350,13 +2453,14 @@ pub fn job(
     let repo = project.map(|project| format!("https://github.com/{}", project.repo));
     let repo_url = repo.as_deref();
     let id = row.id;
+    let estimated = any_estimated(events);
     page(
         user,
         &format!("Job #{id}"),
         &html! {},
         &html! {
             (job_poll(false, id, job))
-            (job_header(id, row, repo_url, cost_usd))
+            (job_header(id, row, repo_url, cost_usd, estimated))
             div.job-layout {
                 div.job-now {
                     (status_region(false, id, job, settings, auto_merge))
@@ -2410,7 +2514,7 @@ pub fn job_fragment(
     let repo_url = repo.as_deref();
     html! {
         @if terminal(job) { (job_poll(true, row.id, job)) }
-        (cost_badge(true, cost_usd))
+        (cost_badge(true, cost_usd, any_estimated(events)))
         (timeline_region(true, job, events, models, efforts))
         (status_region(true, row.id, job, settings, auto_merge))
         (spec_region(true, job))
@@ -2446,10 +2550,17 @@ fn job_poll(oob: bool, id: i64, job: &Job) -> Markup {
 }
 
 /// The cost pill on the title row. A poll updates it out of band, so the title
-/// stays put while the figure changes.
-fn cost_badge(oob: bool, cost_usd: f64) -> Markup {
+/// stays put while the figure changes. When any of the job's cost rows is an
+/// estimate, such as a Codex run's cost from the price table, the figure carries
+/// a `≈` and a title that says it includes an estimate.
+fn cost_badge(oob: bool, cost_usd: f64, estimated: bool) -> Markup {
+    let estimated = estimated && cost_usd > 0.0;
     html! {
-        span #job-cost.badge.cost hx-swap-oob=[oob.then_some("true")] {
+        span #job-cost.badge.cost
+            hx-swap-oob=[oob.then_some("true")]
+            title=[estimated.then_some("Includes an estimate for Codex runs.")]
+        {
+            @if estimated { "≈ " }
             (cost_label(cost_usd))
         }
     }
@@ -2684,12 +2795,18 @@ fn log_region(oob: bool, logs: &[LogEntry]) -> Markup {
     }
 }
 
-fn job_header(id: i64, row: &JobRow, repo_url: Option<&str>, cost_usd: f64) -> Markup {
+fn job_header(
+    id: i64,
+    row: &JobRow,
+    repo_url: Option<&str>,
+    cost_usd: f64,
+    estimated: bool,
+) -> Markup {
     let job = &row.job;
     html! {
         div.title-row {
             h1 { "#" (id) " " (first_line(job.request())) }
-            (cost_badge(false, cost_usd))
+            (cost_badge(false, cost_usd, estimated))
         }
         p.meta {
             @if let Some(url) = repo_url {

@@ -24,7 +24,7 @@ mod workers;
 
 pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT, ToolList};
 pub use codex::{CodexLogin, CodexRun};
-pub use cost::{format_cost, merge_fraction};
+pub use cost::{codex_cost, format_cost, merge_fraction};
 pub use device_login::{DeviceLogin, LoginProcess, LoginSpawner, LoginView, PodmanLogin};
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
@@ -49,7 +49,9 @@ pub use secrets::{
     SecretRef, SecretStore, UnavailableSecrets, master_key_from_env, validate_codex_auth,
 };
 pub use settings::Settings;
-pub use store::{JobEvent, JobFile, JobRow, LogEntry, ProjectTotals, Store, StoreError};
+pub use store::{
+    CodexPrice, JobEvent, JobFile, JobRow, LogEntry, ProjectTotals, Store, StoreError,
+};
 pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;
 pub use web::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, USER_HEADER, app};

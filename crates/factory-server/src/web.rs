@@ -143,6 +143,11 @@ pub fn app(
             "/settings/agents/codex/login/cancel",
             post(cancel_codex_login),
         )
+        .route("/settings/agents/codex/prices", post(save_codex_price))
+        .route(
+            "/settings/agents/codex/prices/delete",
+            post(delete_codex_price),
+        )
         .route("/settings/mcp", get(show_mcp).post(add_mcp_server))
         .route(
             "/settings/mcp/{name}",
@@ -1197,11 +1202,13 @@ async fn codex_page(
         last_refresh: auth.as_deref().and_then(codex_last_refresh),
     };
     let login = state.device_login.snapshot().await;
+    let prices = state.store.codex_prices()?;
     Ok(pages::settings_codex(
         &user(headers),
         &settings_nav(state)?,
         &account,
         &login,
+        &prices,
         state.secrets.available(),
         notice,
     ))
@@ -2054,6 +2061,73 @@ async fn cancel_codex_login(
 ) -> Result<Markup, AppError> {
     state.device_login.cancel().await;
     codex_page(&state, &headers, None).await
+}
+
+#[derive(Deserialize)]
+struct CodexPriceForm {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    input: String,
+    #[serde(default)]
+    cached_input: String,
+    #[serde(default)]
+    output: String,
+}
+
+/// Parses a USD-per-million-tokens price field: a finite, non-negative number.
+/// Anything else, such as an empty field or text, is refused with a message that
+/// names the field.
+fn parse_price(field: &str, value: &str) -> Result<f64, String> {
+    match value.trim().parse::<f64>() {
+        Ok(price) if price.is_finite() && price >= 0.0 => Ok(price),
+        _ => Err(format!(
+            "The {field} price must be a number that is zero or more."
+        )),
+    }
+}
+
+/// Adds a Codex model price or replaces the row for its model, so the same form
+/// adds a new model and edits an existing one. A blank model or a price that is
+/// not a non-negative number is refused and stores nothing. The next Codex run
+/// reads the price afresh, so a change applies with no restart.
+async fn save_codex_price(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CodexPriceForm>,
+) -> Result<Markup, AppError> {
+    let model = form.model.trim();
+    if model.is_empty() {
+        return codex_page(&state, &headers, Some("The model must not be empty.")).await;
+    }
+    let price = match (
+        parse_price("input", &form.input),
+        parse_price("cached input", &form.cached_input),
+        parse_price("output", &form.output),
+    ) {
+        (Ok(input), Ok(cached_input), Ok(output)) => crate::store::CodexPrice {
+            model: model.to_owned(),
+            input_usd_per_mtok: input,
+            cached_input_usd_per_mtok: cached_input,
+            output_usd_per_mtok: output,
+        },
+        (input, cached_input, output) => {
+            let reason = input.err().or(cached_input.err()).or(output.err());
+            return codex_page(&state, &headers, reason.as_deref()).await;
+        }
+    };
+    state.store.set_codex_price(&price)?;
+    codex_page(&state, &headers, Some("Saved.")).await
+}
+
+/// Deletes the Codex price for the posted model. A model with no row is a no-op.
+async fn delete_codex_price(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CodexPriceForm>,
+) -> Result<Markup, AppError> {
+    state.store.delete_codex_price(form.model.trim())?;
+    codex_page(&state, &headers, Some("Deleted.")).await
 }
 
 /// The base branch an empty field defaults to.

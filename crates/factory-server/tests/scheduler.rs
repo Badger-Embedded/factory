@@ -7,13 +7,13 @@ use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
     PrDescription, Question, ReviewState, Stage, Turn,
 };
-use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunReport};
+use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunReport, TokenUsage};
 use factory_server::{
-    AgentRequest, ChecksRequest, Executor, JobFile, LogSink, McpProjectSettings, McpRuntime,
-    McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
+    AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink, McpProjectSettings,
+    McpRuntime, McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
     RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
-    StageEfforts, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest,
-    format_cost, ready_action, watch_only_event,
+    StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport,
+    WatchRequest, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -33,6 +33,9 @@ struct FakeExecutor {
     respond: Respond,
     requests: Mutex<Vec<AgentRequest>>,
     costs: Mutex<VecDeque<Option<f64>>>,
+    /// The token usage each run reports instead of a dollar cost, the way a
+    /// Codex run does. A run with none queued reports no usage, as Claude does.
+    token_usages: Mutex<VecDeque<TokenUsage>>,
     /// The MCP servers each run reports as not connected in its init line.
     unavailable: Mutex<VecDeque<Vec<McpUnavailable>>>,
     /// The agent-reported session ids each run streams back, such as Codex's
@@ -57,6 +60,7 @@ impl FakeExecutor {
             respond: Box::new(respond),
             requests: Mutex::new(Vec::new()),
             costs: Mutex::new(VecDeque::new()),
+            token_usages: Mutex::new(VecDeque::new()),
             unavailable: Mutex::new(VecDeque::new()),
             sessions: Mutex::new(VecDeque::new()),
             stopped: Mutex::new(Vec::new()),
@@ -109,10 +113,18 @@ impl Executor for FakeExecutor {
             session(id);
         }
         log(LogLine::Text("Reading the repository.".into()));
+        // A run with queued token usage reports it and no dollar cost, the way a
+        // Codex run does; otherwise it reports a dollar cost like Claude.
+        let token_usage = self.token_usages.lock().unwrap().pop_front();
+        let cost_usd = if token_usage.is_some() {
+            None
+        } else {
+            self.costs.lock().unwrap().pop_front().unwrap_or(Some(0.12))
+        };
         RunReport {
             event: (self.respond)(&request),
             session_id: Some(request.session_id),
-            cost_usd: self.costs.lock().unwrap().pop_front().unwrap_or(Some(0.12)),
+            cost_usd,
             mcp_unavailable: self
                 .unavailable
                 .lock()
@@ -120,7 +132,7 @@ impl Executor for FakeExecutor {
                 .pop_front()
                 .unwrap_or_default(),
             credential: None,
-            token_usage: None,
+            token_usage,
         }
     }
 
@@ -716,6 +728,125 @@ fn cost_formats_as_dollars_and_cents() {
     assert_eq!(format_cost(12.0), "$12.00");
 }
 
+/// A sample Codex price row.
+fn codex_price(model: &str) -> CodexPrice {
+    CodexPrice {
+        model: model.to_owned(),
+        input_usd_per_mtok: 2.0,
+        cached_input_usd_per_mtok: 0.5,
+        output_usd_per_mtok: 8.0,
+    }
+}
+
+/// A sample Codex run's summed token usage.
+fn codex_usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: 1000,
+        cached_input_tokens: 200,
+        output_tokens: 500,
+        reasoning_output_tokens: 120,
+    }
+}
+
+/// Sets the project's clarify stage to Codex with `model`, saves `price` when
+/// given, queues `usage` for the run, and runs one clarify run on Codex.
+async fn codex_clarify_run(
+    model: Option<&str>,
+    price: Option<CodexPrice>,
+    usage: TokenUsage,
+) -> (Arc<Store>, i64) {
+    let (store, executor, scheduler) = setup(|_| questions());
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                clarify: "codex".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    if let Some(model) = model {
+        store
+            .save_project_models(
+                "maestro",
+                &StageModels {
+                    clarify: Some(model.to_owned()),
+                    ..StageModels::default()
+                },
+            )
+            .unwrap();
+    }
+    if let Some(price) = price {
+        store.set_codex_price(&price).unwrap();
+    }
+    executor.token_usages.lock().unwrap().push_back(usage);
+    executor.release(1);
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+    (store, id)
+}
+
+/// The job log lines that report a finished run.
+fn finished_lines(store: &Store, id: i64) -> Vec<String> {
+    store
+        .logs(id, 20)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .filter(|text| text.contains("run finished"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_codex_run_cost_is_estimated_from_the_price_table() {
+    let (store, id) = codex_clarify_run(
+        Some("gpt-6.1-sol"),
+        Some(codex_price("gpt-6.1-sol")),
+        codex_usage(),
+    )
+    .await;
+
+    // 800 uncached input at $2, 200 cached at $0.50, 500 output at $8, per Mtok.
+    let expected = 800.0 / 1e6 * 2.0 + 200.0 / 1e6 * 0.5 + 500.0 / 1e6 * 8.0;
+    assert!((store.cost_usd(id).unwrap() - expected).abs() < 1e-12);
+    // The row is marked estimated, so the job page flags the total.
+    assert!(store.has_estimated_cost(id).unwrap());
+    let finished = finished_lines(&store, id);
+    assert_eq!(finished.len(), 1);
+    assert!(finished[0].contains("estimated"));
+    assert!(finished[0].contains("gpt-6.1-sol"));
+    assert!(finished[0].contains("1000 input tokens (200 cached), 500 output tokens"));
+}
+
+#[tokio::test]
+async fn a_codex_run_with_no_price_for_the_model_adds_no_cost() {
+    let (store, id) = codex_clarify_run(Some("gpt-6.1-sol"), None, codex_usage()).await;
+
+    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
+    assert!(!store.has_estimated_cost(id).unwrap());
+    let finished = finished_lines(&store, id);
+    assert_eq!(finished.len(), 1);
+    assert!(finished[0].contains("No price is set for the model gpt-6.1-sol"));
+    // The token counts still go to the log.
+    assert!(finished[0].contains("1000 input tokens (200 cached), 500 output tokens"));
+}
+
+#[tokio::test]
+async fn a_codex_run_with_no_model_adds_no_cost() {
+    let (store, id) =
+        codex_clarify_run(None, Some(codex_price("gpt-6.1-sol")), codex_usage()).await;
+
+    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
+    assert!(!store.has_estimated_cost(id).unwrap());
+    let finished = finished_lines(&store, id);
+    assert_eq!(finished.len(), 1);
+    assert!(finished[0].contains("passed no model"));
+    assert!(finished[0].contains("1000 input tokens (200 cached), 500 output tokens"));
+}
+
 fn planned_pr(title: &str) -> factory_core::PlannedPr {
     factory_core::PlannedPr {
         title: title.into(),
@@ -748,10 +879,10 @@ fn totals_sum_the_cost_of_every_run_in_the_project() {
     let first = store.create("maestro", "alice", "x").unwrap();
     let second = store.create("maestro", "alice", "y").unwrap();
     let other = store.create("factory", "alice", "z").unwrap();
-    store.add_cost(first, 0.5).unwrap();
-    store.add_cost(first, 0.25).unwrap();
-    store.add_cost(second, 1.0).unwrap();
-    store.add_cost(other, 4.0).unwrap();
+    store.add_cost(first, 0.5, false).unwrap();
+    store.add_cost(first, 0.25, false).unwrap();
+    store.add_cost(second, 1.0, false).unwrap();
+    store.add_cost(other, 4.0, false).unwrap();
 
     assert!((store.project_totals("maestro").unwrap().usd - 1.75).abs() < 1e-9);
     assert!((store.project_totals("factory").unwrap().usd - 4.0).abs() < 1e-9);
@@ -849,7 +980,7 @@ fn the_history_keeps_failure_reasons_and_run_costs() {
     let store = Store::open_in_memory().unwrap();
     let id = store.create("maestro", "alice", "x").unwrap();
     store.apply(id, Event::Start).unwrap();
-    store.add_cost(id, 0.75).unwrap();
+    store.add_cost(id, 0.75, false).unwrap();
     store
         .apply(
             id,
@@ -1879,7 +2010,7 @@ mod purge {
     async fn project_totals_survive_the_deletion_of_a_job() {
         let f = fixture();
         let id = f.job(31);
-        f.store.add_cost(id, 0.5).unwrap();
+        f.store.add_cost(id, 0.5, false).unwrap();
         f.finish(id, "merged");
         f.scheduler.tick().await.unwrap();
         assert!(!f.exists(id));
@@ -1938,7 +2069,7 @@ mod purge {
     async fn a_merged_job_loses_its_checkout_and_session() {
         let f = fixture();
         let id = f.job(1);
-        f.store.add_cost(id, 0.25).unwrap();
+        f.store.add_cost(id, 0.25, false).unwrap();
         f.finish(id, "merged");
         f.scheduler.tick().await.unwrap();
 
