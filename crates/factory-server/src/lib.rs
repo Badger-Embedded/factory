@@ -41,8 +41,8 @@ pub use scheduler::{
     branch_name, ready_action, watch_only_event,
 };
 pub use secrets::{
-    ClaudeToken, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef, SecretStore,
-    UnavailableSecrets, master_key_from_env,
+    ClaudeToken, CodexAuthError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError,
+    SecretRef, SecretStore, UnavailableSecrets, master_key_from_env, validate_codex_auth,
 };
 pub use settings::Settings;
 pub use store::{JobEvent, JobFile, JobRow, LogEntry, ProjectTotals, Store, StoreError};
