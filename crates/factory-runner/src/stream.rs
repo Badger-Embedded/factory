@@ -1,3 +1,4 @@
+use factory_core::PlanUsage;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -11,6 +12,10 @@ pub enum StreamItem {
     /// to connect to and their status. The factory warns about each active
     /// server that is not `connected`.
     Init(Vec<McpServerStatus>),
+    /// A `rate_limit_event` line: the plan windows Claude Code read from the
+    /// API's response headers. A line that reports no window the tile shows is
+    /// dropped.
+    PlanUsage(PlanUsage),
 }
 
 /// One entry of the `mcp_servers` array in the `system`/`init` line: the server
@@ -103,6 +108,14 @@ pub fn parse_line(line: &str) -> Vec<StreamItem> {
             Ok(result) => vec![StreamItem::Result(result)],
             Err(_) => vec![StreamItem::Log(LogLine::Other(line.to_owned()))],
         };
+    }
+    if value.get("type").and_then(Value::as_str) == Some("rate_limit_event") {
+        return value
+            .get("rate_limit_info")
+            .and_then(|info| PlanUsage::from_rate_limit_info(info.clone()).ok())
+            .map(StreamItem::PlanUsage)
+            .into_iter()
+            .collect();
     }
     if value.get("type").and_then(Value::as_str) == Some("system") {
         if value.get("subtype").and_then(Value::as_str) == Some("init") {

@@ -5,11 +5,10 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRegistry, ClaudeToken, CurlUsageSource, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker,
-    McpRuntime, McpWarnings, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects,
-    ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
-    StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
-    master_key_from_env, proxy_app, refresh_forever,
+    AgentRegistry, ClaudeToken, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker, McpRuntime,
+    McpWarnings, PlanUsageCache, PodmanExecutor, Projects, ProxyEvent, ProxyEventFn, RepoChecker,
+    RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams,
+    WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
 };
 use tokio::sync::Notify;
 
@@ -170,6 +169,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Without podman workers no job takes a slot, so the board shows every
     // slot idle.
     let mut slots = Arc::new(WorkerSlots::new());
+    let plan_usage = Arc::new(PlanUsageCache::new());
     if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {
         let executor = PodmanExecutor {
             base: worker_base(worker_network.clone()),
@@ -182,6 +182,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             data_dir: data_dir.clone(),
             registry: Arc::clone(&agents),
             store: Arc::clone(&store),
+            plan_usage: Arc::clone(&plan_usage),
         };
         let scheduler = Scheduler::new(
             Arc::clone(&store),
@@ -202,17 +203,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         tracing::info!("workers are off, set FACTORY_WORKERS=podman to run jobs");
     }
-
-    // The usage fetch resolves the current token on each refresh, so a token
-    // saved on the settings page is used from the next one. With no token the
-    // fetch is skipped and the tile stays hidden.
-    let plan_usage = Arc::new(PlanUsageCache::new());
-    let source = CurlUsageSource {
-        curl: path_var("FACTORY_CURL", "curl"),
-        token: Arc::clone(&claude_token),
-    };
-    tokio::spawn(refresh_forever(source, Arc::clone(&plan_usage)));
-    tracing::info!("refreshing Claude plan usage every {PLAN_USAGE_REFRESH:?}");
 
     // The onboarding wizard runs its repository checks as the bot, with the
     // same `gh` and token the factory uses for pull requests.

@@ -1,13 +1,11 @@
 //! Tests for the Claude token resolver: the one-time import, a later start
-//! with a different env value, the env fallback when the store is unavailable,
-//! and a usage refresh that picks up a newly saved token. No network and no
-//! files: the store runs in memory.
+//! with a different env value, and the env fallback when the store is
+//! unavailable. No network and no files: the store runs in memory.
 
 use std::sync::Arc;
 
 use factory_server::{
-    ClaudeToken, LocalSecrets, MASTER_KEY_LEN, PlanUsageCache, SecretStore, Store,
-    UnavailableSecrets, UsageSource, refresh_once,
+    ClaudeToken, LocalSecrets, MASTER_KEY_LEN, SecretStore, Store, UnavailableSecrets,
 };
 
 fn store() -> Arc<Store> {
@@ -89,54 +87,4 @@ fn an_unavailable_store_with_no_env_resolves_to_no_token() {
     let token = ClaudeToken::new(secrets, None);
 
     assert!(token.resolve().is_none());
-}
-
-/// A usage source that resolves its token through a [`ClaudeToken`] and returns
-/// a body only when a token is set, standing in for the curl source so a test
-/// can watch a refresh pick up a newly saved token with no network.
-struct TokenSource {
-    token: Arc<ClaudeToken>,
-    body: String,
-}
-
-impl UsageSource for TokenSource {
-    fn fetch(&self) -> impl std::future::Future<Output = Result<Option<String>, String>> {
-        std::future::ready(Ok(self.token.resolve().map(|_| self.body.clone())))
-    }
-}
-
-const SAMPLE: &str = r#"{
-    "five_hour": { "utilization": 0.42, "resets_at": 1763660000 },
-    "seven_day": { "utilization": 0.73, "resets_at": 1764200000 }
-}"#;
-
-#[tokio::test]
-async fn a_refresh_picks_up_a_newly_saved_token() {
-    let store = store();
-    let secrets = local(&store);
-    let token = Arc::new(ClaudeToken::new(Arc::clone(&secrets), None));
-    let source = TokenSource {
-        token: Arc::clone(&token),
-        body: SAMPLE.into(),
-    };
-    let cache = PlanUsageCache::new();
-
-    // With no token the fetch is skipped and the tile stays hidden.
-    refresh_once(&source, &cache).await;
-    assert!(cache.visible(now()).is_none());
-
-    // Saving a token takes effect on the next refresh, with no restart.
-    secrets.set_claude_token("sk-ant-oat01-saved").expect("set");
-    refresh_once(&source, &cache).await;
-    assert!(cache.visible(now()).is_some());
-}
-
-fn now() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    )
-    .unwrap()
 }

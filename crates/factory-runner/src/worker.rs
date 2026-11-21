@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use factory_core::{Agent, Event};
+use factory_core::{Agent, Event, PlanUsage};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -225,13 +225,14 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     args
 }
 
-/// Runs the worker to the end, passing each log line to `log`, and returns
-/// the event for the job. Every failure, including podman failing to start,
+/// Runs the worker to the end, passing each log line to `log` and each plan
+/// usage report to `usage`, and returns the event for the job. Every failure, including podman failing to start,
 /// becomes [`Event::AgentFailed`].
 pub async fn run(
     config: &WorkerConfig,
     run: &WorkerRun,
     mut log: impl FnMut(LogLine),
+    mut usage: impl FnMut(PlanUsage),
 ) -> RunReport {
     // A review run fails closed. A crash or a missing result is a
     // `ReviewFailed`, so the factory does not merge. Every other run reports
@@ -290,6 +291,7 @@ pub async fn run(
             for item in backend.parse(run.expect, &line) {
                 match item {
                     AgentItem::Log(line) => log(line),
+                    AgentItem::PlanUsage(report) => usage(report),
                     AgentItem::Result(run_result) => result = Some(run_result),
                     AgentItem::Unavailable(unavailable) => mcp_unavailable.push(unavailable),
                 }

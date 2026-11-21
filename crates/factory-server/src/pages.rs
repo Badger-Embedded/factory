@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, EFFORTS, Gates, Job, PlanUsage, Stage, Task, Turn, UsageWindow,
-    Verdict,
+    Ask, BranchSummary, Command, EFFORTS, Gates, Job, PlanUsageSnapshot, Stage, Task, Turn,
+    UsageWindow, Verdict,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -113,7 +113,7 @@ pub fn index(
     jobs: &[JobRow],
     costs: &HashMap<i64, f64>,
     totals: ProjectTotals,
-    plan_usage: Option<&PlanUsage>,
+    plan_usage: Option<&UsageTile>,
     auto_merge: bool,
     workers: &Workers,
 ) -> Markup {
@@ -288,11 +288,19 @@ pub fn stats(totals: ProjectTotals, project: &str) -> Markup {
     }
 }
 
+/// What the plan usage tile renders: the last snapshot and the time the page
+/// renders at, a Unix timestamp in seconds, so a window whose reset time has
+/// passed reads as reset.
+pub struct UsageTile {
+    pub snapshot: PlanUsageSnapshot,
+    pub now: i64,
+}
+
 /// The plan usage tile sits in a wrapper that polls on its own interval, so
-/// the tile hides when the cache is empty, stale or errored and returns on a
-/// later poll once it is fresh. htmx swaps the wrapper's contents, so an empty
-/// response removes the tile while the wrapper keeps polling.
-fn plan_usage_region(usage: Option<&PlanUsage>) -> Markup {
+/// the tile appears once a run reports usage and its numbers follow later
+/// reports. htmx swaps the wrapper's contents, so an empty response leaves no
+/// tile while the wrapper keeps polling.
+fn plan_usage_region(usage: Option<&UsageTile>) -> Markup {
     html! {
         div #usage hx-get="/fragments/plan-usage" hx-trigger=(POLL_TRIGGER) {
             (plan_usage(usage))
@@ -301,7 +309,7 @@ fn plan_usage_region(usage: Option<&PlanUsage>) -> Markup {
 }
 
 /// The plan usage tile, or nothing when the handler passes `None`.
-pub fn plan_usage(usage: Option<&PlanUsage>) -> Markup {
+pub fn plan_usage(usage: Option<&UsageTile>) -> Markup {
     html! {
         @if let Some(usage) = usage {
             (plan_usage_panel(usage))
@@ -310,33 +318,51 @@ pub fn plan_usage(usage: Option<&PlanUsage>) -> Markup {
 }
 
 /// The account-wide panel of Claude subscription limits: the 5-hour window,
-/// the weekly window, and each per-model window the plan reports, such as
-/// Fable. It reads the same for every project, because the limits belong to
-/// the account.
-fn plan_usage_panel(usage: &PlanUsage) -> Markup {
+/// the weekly window and the Fable window, each when a run has reported it,
+/// and the time of the last report. It reads the same for every project,
+/// because the limits belong to the account.
+fn plan_usage_panel(tile: &UsageTile) -> Markup {
+    let usage = &tile.snapshot.usage;
+    let windows = [
+        ("5-hour", &usage.five_hour),
+        ("Weekly", &usage.seven_day),
+        ("Fable", &usage.fable),
+    ];
     html! {
         section.plan-usage {
-            h2 { "Claude plan usage" }
+            h2 {
+                "Claude plan usage "
+                span.usage-as-of { "as of " (crate::localtime::unix(tile.snapshot.reported_at)) }
+            }
             ul.usage-windows {
-                (usage_window("5-hour", &usage.five_hour))
-                (usage_window("Weekly", &usage.seven_day))
-                @for model in &usage.model_scoped {
-                    (usage_window(&model.display_name, &model.window))
+                @for (label, window) in windows {
+                    @if let Some(window) = window {
+                        (usage_window(label, window, tile.now))
+                    }
                 }
             }
         }
     }
 }
 
-fn usage_window(label: &str, window: &UsageWindow) -> Markup {
-    let percent = window.percent_used();
+/// One window's bar, percent and reset time. After the reset time passes the
+/// last report describes the old window, so the bar is empty and the text says
+/// the window reset with no report since.
+fn usage_window(label: &str, window: &UsageWindow, now: i64) -> Markup {
+    let reset = window.has_reset(now);
+    let percent = if reset { 0.0 } else { window.percent_used() };
     let fill = format!("{:.1}%", percent.clamp(0.0, 100.0));
     html! {
         li.usage-window {
             span.usage-name { (label) }
             span.usage-track { span.usage-fill style={ "width: " (fill) } {} }
-            span.usage-percent { (format!("{percent:.0}% used")) }
-            span.usage-reset { "resets " (crate::localtime::reset(window.resets_at)) }
+            @if reset {
+                span.usage-percent { "no report since the reset" }
+                span.usage-reset { "reset " (crate::localtime::unix(window.resets_at)) }
+            } @else {
+                span.usage-percent { (format!("{percent:.0}% used")) }
+                span.usage-reset { "resets " (crate::localtime::unix(window.resets_at)) }
+            }
         }
     }
 }

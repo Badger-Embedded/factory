@@ -67,9 +67,9 @@ pub(crate) fn time_seconds(at: &str) -> Markup {
 }
 
 /// A Unix time in seconds as a full date and time at minute precision, as the
-/// plan usage tile shows a reset time. Without JavaScript it reads
-/// `YYYY-MM-DD HH:MM UTC`.
-pub(crate) fn reset(unix: i64) -> Markup {
+/// plan usage tile shows its report and reset times. Without JavaScript it
+/// reads `YYYY-MM-DD HH:MM UTC`.
+pub(crate) fn unix(unix: i64) -> Markup {
     let (year, month, day) = civil_from_days(unix.div_euclid(86_400));
     let secs = unix.rem_euclid(86_400);
     let (hour, minute) = (secs / 3600, secs % 3600 / 60);

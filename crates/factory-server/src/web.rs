@@ -61,7 +61,7 @@ struct AppState {
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
 /// job loop looks at the job right away. Uploaded images go under
 /// `<data_dir>/jobs/<id>/images/`. The index page reads `plan_usage` from the
-/// cache the refresh task fills, so it makes no live call to the usage source.
+/// cache the worker runs fill.
 /// The onboarding wizard runs its repository checks through `github`. The
 /// board shows the worker slots the scheduler fills in `slots`. Per-project
 /// MCP header values are read and written through `secrets`, which reports
@@ -316,7 +316,7 @@ async fn index(
     Query(query): Query<IndexQuery>,
 ) -> Result<Markup, AppError> {
     let data = load_board(&state, query.project)?;
-    let plan_usage = state.plan_usage.visible(now_secs());
+    let plan_usage = usage_tile(&state);
     Ok(pages::index(
         &user(&headers),
         &data.names,
@@ -330,11 +330,20 @@ async fn index(
     ))
 }
 
-/// Serves the plan usage tile on its own, from the same cache `index` reads,
-/// so a poll makes no live call to the usage endpoint.
+/// Serves the plan usage tile on its own, from the same cache `index` reads.
 async fn plan_usage_fragment(State(state): State<AppState>) -> Markup {
-    let plan_usage = state.plan_usage.visible(now_secs());
-    pages::plan_usage(plan_usage.as_ref())
+    pages::plan_usage(usage_tile(&state).as_ref())
+}
+
+/// The plan usage tile, or `None` before any run has reported usage.
+fn usage_tile(state: &AppState) -> Option<pages::UsageTile> {
+    state
+        .plan_usage
+        .snapshot()
+        .map(|snapshot| pages::UsageTile {
+            snapshot,
+            now: now_secs(),
+        })
 }
 
 async fn stats_fragment(
@@ -1859,8 +1868,7 @@ struct ClaudeTokenForm {
 /// of surrounding whitespace and a trailing newline, the way a pasted
 /// `claude setup-token` output needs. An empty field keeps the stored token, so
 /// a save that leaves the field blank is a no-op. The resolver reads the token
-/// afresh, so the next worker run and the next plan usage refresh use the new
-/// one with no restart.
+/// afresh, so the next worker run uses the new one with no restart.
 async fn save_claude_token(
     State(state): State<AppState>,
     headers: HeaderMap,

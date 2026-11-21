@@ -125,8 +125,8 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, at: SecretRef<'_>) -> Result<(), SecretError>;
 
     /// The stored Claude token, or `None` when none is set. This is the
-    /// account-wide subscription token the workers and the plan usage fetch
-    /// use, kept in a reserved row apart from the MCP header values.
+    /// account-wide subscription token the workers use, kept in a reserved row
+    /// apart from the MCP header values.
     ///
     /// # Errors
     ///
@@ -314,9 +314,9 @@ impl SecretStore for UnavailableSecrets {
     }
 }
 
-/// Resolves the Claude subscription token a worker run and the plan usage
-/// fetch use. With the secret store available the token is the stored one, so
-/// a token saved on the settings page takes effect without a restart. With the
+/// Resolves the Claude subscription token a worker run uses. With the secret
+/// store available the token is the stored one, so a token saved on the
+/// settings page takes effect without a restart. With the
 /// store unavailable, because the master key is missing or malformed, it falls
 /// back to the `CLAUDE_CODE_OAUTH_TOKEN` captured at startup, so a lost key
 /// does not stop jobs while the old podman secret still passes the token in.

@@ -1,82 +1,92 @@
-use factory_core::{PLAN_USAGE_STALE_AFTER_SECS, PlanUsage, PlanUsageSnapshot};
+use factory_core::{PlanUsage, UsageWindow};
 
-/// A `?skip_spend=1` body like the one the spike documented: the three
-/// windows, each with a `status`, and a `model_scoped` array that carries
-/// Fable. The parser keeps the fields the tile needs and ignores the rest.
+/// The `rate_limit_info` object Claude Code 2.1.330 wrote on moon on
+/// 2026-11-21, with a Fable window added.
 const SAMPLE: &str = r#"{
-    "five_hour": { "utilization": 0.42, "resets_at": 1763660000, "status": "allowed" },
-    "seven_day": { "utilization": 0.73, "resets_at": 1764200000, "status": "allowed_warning" },
-    "seven_day_overage_included": { "utilization": 0.10, "resets_at": 1764200000 },
-    "model_scoped": [
-        { "display_name": "Fable", "utilization": 0.55, "resets_at": 1764200000 }
-    ]
+    "status": "allowed",
+    "resetsAt": 1795234800,
+    "rateLimitType": "five_hour",
+    "overageStatus": "rejected",
+    "overageDisabledReason": "org_level_disabled",
+    "isUsingOverage": false,
+    "unifiedWindows": {
+        "five_hour": { "utilization": 0.77, "resetsAt": 1795234800, "status": "allowed" },
+        "seven_day": { "utilization": 0.33, "resetsAt": 1795676400, "status": "allowed" },
+        "seven_day_overage_included": { "utilization": 0.5, "resetsAt": 1795676400, "status": "allowed" }
+    }
 }"#;
 
+fn window(utilization: f64, resets_at: i64) -> UsageWindow {
+    UsageWindow {
+        utilization,
+        resets_at,
+    }
+}
+
 #[test]
-fn parses_a_sample_response() {
+fn parses_the_unified_windows() {
     let usage = PlanUsage::parse(SAMPLE).expect("sample parses");
 
-    assert_eq!(usage.five_hour.utilization, 0.42);
-    assert_eq!(usage.five_hour.resets_at, 1_763_660_000);
-    assert_eq!(usage.seven_day.utilization, 0.73);
-    assert_eq!(usage.seven_day.resets_at, 1_764_200_000);
+    assert_eq!(usage.five_hour, Some(window(0.77, 1_795_234_800)));
+    assert_eq!(usage.seven_day, Some(window(0.33, 1_795_676_400)));
+    assert_eq!(usage.fable, Some(window(0.5, 1_795_676_400)));
+}
 
-    let fable = usage.model_window("Fable").expect("Fable window present");
-    assert_eq!(fable.window.utilization, 0.55);
-    assert_eq!(fable.window.resets_at, 1_764_200_000);
+#[test]
+fn a_window_the_event_leaves_out_is_none() {
+    let body = r#"{ "unifiedWindows": {
+        "five_hour": { "utilization": 0.1, "resetsAt": 1795234800 },
+        "seven_day": { "utilization": 0.2, "resetsAt": 1795676400 }
+    } }"#;
+
+    let usage = PlanUsage::parse(body).expect("body without Fable parses");
+
+    assert!(usage.five_hour.is_some());
+    assert!(usage.fable.is_none());
+}
+
+#[test]
+fn an_event_without_unified_windows_reports_its_one_window() {
+    let body = r#"{ "status": "allowed_warning", "rateLimitType": "seven_day",
+        "utilization": 0.9, "resetsAt": 1795676400 }"#;
+
+    let usage = PlanUsage::parse(body).expect("legacy shape parses");
+
+    assert_eq!(usage.seven_day, Some(window(0.9, 1_795_676_400)));
+    assert!(usage.five_hour.is_none());
+}
+
+#[test]
+fn an_event_with_no_window_is_an_error() {
+    assert!(PlanUsage::parse(r#"{ "status": "allowed", "resetsAt": 1795234800 }"#).is_err());
+    assert!(PlanUsage::parse(r#"{ "unifiedWindows": {} }"#).is_err());
+    assert!(PlanUsage::parse("not json").is_err());
 }
 
 #[test]
 fn percent_used_scales_the_fraction() {
     let usage = PlanUsage::parse(SAMPLE).expect("sample parses");
-    assert_eq!(usage.five_hour.percent_used(), 42.0);
+    assert_eq!(usage.seven_day.unwrap().percent_used(), 33.0);
 }
 
 #[test]
-fn a_missing_model_scoped_array_leaves_no_model_windows() {
-    let body = r#"{
-        "five_hour": { "utilization": 0.1, "resets_at": 1763660000 },
-        "seven_day": { "utilization": 0.2, "resets_at": 1764200000 }
-    }"#;
-
-    let usage = PlanUsage::parse(body).expect("body without model_scoped parses");
-
-    assert_eq!(usage.model_scoped.len(), 0);
-    assert!(usage.model_window("Fable").is_none());
+fn a_window_has_reset_once_its_reset_time_passes() {
+    let window = window(0.5, 1_000);
+    assert!(!window.has_reset(999));
+    assert!(window.has_reset(1_000));
 }
 
 #[test]
-fn malformed_json_is_an_error() {
-    assert!(PlanUsage::parse("not json").is_err());
-}
+fn merge_keeps_the_windows_a_newer_report_leaves_out() {
+    let mut usage = PlanUsage::parse(SAMPLE).expect("sample parses");
+    let newer = PlanUsage {
+        five_hour: Some(window(0.8, 1_795_300_000)),
+        ..PlanUsage::default()
+    };
 
-#[test]
-fn a_missing_window_is_an_error() {
-    let body = r#"{ "five_hour": { "utilization": 0.1, "resets_at": 1763660000 } }"#;
-    assert!(PlanUsage::parse(body).is_err());
-}
+    usage.merge(newer);
 
-fn snapshot(fetched_at: i64) -> PlanUsageSnapshot {
-    PlanUsageSnapshot {
-        usage: PlanUsage::parse(SAMPLE).expect("sample parses"),
-        fetched_at,
-    }
-}
-
-#[test]
-fn a_recent_snapshot_is_fresh() {
-    let snap = snapshot(1_000);
-    let now = 1_000 + PLAN_USAGE_STALE_AFTER_SECS - 1;
-
-    assert!(snap.is_fresh(now));
-    assert!(!snap.is_stale(now));
-}
-
-#[test]
-fn a_snapshot_past_the_cutoff_is_stale() {
-    let snap = snapshot(1_000);
-    let now = 1_000 + PLAN_USAGE_STALE_AFTER_SECS;
-
-    assert!(snap.is_stale(now));
-    assert!(!snap.is_fresh(now));
+    assert_eq!(usage.five_hour, Some(window(0.8, 1_795_300_000)));
+    assert_eq!(usage.seven_day, Some(window(0.33, 1_795_676_400)));
+    assert_eq!(usage.fable, Some(window(0.5, 1_795_676_400)));
 }

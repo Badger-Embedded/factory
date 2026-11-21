@@ -15,7 +15,7 @@ use factory_core::Event;
 use factory_runner::{Expect, Git, GitHub, WorkerConfig};
 use factory_server::{
     AgentRegistry, AgentRequest, ClaudeToken, Executor, LocalSecrets, MASTER_KEY_LEN,
-    PodmanExecutor, SecretStore, Settings, Store,
+    PlanUsageCache, PodmanExecutor, SecretStore, Settings, Store,
 };
 
 fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) -> PodmanExecutor {
@@ -31,6 +31,7 @@ fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) 
         data_dir,
         registry,
         store,
+        plan_usage: Arc::new(PlanUsageCache::new()),
     }
 }
 

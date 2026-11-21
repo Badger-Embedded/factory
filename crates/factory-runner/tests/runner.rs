@@ -3,8 +3,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    Agent, AgentResult, Command, EFFORTS, Event, Gates, Job, PlannedPr, PrDescription, Question,
-    Stage, Task,
+    Agent, AgentResult, Command, EFFORTS, Event, Gates, Job, PlanUsage, PlannedPr, PrDescription,
+    Question, Stage, Task, UsageWindow,
 };
 use factory_runner::{
     Expect, LogLine, McpConfig, McpServerStatus, PlacedFile, ResultMessage, SessionRun, StreamItem,
@@ -148,6 +148,53 @@ fn the_init_line_reports_each_mcp_server_status() {
             },
         ])]
     );
+}
+
+/// A `rate_limit_event` line as Claude Code 2.1.330 writes it.
+const RATE_LIMIT_EVENT: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795234800,"rateLimitType":"five_hour","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.77,"resetsAt":1795234800,"status":"allowed"},"seven_day":{"utilization":0.33,"resetsAt":1795676400,"status":"allowed"}}},"uuid":"u","session_id":"s"}"#;
+
+fn reported_usage() -> PlanUsage {
+    PlanUsage {
+        five_hour: Some(UsageWindow {
+            utilization: 0.77,
+            resets_at: 1_795_234_800,
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 0.33,
+            resets_at: 1_795_676_400,
+        }),
+        fable: None,
+    }
+}
+
+#[test]
+fn the_rate_limit_event_reports_plan_usage() {
+    assert_eq!(
+        parse_line(RATE_LIMIT_EVENT),
+        vec![StreamItem::PlanUsage(reported_usage())]
+    );
+    // A rate limit event with no window the tile shows gives nothing.
+    assert_eq!(
+        parse_line(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#),
+        vec![]
+    );
+}
+
+#[tokio::test]
+async fn a_run_passes_each_plan_usage_report_to_its_callback() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(&stdout, format!("{RATE_LIMIT_EVENT}\n")).unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, "", 0),
+        ..WorkerConfig::default()
+    };
+    let worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
+
+    let mut reports = Vec::new();
+    run(&config, &worker, |_| {}, |usage| reports.push(usage)).await;
+
+    assert_eq!(reports, [reported_usage()]);
 }
 
 #[test]
@@ -398,6 +445,7 @@ async fn a_finished_run_reports_its_event_session_cost_and_log() {
         &config,
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
         |line| log.push(line),
+        |_| {},
     )
     .await;
 
@@ -437,7 +485,7 @@ async fn the_token_reaches_the_worker_environment_not_its_arguments() {
     let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.token = "sk-ant-oat01-secret".into();
 
-    run(&config, &worker, |_| {}).await;
+    run(&config, &worker, |_| {}, |_| {}).await;
 
     // podman saw the token in its environment, so it passes it to the container,
     // but the token is in none of the arguments.
@@ -464,6 +512,7 @@ async fn a_run_reports_each_mcp_server_the_init_line_shows_as_not_connected() {
     let report = run(
         &config,
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
+        |_| {},
         |_| {},
     )
     .await;
@@ -498,6 +547,7 @@ async fn a_worker_that_dies_without_a_result_fails_with_its_stderr() {
         &config,
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
         |_| {},
+        |_| {},
     )
     .await;
 
@@ -517,6 +567,7 @@ async fn a_missing_podman_binary_fails_the_run() {
     let report = run(
         &config,
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
+        |_| {},
         |_| {},
     )
     .await;
@@ -1243,7 +1294,7 @@ async fn a_review_run_that_dies_without_a_result_fails_closed() {
     let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.expect = Expect::Review;
 
-    let report = run(&config, &worker, |_| {}).await;
+    let report = run(&config, &worker, |_| {}, |_| {}).await;
     let reason = review_failure_reason(report.event);
     assert!(reason.contains("the worker crashed"), "{reason}");
 }

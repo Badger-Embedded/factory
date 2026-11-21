@@ -5266,21 +5266,19 @@ async fn a_failed_job_still_counts_as_finished_for_the_30_day_expiry() {
     assert_lane(&dashboard, id, "inbox-failed").await;
 }
 
-/// A `?skip_spend=1` body with Fable in `model_scoped`, using Unix timestamps
-/// whose UTC dates the tile tests assert.
-const USAGE_WITH_FABLE: &str = r#"{
-    "five_hour": { "utilization": 0.42, "resets_at": 1700000000 },
-    "seven_day": { "utilization": 0.73, "resets_at": 1701000000 },
-    "model_scoped": [
-        { "display_name": "Fable", "utilization": 0.1, "resets_at": 1701000000 }
-    ]
-}"#;
+/// A `rate_limit_info` object with all three windows. The reset times are in
+/// 2100, so the tile shows them as upcoming.
+const USAGE_WITH_FABLE: &str = r#"{ "unifiedWindows": {
+    "five_hour": { "utilization": 0.42, "resetsAt": 4102444800 },
+    "seven_day": { "utilization": 0.73, "resetsAt": 4102531200 },
+    "seven_day_overage_included": { "utilization": 0.1, "resetsAt": 4102531200 }
+} }"#;
 
-/// The same body with no `model_scoped`, so the plan reports no Fable window.
-const USAGE_NO_FABLE: &str = r#"{
-    "five_hour": { "utilization": 0.42, "resets_at": 1700000000 },
-    "seven_day": { "utilization": 0.73, "resets_at": 1701000000 }
-}"#;
+/// The same object with no Fable window.
+const USAGE_NO_FABLE: &str = r#"{ "unifiedWindows": {
+    "five_hour": { "utilization": 0.42, "resetsAt": 4102444800 },
+    "seven_day": { "utilization": 0.73, "resetsAt": 4102531200 }
+} }"#;
 
 fn usage(body: &str) -> PlanUsage {
     PlanUsage::parse(body).unwrap()
@@ -5296,6 +5294,9 @@ fn now() -> i64 {
     .unwrap()
 }
 
+/// 2026-11-21 00:00 UTC, the report time the tile tests record.
+const REPORTED_AT: i64 = 1_795_219_200;
+
 /// The plan usage panel on the page, or `None` when the tile is hidden.
 fn usage_tile(body: &str) -> Option<&str> {
     let marker = "<section class=\"plan-usage\">";
@@ -5307,32 +5308,35 @@ fn usage_tile(body: &str) -> Option<&str> {
 #[tokio::test]
 async fn the_board_shows_the_plan_usage_tile_with_fable() {
     let dashboard = dashboard();
-    dashboard
-        .usage
-        .record_success(usage(USAGE_WITH_FABLE), now());
+    dashboard.usage.record(usage(USAGE_WITH_FABLE), REPORTED_AT);
 
     let body = dashboard.get("/").await.body;
-    let tile = usage_tile(&body).expect("the tile shows after a fresh success");
+    let tile = usage_tile(&body).expect("the tile shows after a run reports usage");
     assert!(tile.contains("Claude plan usage"));
     assert!(tile.contains("5-hour"));
     assert!(tile.contains("Weekly"));
     assert!(tile.contains("Fable"));
     assert!(tile.contains("42% used"));
     assert!(tile.contains("73% used"));
-    // The reset time is wrapped so the browser shows it in its own zone, with
-    // the stored UTC time as the fallback for a visitor with JavaScript off.
+    assert!(tile.contains("10% used"));
+    // The report and reset times are wrapped so the browser shows them in its
+    // own zone, with the stored UTC time as the fallback for a visitor with
+    // JavaScript off.
     assert!(tile.contains(
-        "<time datetime=\"2023-11-14T22:13:00Z\" data-format=\"datetime\">2023-11-14 22:13 UTC</time>"
+        "as of <time datetime=\"2026-11-21T00:00:00Z\" data-format=\"datetime\">2026-11-21 00:00 UTC</time>"
     ));
     assert!(tile.contains(
-        "<time datetime=\"2023-11-26T12:00:00Z\" data-format=\"datetime\">2023-11-26 12:00 UTC</time>"
+        "resets <time datetime=\"2100-01-01T00:00:00Z\" data-format=\"datetime\">2100-01-01 00:00 UTC</time>"
+    ));
+    assert!(tile.contains(
+        "<time datetime=\"2100-01-02T00:00:00Z\" data-format=\"datetime\">2100-01-02 00:00 UTC</time>"
     ));
 }
 
 #[tokio::test]
-async fn the_tile_shows_the_two_windows_when_the_plan_reports_no_fable() {
+async fn the_tile_shows_the_two_windows_when_no_fable_window_is_reported() {
     let dashboard = dashboard();
-    dashboard.usage.record_success(usage(USAGE_NO_FABLE), now());
+    dashboard.usage.record(usage(USAGE_NO_FABLE), REPORTED_AT);
 
     let body = dashboard.get("/").await.body;
     let tile = usage_tile(&body).expect("the tile shows without a Fable window");
@@ -5355,37 +5359,56 @@ async fn an_empty_cache_hides_the_tile_and_renders_the_rest() {
 }
 
 #[tokio::test]
-async fn a_stale_success_hides_the_tile() {
+async fn an_old_report_stays_on_the_tile_with_its_time() {
     let dashboard = dashboard();
-    let stale = now() - factory_core::PLAN_USAGE_STALE_AFTER_SECS - 1;
     dashboard
         .usage
-        .record_success(usage(USAGE_WITH_FABLE), stale);
+        .record(usage(USAGE_WITH_FABLE), 1_000_000_000);
 
     let body = dashboard.get("/").await.body;
-    assert!(usage_tile(&body).is_none());
-    assert!(body.contains("id=\"board\""));
+    let tile = usage_tile(&body).expect("an old report still shows");
+    assert!(tile.contains("as of <time datetime=\"2001-09-09T01:46:00Z\""));
+    assert!(tile.contains("42% used"));
 }
 
 #[tokio::test]
-async fn an_errored_fetch_hides_the_tile() {
+async fn a_window_past_its_reset_time_reads_as_reset() {
     let dashboard = dashboard();
-    dashboard
-        .usage
-        .record_success(usage(USAGE_WITH_FABLE), now());
-    dashboard.usage.record_error();
+    let body = r#"{ "unifiedWindows": {
+        "five_hour": { "utilization": 0.9, "resetsAt": 1700000000 },
+        "seven_day": { "utilization": 0.73, "resetsAt": 4102531200 }
+    } }"#;
+    dashboard.usage.record(usage(body), REPORTED_AT);
+
+    let page = dashboard.get("/").await.body;
+    let tile = usage_tile(&page).expect("the tile shows");
+    assert!(!tile.contains("90% used"));
+    assert!(tile.contains("no report since the reset"));
+    assert!(tile.contains(
+        "reset <time datetime=\"2023-11-14T22:13:00Z\" data-format=\"datetime\">2023-11-14 22:13 UTC</time>"
+    ));
+    assert!(tile.contains("73% used"));
+}
+
+#[tokio::test]
+async fn a_later_report_replaces_only_the_windows_it_carries() {
+    let dashboard = dashboard();
+    dashboard.usage.record(usage(USAGE_WITH_FABLE), REPORTED_AT);
+    let five_hour =
+        r#"{ "rateLimitType": "five_hour", "utilization": 0.5, "resetsAt": 4102444800 }"#;
+    dashboard.usage.record(usage(five_hour), REPORTED_AT + 60);
 
     let body = dashboard.get("/").await.body;
-    assert!(usage_tile(&body).is_none());
-    assert!(body.contains("id=\"board\""));
+    let tile = usage_tile(&body).expect("the tile shows");
+    assert!(tile.contains("50% used"));
+    assert!(tile.contains("73% used"));
+    assert!(tile.contains("as of <time datetime=\"2026-11-21T00:01:00Z\""));
 }
 
 #[tokio::test]
 async fn the_tile_is_the_same_whatever_project_is_selected() {
     let dashboard = two_projects();
-    dashboard
-        .usage
-        .record_success(usage(USAGE_WITH_FABLE), now());
+    dashboard.usage.record(usage(USAGE_WITH_FABLE), REPORTED_AT);
 
     let maestro = dashboard.get("/?project=maestro").await.body;
     let tool = dashboard.get("/?project=tool").await.body;
@@ -5593,24 +5616,18 @@ async fn a_lane_change_shows_up_in_the_board_fragment() {
 }
 
 #[tokio::test]
-async fn the_plan_usage_fragment_hides_and_reappears_with_the_cache() {
+async fn the_plan_usage_fragment_appears_once_a_run_reports() {
     let dashboard = dashboard();
-    // An empty cache: the fragment is empty, so a swap removes the tile.
+    // An empty cache: the fragment is empty, so a swap leaves no tile.
     let empty = dashboard.get("/fragments/plan-usage").await;
     assert_eq!(empty.status, StatusCode::OK);
     assert!(!empty.body.contains("Claude plan usage"));
 
-    dashboard
-        .usage
-        .record_success(usage(USAGE_WITH_FABLE), now());
-    let fresh = dashboard.get("/fragments/plan-usage").await.body;
-    assert!(fresh.contains("<section class=\"plan-usage\">"));
-    assert!(fresh.contains("Claude plan usage"));
-    assert!(fresh.contains("Fable"));
-
-    dashboard.usage.record_error();
-    let errored = dashboard.get("/fragments/plan-usage").await.body;
-    assert!(!errored.contains("Claude plan usage"));
+    dashboard.usage.record(usage(USAGE_WITH_FABLE), REPORTED_AT);
+    let reported = dashboard.get("/fragments/plan-usage").await.body;
+    assert!(reported.contains("<section class=\"plan-usage\">"));
+    assert!(reported.contains("Claude plan usage"));
+    assert!(reported.contains("Fable"));
 }
 
 // --- Onboarding wizard ---

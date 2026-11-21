@@ -12,7 +12,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use factory_core::{Agent, Event};
+use factory_core::{Agent, Event, PlanUsage};
 
 use crate::claude::ClaudeAgent;
 use crate::outcome::Expect;
@@ -62,6 +62,9 @@ pub enum AgentItem {
     /// An active MCP server the agent could not use, named with a reason that
     /// carries no credential.
     Unavailable(McpUnavailable),
+    /// The plan usage the agent reported for the account its credential
+    /// belongs to.
+    PlanUsage(PlanUsage),
     /// The run's final result.
     Result(RunResult),
 }
