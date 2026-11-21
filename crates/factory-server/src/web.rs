@@ -550,20 +550,37 @@ async fn create_job(
     Ok(job_redirect(id))
 }
 
-/// Writes each attachment under a generated name, so an upload's own file name
-/// never reaches the file system, and records the names with the job. Images
-/// go under `images/` and keep the `job_images` table; files go under `files/`
-/// and record their original name in `job_files`. Images and files are
-/// numbered apart, each in upload order.
+/// Writes each attachment under the job's directory with a generated name, so
+/// an upload's own file name never reaches the file system, and records the
+/// images in `job_images` and the files in `job_files`.
 fn save_attachments(state: &AppState, id: i64, attachments: &[Attachment]) -> Result<(), AppError> {
     let job_dir = state.data_dir.join("jobs").join(id.to_string());
+    let (image_names, files) = write_numbered_attachments(&job_dir, attachments)?;
+    if !image_names.is_empty() {
+        state.store.add_images(id, &image_names)?;
+    }
+    if !files.is_empty() {
+        state.store.add_files(id, &files)?;
+    }
+    Ok(())
+}
+
+/// Writes `attachments` under `dir`, images in its `images/` subdirectory and
+/// files in its `files/` subdirectory, each type numbered from 1 in order as
+/// `image-<n>.<ext>` or `file-<n>.<ext>`. A file's original name is its own,
+/// or its stored name when the upload carried none. Returns the image names
+/// and the file rows for the caller to record.
+fn write_numbered_attachments(
+    dir: &std::path::Path,
+    attachments: &[Attachment],
+) -> Result<(Vec<String>, Vec<JobFile>), AppError> {
     let mut image_names = Vec::new();
     let mut files = Vec::new();
     for attachment in attachments {
         match attachment {
             Attachment::Image { extension, bytes } => {
                 let name = format!("image-{}.{extension}", image_names.len() + 1);
-                write_attachment(&job_dir.join("images"), &name, bytes)?;
+                write_attachment(&dir.join("images"), &name, bytes)?;
                 image_names.push(name);
             }
             Attachment::File {
@@ -572,7 +589,7 @@ fn save_attachments(state: &AppState, id: i64, attachments: &[Attachment]) -> Re
                 bytes,
             } => {
                 let stored = format!("file-{}.{extension}", files.len() + 1);
-                write_attachment(&job_dir.join("files"), &stored, bytes)?;
+                write_attachment(&dir.join("files"), &stored, bytes)?;
                 let original_name = name.clone().unwrap_or_else(|| stored.clone());
                 files.push(JobFile {
                     name: stored,
@@ -581,13 +598,7 @@ fn save_attachments(state: &AppState, id: i64, attachments: &[Attachment]) -> Re
             }
         }
     }
-    if !image_names.is_empty() {
-        state.store.add_images(id, &image_names)?;
-    }
-    if !files.is_empty() {
-        state.store.add_files(id, &files)?;
-    }
-    Ok(())
+    Ok((image_names, files))
 }
 
 /// Writes one attachment's bytes under `dir`, creating `dir` on the first file.
