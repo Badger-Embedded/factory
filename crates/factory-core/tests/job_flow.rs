@@ -432,6 +432,7 @@ fn an_agent_failure_fails_the_job_with_the_failed_task_to_retry() {
                     pr: planned("only")
                 }),
             }),
+            dismissed: false,
         }
     );
     assert!(job.can_retry());
@@ -1222,6 +1223,131 @@ fn retry_is_rejected_while_the_job_still_runs() {
     let before = job.clone();
     assert!(job.apply(Event::Retry).is_err());
     assert_eq!(job, before);
+}
+
+#[test]
+fn dismiss_marks_a_retryable_failed_job_without_moving_it() {
+    let mut job = implementing(&["only"]);
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+    let before = job.clone();
+    assert!(job.can_retry());
+    assert!(!job.is_dismissed());
+
+    apply(&mut job, Event::Dismiss);
+    assert!(job.is_dismissed());
+    // Still failed, with the reason and retry target unchanged, so retry and
+    // expiry keep working.
+    assert_eq!(
+        job.stage(),
+        &Stage::Failed {
+            reason: "usage limit".into(),
+            retry: Some(RetryTarget::Agent {
+                stage: Box::new(Stage::Implementing { pr: 0 }),
+                task: Box::new(Task::Implement {
+                    pr: planned("only")
+                }),
+            }),
+            dismissed: true,
+        }
+    );
+    assert_eq!(job.turn(), before.turn());
+    assert!(job.can_retry());
+}
+
+#[test]
+fn dismiss_marks_a_failed_job_that_cannot_retry() {
+    let mut job = closed_unmerged_job();
+    assert!(!job.can_retry());
+
+    apply(&mut job, Event::Dismiss);
+    assert!(job.is_dismissed());
+    assert!(!job.can_retry());
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+}
+
+#[test]
+fn dismiss_is_rejected_on_an_already_dismissed_job() {
+    let mut job = closed_unmerged_job();
+    apply(&mut job, Event::Dismiss);
+    let before = job.clone();
+
+    assert!(matches!(
+        job.apply(Event::Dismiss),
+        Err(Rejected::Unexpected { .. })
+    ));
+    assert_eq!(job, before);
+}
+
+#[test]
+fn dismiss_is_rejected_on_merged_cancelled_and_live_jobs() {
+    let mut merged = watching(9);
+    apply(&mut merged, Event::Merged);
+
+    for mut job in [
+        merged,
+        cancelled_job(),
+        implementing(&["only"]),
+        watching(9),
+    ] {
+        let before = job.clone();
+        assert!(matches!(
+            job.apply(Event::Dismiss),
+            Err(Rejected::Unexpected { .. })
+        ));
+        assert_eq!(job, before, "dismiss changed {:?}", before.stage());
+    }
+}
+
+#[test]
+fn retry_clears_the_dismissal_and_a_later_failure_is_not_dismissed() {
+    let mut job = implementing(&["only"]);
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+    apply(&mut job, Event::Dismiss);
+    assert!(job.is_dismissed());
+
+    apply(&mut job, Event::Retry);
+    assert!(!job.is_dismissed());
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 0 });
+
+    // Failing again starts a fresh, non-dismissed failure.
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert!(!job.is_dismissed());
+}
+
+#[test]
+fn a_stored_failed_job_without_the_dismissed_field_loads_as_not_dismissed() {
+    let mut job = closed_unmerged_job();
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    let mut value: serde_json::Value = serde_json::to_value(&job).unwrap();
+    value["stage"]["Failed"]
+        .as_object_mut()
+        .unwrap()
+        .remove("dismissed")
+        .unwrap();
+
+    let loaded: Job = serde_json::from_value(value).unwrap();
+    assert_eq!(loaded, job);
+    assert!(!loaded.is_dismissed());
+
+    // The flag still applies once read back.
+    apply(&mut job, Event::Dismiss);
+    assert!(job.is_dismissed());
 }
 
 fn closed_unmerged_job() -> Job {

@@ -114,6 +114,7 @@ pub fn app(
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/retry", post(retry))
+        .route("/jobs/{id}/dismiss", post(dismiss))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(settings_home))
@@ -1038,6 +1039,18 @@ async fn retry(
     state
         .store
         .append_factory_log(id, "Retried the job from the dashboard.")?;
+    board_redirect(&state, form.project, redirect)
+}
+
+async fn dismiss(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Form(form): Form<ApproveForm>,
+) -> Result<Redirect, AppError> {
+    let redirect = apply(&state, id, Event::Dismiss)?;
+    state
+        .store
+        .append_factory_log(id, "Dismissed the job from the dashboard.")?;
     board_redirect(&state, form.project, redirect)
 }
 

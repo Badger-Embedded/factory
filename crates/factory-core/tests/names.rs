@@ -17,6 +17,7 @@ fn stages_name_themselves_like_the_job_page() {
             Stage::Failed {
                 reason: "x".into(),
                 retry: None,
+                dismissed: false,
             },
             "failed",
             None,

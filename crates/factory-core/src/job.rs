@@ -142,6 +142,12 @@ pub enum Stage {
         /// [`Job::can_retry`].
         #[serde(default)]
         retry: Option<RetryTarget>,
+        /// Whether the user dismissed the job from the Failed section of the
+        /// board. A dismissed job stays failed, with its reason and retry
+        /// target unchanged, and shows in Done. A job stored before this
+        /// field existed loads as not dismissed. See [`Event::Dismiss`].
+        #[serde(default)]
+        dismissed: bool,
     },
 }
 
@@ -411,6 +417,12 @@ pub enum Event {
     /// Resume a job that failed because it used up its failed rounds or an
     /// agent run failed. See [`Job::can_retry`].
     Retry,
+    /// Clear a failed job off the Failed section of the board without
+    /// deleting it. Sets the dismissed flag on a failed job that is not yet
+    /// dismissed; every other stage, and an already dismissed job, reject it.
+    /// The job stays failed, so its reason, retry target and directories are
+    /// unchanged. See [`Stage::Failed`].
+    Dismiss,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,6 +599,10 @@ impl Job {
             return self.retry();
         }
 
+        if let E::Dismiss = event {
+            return self.dismiss();
+        }
+
         if self.is_finished() {
             return Err(self.unexpected(event));
         }
@@ -610,13 +626,13 @@ impl Job {
                 (stage.clone(), Turn::User(Ask::Answers { questions }))
             }
             (stage, Turn::Agent(task), E::AgentFailed { reason }) => (
-                S::Failed {
+                Self::failed(
                     reason,
-                    retry: Some(RetryTarget::Agent {
+                    Some(RetryTarget::Agent {
                         stage: Box::new(stage.clone()),
                         task: Box::new(task.clone()),
                     }),
-                },
+                ),
                 Turn::Done,
             ),
 
@@ -781,10 +797,7 @@ impl Job {
                 _,
                 E::ClosedUnmerged,
             ) if pr.is_some_and(|pr| self.plan[pr].number.is_some()) => (
-                S::Failed {
-                    reason: "the pull request was closed without merging".into(),
-                    retry: None,
-                },
+                Self::failed("the pull request was closed without merging", None),
                 Turn::Done,
             ),
 
@@ -827,7 +840,7 @@ impl Job {
                 Stage::CiAndReview { pr } => Some(RetryTarget::CiAndReview { pr: *pr }),
                 _ => None,
             };
-            (Stage::Failed { reason, retry }, Turn::Done)
+            (Self::failed(reason, retry), Turn::Done)
         } else {
             (stage, next)
         }
@@ -970,6 +983,49 @@ impl Job {
         }
     }
 
+    /// A fresh, not-dismissed failed stage with `reason` and `retry`.
+    fn failed(reason: impl Into<String>, retry: Option<RetryTarget>) -> Stage {
+        Stage::Failed {
+            reason: reason.into(),
+            retry,
+            dismissed: false,
+        }
+    }
+
+    /// Applies [`Event::Dismiss`]. A failed job that is not yet dismissed
+    /// records the flag and stays failed; every other stage, and an already
+    /// dismissed job, are rejected. On `Err` the job is unchanged.
+    fn dismiss(&mut self) -> Result<(Stage, Turn), Rejected> {
+        match &self.stage {
+            Stage::Failed {
+                reason,
+                retry,
+                dismissed: false,
+            } => Ok((
+                Stage::Failed {
+                    reason: reason.clone(),
+                    retry: retry.clone(),
+                    dismissed: true,
+                },
+                self.turn.clone(),
+            )),
+            _ => Err(self.unexpected(Event::Dismiss)),
+        }
+    }
+
+    /// Whether a failed job was dismissed from the board. False for every
+    /// other stage.
+    #[must_use]
+    pub fn is_dismissed(&self) -> bool {
+        matches!(
+            self.stage,
+            Stage::Failed {
+                dismissed: true,
+                ..
+            }
+        )
+    }
+
     /// Whether a [`Event::Retry`] would resume the job. True for a stopped
     /// review on a pull request that has a number, and for a job that failed
     /// because it used up its failed rounds or an agent run failed: one with a
@@ -989,7 +1045,7 @@ impl Job {
     /// The stage and turn a retry resumes at, or `None` when the job cannot
     /// be retried.
     fn retry_step(&self) -> Option<(Stage, Turn)> {
-        let Stage::Failed { reason, retry } = &self.stage else {
+        let Stage::Failed { reason, retry, .. } = &self.stage else {
             return None;
         };
         match retry {

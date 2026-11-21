@@ -114,6 +114,7 @@ impl Event {
             Event::ClosedUnmerged => "closed-unmerged",
             Event::Cancel => "cancel",
             Event::Retry => "retry",
+            Event::Dismiss => "dismiss",
         }
     }
 }

@@ -2320,8 +2320,14 @@ fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Ma
 /// cancelled job has none, because its badge already says so.
 fn row_detail(job: &Job) -> Option<String> {
     match job.stage() {
-        Stage::Failed { reason, .. } => Some(first_line(reason)),
-        Stage::Merged | Stage::Cancelled => None,
+        // A dismissed failed job shows in Done with no detail, like merged
+        // and cancelled rows.
+        Stage::Failed {
+            reason,
+            dismissed: false,
+            ..
+        } => Some(first_line(reason)),
+        Stage::Failed { .. } | Stage::Merged | Stage::Cancelled => None,
         _ => Some(stage_label(job)),
     }
 }
@@ -2345,11 +2351,17 @@ fn row_actions(row: &JobRow, lane: Lane) -> Markup {
                 }
             }
         }
-        @if lane == Lane::Failed && row.job.can_retry() {
+        @if lane == Lane::Failed {
             div.job-actions {
-                form.retry method="post" action={ (page) "/retry" } {
+                @if row.job.can_retry() {
+                    form.retry method="post" action={ (page) "/retry" } {
+                        input type="hidden" name="project" value=(row.project);
+                        button.primary { "Retry" }
+                    }
+                }
+                form.dismiss method="post" action={ (page) "/dismiss" } {
                     input type="hidden" name="project" value=(row.project);
-                    button.primary { "Retry" }
+                    button { "Dismiss" }
                 }
             }
         }
@@ -3136,28 +3148,52 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
                 }
             }
         },
-        (Stage::Failed { reason, .. }, _) => html! {
-            div.card.failed {
-                div.card-head {
-                    span.badge.bad { "failed" }
-                    h2 { "The job failed" }
-                }
-                p.failure-reason { (reason) }
-                @if job.can_retry() {
-                    div.row.actions {
-                        form method="post" action={ "/jobs/" (id) "/retry" } {
-                            button.primary { "Retry" }
-                        }
-                    }
-                }
-            }
-        },
+        (
+            Stage::Failed {
+                reason, dismissed, ..
+            },
+            _,
+        ) => failed_card(id, job, reason, *dismissed),
         _ => html! {
             div.card.status {
                 (turn_badge(job, auto_merge))
                 span.status-detail { (turn_detail(job, settings, auto_merge)) }
             }
         },
+    }
+}
+
+/// The failure card of a failed job. A dismissed job says it was dismissed
+/// and keeps its reason and Retry, with no Dismiss; a live failure shows
+/// Dismiss next to Retry, or Dismiss alone when it cannot retry.
+fn failed_card(id: i64, job: &Job, reason: &str, dismissed: bool) -> Markup {
+    html! {
+        div.card.failed {
+            div.card-head {
+                @if dismissed {
+                    span.badge.factory { "dismissed" }
+                    h2 { "The job was dismissed" }
+                } @else {
+                    span.badge.bad { "failed" }
+                    h2 { "The job failed" }
+                }
+            }
+            p.failure-reason { (reason) }
+            @if job.can_retry() || !dismissed {
+                div.row.actions {
+                    @if job.can_retry() {
+                        form method="post" action={ "/jobs/" (id) "/retry" } {
+                            button.primary { "Retry" }
+                        }
+                    }
+                    @if !dismissed {
+                        form method="post" action={ "/jobs/" (id) "/dismiss" } {
+                            button { "Dismiss" }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3181,6 +3217,12 @@ struct Status {
 fn status(job: &Job, auto_merge: bool) -> Status {
     let (lane, class, text) = match (job.stage(), job.turn()) {
         (Stage::Merged, _) => (Lane::Done, "ok", "merged"),
+        (
+            Stage::Failed {
+                dismissed: true, ..
+            },
+            _,
+        ) => (Lane::Done, "factory", "dismissed"),
         (Stage::Failed { .. }, _) => (Lane::Failed, "bad", "failed"),
         (Stage::Cancelled, _) => (Lane::Done, "factory", "cancelled"),
         (Stage::Requested, _) => (Lane::Factory, "factory", "queued"),
