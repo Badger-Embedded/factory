@@ -1,3 +1,5 @@
+mod support;
+
 use std::future::{Future, ready};
 
 use factory_server::{
@@ -216,18 +218,10 @@ async fn unreadable_branch_rules_are_only_a_warning() {
     assert!(report.warnings[0].contains("Upgrade to GitHub Pro"));
 }
 
-/// A test that writes and runs a fake `gh` holds this lock. A script file that
-/// is still open for writing in a forked child cannot be executed, and the
-/// child lives until its exec, so a parallel test can make the run fail with
-/// "Text file busy".
-static SCRIPTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// A `gh` stand-in that answers each `gh api <path>` the way GitHub answers
 /// for a private repository on a free plan: the rules endpoint returns 403.
 /// `forbid` names one more path that returns 403.
 fn fake_gh(dir: &std::path::Path, forbid: &str) -> GhRepos {
-    use std::os::unix::fs::PermissionsExt;
-    let path = dir.join("gh");
     let script = format!(
         r#"#!/bin/sh
 forbidden() {{
@@ -244,17 +238,14 @@ case "$2" in
 esac
 "#
     );
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     GhRepos {
-        gh: path,
+        gh: support::executable(dir, "gh", &script),
         token: None,
     }
 }
 
 #[tokio::test]
 async fn gh_reads_a_forbidden_rules_endpoint_as_unknown_protection() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let gh = fake_gh(dir.path(), "");
     let report = check_repo(&gh, "o/r", "main").await.unwrap();
@@ -270,7 +261,6 @@ async fn gh_reads_a_forbidden_rules_endpoint_as_unknown_protection() {
 
 #[tokio::test]
 async fn gh_still_fails_on_a_forbidden_repository() {
-    let _serial = SCRIPTS.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let gh = fake_gh(dir.path(), "repos/o/r");
     let err = check_repo(&gh, "o/r", "main").await.unwrap_err();
