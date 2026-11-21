@@ -14,26 +14,27 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn plugin_dir() -> PathBuf {
-    repo_root().join("plugin")
+fn agents_dir() -> PathBuf {
+    repo_root().join("agents")
 }
 
 #[test]
-fn the_plugin_ships_the_review_skills_and_schema() {
-    let plugin = plugin_dir();
+fn the_directory_ships_the_review_skills_and_schema() {
+    let agents = agents_dir();
     for file in [
         ".claude-plugin/plugin.json",
         "skills/review/SKILL.md",
         "skills/comment-review/SKILL.md",
         "schemas/review.json",
+        "README.md",
     ] {
-        assert!(plugin.join(file).is_file(), "plugin is missing {file}");
+        assert!(agents.join(file).is_file(), "agents is missing {file}");
     }
 }
 
 #[test]
 fn the_manifest_names_the_factory_plugin() {
-    let text = fs::read_to_string(plugin_dir().join(".claude-plugin/plugin.json")).unwrap();
+    let text = fs::read_to_string(agents_dir().join(".claude-plugin/plugin.json")).unwrap();
     let manifest: Value = serde_json::from_str(&text).expect("plugin.json parses");
     assert_eq!(manifest["name"], "factory");
 }
@@ -42,7 +43,7 @@ fn the_manifest_names_the_factory_plugin() {
 fn each_skill_declares_its_name() {
     for name in ["review", "comment-review"] {
         let skill =
-            fs::read_to_string(plugin_dir().join("skills").join(name).join("SKILL.md")).unwrap();
+            fs::read_to_string(agents_dir().join("skills").join(name).join("SKILL.md")).unwrap();
         assert!(
             skill.contains(&format!("name: {name}")),
             "the {name} skill does not name itself"
@@ -51,8 +52,23 @@ fn each_skill_declares_its_name() {
 }
 
 #[test]
+fn no_bundled_skill_names_claude_md_as_the_only_rules_file() {
+    for name in ["review", "comment-review"] {
+        let skill =
+            fs::read_to_string(agents_dir().join("skills").join(name).join("SKILL.md")).unwrap();
+        if skill.contains("CLAUDE.md") {
+            assert!(
+                skill.contains("AGENTS.md"),
+                "the {name} skill names CLAUDE.md without AGENTS.md, so a Codex run reads the \
+                 wrong rules file"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_review_schema_parses_and_offers_approve_or_changes() {
-    let text = fs::read_to_string(plugin_dir().join("schemas/review.json")).unwrap();
+    let text = fs::read_to_string(agents_dir().join("schemas/review.json")).unwrap();
     let schema: Value = serde_json::from_str(&text).expect("the review schema parses");
     let outcomes = schema["properties"]["outcome"]["enum"]
         .as_array()
@@ -67,17 +83,17 @@ fn the_review_schema_parses_and_offers_approve_or_changes() {
 }
 
 #[test]
-fn the_worker_image_bundles_the_plugin() {
+fn the_worker_image_bundles_the_agents_directory() {
     let containerfile =
         fs::read_to_string(repo_root().join("containers/worker/Containerfile")).unwrap();
     assert!(
-        containerfile.contains("COPY") && containerfile.contains("plugin"),
-        "the worker Containerfile does not copy the plugin into the image"
+        containerfile.contains("COPY") && containerfile.contains("agents"),
+        "the worker Containerfile does not copy the agents directory into the image"
     );
     let install = fs::read_to_string(repo_root().join("deploy/install.sh")).unwrap();
     assert!(
         install.contains("containers/worker/Containerfile"),
-        "install.sh must build the worker from the repository root so the COPY sees plugin/"
+        "install.sh must build the worker from the repository root so the COPY sees agents/"
     );
 }
 

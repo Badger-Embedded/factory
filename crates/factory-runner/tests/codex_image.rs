@@ -78,8 +78,8 @@ fn the_image_links_the_factory_skills_for_codex() {
         "the image does not install the factory skills under /etc/codex/skills"
     );
     assert!(
-        text.contains("ln -s /factory-plugin/skills /etc/codex/skills/factory"),
-        "the factory skills are not linked from the bundled plugin"
+        text.contains("ln -s /factory-agents/skills /etc/codex/skills/factory"),
+        "the factory skills are not linked from the bundled agents directory"
     );
 }
 

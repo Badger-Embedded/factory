@@ -65,7 +65,7 @@ impl Expect {
     }
 
     /// The JSON Schema passed to `claude --json-schema`. The review schema
-    /// matches `plugin/schemas/review.json`, which the review skill cites.
+    /// matches `agents/schemas/review.json`, which the review skill cites.
     #[must_use]
     pub fn schema(self) -> Value {
         if self == Expect::Review {

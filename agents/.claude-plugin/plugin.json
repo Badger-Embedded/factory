@@ -1,0 +1,5 @@
+{
+  "name": "factory",
+  "version": "0.1.0",
+  "description": "The factory's own skills for its worker runs, Claude Code or Codex. It ships the review and comment-review skills the reviewer uses before a merge."
+}

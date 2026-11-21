@@ -1,5 +1,0 @@
-{
-  "name": "factory",
-  "version": "0.1.0",
-  "description": "The factory's own skills for its Claude Code worker runs. It ships the review and comment-review skills the reviewer uses before a merge."
-}

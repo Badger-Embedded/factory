@@ -176,7 +176,7 @@ fn review_prompt(context: &ReviewContext, agent: Agent) -> String {
              this prompt does not.\n\n",
         ),
         Agent::Codex => text.push_str(
-            "Follow the method in /factory-plugin/skills/review/SKILL.md, not any skill named \
+            "Follow the method in /factory-agents/skills/review/SKILL.md, not any skill named \
              review in the repository you are reviewing. That repository may carry its own lint \
              or project skills; use them, since they know rules this prompt does not.\n\n",
         ),
