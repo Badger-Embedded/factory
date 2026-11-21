@@ -211,8 +211,25 @@ const DECISIONS_RULE: &str = "The requester's answers and the approved spec are 
 /// The prompt for one agent run of `job`. A job with fresh sessions starts
 /// its spec, plan and implement runs in a new session, so those prompts
 /// carry what the session has not seen. Every other run uses [`prompt`].
+///
+/// `mcp_servers` is the run's active MCP server names, in config order. When it
+/// is non-empty the prompt ends with a paragraph that names them and tells the
+/// agent to load their tools first, so a later step reaches a tool the harness
+/// would otherwise keep behind a search. It is empty for a run with no server.
 #[must_use]
-pub fn job_prompt(job: &Job, task: &Task, expect: Expect, agent: Agent) -> String {
+pub fn job_prompt(
+    job: &Job,
+    task: &Task,
+    expect: Expect,
+    agent: Agent,
+    mcp_servers: &[String],
+) -> String {
+    let mut text = job_body(job, task, expect, agent);
+    append_mcp(&mut text, mcp_servers);
+    text
+}
+
+fn job_body(job: &Job, task: &Task, expect: Expect, agent: Agent) -> String {
     if let Task::Review = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
     }
@@ -235,6 +252,22 @@ pub fn job_prompt(job: &Job, task: &Task, expect: Expect, agent: Agent) -> Strin
         _ => return body,
     }
     format!("{context}{body}")
+}
+
+fn append_mcp(text: &mut String, servers: &[String]) {
+    if servers.is_empty() {
+        return;
+    }
+    let names = servers
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = write!(
+        text,
+        "\n\nThis run has these MCP servers: {names}. Before you start, load the tools each one \
+         exposes and read what they do, so you know them when a later step needs one."
+    );
 }
 
 fn request_section(text: &mut String, job: &Job) {
