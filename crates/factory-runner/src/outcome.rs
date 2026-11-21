@@ -109,9 +109,13 @@ impl Expect {
                         "type": "object",
                         "properties": {
                             "title": { "type": "string" },
-                            "summary": { "type": "string" }
+                            "summary": { "type": "string" },
+                            "notes": {
+                                "type": "string",
+                                "description": "What you found that the implementer of this pull request needs, since it starts in a new session: the files and functions to change, the tests to extend, the docs/design.md rows and sections that apply, and what an earlier pull request in this plan adds that this one builds on."
+                            }
                         },
-                        "required": ["title", "summary"],
+                        "required": ["title", "summary", "notes"],
                         "additionalProperties": false
                     }
                 });
@@ -209,6 +213,7 @@ struct Output {
 struct PlanEntry {
     title: String,
     summary: String,
+    notes: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -335,6 +340,7 @@ fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, St
                     summary: entry.summary,
                     number: None,
                     description: None,
+                    notes: entry.notes.filter(|notes| !notes.trim().is_empty()),
                 })
                 .collect(),
         )),

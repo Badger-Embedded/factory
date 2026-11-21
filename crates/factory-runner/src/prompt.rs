@@ -25,19 +25,34 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
              requests that follow the repository's CONTRIBUTING.md: one change per pull \
              request, and a large refactor first in its own pull request. Give each pull \
              request a title in the repository's title format and a summary of what it \
-             changes. Do not change any files."
+             changes. Each pull request is implemented in a new session that has not seen \
+             the repository, so give each one notes with what you found that it needs: the \
+             files and functions to change, the tests to extend, and the docs that apply. \
+             Do not change any files."
             .to_owned(),
-        Task::Implement { pr } => format!(
-            "The requester approved the plan. Implement this pull request:\n\n\
-             {}\n\n{}\n\n\
-             Follow the repository's {} and CONTRIBUTING.md, tests included. Commit \
-             your work on the current branch. Do not push or open a pull request. The \
-             factory does that with the title and description you return, so write them \
-             the way CONTRIBUTING.md asks.",
-            pr.title,
-            pr.summary,
-            agent.rules_doc()
-        ),
+        Task::Implement { pr } => {
+            let mut text = format!(
+                "The requester approved the plan. Implement this pull request:\n\n{}\n\n{}\n\n",
+                pr.title, pr.summary
+            );
+            if let Some(notes) = &pr.notes {
+                let _ = write!(
+                    text,
+                    "The planning run left these notes. It wrote them before the earlier \
+                     pull requests in the plan were implemented, so check them against the \
+                     code:\n\n{notes}\n\n"
+                );
+            }
+            let _ = write!(
+                text,
+                "Follow the repository's {} and CONTRIBUTING.md, tests included. Commit \
+                 your work on the current branch. Do not push or open a pull request. The \
+                 factory does that with the title and description you return, so write them \
+                 the way CONTRIBUTING.md asks.",
+                agent.rules_doc()
+            );
+            text
+        }
         Task::Answer { questions, answers } => {
             let mut text = "The requester answered your questions:\n".to_owned();
             for (question, answer) in questions.iter().zip(answers) {

@@ -656,6 +656,7 @@ async fn the_plan_page_lists_the_planned_pull_requests() {
             summary: "POST /reboot".into(),
             number: None,
             description: None,
+            notes: None,
         }])),
     );
 
@@ -1873,6 +1874,7 @@ async fn a_pull_request_in_review_waits_for_the_user() {
             summary: "POST /reboot".into(),
             number: None,
             description: None,
+            notes: None,
         }])),
     );
     dashboard.apply(id, Event::Approve);
@@ -2075,6 +2077,7 @@ fn planned(title: &str, number: Option<u64>) -> PlannedPr {
         summary: "summary".into(),
         number,
         description: None,
+        notes: None,
     }
 }
 
@@ -2096,6 +2099,19 @@ async fn the_job_page_links_the_project_to_its_repository() {
         page.body
             .contains(r#"<a href="https://github.com/Badger-Embedded/maestro">maestro</a>"#)
     );
+}
+
+#[tokio::test]
+async fn the_plan_card_shows_the_notes_for_the_implementer() {
+    let dashboard = dashboard();
+    let mut noted = planned("add a reboot endpoint", None);
+    noted.notes = Some("Change maestrod/src/api.rs.".into());
+    let id = with_plan(&dashboard, vec![noted, planned("add a button", None)]).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("Notes for the implementer"));
+    assert!(page.body.contains("Change maestrod/src/api.rs."));
+    assert_eq!(page.body.matches("Notes for the implementer").count(), 1);
 }
 
 #[tokio::test]
@@ -3414,6 +3430,7 @@ async fn at_publish_gate(dashboard: &Dashboard) -> i64 {
             summary: "POST /reboot".into(),
             number: None,
             description: None,
+            notes: None,
         }])),
     );
     dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(description())));

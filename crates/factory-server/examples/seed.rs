@@ -20,6 +20,16 @@ fn ready() -> PrDescription {
     }
 }
 
+fn planned(title: &str, summary: &str) -> PlannedPr {
+    PlannedPr {
+        title: title.into(),
+        summary: summary.into(),
+        number: None,
+        description: None,
+        notes: None,
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let db =
         env::var_os("FACTORY_DB").map_or_else(|| PathBuf::from("data/factory.db"), PathBuf::from);
@@ -30,18 +40,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let spec = "Goal: reboot the device under test from its page.\n\nScope:\n- A Reboot button on the device page.\n- POST /devices/{id}/reboot in maestrod.\n\nOut of scope: scheduled reboots.\n\nAcceptance:\n- The button power-cycles the DUT and the page shows it coming back.";
     let plan = vec![
-        PlannedPr {
-            title: "maestrod: add a reboot endpoint".into(),
-            summary: "POST /devices/{id}/reboot power-cycles the DUT through the relay.".into(),
-            number: None,
-            description: None,
-        },
-        PlannedPr {
-            title: "web: add a reboot button to the device page".into(),
-            summary: "Calls the new endpoint and shows the result.".into(),
-            number: None,
-            description: None,
-        },
+        planned(
+            "maestrod: add a reboot endpoint",
+            "POST /devices/{id}/reboot power-cycles the DUT through the relay.",
+        ),
+        planned(
+            "web: add a reboot button to the device page",
+            "Calls the new endpoint and shows the result.",
+        ),
     ];
     let to_spec = vec![
         Event::Start,

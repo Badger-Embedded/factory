@@ -568,6 +568,9 @@ button:hover { filter: brightness(0.96); }
 .plan { margin: 0; padding-left: var(--space-20); }
 .plan li { margin-bottom: var(--space-10); }
 .plan .summary { color: var(--muted); }
+.plan .notes { margin-top: var(--space-6); }
+.plan .notes summary { color: var(--muted); cursor: pointer; font-size: var(--font-size-sm); }
+.plan .notes pre { margin-top: var(--space-6); }
 
 .commits { margin: 0 0 var(--space-12); padding-left: var(--space-20); font: var(--font-size-sm)/1.6 var(--mono); }
 

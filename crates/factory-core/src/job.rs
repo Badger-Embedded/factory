@@ -271,6 +271,12 @@ pub struct PlannedPr {
     /// The title and description the agent wrote with its latest commits.
     #[serde(default)]
     pub description: Option<PrDescription>,
+    /// What the planning run found that the implement run would otherwise
+    /// search for again: the files and functions to change, the tests to
+    /// extend and the design rows that apply. `None` for a plan written
+    /// before this field existed.
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 /// A pull request's title and description, written by the agent to the
