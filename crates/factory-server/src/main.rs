@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
-    ClaudeToken, CurlUsageSource, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker, McpRuntime,
-    McpWarnings, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, ProxyEvent,
-    ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams,
-    UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
-    refresh_forever,
+    AgentRegistry, ClaudeToken, CurlUsageSource, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker,
+    McpRuntime, McpWarnings, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects,
+    ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
+    StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
+    master_key_from_env, proxy_app, refresh_forever,
 };
 use tokio::sync::Notify;
 
@@ -145,6 +145,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ));
     claude_token.import_env_token();
 
+    // The registry maps each agent to its credential, worker image and config
+    // directory. The executor runs agents through it; the plan usage fetch keeps
+    // its own handle on the Claude token.
+    let agents = Arc::new(AgentRegistry::new(Arc::clone(&claude_token)));
+
     // An unreachable MCP server does not fail a run; it records a warning on the
     // job. The proxy and the scheduler share this recorder so a server is warned
     // about at most once per run.
@@ -175,7 +180,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ..GitHub::default()
             },
             data_dir: data_dir.clone(),
-            token: Arc::clone(&claude_token),
+            registry: Arc::clone(&agents),
             store: Arc::clone(&store),
         };
         let scheduler = Scheduler::new(

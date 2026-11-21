@@ -14,11 +14,11 @@ use std::sync::Arc;
 use factory_core::Event;
 use factory_runner::{Expect, Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRequest, ClaudeToken, Executor, LocalSecrets, MASTER_KEY_LEN, PodmanExecutor, SecretStore,
-    Settings, Store,
+    AgentRegistry, AgentRequest, ClaudeToken, Executor, LocalSecrets, MASTER_KEY_LEN,
+    PodmanExecutor, SecretStore, Settings, Store,
 };
 
-fn executor(token: Arc<ClaudeToken>, data_dir: PathBuf, store: Arc<Store>) -> PodmanExecutor {
+fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) -> PodmanExecutor {
     PodmanExecutor {
         base: WorkerConfig::default(),
         // A missing git binary makes the checkout step fail, so a run that gets
@@ -29,7 +29,7 @@ fn executor(token: Arc<ClaudeToken>, data_dir: PathBuf, store: Arc<Store>) -> Po
         },
         github: GitHub::default(),
         data_dir,
-        token,
+        registry,
         store,
     }
 }
@@ -62,8 +62,9 @@ async fn a_run_with_no_token_fails_before_any_container() {
     let secrets: Arc<dyn SecretStore> =
         Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
     let token = Arc::new(ClaudeToken::new(secrets, None));
+    let registry = Arc::new(AgentRegistry::new(token));
     let data_dir = tempfile::tempdir().unwrap();
-    let executor = executor(token, data_dir.path().to_path_buf(), Arc::clone(&store));
+    let executor = executor(registry, data_dir.path().to_path_buf(), Arc::clone(&store));
 
     let report = executor
         .run_agent(&Settings::default(), request(), Box::new(|_| {}))
@@ -81,12 +82,9 @@ async fn a_token_saved_between_runs_reaches_the_next_run() {
     let secrets: Arc<dyn SecretStore> =
         Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
     let token = Arc::new(ClaudeToken::new(Arc::clone(&secrets), None));
+    let registry = Arc::new(AgentRegistry::new(token));
     let data_dir = tempfile::tempdir().unwrap();
-    let executor = executor(
-        Arc::clone(&token),
-        data_dir.path().to_path_buf(),
-        Arc::clone(&store),
-    );
+    let executor = executor(registry, data_dir.path().to_path_buf(), Arc::clone(&store));
 
     // No token yet: the run fails at the gate.
     let first = executor
