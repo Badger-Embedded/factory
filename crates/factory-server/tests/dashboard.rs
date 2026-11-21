@@ -5473,13 +5473,15 @@ fn usage_wrapper(body: &str) -> &str {
 async fn each_board_region_polls_its_fragment_every_five_seconds() {
     let dashboard = dashboard();
     let body = dashboard.get("/").await.body;
+    // The plan usage wrapper keeps a fixed URL and sends its version in
+    // `hx-vals`; the other three carry the version in the poll URL as `&v=`.
+    assert!(body.contains("hx-get=\"/fragments/plan-usage\""));
     for url in [
-        "/fragments/plan-usage",
         "/fragments/stats?project=maestro",
         "/fragments/board?project=maestro",
         "/fragments/workers?project=maestro",
     ] {
-        assert!(body.contains(&format!("hx-get=\"{url}\"")), "{url}");
+        assert!(body.contains(&format!("hx-get=\"{url}&amp;v=")), "{url}");
     }
     // One trigger per region: the worker tiles, the usage meters, the job
     // rows and the totals line.
@@ -5498,7 +5500,7 @@ fn worker_tiles(body: &str) -> &str {
 async fn the_board_shows_one_idle_tile_per_worker_slot() {
     let body = dashboard().get("/").await.body;
     let tiles = worker_tiles(&body);
-    assert!(tiles.contains("hx-get=\"/fragments/workers?project=maestro\""));
+    assert!(tiles.contains("hx-get=\"/fragments/workers?project=maestro&amp;v="));
     assert_eq!(tiles.matches("<li class=\"worker idle\">").count(), 2);
     assert!(tiles.contains("Worker 1"));
     assert!(tiles.contains("Worker 2"));
@@ -5628,7 +5630,7 @@ async fn a_board_fragment_is_a_plain_get_of_only_that_region() {
     assert!(
         reply
             .body
-            .contains("hx-get=\"/fragments/board?project=maestro\"")
+            .contains("hx-get=\"/fragments/board?project=maestro&amp;v=")
     );
 }
 
@@ -5670,6 +5672,142 @@ async fn the_plan_usage_fragment_appears_once_a_run_reports() {
     assert!(reported.contains("<section class=\"plan-usage\">"));
     assert!(reported.contains("Claude plan usage"));
     assert!(reported.contains("Fable"));
+}
+
+/// The version a region's markup carries in its poll URL. The `&` renders as
+/// `&amp;` in the attribute, so the marker matches the escaped form.
+fn url_version(body: &str) -> String {
+    let marker = "&amp;v=";
+    let start = body.find(marker).expect("a region version") + marker.len();
+    body[start..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect()
+}
+
+/// The version the plan usage tile carries in its hidden marker, which the
+/// wrapper's `hx-vals` sends on the next poll.
+fn data_version(body: &str) -> String {
+    let marker = "data-version=\"";
+    let start = body.find(marker).expect("a usage version") + marker.len();
+    body[start..].chars().take_while(|c| *c != '"').collect()
+}
+
+#[tokio::test]
+async fn a_board_poll_with_the_current_version_is_a_204() {
+    let dashboard = dashboard();
+    dashboard.new_job().await;
+    let region = dashboard.get("/fragments/board?project=maestro").await;
+    assert_eq!(region.status, StatusCode::OK);
+    let version = url_version(&region.body);
+
+    // The version the page already shows: nothing to redraw, so htmx is told
+    // not to swap with an empty 204.
+    let same = dashboard
+        .get(&format!("/fragments/board?project=maestro&v={version}"))
+        .await;
+    assert_eq!(same.status, StatusCode::NO_CONTENT);
+    assert_eq!(same.body, "");
+
+    // A stale version, and a missing one, get the region markup to swap in.
+    let stale = dashboard
+        .get("/fragments/board?project=maestro&v=deadbeefdeadbeef")
+        .await;
+    assert_eq!(stale.status, StatusCode::OK);
+    assert!(stale.body.contains("class=\"board\""));
+    let missing = dashboard.get("/fragments/board?project=maestro").await;
+    assert_eq!(missing.status, StatusCode::OK);
+    assert!(missing.body.contains("class=\"board\""));
+}
+
+#[tokio::test]
+async fn the_board_version_changes_when_a_job_changes_stage() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let before = url_version(&dashboard.get("/fragments/board?project=maestro").await.body);
+
+    to_spec_approval(&dashboard, id);
+    let after = url_version(&dashboard.get("/fragments/board?project=maestro").await.body);
+    assert_ne!(
+        before, after,
+        "the rendered markup changed, so its version must"
+    );
+
+    // The version from before the change is now stale, so the poll that sent
+    // it gets the new markup rather than a 204.
+    let stale = dashboard
+        .get(&format!("/fragments/board?project=maestro&v={before}"))
+        .await;
+    assert_eq!(stale.status, StatusCode::OK);
+    let current = dashboard
+        .get(&format!("/fragments/board?project=maestro&v={after}"))
+        .await;
+    assert_eq!(current.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn the_worker_and_stats_polls_answer_204_when_unchanged() {
+    let dashboard = dashboard();
+    for region in ["workers", "stats"] {
+        let url = format!("/fragments/{region}?project=maestro");
+        let version = url_version(&dashboard.get(&url).await.body);
+        let same = dashboard.get(&format!("{url}&v={version}")).await;
+        assert_eq!(same.status, StatusCode::NO_CONTENT, "{region}");
+        assert!(same.body.is_empty(), "{region}");
+        let stale = dashboard.get(&format!("{url}&v=0000000000000000")).await;
+        assert_eq!(stale.status, StatusCode::OK, "{region}");
+    }
+}
+
+#[tokio::test]
+async fn the_workers_version_changes_when_a_slot_fills() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let before = url_version(
+        &dashboard
+            .get("/fragments/workers?project=maestro")
+            .await
+            .body,
+    );
+
+    dashboard.apply(id, Event::Start);
+    dashboard.slots.take(id, now());
+    let after = url_version(
+        &dashboard
+            .get("/fragments/workers?project=maestro")
+            .await
+            .body,
+    );
+    assert_ne!(before, after, "a busy tile differs from an idle one");
+}
+
+#[tokio::test]
+async fn a_plan_usage_poll_with_the_current_version_is_a_204() {
+    let dashboard = dashboard();
+    dashboard.usage.record(usage(USAGE_WITH_FABLE), REPORTED_AT);
+    let region = dashboard.get("/fragments/plan-usage").await;
+    assert_eq!(region.status, StatusCode::OK);
+    let version = data_version(&region.body);
+
+    let same = dashboard
+        .get(&format!("/fragments/plan-usage?v={version}"))
+        .await;
+    assert_eq!(same.status, StatusCode::NO_CONTENT);
+    assert_eq!(same.body, "");
+
+    let stale = dashboard
+        .get("/fragments/plan-usage?v=0000000000000000")
+        .await;
+    assert_eq!(stale.status, StatusCode::OK);
+    assert!(stale.body.contains("Claude plan usage"));
+
+    // A later report moves the "as of" time to a new minute, so it changes the
+    // rendered markup and with it the version.
+    dashboard
+        .usage
+        .record(usage(USAGE_WITH_FABLE), REPORTED_AT + 60);
+    let next = data_version(&dashboard.get("/fragments/plan-usage").await.body);
+    assert_ne!(version, next);
 }
 
 // --- Onboarding wizard ---

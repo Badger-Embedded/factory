@@ -52,12 +52,51 @@ const DETAILS_STATE: &str = include_str!("../static/details-state.js");
 /// shows without a reload.
 const POLL_TRIGGER: &str = "every 5s";
 
-fn fragment_url(region: &str, project: &str) -> String {
+/// A board region that polls itself, paired with a version of its content. The
+/// version is a hash of the region's inner markup, so it changes whenever the
+/// rendered content changes — a worker's "2 min" counter, a usage window passing
+/// its reset time — but not when a reader opens a `<details>`, which the server
+/// always renders closed. The region's poll sends the version it holds, and the
+/// handler answers `204 No Content` when it still matches, so htmx leaves the
+/// region's DOM alone. See "Dashboard updates" in `docs/design.md`.
+pub struct Region {
+    pub version: String,
+    pub markup: Markup,
+}
+
+impl maud::Render for Region {
+    fn render_to(&self, buffer: &mut String) {
+        buffer.push_str(&self.markup.0);
+    }
+}
+
+/// A region's version: a short hash of its inner markup. It is computed from the
+/// server's markup alone, so a `<details>` a reader opened does not change it,
+/// and it is deterministic within the process, so the handler that renders a
+/// region recomputes the same value a page earlier sent.
+fn version_of(inner: &Markup) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    inner.0.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The URL a region polls: its fragment route, the selected project, and the
+/// version of the content on the page, so the handler can answer 204 when the
+/// version still matches.
+fn fragment_url(region: &str, project: &str, version: &str) -> String {
     format!(
-        "/fragments/{region}?project={}",
+        "/fragments/{region}?project={}&v={version}",
         crate::web::query_escape(project)
     )
 }
+
+/// The `hx-vals` that makes the plan usage poll send the version of the tile now
+/// on the page. The `#usage` wrapper stays put and htmx swaps its contents, so
+/// the version travels in a `data-version` on the swapped-in marker rather than
+/// in the poll URL. htmx evaluates this before each poll.
+const USAGE_VERSION_VALS: &str =
+    "js:{v: document.querySelector('#usage [data-version]')?.dataset.version ?? ''}";
 
 fn layout(user: &str, title: &str, body: &Markup) -> Markup {
     page(user, title, &html! {}, body)
@@ -168,7 +207,7 @@ pub struct Workers {
 /// long it has held the slot. Slots are account-wide, so a job of another
 /// project shows that project's name. A job waiting for you holds no slot,
 /// so a full row of busy tiles is why a new job has not started.
-pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Markup {
+pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Region {
     let count = workers.limit.max(
         workers
             .busy
@@ -177,11 +216,9 @@ pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Markup {
             .max()
             .unwrap_or(0),
     );
-    html! {
-        section.workers #workers hx-get=(fragment_url("workers", project))
-            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
-            h2.visually-hidden { "Workers" }
-            ul.worker-slots {
+    let inner = html! {
+        h2.visually-hidden { "Workers" }
+        ul.worker-slots {
                 @for number in 1..=count {
                     @let slot = workers.busy.iter().find(|slot| slot.number == number);
                     @let row = slot.and_then(|slot| jobs.iter().find(|row| row.id == slot.job_id));
@@ -213,8 +250,15 @@ pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Markup {
                     }
                 }
             }
+    };
+    let version = version_of(&inner);
+    let markup = html! {
+        section.workers #workers hx-get=(fragment_url("workers", project, &version))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
+            (inner)
         }
-    }
+    };
+    Region { version, markup }
 }
 
 /// `seconds` as "under a minute", "12 min" or "2 h 5 min".
@@ -261,7 +305,7 @@ const NO_VALUE: &str = "–";
 /// The project's totals as one line under the board. A figure that is zero
 /// or would divide by zero shows a dash.
 #[allow(clippy::cast_precision_loss, reason = "job counts stay far below 2^52")]
-pub fn stats(totals: ProjectTotals, project: &str) -> Markup {
+pub fn stats(totals: ProjectTotals, project: &str) -> Region {
     let created = totals.jobs_created;
     let merged = totals.jobs_merged;
     let average = (merged > 0).then(|| format_cost(totals.usd / merged as f64));
@@ -280,17 +324,22 @@ pub fn stats(totals: ProjectTotals, project: &str) -> Markup {
             average.unwrap_or_else(|| NO_VALUE.to_owned()),
         ),
     ];
-    html! {
-        dl.totals #stats hx-get=(fragment_url("stats", project))
-            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
-            @for (label, value) in figures {
-                div.total {
-                    dt { (label) }
-                    dd { (value) }
-                }
+    let inner = html! {
+        @for (label, value) in figures {
+            div.total {
+                dt { (label) }
+                dd { (value) }
             }
         }
-    }
+    };
+    let version = version_of(&inner);
+    let markup = html! {
+        dl.totals #stats hx-get=(fragment_url("stats", project, &version))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
+            (inner)
+        }
+    };
+    Region { version, markup }
 }
 
 /// What the plan usage tile renders: the last snapshot and the time the page
@@ -307,19 +356,29 @@ pub struct UsageTile {
 /// tile while the wrapper keeps polling.
 fn plan_usage_region(usage: Option<&UsageTile>) -> Markup {
     html! {
-        div #usage hx-get="/fragments/plan-usage" hx-trigger=(POLL_TRIGGER) {
+        div #usage hx-get="/fragments/plan-usage" hx-trigger=(POLL_TRIGGER)
+            hx-vals=(USAGE_VERSION_VALS) {
             (plan_usage(usage))
         }
     }
 }
 
-/// The plan usage tile, or nothing when the handler passes `None`.
-pub fn plan_usage(usage: Option<&UsageTile>) -> Markup {
-    html! {
+/// The plan usage tile, or nothing when the handler passes `None`, with a hidden
+/// marker that carries the content's version. The `#usage` wrapper swaps its
+/// contents in place, so the marker is where the next poll reads the version
+/// from, see `USAGE_VERSION_VALS`.
+pub fn plan_usage(usage: Option<&UsageTile>) -> Region {
+    let inner = html! {
         @if let Some(usage) = usage {
             (plan_usage_panel(usage))
         }
-    }
+    };
+    let version = version_of(&inner);
+    let markup = html! {
+        (inner)
+        span.usage-version.visually-hidden data-version=(version) {}
+    };
+    Region { version, markup }
 }
 
 /// The account-wide panel of Claude subscription limits: the 5-hour window,
@@ -1884,7 +1943,7 @@ pub fn board(
     costs: &HashMap<i64, f64>,
     auto_merge: bool,
     project: &str,
-) -> Markup {
+) -> Region {
     let in_section = |section: Section| -> Vec<&JobRow> {
         rows.iter()
             .copied()
@@ -1892,31 +1951,36 @@ pub fn board(
             .collect()
     };
     let live = rows.iter().any(|row| !row.job.is_finished());
-    html! {
-        div.board #board hx-get=(fragment_url("board", project))
-            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
-            @if !live {
-                p.board-quiet { "Nothing needs you and no job is running." }
-            }
-            @for section in Section::ALL {
-                @let jobs = in_section(section);
-                @if !jobs.is_empty() {
-                    section class={ "inbox inbox-" (section.name()) } {
-                        h2 { (section.title()) " " span.count { (jobs.len()) } }
-                        @if section == Section::Done && jobs.len() > DONE_SHOWN {
-                            (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge))
-                            details.older data-key=(section.name()) {
-                                summary { "Show " (jobs.len() - DONE_SHOWN) " older" }
-                                (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge))
-                            }
-                        } @else {
-                            (job_rows(&jobs, costs, auto_merge))
+    let inner = html! {
+        @if !live {
+            p.board-quiet { "Nothing needs you and no job is running." }
+        }
+        @for section in Section::ALL {
+            @let jobs = in_section(section);
+            @if !jobs.is_empty() {
+                section class={ "inbox inbox-" (section.name()) } {
+                    h2 { (section.title()) " " span.count { (jobs.len()) } }
+                    @if section == Section::Done && jobs.len() > DONE_SHOWN {
+                        (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge))
+                        details.older data-key=(section.name()) {
+                            summary { "Show " (jobs.len() - DONE_SHOWN) " older" }
+                            (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge))
                         }
+                    } @else {
+                        (job_rows(&jobs, costs, auto_merge))
                     }
                 }
             }
         }
-    }
+    };
+    let version = version_of(&inner);
+    let markup = html! {
+        div.board #board hx-get=(fragment_url("board", project, &version))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
+            (inner)
+        }
+    };
+    Region { version, markup }
 }
 
 fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Markup {
