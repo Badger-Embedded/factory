@@ -135,7 +135,7 @@ impl PodmanExecutor {
     /// run goes on; only Codex reads `AGENTS.md`, so it is a no-op for Claude.
     fn warn_missing_agents_md(&self, agent: Agent, workspace: &Path, job_id: i64) {
         if agent == Agent::Codex
-            && !workspace.join("AGENTS.md").exists()
+            && !workspace.join(agent.rules_doc()).exists()
             && let Err(err) = self.store.append_factory_log(
                 job_id,
                 "This repository has no AGENTS.md, so Codex runs without its instructions.",
