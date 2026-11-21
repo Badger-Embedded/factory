@@ -10,7 +10,7 @@ These decisions were made on 2026-11-19 while brainstorming in the maestro repos
 
 | Topic | Decision |
 | --- | --- |
-| Agent runtime | Agents run in rootless podman worker containers. Everything agent-specific sits behind one agent interface in `factory-runner`, the `AgentBackend` trait: the command after the image, the credential and config-directory environment variable names, the session-resume check, and the parser that turns the agent's stdout into the generic items the worker consumes. `worker.rs` keeps the generic `podman run` flags and names no one agent. Claude Code is the first agent and the only one that runs; see "Running Claude Code in a worker" for its implementation. Claude Managed Agents was considered and rejected in favor of local Claude Code on our own hardware. |
+| Agent runtime | Agents run in rootless podman worker containers. Everything agent-specific sits behind one agent interface in `factory-runner`, the `AgentBackend` trait: the command after the image, the credential and config-directory environment variable names, the session-resume check, and the parser that turns the agent's stdout into the generic items the worker consumes. `worker.rs` keeps the generic `podman run` flags and names no one agent. Claude Code is the first agent and the only one that runs; see "Running Claude Code in a worker" for its implementation. Claude Managed Agents was considered and rejected in favor of local Claude Code on our own hardware. The worker image now also ships a pinned Codex CLI and the factory review skills, ahead of the `AgentBackend` that runs Codex; see "Running Codex in a worker". |
 | Agent registry | `AgentRegistry` in `factory-server` maps each agent to what the server needs to run and present it: the credential, the worker image, the host config directory, the settings page URL, and the model aliases and effort levels the stage panel offers. It holds the `ClaudeToken` resolver and is built once at startup. For Claude the credential is that resolved token, the image is the `worker_image` setting from the Workers page, the host config directory and the stdout parser come from `factory-runner`'s `AgentBackend` (see "Agent runtime"), the settings page is `/settings/agents/claude`, the model aliases are fable, opus, sonnet and haiku, and the effort levels are the ones `factory-core` exposes. The podman executor reads the credential, the image and the host config directory from the registry rather than naming Claude, so no Claude-specific flag, env var or path lives in `podman.rs`. A run whose agent resolves no credential fails before any checkout or container; Claude's reason is "no Claude token is set". Codex is in the registry as the place the next agent goes: it has no credential, image or settings page, and its entry reports that it cannot run. |
 | Host | `moon.local` (`ssh moon@moon.local`): Ubuntu 26.04, x86_64, 8 cores, 7.2 GB RAM, 74 GB free disk, systemd linger on for user `moon`. Tailscale is up at `100.77.68.75`. |
 | Factory process | A Rust binary in its own container, run as a Quadlet systemd user service. It starts worker containers through the user's `podman.socket`. |
@@ -94,7 +94,7 @@ moon.local (rootless podman, user moon)
 │    holds the master key that decrypts per-project MCP header values
 │    runs the MCP proxy on its own port, which adds a project's stored headers
 └─ worker containers, one per job stage, started by the factory
-     image: Claude Code, git, nix, unzip
+     image: Claude Code, Codex, git, nix, unzip
      mounts: job workspace, shared /nix store volume, cargo cache per project, factory plugin (read-only)
      network: the shared factory podman network, to reach the MCP proxy but not the dashboard
      env: the Claude token the factory resolves, see Claude auth, and an MCP config pointing at the proxy with a per-run token when a server is active
@@ -142,6 +142,43 @@ This is the Claude agent's implementation of the `AgentBackend` interface, see "
 - The target repository's own `CLAUDE.md` and project skills still load. maestro has its own `no-comments` and `open-pr` skills, so the factory's plugin namespaces its versions as `factory:no-comments` and `factory:open-pr`.
 - Claude Code hooks run under whatever shell the container has, without the nix devShell. Write hook scripts for plain bash and test them that way.
 
+## Running Codex in a worker
+
+The worker image carries Codex next to Claude Code. The `AgentBackend` that drives it, the login storage, the settings page and the cost estimate land in later pull requests; this is the image groundwork and the facts the backend builds on.
+
+- The image installs one pinned Codex release, set by the `CODEX_VERSION` build arg (`0.165.0`). It downloads the `codex-x86_64-unknown-linux-musl` tarball from the `rust-v<version>` GitHub release, installs the single binary as `/usr/local/bin/codex`, and fails the build if `codex --version` does not report that version. moon is x86_64, so the image pins that one asset rather than detect the architecture.
+- The image creates `/codex`, owned by the worker user, the way it creates `/claude`. The Codex backend mounts the job's `codex` directory there as `CODEX_HOME`.
+- The image links the bundled review skills to `/etc/codex/skills/factory`, a symlink to `/factory-plugin/skills`. Codex reads skills from `/etc/codex/skills` and `~/.agents/skills`, so a review run finds `review` and `comment-review` there without the `--plugin-dir` flag Claude uses. `/etc/codex/skills/factory/review/SKILL.md` resolves through the symlink.
+
+### Codex CLI facts (rust-v0.165.0)
+
+These were checked by running the pinned `codex-x86_64-unknown-linux-musl` binary (`codex-cli 0.165.0`). A full run needs the ChatGPT login, which this build does not have, so the token-accounting facts are checked against the documentation and confirmed from an authenticated capture on moon in the backend pull request.
+
+Confirmed against the binary:
+
+- `codex exec` accepts `--json`, `--output-schema <FILE>`, `--dangerously-bypass-approvals-and-sandbox`, `-m/--model <MODEL>` and `-c key=value` overrides. `codex exec resume <SESSION_ID> [PROMPT]` takes a session UUID or a thread name.
+- `codex login --device-auth` exists for a machine with no browser. `codex login --with-access-token` reads a Business access token from stdin; it is out of scope for now.
+- `--json` writes JSON Lines. The captured envelopes are in `crates/factory-runner/tests/fixtures/codex-exec-auth-failure.jsonl`: `{"type":"thread.started","thread_id":"<uuid>"}`, `{"type":"turn.started"}`, `{"type":"item.completed","item":{"id":"<id>","type":"error","message":"..."}}`, a top-level `{"type":"error","message":"..."}`, and `{"type":"turn.failed","error":{"message":"..."}}`. The run authenticated against `api.openai.com` with no login and ended at `turn.failed`, so the capture stops before the success-path lines.
+- Codex assigns the session id and reports it in `thread.started.thread_id`, so the factory learns it from the stream and cannot pass it in advance, as the spec expected.
+- `cli_auth_credentials_store = "file"` in `config.toml` is accepted, and `-c` overrides nested keys through dotted TOML paths.
+
+Differences from the spec's expectations:
+
+- The default model is `gpt-6.1-sol`, printed in the run header, not a `gpt-5-codex` id. The Codex model suggestions in the registry should track this CLI's `gpt-6` family.
+- The CLI does not validate `model_reasoning_effort`: `-c model_reasoning_effort=bogus` was accepted and the run header printed `reasoning effort: bogus`. The model's server rejects an unsupported level at request time, so the allowed levels cannot be read from the CLI. OpenAI's model page lists `low`, `medium` (default), `high`, `xhigh` and `max` for `gpt-6.1-sol`, and says `none` and `minimal` are not supported. This differs from the spec's expected `minimal, low, medium, high, xhigh`; the effort-levels pull request uses the model-supported set.
+- `turn.failed` carries the reason under `error.message`, and `item.completed` wraps the item under `item`. The parser reads those paths.
+
+Not confirmable without an authenticated run, deferred to the moon capture in the backend pull request:
+
+- `turn.completed` and its `usage` fields, and whether `cached_input_tokens` is part of `input_tokens` and `reasoning_output_tokens` part of `output_tokens`. The unauthenticated run never reached `turn.completed`, so the cost formula stays unconfirmed.
+- The success-path item types `agent_message`, `command_execution`, `file_change`, `mcp_tool_call`, `web_search` and `todo_list`.
+- Whether the final message conforms to `--output-schema`.
+
+Operational notes:
+
+- Codex warns that it cannot find bubblewrap and uses a bundled copy. With `--dangerously-bypass-approvals-and-sandbox` the container is the sandbox, so bubblewrap is unused and the image does not install it.
+- "Code Mode" fails closed when `codex-code-mode-host` is absent and emits an `error` item. It is not needed; the parser treats such a line as a non-fatal log line.
+
 ## Layout
 
 ```text
@@ -155,7 +192,7 @@ containers/
 deploy/              Quadlet unit, deploy.sh and install.sh
 ```
 
-`plugin/` holds the factory's review skills: a `review` skill that judges a branch's diff before a merge and a `comment-review` skill that checks the comments the diff adds, with their `approve`/`changes` output schema in `plugin/schemas/review.json`. The worker image bundles the directory under `/factory-plugin`, so a reviewer run loads it with `--plugin-dir` without a mount. The reviewed repository's own skills still load alongside it. The image also carries Python and common shell tools so an agent can inspect a binary or parse JSON without a `nix shell` detour: `python3`, `jq`, `strings`, `file`, `xxd`, `hexdump`, `less`, `tree`, `fd`, `sqlite3`, `patch`, `make`, `zip`, `bzip2`, `zstd`, `bc`, `envsubst`, `lsof`, `ss`, `ip`, `dig`, `nc`, `rsync` and `shellcheck`. In the worker shell `grep` is a Claude Code wrapper around ugrep, which rejects some long regexes as too complex; `command grep` runs GNU grep.
+`plugin/` holds the factory's review skills: a `review` skill that judges a branch's diff before a merge and a `comment-review` skill that checks the comments the diff adds, with their `approve`/`changes` output schema in `plugin/schemas/review.json`. The worker image bundles the directory under `/factory-plugin`, so a reviewer run loads it with `--plugin-dir` without a mount. The reviewed repository's own skills still load alongside it. The image also links the same skills to `/etc/codex/skills/factory`, where Codex reads them without a `--plugin-dir` flag, see "Running Codex in a worker". The image also carries Python and common shell tools so an agent can inspect a binary or parse JSON without a `nix shell` detour: `python3`, `jq`, `strings`, `file`, `xxd`, `hexdump`, `less`, `tree`, `fd`, `sqlite3`, `patch`, `make`, `zip`, `bzip2`, `zstd`, `bc`, `envsubst`, `lsof`, `ss`, `ip`, `dig`, `nc`, `rsync` and `shellcheck`. In the worker shell `grep` is a Claude Code wrapper around ugrep, which rejects some long regexes as too complex; `command grep` runs GNU grep.
 
 Not built yet: the other factory skills (unslop, no-comments, open-pr, spec interview, and plan and split) and the live log over server-sent events. The comment review once listed for `verifying` is folded into the merge-time review above. The job page polls its fragment while a job is live, see Dashboard updates. `static/job-updates.js` keeps the log position across a swap: it saves in `sessionStorage` whether the reader was at the bottom or how far up they had scrolled, restores that on load, and re-applies it through an htmx swap hook. Server-sent events will replace the log poll with a live stream.
 

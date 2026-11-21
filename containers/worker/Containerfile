@@ -1,7 +1,7 @@
-# The worker: Claude Code, git and nix. It also carries Python and common
-# shell tools, so agents don't reach for a nix shell to inspect a binary or
-# parse JSON. The factory runs it with --userns=keep-id, so the image user has
-# the UID of the host user that runs podman, 1000 on moon.
+# The worker: Claude Code, Codex, git and nix. It also carries Python and
+# common shell tools, so agents don't reach for a nix shell to inspect a binary
+# or parse JSON. The factory runs it with --userns=keep-id, so the image user
+# has the UID of the host user that runs podman, 1000 on moon.
 FROM docker.io/library/ubuntu:26.04
 
 ARG UID=1000
@@ -21,8 +21,25 @@ RUN apt-get update \
        done \
     && (userdel --remove ubuntu 2>/dev/null || true) \
     && useradd --create-home --uid "$UID" --shell /bin/bash worker \
-    && mkdir -p /nix /work /claude \
-    && chown worker:worker /nix /work /claude
+    && mkdir -p /nix /work /claude /codex \
+    && chown worker:worker /nix /work /claude /codex
+
+# Codex CLI, pinned to one openai/codex release so the stdout parser and the
+# docs track a single version. The release ships one static x86_64 musl binary
+# per platform; moon is x86_64. The build fails if the installed version does
+# not match CODEX_VERSION. /etc/codex/skills/factory points Codex at the
+# factory's review skills without the --plugin-dir flag Claude uses; the symlink
+# resolves once the plugin is copied below.
+ARG CODEX_VERSION=0.165.0
+ARG CODEX_ASSET=codex-x86_64-unknown-linux-musl
+RUN curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${CODEX_ASSET}.tar.gz" -o /tmp/codex.tar.gz \
+    && tar -xzf /tmp/codex.tar.gz -C /tmp \
+    && install -m 0755 "/tmp/${CODEX_ASSET}" /usr/local/bin/codex \
+    && rm -f /tmp/codex.tar.gz "/tmp/${CODEX_ASSET}" \
+    && ver="$(codex --version)" \
+    && grep -qw "${CODEX_VERSION}" <<<"$ver" \
+    && mkdir -p /etc/codex/skills \
+    && ln -s /factory-plugin/skills /etc/codex/skills/factory
 
 USER worker
 ENV HOME=/home/worker \
