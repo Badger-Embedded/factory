@@ -450,6 +450,64 @@ fn cancel_ends_the_job_and_later_events_are_rejected() {
 }
 
 #[test]
+fn editing_a_queued_request_replaces_the_text_the_clarify_run_gets() {
+    let mut job = Job::new("add a reboot button", Gates::default());
+    apply(
+        &mut job,
+        Event::Edit {
+            request: "add a reboot button to the device page".into(),
+        },
+    );
+    assert_eq!(job.stage(), &Stage::Requested);
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(job.request(), "add a reboot button to the device page");
+
+    apply(&mut job, Event::Start);
+    assert_runs(
+        &job,
+        Session::Planning,
+        Task::Clarify {
+            request: "add a reboot button to the device page".into(),
+        },
+    );
+}
+
+#[test]
+fn editing_is_rejected_once_the_job_leaves_requested() {
+    let mut clarifying = Job::new("add a reboot button", Gates::default());
+    apply(&mut clarifying, Event::Start);
+    assert_eq!(clarifying.stage(), &Stage::Clarifying);
+
+    let implementing = implementing(&["only"]);
+
+    let mut failed = implementing.clone();
+    apply(
+        &mut failed,
+        Event::AgentFailed {
+            reason: "no output".into(),
+        },
+    );
+
+    let mut cancelled = implementing.clone();
+    apply(&mut cancelled, Event::Cancel);
+
+    for job in [&clarifying, &implementing, &failed, &cancelled] {
+        let mut edited = job.clone();
+        assert!(
+            matches!(
+                edited.apply(Event::Edit {
+                    request: "changed".into(),
+                }),
+                Err(Rejected::Unexpected { .. })
+            ),
+            "edit accepted in {:?}",
+            job.stage(),
+        );
+        assert_eq!(&edited, job, "edit changed the job in {:?}", job.stage());
+    }
+}
+
+#[test]
 fn a_conflict_sends_the_agent_to_rebase_and_counts_as_a_failed_round() {
     let mut job = watching(7);
     apply(

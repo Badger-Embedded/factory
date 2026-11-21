@@ -85,6 +85,7 @@ impl Event {
     pub fn name(&self) -> &'static str {
         match self {
             Event::Start => "start",
+            Event::Edit { .. } => "edit",
             Event::Agent(result) => match result {
                 AgentResult::Questions(_) => "agent:questions",
                 AgentResult::Clarified => "agent:clarified",

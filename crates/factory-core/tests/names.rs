@@ -53,6 +53,13 @@ fn a_turn_names_its_actor_and_what_it_does() {
 fn an_agent_event_names_its_result() {
     assert_eq!(Event::Start.name(), "start");
     assert_eq!(
+        Event::Edit {
+            request: "r".into()
+        }
+        .name(),
+        "edit"
+    );
+    assert_eq!(
         Event::Agent(AgentResult::Clarified).name(),
         "agent:clarified"
     );

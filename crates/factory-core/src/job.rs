@@ -356,6 +356,11 @@ pub enum AgentResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Start,
+    /// Replace the request text of a job still queued in `requested`. Applies
+    /// only at `(Requested, Factory)`, before the scheduler starts the job.
+    Edit {
+        request: String,
+    },
     Agent(AgentResult),
     AgentFailed {
         reason: String,
@@ -595,6 +600,11 @@ impl Job {
                     request: self.request.clone(),
                 }),
             ),
+
+            (S::Requested, Turn::Factory, E::Edit { request }) => {
+                self.request = request;
+                (S::Requested, Turn::Factory)
+            }
 
             (stage, Turn::Agent(_), E::Agent(AgentResult::Questions(questions))) => {
                 (stage.clone(), Turn::User(Ask::Answers { questions }))
