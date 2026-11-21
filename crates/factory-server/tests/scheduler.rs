@@ -659,10 +659,39 @@ async fn two_clarify_runs(
 }
 
 #[tokio::test]
-async fn costs_sum_over_the_runs_of_a_job() {
+async fn a_resumed_run_adds_what_the_session_cost_since_its_last_run() {
+    // Claude reports the session's total, which keeps counting across
+    // --resume, so the second run cost 0.75, not 1.25.
     let (store, _scheduler, id) = two_clarify_runs([Some(0.5), Some(1.25)]).await;
 
-    assert!((store.cost_usd(id).unwrap() - 1.75).abs() < 1e-9);
+    assert!((store.cost_usd(id).unwrap() - 1.25).abs() < 1e-9);
+    let finished: Vec<String> = store
+        .logs(id, 20)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .filter(|text| text.starts_with("Agent run finished"))
+        .collect();
+    assert_eq!(
+        finished,
+        [
+            format!("Agent run finished, {} at API prices.", format_cost(0.5)),
+            format!(
+                "Agent run finished, {} at API prices, {} for the session so far.",
+                format_cost(0.75),
+                format_cost(1.25)
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_session_total_that_drops_counts_as_a_new_session() {
+    // A total below the stored one means the agent started the session over,
+    // so the whole total is the run's cost.
+    let (store, _scheduler, id) = two_clarify_runs([Some(0.5), Some(0.25)]).await;
+
+    assert!((store.cost_usd(id).unwrap() - 0.75).abs() < 1e-9);
 }
 
 #[tokio::test]
@@ -854,6 +883,25 @@ fn planned_pr(title: &str) -> factory_core::PlannedPr {
         number: None,
         description: None,
     }
+}
+
+#[test]
+fn each_session_of_a_job_keeps_its_own_total() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    let (clarify, _) = store
+        .session_uuid(id, factory_core::Session::Planning, Agent::Claude)
+        .unwrap();
+    let (implement, _) = store
+        .session_uuid(id, factory_core::Session::Pr(0), Agent::Claude)
+        .unwrap();
+
+    assert!((store.add_session_cost(id, &clarify, 1.0).unwrap() - 1.0).abs() < 1e-9);
+    // A different session starts its own total, so nothing is subtracted.
+    assert!((store.add_session_cost(id, &implement, 3.0).unwrap() - 3.0).abs() < 1e-9);
+    assert!((store.add_session_cost(id, &implement, 3.5).unwrap() - 0.5).abs() < 1e-9);
+    assert!((store.add_session_cost(id, &clarify, 1.25).unwrap() - 0.25).abs() < 1e-9);
+    assert!((store.cost_usd(id).unwrap() - 4.75).abs() < 1e-9);
 }
 
 #[test]

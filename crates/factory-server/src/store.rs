@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     uuid TEXT NOT NULL,
     agent TEXT NOT NULL DEFAULT 'claude',
     agent_session TEXT,
+    cost_usd REAL,
     PRIMARY KEY (job_id, session)
 );
 CREATE TABLE IF NOT EXISTS logs (
@@ -384,6 +385,17 @@ impl Store {
         )?;
         if has_agent_session == 0 {
             conn.execute("ALTER TABLE sessions ADD COLUMN agent_session TEXT", [])?;
+        }
+        // `cost_usd` holds the session total the agent last reported, added to
+        // a table that predates it. A row from before reads null, so its next
+        // run counts the whole total once.
+        let has_session_cost: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'cost_usd'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_session_cost == 0 {
+            conn.execute("ALTER TABLE sessions ADD COLUMN cost_usd REAL", [])?;
         }
         // `estimated` marks a cost row the factory estimated rather than read
         // from the agent, such as a Codex run's cost from the price table, so the
@@ -785,8 +797,53 @@ impl Store {
     pub fn add_cost(&self, id: i64, usd: f64, estimated: bool) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row = Self::load(&tx, id)?;
-        Self::record_cost(&tx, id, "cost", &row.job, None, Some(usd), estimated)?;
+        Self::add_cost_in(&tx, id, usd, estimated)?;
+        Ok(tx.commit()?)
+    }
+
+    /// Adds the cost of one run to job `id` when the agent reports `total`,
+    /// the cost of the whole session whose factory UUID is `uuid` so far.
+    /// Claude reports that total, and it keeps counting across `--resume`, so
+    /// the run cost the increase over the total the session last reported.
+    /// A total lower than the stored one means the agent started the session
+    /// over, so the whole total is the run's. Returns the cost added.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on
+    /// a database error.
+    pub fn add_session_cost(&self, id: i64, uuid: &str, total: f64) -> Result<f64, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let previous: Option<f64> = tx
+            .query_row(
+                "SELECT cost_usd FROM sessions WHERE uuid = ?1",
+                params![uuid],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let usd = match previous {
+            Some(previous) if total >= previous => total - previous,
+            _ => total,
+        };
+        tx.execute(
+            "UPDATE sessions SET cost_usd = ?2 WHERE uuid = ?1",
+            params![uuid, total],
+        )?;
+        Self::add_cost_in(&tx, id, usd, false)?;
+        tx.commit()?;
+        Ok(usd)
+    }
+
+    fn add_cost_in(
+        tx: &rusqlite::Transaction<'_>,
+        id: i64,
+        usd: f64,
+        estimated: bool,
+    ) -> Result<(), StoreError> {
+        let row = Self::load(tx, id)?;
+        Self::record_cost(tx, id, "cost", &row.job, None, Some(usd), estimated)?;
         tx.execute(
             "INSERT INTO job_costs (job_id, usd) VALUES (?1, ?2)
              ON CONFLICT (job_id) DO UPDATE SET usd = usd + excluded.usd",
@@ -797,7 +854,7 @@ impl Store {
              ON CONFLICT (project) DO UPDATE SET usd = usd + excluded.usd",
             params![row.project, usd],
         )?;
-        Ok(tx.commit()?)
+        Ok(())
     }
 
     /// Records that MCP `server` was unavailable for job `id`, with `reason`.
