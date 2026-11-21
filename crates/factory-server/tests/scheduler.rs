@@ -3303,8 +3303,6 @@ async fn a_server_whose_secret_cannot_be_decrypted_is_skipped_with_a_warning() {
 
     scheduler.tick().await.unwrap();
     wait_for_requests(&executor, 1).await;
-    // The server was skipped, so the run carries no MCP config and no paragraph
-    // names it.
     assert!(executor.requests()[0].mcp.is_none());
     assert!(!executor.requests()[0].prompt.contains("MCP servers"));
     executor.release(1);
