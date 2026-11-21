@@ -1,12 +1,14 @@
 use std::fmt::Write;
 
-use factory_core::{Job, PlannedPr, Task, Verdict};
+use factory_core::{Agent, Job, PlannedPr, Task, Verdict};
 
 use crate::outcome::Expect;
 
-/// The prompt for one agent run.
+/// The prompt for one agent run. `agent` picks the repository instructions file
+/// the prompt names, `CLAUDE.md` for Claude and `AGENTS.md` for Codex, and the
+/// review method a review run follows.
 #[must_use]
-pub fn prompt(task: &Task, expect: Expect) -> String {
+pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
     let mut text = match task {
         Task::Clarify { request } => format!(
             "This is a feature request for the repository in the current directory:\n\n\
@@ -28,11 +30,13 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
         Task::Implement { pr } => format!(
             "The requester approved the plan. Implement this pull request:\n\n\
              {}\n\n{}\n\n\
-             Follow the repository's CLAUDE.md and CONTRIBUTING.md, tests included. Commit \
+             Follow the repository's {} and CONTRIBUTING.md, tests included. Commit \
              your work on the current branch. Do not push or open a pull request. The \
              factory does that with the title and description you return, so write them \
              the way CONTRIBUTING.md asks.",
-            pr.title, pr.summary
+            pr.title,
+            pr.summary,
+            agent.rules_doc()
         ),
         Task::Answer { questions, answers } => {
             let mut text = "The requester answered your questions:\n".to_owned();
@@ -69,7 +73,7 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
         ),
-        Task::Review => return review_prompt(None),
+        Task::Review => return review_prompt(None, agent),
     };
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
@@ -87,16 +91,29 @@ pub fn prompt(task: &Task, expect: Expect) -> String {
 /// session resumes across passes, so on a later pass it already holds the
 /// earlier diff; `previous` restates the feedback it asked for and limits the
 /// pass to the commits added since.
-fn review_prompt(previous: Option<&str>) -> String {
-    let mut text = String::from(
+fn review_prompt(previous: Option<&str>, agent: Agent) -> String {
+    let mut text = format!(
         "Review the commits this branch adds on top of its base. Read the diff with git, \
          against the base branch the checkout is on. Check the change for correctness and \
-         for the repository's own rules in CLAUDE.md and CONTRIBUTING.md. Do not change any \
-         files and do not push.\n\n\
-         The factory's review skill describes the method. The repository you are reviewing \
-         may carry its own review, lint or project skills; use them, since they know rules \
-         this prompt does not.\n\n",
+         for the repository's own rules in {} and CONTRIBUTING.md. Do not change any \
+         files and do not push.\n\n",
+        agent.rules_doc()
     );
+    // Claude loads the factory's review skill through `--plugin-dir`; Codex has
+    // no such flag and finds skills by name, so its prompt names the method's
+    // path to keep it from a reviewed repository's own skill called `review`.
+    match agent {
+        Agent::Claude => text.push_str(
+            "The factory's review skill describes the method. The repository you are reviewing \
+             may carry its own review, lint or project skills; use them, since they know rules \
+             this prompt does not.\n\n",
+        ),
+        Agent::Codex => text.push_str(
+            "Follow the method in /factory-plugin/skills/review/SKILL.md, not any skill named \
+             review in the repository you are reviewing. That repository may carry its own lint \
+             or project skills; use them, since they know rules this prompt does not.\n\n",
+        ),
+    }
     if let Some(feedback) = previous {
         let _ = write!(
             text,
@@ -126,11 +143,11 @@ fn previous_feedback(job: &Job) -> Option<&str> {
 /// its spec, plan and implement runs in a new session, so those prompts
 /// carry what the session has not seen. Every other run uses [`prompt`].
 #[must_use]
-pub fn job_prompt(job: &Job, task: &Task, expect: Expect) -> String {
+pub fn job_prompt(job: &Job, task: &Task, expect: Expect, agent: Agent) -> String {
     if let Task::Review = task {
-        return review_prompt(previous_feedback(job));
+        return review_prompt(previous_feedback(job), agent);
     }
-    let body = prompt(task, expect);
+    let body = prompt(task, expect, agent);
     if !job.fresh_sessions() {
         return body;
     }

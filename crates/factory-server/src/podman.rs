@@ -1,12 +1,15 @@
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
-use factory_core::Event;
+use factory_core::{Agent, Event};
 use factory_runner::{
-    BranchSummary, Git, GitHub, Observation, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
-    backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
-    show_images,
+    BranchSummary, Credential, Git, GitHub, Observation, Rerun, RunReport, SessionRun,
+    WorkerConfig, WorkerRun, backend, observe, place_files, place_images, remove_container, run,
+    run_checks, show_files, show_images,
 };
 
 use crate::registry::AgentRegistry;
@@ -47,6 +50,24 @@ pub struct PodmanExecutor {
     pub plan_usage: Arc<PlanUsageCache>,
 }
 
+/// Writes a credential file, such as Codex's `auth.json`, with mode 0600 so
+/// only the worker user reads it. A file left by an earlier crashed run is
+/// removed first, so the new one is created with the right mode rather than
+/// keeping the old one's.
+fn write_credential_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+        _ => {}
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
 fn failed(reason: String) -> RunReport {
     RunReport {
         event: Event::AgentFailed { reason },
@@ -84,6 +105,80 @@ impl PodmanExecutor {
             .collect())
     }
 
+    /// The prompt for a fresh-session run: the task prompt with the job's
+    /// images and files placed in the checkout and listed, and a one-time
+    /// warning for a Codex session with no `AGENTS.md`. A resumed session skips
+    /// all of this, because it has already seen them.
+    fn start_session_prompt(
+        &self,
+        request: &AgentRequest,
+        agent: Agent,
+        workspace: &Path,
+        job_dir: &Path,
+    ) -> Result<String, String> {
+        let mut prompt = request.prompt.clone();
+        let paths = place_images(workspace, &job_images(job_dir))
+            .map_err(|err| format!("could not place the images: {err}"))?;
+        prompt = show_images(&prompt, &paths);
+        let files = self
+            .job_files(request.job_id, job_dir)
+            .map_err(|err| format!("could not read the files: {err}"))?;
+        let placed = place_files(workspace, &files)
+            .map_err(|err| format!("could not place the files: {err}"))?;
+        prompt = show_files(&prompt, &placed);
+        self.warn_missing_agents_md(agent, workspace, request.job_id);
+        Ok(prompt)
+    }
+
+    /// Warns the job once that a fresh Codex session in a repository with no
+    /// `AGENTS.md` at its root runs without the repository's instructions. The
+    /// run goes on; only Codex reads `AGENTS.md`, so it is a no-op for Claude.
+    fn warn_missing_agents_md(&self, agent: Agent, workspace: &Path, job_id: i64) {
+        if agent == Agent::Codex
+            && !workspace.join("AGENTS.md").exists()
+            && let Err(err) = self.store.append_factory_log(
+                job_id,
+                "This repository has no AGENTS.md, so Codex runs without its instructions.",
+            )
+        {
+            tracing::error!("job {job_id}: {err}");
+        }
+    }
+
+    /// Serialises a Codex run while the stored login is due for a refresh and
+    /// writes the login into the config directory at mode 0600. Returns the
+    /// login written, so the caller carries it on the run, and the run guard,
+    /// which the caller holds until the refreshed login is stored.
+    async fn place_codex_login<'a>(
+        &'a self,
+        path: &Path,
+        token: String,
+    ) -> Result<(String, crate::CodexRun<'a>), String> {
+        let run = self
+            .registry
+            .codex_login()
+            .enter_run(token, SystemTime::now())
+            .await;
+        write_credential_file(path, &run.auth)
+            .map_err(|err| format!("could not write the Codex login: {err}"))?;
+        Ok((run.auth.clone(), run))
+    }
+
+    /// Keeps a login Codex refreshed mid-run, then deletes the file from the
+    /// config directory so it stays in a job directory only while a run is in
+    /// flight. The store holds the run's gate guard, so a waiting run reads the
+    /// refreshed login.
+    async fn keep_refreshed_login(&self, path: &Path, credential: Option<&str>) {
+        if let Some(refreshed) = credential {
+            self.registry.codex_login().store_refreshed(refreshed).await;
+        }
+        if let Err(err) = fs::remove_file(path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("removing {}: {err}", path.display());
+        }
+    }
+
     fn worker_config(&self, settings: &Settings, image: String) -> WorkerConfig {
         WorkerConfig {
             image,
@@ -119,7 +214,7 @@ impl Executor for PodmanExecutor {
         // container. With none, the run fails here; the agent failure keeps the
         // task as its retry target, so the job page shows Retry and a token
         // saved on the settings page lets Retry run the task.
-        let token = match entry.credential() {
+        let mut token = match entry.credential() {
             Ok(token) => token,
             Err(reason) => return failed(reason),
         };
@@ -162,21 +257,33 @@ impl Executor for PodmanExecutor {
             .as_deref()
             .unwrap_or(&request.session_id);
         let session_run = backend.session_for(&config_dir, resume_id);
-        let mut prompt = request.prompt;
-        if matches!(session_run, SessionRun::Start(_)) {
-            match place_images(&workspace, &job_images(&job_dir)) {
-                Ok(paths) => prompt = show_images(&prompt, &paths),
-                Err(err) => return failed(format!("could not place the images: {err}")),
+        let prompt = if matches!(session_run, SessionRun::Start(_)) {
+            match self.start_session_prompt(&request, agent, &workspace, &job_dir) {
+                Ok(prompt) => prompt,
+                Err(reason) => return failed(reason),
             }
-            let files = match self.job_files(request.job_id, &job_dir) {
-                Ok(files) => files,
-                Err(err) => return failed(format!("could not read the files: {err}")),
-            };
-            match place_files(&workspace, &files) {
-                Ok(placed) => prompt = show_files(&prompt, &placed),
-                Err(err) => return failed(format!("could not place the files: {err}")),
-            }
-        }
+        } else {
+            request.prompt
+        };
+        // A file credential, such as Codex's auth.json, is written into the
+        // config directory before the run and read back after. While the stored
+        // login is due for a refresh, at most one Codex run is in flight, and a
+        // run that waited writes the freshest stored login, so two runs cannot
+        // rotate the same refresh token at once.
+        let credential_file = match backend.credential() {
+            Credential::File(name) => Some(config_dir.join(name)),
+            Credential::Env(_) => None,
+        };
+        let codex_run = match &credential_file {
+            Some(path) => match self.place_codex_login(path, token).await {
+                Ok((auth, run)) => {
+                    token = auth;
+                    Some(run)
+                }
+                Err(reason) => return failed(reason),
+            },
+            None => None,
+        };
         let worker = WorkerRun {
             name,
             agent,
@@ -190,7 +297,7 @@ impl Executor for PodmanExecutor {
             effort: request.effort,
             mcp: request.mcp,
         };
-        run(
+        let report = run(
             &config,
             &worker,
             log,
@@ -199,7 +306,13 @@ impl Executor for PodmanExecutor {
             },
             |id: &str| session(id.to_owned()),
         )
-        .await
+        .await;
+        if let Some(path) = &credential_file {
+            self.keep_refreshed_login(path, report.credential.as_deref())
+                .await;
+        }
+        drop(codex_run);
+        report
     }
 
     async fn run_checks(

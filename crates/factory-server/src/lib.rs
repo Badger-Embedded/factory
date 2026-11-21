@@ -1,6 +1,7 @@
 //! The factory's dashboard and job store.
 
 mod check;
+mod codex;
 mod cost;
 mod github;
 mod localtime;
@@ -21,6 +22,7 @@ mod web;
 mod workers;
 
 pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT, ToolList};
+pub use codex::{CodexLogin, CodexRun};
 pub use cost::{format_cost, merge_fraction};
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,

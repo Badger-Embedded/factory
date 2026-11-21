@@ -1,22 +1,35 @@
-//! Tests for the agent registry: the Claude entry carries its credential,
-//! worker image, config directory, settings page and stage-panel suggestions,
-//! and the Codex entry is listed but reports that it cannot run.
+//! Tests for the agent registry: the Claude and Codex entries each carry their
+//! credential, worker image, config directory, settings page and stage-panel
+//! suggestions.
 
 use std::sync::Arc;
 
 use factory_core::Agent;
 use factory_server::{
-    AgentRegistry, ClaudeToken, LocalSecrets, MASTER_KEY_LEN, SecretStore, Settings,
+    AgentRegistry, ClaudeToken, CodexLogin, LocalSecrets, MASTER_KEY_LEN, SecretStore, Settings,
 };
 
-fn registry_with_token(token: Option<&str>) -> AgentRegistry {
+/// A subscription `auth.json`, shaped like the one `codex login` writes.
+const AUTH: &str = r#"{"tokens":{"access_token":"at-1","refresh_token":"rt-1"},"last_refresh":"2026-11-20T00:00:00Z"}"#;
+
+fn registry_with(token: Option<&str>, codex: Option<&str>) -> AgentRegistry {
     let store = Arc::new(factory_server::Store::open_in_memory().expect("open store"));
     let secrets: Arc<dyn SecretStore> =
         Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
     if let Some(value) = token {
         secrets.set_claude_token(value).expect("store token");
     }
-    AgentRegistry::new(Arc::new(ClaudeToken::new(secrets, None)))
+    if let Some(value) = codex {
+        secrets.set_codex_auth(value).expect("store codex login");
+    }
+    AgentRegistry::new(
+        Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
+        Arc::new(CodexLogin::new(secrets)),
+    )
+}
+
+fn registry_with_token(token: Option<&str>) -> AgentRegistry {
+    registry_with(token, None)
 }
 
 #[test]
@@ -68,23 +81,41 @@ fn the_claude_entry_resolves_a_stored_token() {
 }
 
 #[test]
-fn the_codex_entry_is_listed_but_cannot_run() {
-    let registry = registry_with_token(Some("sk-ant-oat01-stored"));
+fn the_codex_entry_carries_its_image_login_and_suggestions() {
+    let registry = registry_with(None, Some(AUTH));
     let codex = registry.entry(Agent::Codex);
 
     assert_eq!(codex.display_name(), "Codex");
-    assert!(!codex.available());
-    assert_eq!(codex.settings_url(), None);
-    assert_eq!(codex.host_config_dir(), None);
-    assert_eq!(codex.model_suggestions(), [""; 0]);
-    // Codex cannot run yet, but it carries its own effort levels so the stage
-    // panel can offer them.
+    assert!(codex.available());
+    assert_eq!(codex.settings_url(), Some("/settings/agents/codex"));
+    assert_eq!(codex.host_config_dir(), Some("codex"));
+    assert_eq!(codex.model_suggestions(), ["gpt-6.1-sol", "gpt-6.1-codex"]);
     assert_eq!(
         codex.efforts(),
         ["minimal", "low", "medium", "high", "xhigh"]
     );
     assert_eq!(codex.default_effort(), "medium");
-    assert_eq!(codex.image(&Settings::default()), None);
-    // Codex cannot run even with a Claude token stored.
-    assert!(codex.credential().is_err());
+
+    // One worker image carries both agents, so Codex runs in `worker_image`.
+    let settings = Settings {
+        worker_image: "localhost/factory-worker:latest".into(),
+        ..Settings::default()
+    };
+    assert_eq!(
+        codex.image(&settings),
+        Some("localhost/factory-worker:latest".to_owned())
+    );
+
+    // The stored login resolves as the credential.
+    assert_eq!(codex.credential(), Ok(AUTH.to_owned()));
+}
+
+#[test]
+fn the_codex_entry_fails_with_no_login() {
+    let registry = registry_with(Some("sk-ant-oat01-stored"), None);
+    // A Claude token stored does not stand in for a Codex login.
+    assert_eq!(
+        registry.entry(Agent::Codex).credential(),
+        Err("no Codex login is set".to_owned())
+    );
 }

@@ -1724,6 +1724,7 @@ mod purge {
             std::fs::write(files.join("file-1.txt"), b"log").unwrap();
             std::fs::create_dir_all(self.dir(id).join("work")).unwrap();
             std::fs::create_dir_all(self.dir(id).join("claude")).unwrap();
+            std::fs::create_dir_all(self.dir(id).join("codex")).unwrap();
             id
         }
 
@@ -1917,6 +1918,10 @@ mod purge {
             self.dir(id).join("claude").exists()
         }
 
+        fn has_codex(&self, id: i64) -> bool {
+            self.dir(id).join("codex").exists()
+        }
+
         /// The number of cleanup lines the merged-job cleanup wrote to the job
         /// log.
         fn cleanup_lines(&self, id: i64) -> usize {
@@ -1939,6 +1944,7 @@ mod purge {
 
         assert!(!f.has_work(id));
         assert!(!f.has_claude(id));
+        assert!(!f.has_codex(id));
         assert!(f.dir(id).join("images/image-1.png").exists());
         assert!(f.dir(id).join("files/file-1.txt").exists());
         assert!(f.exists(id));

@@ -12,7 +12,7 @@ use factory_core::{
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
 use factory_server::{
-    AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, GitHubRepos, LocalSecrets,
+    AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, GitHubRepos, LocalSecrets,
     MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection,
     RepoChecker, RepoInfo, SecretStore, Settings, StageAgents, StageEfforts, StageModels, Store,
     StoreError, ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
@@ -189,10 +189,10 @@ fn dashboard_with_secrets(
     let usage = Arc::new(PlanUsageCache::new());
     let slots = Arc::new(WorkerSlots::new());
     let checker = Arc::new(FakeChecker::default());
-    let registry = Arc::new(AgentRegistry::new(Arc::new(ClaudeToken::new(
-        Arc::clone(&secrets),
-        None,
-    ))));
+    let registry = Arc::new(AgentRegistry::new(
+        Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
+        Arc::new(CodexLogin::new(Arc::clone(&secrets))),
+    ));
     Dashboard {
         router: app(
             store.clone(),
@@ -2100,10 +2100,15 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(WorkerSlots::new()),
         Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
         Arc::new(FakeChecker::default()) as Arc<dyn McpChecker>,
-        Arc::new(AgentRegistry::new(Arc::new(ClaudeToken::new(
-            Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
-            None,
-        )))),
+        Arc::new(AgentRegistry::new(
+            Arc::new(ClaudeToken::new(
+                Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
+                None,
+            )),
+            Arc::new(CodexLogin::new(Arc::new(UnavailableSecrets::new(
+                dashboard.store.clone(),
+            )))),
+        )),
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
@@ -3056,6 +3061,7 @@ async fn a_cleaned_merged_job_page_and_its_attachments_still_render() {
     let dir = dashboard.data.path().join("jobs").join(id.to_string());
     std::fs::create_dir_all(dir.join("work")).unwrap();
     std::fs::create_dir_all(dir.join("claude")).unwrap();
+    std::fs::create_dir_all(dir.join("codex")).unwrap();
     assert!(
         dashboard
             .store
@@ -3064,6 +3070,8 @@ async fn a_cleaned_merged_job_page_and_its_attachments_still_render() {
     );
     assert!(!dir.join("work").exists());
     assert!(!dir.join("claude").exists());
+    // Both agents' session directories go, so a Codex job frees its disk too.
+    assert!(!dir.join("codex").exists());
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert_eq!(page.status, StatusCode::OK);
@@ -4516,24 +4524,31 @@ fn saving_one_projects_agents_leaves_other_projects_alone() {
 }
 
 #[test]
-fn an_unavailable_or_unknown_agent_is_rejected_and_not_stored() {
+fn an_unknown_agent_is_rejected_and_not_stored() {
     let store = Store::open_in_memory().unwrap();
-    // Codex is registered but cannot run, so it is refused like an unknown id.
-    for bad in ["codex", "gemini"] {
-        let submitted = agents("claude", bad, "claude", "claude", "claude");
-        let err = store
-            .save_project_agents("maestro", &submitted)
-            .unwrap_err();
-        assert!(
-            matches!(&err, StoreError::InvalidAgent(id) if id == bad),
-            "{err:?}"
-        );
-    }
+    // An unknown id is refused and writes nothing; codex is an available agent
+    // and is accepted (see the codex save test).
+    let submitted = agents("claude", "gemini", "claude", "claude", "claude");
+    let err = store
+        .save_project_agents("maestro", &submitted)
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidAgent(id) if id == "gemini"),
+        "{err:?}"
+    );
     // Nothing was written, so the project still reads the default agent.
     assert_eq!(
         store.project_agents("maestro").unwrap(),
         StageAgents::default()
     );
+}
+
+#[test]
+fn codex_is_accepted_for_every_stage() {
+    let store = Store::open_in_memory().unwrap();
+    let submitted = agents("codex", "codex", "codex", "codex", "codex");
+    store.save_project_agents("maestro", &submitted).unwrap();
+    assert_eq!(store.project_agents("maestro").unwrap(), submitted);
 }
 
 #[test]
@@ -4689,7 +4704,7 @@ fn a_sessions_table_without_the_agent_session_column_opens_and_reads_none() {
 }
 
 #[tokio::test]
-async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_disabled() {
+async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_selectable() {
     let dashboard = dashboard();
     let page = dashboard.get("/settings/projects/maestro").await;
     // Each stage's panel has a radio group named "<stage>_agent".
@@ -4706,9 +4721,10 @@ async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_disabled()
         5,
         "Claude should be preselected in all five stages",
     );
-    // Codex is listed but disabled and marked, and never selected.
+    // Codex is listed and selectable now, so it is not marked unavailable and
+    // not preselected over Claude.
     assert!(page.body.contains("value=\"codex\""));
-    assert!(page.body.contains("Not available yet"));
+    assert!(!page.body.contains("Not available yet"));
     assert!(!page.body.contains("value=\"codex\" checked"));
 }
 
@@ -4752,7 +4768,7 @@ async fn an_invalid_agent_submission_is_rejected_and_stores_nothing() {
             "clarify=opus&spec=&plan=&implement=&review=&\
              clarify_effort=medium&spec_effort=high&plan_effort=medium&\
              implement_effort=medium&review_effort=medium&\
-             clarify_agent=claude&spec_agent=codex&plan_agent=claude&\
+             clarify_agent=claude&spec_agent=gemini&plan_agent=claude&\
              implement_agent=claude&review_agent=claude",
         )
         .await;
@@ -7284,7 +7300,7 @@ async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
 }
 
 #[tokio::test]
-async fn the_sidebar_groups_agents_and_lists_codex_as_disabled() {
+async fn the_sidebar_groups_agents_and_links_each_one() {
     let dashboard = dashboard();
     let body = dashboard.get("/settings/github").await.body;
 
@@ -7298,10 +7314,10 @@ async fn the_sidebar_groups_agents_and_lists_codex_as_disabled() {
     assert!(body.contains(r#"href="/settings/agents/claude""#));
     assert!(!body.contains("Claude account"));
 
-    // Codex is listed, disabled, with no link and a "Not available yet" note.
+    // Codex runs now, so it is listed with a link and no "Not available yet".
     assert!(body.contains("Codex"));
-    assert!(body.contains("Not available yet"));
-    assert!(!body.contains(r#"href="/settings/agents/codex""#));
+    assert!(body.contains(r#"href="/settings/agents/codex""#));
+    assert!(!body.contains("Not available yet"));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;
