@@ -1,6 +1,7 @@
-# The worker: Claude Code, git and nix. The factory runs it with
-# --userns=keep-id, so the image user has the UID of the host user that
-# runs podman, 1000 on moon.
+# The worker: Claude Code, git and nix. It also carries Python and common
+# shell tools, so agents don't reach for a nix shell to inspect a binary or
+# parse JSON. The factory runs it with --userns=keep-id, so the image user has
+# the UID of the host user that runs podman, 1000 on moon.
 FROM docker.io/library/ubuntu:26.04
 
 ARG UID=1000
@@ -9,7 +10,15 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl git unzip xz-utils \
+       python3 jq binutils file xxd bsdextrautils less tree fd-find sqlite3 patch make \
+       zip bzip2 zstd bc gettext-base lsof iproute2 dnsutils netcat-openbsd rsync shellcheck \
     && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && for c in python3 curl jq strings file xxd hexdump less tree fd \
+                sqlite3 patch make zip bzip2 zstd bc envsubst \
+                lsof ss ip dig nc rsync shellcheck; do \
+         command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }; \
+       done \
     && (userdel --remove ubuntu 2>/dev/null || true) \
     && useradd --create-home --uid "$UID" --shell /bin/bash worker \
     && mkdir -p /nix /work /claude \
