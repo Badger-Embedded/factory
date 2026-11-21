@@ -17,6 +17,7 @@ fn planned(title: &str) -> PlannedPr {
         summary: format!("{title} summary"),
         number: None,
         description: None,
+        notes: None,
     }
 }
 

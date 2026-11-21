@@ -277,7 +277,31 @@ fn structured_outputs_become_agent_results() {
                 summary: "c".into(),
                 number: None,
                 description: None,
+                notes: None,
             }]),
+        ),
+        (
+            Expect::Plan,
+            json!({"outcome": "plan", "plan": [
+                {"title": "a: b", "summary": "c", "notes": "Change store.rs add_cost."},
+                {"title": "d: e", "summary": "f", "notes": "  "}
+            ]}),
+            AgentResult::Plan(vec![
+                PlannedPr {
+                    title: "a: b".into(),
+                    summary: "c".into(),
+                    number: None,
+                    description: None,
+                    notes: Some("Change store.rs add_cost.".into()),
+                },
+                PlannedPr {
+                    title: "d: e".into(),
+                    summary: "f".into(),
+                    number: None,
+                    description: None,
+                    notes: None,
+                },
+            ]),
         ),
         (
             Expect::Commits,
@@ -370,11 +394,44 @@ fn every_prompt_names_the_outcome_that_ends_the_task() {
         summary: "POST /reboot".into(),
         number: None,
         description: None,
+        notes: None,
     };
     let text = prompt(&Task::Implement { pr }, Expect::Commits, Agent::Claude);
     assert!(text.contains("maestrod: add a reboot endpoint"));
     assert!(text.contains("\"commits_ready\""));
     assert!(text.contains("Do not push"));
+}
+
+#[test]
+fn the_plan_schema_asks_for_notes_on_each_pull_request() {
+    let schema = Expect::Plan.schema();
+    let item = &schema["properties"]["plan"]["items"];
+    assert_eq!(item["required"], json!(["title", "summary", "notes"]));
+    assert!(item["properties"]["notes"].is_object());
+    let text = prompt(&Task::WritePlan, Expect::Plan, Agent::Claude);
+    assert!(text.contains("notes"));
+}
+
+#[test]
+fn the_implement_prompt_carries_the_planning_notes() {
+    let mut pr = PlannedPr {
+        title: "maestrod: add a reboot endpoint".into(),
+        summary: "POST /reboot".into(),
+        number: None,
+        description: None,
+        notes: None,
+    };
+    let without = prompt(
+        &Task::Implement { pr: pr.clone() },
+        Expect::Commits,
+        Agent::Claude,
+    );
+    assert!(!without.contains("planning run left"));
+
+    pr.notes = Some("Add the route in maestrod/src/api.rs next to power_off.".into());
+    let with = prompt(&Task::Implement { pr }, Expect::Commits, Agent::Claude);
+    assert!(with.contains("planning run left these notes"));
+    assert!(with.contains("Add the route in maestrod/src/api.rs next to power_off."));
 }
 
 #[test]
@@ -958,6 +1015,7 @@ fn planned(title: &str) -> PlannedPr {
         summary: format!("{title} summary"),
         number: None,
         description: None,
+        notes: None,
     }
 }
 
@@ -1215,6 +1273,7 @@ fn a_prompt_names_the_rules_file_the_agent_reads() {
         summary: "POST /reboot".into(),
         number: None,
         description: None,
+        notes: None,
     };
     let claude = prompt(
         &Task::Implement { pr: pr.clone() },

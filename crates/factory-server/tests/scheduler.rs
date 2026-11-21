@@ -488,6 +488,7 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
             summary: "c".into(),
             number: None,
             description: None,
+            notes: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
@@ -882,6 +883,7 @@ fn planned_pr(title: &str) -> factory_core::PlannedPr {
         summary: "s".into(),
         number: None,
         description: None,
+        notes: None,
     }
 }
 
@@ -1101,12 +1103,14 @@ async fn to_commits_ready(
                     summary: "POST /reboot".into(),
                     number: None,
                     description: None,
+                    notes: None,
                 },
                 factory_core::PlannedPr {
                     title: "web: add a reboot button".into(),
                     summary: "Calls it.".into(),
                     number: None,
                     description: None,
+                    notes: None,
                 },
             ])),
         )
@@ -1224,6 +1228,7 @@ async fn a_project_without_checks_publishes_unchecked() {
             summary: "s".into(),
             number: None,
             description: None,
+            notes: None,
         }])),
         Event::Approve,
         Event::Agent(AgentResult::CommitsReady(ready())),
@@ -1948,6 +1953,7 @@ mod purge {
                             summary: "s".into(),
                             number: None,
                             description: None,
+                            notes: None,
                         }])),
                         Event::Approve,
                         Event::Agent(AgentResult::CommitsReady(ready())),
@@ -2253,6 +2259,7 @@ fn one_pass(request: &AgentRequest) -> Event {
             summary: "c".into(),
             number: None,
             description: None,
+            notes: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
@@ -2878,6 +2885,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
             summary: "c".into(),
             number: None,
             description: None,
+            notes: None,
         }])),
     });
     let projects: Projects = [(

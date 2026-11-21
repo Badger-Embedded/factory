@@ -2997,7 +2997,7 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
             div.card {
                 h2 { "Plan" }
                 ol.plan {
-                    @for pr in job.plan() {
+                    @for (index, pr) in job.plan().iter().enumerate() {
                         li {
                             strong { (pr.title) }
                             @if let Some(number) = pr.number {
@@ -3009,6 +3009,12 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
                                 }
                             }
                             div.summary { (pr.summary) }
+                            @if let Some(notes) = &pr.notes {
+                                details.notes data-key={ "plan-notes-" (index) } {
+                                    summary { "Notes for the implementer" }
+                                    pre.doc { (notes) }
+                                }
+                            }
                         }
                     }
                 }
