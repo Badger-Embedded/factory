@@ -680,6 +680,38 @@ impl Store {
         Ok(tx.commit()?)
     }
 
+    /// Records that the MCP proxy forwarded a call to `tool` of `server` for
+    /// job `id`. It writes an `mcp-tool-call` row to `job_events` with
+    /// `<server>: <tool>` in its detail. The row carries the job's current
+    /// stage, pull request and turn and changes none of them, the way
+    /// [`Store::add_cost`] writes a `cost` row. It writes no job log line,
+    /// because the agent's own `tool mcp__…` line already records the call, and
+    /// it is not deduplicated: every forwarded call is a row.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on a
+    /// database error.
+    pub fn record_mcp_tool_call(
+        &self,
+        id: i64,
+        server: &str,
+        tool: &str,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row = Self::load(&tx, id)?;
+        Self::record(
+            &tx,
+            id,
+            "mcp-tool-call",
+            &row.job,
+            Some(&format!("{server}: {tool}")),
+            None,
+        )?;
+        Ok(tx.commit()?)
+    }
+
     fn record(
         tx: &Transaction<'_>,
         id: i64,

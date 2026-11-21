@@ -1,6 +1,7 @@
 //! Records an unavailable MCP server as a warning on a job, at most once per
 //! server per run, and a call the proxy refused to a tool the project turned
-//! off, at most once per server and tool per run.
+//! off, at most once per server and tool per run. It also records each call the
+//! proxy forwarded, with no dedup.
 //!
 //! Two paths report that a run could not use a server: the proxy, when it
 //! cannot reach the server, a connection times out or the server answers 5xx;
@@ -12,7 +13,9 @@
 //! `job_events`, neither of which changes the job's stage or turn.
 //!
 //! A refused tool call comes only from the proxy. It writes a factory line to
-//! the job log and an `mcp-tool-blocked` row to `job_events`.
+//! the job log and an `mcp-tool-blocked` row to `job_events`. A forwarded call
+//! comes only from the proxy too and writes an `mcp-tool-call` row, with no log
+//! line and no dedup, so every call the agent makes is one row.
 //!
 //! The dedup is keyed by job. A job runs one agent run at a time, so
 //! [`McpWarnings::begin`] clears the servers warned in the job's previous run
@@ -89,6 +92,17 @@ impl McpWarnings {
         }
         if let Err(err) = self.store.record_mcp_tool_blocked(job_id, server, tool) {
             tracing::error!("job {job_id}: recording a blocked call to {server:?} {tool:?}: {err}");
+        }
+    }
+
+    /// Records that the proxy forwarded `job_id`'s call to `tool` of `server`.
+    /// Unlike the blocked and unavailable warnings this is not deduped: every
+    /// forwarded call writes its own `mcp-tool-call` row, because the job page
+    /// counts the calls. A database error, such as an unknown job, is logged
+    /// and ignored, the way the other reports are.
+    pub fn record_tool_called(&self, job_id: i64, server: &str, tool: &str) {
+        if let Err(err) = self.store.record_mcp_tool_call(job_id, server, tool) {
+            tracing::error!("job {job_id}: recording a call to {server:?} {tool:?}: {err}");
         }
     }
 

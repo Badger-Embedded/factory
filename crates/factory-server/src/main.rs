@@ -6,9 +6,9 @@ use std::sync::Arc;
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
     ClaudeToken, CurlUsageSource, GhRepos, HttpMcpChecker, LocalSecrets, McpChecker, McpRuntime,
-    McpWarnings, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, ProxyWarning,
-    RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets,
-    Upstreams, WarnFn, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
+    McpWarnings, PLAN_USAGE_REFRESH, PlanUsageCache, PodmanExecutor, Projects, ProxyEvent,
+    ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams,
+    UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls, master_key_from_env, proxy_app,
     refresh_forever,
 };
 use tokio::sync::Notify;
@@ -46,19 +46,22 @@ async fn start_mcp_proxy(
     // A proxy-side failure to reach a server records a warning on the job, the
     // same path the runner's init-line check uses, deduped so a server is warned
     // about at most once per run.
-    let warn: WarnFn = Arc::new(move |warning: ProxyWarning| match warning {
-        ProxyWarning::Unavailable {
+    let report: ProxyEventFn = Arc::new(move |event: ProxyEvent| match event {
+        ProxyEvent::Unavailable {
             job,
             server,
             reason,
         } => warnings.record(job, &server, &reason),
-        ProxyWarning::ToolBlocked { job, server, tool } => {
+        ProxyEvent::ToolBlocked { job, server, tool } => {
             warnings.record_tool_blocked(job, &server, &tool);
+        }
+        ProxyEvent::ToolCalled { job, server, tool } => {
+            warnings.record_tool_called(job, &server, &tool);
         }
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("MCP proxy listening on http://{listen}");
-    let app = proxy_app(Arc::clone(&run_tokens), upstreams, warn);
+    let app = proxy_app(Arc::clone(&run_tokens), upstreams, report);
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::error!("the MCP proxy stopped: {err}");

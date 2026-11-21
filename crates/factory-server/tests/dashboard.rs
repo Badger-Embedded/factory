@@ -720,6 +720,40 @@ async fn the_timeline_notes_a_refused_tool_call_under_its_step() {
 }
 
 #[tokio::test]
+async fn mcp_tool_call_rows_do_not_change_the_timeline() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard.store.add_cost(id, 1.5).unwrap();
+
+    // The timeline region, from its id to the end of the side column.
+    let timeline = |body: &str| {
+        let start = body
+            .find("id=\"job-timeline\"")
+            .expect("the timeline region");
+        let end = body[start..].find("</aside>").expect("the region ends") + start;
+        body[start..end].to_owned()
+    };
+
+    let before = timeline(&dashboard.get(&format!("/jobs/{id}")).await.body);
+
+    // Forwarded MCP calls are recorded as rows. They add no note and store the
+    // stage the job is already in, so the timeline's steps, notes, durations and
+    // costs are unchanged.
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "context7", "resolve-library-id")
+        .unwrap();
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "context7", "get-library-docs")
+        .unwrap();
+
+    let after = timeline(&dashboard.get(&format!("/jobs/{id}")).await.body);
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
 async fn a_job_without_cost_shows_a_dash() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
