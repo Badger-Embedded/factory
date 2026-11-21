@@ -12,14 +12,34 @@ use factory_core::{
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
 use factory_server::{
-    AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, GitHubRepos, LocalSecrets,
-    MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection,
-    RepoChecker, RepoInfo, SecretStore, Settings, StageAgents, StageEfforts, StageModels, Store,
-    StoreError, ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin, GitHubRepos,
+    LocalSecrets, LoginProcess, LoginSpawner, MASTER_KEY_LEN, McpChecker, McpTool, Permission,
+    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, SecretStore, Settings,
+    StageAgents, StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER,
+    UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
 use tower::ServiceExt;
+
+/// A login spawner that never runs a container, for the dashboard tests that do
+/// not drive a Codex login. The device login has its own test file.
+struct NoLogin;
+
+impl LoginSpawner for NoLogin {
+    fn spawn(
+        &self,
+        _name: String,
+        _image: String,
+        _codex_home: std::path::PathBuf,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Box<dyn LoginProcess>>> + Send + '_>> {
+        Box::pin(async {
+            Err(std::io::Error::other(
+                "no login container in dashboard tests",
+            ))
+        })
+    }
+}
 
 /// A fake GitHub the onboarding wizard checks against, so tests need no network.
 /// The default passes every check; a test mutates one field to fail one.
@@ -193,6 +213,7 @@ fn dashboard_with_secrets(
         Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
         Arc::new(CodexLogin::new(Arc::clone(&secrets))),
     ));
+    let device_login = Arc::new(DeviceLogin::new(Arc::clone(&secrets), Arc::new(NoLogin)));
     Dashboard {
         router: app(
             store.clone(),
@@ -205,6 +226,7 @@ fn dashboard_with_secrets(
             secrets,
             Arc::clone(&checker) as Arc<dyn McpChecker>,
             registry,
+            device_login,
         ),
         store,
         data,
@@ -251,6 +273,7 @@ impl Dashboard {
             "/settings/gates",
             "/settings/github",
             "/settings/agents/claude",
+            "/settings/agents/codex",
             "/settings/mcp",
         ]
         .map(str::to_owned)
@@ -2108,6 +2131,10 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
             Arc::new(CodexLogin::new(Arc::new(UnavailableSecrets::new(
                 dashboard.store.clone(),
             )))),
+        )),
+        Arc::new(DeviceLogin::new(
+            Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
+            Arc::new(NoLogin),
         )),
     );
     let page = Dashboard {

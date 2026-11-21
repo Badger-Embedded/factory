@@ -15,13 +15,14 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::check::{CheckOutcome, McpChecker, ToolList};
+use crate::device_login::DeviceLogin;
 use crate::github::{RepoChecker, RepoReport};
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, Projects, StageAgents, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
-use crate::secrets::{SecretError, SecretRef, SecretStore};
+use crate::secrets::{SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{JobFile, JobRow, ProjectTotals, Store, StoreError};
 use crate::usage::PlanUsageCache;
@@ -56,6 +57,7 @@ struct AppState {
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
     registry: Arc<AgentRegistry>,
+    device_login: Arc<DeviceLogin>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -84,6 +86,7 @@ pub fn app(
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
     registry: Arc<AgentRegistry>,
+    device_login: Arc<DeviceLogin>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -128,6 +131,18 @@ pub fn app(
             "/settings/agents/claude/token/clear",
             post(clear_claude_token),
         )
+        .route("/settings/agents/codex", get(show_codex))
+        .route("/settings/agents/codex/auth", post(save_codex_auth))
+        .route("/settings/agents/codex/auth/clear", post(clear_codex_auth))
+        .route("/settings/agents/codex/login", post(start_codex_login))
+        .route(
+            "/settings/agents/codex/login/fragment",
+            get(codex_login_fragment),
+        )
+        .route(
+            "/settings/agents/codex/login/cancel",
+            post(cancel_codex_login),
+        )
         .route("/settings/mcp", get(show_mcp).post(add_mcp_server))
         .route(
             "/settings/mcp/{name}",
@@ -153,6 +168,7 @@ pub fn app(
             secrets,
             checker,
             registry,
+            device_login,
         })
 }
 
@@ -1163,6 +1179,46 @@ fn claude_page(
     ))
 }
 
+/// The Codex account page: whether a login is stored, when Codex last refreshed
+/// it, and the current state of a device login. The stored file never reaches
+/// the page; only the `last_refresh` time does.
+async fn codex_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let auth = state
+        .secrets
+        .available()
+        .then(|| state.secrets.codex_auth().ok().flatten())
+        .flatten();
+    let account = pages::CodexAccount {
+        stored: auth.is_some(),
+        last_refresh: auth.as_deref().and_then(codex_last_refresh),
+    };
+    let login = state.device_login.snapshot().await;
+    Ok(pages::settings_codex(
+        &user(headers),
+        &settings_nav(state)?,
+        &account,
+        &login,
+        state.secrets.available(),
+        notice,
+    ))
+}
+
+/// The `last_refresh` time of a stored `auth.json` as a `YYYY-MM-DD HH:MM:SS`
+/// string for the dashboard time helper, or `None` when the field is absent or
+/// not an RFC 3339 time. The time carries no secret.
+fn codex_last_refresh(auth: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(auth).ok()?;
+    let text = value.get("last_refresh")?.as_str()?;
+    let date = text.get(0..10)?;
+    let time = text.get(11..19)?;
+    (text.as_bytes().get(10) == Some(&b'T') && time.as_bytes().get(2) == Some(&b':'))
+        .then(|| format!("{date} {time}"))
+}
+
 fn mcp_page(
     state: &AppState,
     headers: &HeaderMap,
@@ -1926,6 +1982,78 @@ async fn clear_claude_token(
 ) -> Result<Markup, AppError> {
     state.secrets.clear_claude_token()?;
     claude_page(&state, &headers, Some("Cleared."))
+}
+
+async fn show_codex(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {
+    codex_page(&state, &headers, None).await
+}
+
+#[derive(Deserialize)]
+struct CodexAuthForm {
+    #[serde(default)]
+    auth: String,
+}
+
+/// Replaces the stored Codex login with the pasted `auth.json`. The value is
+/// trimmed of surrounding whitespace. An empty field keeps the stored login, so
+/// a blank save is a no-op. A paste that is not a subscription `auth.json` is
+/// refused with a message that names the missing field and never echoes the
+/// input, and stores nothing. The next Codex run reads the login afresh, so a
+/// save applies with no restart.
+async fn save_codex_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CodexAuthForm>,
+) -> Result<Markup, AppError> {
+    let auth = form.auth.trim();
+    if auth.is_empty() {
+        return codex_page(&state, &headers, Some("Saved.")).await;
+    }
+    match validate_codex_auth(auth) {
+        Ok(()) => {
+            state.secrets.set_codex_auth(auth)?;
+            codex_page(&state, &headers, Some("Saved.")).await
+        }
+        Err(err) => codex_page(&state, &headers, Some(&err.to_string())).await,
+    }
+}
+
+/// Clears the stored Codex login. Clearing works even when the master key is
+/// missing, so a login stranded by a lost key can still be removed.
+async fn clear_codex_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    state.secrets.clear_codex_auth()?;
+    codex_page(&state, &headers, Some("Cleared.")).await
+}
+
+/// Starts a device login, or leaves a running one alone, then redraws the page
+/// with the login area polling for the URL and code.
+async fn start_codex_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    let image = state.store.settings()?.worker_image;
+    state.device_login.start(image).await;
+    codex_page(&state, &headers, None).await
+}
+
+/// The login area the page polls for the URL, the code, success or a failure
+/// reason.
+async fn codex_login_fragment(State(state): State<AppState>) -> Markup {
+    let login = state.device_login.snapshot().await;
+    pages::codex_login_fragment(&login, state.secrets.available())
+}
+
+/// Cancels a running device login, which removes its container, then redraws
+/// the page.
+async fn cancel_codex_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    state.device_login.cancel().await;
+    codex_page(&state, &headers, None).await
 }
 
 /// The base branch an empty field defaults to.
