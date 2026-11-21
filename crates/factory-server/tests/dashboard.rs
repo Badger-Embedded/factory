@@ -4618,6 +4618,76 @@ fn a_resumed_session_keeps_the_agent_it_started_on() {
     assert_eq!(other, Agent::Codex);
 }
 
+#[test]
+fn an_agent_session_id_is_stored_against_the_session_and_read_back() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    let (uuid, _) = store
+        .session_uuid(id, Session::Planning, Agent::Codex)
+        .unwrap();
+    // A fresh session has none, the way a run reads before its agent reports one.
+    assert_eq!(store.agent_session(id, Session::Planning).unwrap(), None);
+    // A session that never ran has no row either.
+    assert_eq!(store.agent_session(id, Session::Spec).unwrap(), None);
+
+    store.set_agent_session(&uuid, "thread-42").unwrap();
+    assert_eq!(
+        store
+            .agent_session(id, Session::Planning)
+            .unwrap()
+            .as_deref(),
+        Some("thread-42")
+    );
+    // The id is keyed by the session's UUID, so it touches no other session.
+    store.session_uuid(id, Session::Spec, Agent::Codex).unwrap();
+    assert_eq!(store.agent_session(id, Session::Spec).unwrap(), None);
+
+    // A later run refreshes it with the id the agent reports again.
+    store.set_agent_session(&uuid, "thread-43").unwrap();
+    assert_eq!(
+        store
+            .agent_session(id, Session::Planning)
+            .unwrap()
+            .as_deref(),
+        Some("thread-43")
+    );
+}
+
+#[test]
+fn a_sessions_table_without_the_agent_session_column_opens_and_reads_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    // A `sessions` table as it was before `agent_session` joined it, with one row.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                job_id INTEGER NOT NULL,
+                session TEXT NOT NULL,
+                uuid TEXT NOT NULL,
+                agent TEXT NOT NULL DEFAULT 'claude',
+                PRIMARY KEY (job_id, session)
+            );
+            INSERT INTO sessions (job_id, session, uuid, agent)
+                VALUES (1, 'planning', 'fixed-uuid', 'codex');",
+        )
+        .unwrap();
+    }
+    // Opening the store adds the nullable column, so the old session reads no
+    // reported id and the next run starts fresh.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.agent_session(1, Session::Planning).unwrap(), None);
+    // The column is writable after the migration.
+    store.set_agent_session("fixed-uuid", "thread-9").unwrap();
+    assert_eq!(
+        store
+            .agent_session(1, Session::Planning)
+            .unwrap()
+            .as_deref(),
+        Some("thread-9")
+    );
+}
+
 #[tokio::test]
 async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_disabled() {
     let dashboard = dashboard();

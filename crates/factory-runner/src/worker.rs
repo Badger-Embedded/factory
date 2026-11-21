@@ -247,14 +247,17 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     args
 }
 
-/// Runs the worker to the end, passing each log line to `log` and each plan
-/// usage report to `usage`, and returns the event for the job. Every failure, including podman failing to start,
-/// becomes [`Event::AgentFailed`].
+/// Runs the worker to the end, passing each log line to `log`, each plan usage
+/// report to `usage`, and the id an agent reports for its own session, such as
+/// Codex's thread id, to `session` as it arrives, and returns the event for the
+/// job. Every failure, including podman failing to start, becomes
+/// [`Event::AgentFailed`].
 pub async fn run(
     config: &WorkerConfig,
     run: &WorkerRun,
     mut log: impl FnMut(LogLine),
     mut usage: impl FnMut(PlanUsage),
+    mut session: impl FnMut(&str),
 ) -> RunReport {
     // A review run fails closed. A crash or a missing result is a
     // `ReviewFailed`, so the factory does not merge. Every other run reports
@@ -324,7 +327,7 @@ pub async fn run(
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             for item in backend.parse(run.expect, &line) {
-                collected.absorb(item, &mut log, &mut usage);
+                collected.absorb(item, &mut log, &mut usage, &mut session);
             }
         }
     }
@@ -365,13 +368,19 @@ impl Collected {
         item: AgentItem,
         log: &mut impl FnMut(LogLine),
         usage: &mut impl FnMut(PlanUsage),
+        session: &mut impl FnMut(&str),
     ) {
         match item {
             AgentItem::Log(line) => log(line),
             AgentItem::PlanUsage(report) => usage(report),
             AgentItem::Result(result) => self.result = Some(result),
             AgentItem::Unavailable(unavailable) => self.mcp_unavailable.push(unavailable),
-            AgentItem::Session(id) => self.agent_session = Some(id),
+            AgentItem::Session(id) => {
+                // Hand the id to the caller before keeping it, so the scheduler
+                // can store it the moment it arrives.
+                session(&id);
+                self.agent_session = Some(id);
+            }
             AgentItem::Usage(turn) => {
                 self.token_usage = Some(self.token_usage.unwrap_or_default().plus(turn));
             }

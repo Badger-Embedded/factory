@@ -192,7 +192,14 @@ async fn a_run_passes_each_plan_usage_report_to_its_callback() {
     let worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
 
     let mut reports = Vec::new();
-    run(&config, &worker, |_| {}, |usage| reports.push(usage)).await;
+    run(
+        &config,
+        &worker,
+        |_| {},
+        |usage| reports.push(usage),
+        |_| {},
+    )
+    .await;
 
     assert_eq!(reports, [reported_usage()]);
 }
@@ -446,6 +453,7 @@ async fn a_finished_run_reports_its_event_session_cost_and_log() {
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
         |line| log.push(line),
         |_| {},
+        |_| {},
     )
     .await;
 
@@ -485,7 +493,7 @@ async fn the_token_reaches_the_worker_environment_not_its_arguments() {
     let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.token = "sk-ant-oat01-secret".into();
 
-    run(&config, &worker, |_| {}, |_| {}).await;
+    run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
 
     // podman saw the token in its environment, so it passes it to the container,
     // but the token is in none of the arguments.
@@ -512,6 +520,7 @@ async fn a_run_reports_each_mcp_server_the_init_line_shows_as_not_connected() {
     let report = run(
         &config,
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
+        |_| {},
         |_| {},
         |_| {},
     )
@@ -548,6 +557,7 @@ async fn a_worker_that_dies_without_a_result_fails_with_its_stderr() {
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
         |_| {},
         |_| {},
+        |_| {},
     )
     .await;
 
@@ -567,6 +577,7 @@ async fn a_missing_podman_binary_fails_the_run() {
     let report = run(
         &config,
         &worker_run(dir.path(), SessionRun::Start(SESSION.into())),
+        |_| {},
         |_| {},
         |_| {},
     )
@@ -1294,7 +1305,7 @@ async fn a_review_run_that_dies_without_a_result_fails_closed() {
     let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.expect = Expect::Review;
 
-    let report = run(&config, &worker, |_| {}, |_| {}).await;
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
     let reason = review_failure_reason(report.event);
     assert!(reason.contains("the worker crashed"), "{reason}");
 }

@@ -63,8 +63,15 @@ pub struct AgentRequest {
     /// The pull request branch, or `None` for a planning run, which reads
     /// the base branch.
     pub branch: Option<String>,
-    /// The agent session UUID.
+    /// The agent session UUID the factory picks. Claude passes it to
+    /// `--session-id` and `--resume`; Codex, which names its own session, uses it
+    /// only as the key its reported id is stored under.
     pub session_id: String,
+    /// The id the agent reported for this session on an earlier run, such as
+    /// Codex's thread id, or `None` for a session that has not reported one. The
+    /// runner resumes Codex on it when its rollout file exists and otherwise
+    /// starts fresh. Claude leaves it `None` and resumes by `session_id`.
+    pub agent_session: Option<String>,
     /// The agent the run uses. The scheduler picks the stage's agent for a fresh
     /// session and keeps a resumed session on the agent it started, see
     /// [`Store::session_uuid`](crate::Store::session_uuid).
@@ -217,6 +224,11 @@ pub struct WatchReport {
 
 pub type LogSink = Box<dyn FnMut(LogLine) + Send>;
 
+/// Takes the id an agent reports for its own session, such as Codex's thread
+/// id, the moment the run reports it, so the scheduler stores it before the run
+/// ends and a run that dies after that line still resumes.
+pub type SessionSink = Box<dyn FnMut(String) + Send>;
+
 /// Carries out the commands of [`factory_core::Command`].
 ///
 /// An `Err` from a method means the factory could not do the step, such as
@@ -230,6 +242,7 @@ pub trait Executor: Send + Sync + 'static {
         settings: &Settings,
         request: AgentRequest,
         log: LogSink,
+        session: SessionSink,
     ) -> impl Future<Output = RunReport> + Send;
 
     /// Runs the project's checks in a worker.
@@ -641,6 +654,7 @@ impl<E: Executor> Scheduler<E> {
         let agents = self.store.project_agents(&row.project)?;
         let agent = stage_agent(&agents, expect);
         let (session_id, agent) = self.store.session_uuid(row.id, session, agent)?;
+        let agent_session = self.store.agent_session(row.id, session)?;
         let selection = self.mcp_config(row.id, &row.project, expect)?;
         let request = AgentRequest {
             job_id: row.id,
@@ -651,6 +665,7 @@ impl<E: Executor> Scheduler<E> {
                 Session::Pr(pr) | Session::Review(pr) => Some(branch_name(row.id, pr)),
             },
             session_id,
+            agent_session,
             agent,
             expect,
             prompt: job_prompt(job, task, expect),
@@ -931,9 +946,16 @@ impl<E: Executor> Scheduler<E> {
         for (server, reason) in &skipped {
             self.mcp.warnings.record(job_id, server, reason);
         }
+        // The session the run resumes: Codex's thread id once it has one, else
+        // the factory UUID that names the session for Claude and a fresh Codex
+        // run.
+        let session_label = request
+            .agent_session
+            .clone()
+            .unwrap_or_else(|| request.session_id.clone());
         self.note(
             job_id,
-            &format!("Agent run started in session {}.", request.session_id),
+            &format!("Agent run started in session {session_label}."),
         );
         let sink_store = Arc::clone(&self.store);
         let sink: LogSink = Box::new(move |line| {
@@ -941,7 +963,20 @@ impl<E: Executor> Scheduler<E> {
                 tracing::error!("job {job_id}: {err}");
             }
         });
-        let report = self.executor.run_agent(settings, request, sink).await;
+        // The agent names its own session, such as Codex's thread id, mid-run.
+        // Store it against the factory UUID the moment it arrives, so a run that
+        // dies after that line resumes on it.
+        let session_store = Arc::clone(&self.store);
+        let session_uuid = request.session_id.clone();
+        let session: SessionSink = Box::new(move |id| {
+            if let Err(err) = session_store.set_agent_session(&session_uuid, &id) {
+                tracing::error!("job {job_id}: {err}");
+            }
+        });
+        let report = self
+            .executor
+            .run_agent(settings, request, sink, session)
+            .await;
         // Each active server the agent read as not connected in the run's init
         // line gets its warning, deduped against a proxy warning for the same
         // server already recorded during the run.

@@ -549,11 +549,13 @@ async fn a_run_reports_the_thread_id_usage_and_reads_the_refreshed_login_back() 
     };
 
     let mut log = Vec::new();
+    let mut reported_sessions = Vec::new();
     let report = run(
         &config,
         &codex_run(dir.path(), SessionRun::Start(THREAD.into())),
         |line| log.push(line),
         |_| {},
+        |id| reported_sessions.push(id.to_owned()),
     )
     .await;
 
@@ -563,6 +565,9 @@ async fn a_run_reports_the_thread_id_usage_and_reads_the_refreshed_login_back() 
             "Goal: reboot the DUT from its page.".into()
         ))
     );
+    // The thread id reaches the session callback the moment `thread.started`
+    // arrives, so the scheduler can store it before the run ends.
+    assert_eq!(reported_sessions, [THREAD.to_owned()]);
     // Codex's final message carries no session id, so the thread id from
     // thread.started fills it in.
     assert_eq!(report.session_id.as_deref(), Some(THREAD));

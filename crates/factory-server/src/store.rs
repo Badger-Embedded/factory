@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session TEXT NOT NULL,
     uuid TEXT NOT NULL,
     agent TEXT NOT NULL DEFAULT 'claude',
+    agent_session TEXT,
     PRIMARY KEY (job_id, session)
 );
 CREATE TABLE IF NOT EXISTS logs (
@@ -344,6 +345,18 @@ impl Store {
                 "ALTER TABLE sessions ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
                 [],
             )?;
+        }
+        // `agent_session` holds the id the agent reports for its own session,
+        // such as Codex's thread id, added to a table that predates it. It stays
+        // null for a session Claude runs, which resumes by the factory's UUID, so
+        // an old row reads null and keeps resuming on the UUID in `uuid`.
+        let has_agent_session: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'agent_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_agent_session == 0 {
+            conn.execute("ALTER TABLE sessions ADD COLUMN agent_session TEXT", [])?;
         }
         Ok(Store {
             conn: Mutex::new(conn),
@@ -1472,13 +1485,7 @@ impl Store {
         session: Session,
         stage_agent: Agent,
     ) -> Result<(String, Agent), StoreError> {
-        let key = match session {
-            Session::Planning => "planning".to_owned(),
-            Session::Spec => "spec".to_owned(),
-            Session::Plan => "plan".to_owned(),
-            Session::Pr(pr) => format!("pr-{pr}"),
-            Session::Review(pr) => format!("review-{pr}"),
-        };
+        let key = session_key(session);
         let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO sessions (job_id, session, uuid, agent) VALUES (?1, ?2, ?3, ?4)",
@@ -1499,6 +1506,46 @@ impl Store {
         // than failing the run.
         let agent = Agent::from_id(&agent_id).unwrap_or(DEFAULT_AGENT);
         Ok((uuid, agent))
+    }
+
+    /// The id the agent reported for `session` of job `job_id`, such as Codex's
+    /// thread id, or `None` when the session has none yet or runs on an agent
+    /// that resumes by the factory's UUID, as Claude does. A session that has
+    /// never run has no row and reads `None`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn agent_session(
+        &self,
+        job_id: i64,
+        session: Session,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT agent_session FROM sessions WHERE job_id = ?1 AND session = ?2",
+                params![job_id, session_key(session)],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Records `id` as the agent-reported session id of the session whose
+    /// factory UUID is `uuid`, as soon as the run reports it, so a run that dies
+    /// after that line resumes on the id. The UUID names one session row, so this
+    /// touches no other. A UUID no row holds writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_agent_session(&self, uuid: &str, id: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE sessions SET agent_session = ?2 WHERE uuid = ?1",
+            params![uuid, id],
+        )?;
+        Ok(())
     }
 
     /// The time of the newest pull request comment already given to the
@@ -2176,6 +2223,18 @@ impl DirSwap {
 }
 
 /// A `projects` row whose first column is `name`, as `list_projects` selects.
+/// The `session` column value for `session`, the key each session row carries
+/// next to its job id.
+fn session_key(session: Session) -> String {
+    match session {
+        Session::Planning => "planning".to_owned(),
+        Session::Spec => "spec".to_owned(),
+        Session::Plan => "plan".to_owned(),
+        Session::Pr(pr) => format!("pr-{pr}"),
+        Session::Review(pr) => format!("review-{pr}"),
+    }
+}
+
 fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         repo: row.get(1)?,
