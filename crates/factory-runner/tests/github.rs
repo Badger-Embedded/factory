@@ -10,6 +10,7 @@ use factory_runner::{
 
 const VIEW: &str = r#"{
   "state": "OPEN",
+  "headRefOid": "4f1c2e9a7b3d",
   "statusCheckRollup": [
     {"__typename": "CheckRun", "name": "Lint and test", "status": "COMPLETED", "conclusion": "FAILURE",
      "detailsUrl": "https://github.com/o/r/actions/runs/44/job/135"},
@@ -56,6 +57,7 @@ fn description() -> PrDescription {
 fn status_reads_state_checks_and_human_comments() {
     let status = parse_status(VIEW, INLINE, "moonthebot").unwrap();
     assert_eq!(status.state, PrState::Open);
+    assert_eq!(status.head, "4f1c2e9a7b3d");
     assert_eq!(
         status.ci,
         Ci::Failed(vec![FailedCheck {
@@ -433,7 +435,7 @@ case "$1 $2" in
   "pr edit") cat > /dev/null ;;
   "pr view")
     case "$*" in
-      *headRefOid*) echo abc123 ;;
+      *"--jq .headRefOid"*) echo abc123 ;;
       *) if [ -e '{dir}/rerun' ]; then cat '{dir}/after'; else cat '{dir}/before'; fi ;;
     esac ;;
   "run list") cat '{dir}/runs' ;;

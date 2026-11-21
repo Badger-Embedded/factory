@@ -392,7 +392,12 @@ impl Executor for PodmanExecutor {
                 request.review_approved,
                 request.auto_merge,
             ) {
-                ReadyAction::Review => (Some(Event::StartReview), None),
+                ReadyAction::Review => (
+                    Some(Event::StartReview {
+                        head: status.head.clone(),
+                    }),
+                    None,
+                ),
                 ReadyAction::Merge => {
                     self.github.merge(&request.repo, request.number).await?;
                     merged_by_factory = true;

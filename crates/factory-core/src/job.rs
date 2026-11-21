@@ -24,6 +24,12 @@ const LEGACY_ROUNDS_REASON: &str = "5 failed check or CI rounds on one pull requ
 /// highest-numbered pull request like a [`LEGACY_ROUNDS_REASON`] job.
 const LEGACY_AGENT_REASON: &str = "the agent run ended with";
 
+/// The reason a review stopped with [`ReviewStop::Unchanged`].
+const UNCHANGED_REASON: &str = "The author added no commit after the last review asked for \
+     changes, and you answered no question since, so another pass would give the same \
+     verdict. Merge the pull request on GitHub to accept it as it is, or retry to run the \
+     reviewer again.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     request: String,
@@ -55,6 +61,10 @@ pub struct Job {
     /// One record per review pass, in order, kept for the job page.
     #[serde(default)]
     reviews: Vec<ReviewPass>,
+    /// The head commit the running review pass reads, from
+    /// [`Event::StartReview`]. Recorded on the pass when it ends.
+    #[serde(default)]
+    review_head: Option<String>,
 }
 
 /// Whether the reviewer has approved the current head of a pull request.
@@ -76,6 +86,18 @@ pub struct ReviewPass {
     pub verdict: Verdict,
     /// The reviewer's feedback, set when it asked for changes.
     pub feedback: Option<String>,
+    /// The index in the plan of the pull request the pass reviewed. `None`
+    /// for a pass stored before this field existed.
+    #[serde(default)]
+    pub pr: Option<usize>,
+    /// The head commit the pass reviewed. `None` for a pass stored before
+    /// this field existed.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// How many of the requester's answers the job held when the pass ran,
+    /// so a later pass gets only the answers given since.
+    #[serde(default)]
+    pub answers_seen: usize,
 }
 
 /// What a review pass decided.
@@ -219,6 +241,11 @@ pub enum ReviewStop {
     /// rounds and sends `feedback`, the last pass's, to the implement session
     /// as [`Task::AddressReview`], giving the pull request five fresh rounds.
     CapReached { feedback: String },
+    /// CI went green on the head the last pass asked to change, and the
+    /// requester answered no question since. The author added no commit, so
+    /// a new pass would read the same diff and give the same verdict. Retry
+    /// runs the reviewer on that head anyway.
+    Unchanged,
 }
 
 /// What a pull request branch would add to its base branch.
@@ -397,9 +424,11 @@ pub enum Event {
     ReviewComments {
         comments: String,
     },
-    /// CI is green and the project has LLM review on, so the reviewer should
-    /// run before the factory merges.
-    StartReview,
+    /// CI is green on `head` and the project has LLM review on, so the
+    /// reviewer should run before the factory merges.
+    StartReview {
+        head: String,
+    },
     /// The reviewer approved the pull request's current head.
     ReviewApproved,
     /// The reviewer asked for changes and gave `feedback`.
@@ -472,6 +501,7 @@ impl Job {
             review_rounds: 0,
             review: ReviewState::Pending,
             reviews: Vec::new(),
+            review_head: None,
         }
     }
 
@@ -679,7 +709,7 @@ impl Job {
             (
                 S::CiAndReview { .. },
                 _,
-                event @ (E::StartReview
+                event @ (E::StartReview { .. }
                 | E::ReviewApproved
                 | E::ReviewChanges { .. }
                 | E::ReviewFailed { .. }),
@@ -856,20 +886,32 @@ impl Job {
         use Stage as S;
 
         let next = match (&self.stage, &self.turn, event) {
-            (S::CiAndReview { pr }, Turn::Factory, E::StartReview)
+            (S::CiAndReview { pr }, Turn::Factory, E::StartReview { head })
                 if self.review == ReviewState::Pending =>
             {
-                (S::CiAndReview { pr: *pr }, Turn::Agent(Task::Review))
+                let pr = *pr;
+                if self.review_unchanged(pr, &head) {
+                    (
+                        S::CiAndReview { pr },
+                        Turn::User(Ask::ReviewStopped {
+                            reason: UNCHANGED_REASON.to_owned(),
+                            stop: ReviewStop::Unchanged,
+                        }),
+                    )
+                } else {
+                    self.review_head = Some(head);
+                    (S::CiAndReview { pr }, Turn::Agent(Task::Review))
+                }
             }
             (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewApproved) => {
                 let pr = *pr;
-                self.record_review(Verdict::Approve, None);
+                self.record_review(pr, Verdict::Approve, None);
                 self.review = ReviewState::Approved;
                 (S::CiAndReview { pr }, Turn::Factory)
             }
             (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewChanges { feedback }) => {
                 let pr = *pr;
-                self.record_review(Verdict::Changes, Some(feedback.clone()));
+                self.record_review(pr, Verdict::Changes, Some(feedback.clone()));
                 self.review_rounds += 1;
                 if self.review_rounds >= MAX_REVIEW_ROUNDS {
                     let reason = format!("{MAX_REVIEW_ROUNDS} review rounds on one pull request");
@@ -922,7 +964,7 @@ impl Job {
         ))
     }
 
-    fn record_review(&mut self, verdict: Verdict, feedback: Option<String>) {
+    fn record_review(&mut self, pr: usize, verdict: Verdict, feedback: Option<String>) {
         let number = u32::try_from(self.reviews.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
@@ -930,7 +972,27 @@ impl Job {
             number,
             verdict,
             feedback,
+            pr: Some(pr),
+            head: self.review_head.clone(),
+            answers_seen: self.answers.len(),
         });
+    }
+
+    /// Whether a review of `head` on pull request `pr` would read what the
+    /// last pass read: that pass asked for changes on the same head, and the
+    /// requester has answered nothing since.
+    fn review_unchanged(&self, pr: usize, head: &str) -> bool {
+        self.reviews_of(pr).last().is_some_and(|pass| {
+            pass.verdict == Verdict::Changes
+                && pass.head.as_deref() == Some(head)
+                && pass.answers_seen == self.answers.len()
+        })
+    }
+
+    /// The review passes on pull request `pr`, in order. Passes stored before
+    /// [`ReviewPass::pr`] existed belong to no pull request.
+    pub fn reviews_of(&self, pr: usize) -> impl Iterator<Item = &ReviewPass> {
+        self.reviews.iter().filter(move |pass| pass.pr == Some(pr))
     }
 
     fn current_pr(&self) -> Option<usize> {
@@ -956,7 +1018,7 @@ impl Job {
             return Ok(match stop.clone() {
                 // A reviewer run failed, so rerun the reviewer in the same
                 // review session. The round counts stay as they are.
-                ReviewStop::ReviewerFailed => {
+                ReviewStop::ReviewerFailed | ReviewStop::Unchanged => {
                     (Stage::CiAndReview { pr }, Turn::Agent(Task::Review))
                 }
                 // The review hit its cap, so hand the last feedback back to

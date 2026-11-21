@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use factory_core::{Agent, Job, PlannedPr, Task, Verdict};
+use factory_core::{Agent, Answered, Job, PlannedPr, Task, Verdict};
 
 use crate::outcome::Expect;
 
@@ -73,7 +73,7 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
         ),
-        Task::Review => return review_prompt(None, agent),
+        Task::Review => return review_prompt(&ReviewContext::default(), agent),
     };
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
@@ -86,19 +86,71 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
     text
 }
 
+/// What a review pass reads besides the diff.
+#[derive(Default)]
+struct ReviewContext<'a> {
+    /// The request, the requester's answers, the approved spec and the plan,
+    /// for the first pass on a pull request. Empty on a later pass, whose
+    /// resumed session already holds them.
+    decisions: String,
+    /// The answers the requester gave since the last pass, on a later pass.
+    new_answers: &'a [Answered],
+    /// The feedback the last pass asked for, when it asked for changes.
+    previous: Option<&'a str>,
+}
+
+impl<'a> ReviewContext<'a> {
+    fn for_job(job: &'a Job) -> Self {
+        let Some(pr) = job.stage().pr() else {
+            return ReviewContext::default();
+        };
+        let Some(last) = job.reviews_of(pr).last() else {
+            let mut decisions = String::new();
+            request_section(&mut decisions, job);
+            if job.spec().is_some() {
+                spec_section(&mut decisions, job);
+            }
+            if let Some(planned) = job.plan().get(pr) {
+                plan_section(&mut decisions, job, planned);
+                let _ = write!(
+                    decisions,
+                    "This branch implements:\n\n{}\n\n{}\n\n",
+                    planned.title, planned.summary
+                );
+            }
+            return ReviewContext {
+                decisions,
+                ..ReviewContext::default()
+            };
+        };
+        ReviewContext {
+            decisions: String::new(),
+            new_answers: job.answers().get(last.answers_seen..).unwrap_or_default(),
+            previous: (last.verdict == Verdict::Changes)
+                .then_some(last.feedback.as_deref())
+                .flatten(),
+        }
+    }
+}
+
 /// The prompt for an LLM review run. The worker has no GitHub token, so the
 /// reviewer reads the branch's diff from the checkout and does not push. The
-/// session resumes across passes, so on a later pass it already holds the
-/// earlier diff; `previous` restates the feedback it asked for and limits the
-/// pass to the commits added since.
-fn review_prompt(previous: Option<&str>, agent: Agent) -> String {
-    let mut text = format!(
+/// session resumes across passes, so the first pass on a pull request gets the
+/// request, answers, spec and plan, and a later pass gets only the answers
+/// given since, with the feedback it asked for when it asked for changes.
+fn review_prompt(context: &ReviewContext, agent: Agent) -> String {
+    let mut text = context.decisions.clone();
+    let _ = write!(
+        text,
         "Review the commits this branch adds on top of its base. Read the diff with git, \
          against the base branch the checkout is on. Check the change for correctness and \
          for the repository's own rules in {} and CONTRIBUTING.md. Do not change any \
          files and do not push.\n\n",
         agent.rules_doc()
     );
+    if !context.decisions.is_empty() {
+        text.push_str(DECISIONS_RULE);
+    }
     // Claude loads the factory's review skill through `--plugin-dir`; Codex has
     // no such flag and finds skills by name, so its prompt names the method's
     // path to keep it from a reviewed repository's own skill called `review`.
@@ -114,7 +166,15 @@ fn review_prompt(previous: Option<&str>, agent: Agent) -> String {
              or project skills; use them, since they know rules this prompt does not.\n\n",
         ),
     }
-    if let Some(feedback) = previous {
+    if !context.new_answers.is_empty() {
+        text.push_str("Since your last review, the requester answered these questions:\n");
+        for answered in context.new_answers {
+            let _ = write!(text, "\nQ: {}\nA: {}\n", answered.question, answered.answer);
+        }
+        text.push('\n');
+        text.push_str(DECISIONS_RULE);
+    }
+    if let Some(feedback) = context.previous {
         let _ = write!(
             text,
             "You reviewed an earlier version of this branch and asked for these changes:\n\n\
@@ -130,14 +190,12 @@ fn review_prompt(previous: Option<&str>, agent: Agent) -> String {
     text
 }
 
-/// The feedback from the most recent review pass that asked for changes, for a
-/// later review pass. `None` on the first pass, which reviews the whole branch.
-fn previous_feedback(job: &Job) -> Option<&str> {
-    job.reviews()
-        .last()
-        .filter(|pass| pass.verdict == Verdict::Changes)
-        .and_then(|pass| pass.feedback.as_deref())
-}
+/// The requester's answers and the approved spec settle what the branch does.
+/// A reviewer that asks to change one repeats a question the requester already
+/// answered, and the author cannot act on it.
+const DECISIONS_RULE: &str = "The requester's answers and the approved spec are decisions. Do not \
+     ask for a change that contradicts one of them. If you think a decision is wrong, say so \
+     in your feedback, and do not let it alone decide the verdict.\n\n";
 
 /// The prompt for one agent run of `job`. A job with fresh sessions starts
 /// its spec, plan and implement runs in a new session, so those prompts
@@ -145,7 +203,7 @@ fn previous_feedback(job: &Job) -> Option<&str> {
 #[must_use]
 pub fn job_prompt(job: &Job, task: &Task, expect: Expect, agent: Agent) -> String {
     if let Task::Review = task {
-        return review_prompt(previous_feedback(job), agent);
+        return review_prompt(&ReviewContext::for_job(job), agent);
     }
     let body = prompt(task, expect, agent);
     if !job.fresh_sessions() {

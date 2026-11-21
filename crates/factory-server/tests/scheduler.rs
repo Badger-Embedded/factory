@@ -1511,7 +1511,7 @@ async fn an_approved_review_lets_an_auto_merge_go_through() {
     let id = to_watching(&store, &executor, &scheduler).await;
 
     // CI is green: the factory starts the review instead of merging.
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     assert!(matches!(
         store.get(id).unwrap().job.turn(),
@@ -1563,7 +1563,7 @@ async fn with_auto_merge_off_the_review_runs_and_the_factory_does_not_merge() {
     store.save_project_settings("maestro", false, true).unwrap();
     let id = to_watching(&store, &executor, &scheduler).await;
 
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     executor.release(1);
     step(&scheduler).await;
@@ -1602,7 +1602,7 @@ async fn requested_changes_go_to_the_implement_session_and_review_again() {
     store.save_project_settings("maestro", true, true).unwrap();
     let id = to_watching(&store, &executor, &scheduler).await;
 
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     executor.release(1);
     step(&scheduler).await; // review asks for changes
@@ -1638,7 +1638,7 @@ async fn requested_changes_go_to_the_implement_session_and_review_again() {
         store.get(id).unwrap().job.review_state(),
         ReviewState::Pending
     );
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     assert!(matches!(
         store.get(id).unwrap().job.turn(),
@@ -1658,7 +1658,7 @@ async fn a_reviewer_failure_stops_the_job_for_the_user_without_merging() {
     store.save_project_settings("maestro", true, true).unwrap();
     let id = to_watching(&store, &executor, &scheduler).await;
 
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     executor.release(1);
     step(&scheduler).await; // reviewer fails
@@ -1704,7 +1704,7 @@ async fn a_stopped_review_fails_when_its_pull_request_is_closed() {
     store.save_project_settings("maestro", true, true).unwrap();
     let id = to_watching(&store, &executor, &scheduler).await;
 
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     executor.release(1);
     step(&scheduler).await; // reviewer fails -> review stopped
@@ -1762,7 +1762,7 @@ async fn the_review_cap_sends_the_job_to_the_user() {
     let id = to_watching(&store, &executor, &scheduler).await;
 
     for round in 1..=MAX_REVIEW_ROUNDS {
-        green(&executor, Event::StartReview);
+        green(&executor, start_review());
         step(&scheduler).await;
         executor.release(1);
         step(&scheduler).await; // review asks for changes
@@ -2624,7 +2624,7 @@ async fn the_review_run_uses_the_review_effort() {
         .unwrap();
     to_watching(&store, &executor, &scheduler).await;
 
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     executor.release(1);
     step(&scheduler).await;
@@ -3122,7 +3122,7 @@ async fn mcp_servers_reach_only_the_runs_of_their_checked_stages() {
     assert_eq!(mcp_stage(&implement), ["impl-only"]);
 
     // Drive the review run for the same pull request.
-    green(&executor, Event::StartReview);
+    green(&executor, start_review());
     step(&scheduler).await;
     executor.release(1);
     step(&scheduler).await;
@@ -3386,4 +3386,14 @@ async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
     assert_eq!(request.expect, Expect::Clarify);
     assert!(request.prompt.contains("Add a shutdown button"));
     assert!(!request.prompt.contains("Add a reboot button"));
+}
+
+/// A [`Event::StartReview`] on a head no earlier pass read, so the reviewer
+/// runs.
+fn start_review() -> Event {
+    static HEADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = HEADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Event::StartReview {
+        head: format!("head{n}"),
+    }
 }

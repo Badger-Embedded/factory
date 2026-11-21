@@ -1244,33 +1244,72 @@ fn the_review_prompt_names_the_method_for_each_agent() {
 }
 
 #[test]
-fn the_first_review_pass_carries_no_earlier_feedback() {
+fn the_first_review_pass_carries_the_request_answers_spec_and_plan() {
     let mut job = watching(7);
-    job.apply(Event::StartReview).unwrap();
+    job.apply(start_review()).unwrap();
     let text = run_prompt(&job, Expect::Review);
-    assert_eq!(text, prompt(&Task::Review, Expect::Review, Agent::Claude));
+    assert!(text.contains("Add a reboot button"));
+    assert!(text.contains("Q: Which board?\nA: rpi5"));
+    assert!(text.contains("Reboot over HTTP."));
+    assert!(text.contains("maestrod: add a reboot endpoint (the one to implement now)"));
+    assert!(text.contains("are decisions"));
     assert!(!text.contains("earlier version"));
+}
+
+/// Runs a changes-requested pass with `feedback` on `job`, then the agent's
+/// review fix, so the job waits for CI on the new head.
+fn changes_then_fix(job: &mut Job, feedback: &str) {
+    job.apply(Event::ReviewChanges {
+        feedback: feedback.into(),
+    })
+    .unwrap();
+    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+        .unwrap();
+    job.apply(Event::ChecksPassed).unwrap();
+    job.apply(Event::Published { number: 7 }).unwrap();
 }
 
 #[test]
 fn a_later_review_pass_restates_the_feedback_and_reviews_only_the_new_commits() {
     let mut job = watching(7);
-    job.apply(Event::StartReview).unwrap();
-    job.apply(Event::ReviewChanges {
-        feedback: "guard the empty-slice case".into(),
-    })
-    .unwrap();
-    // The agent addresses the review, the checks pass, and the reviewer runs
-    // again on the new head.
-    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
-        .unwrap();
-    job.apply(Event::ChecksPassed).unwrap();
-    job.apply(Event::Published { number: 7 }).unwrap();
-    job.apply(Event::StartReview).unwrap();
+    job.apply(start_review()).unwrap();
+    changes_then_fix(&mut job, "guard the empty-slice case");
+    job.apply(start_review()).unwrap();
 
     let text = run_prompt(&job, Expect::Review);
     assert!(text.contains("guard the empty-slice case"));
     assert!(text.contains("commits added since your last review"));
+    // The resumed review session already holds the request and the spec.
+    assert!(!text.contains("Reboot over HTTP."));
+    assert!(!text.contains("Which board?"));
+}
+
+#[test]
+fn a_later_review_pass_carries_the_answers_given_since_the_last_pass() {
+    let mut job = watching(7);
+    job.apply(start_review()).unwrap();
+    job.apply(Event::ReviewChanges {
+        feedback: "read FACTORY_PLUGIN_DIR as a fallback".into(),
+    })
+    .unwrap();
+    // The agent asks the requester instead of following the feedback.
+    job.apply(Event::Agent(AgentResult::Questions(vec![Question {
+        text: "Keep the spec and drop the fallback?".into(),
+    }])))
+    .unwrap();
+    job.apply(Event::Answer(vec!["yes, keep the spec".into()]))
+        .unwrap();
+    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+        .unwrap();
+    job.apply(Event::ChecksPassed).unwrap();
+    job.apply(Event::Published { number: 7 }).unwrap();
+    job.apply(start_review()).unwrap();
+
+    let text = run_prompt(&job, Expect::Review);
+    assert!(text.contains("Q: Keep the spec and drop the fallback?\nA: yes, keep the spec"));
+    assert!(text.contains("are decisions"));
+    // The answer from clarifying went to the first pass already.
+    assert!(!text.contains("Which board?"));
 }
 
 #[test]
@@ -1351,4 +1390,14 @@ async fn a_review_run_that_dies_without_a_result_fails_closed() {
     let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
     let reason = review_failure_reason(report.event);
     assert!(reason.contains("the worker crashed"), "{reason}");
+}
+
+/// A [`Event::StartReview`] on a head no earlier pass read, so the reviewer
+/// runs.
+fn start_review() -> Event {
+    static HEADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = HEADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Event::StartReview {
+        head: format!("head{n}"),
+    }
 }

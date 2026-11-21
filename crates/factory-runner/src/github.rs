@@ -88,6 +88,8 @@ pub struct PrStatus {
     pub conflicting: bool,
     pub ci: Ci,
     pub comments: Vec<Comment>,
+    /// The SHA of the pull request's head commit.
+    pub head: String,
 }
 
 /// What the factory tells the job after looking at its pull request.
@@ -111,6 +113,8 @@ pub enum Observation {
 #[serde(rename_all = "camelCase")]
 struct ViewJson {
     state: String,
+    #[serde(default)]
+    head_ref_oid: String,
     #[serde(default)]
     mergeable: String,
     #[serde(default)]
@@ -277,6 +281,7 @@ pub fn parse_status(view: &str, inline: &str, bot_login: &str) -> Result<PrStatu
         conflicting: view.mergeable == "CONFLICTING",
         ci,
         comments,
+        head: view.head_ref_oid,
     })
 }
 
@@ -574,7 +579,7 @@ impl GitHub {
                     "--repo",
                     repo,
                     "--json",
-                    "state,mergeable,statusCheckRollup,comments,reviews",
+                    "state,mergeable,statusCheckRollup,comments,reviews,headRefOid",
                 ],
                 None,
             )

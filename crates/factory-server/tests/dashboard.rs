@@ -1916,7 +1916,7 @@ fn to_review_turn(dashboard: &Dashboard, id: i64) {
     dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 15 });
-    dashboard.apply(id, Event::StartReview);
+    dashboard.apply(id, start_review());
 }
 
 #[tokio::test]
@@ -1974,7 +1974,7 @@ async fn the_job_page_lists_every_pass_and_the_cap_reason() {
             dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
             dashboard.apply(id, Event::ChecksPassed);
             dashboard.apply(id, Event::Published { number: 15 });
-            dashboard.apply(id, Event::StartReview);
+            dashboard.apply(id, start_review());
         }
     }
 
@@ -8094,4 +8094,14 @@ async fn a_pipeline_stage_switch_turns_a_server_on_in_that_stage() {
     let settings = saved();
     assert!(!settings.enabled);
     assert!(settings.stages.plan && settings.stages.review);
+}
+
+/// A [`Event::StartReview`] on a head no earlier pass read, so the reviewer
+/// runs.
+fn start_review() -> Event {
+    static HEADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = HEADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Event::StartReview {
+        head: format!("head{n}"),
+    }
 }
