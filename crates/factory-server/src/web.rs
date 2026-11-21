@@ -20,6 +20,7 @@ use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, Projects, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
+use crate::registry::AgentRegistry;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
 use crate::store::{JobFile, JobRow, ProjectTotals, Store, StoreError};
@@ -54,6 +55,7 @@ struct AppState {
     slots: Arc<WorkerSlots>,
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
+    registry: Arc<AgentRegistry>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -65,7 +67,8 @@ struct AppState {
 /// MCP header values are read and written through `secrets`, which reports
 /// itself unavailable when no master key is present. The per-project MCP
 /// connection check runs through `checker`, the way the onboarding checks run
-/// through `github`.
+/// through `github`. The settings pages list the agents and link their account
+/// pages through `registry`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the dashboard wires each long-lived dependency the handlers share"
@@ -80,6 +83,7 @@ pub fn app(
     slots: Arc<WorkerSlots>,
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
+    registry: Arc<AgentRegistry>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -107,13 +111,17 @@ pub fn app(
         .route("/settings/workers", get(show_workers).post(save_workers))
         .route("/settings/gates", get(show_gates).post(save_gates))
         .route("/settings/github", get(show_github).post(save_github))
-        .route("/settings/claude", get(show_claude))
+        .route("/settings/claude", get(redirect_claude))
+        .route("/settings/agents/claude", get(show_claude))
         .route(
             "/settings/projects/{name}",
             get(show_project_settings).post(save_project_models),
         )
-        .route("/settings/claude-token", post(save_claude_token))
-        .route("/settings/claude-token/clear", post(clear_claude_token))
+        .route("/settings/agents/claude/token", post(save_claude_token))
+        .route(
+            "/settings/agents/claude/token/clear",
+            post(clear_claude_token),
+        )
         .route("/settings/mcp", get(show_mcp).post(add_mcp_server))
         .route(
             "/settings/mcp/{name}",
@@ -138,6 +146,7 @@ pub fn app(
             slots,
             secrets,
             checker,
+            registry,
         })
 }
 
@@ -868,6 +877,16 @@ fn settings_nav(state: &AppState) -> Result<pages::SettingsNav, StoreError> {
             .into_iter()
             .map(|server| server.name)
             .collect(),
+        agents: state
+            .registry
+            .entries()
+            .map(|entry| pages::AgentNav {
+                id: entry.id().to_owned(),
+                name: entry.display_name().to_owned(),
+                url: entry.settings_url().map(str::to_owned),
+                available: entry.available(),
+            })
+            .collect(),
     })
 }
 
@@ -1071,6 +1090,12 @@ async fn show_claude(
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
     claude_page(&state, &headers, None)
+}
+
+/// Sends the old Claude account URL to the agent's page under Agents, so a
+/// bookmark or a link made before the move still lands on the token card.
+async fn redirect_claude() -> Redirect {
+    Redirect::to("/settings/agents/claude")
 }
 
 async fn show_mcp(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {

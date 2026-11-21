@@ -230,7 +230,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     axum::serve(
         listener,
         app(
-            store, projects, wake, data_dir, plan_usage, github, slots, secrets, checker,
+            store, projects, wake, data_dir, plan_usage, github, slots, secrets, checker, agents,
         ),
     )
     .with_graceful_shutdown(async {

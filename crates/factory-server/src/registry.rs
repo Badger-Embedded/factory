@@ -96,7 +96,7 @@ impl AgentEntry<'_> {
     #[must_use]
     pub fn settings_url(&self) -> Option<&'static str> {
         match self.agent {
-            Agent::Claude => Some("/settings/claude"),
+            Agent::Claude => Some("/settings/agents/claude"),
             Agent::Codex => None,
         }
     }
