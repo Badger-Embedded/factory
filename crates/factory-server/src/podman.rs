@@ -2,26 +2,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_core::{Agent, Event};
+use factory_core::{DEFAULT_AGENT, Event};
 use factory_runner::{
     BranchSummary, Git, GitHub, Observation, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
     backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
     show_images,
 };
 
+use crate::registry::AgentRegistry;
 use crate::scheduler::{
     AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, ReadyAction,
     RerunRequest, SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
 };
-use crate::secrets::ClaudeToken;
 use crate::settings::Settings;
 use crate::store::Store;
 
 /// Runs agents in podman worker containers.
 ///
 /// Each job keeps its files under `<data_dir>/jobs/<id>/`: `work/` is the
-/// checkout and `claude/` is the Claude Code config directory that holds
-/// the job's sessions.
+/// checkout and the agent's config directory, named by the registry, holds the
+/// job's sessions.
 pub struct PodmanExecutor {
     /// The podman binary, secret and plugin directory. The image and limits
     /// come from [`Settings`] on each run.
@@ -32,11 +32,12 @@ pub struct PodmanExecutor {
     /// Opens pull requests and reads their state with the same token.
     pub github: GitHub,
     pub data_dir: PathBuf,
-    /// Resolves the Claude subscription token for each agent run. The run reads
-    /// the current token when it starts, so a token saved on the settings page
-    /// applies to the next run with no factory restart. When it resolves none,
-    /// the run fails with "no Claude token is set" before any container starts.
-    pub token: Arc<ClaudeToken>,
+    /// Resolves each run's agent to its credential, worker image and host config
+    /// directory. The run reads the credential when it starts, so a token saved
+    /// on the settings page applies to the next run with no factory restart.
+    /// When the agent resolves no credential, the run fails before any container
+    /// starts.
+    pub registry: Arc<AgentRegistry>,
     /// Reads each job's attached files, so a fresh-session run lists them in
     /// the prompt with the original names the store holds.
     pub store: Arc<Store>,
@@ -77,9 +78,9 @@ impl PodmanExecutor {
             .collect())
     }
 
-    fn worker_config(&self, settings: &Settings) -> WorkerConfig {
+    fn worker_config(&self, settings: &Settings, image: String) -> WorkerConfig {
         WorkerConfig {
-            image: settings.worker_image.clone(),
+            image,
             memory: settings.worker_memory.clone(),
             cpus: settings.worker_cpus.clone(),
             ..self.base.clone()
@@ -105,19 +106,28 @@ impl Executor for PodmanExecutor {
         request: AgentRequest,
         log: LogSink,
     ) -> RunReport {
-        // Resolve the token before preparing the checkout or starting a
+        let agent = DEFAULT_AGENT;
+        let entry = self.registry.entry(agent);
+        // Resolve the credential before preparing the checkout or starting a
         // container. With none, the run fails here; the agent failure keeps the
         // task as its retry target, so the job page shows Retry and a token
         // saved on the settings page lets Retry run the task.
-        let Some(token) = self.token.resolve() else {
-            return failed("no Claude token is set".into());
+        let token = match entry.credential() {
+            Ok(token) => token,
+            Err(reason) => return failed(reason),
         };
-        let agent = Agent::Claude;
         let backend = backend(agent).expect("the run's agent has a worker backend");
-        let config = self.worker_config(settings);
+        let image = entry
+            .image(settings)
+            .expect("the run's agent has a worker image");
+        let config = self.worker_config(settings, image);
         let job_dir = self.job_dir(request.job_id);
         let workspace = job_dir.join("work");
-        let config_dir = job_dir.join(backend.host_config_dir());
+        let config_dir = job_dir.join(
+            entry
+                .host_config_dir()
+                .expect("the run's agent has a host config dir"),
+        );
         if let Err(err) = fs::create_dir_all(&config_dir) {
             return failed(format!("could not create {}: {err}", config_dir.display()));
         }
@@ -175,7 +185,7 @@ impl Executor for PodmanExecutor {
         settings: &Settings,
         request: ChecksRequest,
     ) -> Result<Event, String> {
-        let config = self.worker_config(settings);
+        let config = self.worker_config(settings, settings.worker_image.clone());
         let name = Self::container(request.job_id);
         if let Err(err) = remove_container(&config, &name).await {
             tracing::warn!("removing {name}: {err}");

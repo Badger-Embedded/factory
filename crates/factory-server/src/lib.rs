@@ -9,6 +9,7 @@ mod pages;
 mod podman;
 mod projects;
 mod proxy;
+mod registry;
 mod scheduler;
 mod secrets;
 mod settings;
@@ -31,6 +32,7 @@ pub use projects::{ImportError, Project, Projects, StageEfforts, StageModels, im
 pub use proxy::{
     ProxyEvent, ProxyEventFn, RunTokens, StoreUpstreams, Upstream, Upstreams, proxy_app,
 };
+pub use registry::{AgentEntry, AgentRegistry};
 pub use scheduler::{
     AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, McpRuntime, PublishRequest,
     Published, ReadyAction, RerunRequest, Scheduler, SummaryRequest, WatchReport, WatchRequest,
