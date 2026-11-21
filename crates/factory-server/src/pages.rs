@@ -2320,8 +2320,6 @@ fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Ma
 /// cancelled job has none, because its badge already says so.
 fn row_detail(job: &Job) -> Option<String> {
     match job.stage() {
-        // A dismissed failed job shows in Done with no detail, like merged
-        // and cancelled rows.
         Stage::Failed {
             reason,
             dismissed: false,
@@ -3163,9 +3161,6 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
     }
 }
 
-/// The failure card of a failed job. A dismissed job says it was dismissed
-/// and keeps its reason and Retry, with no Dismiss; a live failure shows
-/// Dismiss next to Retry, or Dismiss alone when it cannot retry.
 fn failed_card(id: i64, job: &Job, reason: &str, dismissed: bool) -> Markup {
     html! {
         div.card.failed {

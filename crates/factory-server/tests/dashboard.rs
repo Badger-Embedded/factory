@@ -5565,11 +5565,9 @@ async fn a_dismissed_job_moves_to_done_with_a_dismissed_badge_and_no_button() {
     assert_eq!(lanes_of(&body, id), ["inbox-done"]);
     let done = lane_html(&body, "inbox-done");
     assert!(done.contains(">dismissed</span>"));
-    // No detail line and no button on the dismissed row.
     assert!(!done.contains("5 failed check or CI rounds on one pull request"));
     assert!(!done.contains("/dismiss"));
     assert!(!done.contains("/retry"));
-    // The Failed section is gone with its only job dismissed.
     assert!(!body.contains("inbox-failed"));
 }
 
@@ -5604,7 +5602,6 @@ async fn the_failure_card_dismiss_button_toggles_with_the_state() {
     let dashboard = dashboard();
     let id = failed_out_of_rounds(&dashboard).await;
 
-    // Before: the card offers Retry and Dismiss.
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("The job failed"));
     assert!(page.body.contains(&format!("action=\"/jobs/{id}/retry\"")));
@@ -5615,8 +5612,6 @@ async fn the_failure_card_dismiss_button_toggles_with_the_state() {
 
     dashboard.apply(id, Event::Dismiss);
 
-    // After: the card says it was dismissed, keeps the reason and Retry, and
-    // drops Dismiss. The header badge reads "dismissed".
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("The job was dismissed"));
     assert!(page.body.contains(">dismissed</span>"));
@@ -5656,19 +5651,16 @@ async fn a_dismissed_job_that_cannot_retry_keeps_the_reason_but_no_button() {
 async fn dismissing_a_non_failed_or_dismissed_job_is_rejected() {
     let dashboard = dashboard();
 
-    // A live job rejects the dismiss.
     let live = dashboard.new_job().await;
     to_spec_approval(&dashboard, live);
     let reply = dashboard.post(&format!("/jobs/{live}/dismiss"), "").await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
 
-    // A merged job rejects it.
     let merged = dashboard.new_job().await;
     merge(&dashboard, merged);
     let reply = dashboard.post(&format!("/jobs/{merged}/dismiss"), "").await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
 
-    // A second dismiss on an already dismissed job is rejected.
     let failed = failed_out_of_rounds(&dashboard).await;
     dashboard.apply(failed, Event::Dismiss);
     let reply = dashboard.post(&format!("/jobs/{failed}/dismiss"), "").await;

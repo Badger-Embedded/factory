@@ -983,7 +983,6 @@ impl Job {
         }
     }
 
-    /// A fresh, not-dismissed failed stage with `reason` and `retry`.
     fn failed(reason: impl Into<String>, retry: Option<RetryTarget>) -> Stage {
         Stage::Failed {
             reason: reason.into(),
@@ -992,9 +991,6 @@ impl Job {
         }
     }
 
-    /// Applies [`Event::Dismiss`]. A failed job that is not yet dismissed
-    /// records the flag and stays failed; every other stage, and an already
-    /// dismissed job, are rejected. On `Err` the job is unchanged.
     fn dismiss(&mut self) -> Result<(Stage, Turn), Rejected> {
         match &self.stage {
             Stage::Failed {

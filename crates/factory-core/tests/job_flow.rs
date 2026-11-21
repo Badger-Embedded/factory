@@ -1240,8 +1240,6 @@ fn dismiss_marks_a_retryable_failed_job_without_moving_it() {
 
     apply(&mut job, Event::Dismiss);
     assert!(job.is_dismissed());
-    // Still failed, with the reason and retry target unchanged, so retry and
-    // expiry keep working.
     assert_eq!(
         job.stage(),
         &Stage::Failed {
@@ -1319,7 +1317,6 @@ fn retry_clears_the_dismissal_and_a_later_failure_is_not_dismissed() {
     assert!(!job.is_dismissed());
     assert_eq!(job.stage(), &Stage::Implementing { pr: 0 });
 
-    // Failing again starts a fresh, non-dismissed failure.
     apply(
         &mut job,
         Event::AgentFailed {
@@ -1345,7 +1342,6 @@ fn a_stored_failed_job_without_the_dismissed_field_loads_as_not_dismissed() {
     assert_eq!(loaded, job);
     assert!(!loaded.is_dismissed());
 
-    // The flag still applies once read back.
     apply(&mut job, Event::Dismiss);
     assert!(job.is_dismissed());
 }
