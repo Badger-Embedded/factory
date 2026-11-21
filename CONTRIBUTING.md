@@ -12,7 +12,7 @@ The pull request carries everything the change needs:
 
 - **Code.**
 - **Tests.** See [Tests](#tests). `tests-accompany-changes` fails a pull request that changes `crates/*/src/` without touching any `crates/*/tests/`.
-- **Docs.** Update the docs that the change makes wrong: READMEs, `docs/design.md`, and `CLAUDE.md` or `.claude/` when the change affects how agents work. No check enforces this. Review does.
+- **Docs.** Update the docs that the change makes wrong: READMEs, `docs/design.md`, and `AGENTS.md`, `.agents/` or `.claude/` when the change affects how agents work. No check enforces this. Review does.
 
 Keep unrelated changes out. A fix found while building a feature gets its own pull request.
 
@@ -106,4 +106,4 @@ Do not credit AI tools in commits or pull requests. An agent commits as the pers
 
 ## Agents
 
-Claude Code agents follow the same rules, and the checks above apply to agents and people alike.
+Coding agents follow the same rules, and the checks above apply to agents and people alike.
