@@ -3,8 +3,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    Agent, AgentResult, Command, EFFORTS, Event, Gates, Job, PlanUsage, PlannedPr, PrDescription,
-    Question, Stage, Task, UsageWindow,
+    Agent, AgentResult, Command, Event, Gates, Job, PlanUsage, PlannedPr, PrDescription, Question,
+    Stage, Task, UsageWindow,
 };
 use factory_runner::{
     Expect, LogLine, McpConfig, McpServerStatus, PlacedFile, ResultMessage, SessionRun, StreamItem,
@@ -867,9 +867,9 @@ fn podman_args_default_to_medium_effort_for_each_stage() {
 
 #[test]
 fn podman_args_pass_the_set_effort_to_claude() {
-    for effort in EFFORTS {
+    for effort in Agent::Claude.efforts() {
         let args = args_with_effort(Expect::Commits, Some(effort));
-        assert_eq!(value_after(&args, "--effort"), effort, "{effort}");
+        assert_eq!(value_after(&args, "--effort"), *effort, "{effort}");
     }
 }
 

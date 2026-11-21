@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, EFFORTS, Gates, Job, PlanUsageSnapshot, Stage, Task, Turn,
-    UsageWindow, Verdict,
+    Ask, BranchSummary, Command, Gates, Job, PlanUsageSnapshot, Stage, Task, Turn, UsageWindow,
+    Verdict,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -412,12 +412,19 @@ pub struct ProjectSettings {
 }
 
 /// One agent the stage panel's agent control offers: its stable id, the name
-/// the control shows, and whether it can be selected. An agent that cannot run,
-/// such as Codex, is shown disabled and marked "Not available yet".
+/// the control shows, whether it can be selected, and the effort levels and
+/// default it offers. An agent that cannot run, such as Codex, is shown disabled
+/// and marked "Not available yet". The effort levels and default let the panel's
+/// script redraw the effort radios when the agent switches.
 pub struct AgentChoice {
     pub id: String,
     pub display_name: String,
     pub available: bool,
+    /// The agent's effort levels, lowest first.
+    pub efforts: Vec<String>,
+    /// The level the panel preselects for this agent when the saved level is not
+    /// one of its own.
+    pub default_effort: String,
 }
 
 /// One server's block inside a project's form: whether the project runs it, the
@@ -1214,6 +1221,19 @@ fn stage_agent<'a>(agents: &'a StageAgents, stage: &str) -> &'a str {
     }
 }
 
+/// The effort levels the stage's selected agent offers, lowest first. The panel
+/// draws the effort radios and the node's pips from these, so a Codex stage
+/// shows Codex's levels and a Claude stage shows Claude's. An empty slice, for a
+/// saved agent the registry no longer lists, draws no radios and no pips.
+fn stage_efforts<'a>(project: &'a ProjectSettings, stage: &str) -> &'a [String] {
+    let agent = stage_agent(&project.agent_selection, stage);
+    project
+        .agents
+        .iter()
+        .find(|choice| choice.id == agent)
+        .map_or(&[], |choice| choice.efforts.as_slice())
+}
+
 fn stage_on(stages: McpStages, stage: &str) -> bool {
     match stage {
         "clarify" => stages.clarify,
@@ -1239,8 +1259,27 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart) -> Markup {
             part.key()
         )
     };
+    // Each agent's effort levels and default, read by the pipeline script to
+    // redraw the effort radios when a stage's agent switches.
+    let agent_efforts = serde_json::Value::Object(
+        project
+            .agents
+            .iter()
+            .map(|choice| {
+                (
+                    choice.id.clone(),
+                    serde_json::json!({
+                        "efforts": choice.efforts,
+                        "default": choice.default_effort,
+                    }),
+                )
+            })
+            .collect(),
+    )
+    .to_string();
     html! {
-        form.card.settings-form.pipeline-form method="post" action=(href(selected)) {
+        form.card.settings-form.pipeline-form method="post" action=(href(selected))
+            data-agent-efforts=(agent_efforts) {
             input type="hidden" name="gates" value="on";
             @for server in &project.servers {
                 input type="hidden" name={ "mcp." (server.name) ".pipeline" } value="on";
@@ -1297,9 +1336,10 @@ fn stage_node(project: &ProjectSettings, stage: &str, selected: bool, href: &str
     let off = stage == "review" && !project.llm_review;
     let model = stage_model(&project.models, stage);
     let effort = stage_effort(&project.efforts, stage);
-    let level = EFFORTS
+    let efforts = stage_efforts(project, stage);
+    let level = efforts
         .iter()
-        .position(|level| *level == effort)
+        .position(|level| level == effort)
         .unwrap_or(0);
     html! {
         a.pipe-node.off[off] href=(href) data-part=(stage)
@@ -1309,7 +1349,7 @@ fn stage_node(project: &ProjectSettings, stage: &str, selected: bool, href: &str
                 @if off { "Off" } @else { (model.unwrap_or("CLI default")) }
             }
             span.pipe-effort data-effort-label=(stage) title={ "effort " (effort) } {
-                @for (index, _) in EFFORTS.iter().enumerate() {
+                @for (index, _) in efforts.iter().enumerate() {
                     i.on[index <= level] {}
                 }
             }
@@ -1387,8 +1427,8 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool) -> Markup
             }
             div.field {
                 span.label { "Effort" }
-                div.seg role="radiogroup" aria-label={ (stage) " effort" } {
-                    @for level in EFFORTS {
+                div.seg role="radiogroup" aria-label={ (stage) " effort" } data-effort-seg=(stage) {
+                    @for level in stage_efforts(project, stage) {
                         label {
                             input type="radio" name={ (stage) "_effort" } value=(level)
                                 checked[level == effort];

@@ -9,7 +9,16 @@
   document.documentElement.classList.add("pipeline-js");
   var form = document.querySelector(".pipeline-form");
   if (!form) return;
-  var EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+  // Each agent id maps to { efforts: [...], default: "..." }, so the effort
+  // radios can be redrawn when a stage's agent switches.
+  var AGENT_EFFORTS = JSON.parse(form.dataset.agentEfforts || "{}");
+
+  // The effort levels of the agent a stage is set to, lowest first.
+  function effortsFor(stage) {
+    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+    var spec = agent && AGENT_EFFORTS[agent.value];
+    return spec ? spec.efforts : [];
+  }
 
   function select(part) {
     form.querySelectorAll("[data-part]").forEach(function (node) {
@@ -38,10 +47,38 @@
 
   function setEffortLabel(stage, level) {
     var pips = form.querySelectorAll('[data-effort-label="' + stage + '"] i');
-    var index = EFFORTS.indexOf(level);
+    var index = effortsFor(stage).indexOf(level);
     pips.forEach(function (pip, i) {
       pip.classList.toggle("on", i <= index);
     });
+  }
+
+  // Redraws a stage's effort radios for the agent it is now set to. The saved
+  // level stays selected when the new agent offers it, otherwise the new agent's
+  // default is selected. The node's pips follow through setEffortLabel.
+  function redrawEfforts(stage) {
+    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+    var spec = agent && AGENT_EFFORTS[agent.value];
+    var seg = form.querySelector('[data-effort-seg="' + stage + '"]');
+    if (!spec || !seg) return;
+    var picked = seg.querySelector("input:checked");
+    var current = picked ? picked.value : null;
+    var selected = spec.efforts.indexOf(current) >= 0 ? current : spec.default;
+    seg.textContent = "";
+    spec.efforts.forEach(function (level) {
+      var label = document.createElement("label");
+      var input = document.createElement("input");
+      input.type = "radio";
+      input.name = stage + "_effort";
+      input.value = level;
+      input.checked = level === selected;
+      var span = document.createElement("span");
+      span.textContent = level;
+      label.appendChild(input);
+      label.appendChild(span);
+      seg.appendChild(label);
+    });
+    setEffortLabel(stage, selected);
   }
 
   function setGateNode(box) {
@@ -86,6 +123,8 @@
     var target = event.target;
     if (target.type === "radio" && target.name.endsWith("_effort")) {
       setEffortLabel(target.name.slice(0, -"_effort".length), target.value);
+    } else if (target.type === "radio" && target.name.endsWith("_agent")) {
+      redrawEfforts(target.name.slice(0, -"_agent".length));
     } else if (target.dataset.gate) {
       setGateNode(target);
     } else if (target.name === "llm_review") {

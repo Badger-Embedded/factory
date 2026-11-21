@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
-use factory_core::DEFAULT_EFFORT;
+use factory_core::Agent;
 
 use crate::agent::{AgentBackend, AgentItem, RunResult};
 use crate::outcome::{Expect, event_from_result};
@@ -88,7 +88,12 @@ impl AgentBackend for ClaudeAgent {
             claude.push(model.into());
         }
         claude.push("--effort".into());
-        claude.push(run.effort.as_deref().unwrap_or(DEFAULT_EFFORT).into());
+        claude.push(
+            run.effort
+                .as_deref()
+                .unwrap_or_else(|| Agent::Claude.default_effort())
+                .into(),
+        );
         // One `http` entry per active MCP server, pointed at the proxy with the
         // run token. A run with no active server adds nothing, so its arguments
         // match a run from before MCP.

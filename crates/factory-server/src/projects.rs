@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_core::{DEFAULT_AGENT, DEFAULT_EFFORT};
+use factory_core::DEFAULT_AGENT;
 use serde::Deserialize;
 
 use crate::store::{Store, StoreError};
@@ -27,8 +27,8 @@ pub struct StageModels {
 }
 
 /// The effort level each stage of a job runs with. Every stage always has one,
-/// unlike a model: a project that saves no effort runs all five at
-/// [`DEFAULT_EFFORT`], which [`StageEfforts::default`] fills in. Effort is
+/// unlike a model: a project that saves no effort runs all five at the default
+/// agent's default effort, which [`StageEfforts::default`] fills in. Effort is
 /// never read from `project.toml`; SQLite is its only store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageEfforts {
@@ -41,12 +41,13 @@ pub struct StageEfforts {
 
 impl Default for StageEfforts {
     fn default() -> Self {
+        let level = DEFAULT_AGENT.default_effort().to_owned();
         StageEfforts {
-            clarify: DEFAULT_EFFORT.to_owned(),
-            spec: DEFAULT_EFFORT.to_owned(),
-            plan: DEFAULT_EFFORT.to_owned(),
-            implement: DEFAULT_EFFORT.to_owned(),
-            review: DEFAULT_EFFORT.to_owned(),
+            clarify: level.clone(),
+            spec: level.clone(),
+            plan: level.clone(),
+            implement: level.clone(),
+            review: level,
         }
     }
 }

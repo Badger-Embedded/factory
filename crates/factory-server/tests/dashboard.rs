@@ -8,9 +8,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, DEFAULT_EFFORT, Event, Gates,
-    MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session,
-    Stage, Task, Turn,
+    Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
+    MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, GitHubRepos, LocalSecrets,
@@ -4119,8 +4118,8 @@ fn efforts(clarify: &str, spec: &str, plan: &str, implement: &str, review: &str)
 fn a_project_without_effort_reads_medium_for_every_stage() {
     let store = Store::open_in_memory().unwrap();
     let medium = StageEfforts::default();
-    assert_eq!(medium.clarify, DEFAULT_EFFORT);
-    assert_eq!(medium.review, DEFAULT_EFFORT);
+    assert_eq!(medium.clarify, DEFAULT_AGENT.default_effort());
+    assert_eq!(medium.review, DEFAULT_AGENT.default_effort());
     assert_eq!(store.project_efforts("maestro").unwrap(), medium);
 }
 
@@ -4135,7 +4134,9 @@ fn project_efforts_are_stored_and_reloaded() {
             store.project_efforts("maestro").unwrap(),
             StageEfforts::default()
         );
-        store.save_project_efforts("maestro", &saved).unwrap();
+        store
+            .save_project_efforts("maestro", &saved, &StageAgents::default())
+            .unwrap();
     }
     // Every stage's effort survives a reopen, and another project is untouched.
     let store = Store::open(&path).unwrap();
@@ -4150,13 +4151,25 @@ fn project_efforts_are_stored_and_reloaded() {
 fn saving_one_projects_effort_leaves_other_projects_alone() {
     let store = Store::open_in_memory().unwrap();
     store
-        .save_project_efforts("maestro", &efforts("high", "high", "high", "high", "high"))
+        .save_project_efforts(
+            "maestro",
+            &efforts("high", "high", "high", "high", "high"),
+            &StageAgents::default(),
+        )
         .unwrap();
     store
-        .save_project_efforts("factory", &efforts("low", "low", "low", "low", "low"))
+        .save_project_efforts(
+            "factory",
+            &efforts("low", "low", "low", "low", "low"),
+            &StageAgents::default(),
+        )
         .unwrap();
     store
-        .save_project_efforts("maestro", &efforts("max", "max", "max", "max", "max"))
+        .save_project_efforts(
+            "maestro",
+            &efforts("max", "max", "max", "max", "max"),
+            &StageAgents::default(),
+        )
         .unwrap();
     assert_eq!(
         store.project_efforts("factory").unwrap(),
@@ -4172,7 +4185,9 @@ fn saving_one_projects_effort_leaves_other_projects_alone() {
 fn an_effort_outside_the_allowed_set_is_rejected_and_not_stored() {
     let store = Store::open_in_memory().unwrap();
     let bad = efforts("medium", "medium", "turbo", "medium", "medium");
-    let err = store.save_project_efforts("maestro", &bad).unwrap_err();
+    let err = store
+        .save_project_efforts("maestro", &bad, &StageAgents::default())
+        .unwrap_err();
     assert!(
         matches!(&err, StoreError::InvalidEffort(level) if level == "turbo"),
         "{err:?}"
@@ -4181,6 +4196,59 @@ fn an_effort_outside_the_allowed_set_is_rejected_and_not_stored() {
     assert_eq!(
         store.project_efforts("maestro").unwrap(),
         StageEfforts::default()
+    );
+}
+
+#[test]
+fn an_effort_is_validated_against_its_stages_saved_agent() {
+    let store = Store::open_in_memory().unwrap();
+    // Codex's levels run minimal through xhigh, so xhigh is valid for a codex
+    // stage even though a claude stage would reject it below max.
+    let codex = agents("codex", "codex", "codex", "codex", "codex");
+    store
+        .save_project_efforts(
+            "maestro",
+            &efforts("minimal", "low", "medium", "high", "xhigh"),
+            &codex,
+        )
+        .unwrap();
+    assert_eq!(
+        store.project_efforts("maestro").unwrap(),
+        efforts("minimal", "low", "medium", "high", "xhigh")
+    );
+
+    // `max` is Claude's top level and no level of Codex, so a codex stage
+    // rejects it and writes nothing.
+    let err = store
+        .save_project_efforts(
+            "maestro",
+            &efforts("max", "low", "medium", "high", "xhigh"),
+            &codex,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidEffort(level) if level == "max"),
+        "{err:?}"
+    );
+
+    // `minimal` is a Codex level and no level of Claude, so a claude stage
+    // rejects it.
+    let err = store
+        .save_project_efforts(
+            "maestro",
+            &efforts("minimal", "low", "low", "low", "low"),
+            &StageAgents::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidEffort(level) if level == "minimal"),
+        "{err:?}"
+    );
+
+    // The earlier codex save is the only one that wrote.
+    assert_eq!(
+        store.project_efforts("maestro").unwrap(),
+        efforts("minimal", "low", "medium", "high", "xhigh")
     );
 }
 
@@ -4212,7 +4280,9 @@ fn a_database_from_before_the_effort_table_opens_and_reads_medium() {
         StageEfforts::default()
     );
     let saved = efforts("high", "high", "high", "high", "high");
-    store.save_project_efforts("maestro", &saved).unwrap();
+    store
+        .save_project_efforts("maestro", &saved, &StageAgents::default())
+        .unwrap();
     assert_eq!(store.project_efforts("maestro").unwrap(), saved);
 }
 
@@ -4238,13 +4308,41 @@ async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_e
     // A saved level preselects in place of the default.
     dashboard
         .store
-        .save_project_efforts("maestro", &efforts("low", "medium", "high", "xhigh", "max"))
+        .save_project_efforts(
+            "maestro",
+            &efforts("low", "medium", "high", "xhigh", "max"),
+            &StageAgents::default(),
+        )
         .unwrap();
     let page = dashboard.get("/settings/projects/maestro").await;
     assert!(page.body.contains("value=\"low\" checked"));
     assert!(page.body.contains("value=\"high\" checked"));
     assert!(page.body.contains("value=\"xhigh\" checked"));
     assert!(page.body.contains("value=\"max\" checked"));
+}
+
+#[tokio::test]
+async fn the_pipeline_form_carries_each_agents_effort_levels_for_the_panel_script() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    // The form holds an agent-to-efforts map the pipeline script reads to redraw
+    // the effort radios when a stage's agent switches. It names both agents with
+    // their own levels, so a switch to Codex can show minimal and drop max. The
+    // attribute is HTML-escaped, so its quotes read as &quot; in the source.
+    assert!(
+        page.body.contains("data-agent-efforts="),
+        "the form carries no agent effort map",
+    );
+    for level in ["minimal", "low", "medium", "high", "xhigh"] {
+        assert!(
+            page.body.contains(&format!("&quot;{level}&quot;")),
+            "the agent effort map is missing {level}",
+        );
+    }
+    assert!(
+        page.body.contains("&quot;codex&quot;") && page.body.contains("&quot;claude&quot;"),
+        "the agent effort map names both agents",
+    );
 }
 
 #[tokio::test]
@@ -4603,6 +4701,7 @@ async fn the_running_step_badge_shows_the_effort_and_stays_compact() {
         .save_project_efforts(
             "maestro",
             &efforts("xhigh", "medium", "medium", "medium", "medium"),
+            &StageAgents::default(),
         )
         .unwrap();
     let id = dashboard.new_job().await;
