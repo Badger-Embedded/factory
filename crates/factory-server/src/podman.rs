@@ -12,7 +12,8 @@ use factory_runner::{
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
     AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, ReadyAction,
-    RerunRequest, SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
+    RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action,
+    watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -110,6 +111,7 @@ impl Executor for PodmanExecutor {
         settings: &Settings,
         request: AgentRequest,
         log: LogSink,
+        mut session: SessionSink,
     ) -> RunReport {
         let agent = request.agent;
         let entry = self.registry.entry(agent);
@@ -153,9 +155,15 @@ impl Executor for PodmanExecutor {
         if let Err(err) = remove_container(&config, &name).await {
             tracing::warn!("removing {name}: {err}");
         }
-        let session = backend.session_for(&config_dir, &request.session_id);
+        // Claude resumes by the factory UUID; Codex resumes by the thread id it
+        // reported on an earlier run, when its rollout file is still there.
+        let resume_id = request
+            .agent_session
+            .as_deref()
+            .unwrap_or(&request.session_id);
+        let session_run = backend.session_for(&config_dir, resume_id);
         let mut prompt = request.prompt;
-        if matches!(session, SessionRun::Start(_)) {
+        if matches!(session_run, SessionRun::Start(_)) {
             match place_images(&workspace, &job_images(&job_dir)) {
                 Ok(paths) => prompt = show_images(&prompt, &paths),
                 Err(err) => return failed(format!("could not place the images: {err}")),
@@ -172,7 +180,7 @@ impl Executor for PodmanExecutor {
         let worker = WorkerRun {
             name,
             agent,
-            session,
+            session: session_run,
             workspace,
             config_dir,
             token,
@@ -182,9 +190,15 @@ impl Executor for PodmanExecutor {
             effort: request.effort,
             mcp: request.mcp,
         };
-        run(&config, &worker, log, |usage| {
-            self.plan_usage.record_now(usage);
-        })
+        run(
+            &config,
+            &worker,
+            log,
+            |usage| {
+                self.plan_usage.record_now(usage);
+            },
+            |id: &str| session(id.to_owned()),
+        )
         .await
     }
 

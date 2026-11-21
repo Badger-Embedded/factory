@@ -11,7 +11,7 @@ use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunRep
 use factory_server::{
     AgentRequest, ChecksRequest, Executor, JobFile, LogSink, McpProjectSettings, McpRuntime,
     McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
-    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, Settings, StageAgents,
+    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
     StageEfforts, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest,
     format_cost, ready_action, watch_only_event,
 };
@@ -35,6 +35,9 @@ struct FakeExecutor {
     costs: Mutex<VecDeque<Option<f64>>>,
     /// The MCP servers each run reports as not connected in its init line.
     unavailable: Mutex<VecDeque<Vec<McpUnavailable>>>,
+    /// The agent-reported session ids each run streams back, such as Codex's
+    /// thread id, in run order. A run with none reports no id, as Claude does.
+    sessions: Mutex<VecDeque<String>>,
     stopped: Mutex<Vec<i64>>,
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
@@ -55,6 +58,7 @@ impl FakeExecutor {
             requests: Mutex::new(Vec::new()),
             costs: Mutex::new(VecDeque::new()),
             unavailable: Mutex::new(VecDeque::new()),
+            sessions: Mutex::new(VecDeque::new()),
             stopped: Mutex::new(Vec::new()),
             checks: Mutex::new(VecDeque::new()),
             checks_run: Mutex::new(Vec::new()),
@@ -78,6 +82,12 @@ impl FakeExecutor {
         self.unavailable.lock().unwrap().push_back(servers);
     }
 
+    /// Makes the next run stream back `id` as the agent's own session id, the
+    /// way a Codex run reports its thread id on `thread.started`.
+    fn report_session(&self, id: &str) {
+        self.sessions.lock().unwrap().push_back(id.to_owned());
+    }
+
     fn requests(&self) -> Vec<AgentRequest> {
         self.requests.lock().unwrap().clone()
     }
@@ -89,9 +99,15 @@ impl Executor for FakeExecutor {
         _settings: &Settings,
         request: AgentRequest,
         mut log: LogSink,
+        mut session: SessionSink,
     ) -> RunReport {
         self.requests.lock().unwrap().push(request.clone());
         self.gate.acquire().await.unwrap().forget();
+        // Stream back the agent's own session id, if the test queued one, before
+        // the run ends, the way a Codex run reports its thread id mid-run.
+        if let Some(id) = self.sessions.lock().unwrap().pop_front() {
+            session(id);
+        }
         log(LogLine::Text("Reading the repository.".into()));
         RunReport {
             event: (self.respond)(&request),
@@ -2591,6 +2607,77 @@ async fn a_resumed_session_keeps_the_agent_recorded_on_it() {
     let clarify = &executor.requests()[0];
     assert_eq!(clarify.expect, Expect::Clarify);
     assert_eq!(clarify.agent, Agent::Codex);
+}
+
+#[tokio::test]
+async fn a_codex_run_stores_its_thread_id_and_the_next_run_resumes_on_it() {
+    // Codex names its own session, so the scheduler learns the thread id from the
+    // run, stores it against the session, and passes it to the next run of that
+    // session as `agent_session`. The runner resumes on it.
+    let (store, executor, scheduler) = setup(one_pass);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    store
+        .session_uuid(id, factory_core::Session::Planning, Agent::Codex)
+        .unwrap();
+    // The first clarify run streams its thread id back, the way Codex reports it
+    // on `thread.started`.
+    executor.report_session("01998d1a-thread-id");
+    executor.release(2);
+
+    // The clarify run asks questions and stores its thread id.
+    step(&scheduler).await;
+    assert_eq!(
+        store
+            .agent_session(id, factory_core::Session::Planning)
+            .unwrap()
+            .as_deref(),
+        Some("01998d1a-thread-id")
+    );
+
+    // The answer run resumes the same session, so it carries the stored thread id.
+    store
+        .apply(id, Event::Answer(vec!["a button".into()]))
+        .unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests[0].expect, Expect::Clarify);
+    // Nothing was stored before the first run, so it had no thread id to resume.
+    assert_eq!(requests[0].agent_session, None);
+    assert_eq!(requests[1].expect, Expect::Clarify);
+    assert_eq!(
+        requests[1].agent_session.as_deref(),
+        Some("01998d1a-thread-id")
+    );
+}
+
+#[tokio::test]
+async fn a_codex_run_that_reports_no_thread_id_leaves_the_next_run_fresh() {
+    // A run killed before `thread.started` stores no id, so the next run of the
+    // session starts fresh rather than resuming a session that never began.
+    let (store, executor, scheduler) = setup(one_pass);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    store
+        .session_uuid(id, factory_core::Session::Planning, Agent::Codex)
+        .unwrap();
+    // No `report_session`: the first run ends without reporting a thread id.
+    executor.release(2);
+
+    step(&scheduler).await;
+    assert_eq!(
+        store
+            .agent_session(id, factory_core::Session::Planning)
+            .unwrap(),
+        None
+    );
+
+    store
+        .apply(id, Event::Answer(vec!["a button".into()]))
+        .unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests[1].agent_session, None);
 }
 
 #[tokio::test]

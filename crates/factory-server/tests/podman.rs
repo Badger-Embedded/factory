@@ -42,6 +42,7 @@ fn request() -> AgentRequest {
         base: "main".into(),
         branch: None,
         session_id: "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10".into(),
+        agent_session: None,
         agent: factory_core::DEFAULT_AGENT,
         expect: Expect::Spec,
         prompt: "Write the spec.".into(),
@@ -69,7 +70,12 @@ async fn a_run_with_no_token_fails_before_any_container() {
     let executor = executor(registry, data_dir.path().to_path_buf(), Arc::clone(&store));
 
     let report = executor
-        .run_agent(&Settings::default(), request(), Box::new(|_| {}))
+        .run_agent(
+            &Settings::default(),
+            request(),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
         .await;
 
     assert_eq!(reason(report), "no Claude token is set");
@@ -90,7 +96,12 @@ async fn a_token_saved_between_runs_reaches_the_next_run() {
 
     // No token yet: the run fails at the gate.
     let first = executor
-        .run_agent(&Settings::default(), request(), Box::new(|_| {}))
+        .run_agent(
+            &Settings::default(),
+            request(),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
         .await;
     assert_eq!(reason(first), "no Claude token is set");
 
@@ -98,7 +109,12 @@ async fn a_token_saved_between_runs_reaches_the_next_run() {
     // past the gate, and fails later at the checkout instead.
     secrets.set_claude_token("sk-ant-oat01-saved").unwrap();
     let second = executor
-        .run_agent(&Settings::default(), request(), Box::new(|_| {}))
+        .run_agent(
+            &Settings::default(),
+            request(),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
         .await;
     assert_ne!(reason(second), "no Claude token is set");
 }
