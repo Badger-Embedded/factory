@@ -571,14 +571,33 @@ button:hover { filter: brightness(0.96); }
 .badge.neutral { color: var(--muted); background: var(--sunken); }
 
 .mcp-calls { margin: 0; padding: 0; list-style: none; }
-.mcp-calls li {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-12);
+.mcp-calls > li {
   padding: var(--space-8) 0;
   border-top: var(--border-width) solid var(--border);
 }
-.mcp-calls li:first-child { border-top: 0; }
+.mcp-calls > li:first-child { border-top: 0; }
+.mcp-call {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-12);
+}
+/* A server group: a clickable summary over its calls, which reuse the row
+   layout but indent under the server name. */
+.mcp-call-group > summary {
+  cursor: pointer;
+  list-style: none;
+}
+.mcp-call-group > summary::-webkit-details-marker { display: none; }
+.mcp-call-group > summary::before {
+  content: "▸";
+  flex: none;
+  color: var(--muted);
+  font-size: var(--font-size-xs);
+}
+.mcp-call-group[open] > summary::before { content: "▾"; }
+.mcp-call-list { margin: var(--space-8) 0 0; padding: 0 0 0 var(--space-16); list-style: none; }
+.mcp-call-list > li { padding: var(--space-8) 0; border-top: var(--border-width) solid var(--border); }
+.mcp-call-list > li:first-child { border-top: 0; padding-top: 0; }
 .mcp-call-main { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; flex: 1; }
 .mcp-call-tool { font-family: var(--mono); font-size: var(--font-size-sm); overflow-wrap: anywhere; }
 .mcp-call-where { color: var(--muted); font-size: var(--font-size-xs); }

@@ -772,7 +772,7 @@ async fn a_job_with_no_mcp_calls_has_no_mcp_card() {
 }
 
 #[tokio::test]
-async fn the_job_page_lists_mcp_tool_calls_oldest_first() {
+async fn the_job_page_groups_mcp_tool_calls_oldest_first() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     dashboard.apply(id, Event::Start);
@@ -791,15 +791,22 @@ async fn the_job_page_lists_mcp_tool_calls_oldest_first() {
 
     let body = dashboard.get(&format!("/jobs/{id}")).await.body;
     assert!(body.contains("MCP tool calls"));
-    // The header counts every row and the refused ones.
+    // The header counts every call across servers and the refused ones.
     assert!(body.contains("3 calls"));
     assert!(body.contains("1 refused"));
 
-    // Each row shows its server and tool.
+    // The three calls are one collapsed group for the one server.
+    assert!(body.contains("data-server=\"context7\""));
+    assert_eq!(body.matches("<details").count(), 1);
+    assert!(!body.contains("<details class=\"mcp-call-group\" data-server=\"context7\" open"));
+
+    // The expanded rows hold the tools in recording order, with the server
+    // dropped since the summary shows it.
     let first = body.find("resolve-library-id").expect("the first call");
     let second = body.find("get-library-docs").expect("the second call");
-    let third = body.find("context7 · delete").expect("the refused call");
+    let third = body.find(">delete<").expect("the refused call");
     assert!(first < second && second < third, "rows are oldest first");
+    assert!(!body.contains("context7 · delete"));
 
     // The stage the job was in, from the timeline's labels.
     assert!(body.contains("clarifying"));
@@ -807,6 +814,82 @@ async fn the_job_page_lists_mcp_tool_calls_oldest_first() {
     // A forwarded call is neutral and a refused one is bad.
     assert_eq!(body.matches("class=\"badge neutral\">called").count(), 2);
     assert!(body.contains("class=\"badge bad\">refused: tool turned off"));
+    // The summary carries a counter badge and a bad refused badge.
+    assert!(body.contains("class=\"badge neutral\">3"));
+    assert!(body.contains("class=\"badge bad\">1 refused"));
+}
+
+#[tokio::test]
+async fn one_server_many_calls_groups_and_one_call_stays_a_plain_row() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    for tool in ["a", "b", "c"] {
+        dashboard
+            .store
+            .record_mcp_tool_call(id, "context7", tool)
+            .unwrap();
+    }
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "other", "lone")
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+
+    // The three-call server is one collapsed group with a counter badge of 3.
+    assert_eq!(body.matches("<details").count(), 1);
+    assert!(body.contains("data-server=\"context7\""));
+    assert!(body.contains("class=\"badge neutral\">3"));
+
+    // The one-call server is a plain row with no details and no counter badge,
+    // and its tool is visible next to the server.
+    assert!(body.contains("other · lone"));
+    assert!(!body.contains("data-server=\"other\""));
+}
+
+#[tokio::test]
+async fn mcp_groups_are_ordered_by_each_servers_first_call() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    // A, B, A: server A's first call comes before B's, so A's entry leads even
+    // though A also has the last call. A is a two-call group, B a plain row.
+    dashboard.store.record_mcp_tool_call(id, "a", "a1").unwrap();
+    dashboard.store.record_mcp_tool_call(id, "b", "b1").unwrap();
+    dashboard.store.record_mcp_tool_call(id, "a", "a2").unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let a = body.find("data-server=\"a\"").expect("server a group");
+    let b = body.find("b · b1").expect("server b row");
+    assert!(a < b, "server a's entry comes before server b's");
+}
+
+#[tokio::test]
+async fn an_mcp_group_counter_badge_appears_only_at_two_calls() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "solo", "one")
+        .unwrap();
+
+    // One call: a plain row, no group and no counter badge.
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(!body.contains("<details"));
+    assert!(!body.contains("class=\"badge neutral\">1<"));
+
+    // A second call on the same server turns the row into a group with a badge
+    // reading 2.
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "solo", "two")
+        .unwrap();
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert_eq!(body.matches("<details").count(), 1);
+    assert!(body.contains("data-server=\"solo\""));
+    assert!(body.contains("class=\"badge neutral\">2"));
 }
 
 #[tokio::test]
@@ -818,6 +901,24 @@ async fn an_mcp_tool_name_is_escaped() {
         .store
         .record_mcp_tool_call(id, "context7", "<script>alert(1)</script>")
         .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!body.contains("<script>alert(1)</script>"));
+}
+
+#[tokio::test]
+async fn an_mcp_server_name_is_escaped_in_a_group_summary() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    // Two calls so the server renders a group summary and a data-server value.
+    for tool in ["one", "two"] {
+        dashboard
+            .store
+            .record_mcp_tool_call(id, "<script>alert(1)</script>", tool)
+            .unwrap();
+    }
 
     let body = dashboard.get(&format!("/jobs/{id}")).await.body;
     assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
