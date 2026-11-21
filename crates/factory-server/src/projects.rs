@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_core::DEFAULT_EFFORT;
+use factory_core::{DEFAULT_AGENT, DEFAULT_EFFORT};
 use serde::Deserialize;
 
 use crate::store::{Store, StoreError};
@@ -47,6 +47,34 @@ impl Default for StageEfforts {
             plan: DEFAULT_EFFORT.to_owned(),
             implement: DEFAULT_EFFORT.to_owned(),
             review: DEFAULT_EFFORT.to_owned(),
+        }
+    }
+}
+
+/// The agent each stage of a job runs on, as a stable agent id. Every stage
+/// always has one: a project that saves no agents runs all five on
+/// [`DEFAULT_AGENT`], which [`StageAgents::default`] fills in. A resumed session
+/// keeps the agent it started on, so this holds the stage's current choice, not
+/// the one a session in flight uses. Agents are never read from `project.toml`;
+/// SQLite is their only store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageAgents {
+    pub clarify: String,
+    pub spec: String,
+    pub plan: String,
+    pub implement: String,
+    pub review: String,
+}
+
+impl Default for StageAgents {
+    fn default() -> Self {
+        let id = DEFAULT_AGENT.id().to_owned();
+        StageAgents {
+            clarify: id.clone(),
+            spec: id.clone(),
+            plan: id.clone(),
+            implement: id.clone(),
+            review: id,
         }
     }
 }

@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use factory_core::{
-    BranchSummary, Command, Event, Job, PrDescription, ReviewState, Session, Stage,
+    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, Job, PrDescription, ReviewState, Session,
+    Stage,
 };
 use factory_runner::{Expect, LogLine, McpConfig, Observation, Rerun, RunReport, job_prompt};
 use tokio::sync::Notify;
@@ -14,7 +15,7 @@ use tokio::time::Instant;
 
 use crate::cost::format_cost;
 use crate::mcp::McpServer;
-use crate::projects::{Project, Projects};
+use crate::projects::{Project, Projects, StageAgents};
 use crate::proxy::RunTokens;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
@@ -36,6 +37,21 @@ pub fn branch_name(job_id: i64, pr: usize) -> String {
     format!("factory/job-{job_id}-pr-{}", pr + 1)
 }
 
+/// The agent a run in `expect` reads from `agents`, with the same stage mapping
+/// as the model and the effort: the check fix and CI fix runs use the implement
+/// agent. A stored id always names an available agent; a stray one falls back to
+/// the default rather than failing the run.
+fn stage_agent(agents: &StageAgents, expect: Expect) -> Agent {
+    let id = match expect {
+        Expect::Clarify => &agents.clarify,
+        Expect::Spec => &agents.spec,
+        Expect::Plan => &agents.plan,
+        Expect::Commits | Expect::FixCi => &agents.implement,
+        Expect::Review => &agents.review,
+    };
+    Agent::from_id(id).unwrap_or(DEFAULT_AGENT)
+}
+
 /// One agent run for the executor to carry out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRequest {
@@ -47,8 +63,12 @@ pub struct AgentRequest {
     /// The pull request branch, or `None` for a planning run, which reads
     /// the base branch.
     pub branch: Option<String>,
-    /// The Claude Code session UUID.
+    /// The agent session UUID.
     pub session_id: String,
+    /// The agent the run uses. The scheduler picks the stage's agent for a fresh
+    /// session and keeps a resumed session on the agent it started, see
+    /// [`Store::session_uuid`](crate::Store::session_uuid).
+    pub agent: Agent,
     pub expect: Expect,
     pub prompt: String,
     /// The model for the run's stage, or `None` when the project sets none.
@@ -440,41 +460,10 @@ impl<E: Executor> Scheduler<E> {
                     let Some(expect) = Expect::for_task(job.stage(), &task) else {
                         continue;
                     };
-                    let models = self.store.project_models(&row.project, &project.models)?;
-                    let model = match expect {
-                        Expect::Clarify => models.clarify,
-                        Expect::Spec => models.spec,
-                        Expect::Plan => models.plan,
-                        Expect::Commits | Expect::FixCi => models.implement,
-                        Expect::Review => models.review,
-                    };
-                    let efforts = self.store.project_efforts(&row.project)?;
-                    let effort = match expect {
-                        Expect::Clarify => efforts.clarify,
-                        Expect::Spec => efforts.spec,
-                        Expect::Plan => efforts.plan,
-                        Expect::Commits | Expect::FixCi => efforts.implement,
-                        Expect::Review => efforts.review,
-                    };
-                    let selection = self.mcp_config(row.id, &row.project, expect)?;
-                    let request = AgentRequest {
-                        job_id: row.id,
-                        repo: project.repo.clone(),
-                        base: project.base.clone(),
-                        branch: match session {
-                            Session::Planning | Session::Spec | Session::Plan => None,
-                            Session::Pr(pr) | Session::Review(pr) => Some(branch_name(row.id, pr)),
-                        },
-                        session_id: self.store.session_uuid(row.id, session)?,
-                        expect,
-                        prompt: job_prompt(&job, &task, expect),
-                        model,
-                        effort: Some(effort),
-                        mcp: selection.config,
-                    };
+                    let (request, skipped) =
+                        self.agent_request(&row, &job, &project, session, &task, expect)?;
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
-                    let skipped = selection.skipped;
                     self.spawn(row.id, Kind::Worker, async move {
                         scheduler.agent(&settings, request, skipped).await;
                     });
@@ -619,6 +608,59 @@ impl<E: Executor> Scheduler<E> {
     /// [`Scheduler::agent`] revokes it when the worker exits. The scheduler
     /// reads the registry and the project's settings on every run, so a settings
     /// change reaches a job in flight at its next run.
+    /// Builds the run for the agent stage `expect` of job `row`, with the
+    /// servers it left out for an undecryptable secret. The model, the effort
+    /// and the agent all read from the project's per-stage settings on the same
+    /// mapping, and the session's recorded agent wins over the stage's for a
+    /// resumed session, see [`stage_agent`] and [`Store::session_uuid`].
+    fn agent_request(
+        &self,
+        row: &JobRow,
+        job: &Job,
+        project: &Project,
+        session: Session,
+        task: &factory_core::Task,
+        expect: Expect,
+    ) -> Result<(AgentRequest, Vec<SkippedServer>), StoreError> {
+        let models = self.store.project_models(&row.project, &project.models)?;
+        let model = match expect {
+            Expect::Clarify => models.clarify,
+            Expect::Spec => models.spec,
+            Expect::Plan => models.plan,
+            Expect::Commits | Expect::FixCi => models.implement,
+            Expect::Review => models.review,
+        };
+        let efforts = self.store.project_efforts(&row.project)?;
+        let effort = match expect {
+            Expect::Clarify => efforts.clarify,
+            Expect::Spec => efforts.spec,
+            Expect::Plan => efforts.plan,
+            Expect::Commits | Expect::FixCi => efforts.implement,
+            Expect::Review => efforts.review,
+        };
+        let agents = self.store.project_agents(&row.project)?;
+        let agent = stage_agent(&agents, expect);
+        let (session_id, agent) = self.store.session_uuid(row.id, session, agent)?;
+        let selection = self.mcp_config(row.id, &row.project, expect)?;
+        let request = AgentRequest {
+            job_id: row.id,
+            repo: project.repo.clone(),
+            base: project.base.clone(),
+            branch: match session {
+                Session::Planning | Session::Spec | Session::Plan => None,
+                Session::Pr(pr) | Session::Review(pr) => Some(branch_name(row.id, pr)),
+            },
+            session_id,
+            agent,
+            expect,
+            prompt: job_prompt(job, task, expect),
+            model,
+            effort: Some(effort),
+            mcp: selection.config,
+        };
+        Ok((request, selection.skipped))
+    }
+
     fn mcp_config(
         &self,
         job_id: i64,

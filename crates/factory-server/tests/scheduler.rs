@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use factory_core::{
-    AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
+    Agent, AgentResult, Ask, BranchSummary, DEFAULT_EFFORT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PrDescription, Question, ReviewState, Stage, Turn,
 };
 use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunReport};
@@ -1681,7 +1681,11 @@ mod purge {
                 .unwrap();
             self.store.append_factory_log(id, "hello").unwrap();
             self.store
-                .session_uuid(id, factory_core::Session::Planning)
+                .session_uuid(
+                    id,
+                    factory_core::Session::Planning,
+                    factory_core::DEFAULT_AGENT,
+                )
                 .unwrap();
             self.store.add_images(id, &["image-1.png".into()]).unwrap();
             let images = self.dir(id).join("images");
@@ -2465,6 +2469,117 @@ async fn the_review_run_uses_the_review_effort() {
     let review = requests.last().unwrap();
     assert_eq!(review.expect, Expect::Review);
     assert_eq!(effort_of(review), "xhigh");
+}
+
+#[tokio::test]
+async fn the_planning_stages_pass_the_agent_from_the_stage_mapping() {
+    // Claude is the one available agent, so clarify, the clarify answer, spec,
+    // plan and implement each run on Claude.
+    let (store, executor, scheduler) = setup(one_pass);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(10);
+
+    step(&scheduler).await;
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Approve).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let stages: Vec<Expect> = requests.iter().map(|r| r.expect).collect();
+    assert_eq!(
+        stages,
+        [
+            Expect::Clarify,
+            Expect::Clarify,
+            Expect::Spec,
+            Expect::Plan,
+            Expect::Commits
+        ]
+    );
+    assert!(
+        requests.iter().all(|r| r.agent == Agent::Claude),
+        "{:?}",
+        requests.iter().map(|r| r.agent).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_fixes_ci_fixes_and_review_runs_pass_the_implement_agent() {
+    // The check fix, CI fix and review-comment runs map to the implement stage,
+    // like the model and effort. Each passes the implement agent, which is
+    // Claude, the one available agent.
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    executor
+        .checks
+        .lock()
+        .unwrap()
+        .push_back(Ok(Event::ChecksFailed {
+            report: "clippy".into(),
+        }));
+
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::FixChecks { .. })
+    ));
+    executor.release(1);
+    step(&scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    for event in [
+        Event::CiFailed { log: "red".into() },
+        Event::ReviewComments {
+            comments: "Needs a test.".into(),
+        },
+    ] {
+        executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+            event: Some(event),
+            seen_until: None,
+            merged_by_factory: false,
+        }));
+        step(&scheduler).await;
+        executor.release(1);
+        step(&scheduler).await;
+        step(&scheduler).await;
+        step(&scheduler).await;
+    }
+
+    let requests = executor.requests();
+    // The implement run, the check fix, the CI fix and the review-comment run:
+    // every one runs on Claude.
+    assert_eq!(requests.len(), 4, "{} requests", requests.len());
+    assert!(
+        requests.iter().all(|r| r.agent == Agent::Claude),
+        "{:?}",
+        requests.iter().map(|r| r.agent).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_session_keeps_the_agent_recorded_on_it() {
+    // The scheduler reads the agent the store recorded when the session began.
+    // A session recorded on an agent other than the stage's current one still
+    // runs on the recorded agent.
+    let (store, executor, scheduler) = setup(one_pass);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    // Record the planning session on Codex before the scheduler runs it, as a
+    // session started under a different agent would be.
+    let (_, recorded) = store
+        .session_uuid(id, factory_core::Session::Planning, Agent::Codex)
+        .unwrap();
+    assert_eq!(recorded, Agent::Codex);
+    executor.release(1);
+
+    step(&scheduler).await;
+    let clarify = &executor.requests()[0];
+    assert_eq!(clarify.expect, Expect::Clarify);
+    assert_eq!(clarify.agent, Agent::Codex);
 }
 
 #[tokio::test]

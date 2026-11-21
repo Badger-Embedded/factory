@@ -3,12 +3,14 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use factory_core::{AgentResult, EFFORTS, Event, Gates, Job, Rejected, Session, Stage};
+use factory_core::{
+    Agent, AgentResult, DEFAULT_AGENT, EFFORTS, Event, Gates, Job, Rejected, Session, Stage,
+};
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
-use crate::projects::{Project, StageEfforts, StageModels};
+use crate::projects::{Project, StageAgents, StageEfforts, StageModels};
 use crate::secrets::SecretRef;
 use crate::settings::Settings;
 
@@ -58,10 +60,19 @@ CREATE TABLE IF NOT EXISTS project_efforts (
     implement TEXT NOT NULL,
     review TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS project_agents (
+    project TEXT PRIMARY KEY,
+    clarify TEXT NOT NULL,
+    spec TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    implement TEXT NOT NULL,
+    review TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sessions (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     session TEXT NOT NULL,
     uuid TEXT NOT NULL,
+    agent TEXT NOT NULL DEFAULT 'claude',
     PRIMARY KEY (job_id, session)
 );
 CREATE TABLE IF NOT EXISTS logs (
@@ -229,6 +240,9 @@ pub enum StoreError {
     DuplicateRepo(String),
     /// An effort level outside the allowed set was submitted. It is not stored.
     InvalidEffort(String),
+    /// An agent id that no available agent carries was submitted for a stage.
+    /// It is not stored.
+    InvalidAgent(String),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -245,6 +259,9 @@ impl fmt::Display for StoreError {
             }
             StoreError::InvalidEffort(effort) => {
                 write!(f, "{effort:?} is not an allowed effort level")
+            }
+            StoreError::InvalidAgent(agent) => {
+                write!(f, "{agent:?} is not an available agent")
             }
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
@@ -310,6 +327,21 @@ impl Store {
         if has_llm_review == 0 {
             conn.execute(
                 "ALTER TABLE project_settings ADD COLUMN llm_review INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // `agent` joined `sessions` when agents became pluggable, so add it to a
+        // table that predates it. A fresh database already has the column from
+        // SCHEMA. The default is `claude`, so a session started before the column
+        // existed resumes on Claude, the one agent that ran then.
+        let has_agent: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'agent'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_agent == 0 {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
                 [],
             )?;
         }
@@ -1120,6 +1152,90 @@ impl Store {
         Ok(())
     }
 
+    /// The agents saved for `project`, or [`DEFAULT_AGENT`] for every stage when
+    /// no row is saved. A project in a database made before this table existed
+    /// has no row and so reads the default agent for every stage.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_agents(&self, project: &str) -> Result<StageAgents, StoreError> {
+        let stored = self
+            .conn()
+            .query_row(
+                "SELECT clarify, spec, plan, implement, review FROM project_agents WHERE project = ?1",
+                [project],
+                |row| {
+                    Ok(StageAgents {
+                        clarify: row.get(0)?,
+                        spec: row.get(1)?,
+                        plan: row.get(2)?,
+                        implement: row.get(3)?,
+                        review: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default())
+    }
+
+    /// Checks that every stage names an available agent, without writing. The
+    /// save handler calls this before it writes the efforts and models, so a
+    /// rejected agent leaves all three unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidAgent`] for the first stage whose id matches
+    /// no available agent.
+    pub fn check_agents(agents: &StageAgents) -> Result<(), StoreError> {
+        for id in [
+            &agents.clarify,
+            &agents.spec,
+            &agents.plan,
+            &agents.implement,
+            &agents.review,
+        ] {
+            match Agent::from_id(id) {
+                Ok(agent) if agent.available() => {}
+                _ => return Err(StoreError::InvalidAgent(id.clone())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Saves `project`'s agent for all five stages, writing only this project's
+    /// row. Every id must be one an available agent carries, see
+    /// [`Store::check_agents`]; an unknown id, or one of an agent that cannot
+    /// run, is rejected and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidAgent`] for an id outside the available
+    /// agents, before any write. Otherwise fails only on a database error.
+    pub fn save_project_agents(
+        &self,
+        project: &str,
+        agents: &StageAgents,
+    ) -> Result<(), StoreError> {
+        Self::check_agents(agents)?;
+        self.conn().execute(
+            "INSERT INTO project_agents (project, clarify, spec, plan, implement, review)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (project) DO UPDATE SET clarify = excluded.clarify,
+                spec = excluded.spec, plan = excluded.plan,
+                implement = excluded.implement, review = excluded.review",
+            params![
+                project,
+                agents.clarify,
+                agents.spec,
+                agents.plan,
+                agents.implement,
+                agents.review
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Whether `project` auto-merges its pull requests, or `default` when no
     /// row is saved. A saved row replaces the project file default.
     ///
@@ -1239,13 +1355,21 @@ impl Store {
         Ok(())
     }
 
-    /// The Claude Code session UUID for `session` of job `job_id`, created
-    /// on first use.
+    /// The agent session UUID for `session` of job `job_id` and the agent the
+    /// session runs on, created on first use. A fresh session records
+    /// `stage_agent`, the agent the stage runs today. A session that already
+    /// exists keeps the agent it started with, even when the stage's agent was
+    /// changed since, so a resumed session stays on the agent that began it.
     ///
     /// # Errors
     ///
     /// Fails on a database error.
-    pub fn session_uuid(&self, job_id: i64, session: Session) -> Result<String, StoreError> {
+    pub fn session_uuid(
+        &self,
+        job_id: i64,
+        session: Session,
+        stage_agent: Agent,
+    ) -> Result<(String, Agent), StoreError> {
         let key = match session {
             Session::Planning => "planning".to_owned(),
             Session::Spec => "spec".to_owned(),
@@ -1255,14 +1379,24 @@ impl Store {
         };
         let conn = self.conn();
         conn.execute(
-            "INSERT OR IGNORE INTO sessions (job_id, session, uuid) VALUES (?1, ?2, ?3)",
-            params![job_id, key, uuid::Uuid::new_v4().to_string()],
+            "INSERT OR IGNORE INTO sessions (job_id, session, uuid, agent) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                job_id,
+                key,
+                uuid::Uuid::new_v4().to_string(),
+                stage_agent.id()
+            ],
         )?;
-        Ok(conn.query_row(
-            "SELECT uuid FROM sessions WHERE job_id = ?1 AND session = ?2",
+        let (uuid, agent_id): (String, String) = conn.query_row(
+            "SELECT uuid, agent FROM sessions WHERE job_id = ?1 AND session = ?2",
             params![job_id, key],
-            |row| row.get(0),
-        )?)
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // A stored id always matches an agent, since only an agent's own id is
+        // ever written; an unreadable one falls back to the default agent rather
+        // than failing the run.
+        let agent = Agent::from_id(&agent_id).unwrap_or(DEFAULT_AGENT);
+        Ok((uuid, agent))
     }
 
     /// The time of the newest pull request comment already given to the
