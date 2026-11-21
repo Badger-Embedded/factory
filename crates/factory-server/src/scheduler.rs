@@ -415,6 +415,7 @@ impl<E: Executor> Scheduler<E> {
         rows.reverse();
         self.stop_unwanted(&rows).await?;
         let rows = self.purge_expired(rows)?;
+        self.clean_merged(&rows)?;
 
         for row in rows {
             if self.tasks().contains_key(&row.id) {
@@ -523,6 +524,31 @@ impl<E: Executor> Scheduler<E> {
             kept.push(row);
         }
         Ok(kept)
+    }
+
+    /// Frees disk by deleting each merged job's `work/` checkout and `claude/`
+    /// session directory. It runs every pass, so it also cleans jobs merged
+    /// before this change and retries a deletion that failed earlier. A merged
+    /// job is final: nothing reads those directories again. It skips a job the
+    /// scheduler still holds an unfinished task for, keeps everything else the
+    /// job owns, logs the one line that reports the cleanup only on the pass
+    /// that freed something, and on a deletion error logs the job id and goes
+    /// on, the way [`Self::purge_expired`] does, so the next pass tries again.
+    fn clean_merged(&self, rows: &[JobRow]) -> Result<(), StoreError> {
+        for row in rows {
+            if *row.job.stage() != Stage::Merged || self.tasks().contains_key(&row.id) {
+                continue;
+            }
+            match self.store.clean_merged_job(row.id, &self.data_dir) {
+                Ok(true) => self.store.append_factory_log(
+                    row.id,
+                    "Removed the checkout and session files to free disk space.",
+                )?,
+                Ok(false) => {}
+                Err(err) => tracing::error!("cleaning merged job {}: {err}", row.id),
+            }
+        }
+        Ok(())
     }
 
     async fn stop_unwanted(&self, rows: &[JobRow]) -> Result<(), StoreError> {

@@ -1700,6 +1700,7 @@ mod purge {
             std::fs::create_dir_all(&files).unwrap();
             std::fs::write(files.join("file-1.txt"), b"log").unwrap();
             std::fs::create_dir_all(self.dir(id).join("work")).unwrap();
+            std::fs::create_dir_all(self.dir(id).join("claude")).unwrap();
             id
         }
 
@@ -1882,6 +1883,141 @@ mod purge {
         assert!(f.exists(stuck));
         assert!(!f.exists(last));
         assert_eq!(f.rows("logs", stuck), 1);
+    }
+
+    impl Fixture {
+        fn has_work(&self, id: i64) -> bool {
+            self.dir(id).join("work").exists()
+        }
+
+        fn has_claude(&self, id: i64) -> bool {
+            self.dir(id).join("claude").exists()
+        }
+
+        /// The number of cleanup lines the merged-job cleanup wrote to the job
+        /// log.
+        fn cleanup_lines(&self, id: i64) -> usize {
+            self.store
+                .logs(id, 1000)
+                .unwrap()
+                .into_iter()
+                .filter(|line| line.text.contains("free disk space"))
+                .count()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_merged_job_loses_its_checkout_and_session() {
+        let f = fixture();
+        let id = f.job(1);
+        f.store.add_cost(id, 0.25).unwrap();
+        f.finish(id, "merged");
+        f.scheduler.tick().await.unwrap();
+
+        assert!(!f.has_work(id));
+        assert!(!f.has_claude(id));
+        assert!(f.dir(id).join("images/image-1.png").exists());
+        assert!(f.dir(id).join("files/file-1.txt").exists());
+        assert!(f.exists(id));
+        assert_eq!(f.rows("job_images", id), 1);
+        assert_eq!(f.rows("job_files", id), 1);
+        assert!(f.rows("logs", id) >= 1);
+        assert!(f.rows("job_events", id) > 0);
+        assert!((f.store.cost_usd(id).unwrap() - 0.25).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_merged_job_from_before_the_change_is_cleaned_in_one_tick() {
+        let f = fixture();
+        let id = f.job(1);
+        f.finish(id, "merged");
+        // Both directories exist before the first pass, as for a job merged
+        // before this cleanup shipped.
+        assert!(f.has_work(id));
+        assert!(f.has_claude(id));
+
+        f.scheduler.tick().await.unwrap();
+
+        assert!(!f.has_work(id));
+        assert!(!f.has_claude(id));
+    }
+
+    #[tokio::test]
+    async fn failed_cancelled_and_unfinished_jobs_keep_their_directories() {
+        let f = fixture();
+        let failed = f.job(1);
+        let cancelled = f.job(1);
+        let unfinished = f.job(1);
+        f.finish(failed, "failed");
+        f.finish(cancelled, "cancelled");
+
+        f.scheduler.tick().await.unwrap();
+
+        for id in [failed, cancelled, unfinished] {
+            assert!(f.has_work(id), "job {id} keeps work");
+            assert!(f.has_claude(id), "job {id} keeps claude");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_failing_cleanup_does_not_stop_the_others_and_a_later_pass_succeeds() {
+        let f = fixture();
+        let first = f.job(1);
+        let stuck = f.job(1);
+        let last = f.job(1);
+        for id in [first, stuck, last] {
+            f.finish(id, "merged");
+        }
+        // A file where `work/` should be a directory makes remove_dir_all fail.
+        std::fs::remove_dir_all(f.dir(stuck).join("work")).unwrap();
+        std::fs::write(f.dir(stuck).join("work"), b"not a directory").unwrap();
+
+        f.scheduler.tick().await.unwrap();
+
+        assert!(!f.has_work(first) && !f.has_claude(first));
+        assert!(!f.has_work(last) && !f.has_claude(last));
+        // The stuck job's work could not be removed, so the job is not done and
+        // wrote no cleanup line.
+        assert_eq!(f.cleanup_lines(stuck), 0);
+
+        // Remove the cause and the next pass finishes the cleanup.
+        std::fs::remove_file(f.dir(stuck).join("work")).unwrap();
+        f.scheduler.tick().await.unwrap();
+        assert!(!f.has_work(stuck));
+        assert!(!f.has_claude(stuck));
+        assert_eq!(f.cleanup_lines(stuck), 1);
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_line_is_written_exactly_once() {
+        let f = fixture();
+        let id = f.job(1);
+        f.finish(id, "merged");
+
+        for _ in 0..4 {
+            f.scheduler.tick().await.unwrap();
+        }
+
+        assert_eq!(f.cleanup_lines(id), 1);
+    }
+
+    #[tokio::test]
+    async fn a_merged_job_over_30_days_is_deleted_whether_or_not_it_was_cleaned() {
+        let f = fixture();
+        let cleaned = f.job(31);
+        let intact = f.job(31);
+        f.finish(cleaned, "merged");
+        f.finish(intact, "merged");
+        // Simulate a job already cleaned by an earlier pass before it expired.
+        std::fs::remove_dir_all(f.dir(cleaned).join("work")).unwrap();
+        std::fs::remove_dir_all(f.dir(cleaned).join("claude")).unwrap();
+
+        f.scheduler.tick().await.unwrap();
+
+        assert!(!f.exists(cleaned));
+        assert!(!f.exists(intact));
+        assert!(!f.dir(cleaned).exists());
+        assert!(!f.dir(intact).exists());
     }
 }
 

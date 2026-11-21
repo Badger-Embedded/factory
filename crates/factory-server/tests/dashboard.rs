@@ -2467,6 +2467,68 @@ async fn a_stored_image_is_served_from_its_file() {
 }
 
 #[tokio::test]
+async fn a_cleaned_merged_job_page_and_its_attachments_still_render() {
+    let dashboard = dashboard();
+    let id = job_id(
+        &dashboard
+            .post_job(
+                "maestro",
+                "Add a reboot button",
+                &[("photo.png", PNG), ("notes.txt", TEXT)],
+            )
+            .await,
+    );
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 7 });
+    dashboard.apply(id, Event::Merged);
+    dashboard
+        .store
+        .append_factory_log(
+            id,
+            "Removed the checkout and session files to free disk space.",
+        )
+        .unwrap();
+
+    // Create the checkout and session directories a real job keeps, then clean
+    // them the way the job loop does once the job is merged.
+    let dir = dashboard.data.path().join("jobs").join(id.to_string());
+    std::fs::create_dir_all(dir.join("work")).unwrap();
+    std::fs::create_dir_all(dir.join("claude")).unwrap();
+    assert!(
+        dashboard
+            .store
+            .clean_merged_job(id, dashboard.data.path())
+            .unwrap()
+    );
+    assert!(!dir.join("work").exists());
+    assert!(!dir.join("claude").exists());
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Add a reboot button"), "request");
+    assert!(page.body.contains("Goal: a reboot button."), "spec");
+    assert!(
+        page.body.contains("maestrod: add a reboot endpoint"),
+        "plan"
+    );
+    assert!(page.body.contains("free disk space"), "log");
+
+    let image = dashboard
+        .get(&format!("/jobs/{id}/images/image-1.png"))
+        .await;
+    assert_eq!(image.status, StatusCode::OK);
+    assert_eq!(image.bytes, PNG);
+    let file = dashboard.get(&format!("/jobs/{id}/files/file-1.txt")).await;
+    assert_eq!(file.status, StatusCode::OK);
+    assert_eq!(file.bytes, TEXT);
+}
+
+#[tokio::test]
 async fn only_the_jobs_own_stored_images_are_served() {
     let dashboard = dashboard();
     let id = job_id(&dashboard.post_job("maestro", "x", &[("a.png", PNG)]).await);
