@@ -403,10 +403,22 @@ pub enum SettingsPage {
     Workers,
     Gates,
     Github,
-    Claude,
+    /// An agent's account page, named by the agent's id.
+    Agent(String),
     Mcp,
     McpServer(String),
     Project(String),
+}
+
+/// One agent in the sidebar's Agents group, as the registry reports it: the id
+/// the open page marks itself with, the display name, the account page URL (none
+/// for an agent with no page, which the sidebar lists without a link), and
+/// whether the agent can run. A disabled entry shows "Not available yet".
+pub struct AgentNav {
+    pub id: String,
+    pub name: String,
+    pub url: Option<String>,
+    pub available: bool,
 }
 
 /// What the settings sidebar lists besides its fixed entries.
@@ -415,6 +427,8 @@ pub struct SettingsNav {
     pub projects: Vec<String>,
     /// Registered MCP server names, in the registry's order.
     pub servers: Vec<String>,
+    /// The registered agents, in the registry's order.
+    pub agents: Vec<AgentNav>,
 }
 
 /// A settings page: the sidebar, then `body` under its heading and the
@@ -460,7 +474,16 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
             (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
             (entry("/settings/gates".into(), "Default gates", &SettingsPage::Gates))
             (entry("/settings/github".into(), "GitHub", &SettingsPage::Github))
-            (entry("/settings/claude".into(), "Claude account", &SettingsPage::Claude))
+            p.settings-group { "Agents" }
+            @for agent in &nav.agents {
+                @match (agent.available, &agent.url) {
+                    (true, Some(url)) => (entry(url.clone(), &agent.name, &SettingsPage::Agent(agent.id.clone()))),
+                    _ => span.settings-link.settings-disabled {
+                        (agent.name)
+                        span.settings-note { "Not available yet" }
+                    },
+                }
+            }
             p.settings-group { "Integrations" }
             a.settings-link href="/settings/mcp" aria-current=[in_mcp.then_some("page")] {
                 "MCP servers"
@@ -613,11 +636,11 @@ pub fn settings_claude(
     settings_page(
         user,
         nav,
-        &SettingsPage::Claude,
-        "Claude account",
+        &SettingsPage::Agent("claude".to_owned()),
+        "Claude",
         notice,
         &html! {
-            h1 { "Claude account" }
+            h1 { "Claude" }
             (claude_token_card(claude_token_set, secrets_available))
         },
     )
@@ -903,7 +926,7 @@ fn header_row(value: &str) -> Markup {
     }
 }
 
-/// The "Claude token" card on the Claude account page. It shows only whether a token is stored, never the value:
+/// The "Claude token" card on the Claude agent page. It shows only whether a token is stored, never the value:
 /// the input carries no `value`, so the token is never in the page source. A
 /// non-empty save replaces the token, an empty save keeps it, and the Clear
 /// button removes it. When the secret store is unavailable the input and Save
@@ -912,7 +935,7 @@ fn header_row(value: &str) -> Markup {
 /// token can still be removed after the master key is lost.
 fn claude_token_card(claude_token_set: bool, secrets_available: bool) -> Markup {
     html! {
-        form.card.settings-form method="post" action="/settings/claude-token" {
+        form.card.settings-form method="post" action="/settings/agents/claude/token" {
             h2 { "Claude token" }
             p.hint { "The subscription token from " code { "claude setup-token" } ", used for every agent run and the plan usage tile. Stored encrypted and never shown." }
             @if !secrets_available {
@@ -934,7 +957,7 @@ fn claude_token_card(claude_token_set: bool, secrets_available: bool) -> Markup 
                 button.primary disabled[!secrets_available] { "Save token" }
             }
             div.danger-zone {
-                button.danger formaction="/settings/claude-token/clear" formnovalidate { "Clear token" }
+                button.danger formaction="/settings/agents/claude/token/clear" formnovalidate { "Clear token" }
             }
         }
     }

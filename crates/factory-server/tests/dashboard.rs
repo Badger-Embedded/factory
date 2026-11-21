@@ -12,10 +12,10 @@ use factory_core::{
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Stage, Task, Turn,
 };
 use factory_server::{
-    BranchInfo, CheckOutcome, GitHubRepos, LocalSecrets, MASTER_KEY_LEN, McpChecker, McpTool,
-    Permission, PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, SecretStore, Settings,
-    StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER, UnavailableSecrets,
-    WorkerSlots, app,
+    AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, GitHubRepos, LocalSecrets,
+    MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection,
+    RepoChecker, RepoInfo, SecretStore, Settings, StageEfforts, StageModels, Store, StoreError,
+    ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -185,6 +185,10 @@ fn dashboard_with_secrets(
     let usage = Arc::new(PlanUsageCache::new());
     let slots = Arc::new(WorkerSlots::new());
     let checker = Arc::new(FakeChecker::default());
+    let registry = Arc::new(AgentRegistry::new(Arc::new(ClaudeToken::new(
+        Arc::clone(&secrets),
+        None,
+    ))));
     Dashboard {
         router: app(
             store.clone(),
@@ -196,6 +200,7 @@ fn dashboard_with_secrets(
             Arc::clone(&slots),
             secrets,
             Arc::clone(&checker) as Arc<dyn McpChecker>,
+            registry,
         ),
         store,
         data,
@@ -241,7 +246,7 @@ impl Dashboard {
             "/settings/workers",
             "/settings/gates",
             "/settings/github",
-            "/settings/claude",
+            "/settings/agents/claude",
             "/settings/mcp",
         ]
         .map(str::to_owned)
@@ -1889,6 +1894,10 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(WorkerSlots::new()),
         Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
         Arc::new(FakeChecker::default()) as Arc<dyn McpChecker>,
+        Arc::new(AgentRegistry::new(Arc::new(ClaudeToken::new(
+            Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
+            None,
+        )))),
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
@@ -5596,12 +5605,13 @@ fn store_claude_token(dashboard: &Dashboard, value: &str) {
 }
 
 #[tokio::test]
-async fn the_settings_page_has_a_claude_token_field_in_the_global_section() {
+async fn the_claude_agent_page_has_the_token_card_under_a_claude_heading() {
     let dashboard = dashboard();
-    let page = dashboard.settings_pages().await;
+    let page = dashboard.get("/settings/agents/claude").await.body;
+    assert!(page.contains("<h1>Claude</h1>"));
     assert!(page.contains("Claude token"));
     assert!(page.contains("name=\"claude_token\""));
-    assert!(page.contains("action=\"/settings/claude-token\""));
+    assert!(page.contains("action=\"/settings/agents/claude/token\""));
     // No token yet, so the field shows "not set".
     assert!(page.contains("placeholder=\"not set\""));
 }
@@ -5630,7 +5640,7 @@ async fn saving_the_claude_token_replaces_it_and_trims_whitespace() {
     // stored without them, and replaces the old token.
     let reply = dashboard
         .post(
-            "/settings/claude-token",
+            "/settings/agents/claude/token",
             "claude_token=%20sk-ant-oat-new%0A",
         )
         .await;
@@ -5648,7 +5658,7 @@ async fn an_empty_claude_token_field_keeps_the_stored_token() {
     store_claude_token(&dashboard, "sk-ant-oat-keep");
 
     let reply = dashboard
-        .post("/settings/claude-token", "claude_token=")
+        .post("/settings/agents/claude/token", "claude_token=")
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
@@ -5663,7 +5673,7 @@ async fn the_clear_control_removes_the_claude_token() {
     store_claude_token(&dashboard, "sk-ant-oat-gone");
 
     let reply = dashboard
-        .post("/settings/claude-token/clear", "claude_token=")
+        .post("/settings/agents/claude/token/clear", "claude_token=")
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.body.contains("Cleared."));
@@ -6135,7 +6145,7 @@ async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
         "/settings/workers",
         "/settings/gates",
         "/settings/github",
-        "/settings/claude",
+        "/settings/agents/claude",
         "/settings/mcp",
         "/settings/projects/maestro",
         "/settings/projects/tool",
@@ -6152,6 +6162,39 @@ async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
 }
 
 #[tokio::test]
+async fn the_sidebar_groups_agents_and_lists_codex_as_disabled() {
+    let dashboard = dashboard();
+    let body = dashboard.get("/settings/github").await.body;
+
+    // The sidebar has an Agents group between Factory and Integrations.
+    assert!(body.contains("Agents"));
+    let agents = body.find("Agents").unwrap();
+    let integrations = body.find("Integrations").unwrap();
+    assert!(agents < integrations);
+
+    // Claude links to its page; "Claude account" is gone from Factory.
+    assert!(body.contains(r#"href="/settings/agents/claude""#));
+    assert!(!body.contains("Claude account"));
+
+    // Codex is listed, disabled, with no link and a "Not available yet" note.
+    assert!(body.contains("Codex"));
+    assert!(body.contains("Not available yet"));
+    assert!(!body.contains(r#"href="/settings/agents/codex""#));
+
+    // The Claude agent page marks its own sidebar entry.
+    let body = dashboard.get("/settings/agents/claude").await.body;
+    assert!(body.contains(r#"href="/settings/agents/claude" aria-current="page""#));
+}
+
+#[tokio::test]
+async fn the_old_claude_url_redirects_to_the_agent_page() {
+    let dashboard = dashboard();
+    let reply = dashboard.get("/settings/claude").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/settings/agents/claude"));
+}
+
+#[tokio::test]
 async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     let dashboard = dashboard();
     add_context7(&dashboard).await;
@@ -6159,7 +6202,7 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
         "/settings/workers",
         "/settings/gates",
         "/settings/github",
-        "/settings/claude",
+        "/settings/agents/claude",
         "/settings/mcp/context7",
         "/settings/projects/maestro",
     ] {
@@ -6181,7 +6224,7 @@ async fn save_comes_before_delete_and_clear_so_enter_saves() {
     let delete = body.find("/settings/mcp/context7/delete").unwrap();
     assert!(save < delete);
 
-    let body = dashboard.get("/settings/claude").await.body;
+    let body = dashboard.get("/settings/agents/claude").await.body;
     let save = body.find("Save token").unwrap();
     let clear = body.find("Clear token").unwrap();
     assert!(save < clear);

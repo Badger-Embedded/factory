@@ -33,7 +33,7 @@ fn the_claude_entry_carries_its_image_and_suggestions() {
 
     assert_eq!(claude.display_name(), "Claude");
     assert!(claude.available());
-    assert_eq!(claude.settings_url(), Some("/settings/claude"));
+    assert_eq!(claude.settings_url(), Some("/settings/agents/claude"));
     assert_eq!(claude.host_config_dir(), Some("claude"));
     assert_eq!(
         claude.model_suggestions(),

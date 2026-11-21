@@ -768,7 +768,10 @@ form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
 .settings-link:hover { background: var(--sunken); }
 .settings-link[aria-current="page"] { background: var(--agent-bg); color: var(--agent); font-weight: var(--weight-semibold); }
 .settings-link.settings-add { color: var(--accent); }
+.settings-link.settings-disabled { color: var(--muted); cursor: default; }
+.settings-link.settings-disabled:hover { background: none; }
 .settings-count { color: var(--muted); font-size: var(--font-size-xs); font-variant-numeric: tabular-nums; }
+.settings-note { color: var(--muted); font-size: var(--font-size-xs); }
 .settings-main { min-width: 0; }
 .crumbs { margin: 0 0 var(--space-6); color: var(--muted); font-size: var(--font-size-sm); }
 
