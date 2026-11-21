@@ -131,6 +131,7 @@ fn note(step: &mut Step, event: &JobEvent) {
             step.approved = Some(event.at.clone());
             None
         }
+        "edit" => Some("You edited the request"),
         "agent:questions" => Some("The agent asked questions"),
         "answer" => Some("You answered"),
         "request-changes" => Some("You asked for changes"),

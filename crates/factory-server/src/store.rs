@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
@@ -628,6 +628,88 @@ impl Store {
             )?;
         }
         Ok(tx.commit()?)
+    }
+
+    /// Replaces the request text and attachment set of a still-queued job in
+    /// one transaction, so the scheduler's `Event::Start` cannot run in
+    /// between. The caller writes the new attachment set to the job's
+    /// `staging/` directory first, numbered as `write_numbered_attachments`
+    /// does, and passes the resulting `image_names` and `files`. Holding the
+    /// connection lock, this checks the job is still `requested`, swaps the
+    /// staged set in over the old one, replaces the `job_images` and
+    /// `job_files` rows, and applies [`Event::Edit`] so the `edit` history row
+    /// lands in the same transaction.
+    ///
+    /// On success the old attachment set is deleted and the new one is live.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Rejected`] when the job already left
+    /// `requested`, and then nothing changes: neither the store nor the files
+    /// on disk. The staged set stays for the caller to discard. Fails with
+    /// [`StoreError::Io`] on a file system error, and with [`StoreError::Db`]
+    /// on a database error; either restores the old set and leaves the job
+    /// unchanged.
+    pub fn edit_request(
+        &self,
+        id: i64,
+        request: String,
+        data_dir: &Path,
+        image_names: &[String],
+        files: &[JobFile],
+    ) -> Result<(), StoreError> {
+        let event = Event::Edit { request };
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, id)?;
+        if *row.job.stage() != Stage::Requested {
+            return Err(StoreError::Rejected(Rejected::Unexpected {
+                stage: row.job.stage().clone(),
+                event,
+            }));
+        }
+        let job_dir = data_dir.join("jobs").join(id.to_string());
+        let swap = DirSwap::swap_in(&job_dir)?;
+        let committed = Self::write_edit(&tx, id, &mut row, event, image_names, files)
+            .and_then(|()| tx.commit().map_err(StoreError::from));
+        match committed {
+            Ok(()) => {
+                swap.commit();
+                Ok(())
+            }
+            Err(err) => {
+                swap.undo();
+                Err(err)
+            }
+        }
+    }
+
+    /// Replaces the attachment rows of job `id` and applies `event` to `row`,
+    /// without committing, so [`Store::edit_request`] can still roll the disk
+    /// swap back if the commit itself fails.
+    fn write_edit(
+        tx: &Transaction<'_>,
+        id: i64,
+        row: &mut JobRow,
+        event: Event,
+        image_names: &[String],
+        files: &[JobFile],
+    ) -> Result<(), StoreError> {
+        tx.execute("DELETE FROM job_images WHERE job_id = ?1", [id])?;
+        tx.execute("DELETE FROM job_files WHERE job_id = ?1", [id])?;
+        for name in image_names {
+            tx.execute(
+                "INSERT INTO job_images (job_id, name) VALUES (?1, ?2)",
+                params![id, name],
+            )?;
+        }
+        for file in files {
+            tx.execute(
+                "INSERT INTO job_files (job_id, name, original_name) VALUES (?1, ?2, ?3)",
+                params![id, file.name, file.original_name],
+            )?;
+        }
+        Self::apply_in(tx, row, event)
     }
 
     /// Adds `usd` to the running API cost of job `id` and to the totals of
@@ -1994,6 +2076,82 @@ impl Store {
             .optional()?
             .ok_or(StoreError::NotFound(id))?;
         parse_row(raw)
+    }
+}
+
+/// Swaps a queued job's staged attachment directories into place while keeping
+/// the old set aside, so a failure before the store commits can restore it
+/// exactly. [`DirSwap::swap_in`] moves `images/` and `files/` to `.bak` names
+/// and the `staging/` set over them, recording each rename. `commit` drops the
+/// `.bak` set once the transaction has committed; `undo` reverses every rename.
+struct DirSwap {
+    /// Each rename performed, as `(from, to)`, in the order done.
+    done: Vec<(PathBuf, PathBuf)>,
+    /// The `.bak` directories holding the old set, removed on `commit`.
+    backups: Vec<PathBuf>,
+}
+
+impl DirSwap {
+    /// Moves the current `images/` and `files/` aside to `.bak` names, then
+    /// moves the `staging/images` and `staging/files` set into their place. A
+    /// directory that does not exist is skipped, so a job with no images or no
+    /// files swaps only what it has. On any failure the partial swap is undone
+    /// and the error returned, leaving the old set live.
+    fn swap_in(job_dir: &Path) -> Result<DirSwap, StoreError> {
+        let mut swap = DirSwap {
+            done: Vec::new(),
+            backups: Vec::new(),
+        };
+        match swap.try_swap(job_dir) {
+            Ok(()) => Ok(swap),
+            Err(err) => {
+                swap.undo();
+                Err(err)
+            }
+        }
+    }
+
+    fn try_swap(&mut self, job_dir: &Path) -> Result<(), StoreError> {
+        let images = job_dir.join("images");
+        let files = job_dir.join("files");
+        let images_bak = job_dir.join("images.bak");
+        let files_bak = job_dir.join("files.bak");
+        let staging = job_dir.join("staging");
+        if self.rename_opt(&images, &images_bak)? {
+            self.backups.push(images_bak.clone());
+        }
+        if self.rename_opt(&files, &files_bak)? {
+            self.backups.push(files_bak.clone());
+        }
+        self.rename_opt(&staging.join("images"), &images)?;
+        self.rename_opt(&staging.join("files"), &files)?;
+        Ok(())
+    }
+
+    /// Renames `from` to `to` when `from` exists, recording the move. Returns
+    /// whether a rename happened.
+    fn rename_opt(&mut self, from: &Path, to: &Path) -> Result<bool, StoreError> {
+        if from.exists() {
+            std::fs::rename(from, to).map_err(StoreError::Io)?;
+            self.done.push((from.to_owned(), to.to_owned()));
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Reverses every recorded rename, newest first, restoring the old set.
+    fn undo(self) {
+        for (from, to) in self.done.into_iter().rev() {
+            let _ = std::fs::rename(&to, &from);
+        }
+    }
+
+    /// Drops the saved old set once the swap is permanent.
+    fn commit(self) {
+        for bak in &self.backups {
+            let _ = std::fs::remove_dir_all(bak);
+        }
     }
 }
 

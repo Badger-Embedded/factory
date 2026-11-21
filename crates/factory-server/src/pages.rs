@@ -2397,7 +2397,12 @@ fn job_header(id: i64, row: &JobRow, repo_url: Option<&str>, cost_usd: f64) -> M
 fn request_card(id: i64, job: &Job, images: &[String], files: &[JobFile]) -> Markup {
     html! {
         div.card {
-            h2 { "Request" }
+            div.card-head {
+                h2 { "Request" }
+                @if *job.stage() == Stage::Requested {
+                    a.nav href={ "/jobs/" (id) "/edit" } { "Edit" }
+                }
+            }
             pre.doc { (job.request()) }
             @if !images.is_empty() {
                 ul.request-images {
@@ -2424,6 +2429,84 @@ fn request_card(id: i64, job: &Job, images: &[String], files: &[JobFile]) -> Mar
             }
         }
     }
+}
+
+/// The page to edit a queued job's request. It posts to `/jobs/{id}/edit` as
+/// multipart, the way the new-request form posts. The textarea starts with the
+/// current text, each current image and file carries a Remove checkbox that
+/// posts its stored name, and `paste-images.js` drives the file input for new
+/// uploads. The form works without JavaScript; the checkboxes and file input
+/// post on their own.
+pub fn edit_request(
+    user: &str,
+    id: i64,
+    job: &Job,
+    images: &[String],
+    files: &[JobFile],
+) -> Markup {
+    layout(
+        user,
+        &format!("Edit request · Job #{id}"),
+        &html! {
+            div.card {
+                h1 { "Edit request" }
+                form.edit-request method="post" action={ "/jobs/" (id) "/edit" }
+                    enctype="multipart/form-data" {
+                    label.visually-hidden for="request" { "Request" }
+                    textarea #request name="request" required rows="8" { (job.request()) }
+                    @if !images.is_empty() || !files.is_empty() {
+                        fieldset.current-attachments {
+                            legend { "Current attachments" }
+                            @if !images.is_empty() {
+                                ul.request-images {
+                                    @for name in images {
+                                        li {
+                                            img src={ "/jobs/" (id) "/images/" (name) } alt=(name);
+                                            label.remove-attachment {
+                                                input type="checkbox" name="remove" value=(name);
+                                                " Remove"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            @if !files.is_empty() {
+                                ul.request-files {
+                                    @for file in files {
+                                        li {
+                                            span.file-tile {
+                                                (file_icon(is_zip(&file.name)))
+                                                span.file-name { (file.original_name) }
+                                            }
+                                            label.remove-attachment {
+                                                input type="checkbox" name="remove" value=(file.name);
+                                                " Remove"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div.file-picker {
+                        input #images type="file" name="images" multiple class="visually-hidden";
+                        label.file-button for="images" { "Attach files" }
+                        span.hint {
+                            "Images (PNG, JPEG, GIF, WebP), text files or ZIP archives, up to 10 MiB \
+                             each and 5 in total, counting the ones you keep. You can also paste \
+                             images into the box above."
+                        }
+                    }
+                    ul #pasted-images.pasted-images {}
+                    div.form-actions {
+                        button.primary { "Save" }
+                        a.nav href={ "/jobs/" (id) } { "Back to job" }
+                    }
+                }
+                script { (PreEscaped(PASTE_IMAGES)) }
+            }
+        },
+    )
 }
 
 /// Whether a stored file name is a ZIP archive, by its extension. The server
