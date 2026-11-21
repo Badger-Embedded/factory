@@ -1072,7 +1072,7 @@ impl<E: Executor> Scheduler<E> {
                         &format!("Merged #{number}: its checks passed and auto-merge is on."),
                     );
                 }
-                if event == Event::StartReview {
+                if matches!(event, Event::StartReview { .. }) {
                     self.note(
                         job_id,
                         &format!("#{number} is green; reviewing it before the merge."),

@@ -106,7 +106,7 @@ impl Event {
             Event::CiRerun => "ci-rerun",
             Event::Conflicted { .. } => "conflicted",
             Event::ReviewComments { .. } => "review-comments",
-            Event::StartReview => "start-review",
+            Event::StartReview { .. } => "start-review",
             Event::ReviewApproved => "review-approved",
             Event::ReviewChanges { .. } => "review-changes",
             Event::ReviewFailed { .. } => "review-failed",

@@ -1502,7 +1502,7 @@ fn a_legacy_failed_job_with_no_pull_request_number_is_not_retryable() {
 /// `number`: the reviewer asks for changes, the agent fixes and pushes, and
 /// the checks pass, so the head is ready for the next review.
 fn review_changes_round(job: &mut Job, number: u64) {
-    apply(job, Event::StartReview);
+    apply(job, start_review());
     apply(
         job,
         Event::ReviewChanges {
@@ -1527,7 +1527,7 @@ fn an_approved_review_records_the_pass_and_returns_to_watching() {
     let mut job = watching(7);
     assert_eq!(job.review_state(), ReviewState::Pending);
 
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
     assert_runs(&job, Session::Review(0), Task::Review);
 
@@ -1540,6 +1540,9 @@ fn an_approved_review_records_the_pass_and_returns_to_watching() {
             number: 1,
             verdict: Verdict::Approve,
             feedback: None,
+            pr: Some(0),
+            head: job.reviews()[0].head.clone(),
+            answers_seen: 0,
         }]
     );
     assert_eq!(
@@ -1558,7 +1561,7 @@ fn an_approved_review_records_the_pass_and_returns_to_watching() {
 #[test]
 fn requested_changes_go_to_the_implement_session_and_re_review_after_the_push() {
     let mut job = watching(7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewChanges {
@@ -1579,6 +1582,9 @@ fn requested_changes_go_to_the_implement_session_and_re_review_after_the_push() 
             number: 1,
             verdict: Verdict::Changes,
             feedback: Some("rename the field".into()),
+            pr: Some(0),
+            head: job.reviews()[0].head.clone(),
+            answers_seen: 0,
         }]
     );
 
@@ -1587,7 +1593,7 @@ fn requested_changes_go_to_the_implement_session_and_re_review_after_the_push() 
     apply(&mut job, Event::Published { number: 7 });
     assert_eq!(job.review_state(), ReviewState::Pending);
 
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(&mut job, Event::ReviewApproved);
     assert_eq!(
         job.reviews().iter().map(|r| r.number).collect::<Vec<_>>(),
@@ -1599,13 +1605,13 @@ fn requested_changes_go_to_the_implement_session_and_re_review_after_the_push() 
 #[test]
 fn start_review_runs_only_once_until_a_new_push() {
     let mut job = watching(7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(&mut job, Event::ReviewApproved);
     assert_eq!(job.review_state(), ReviewState::Approved);
 
     let before = job.clone();
     assert!(matches!(
-        job.apply(Event::StartReview),
+        job.apply(start_review()),
         Err(Rejected::Unexpected { .. })
     ));
     assert_eq!(job, before);
@@ -1627,7 +1633,7 @@ fn review_events_apply_only_in_a_review_turn() {
     );
 
     let mut implementing = implementing(&["only"]);
-    assert!(implementing.apply(Event::StartReview).is_err());
+    assert!(implementing.apply(start_review()).is_err());
 }
 
 #[test]
@@ -1636,7 +1642,7 @@ fn the_review_cap_stops_the_job_without_merging() {
     for _ in 1..MAX_REVIEW_ROUNDS {
         review_changes_round(&mut job, 7);
     }
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewChanges {
@@ -1668,10 +1674,106 @@ fn the_review_cap_stops_the_job_without_merging() {
     assert!(!job.is_finished());
 }
 
+fn start_review_on(head: &str) -> Event {
+    Event::StartReview { head: head.into() }
+}
+
+/// Asks for changes on `head`, then the agent ends its review fix with no new
+/// commit, so CI goes green on the same head again.
+fn changes_without_a_commit(job: &mut Job, head: &str) {
+    apply(job, start_review_on(head));
+    apply(
+        job,
+        Event::ReviewChanges {
+            feedback: "read the old variable as a fallback".into(),
+        },
+    );
+    apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(job, Event::ChecksPassed);
+    apply(job, Event::Published { number: 7 });
+}
+
+#[test]
+fn a_pass_records_its_pull_request_head_and_the_answers_it_saw() {
+    let mut job = watching(7);
+    apply(&mut job, start_review_on("abc123"));
+    apply(&mut job, Event::ReviewApproved);
+    let pass = &job.reviews()[0];
+    assert_eq!(pass.pr, Some(0));
+    assert_eq!(pass.head.as_deref(), Some("abc123"));
+    assert_eq!(pass.answers_seen, job.answers().len());
+    assert_eq!(job.reviews_of(0).count(), 1);
+    assert_eq!(job.reviews_of(1).count(), 0);
+}
+
+#[test]
+fn the_reviewer_does_not_rerun_on_the_head_it_asked_to_change() {
+    let mut job = watching(7);
+    changes_without_a_commit(&mut job, "abc123");
+
+    apply(&mut job, start_review_on("abc123"));
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    let Turn::User(Ask::ReviewStopped { stop, .. }) = job.turn() else {
+        panic!("expected a stopped review, got {:?}", job.turn());
+    };
+    assert_eq!(stop, &ReviewStop::Unchanged);
+    // No pass ran, so none is recorded and no review round is spent.
+    assert_eq!(job.reviews().len(), 1);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 7,
+            watch_only: true,
+        })
+    );
+
+    // Retry runs the reviewer on that head anyway.
+    assert!(job.can_retry());
+    apply(&mut job, Event::Retry);
+    assert_runs(&job, Session::Review(0), Task::Review);
+    apply(&mut job, Event::ReviewApproved);
+    assert_eq!(job.reviews()[1].head.as_deref(), Some("abc123"));
+}
+
+#[test]
+fn the_reviewer_reruns_on_the_same_head_after_a_new_answer() {
+    let mut job = watching(7);
+    apply(&mut job, start_review_on("abc123"));
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "read the old variable as a fallback".into(),
+        },
+    );
+    // The agent asks the requester instead of changing the code.
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Questions(vec![Question {
+            text: "Keep the spec?".into(),
+        }])),
+    );
+    apply(&mut job, Event::Answer(vec!["yes".into()]));
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+
+    apply(&mut job, start_review_on("abc123"));
+    assert_runs(&job, Session::Review(0), Task::Review);
+}
+
+#[test]
+fn the_reviewer_reruns_on_a_new_head() {
+    let mut job = watching(7);
+    changes_without_a_commit(&mut job, "abc123");
+    apply(&mut job, start_review_on("def456"));
+    assert_runs(&job, Session::Review(0), Task::Review);
+}
+
 #[test]
 fn a_reviewer_failure_stops_the_job_without_merging() {
     let mut job = watching(7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewFailed {
@@ -1710,7 +1812,7 @@ fn a_stopped_review_watches_until_the_next_pull_request() {
     apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 11 });
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewFailed {
@@ -1734,7 +1836,7 @@ fn a_stopped_review_watches_until_the_next_pull_request() {
 #[test]
 fn a_stopped_review_fails_when_the_pull_request_is_closed() {
     let mut job = watching(7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewFailed {
@@ -1773,7 +1875,7 @@ fn capped_review(number: u64, feedback: &str) -> Job {
     for _ in 1..MAX_REVIEW_ROUNDS {
         review_changes_round(&mut job, number);
     }
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewChanges {
@@ -1789,7 +1891,7 @@ fn a_retry_after_a_reviewer_failure_reruns_the_reviewer() {
     let mut job = watching(7);
     // Fail one review round first, so the kept counts are not zero.
     review_changes_round(&mut job, 7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewFailed {
@@ -1830,7 +1932,7 @@ fn a_retry_at_the_review_cap_addresses_the_last_feedback_with_fresh_rounds() {
         review_changes_round(&mut job, 7);
     }
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewChanges {
@@ -1848,7 +1950,7 @@ fn a_stopped_review_with_no_pull_request_number_cannot_retry() {
     apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewFailed {
@@ -1900,7 +2002,7 @@ fn a_job_stored_in_review_stopped_without_the_stop_field_retries_as_a_reviewer_f
     // has only a reason. It loads as a reviewer failure and reruns the
     // reviewer.
     let mut job = watching(7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewFailed {
@@ -1942,7 +2044,7 @@ fn the_review_cap_and_the_failed_round_cap_are_independent() {
 
     // The next changes verdict is the fifth review round, so the job stops.
     // The four failed rounds did not count toward it.
-    apply(&mut review_capped, Event::StartReview);
+    apply(&mut review_capped, start_review());
     apply(
         &mut review_capped,
         Event::ReviewChanges {
@@ -1980,7 +2082,7 @@ fn the_review_cap_starts_over_for_the_next_pull_request() {
         review_changes_round(&mut job, 2);
     }
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 1 });
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewChanges {
@@ -1993,7 +2095,7 @@ fn the_review_cap_starts_over_for_the_next_pull_request() {
 #[test]
 fn a_human_merge_moves_a_job_on_while_the_reviewer_runs() {
     let mut job = watching(7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     assert_runs(&job, Session::Review(0), Task::Review);
 
     apply(&mut job, Event::Merged);
@@ -2003,7 +2105,7 @@ fn a_human_merge_moves_a_job_on_while_the_reviewer_runs() {
 #[test]
 fn a_review_pass_survives_a_round_trip_through_json() {
     let mut job = watching(7);
-    apply(&mut job, Event::StartReview);
+    apply(&mut job, start_review());
     apply(
         &mut job,
         Event::ReviewChanges {
@@ -2028,4 +2130,14 @@ fn a_stored_job_without_review_fields_loads_with_no_reviews() {
     assert_eq!(job, Job::new("add a reboot button", Gates::default()));
     assert_eq!(job.review_state(), ReviewState::Pending);
     assert_eq!(job.reviews(), []);
+}
+
+/// A [`Event::StartReview`] on a head no earlier pass read, so the reviewer
+/// runs.
+fn start_review() -> Event {
+    static HEADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = HEADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Event::StartReview {
+        head: format!("head{n}"),
+    }
 }
