@@ -1439,6 +1439,23 @@ async fn the_board_and_the_job_page_load_the_local_time_script() {
     );
 }
 
+/// A poll swaps a region's content in. `local-time.js` converts it on htmx's
+/// `afterSwap` and `oobAfterSwap` events, which fire before the browser paints,
+/// so no UTC frame shows. Both pages inline the script, so both hook the events.
+#[tokio::test]
+async fn the_local_time_script_converts_swapped_content_before_paint() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    for body in [
+        dashboard.get("/").await.body,
+        dashboard.get(&format!("/jobs/{id}")).await.body,
+    ] {
+        assert!(body.contains("htmx:afterSwap"), "hooks the main swap");
+        assert!(body.contains("htmx:oobAfterSwap"), "hooks the oob swap");
+    }
+}
+
 /// The log line time is wrapped as `time-seconds`, in the full page and in the
 /// polled fragment, so a visitor sees it in their own zone either way.
 #[tokio::test]

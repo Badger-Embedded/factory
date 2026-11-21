@@ -5,8 +5,11 @@
 // `datetime` is a full date and time with the zone name, `time` is HH:MM, and
 // `time-seconds` is HH:MM:SS. The title always carries the full local time.
 //
-// It runs on load and on htmx's load and out-of-band swap events, so the
-// 5-second fragment polls and out-of-band swaps are converted too. It reads
+// It runs on load, and on htmx's `afterSwap` and `oobAfterSwap` events, which
+// htmx fires in the same task as the swap, before the browser paints. So the
+// 5-second fragment polls and out-of-band swaps show local time with no UTC
+// frame in between. It also runs on `htmx:load`, which htmx fires 20 ms later
+// in the settle step, as a backstop for content added by other means. It reads
 // only the `datetime` attribute, never the current text, so running it twice
 // on one element changes nothing.
 (function () {
@@ -75,9 +78,19 @@
   }
 
   run(document);
-  // htmx fires htmx:load on the content it swaps in, for both normal and
-  // out-of-band swaps. Listening on document.body works even though htmx, a
-  // deferred script, loads after this inline one runs.
+  // htmx sets `event.detail.target` to the element it swapped content into, for
+  // both the main swap (`htmx:afterSwap`) and each out-of-band swap
+  // (`htmx:oobAfterSwap`). Both fire in the same task as the swap, so the
+  // conversion lands before the browser paints and no UTC frame shows. Listen
+  // on document.body, which works even though htmx, a deferred script, loads
+  // after this inline one runs.
+  function onSwap(event) {
+    run((event.detail && event.detail.target) || event.target || document);
+  }
+  document.body.addEventListener("htmx:afterSwap", onSwap);
+  document.body.addEventListener("htmx:oobAfterSwap", onSwap);
+  // Backstop: htmx:load fires in the settle step, 20 ms later, for content
+  // added outside a swap.
   document.body.addEventListener("htmx:load", function (event) {
     run(event.detail && event.detail.elt);
   });
