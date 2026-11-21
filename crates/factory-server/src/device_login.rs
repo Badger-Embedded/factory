@@ -262,6 +262,7 @@ impl RunTask {
             tokio::select! {
                 line = process.next_line() => match line {
                     Some(line) => {
+                        let line = strip_ansi(&line);
                         push_recent(&mut recent, &line);
                         if !found_prompt {
                             seen.push_str(&line);
@@ -340,6 +341,32 @@ impl RunTask {
     }
 }
 
+/// A line with its ANSI escape sequences removed. Codex colors the URL and the
+/// code, as in `\x1b[94mhttps://auth.openai.com/codex/device\x1b[0m`, and the
+/// color codes would otherwise stick to the tokens [`parse_prompt`] looks for.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // A CSI sequence, `ESC [` then parameters, ends at a byte in `@`..=`~`.
+        // Any other escape drops the one character after `ESC`.
+        if chars.next_if_eq(&'[').is_some() {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            chars.next();
+        }
+    }
+    out
+}
+
 /// Keeps the last [`RECENT_LINES`] output lines for a failure reason.
 fn push_recent(recent: &mut VecDeque<String>, line: &str) {
     if recent.len() == RECENT_LINES {
@@ -365,13 +392,18 @@ fn parse_prompt(text: &str) -> Option<(String, String)> {
 }
 
 /// Whether a token is a device code such as `WDJB-MJHT`: two groups of three to
-/// eight letters or digits around a single dash.
+/// eight uppercase letters or digits around a single dash. Codex's prompt says
+/// "Enter this one-time code", and the uppercase rule keeps `one-time` from
+/// matching.
 fn is_code(token: &str) -> bool {
     let Some((left, right)) = token.split_once('-') else {
         return false;
     };
     let group = |part: &str| {
-        (3..=8).contains(&part.len()) && part.chars().all(|c| c.is_ascii_alphanumeric())
+        (3..=8).contains(&part.len())
+            && part
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     };
     group(left) && group(right)
 }

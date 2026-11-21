@@ -407,6 +407,27 @@ async fn device_login_shows_the_url_and_code_then_signs_in() {
     );
 }
 
+/// Codex 0.165 colors the URL and the code with ANSI escapes, which must not
+/// stick to the tokens the page shows.
+#[tokio::test]
+async fn a_colored_prompt_is_read_without_its_escapes() {
+    let harness = harness();
+    harness.spawner.set(Script {
+        lines: vec![
+            "1. Open this link in your browser and sign in to your account".to_owned(),
+            "   \u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m".to_owned(),
+            "2. Enter this one-time code \u{1b}[90m(expires in 15 minutes)\u{1b}[0m".to_owned(),
+            "   \u{1b}[94mWDJB-MJHT\u{1b}[0m".to_owned(),
+        ],
+        outcome: Outcome::Success(auth("2026-11-28T00:00:00Z")),
+    });
+
+    harness.post("/settings/agents/codex/login", "").await;
+    let waiting = harness.poll_fragment("WDJB-MJHT").await;
+    assert!(waiting.contains("https://auth.openai.com/codex/device"));
+    assert!(!waiting.contains("94m"));
+}
+
 /// The factory runs in a container and starts the login through the host's
 /// podman socket, so the `CODEX_HOME` it mounts must be a path the host has:
 /// one under the data directory, not the container's `/tmp`.
