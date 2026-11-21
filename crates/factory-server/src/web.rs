@@ -246,6 +246,22 @@ async fn htmx() -> impl IntoResponse {
 #[derive(Deserialize)]
 struct IndexQuery {
     project: Option<String>,
+    /// The version of the region a poll already shows. The handler answers 204
+    /// when it still matches, so htmx leaves the region's DOM alone. Absent on
+    /// the full-page load and on a stale poll.
+    #[serde(default)]
+    v: Option<String>,
+}
+
+/// A region poll's answer: 204 when the poll's version still matches what the
+/// server would render, so htmx does not swap, or the region's markup when it
+/// changed or the poll carried no version.
+fn region_response(requested: Option<&str>, region: pages::Region) -> Response {
+    if requested == Some(region.version.as_str()) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        region.markup.into_response()
+    }
 }
 
 /// The store data the board and its fragments render from. Loading it in one
@@ -330,9 +346,14 @@ async fn index(
     ))
 }
 
-/// Serves the plan usage tile on its own, from the same cache `index` reads.
-async fn plan_usage_fragment(State(state): State<AppState>) -> Markup {
-    pages::plan_usage(usage_tile(&state).as_ref())
+/// Serves the plan usage tile on its own, from the same cache `index` reads. A
+/// poll whose version still matches gets a 204, so the tile does not redraw.
+async fn plan_usage_fragment(
+    State(state): State<AppState>,
+    Query(query): Query<IndexQuery>,
+) -> Response {
+    let region = pages::plan_usage(usage_tile(&state).as_ref());
+    region_response(query.v.as_deref(), region)
 }
 
 /// The plan usage tile, or `None` before any run has reported usage.
@@ -349,38 +370,45 @@ fn usage_tile(state: &AppState) -> Option<pages::UsageTile> {
 async fn stats_fragment(
     State(state): State<AppState>,
     Query(query): Query<IndexQuery>,
-) -> Result<Markup, AppError> {
+) -> Result<Response, AppError> {
+    let version = query.v.clone();
     let data = load_board(&state, query.project)?;
     let Some(project) = data.selected.as_deref() else {
-        return Ok(html! {});
+        return Ok(html! {}.into_response());
     };
-    Ok(pages::stats(data.totals, project))
+    Ok(region_response(
+        version.as_deref(),
+        pages::stats(data.totals, project),
+    ))
 }
 
 async fn workers_fragment(
     State(state): State<AppState>,
     Query(query): Query<IndexQuery>,
-) -> Result<Markup, AppError> {
+) -> Result<Response, AppError> {
+    let version = query.v.clone();
     let data = load_board(&state, query.project)?;
     let Some(project) = data.selected.as_deref() else {
-        return Ok(html! {});
+        return Ok(html! {}.into_response());
     };
-    Ok(pages::workers(&data.workers, &data.jobs, project))
+    Ok(region_response(
+        version.as_deref(),
+        pages::workers(&data.workers, &data.jobs, project),
+    ))
 }
 
 async fn board_fragment(
     State(state): State<AppState>,
     Query(query): Query<IndexQuery>,
-) -> Result<Markup, AppError> {
+) -> Result<Response, AppError> {
+    let version = query.v.clone();
     let data = load_board(&state, query.project)?;
     let Some(project) = data.selected.as_deref() else {
-        return Ok(html! {});
+        return Ok(html! {}.into_response());
     };
-    Ok(pages::board(
-        &data.rows(),
-        &data.costs,
-        data.auto_merge,
-        project,
+    Ok(region_response(
+        version.as_deref(),
+        pages::board(&data.rows(), &data.costs, data.auto_merge, project),
     ))
 }
 
