@@ -3071,6 +3071,153 @@ async fn a_resumed_session_keeps_the_agent_recorded_on_it() {
     assert_eq!(clarify.agent, Agent::Codex);
 }
 
+fn copilot_implement() -> StageAgents {
+    StageAgents {
+        implement: "copilot".into(),
+        ..StageAgents::default()
+    }
+}
+
+fn implement_model(model: &str) -> StageModels {
+    StageModels {
+        implement: Some(model.to_owned()),
+        ..StageModels::default()
+    }
+}
+
+fn implement_effort(level: &str) -> StageEfforts {
+    StageEfforts {
+        implement: level.to_owned(),
+        ..StageEfforts::default()
+    }
+}
+
+fn to_implement(store: &Store) -> i64 {
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    let planned = factory_core::PlannedPr {
+        title: "maestrod: add a reboot endpoint".into(),
+        summary: "POST /reboot".into(),
+        number: None,
+        description: None,
+        notes: None,
+    };
+    store
+        .apply(id, Event::Agent(AgentResult::Plan(vec![planned])))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_resumed_implement_session_keeps_its_model_and_effort_when_the_stage_moves_to_copilot() {
+    let (store, executor, scheduler) = setup(|request| {
+        if request.prompt.contains("answered") {
+            Event::Agent(AgentResult::CommitsReady(ready()))
+        } else {
+            questions()
+        }
+    });
+    store
+        .save_project_models("maestro", &implement_model("sonnet"))
+        .unwrap();
+    store
+        .save_project_efforts(
+            "maestro",
+            &implement_effort("high"),
+            &StageAgents::default(),
+        )
+        .unwrap();
+    let id = to_implement(&store);
+    executor.release(2);
+    step(&scheduler).await;
+
+    store
+        .save_project_agents("maestro", &copilot_implement())
+        .unwrap();
+    store
+        .save_project_models("maestro", &implement_model("claude-sonnet-5.5"))
+        .unwrap();
+    store
+        .save_project_efforts("maestro", &implement_effort("low"), &copilot_implement())
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests[0].expect, Expect::Commits);
+    assert_eq!(requests[1].expect, Expect::Commits);
+    assert_eq!(requests[1].agent, Agent::Claude);
+    assert_eq!(model_of(&requests[1]), "sonnet");
+    assert_eq!(effort_of(&requests[1]), "high");
+    let notes: Vec<String> = store
+        .logs(id, 50)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .filter(|text| text.contains("stays on Claude"))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "This session started on Claude, so it stays on Claude with its earlier model. \
+          The implement stage is now set to Copilot, which new sessions use."
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_session_with_no_recorded_settings_resumes_with_no_model_and_the_default_effort() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_agents("maestro", &copilot_implement())
+        .unwrap();
+    store
+        .save_project_models("maestro", &implement_model("claude-sonnet-5.5"))
+        .unwrap();
+    store
+        .save_project_efforts("maestro", &implement_effort("high"), &copilot_implement())
+        .unwrap();
+    let id = to_implement(&store);
+    store
+        .session_uuid(id, factory_core::Session::Pr(0), Agent::Claude)
+        .unwrap();
+    executor.release(1);
+    step(&scheduler).await;
+
+    let request = &executor.requests()[0];
+    assert_eq!(request.agent, Agent::Claude);
+    assert_eq!(request.model, None);
+    assert_eq!(effort_of(request), Agent::Claude.default_effort());
+}
+
+#[tokio::test]
+async fn a_fresh_copilot_stage_runs_with_its_model() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_agents("maestro", &copilot_implement())
+        .unwrap();
+    store
+        .save_project_models("maestro", &implement_model("claude-sonnet-5.5"))
+        .unwrap();
+    to_implement(&store);
+    executor.release(1);
+    step(&scheduler).await;
+
+    let request = &executor.requests()[0];
+    assert_eq!(request.agent, Agent::Copilot);
+    assert_eq!(model_of(request), "claude-sonnet-5.5");
+}
+
 #[tokio::test]
 async fn a_codex_run_stores_its_thread_id_and_the_next_run_resumes_on_it() {
     // Codex names its own session, so the scheduler learns the thread id from the

@@ -52,6 +52,16 @@ fn stage_agent(agents: &StageAgents, expect: Expect) -> Agent {
     Agent::from_id(id).unwrap_or(DEFAULT_AGENT)
 }
 
+fn stage_name(expect: Expect) -> &'static str {
+    match expect {
+        Expect::Clarify => "clarify",
+        Expect::Spec => "spec",
+        Expect::Plan => "plan",
+        Expect::Commits | Expect::FixCi => "implement",
+        Expect::Review => "review",
+    }
+}
+
 /// One agent run for the executor to carry out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRequest {
@@ -611,11 +621,6 @@ impl<E: Executor> Scheduler<E> {
     /// [`Scheduler::agent`] revokes it when the worker exits. The scheduler
     /// reads the registry and the project's settings on every run, so a settings
     /// change reaches a job in flight at its next run.
-    /// Builds the run for the agent stage `expect` of job `row`, with the
-    /// servers it left out for an undecryptable secret. The model, the effort
-    /// and the agent all read from the project's per-stage settings on the same
-    /// mapping, and the session's recorded agent wins over the stage's for a
-    /// resumed session, see [`stage_agent`] and [`Store::session_uuid`].
     fn agent_request(
         &self,
         row: &JobRow,
@@ -625,25 +630,47 @@ impl<E: Executor> Scheduler<E> {
         task: &factory_core::Task,
         expect: Expect,
     ) -> Result<(AgentRequest, Vec<SkippedServer>), StoreError> {
-        let models = self.store.project_models(&row.project, &project.models)?;
-        let model = match expect {
-            Expect::Clarify => models.clarify,
-            Expect::Spec => models.spec,
-            Expect::Plan => models.plan,
-            Expect::Commits | Expect::FixCi => models.implement,
-            Expect::Review => models.review,
-        };
-        let efforts = self.store.project_efforts(&row.project)?;
-        let effort = match expect {
-            Expect::Clarify => efforts.clarify,
-            Expect::Spec => efforts.spec,
-            Expect::Plan => efforts.plan,
-            Expect::Commits | Expect::FixCi => efforts.implement,
-            Expect::Review => efforts.review,
-        };
         let agents = self.store.project_agents(&row.project)?;
-        let agent = stage_agent(&agents, expect);
-        let (session_id, agent) = self.store.session_uuid(row.id, session, agent)?;
+        let stage = stage_agent(&agents, expect);
+        let (session_id, agent) = self.store.session_uuid(row.id, session, stage)?;
+        let (model, effort) = if agent == stage {
+            let models = self.store.project_models(&row.project, &project.models)?;
+            let model = match expect {
+                Expect::Clarify => models.clarify,
+                Expect::Spec => models.spec,
+                Expect::Plan => models.plan,
+                Expect::Commits | Expect::FixCi => models.implement,
+                Expect::Review => models.review,
+            };
+            let efforts = self.store.project_efforts(&row.project)?;
+            let effort = match expect {
+                Expect::Clarify => efforts.clarify,
+                Expect::Spec => efforts.spec,
+                Expect::Plan => efforts.plan,
+                Expect::Commits | Expect::FixCi => efforts.implement,
+                Expect::Review => efforts.review,
+            };
+            self.store
+                .record_session_settings(row.id, session, model.as_deref(), &effort)?;
+            (model, effort)
+        } else {
+            let last = self.store.session_settings(row.id, session)?;
+            let effort = last
+                .as_ref()
+                .and_then(|last| last.effort.clone())
+                .unwrap_or_else(|| agent.default_effort().to_owned());
+            self.store.append_factory_log(
+                row.id,
+                &format!(
+                    "This session started on {from}, so it stays on {from} with its earlier model. \
+                     The {stage_name} stage is now set to {to}, which new sessions use.",
+                    from = agent.display_name(),
+                    to = stage.display_name(),
+                    stage_name = stage_name(expect),
+                ),
+            )?;
+            (last.and_then(|last| last.model), effort)
+        };
         let agent_session = self.store.agent_session(row.id, session)?;
         let selection = self.mcp_config(row.id, &row.project, expect)?;
         let mcp_servers = selection
