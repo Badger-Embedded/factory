@@ -223,6 +223,7 @@ fn dashboard_with_secrets(
     let registry = Arc::new(AgentRegistry::new(
         Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
         Arc::new(CodexLogin::new(Arc::clone(&secrets))),
+        Arc::clone(&secrets),
     ));
     let device_login = Arc::new(DeviceLogin::new(
         Arc::clone(&secrets),
@@ -2218,6 +2219,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
             Arc::new(CodexLogin::new(Arc::new(UnavailableSecrets::new(
                 dashboard.store.clone(),
             )))),
+            Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
         )),
         Arc::new(DeviceLogin::new(
             Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
@@ -5272,6 +5274,98 @@ fn codex_is_accepted_for_every_stage() {
     let submitted = agents("codex", "codex", "codex", "codex", "codex");
     store.save_project_agents("maestro", &submitted).unwrap();
     assert_eq!(store.project_agents("maestro").unwrap(), submitted);
+}
+
+#[test]
+fn copilot_is_accepted_for_every_stage() {
+    let store = Store::open_in_memory().unwrap();
+    let submitted = agents("copilot", "copilot", "copilot", "copilot", "copilot");
+    store.save_project_agents("maestro", &submitted).unwrap();
+    assert_eq!(store.project_agents("maestro").unwrap(), submitted);
+}
+
+#[test]
+fn a_copilot_session_records_and_keeps_copilot() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    let (uuid, started) = store
+        .session_uuid(id, Session::Planning, Agent::Copilot)
+        .unwrap();
+    assert_eq!(started, Agent::Copilot);
+    let (again, resumed) = store
+        .session_uuid(id, Session::Planning, Agent::Claude)
+        .unwrap();
+    assert_eq!(again, uuid);
+    assert_eq!(resumed, Agent::Copilot);
+}
+
+#[test]
+fn copilot_efforts_run_low_through_max_and_reject_other_levels() {
+    let store = Store::open_in_memory().unwrap();
+    let copilot = agents("copilot", "copilot", "copilot", "copilot", "copilot");
+    store
+        .save_project_efforts(
+            "maestro",
+            &efforts("low", "medium", "high", "xhigh", "max"),
+            &copilot,
+        )
+        .unwrap();
+
+    let err = store
+        .save_project_efforts(
+            "maestro",
+            &efforts("minimal", "low", "low", "low", "low"),
+            &copilot,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidEffort(level) if level == "minimal"),
+        "{err:?}"
+    );
+    assert_eq!(
+        store.project_efforts("maestro").unwrap(),
+        efforts("low", "medium", "high", "xhigh", "max")
+    );
+}
+
+#[tokio::test]
+async fn saving_copilot_for_a_stage_stores_it_and_an_unsupported_effort_stores_nothing() {
+    let dashboard = dashboard();
+    let form = |effort: &str| {
+        format!(
+            "clarify=&spec=&plan=&implement=&review=&\
+             clarify_effort=medium&spec_effort={effort}&plan_effort=medium&\
+             implement_effort=medium&review_effort=medium&\
+             clarify_agent=claude&spec_agent=copilot&plan_agent=claude&\
+             implement_agent=claude&review_agent=claude"
+        )
+    };
+
+    let reply = dashboard
+        .post("/settings/projects/maestro", &form("minimal"))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        dashboard.store.project_agents("maestro").unwrap(),
+        StageAgents::default()
+    );
+    assert_eq!(
+        dashboard.store.project_efforts("maestro").unwrap(),
+        StageEfforts::default()
+    );
+
+    let reply = dashboard
+        .post("/settings/projects/maestro", &form("max"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard.store.project_agents("maestro").unwrap(),
+        agents("claude", "copilot", "claude", "claude", "claude")
+    );
+    assert_eq!(
+        dashboard.store.project_efforts("maestro").unwrap(),
+        efforts("medium", "max", "medium", "medium", "medium")
+    );
 }
 
 #[test]

@@ -878,6 +878,42 @@ async fn a_codex_run_with_no_model_adds_no_cost() {
     assert!(finished[0].contains("1000 input tokens (200 cached), 500 output tokens"));
 }
 
+#[tokio::test]
+async fn a_copilot_run_adds_no_cost_and_the_log_says_so_once() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                clarify: "copilot".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    executor.release(1);
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+
+    assert_eq!(executor.requests()[0].agent, Agent::Copilot);
+    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
+    assert!(!store.has_estimated_cost(id).unwrap());
+    assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
+    assert!(
+        store
+            .events(id)
+            .unwrap()
+            .iter()
+            .all(|event| event.event != "cost"),
+        "a Copilot run must not write a cost row",
+    );
+    let finished = finished_lines(&store, id);
+    assert_eq!(finished.len(), 1);
+    assert!(finished[0].contains("Copilot runs are not counted in the cost"));
+}
+
 fn planned_pr(title: &str) -> factory_core::PlannedPr {
     factory_core::PlannedPr {
         title: title.into(),

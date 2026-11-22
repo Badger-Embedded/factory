@@ -25,6 +25,7 @@ fn registry(secrets: &Arc<dyn SecretStore>) -> Arc<AgentRegistry> {
     Arc::new(AgentRegistry::new(
         Arc::new(ClaudeToken::new(Arc::clone(secrets), None)),
         Arc::new(CodexLogin::new(Arc::clone(secrets))),
+        Arc::clone(secrets),
     ))
 }
 
@@ -173,4 +174,42 @@ async fn a_codex_run_with_no_login_fails_before_any_container() {
         )
         .await;
     assert_ne!(reason(second), "no Codex login is set");
+}
+
+#[tokio::test]
+async fn a_copilot_run_with_no_login_fails_before_any_container() {
+    let store = Arc::new(Store::open_in_memory().expect("open store"));
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    let data_dir = tempfile::tempdir().unwrap();
+    let executor = executor(
+        registry(&secrets),
+        data_dir.path().to_path_buf(),
+        Arc::clone(&store),
+    );
+
+    let mut request = request();
+    request.agent = factory_core::Agent::Copilot;
+
+    let first = executor
+        .run_agent(
+            &Settings::default(),
+            request.clone(),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+    assert_eq!(reason(first), "no Copilot login is set");
+    assert!(!data_dir.path().join("jobs").join("7").exists());
+
+    secrets.set_copilot_token("gho_saved").unwrap();
+    let second = executor
+        .run_agent(
+            &Settings::default(),
+            request,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+    assert_ne!(reason(second), "no Copilot login is set");
 }
