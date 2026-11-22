@@ -50,7 +50,7 @@
     });
     try {
       localStorage.setItem(
-        TAB,
+        TAB + "." + data.snapshot.join("-"),
         JSON.stringify({
           snapshot: data.snapshot,
           keys: data.items.map(function (item) {
@@ -59,7 +59,7 @@
         })
       );
       found.forEach(function (entry) {
-        if (entry.name !== TAB && newer(data.snapshot, entry.state.snapshot)) {
+        if (newer(data.snapshot, entry.state.snapshot)) {
           localStorage.removeItem(entry.name);
         }
       });

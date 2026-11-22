@@ -96,9 +96,12 @@ storage["factory.notified.seed"] = JSON.stringify({ snapshot: [1, 0], keys: [] }
 new Function(code)();
 new Function(code)();
 const [first, second] = requests.splice(0);
-// The tab that started first gets the newer snapshot from the server. The
-// other tab has read the stored state when the first one finishes its write.
-global.afterRead = () => respond(first, [1, 6], [item(6)]);
+respond(first, [1, 1], [item(1)]);
+ticks[0]();
+const [third] = requests.splice(0);
+// The second tab reads the first tab's entry at snapshot 1. Before it
+// stores, the first tab stores snapshot 6. The second tab's response is older.
+global.afterRead = () => respond(third, [1, 6], [item(6)]);
 respond(second, [1, 5], [item(5)]);
 const afterRace = latest();
 ticks[0]();
