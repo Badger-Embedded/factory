@@ -215,6 +215,7 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
     let registry = Arc::new(AgentRegistry::new(
         Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
         Arc::new(CodexLogin::new(Arc::clone(&secrets))),
+        Arc::clone(&secrets),
     ));
     let device_login = Arc::new(DeviceLogin::with_timeout(
         Arc::clone(&secrets),

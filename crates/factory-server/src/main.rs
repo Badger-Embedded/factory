@@ -178,6 +178,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let agents = Arc::new(AgentRegistry::new(
         Arc::clone(&claude_token),
         Arc::clone(&codex_login),
+        Arc::clone(&secrets),
     ));
 
     // An unreachable MCP server does not fail a run; it records a warning on the

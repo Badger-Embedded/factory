@@ -9,10 +9,11 @@
 //! [`podman`](crate::podman) and the settings pages read one place instead of
 //! naming Claude.
 //!
-//! Both agents run. Claude's credential is the subscription token the
+//! All three agents run. Claude's credential is the subscription token the
 //! [`ClaudeToken`] resolver reads afresh on each run; Codex's is the stored
-//! `auth.json` the [`CodexLogin`] coordinator resolves. Both run in the
-//! `worker_image` setting, since one image carries both, and each config
+//! `auth.json` the [`CodexLogin`] coordinator resolves; Copilot's is the GitHub
+//! token read afresh from the secret store. All run in the
+//! `worker_image` setting, since one image carries them, and each config
 //! directory and stdout parser lives in `factory-runner` behind
 //! [`factory_runner::backend`]. The registry also hands the executor the
 //! [`CodexLogin`] coordinator, which keeps the login Codex refreshes mid-run.
@@ -23,7 +24,7 @@ use factory_core::Agent;
 use factory_runner::backend;
 
 use crate::codex::CodexLogin;
-use crate::secrets::ClaudeToken;
+use crate::secrets::{ClaudeToken, SecretStore};
 use crate::settings::Settings;
 
 /// Model aliases the Claude stage panel offers. Any other model id can be typed.
@@ -34,22 +35,37 @@ const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 /// track it; any other model id can be typed.
 const CODEX_MODELS: [&str; 2] = ["gpt-6.1-sol", "gpt-6.1-codex"];
 
+/// Model ids the Copilot stage panel offers, from the pinned CLI's list. Any
+/// other model id can be typed.
+const COPILOT_MODELS: [&str; 4] = [
+    "claude-sonnet-5.5",
+    "claude-opus-5.5",
+    "gpt-6.2-sol",
+    "gemini-3.8-flash",
+];
+
 /// What the server needs for each agent, built once at startup and shared by
 /// the executor and the settings pages. It holds the [`ClaudeToken`] resolver
-/// so a run reads the current token.
+/// and the secret store so a run reads the current token.
 pub struct AgentRegistry {
     claude_token: Arc<ClaudeToken>,
     codex_login: Arc<CodexLogin>,
+    secrets: Arc<dyn SecretStore>,
 }
 
 impl AgentRegistry {
-    /// Builds the registry from the Claude token resolver and the Codex login
-    /// coordinator.
+    /// Builds the registry from the Claude token resolver, the Codex login
+    /// coordinator and the secret store that holds the Copilot token.
     #[must_use]
-    pub fn new(claude_token: Arc<ClaudeToken>, codex_login: Arc<CodexLogin>) -> Self {
+    pub fn new(
+        claude_token: Arc<ClaudeToken>,
+        codex_login: Arc<CodexLogin>,
+        secrets: Arc<dyn SecretStore>,
+    ) -> Self {
         AgentRegistry {
             claude_token,
             codex_login,
+            secrets,
         }
     }
 
@@ -116,6 +132,8 @@ impl AgentEntry<'_> {
         match self.agent {
             Agent::Claude => Some("/settings/agents/claude"),
             Agent::Codex => Some("/settings/agents/codex"),
+            // The page arrives with the Copilot settings PR; until then the
+            // sidebar lists Copilot without a link rather than a dead one.
             Agent::Copilot => None,
         }
     }
@@ -127,7 +145,7 @@ impl AgentEntry<'_> {
         match self.agent {
             Agent::Claude => &CLAUDE_MODELS,
             Agent::Codex => &CODEX_MODELS,
-            Agent::Copilot => &[],
+            Agent::Copilot => &COPILOT_MODELS,
         }
     }
 
@@ -152,8 +170,7 @@ impl AgentEntry<'_> {
         match self.agent {
             // One worker image carries the agents that have a backend, so they
             // run in the `worker_image` setting edited on the Workers page.
-            Agent::Claude | Agent::Codex => Some(settings.worker_image.clone()),
-            Agent::Copilot => None,
+            Agent::Claude | Agent::Codex | Agent::Copilot => Some(settings.worker_image.clone()),
         }
     }
 
@@ -168,8 +185,8 @@ impl AgentEntry<'_> {
     /// start without it. Claude resolves the subscription token afresh and fails
     /// with "no Claude token is set" when none is stored or in the environment;
     /// Codex resolves the stored `auth.json` and fails with "no Codex login is
-    /// set"; Copilot has no stored login and fails with "no Copilot login is
-    /// set". A run gates on the credential before any container starts, so a
+    /// set"; Copilot resolves the stored token afresh and fails with "no Copilot
+    /// login is set". A run gates on the credential before any container starts, so a
     /// token or login saved on the settings page reaches the next run.
     ///
     /// # Errors
@@ -183,7 +200,24 @@ impl AgentEntry<'_> {
                 .resolve()
                 .ok_or_else(|| "no Claude token is set".to_owned()),
             Agent::Codex => self.registry.codex_login.credential(),
-            Agent::Copilot => Err("no Copilot login is set".to_owned()),
+            Agent::Copilot => self.copilot_token(),
+        }
+    }
+
+    /// The stored Copilot token. An unavailable store, an empty row and a row
+    /// that will not decrypt all read as no login; the last is logged without
+    /// the value.
+    fn copilot_token(&self) -> Result<String, String> {
+        const NONE: &str = "no Copilot login is set";
+        if !self.registry.secrets.available() {
+            return Err(NONE.to_owned());
+        }
+        match self.registry.secrets.copilot_token() {
+            Ok(token) => token.ok_or_else(|| NONE.to_owned()),
+            Err(err) => {
+                tracing::warn!("reading the stored Copilot token failed: {err}");
+                Err(NONE.to_owned())
+            }
         }
     }
 }

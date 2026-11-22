@@ -1,7 +1,8 @@
 //! Tests for the agent registry: the Claude and Codex entries each carry their
 //! credential, worker image, config directory, settings page and stage-panel
-//! suggestions. The Copilot entry is available and has a worker backend, but no
-//! login or settings page is wired yet, so its run gates on the credential.
+//! suggestions. The Copilot entry reads its token afresh from the secret store
+//! and gates the run on it. It has no settings page yet, so the sidebar lists
+//! it without a link.
 
 use std::sync::Arc;
 
@@ -25,7 +26,8 @@ fn registry_with(token: Option<&str>, codex: Option<&str>) -> AgentRegistry {
     }
     AgentRegistry::new(
         Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
-        Arc::new(CodexLogin::new(secrets)),
+        Arc::new(CodexLogin::new(Arc::clone(&secrets))),
+        secrets,
     )
 }
 
@@ -41,25 +43,49 @@ fn the_registry_lists_the_agents_in_order() {
 }
 
 #[test]
-fn the_copilot_entry_is_available_and_gates_on_its_credential() {
-    let registry = registry_with_token(None);
+fn the_copilot_entry_carries_its_image_suggestions_and_stored_token() {
+    let store = Arc::new(factory_server::Store::open_in_memory().expect("open store"));
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    let registry = AgentRegistry::new(
+        Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
+        Arc::new(CodexLogin::new(Arc::clone(&secrets))),
+        Arc::clone(&secrets),
+    );
     let copilot = registry.entry(Agent::Copilot);
 
     assert_eq!(copilot.display_name(), "Copilot");
     assert!(copilot.available());
     assert_eq!(copilot.efforts(), ["low", "medium", "high", "xhigh", "max"]);
     assert_eq!(copilot.default_effort(), "medium");
-
-    assert_eq!(copilot.settings_url(), None);
-    // The backend now exists, so the registry derives its config directory.
     assert_eq!(copilot.host_config_dir(), Some("copilot"));
-    assert_eq!(copilot.model_suggestions(), [] as [&str; 0]);
+    assert_eq!(
+        copilot.model_suggestions(),
+        [
+            "claude-sonnet-5.5",
+            "claude-opus-5.5",
+            "gpt-6.2-sol",
+            "gemini-3.8-flash"
+        ]
+    );
     let settings = Settings {
         worker_image: "localhost/factory-worker:latest".into(),
         ..Settings::default()
     };
-    assert_eq!(copilot.image(&settings), None);
+    assert_eq!(
+        copilot.image(&settings),
+        Some("localhost/factory-worker:latest".to_owned())
+    );
 
+    // No token stored: the run fails on the credential.
+    assert_eq!(
+        copilot.credential(),
+        Err("no Copilot login is set".to_owned())
+    );
+    // A token saved afterwards reaches the next run without a restart.
+    secrets.set_copilot_token("gho_abc").expect("store token");
+    assert_eq!(copilot.credential(), Ok("gho_abc".to_owned()));
+    secrets.clear_copilot_token().expect("clear token");
     assert_eq!(
         copilot.credential(),
         Err("no Copilot login is set".to_owned())

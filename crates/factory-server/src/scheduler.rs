@@ -996,6 +996,7 @@ impl<E: Executor> Scheduler<E> {
         // The model the run passed, kept before the request moves into the run,
         // so a Codex run can look up its price by it afterwards.
         let model = request.model.clone();
+        let agent = request.agent;
         let report = self
             .executor
             .run_agent(settings, request, sink, session)
@@ -1008,7 +1009,7 @@ impl<E: Executor> Scheduler<E> {
                 .warnings
                 .record(job_id, &unavailable.server, &unavailable.reason);
         }
-        self.record_run_cost(job_id, &cost_session, model.as_deref(), &report);
+        self.record_run_cost(job_id, &cost_session, agent, model.as_deref(), &report);
         self.apply(job_id, report.event);
     }
 
@@ -1020,8 +1021,25 @@ impl<E: Executor> Scheduler<E> {
     /// the price table for the model it ran: with a price row the estimate counts
     /// toward the job and project totals and is marked estimated, and with no row
     /// for the model, or no model at all, the run adds no cost and the log names
-    /// the model. The token counts go to the log either way.
-    fn record_run_cost(&self, job_id: i64, session: &str, model: Option<&str>, report: &RunReport) {
+    /// the model. The token counts go to the log either way. A Copilot run adds
+    /// no cost at all.
+    fn record_run_cost(
+        &self,
+        job_id: i64,
+        session: &str,
+        agent: Agent,
+        model: Option<&str>,
+        report: &RunReport,
+    ) {
+        if agent == Agent::Copilot {
+            // Copilot bills in credits the factory does not price, so the run
+            // adds no cost row and the log says so once.
+            self.note(
+                job_id,
+                "Copilot run finished. Copilot runs are not counted in the cost.",
+            );
+            return;
+        }
         if let Some(total) = report.cost_usd {
             match self.store.add_session_cost(job_id, session, total) {
                 Ok(usd) => {
