@@ -735,10 +735,6 @@ fn scrub_line(line: &str) -> String {
         .join(" ")
 }
 
-/// A file or key name with every token-like run replaced by `[redacted]`. A
-/// run is a stretch of token-alphabet characters, so a token joined to other
-/// text by a character outside the alphabet, as in `credential:gho_...`, is
-/// found inside the name.
 fn scrub_name(name: &str) -> String {
     let in_alphabet = |c: char| c.is_ascii_alphanumeric() || "-_.+/=".contains(c);
     let mut out = String::with_capacity(name.len());
