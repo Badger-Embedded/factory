@@ -12,6 +12,8 @@ nix develop -c cargo run -p factory-server
 
 Then open <http://127.0.0.1:8080>. Without `tailscale serve` in front, the dashboard shows the user as `local`.
 
+Run the browser tests with `nix develop -c just e2e`. They start their own server and need no setup.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FACTORY_LISTEN` | `127.0.0.1:8080` | Address the dashboard listens on |

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stands in for podman. The browser tests never start a container.
+if [ "$1" = rm ]; then
+  exit 0
+fi
+echo "fake podman: no response is set up for: $*" >&2
+exit 1
