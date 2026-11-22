@@ -242,6 +242,7 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
             data.path().join("copilot-login"),
             timeout,
         )),
+        vec!["alice@example.com".to_owned()],
     );
     Harness {
         router,
@@ -269,8 +270,13 @@ impl Harness {
     }
 
     async fn get(&self, uri: &str) -> Reply {
-        self.send(Request::get(uri).body(Body::empty()).unwrap())
-            .await
+        self.send(
+            Request::get(uri)
+                .header(USER_HEADER, "alice@example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
     }
 
     async fn post(&self, uri: &str, form: &str) -> Reply {
