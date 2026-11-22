@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -2208,37 +2210,17 @@ async fn the_job_page_links_a_numbered_pull_request() {
     ));
 }
 
-/// Returns how many external anchors `body` has, asserting that each opens in
-/// a new tab and that no internal anchor does.
-fn check_link_targets(body: &str) -> usize {
-    let html = scraper::Html::parse_document(body);
-    let anchors = scraper::Selector::parse("a[href]").unwrap();
-    let mut external = 0;
-    for a in html.select(&anchors) {
-        let href = a.value().attr("href").unwrap();
-        let (target, rel) = (a.value().attr("target"), a.value().attr("rel"));
-        if href.starts_with("http://") || href.starts_with("https://") {
-            external += 1;
-            assert_eq!(target, Some("_blank"), "{href} must open in a new tab");
-            assert_eq!(rel, Some("noopener noreferrer"), "{href} needs rel");
-        } else {
-            assert_ne!(target, Some("_blank"), "{href} must stay in the same tab");
-        }
-    }
-    external
-}
-
 #[tokio::test]
 async fn external_links_open_in_a_new_tab_and_internal_links_do_not() {
     let dashboard = dashboard();
     let id = with_plan(&dashboard, vec![planned("x", Some(7))]).await;
 
-    check_link_targets(&dashboard.get("/").await.body);
+    support::check_link_targets(&dashboard.get("/").await.body);
     let page = dashboard.get(&format!("/jobs/{id}")).await;
-    assert_eq!(check_link_targets(&page.body), 2);
+    assert_eq!(support::check_link_targets(&page.body), 2);
     let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await;
-    assert!(check_link_targets(&fragment.body) >= 1);
-    check_link_targets(&dashboard.settings_pages().await);
+    assert!(support::check_link_targets(&fragment.body) >= 1);
+    support::check_link_targets(&dashboard.settings_pages().await);
 }
 
 #[tokio::test]

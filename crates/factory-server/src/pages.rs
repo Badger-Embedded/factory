@@ -1384,7 +1384,6 @@ fn server_usage_card(server: &str, usage: &[ServerUsage]) -> Markup {
     }
 }
 
-/// Every link to a site outside the factory goes through this function.
 fn external_link(href: &str, label: impl maud::Render) -> Markup {
     html! { a href=(href) target="_blank" rel="noopener noreferrer" { (label) } }
 }
