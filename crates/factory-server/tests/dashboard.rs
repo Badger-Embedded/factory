@@ -10019,7 +10019,7 @@ async fn a_packaging_save_saves_and_renders_the_stored_values() {
         packaging.manifest_files,
         ["debian/control", "snap/snapcraft.yaml"]
     );
-    assert!(packaging.build_config_files.is_empty());
+    assert_eq!(packaging.build_config_files, Vec::<String>::new());
     assert_eq!(packaging.upstream_repo, "o/tool");
 
     let page = dashboard.get("/settings/projects/maestro").await;
