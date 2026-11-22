@@ -2447,7 +2447,6 @@ async fn an_unknown_project_in_the_index_is_not_found() {
     assert_eq!(page.status, StatusCode::NOT_FOUND);
 }
 
-/// The `name=value` pair of the project cookie a reply sets.
 fn project_cookie(reply: &Reply) -> Option<String> {
     reply
         .headers

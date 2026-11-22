@@ -433,6 +433,7 @@ fn load_board(
     state: &AppState,
     login: &str,
     project: Option<String>,
+    cookie_project: Option<String>,
 ) -> Result<BoardData, AppError> {
     let names = state.store.projects_for(login)?;
     let selected = match project {
@@ -440,7 +441,9 @@ fn load_board(
             return Err(AppError::UnknownProject(name));
         }
         Some(name) => Some(name),
-        None => names.first().cloned(),
+        None => cookie_project
+            .filter(|name| names.contains(name))
+            .or_else(|| names.first().cloned()),
     };
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
@@ -476,13 +479,7 @@ async fn index(
 ) -> Result<Response, AppError> {
     let login = user(&headers);
     let explicit = query.project.is_some();
-    let requested = if let Some(name) = query.project {
-        Some(name)
-    } else {
-        let names = state.store.projects_for(&login)?;
-        remembered_project(&headers).filter(|name| names.contains(name))
-    };
-    let data = load_board(&state, &login, requested)?;
+    let data = load_board(&state, &login, query.project, cookie_project(&headers))?;
     let plan_usage = usage_tile(&state);
     let notifications = state.store.notifications_enabled(&login)?;
     let page = pages::index(
@@ -511,9 +508,7 @@ async fn index(
 
 const PROJECT_COOKIE: &str = "factory_project";
 
-/// The project named by the cookie, unchecked. The caller must confirm the
-/// login can see it.
-fn remembered_project(headers: &HeaderMap) -> Option<String> {
+fn cookie_project(headers: &HeaderMap) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -602,7 +597,7 @@ async fn stats_fragment(
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
     let version = query.v.clone();
-    let data = load_board(&state, &user(&headers), query.project)?;
+    let data = load_board(&state, &user(&headers), query.project, None)?;
     let Some(project) = data.selected.as_deref() else {
         return Ok(html! {}.into_response());
     };
@@ -618,7 +613,7 @@ async fn workers_fragment(
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
     let version = query.v.clone();
-    let data = load_board(&state, &user(&headers), query.project)?;
+    let data = load_board(&state, &user(&headers), query.project, None)?;
     let Some(project) = data.selected.as_deref() else {
         return Ok(html! {}.into_response());
     };
@@ -634,7 +629,7 @@ async fn board_fragment(
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
     let version = query.v.clone();
-    let data = load_board(&state, &user(&headers), query.project)?;
+    let data = load_board(&state, &user(&headers), query.project, None)?;
     let Some(project) = data.selected.as_deref() else {
         return Ok(html! {}.into_response());
     };
