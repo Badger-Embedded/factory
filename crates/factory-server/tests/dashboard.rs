@@ -2832,6 +2832,39 @@ async fn maintenance_edits_mark_the_page_unsaved_until_that_form_saves() {
 }
 
 #[tokio::test]
+async fn saving_one_settings_form_keeps_the_prompt_for_the_other() {
+    let body = dashboard().get("/settings/projects/maestro").await.body;
+    let setup = settings_form_setup(&body);
+    let dirty_then_submit = |input: &str, form: &str| {
+        format!(
+            "fire(docListeners, \"input\", {input});\
+             fire(docListeners, \"submit\", {form});\
+             fire(winListeners, \"beforeunload\", null);"
+        )
+    };
+    let both = "fire(docListeners, \"input\", pipelineInput);\
+                fire(docListeners, \"input\", maintenanceInput);";
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("pipelineInput", "maintenanceForm")
+    ));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("maintenanceInput", "pipelineForm")
+    ));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &format!(
+            "{both}fire(docListeners, \"submit\", pipelineForm);fire(winListeners, \"beforeunload\", null);"
+        )
+    ));
+    assert!(!beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("pipelineInput", "pipelineForm")
+    ));
+}
+
+#[tokio::test]
 async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
     let page = two_projects().get("/?project=tool").await;
     let main = page.body.find("<main>").unwrap();
