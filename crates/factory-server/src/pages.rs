@@ -1472,15 +1472,11 @@ fn remove_project_card(project: &ProjectSettings) -> Markup {
     }
 }
 
-/// The Maintenance card: the Renovate and packaging switches, and the
-/// packaging fields. The fields are left out of the markup while "Packaging
-/// project" is off. An operator ticks the switch and saves; the refused save
-/// redraws the page with the fields, so this works without JavaScript.
 fn project_maintenance_card(project: &ProjectSettings) -> Markup {
     let maintenance = &project.maintenance;
     let packaging = maintenance.packaging.as_ref();
     html! {
-        form.card method="post"
+        form.card.settings-form method="post"
             action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/maintenance" } {
             h2 { "Maintenance" }
             div.field {

@@ -2680,6 +2680,8 @@ const DOM_LIB: &str = r#"
     var pipelineInput = NODES[pipelineInputId];
     var collabAddForm = NODES[collabAddFormId];
     var collabRemoveForm = NODES[collabRemoveFormId];
+    var maintenanceForm = NODES[maintenanceFormId];
+    var maintenanceInput = NODES[maintenanceInputId];
 "#;
 
 #[derive(serde::Serialize)]
@@ -2741,6 +2743,21 @@ fn settings_form_setup(body: &str) -> String {
         }
         false
     };
+    let maintenance_form_id = form_posting_to("/settings/projects/maestro/maintenance");
+    let within = |form: i64, mut id: i64| {
+        while let Ok(index) = usize::try_from(id) {
+            if id == form {
+                return true;
+            }
+            id = nodes[index].parent;
+        }
+        false
+    };
+    let maintenance_input_id = nodes
+        .iter()
+        .find(|n| n.tag == "input" && within(maintenance_form_id, n.id))
+        .expect("an input in the maintenance form")
+        .id;
     let pipeline_input_id = nodes
         .iter()
         .find(|n| {
@@ -2749,7 +2766,7 @@ fn settings_form_setup(body: &str) -> String {
         })
         .map_or(pipeline_form_id, |n| n.id);
     format!(
-        "var RAW = {}; var pipelineFormId = {pipeline_form_id}; var pipelineInputId = {pipeline_input_id}; var collabAddFormId = {}; var collabRemoveFormId = {};\n",
+        "var RAW = {}; var pipelineFormId = {pipeline_form_id}; var pipelineInputId = {pipeline_input_id}; var collabAddFormId = {}; var collabRemoveFormId = {}; var maintenanceFormId = {maintenance_form_id}; var maintenanceInputId = {maintenance_input_id};\n",
         serde_json::to_string(&nodes).unwrap(),
         form_posting_to("/settings/projects/maestro/collaborators"),
         form_posting_to("/settings/projects/maestro/collaborators/remove"),
@@ -2793,6 +2810,24 @@ async fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
     assert!(!beforeunload_warns_after(
         &setup,
         "fire(winListeners, \"beforeunload\", null);"
+    ));
+}
+
+#[tokio::test]
+async fn maintenance_edits_mark_the_page_unsaved_until_that_form_saves() {
+    let body = dashboard().get("/settings/projects/maestro").await.body;
+    let setup = settings_form_setup(&body);
+    let edit = "fire(docListeners, \"input\", maintenanceInput);";
+    let leave = "fire(winListeners, \"beforeunload\", null);";
+    let after = |submit: &str| format!("{edit}{submit}{leave}");
+    assert!(beforeunload_warns_after(&setup, &after("")));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &after("fire(docListeners, \"submit\", collabAddForm);")
+    ));
+    assert!(!beforeunload_warns_after(
+        &setup,
+        &after("fire(docListeners, \"submit\", maintenanceForm);")
     ));
 }
 
@@ -8548,7 +8583,6 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
         "/settings/projects/maestro",
     ] {
         let body = dashboard.get(uri).await.body;
-        // The project page has a second form, the Maintenance card.
         let bars = if uri == "/settings/projects/maestro" {
             2
         } else {

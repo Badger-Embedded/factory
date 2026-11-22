@@ -1591,8 +1591,6 @@ fn project_page(
     project_page_with(state, headers, name, selected, notice, problem, None)
 }
 
-/// As [`project_page`], with `maintenance` shown in place of the stored
-/// maintenance settings, so a refused save redraws what was posted.
 fn project_page_with(
     state: &AppState,
     headers: &HeaderMap,
@@ -1980,7 +1978,6 @@ struct MaintenanceForm {
     upstream_repo: String,
 }
 
-/// One path per line, trimmed, with empty lines dropped.
 fn path_lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
