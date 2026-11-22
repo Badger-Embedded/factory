@@ -144,7 +144,6 @@ test.fixme('a closed Show older disclosure stays closed when another region swap
   const older = page.locator('details.older');
   await older.getByText('Show 1 older').click();
 
-  // A board swap while the section is open records it as open.
   factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', 'Cancelled behind the page');
   await expect(older.getByText('Show 2 older')).toBeVisible();
   await expect(older).toHaveJSProperty('open', true);
@@ -152,7 +151,6 @@ test.fixme('a closed Show older disclosure stays closed when another region swap
   await older.getByText('Show 2 older').click();
   await expect(older).toHaveJSProperty('open', false);
 
-  // Swap the totals line, a region that holds no disclosure.
   await page.evaluate(async () => {
     const stats = document.querySelector('#stats')!;
     const url = new URL(stats.getAttribute('hx-get')!, location.href);
