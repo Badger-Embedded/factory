@@ -1301,7 +1301,11 @@ fn the_review_prompt_names_the_method_for_each_agent() {
 }
 
 const MCP_PARAGRAPH: &str = "This run has these MCP servers: `a`, `b`. Before you start, load the \
-     tools each one exposes and read what they do, so you know them when a later step needs one.";
+     tools each one exposes and read what they do, so you know them when a later step needs one. \
+     Some servers are gateways: the tools they expose search for and run other tools that are not \
+     listed up front. For such a server, the loaded tools are not all it offers. When a step \
+     needs an outside app or data source, ask the server's search tool for it before you decide \
+     no tool exists, and run what it finds through the server's own execute tool.";
 
 #[test]
 fn the_mcp_paragraph_names_the_servers_for_a_stage_prompt() {
@@ -1310,7 +1314,7 @@ fn the_mcp_paragraph_names_the_servers_for_a_stage_prompt() {
         pr: job.plan()[0].clone(),
     };
     let servers = ["a".to_owned(), "b".to_owned()];
-    for agent in [Agent::Claude, Agent::Codex] {
+    for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
         let text = job_prompt(&job, &task, Expect::Commits, agent, &servers);
         assert!(
             text.contains(MCP_PARAGRAPH),
@@ -1324,7 +1328,7 @@ fn the_mcp_paragraph_names_the_servers_for_the_review_prompt() {
     let mut job = watching(7);
     job.apply(start_review()).unwrap();
     let servers = ["a".to_owned(), "b".to_owned()];
-    for agent in [Agent::Claude, Agent::Codex] {
+    for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
         let text = job_prompt(&job, &Task::Review, Expect::Review, agent, &servers);
         assert!(
             text.contains(MCP_PARAGRAPH),
@@ -1350,6 +1354,7 @@ fn a_prompt_with_no_mcp_server_gets_no_paragraph() {
     assert!(without.contains("Implement this pull request"));
     assert!(!without.contains("MCP servers"));
     assert_eq!(with, format!("{without}\n\n{MCP_PARAGRAPH}"));
+    assert!(!MCP_PARAGRAPH.contains("Composio"));
 }
 
 #[test]
