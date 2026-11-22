@@ -115,6 +115,13 @@ pub trait AgentBackend: Sync {
     /// invocation the worker runs.
     fn command(&self, config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString>;
 
+    /// Log lines the worker writes once, before it reads any output, so a run
+    /// that ends with no output still carries them. Copilot notes here that its
+    /// runs are not counted in the job cost. The default is none.
+    fn start_log(&self) -> Vec<LogLine> {
+        Vec::new()
+    }
+
     /// Parses one stdout line into the generic items the worker consumes. The
     /// run's [`Expect`] decides what the final result means.
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem>;

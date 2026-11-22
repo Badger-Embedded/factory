@@ -52,8 +52,8 @@ const SCHEMA_IN_PROMPT: &str = "This agent has no structured-output mode, so pro
      outcome and nothing else: no sentence before it and none after. A single ```json fenced \
      block around the whole message is allowed. The JSON must match this schema:";
 
-/// The once-per-run note that a Copilot run adds no cost, logged on the final
-/// `result` line. See Job cost in the design doc.
+/// The note [`start_log`](AgentBackend::start_log) writes at the start of each
+/// run. See Job cost in the design doc.
 const COST_NOTE: &str = "Copilot runs are not counted in the job cost.";
 
 /// The review-method paragraph for a Copilot run. Every run passes
@@ -152,6 +152,10 @@ impl AgentBackend for CopilotAgent {
         copilot.into_iter().map(OsString::from).collect()
     }
 
+    fn start_log(&self) -> Vec<LogLine> {
+        vec![LogLine::Other(COST_NOTE.to_owned())]
+    }
+
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         parse_copilot(expect, line)
     }
@@ -208,18 +212,12 @@ fn parse_copilot(expect: Expect, line: &str) -> Vec<AgentItem> {
             .map(|message| AgentItem::Log(LogLine::Other(message.to_owned())))
             .into_iter()
             .collect(),
-        Some("session.usage_checkpoint") => usage_log(data).into_iter().collect(),
+        Some("session.usage_checkpoint") => checkpoint_log(data).into_iter().collect(),
         Some("result") => parse_result(expect, &value),
         _ => Vec::new(),
     }
 }
 
-/// Turns a non-ephemeral `assistant.message` into its log line and, when the
-/// message is the final answer, the result. A message that requested a tool is
-/// not the final answer, so it logs its text but sets no result: a run that
-/// fails before its answer then ends on the failure, not on a message it wrote
-/// on the way there. Among final-answer messages the last one wins, since `run`
-/// keeps the latest result.
 fn parse_message(expect: Expect, data: Option<&Value>) -> Vec<AgentItem> {
     let Some(text) = string_at(data, "content").filter(|text| !text.trim().is_empty()) else {
         return Vec::new();
@@ -231,19 +229,14 @@ fn parse_message(expect: Expect, data: Option<&Value>) -> Vec<AgentItem> {
     items
 }
 
-/// Whether an `assistant.message` carries a non-empty `toolRequests` list, which
-/// a message that precedes a tool call does and a final answer does not.
+/// A message that precedes a tool call lists it in `toolRequests`; the final
+/// answer's list is empty.
 fn requested_tools(data: Option<&Value>) -> bool {
     data.and_then(|data| data.get("toolRequests"))
         .and_then(Value::as_array)
         .is_some_and(|requests| !requests.is_empty())
 }
 
-/// Turns the final assistant message into a run result. The text must be the
-/// JSON the prompt's schema asked for, with an optional fenced code block around
-/// it; text that is not valid JSON fails the run closed for a review and as an
-/// agent failure otherwise. Copilot records no cost (option a) and reports the
-/// session id on `session.start`, so the run fills both in elsewhere.
 fn message_result(expect: Expect, text: &str) -> RunResult {
     let event = match serde_json::from_str::<Value>(unfence(text)) {
         Ok(value) => event_from_output(expect, Some(value)),
@@ -275,10 +268,6 @@ fn unfence(text: &str) -> &str {
     inner.split_once('\n').map_or("", |(_, body)| body).trim()
 }
 
-/// Turns a `tool.execution_start` into one log line: an MCP call as
-/// `mcp__<server>__<tool>`, a shell command as an `exec` line, a built-in file
-/// edit as an `edit` line, and any other tool as nothing, the way Codex drops a
-/// read or a reasoning step.
 fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {
     let Some(data) = data else {
         return Vec::new();
@@ -312,10 +301,6 @@ fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {
     Vec::new()
 }
 
-/// A failed `tool.execution_complete` as a log line. A tool that completes does
-/// not fail the run, the way a non-fatal Codex item error does not; the log just
-/// notes the failure. A successful completion gives nothing, since
-/// `tool.execution_start` already logged the call.
 fn parse_tool_complete(data: Option<&Value>) -> Vec<AgentItem> {
     let Some(data) = data else {
         return Vec::new();
@@ -331,12 +316,18 @@ fn parse_tool_complete(data: Option<&Value>) -> Vec<AgentItem> {
     Vec::new()
 }
 
-/// The final `result` line: the once-per-run note that Copilot runs carry no
-/// cost, and, when `exitCode` is non-zero, the failure. The human cause of a
-/// failure is on stderr, not in the stream, so the reason names the code; the
-/// run uses the failure only when no final message arrived.
+/// The CLI writes the cause of a failed run to stderr, not to the stream, so the
+/// reason names the exit code.
 fn parse_result(expect: Expect, value: &Value) -> Vec<AgentItem> {
-    let mut items = vec![AgentItem::Log(LogLine::Other(COST_NOTE.to_owned()))];
+    let mut items = Vec::new();
+    if let Some(requests) = value
+        .pointer("/usage/premiumRequests")
+        .and_then(Value::as_i64)
+    {
+        items.push(AgentItem::Log(LogLine::Other(format!(
+            "Copilot reported {requests} premium request(s)"
+        ))));
+    }
     let code = value.get("exitCode").and_then(Value::as_i64).unwrap_or(0);
     if code != 0 {
         items.push(AgentItem::Failure(failed_event(
@@ -347,14 +338,16 @@ fn parse_result(expect: Expect, value: &Value) -> Vec<AgentItem> {
     items
 }
 
-/// The log line that records what a `session.usage_checkpoint` reports: premium
-/// requests, AI credits and token counts. The factory keeps no dollar cost for a
-/// Copilot run (see Job cost), so these counts go to the job log alone.
-fn usage_log(data: Option<&Value>) -> Option<AgentItem> {
+/// `totalNanoAiu` is in billionths of an AI credit, and `tokenDetails` holds one
+/// count per category.
+fn checkpoint_log(data: Option<&Value>) -> Option<AgentItem> {
     let data = data?;
-    let count = |key: &str| data.get(key).and_then(Value::as_i64).unwrap_or(0);
     #[allow(clippy::cast_precision_loss)]
-    let credits = count("totalNanoAiu") as f64 / 1e9;
+    let credits = data
+        .get("totalNanoAiu")
+        .and_then(Value::as_i64)
+        .unwrap_or(0) as f64
+        / 1e9;
     let tokens = |key: &str| {
         data.pointer(&format!(
             "/accountingSnapshot/tokenDetails/{key}/tokenCount"
@@ -363,9 +356,10 @@ fn usage_log(data: Option<&Value>) -> Option<AgentItem> {
         .unwrap_or(0)
     };
     Some(AgentItem::Log(LogLine::Other(format!(
-        "Copilot usage: {} premium request(s), {credits:.4} AI credits, {} input and {} output tokens",
-        count("totalPremiumRequests"),
+        "Copilot usage: {credits:.4} AI credits; tokens: {} input, {} cache read, {} cache write, {} output",
         tokens("input"),
+        tokens("cache_read"),
+        tokens("cache_write"),
         tokens("output"),
     ))))
 }

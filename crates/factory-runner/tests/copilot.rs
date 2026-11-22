@@ -259,7 +259,7 @@ fn the_success_fixture_parses_into_the_reply_and_a_result() {
     );
 
     // The streaming deltas are ephemeral and skipped, so the reply logs once. The
-    // usage checkpoint and the result line add the counts and the cost note.
+    // usage checkpoint and the result line add the reported counts.
     let logs: Vec<&LogLine> = items
         .iter()
         .filter_map(|item| match item {
@@ -272,10 +272,10 @@ fn the_success_fixture_parses_into_the_reply_and_a_result() {
         [
             &LogLine::Text("pong".into()),
             &LogLine::Other(
-                "Copilot usage: 1 premium request(s), 6.2503 AI credits, 4 input and 4 output tokens"
+                "Copilot usage: 6.2503 AI credits; tokens: 4 input, 0 cache read, 24982 cache write, 4 output"
                     .into()
             ),
-            &LogLine::Other("Copilot runs are not counted in the job cost.".into()),
+            &LogLine::Other("Copilot reported 1 premium request(s)".into()),
         ]
     );
 
@@ -556,4 +556,62 @@ async fn a_run_that_fails_after_an_intermediate_message_ends_on_the_failure() {
         other => panic!("expected ReviewFailed, got {other:?}"),
     }
     assert_eq!(report.cost_usd, None);
+}
+
+const COST_NOTE: &str = "Copilot runs are not counted in the job cost.";
+
+fn cost_notes(log: &[LogLine]) -> usize {
+    log.iter()
+        .filter(|line| **line == LogLine::Other(COST_NOTE.into()))
+        .count()
+}
+
+#[test]
+fn the_failure_fixture_logs_its_premium_request_count() {
+    let items = parse(
+        Expect::Spec,
+        &fs::read_to_string(fixture("copilot-auth-failure.jsonl")).unwrap(),
+    );
+    assert!(items.contains(&AgentItem::Log(LogLine::Other(
+        "Copilot reported 0 premium request(s)".into()
+    ))));
+}
+
+#[tokio::test]
+async fn the_cost_note_is_logged_once_even_when_the_worker_prints_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let podman = support::executable(dir.path(), "podman", "#!/bin/bash\nexit 137\n");
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+
+    let mut log = Vec::new();
+    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+
+    assert!(matches!(report.event, Event::AgentFailed { .. }));
+    assert_eq!(cost_notes(&log), 1, "{log:?}");
+}
+
+#[tokio::test]
+async fn the_cost_note_is_logged_once_for_a_run_that_reaches_its_result_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = fixture("copilot-success.jsonl");
+    let podman = support::executable(
+        dir.path(),
+        "podman",
+        &format!("#!/bin/bash\ncat '{}'\n", stdout.display()),
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+
+    let mut log = Vec::new();
+    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+
+    assert_eq!(report.cost_usd, None);
+    assert_eq!(cost_notes(&log), 1, "{log:?}");
 }
