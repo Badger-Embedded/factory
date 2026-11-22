@@ -1291,11 +1291,9 @@ async fn show_notifications(
 
 #[derive(Deserialize)]
 struct NotificationsForm {
-    /// The checkbox: present when ticked, absent when not.
     notifications: Option<String>,
 }
 
-/// Saves the current login's setting. It never writes another login's row.
 async fn save_notifications(
     State(state): State<AppState>,
     headers: HeaderMap,

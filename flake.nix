@@ -29,6 +29,7 @@
             hadolint
             actionlint
             just
+            nodejs
           ];
 
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
