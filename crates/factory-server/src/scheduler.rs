@@ -1381,7 +1381,10 @@ impl<E: Executor> Scheduler<E> {
                 );
                 self.apply(job_id, Event::Merged);
             }
-            Err(err) => self.retry_later(settings, job_id, &err),
+            Err(err) => {
+                self.retry_later(settings, job_id, &err);
+                self.apply(job_id, Event::MergeFailed);
+            }
         }
     }
 
@@ -1392,6 +1395,7 @@ impl<E: Executor> Scheduler<E> {
         reason: &str,
         agent_asked: bool,
     ) {
+        let renovate = !agent_asked;
         let job_id = request.job_id;
         let number = request.number;
         let text = if agent_asked {
@@ -1401,18 +1405,26 @@ impl<E: Executor> Scheduler<E> {
         };
         self.note(job_id, &text);
         match self.executor.rerun(request).await {
-            Ok(rerun) => {
-                let text = match rerun {
-                    Rerun::Started(ids) => {
-                        format!("Reran {} failed CI run(s) on #{number}.", ids.len())
-                    }
-                    Rerun::NothingToRerun => {
-                        format!("#{number} has no failed Actions run to rerun.")
-                    }
-                };
-                self.note(job_id, &text);
+            Ok(Rerun::Started(ids)) => {
+                self.note(
+                    job_id,
+                    &format!("Reran {} failed CI run(s) on #{number}.", ids.len()),
+                );
                 self.wait(settings, job_id);
                 self.apply(job_id, Event::CiRerun);
+            }
+            Ok(Rerun::NothingToRerun) => {
+                self.note(
+                    job_id,
+                    &format!("#{number} has no failed Actions run to rerun."),
+                );
+                self.wait(settings, job_id);
+                let event = if renovate {
+                    Event::NothingToRerun
+                } else {
+                    Event::CiRerun
+                };
+                self.apply(job_id, event);
             }
             Err(err) => self.retry_later(settings, job_id, &err),
         }

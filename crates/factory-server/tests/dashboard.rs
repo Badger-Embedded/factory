@@ -2159,6 +2159,47 @@ async fn a_renovate_job_shows_on_the_board_and_its_page_and_retries_from_it() {
 }
 
 #[tokio::test]
+async fn a_merged_renovate_job_page_keeps_the_verdict_and_summary() {
+    let dashboard = dashboard();
+    let id = dashboard
+        .store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    dashboard.apply(
+        id,
+        Event::RenovateObserved {
+            head: "abc1234".into(),
+            ci: factory_core::RenovateCi::Passed {
+                details: Some(Box::new(factory_core::PrDiff {
+                    diff: "+serde = 1.0.2".into(),
+                    body: "Bumps serde".into(),
+                })),
+            },
+            limits: factory_core::RetryLimits { auto: 3, total: 7 },
+            auto_merge: false,
+        },
+    );
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe: true,
+                reason: "only a version bump".into(),
+                summary: "Bumps serde to 1.0.2".into(),
+                from: None,
+                to: None,
+            },
+        ))),
+    );
+    dashboard.apply(id, Event::Merged);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains("Diff check: safe"));
+    assert!(page.contains("Summary: Bumps serde to 1.0.2"));
+}
+
+#[tokio::test]
 async fn the_job_page_has_no_review_card_without_passes() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;

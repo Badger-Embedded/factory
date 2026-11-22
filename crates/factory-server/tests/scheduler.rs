@@ -65,6 +65,7 @@ struct FakeExecutor {
     comments: Mutex<Vec<(u64, String)>>,
     /// Each approval and squash merge of `(number, head)`.
     merged: Mutex<Vec<(u64, String)>>,
+    merge_failures: Mutex<VecDeque<RenovateNow>>,
 }
 
 /// The state the fake reports for the Renovate pull request.
@@ -104,6 +105,7 @@ impl FakeExecutor {
             renovate_watched: Mutex::new(Vec::new()),
             comments: Mutex::new(Vec::new()),
             merged: Mutex::new(Vec::new()),
+            merge_failures: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -291,6 +293,10 @@ impl Executor for FakeExecutor {
 
     async fn merge_renovate(&self, _repo: &str, number: u64, head: &str) -> Result<(), String> {
         tokio::task::yield_now().await;
+        if let Some(now) = self.merge_failures.lock().unwrap().pop_front() {
+            *self.renovate_now.lock().unwrap() = now;
+            return Err("the head commit changed".into());
+        }
         self.merged.lock().unwrap().push((number, head.to_owned()));
         Ok(())
     }
@@ -4487,4 +4493,60 @@ async fn what_the_factory_posts_on_renovate_pull_requests_is_plain() {
         assert!(body.is_ascii(), "{body}");
         assert!(!body.contains("Moon Skywalker"));
     }
+}
+
+#[tokio::test]
+async fn a_merge_refused_for_a_moved_head_watches_the_new_head() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    executor
+        .merge_failures
+        .lock()
+        .unwrap()
+        .push_back(passed("h2"));
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert_eq!(*executor.merged.lock().unwrap(), [(7, "h2".to_owned())]);
+    assert_eq!(executor.requests().len(), 2, "each head gets its own check");
+}
+
+#[tokio::test]
+async fn a_merge_refused_for_a_pull_request_merged_by_a_person_ends_the_job() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    executor
+        .merge_failures
+        .lock()
+        .unwrap()
+        .push_back(RenovateNow::Merged);
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert!(executor.merged.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_check_with_no_actions_run_is_not_counted_as_a_rerun() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    executor
+        .reruns
+        .lock()
+        .unwrap()
+        .push_back(Ok(Rerun::NothingToRerun));
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    for _ in 0..4 {
+        step(&scheduler).await;
+    }
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Stopped));
+    let pr = pr_of(&store, id);
+    assert_eq!((pr.reruns, pr.auto_reruns), (0, 0));
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), 1);
+    assert_eq!(executor.comments.lock().unwrap().len(), 1);
+    assert_eq!(executor.requests().len(), 0);
 }

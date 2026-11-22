@@ -489,7 +489,7 @@ impl Executor for PodmanExecutor {
     }
 
     async fn merge_renovate(&self, repo: &str, number: u64, head: &str) -> Result<(), String> {
-        self.github.approve(repo, number, APPROVAL).await?;
+        self.github.approve(repo, number, head, APPROVAL).await?;
         self.github.merge_head(repo, number, head).await
     }
 

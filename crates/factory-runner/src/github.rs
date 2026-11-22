@@ -779,23 +779,34 @@ impl GitHub {
         .map(|_| ())
     }
 
-    /// Approves the pull request with `body` as the review text.
+    /// Approves commit `head` of the pull request with `body` as the review
+    /// text. GitHub refuses the review when `head` is no longer a commit of
+    /// the pull request.
     ///
     /// # Errors
     ///
     /// Returns gh's message when the call fails.
-    pub async fn approve(&self, repo: &str, number: u64, body: &str) -> Result<(), String> {
-        let number_text = number.to_string();
+    pub async fn approve(
+        &self,
+        repo: &str,
+        number: u64,
+        head: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let path = format!("repos/{repo}/pulls/{number}/reviews");
+        let commit = format!("commit_id={head}");
         self.run(
             &[
-                "pr",
-                "review",
-                &number_text,
-                "--repo",
-                repo,
-                "--approve",
-                "--body-file",
-                "-",
+                "api",
+                "--method",
+                "POST",
+                &path,
+                "-f",
+                "event=APPROVE",
+                "-f",
+                &commit,
+                "-F",
+                "body=@-",
             ],
             Some(body),
         )

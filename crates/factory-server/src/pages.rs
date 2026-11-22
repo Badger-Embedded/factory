@@ -3228,7 +3228,6 @@ fn job_header(
     }
 }
 
-/// The "Renovate" badge and the link to the pull request of a Renovate job.
 fn renovate_link(job: &Job) -> Markup {
     html! {
         @if let Some(pr) = job.renovate_pr() {
@@ -3238,8 +3237,6 @@ fn renovate_link(job: &Job) -> Markup {
     }
 }
 
-/// The triage state of a Renovate job: the reruns on the current head against
-/// the limits, the diff check's verdict and the summary of the update.
 fn renovate_details(pr: &RenovatePr, settings: &Settings) -> Markup {
     html! {
         ul.renovate-details {
@@ -3517,7 +3514,6 @@ fn log_card(logs: &[LogEntry]) -> Markup {
     }
 }
 
-/// The Needs you card of a Renovate job that waits for a person.
 fn renovate_wait_card(
     id: i64,
     job: &Job,
@@ -3605,7 +3601,7 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
         (_, Turn::User(Ask::Renovate { reason, state })) => {
             renovate_wait_card(id, job, settings, reason, *state)
         }
-        (Stage::Renovate, _) => html! {
+        (Stage::Renovate | Stage::Merged | Stage::Cancelled, _) => html! {
             div.card.status {
                 (turn_badge(job, auto_merge))
                 span.status-detail { (turn_detail(job, settings, auto_merge)) }

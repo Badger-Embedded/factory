@@ -107,6 +107,8 @@ pub enum CommentKind {
     CausedByUpdate,
     /// The diff check found the update unsafe to merge.
     Unsafe,
+    /// CI fails on a check with no failed Actions run to rerun.
+    NothingToRerun,
     /// CI still fails after the total reruns.
     Stopped,
 }
@@ -770,6 +772,12 @@ pub enum Event {
     },
     /// The factory reran the failed CI runs the agent asked to rerun.
     CiRerun,
+    /// The failed check of a Renovate pull request has no Actions run to
+    /// rerun, so no rerun happened and no count changes.
+    NothingToRerun,
+    /// The approval or the merge of a Renovate head failed. The job goes back
+    /// to watching, so the next look sees the current head and state.
+    MergeFailed,
     /// The pull request no longer merges cleanly into `base`.
     Conflicted {
         base: String,
@@ -1312,6 +1320,21 @@ impl Job {
                     }
                     RerunKind::Analysed => pr.reruns += 1,
                     RerunKind::Retry => {}
+                }
+                Turn::Factory
+            }
+            (Turn::RerunCi { .. }, E::NothingToRerun) => pr.stop(
+                CommentKind::NothingToRerun,
+                "CI fails on a check that has no failed GitHub Actions run, so the factory cannot \
+                 rerun it."
+                    .to_owned(),
+                "CI fails on a check that has no failed GitHub Actions run to rerun. The factory \
+                 leaves this pull request to a person."
+                    .to_owned(),
+            ),
+            (Turn::Factory, E::MergeFailed) => {
+                if pr.pending.take() != Some(Pending::Merge) {
+                    return Err(self.unexpected(E::MergeFailed));
                 }
                 Turn::Factory
             }
