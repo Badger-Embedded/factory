@@ -35,8 +35,8 @@
   function before(event) {
     remember(event.detail && event.detail.target);
   }
-  function after(event) {
-    restore(event.detail && event.detail.target);
+  function after() {
+    restore(document);
   }
 
   document.body.addEventListener("htmx:beforeSwap", before);
