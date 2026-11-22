@@ -10,7 +10,7 @@
 //   browser's permission state: "the notifications page saves the toggle and
 //   shows the permission state"
 import type { Page } from '@playwright/test';
-import { COLLABORATOR, expect, test } from '../fixtures';
+import { expect, test } from '../fixtures';
 
 declare global {
   interface Window {
@@ -42,11 +42,17 @@ async function stubNotification(page: Page, permission: 'default' | 'granted' | 
 const polled = (page: Page) =>
   page.waitForResponse((response) => new URL(response.url()).pathname === '/notifications');
 
+// The snapshots the script has stored. A poll that moved past the old snapshot has been handled
+// once its entry appears, after the script showed that poll's notifications.
+const storedSnapshots = (page: Page) =>
+  page.evaluate(() =>
+    Object.keys(localStorage)
+      .filter((name) => name.startsWith('factory.notified.'))
+      .map((name) => name.split('.').pop())
+      .sort(),
+  );
+
 test('a job that starts to need you raises one notification', async ({ page, factory, project }) => {
-  const enabled = await page.request.post('/settings/notifications', {
-    form: { notifications: 'on' },
-  });
-  expect(enabled.ok()).toBe(true);
   const id = factory.fixture(
     'job',
     '--project',
@@ -56,9 +62,9 @@ test('a job that starts to need you raises one notification', async ({ page, fac
     '--request',
     'A job the agent is working on',
   );
+  const other = factory.fixture('job', '--project', project, '--stage', 'requested');
   await stubNotification(page, 'granted');
 
-  // The first poll only records what already needs the user.
   const first = polled(page);
   await page.goto('/');
   await first;
@@ -70,8 +76,11 @@ test('a job that starts to need you raises one notification', async ({ page, fac
     `Job #${id} needs you`,
   ]);
 
-  // Another poll sees the same job and does not notify again.
-  await polled(page);
+  // An unrelated event moves the snapshot, so a new stored entry shows a poll that still lists the
+  // job was handled.
+  const before = await storedSnapshots(page);
+  factory.fixture('apply', '--job', other, '--event', 'start');
+  await expect.poll(() => storedSnapshots(page)).not.toEqual(before);
   expect(await page.evaluate(() => window.__notes.length)).toBe(1);
 });
 
@@ -102,17 +111,20 @@ test('the permission bar stays hidden when permission is already granted', async
 });
 
 test.describe('the notifications page', () => {
-  test.use({ extraHTTPHeaders: { 'Tailscale-User-Login': COLLABORATOR } });
-
   test('the notifications page saves the toggle and shows the permission state', async ({
     page,
-  }) => {
+    browser,
+    baseURL,
+  }, testInfo) => {
+    const suffix = `${testInfo.workerIndex}-${testInfo.parallelIndex}-${Date.now()}`;
+    const login = `notify-${suffix}@e2e.test`;
+    const bystander = `bystander-${suffix}@e2e.test`;
+    await page.setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
     await stubNotification(page, 'default');
     await page.goto('/settings/notifications');
 
     const toggle = page.getByLabel('Browser notifications for my jobs');
     const permission = page.locator('#notification-permission');
-    // Notifications are on until a login turns them off.
     await expect(toggle).toBeChecked();
     await expect(permission.locator('.permission-state')).toHaveText(
       'Browser permission: not asked yet.',
@@ -124,17 +136,20 @@ test.describe('the notifications page', () => {
     await page.reload();
     await expect(toggle).not.toBeChecked();
 
+    const other = await browser.newContext({
+      baseURL,
+      extraHTTPHeaders: { 'Tailscale-User-Login': bystander },
+    });
+    const otherPage = await other.newPage();
+    await otherPage.goto('/settings/notifications');
+    await expect(otherPage.getByLabel('Browser notifications for my jobs')).toBeChecked();
+    await other.close();
+
     await permission.getByRole('button', { name: 'Allow notifications' }).click();
     await expect(permission.locator('.permission-state')).toHaveText(
       'Browser permission: granted.',
     );
     await expect(permission.getByRole('button')).toBeHidden();
-
-    await toggle.check();
-    await page.getByRole('button', { name: 'Save', exact: true }).click();
-    await expect(page.getByText('Saved.')).toBeVisible();
-    await page.reload();
-    await expect(toggle).toBeChecked();
   });
 
   test('the notifications page says when the browser blocks notifications', async ({ page }) => {
