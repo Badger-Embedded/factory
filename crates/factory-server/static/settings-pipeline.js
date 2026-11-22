@@ -13,8 +13,6 @@
   // radios can be redrawn when a stage's agent switches.
   var AGENT_EFFORTS = JSON.parse(form.dataset.agentEfforts || "{}");
 
-  // Each agent id maps to { models: [...], cli: "..." }, so a stage's model
-  // chips, suggestions and hint can be redrawn when its agent switches.
   var AGENT_MODELS = JSON.parse(form.dataset.agentModels || "{}");
 
   // The effort levels of the agent a stage is set to, lowest first.
@@ -85,10 +83,6 @@
     setEffortLabel(stage, selected);
   }
 
-  // Redraws a stage's model chips, datalist and hint for the agent it is now
-  // set to. A model that was one of the previous agent's suggestions is cleared
-  // to "CLI default", since the new agent would refuse it. Any other typed id
-  // stays.
   function redrawModels(stage) {
     var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
     var spec = agent && AGENT_MODELS[agent.value];

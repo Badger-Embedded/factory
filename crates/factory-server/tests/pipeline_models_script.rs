@@ -3,8 +3,6 @@ use std::process::Command;
 
 use serde_json::Value;
 
-// A small DOM: elements with attributes, children and the selectors the
-// pipeline script uses (tag, #id, .class, [attr], [attr="v"], :checked).
 const DOM: &str = r#"
 const fs = require("fs");
 class El {
@@ -142,8 +140,6 @@ console.log(JSON.stringify({ after: state(implement), inputs: global.inputs }));
         after["hint"],
         "An alias or any model ID. Empty runs the model the installed copilot CLI picks."
     );
-    // The cleared field fires an input event, so the node label and the form's
-    // change tracking follow.
     assert_eq!(out["inputs"], serde_json::json!(["implement"]));
 }
 

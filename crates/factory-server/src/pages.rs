@@ -521,8 +521,6 @@ pub struct AgentChoice {
     /// The level the panel preselects for this agent when the saved level is not
     /// one of its own.
     pub default_effort: String,
-    /// The model ids the panel suggests for this agent, as chips and as the
-    /// model field's datalist.
     pub models: Vec<String>,
 }
 
@@ -1979,9 +1977,6 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) 
             .collect(),
     )
     .to_string();
-    // Each agent's model suggestions, read by the pipeline script to redraw a
-    // stage's chips, datalist and hint when its agent switches. The CLI is named
-    // by the agent's id.
     let agent_models = serde_json::Value::Object(
         project
             .agents
