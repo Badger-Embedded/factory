@@ -280,6 +280,7 @@ pub fn import_tomls(store: &Store, dir: &Path) -> Result<(), ImportError> {
             &project.repo,
             &project.base,
             project.checks.as_deref(),
+            None,
         )?;
         if project.models != StageModels::default() {
             store.save_project_models(name, &project.models)?;

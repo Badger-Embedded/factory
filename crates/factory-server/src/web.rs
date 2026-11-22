@@ -2224,7 +2224,7 @@ async fn submit_onboard(
         let checks = (!checks.is_empty()).then_some(checks);
         match state
             .store
-            .create_project(effective_name, repo, base, checks)
+            .create_project(effective_name, repo, base, checks, Some(&user(&headers)))
         {
             Ok(()) => {
                 if form.action == "create" {

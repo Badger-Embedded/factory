@@ -141,6 +141,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let names = projects.names()?;
     store.migrate_global_auto_merge(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
     store.migrate_project_gates()?;
+    store.migrate_project_collaborators()?;
     let wake = Arc::new(Notify::new());
 
     // Per-project MCP header values are encrypted under the `factory-master-key`
