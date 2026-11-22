@@ -835,3 +835,13 @@ async fn file_at_errors_for_a_submodule_and_a_directory() {
     let (github, _) = recording_github(dir.path(), r#"echo '[{"type": "file"}]'"#);
     assert!(github.file_at("o/r", "dir", "main").await.is_err());
 }
+
+#[tokio::test]
+async fn approve_names_the_checked_commit_so_a_later_head_is_not_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(dir.path(), "");
+    github.approve("o/r", 5, "checked1", "ok").await.unwrap();
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("commit_id=checked1"), "{calls}");
+    assert!(!calls.contains("pr review"), "{calls}");
+}

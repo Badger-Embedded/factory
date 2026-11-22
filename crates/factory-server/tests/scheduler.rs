@@ -66,6 +66,7 @@ struct FakeExecutor {
     /// Each approval and squash merge of `(number, head)`.
     merged: Mutex<Vec<(u64, String)>>,
     merge_failures: Mutex<VecDeque<RenovateNow>>,
+    approved: Mutex<Vec<(u64, String)>>,
 }
 
 /// The state the fake reports for the Renovate pull request.
@@ -106,6 +107,7 @@ impl FakeExecutor {
             comments: Mutex::new(Vec::new()),
             merged: Mutex::new(Vec::new()),
             merge_failures: Mutex::new(VecDeque::new()),
+            approved: Mutex::new(Vec::new()),
         })
     }
 
@@ -293,6 +295,10 @@ impl Executor for FakeExecutor {
 
     async fn merge_renovate(&self, _repo: &str, number: u64, head: &str) -> Result<(), String> {
         tokio::task::yield_now().await;
+        self.approved
+            .lock()
+            .unwrap()
+            .push((number, head.to_owned()));
         if let Some(now) = self.merge_failures.lock().unwrap().pop_front() {
             *self.renovate_now.lock().unwrap() = now;
             return Err("the head commit changed".into());
@@ -4511,6 +4517,11 @@ async fn a_merge_refused_for_a_moved_head_watches_the_new_head() {
     .await;
     assert_eq!(*executor.merged.lock().unwrap(), [(7, "h2".to_owned())]);
     assert_eq!(executor.requests().len(), 2, "each head gets its own check");
+    // The push landed after the watch of h1, so only h1 was approved then.
+    assert_eq!(
+        *executor.approved.lock().unwrap(),
+        [(7, "h1".to_owned()), (7, "h2".to_owned())]
+    );
 }
 
 #[tokio::test]
