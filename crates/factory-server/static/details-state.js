@@ -17,26 +17,32 @@
 (function () {
   // key -> true when open, false when the reader closed it.
   var state = {};
+  // Keys inside the content being swapped. htmx reports the replaced element
+  // as the target after an outerHTML swap, and it has left the page by then.
+  var swapped = [];
 
   function remember(root) {
     if (!root || !root.querySelectorAll) return;
+    swapped = [];
     root.querySelectorAll("details[data-key]").forEach(function (d) {
-      state[d.getAttribute("data-key")] = d.open;
+      var key = d.getAttribute("data-key");
+      state[key] = d.open;
+      swapped.push(key);
     });
   }
 
-  function restore(root) {
-    if (!root || !root.querySelectorAll) return;
-    root.querySelectorAll("details[data-key]").forEach(function (d) {
-      if (state[d.getAttribute("data-key")]) d.open = true;
+  function restore() {
+    document.querySelectorAll("details[data-key]").forEach(function (d) {
+      var key = d.getAttribute("data-key");
+      if (swapped.indexOf(key) !== -1 && state[key]) d.open = true;
     });
   }
 
   function before(event) {
     remember(event.detail && event.detail.target);
   }
-  function after(event) {
-    restore(event.detail && event.detail.target);
+  function after() {
+    restore();
   }
 
   document.body.addEventListener("htmx:beforeSwap", before);
