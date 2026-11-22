@@ -91,7 +91,6 @@ fn codex_prepare(home: &Path) -> std::io::Result<()> {
     )
 }
 
-/// The `auth.json` Codex wrote.
 fn codex_read_back(home: &Path) -> Option<String> {
     std::fs::read_to_string(home.join("auth.json")).ok()
 }
