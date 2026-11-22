@@ -6,7 +6,7 @@
 //! e2e_fixture seed --db P
 //! e2e_fixture project --db P --name N --login L [--login L ...]
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
-//! e2e_fixture apply --db P --job ID --event start|approve|cancel
+//! e2e_fixture apply --db P --job ID --event start|approve|cancel|questions
 //! e2e_fixture log --db P --job ID --text TEXT [--count N]
 //! ```
 //!
@@ -105,6 +105,9 @@ fn event_named(name: &str) -> Result<Event> {
         "start" => Event::Start,
         "approve" => Event::Approve,
         "cancel" => Event::Cancel,
+        "questions" => Event::Agent(AgentResult::Questions(vec![Question {
+            text: "Which hub model should the first version support?".into(),
+        }])),
         other => return Err(format!("unknown event {other}").into()),
     })
 }
