@@ -249,7 +249,10 @@ enum Pending {
     /// Approve, then merge the recorded head.
     Merge,
     /// Create a job for each gap, then finish.
-    Propose(Vec<Gap>),
+    Propose {
+        gaps: Vec<Gap>,
+        range: Option<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -813,6 +816,8 @@ pub enum Command {
     /// store transaction.
     ProposeGaps {
         gaps: Vec<Gap>,
+        /// The upstream versions the analysis compared, for the request text.
+        range: Option<(String, String)>,
     },
 }
 
@@ -1176,7 +1181,10 @@ impl Job {
             }
             (_, Stage::Renovate) => self.renovate_command(),
             (Turn::Factory, Stage::Packaging) => self.renovate_pr().map(|pr| match &pr.pending {
-                Some(Pending::Propose(gaps)) => Command::ProposeGaps { gaps: gaps.clone() },
+                Some(Pending::Propose { gaps, range }) => Command::ProposeGaps {
+                    gaps: gaps.clone(),
+                    range: range.clone(),
+                },
                 _ => Command::GatherPackaging { number: pr.number },
             }),
             (Turn::RerunCi { reason }, Stage::CiAndReview { pr }) => {
@@ -1203,7 +1211,7 @@ impl Job {
                     number,
                     head: pr.head.clone()?,
                 },
-                None | Some(Pending::Propose(_)) => Command::WatchRenovate {
+                None | Some(Pending::Propose { .. }) => Command::WatchRenovate {
                     number,
                     verdict_head: pr.verdict.as_ref().map(|verdict| verdict.head.clone()),
                     watch_only: false,
@@ -1576,12 +1584,22 @@ impl Job {
                 pr.runs += 1;
                 Turn::Agent(Task::FindGaps { context })
             }
-            (Turn::Agent(Task::FindGaps { .. }), E::Agent(AgentResult::Gaps(gaps))) => {
-                pr.pending = Some(Pending::Propose(gaps));
+            (Turn::Agent(Task::FindGaps { context }), E::Agent(AgentResult::Gaps(gaps))) => {
+                let range = context.from.clone().zip(context.to.clone());
+                pr.pending = Some(Pending::Propose { gaps, range });
                 Turn::Factory
             }
+            (
+                Turn::Factory,
+                E::RenovateMerged {
+                    packaging,
+                    manifest_changed,
+                },
+            ) if pr.pending.is_none() && !(packaging && manifest_changed) => {
+                return Ok((Stage::Merged, Turn::Done));
+            }
             (Turn::Factory, E::GapsProposed { jobs })
-                if matches!(pr.pending, Some(Pending::Propose(_))) =>
+                if matches!(pr.pending, Some(Pending::Propose { .. })) =>
             {
                 pr.pending = None;
                 pr.gaps = Some(jobs);

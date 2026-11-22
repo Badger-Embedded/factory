@@ -253,3 +253,146 @@ async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_move
     assert!(calls.contains("--match-head-commit checked1"), "{calls}");
     assert!(!calls.contains("unchecked2"), "{calls}");
 }
+
+/// A podman executor whose gh answers `pr view` with `view`, a diff that is
+/// `diff_bytes` long, a manifest file and a compare. It logs each call.
+fn gh_executor(
+    dir: &std::path::Path,
+    view: &serde_json::Value,
+    diff_bytes: usize,
+) -> (PodmanExecutor, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let calls = dir.join("calls");
+    let view_file = dir.join("view.json");
+    std::fs::write(&view_file, view.to_string()).unwrap();
+    let gh = dir.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/bash\necho \"$@\" >> '{}'\ncase \"$1 $2\" in\n\
+             \"pr view\") cat '{}';;\n\
+             \"pr diff\") head -c {diff_bytes} /dev/zero | tr '\\0' x;;\n\
+             \"api --method\") echo '{{\"content\":\"bmFtZQ==\",\"type\":\"file\",\"encoding\":\"base64\"}}';;\n\
+             \"api repos/up/app/compare/\"*) echo '{{\"files\":[{{\"filename\":\"CMakeLists.txt\",\"patch\":\"@@ new\"}}]}}';;\n\
+             esac\n",
+            calls.display(),
+            view_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(LocalSecrets::new(
+        &[7; MASTER_KEY_LEN],
+        Arc::new(Store::open_in_memory().unwrap()),
+    ));
+    let mut podman = executor(
+        registry(&secrets),
+        dir.to_owned(),
+        Arc::new(Store::open_in_memory().unwrap()),
+    );
+    podman.github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+    (podman, calls)
+}
+
+fn view(head: &str, body: &str, files: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "title": "Update app",
+        "body": body,
+        "headRefOid": head,
+        "files": files.iter().map(|path| serde_json::json!({"path": path})).collect::<Vec<_>>(),
+    })
+}
+
+fn packaging_request(
+    verdict_head: Option<&str>,
+    range: Option<(&str, &str)>,
+) -> factory_server::PackagingRequest {
+    factory_server::PackagingRequest {
+        repo: "o/r".into(),
+        upstream: "up/app".into(),
+        base: "main".into(),
+        number: 5,
+        manifest_files: vec!["snap/snapcraft.yaml".into()],
+        build_config_files: vec!["CMakeLists.txt".into()],
+        verdict_head: verdict_head.map(str::to_owned),
+        from: range.map(|(from, _)| from.to_owned()),
+        to: range.map(|(_, to)| to.to_owned()),
+    }
+}
+
+const COMPARE_BODY: &str = "Bumps app. [Compare Source](https://github.com/up/app/compare/v1...v2)";
+
+#[tokio::test]
+async fn a_merge_that_touches_no_manifest_never_downloads_its_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("h1", "", &["Cargo.lock"]), 300_000);
+    let manifests = vec!["snap/snapcraft.yaml".to_owned()];
+
+    let event = podman
+        .renovate_merged("o/r", 5, Some(&manifests))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        event,
+        Event::RenovateMerged {
+            packaging: true,
+            manifest_changed: false
+        }
+    );
+    assert!(!std::fs::read_to_string(&calls).unwrap().contains("pr diff"));
+}
+
+#[tokio::test]
+async fn a_manual_merge_before_any_verdict_takes_the_range_from_the_pull_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("h1", COMPARE_BODY, &[]), 10);
+
+    let context = podman
+        .gather_packaging(packaging_request(None, None))
+        .await
+        .unwrap();
+
+    assert_eq!(context.from.as_deref(), Some("v1"));
+    assert_eq!(context.to.as_deref(), Some("v2"));
+    assert_eq!(context.upstream[0].text.as_deref(), Some("@@ new"));
+    assert!(
+        std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("repos/up/app/compare/v1...v2")
+    );
+}
+
+#[tokio::test]
+async fn a_verdict_for_an_older_head_is_not_used_for_the_merged_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("new", COMPARE_BODY, &[]), 10);
+
+    let context = podman
+        .gather_packaging(packaging_request(Some("old"), Some(("v0", "v0b"))))
+        .await
+        .unwrap();
+
+    assert_eq!(context.from.as_deref(), Some("v1"));
+    assert_eq!(context.to.as_deref(), Some("v2"));
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert!(!calls.contains("v0"), "{calls}");
+}
+
+#[tokio::test]
+async fn a_verdict_for_the_merged_head_gives_its_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, _) = gh_executor(dir.path(), &view("new", "Bumps app.", &[]), 10);
+
+    let context = podman
+        .gather_packaging(packaging_request(Some("new"), Some(("va", "vb"))))
+        .await
+        .unwrap();
+
+    assert_eq!(context.from.as_deref(), Some("va"));
+    assert_eq!(context.to.as_deref(), Some("vb"));
+}

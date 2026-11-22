@@ -2985,13 +2985,48 @@ fn a_merged_manifest_gathers_then_analyses_then_proposes_then_ends() {
     apply(&mut job, Event::Agent(AgentResult::Gaps(vec![gap()])));
     assert_eq!(
         job.next_command(),
-        Some(Command::ProposeGaps { gaps: vec![gap()] })
+        Some(Command::ProposeGaps {
+            gaps: vec![gap()],
+            range: None
+        })
     );
 
     apply(&mut job, Event::GapsProposed { jobs: vec![5, 6] });
     assert_eq!(job.stage(), &Stage::Merged);
     assert!(job.is_finished());
     assert_eq!(pr_of(&job).gaps, Some(vec![5, 6]));
+}
+
+#[test]
+fn the_proposal_carries_the_range_the_analysis_compared() {
+    let mut job = gathering();
+    let mut context = context();
+    context.from = Some("v1".into());
+    context.to = Some("v2".into());
+    apply(&mut job, Event::PackagingGathered(Box::new(context)));
+    apply(&mut job, Event::Agent(AgentResult::Gaps(vec![gap()])));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::ProposeGaps {
+            gaps: vec![gap()],
+            range: Some(("v1".into(), "v2".into()))
+        })
+    );
+}
+
+#[test]
+fn a_merge_that_turns_out_not_to_need_analysis_ends_a_job_waiting_to_gather() {
+    let mut job = gathering();
+    apply(
+        &mut job,
+        Event::RenovateMerged {
+            packaging: false,
+            manifest_changed: false,
+        },
+    );
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert!(job.is_finished());
+    assert_eq!(pr_of(&job).gaps, None);
 }
 
 #[test]

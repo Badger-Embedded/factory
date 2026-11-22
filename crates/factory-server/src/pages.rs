@@ -2869,6 +2869,7 @@ pub fn job(
     models: &StageModels,
     efforts: &StageEfforts,
     auto_merge: bool,
+    gap_links: &[i64],
 ) -> Markup {
     let job = &row.job;
     let repo = project.map(|project| format!("https://github.com/{}", project.repo));
@@ -2884,7 +2885,7 @@ pub fn job(
             (job_header(id, row, repo_url, cost_usd, estimated))
             div.job-layout {
                 div.job-now {
-                    (status_region(false, id, job, settings, auto_merge))
+                    (status_region(false, id, job, settings, auto_merge, gap_links))
                     p.meta { "Approval gates: " (gates_line(job.gates())) }
                 }
                 aside.job-side { (timeline_region(false, job, events, models, efforts)) }
@@ -2929,6 +2930,7 @@ pub fn job_fragment(
     models: &StageModels,
     efforts: &StageEfforts,
     auto_merge: bool,
+    gap_links: &[i64],
 ) -> Markup {
     let job = &row.job;
     let repo = project.map(|project| format!("https://github.com/{}", project.repo));
@@ -2937,7 +2939,7 @@ pub fn job_fragment(
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd, any_estimated(events)))
         (timeline_region(true, job, events, models, efforts))
-        (status_region(true, row.id, job, settings, auto_merge))
+        (status_region(true, row.id, job, settings, auto_merge, gap_links))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
         (reviews_region(true, job))
@@ -3005,10 +3007,17 @@ fn timeline_region(
 /// The status and its controls. A poll swaps this region, so the approval or
 /// answer form appears when the job enters a gate. `job-updates.js` skips the
 /// swap while a field here has focus, so a half-typed answer survives a poll.
-fn status_region(oob: bool, id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Markup {
+fn status_region(
+    oob: bool,
+    id: i64,
+    job: &Job,
+    settings: &Settings,
+    auto_merge: bool,
+    gap_links: &[i64],
+) -> Markup {
     html! {
         div #job-status hx-swap-oob=[oob.then_some("true")] {
-            (status_card(id, job, settings, auto_merge))
+            (status_card(id, job, settings, auto_merge, gap_links))
         }
     }
 }
@@ -3252,7 +3261,9 @@ fn renovate_link(job: &Job) -> Markup {
     }
 }
 
-fn renovate_details(pr: &RenovatePr, settings: &Settings) -> Markup {
+/// `gap_links` holds the gap jobs that still belong to this Renovate job. A
+/// job id can be reused after its job expires, so any other id gets no link.
+fn renovate_details(pr: &RenovatePr, settings: &Settings, gap_links: &[i64]) -> Markup {
     html! {
         ul.renovate-details {
             li {
@@ -3274,7 +3285,11 @@ fn renovate_details(pr: &RenovatePr, settings: &Settings) -> Markup {
                     "Packaging gaps found: "
                     @for (i, job) in jobs.iter().enumerate() {
                         @if i > 0 { ", " }
-                        a href={ "/jobs/" (job) } { "job " (job) }
+                        @if gap_links.contains(job) {
+                            a href={ "/jobs/" (job) } { "job " (job) }
+                        } @else {
+                            "a job that is no longer available"
+                        }
                     }
                 },
                 None => {}
@@ -3546,6 +3561,7 @@ fn renovate_wait_card(
     settings: &Settings,
     reason: &str,
     state: RenovateWait,
+    gap_links: &[i64],
 ) -> Markup {
     let heading = match state {
         RenovateWait::Stopped => "Triage stopped",
@@ -3560,7 +3576,7 @@ fn renovate_wait_card(
             }
             p.status-detail { (reason) }
             @if let Some(pr) = job.renovate_pr() {
-                (renovate_details(pr, settings))
+                (renovate_details(pr, settings, gap_links))
             }
             @if job.can_retry() {
                 div.row.actions {
@@ -3601,7 +3617,13 @@ fn proposal_card(id: i64, job: &Job) -> Markup {
     }
 }
 
-fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Markup {
+fn status_card(
+    id: i64,
+    job: &Job,
+    settings: &Settings,
+    auto_merge: bool,
+    gap_links: &[i64],
+) -> Markup {
     match (job.stage(), job.turn()) {
         (_, Turn::User(Ask::Answers { questions })) => html! {
             form.card.needs-you method="post" action={ "/jobs/" (id) "/answers" } {
@@ -3653,7 +3675,7 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
             }),
         ) => publish_card(id, job, *pr, summary),
         (_, Turn::User(Ask::Renovate { reason, state })) => {
-            renovate_wait_card(id, job, settings, reason, *state)
+            renovate_wait_card(id, job, settings, reason, *state, gap_links)
         }
         (Stage::Proposed, _) => proposal_card(id, job),
         (
@@ -3668,7 +3690,7 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
                 (turn_badge(job, auto_merge))
                 span.status-detail { (turn_detail(job, settings, auto_merge)) }
                 @if let Some(pr) = job.renovate_pr() {
-                    (renovate_details(pr, settings))
+                    (renovate_details(pr, settings, gap_links))
                 }
             }
         },

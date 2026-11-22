@@ -783,15 +783,20 @@ impl Store {
         Ok(id)
     }
 
-    /// Creates a job for each of `gaps` and records their ids on the Renovate
-    /// job `renovate_id` in one transaction, so a retry never creates a gap
+    /// Creates a job for each of `gaps`, with `range` as the upstream versions
+    /// in its text, and records their ids on the Renovate job `renovate_id` in one transaction, so a retry never creates a gap
     /// twice. An empty list is valid.
     ///
     /// # Errors
     ///
     /// Fails with [`StoreError::Rejected`] when the Renovate job is not at the
     /// packaging step, and then nothing is saved.
-    pub fn propose_gaps(&self, renovate_id: i64, gaps: &[Gap]) -> Result<JobRow, StoreError> {
+    pub fn propose_gaps(
+        &self,
+        renovate_id: i64,
+        gaps: &[Gap],
+        range: Option<&(String, String)>,
+    ) -> Result<JobRow, StoreError> {
         let project = self.get(renovate_id)?.project;
         let gates = self.project_gates(&project)?;
         let mut conn = self.conn();
@@ -801,29 +806,15 @@ impl Store {
         check
             .apply(Event::GapsProposed { jobs: Vec::new() })
             .map_err(StoreError::Rejected)?;
-        let (number, range) = row
-            .job
-            .renovate_pr()
-            .map(|pr| {
-                (
-                    pr.number,
-                    pr.verdict
-                        .as_ref()
-                        .and_then(|v| Some((v.from.clone()?, v.to.clone()?))),
-                )
+        let number = row.job.renovate_pr().map(|pr| pr.number).ok_or_else(|| {
+            StoreError::Rejected(Rejected::Unexpected {
+                stage: row.job.stage().clone(),
+                event: Event::GapsProposed { jobs: Vec::new() },
             })
-            .ok_or_else(|| {
-                StoreError::Rejected(Rejected::Unexpected {
-                    stage: row.job.stage().clone(),
-                    event: Event::GapsProposed { jobs: Vec::new() },
-                })
-            })?;
+        })?;
         let mut jobs = Vec::new();
         for gap in gaps {
-            let text = gap.request(
-                number,
-                range.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
-            );
+            let text = gap.request(number, range.map(|(a, b)| (a.as_str(), b.as_str())));
             let new = Job::proposal(&text, gates, renovate_id, number);
             jobs.push(Self::insert_job(&tx, &project, FACTORY_REQUESTER, &new)?);
         }

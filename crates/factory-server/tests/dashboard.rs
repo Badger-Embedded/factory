@@ -10882,7 +10882,7 @@ fn analysed(dashboard: &Dashboard, id: i64, gaps: &[factory_core::Gap]) -> Vec<i
         })),
     );
     dashboard.apply(id, Event::Agent(AgentResult::Gaps(gaps.to_vec())));
-    let row = dashboard.store.propose_gaps(id, gaps).unwrap();
+    let row = dashboard.store.propose_gaps(id, gaps, None).unwrap();
     row.job.renovate_pr().unwrap().gaps.clone().unwrap()
 }
 
@@ -10921,4 +10921,35 @@ async fn a_renovate_job_page_links_its_gap_jobs() {
     for job in jobs {
         assert!(page.contains(&format!("href=\"/jobs/{job}\"")));
     }
+}
+
+#[tokio::test]
+async fn a_reused_gap_job_id_is_not_linked_from_an_older_result() {
+    let dashboard = dashboard();
+    let id = dashboard
+        .store
+        .create_renovate_job("maestro", 7, "Update app", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    let gap = factory_core::Gap {
+        title: "Add the flag".into(),
+        description: "d".into(),
+        evidence: "e".into(),
+        current: "c".into(),
+        suggestion: "s".into(),
+    };
+    let jobs = analysed(&dashboard, id, &[gap]);
+    dashboard
+        .store
+        .delete_job(jobs[0], Path::new("/nonexistent"))
+        .unwrap();
+    let reused = dashboard
+        .store
+        .create_gap_job("maestro", id + 100, 9, "Another gap")
+        .unwrap();
+    assert_eq!(reused, jobs[0], "SQLite reuses the highest id");
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(!page.contains(&format!("href=\"/jobs/{reused}\"")));
+    assert!(page.contains("no longer available"));
 }

@@ -267,8 +267,10 @@ pub struct PackagingRequest {
     pub number: u64,
     pub manifest_files: Vec<String>,
     pub build_config_files: Vec<String>,
-    /// The upstream refs the update moved between, when the diff check found
-    /// them.
+    /// The head commit the diff check's refs belong to. The executor uses the
+    /// refs only for a merge of this head.
+    pub verdict_head: Option<String>,
+    /// The upstream refs the diff check found.
     pub from: Option<String>,
     pub to: Option<String>,
 }
@@ -630,7 +632,9 @@ impl<E: Executor> Scheduler<E> {
                 {
                     self.renovate_command(&row, &job, &project, &settings, renovate)?;
                 }
-                Command::ProposeGaps { gaps } => self.propose_gaps(row.id, &gaps),
+                Command::ProposeGaps { gaps, range } => {
+                    self.propose_gaps(row.id, &gaps, range.as_ref());
+                }
                 _ => {}
             }
         }
@@ -716,8 +720,6 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    /// Starts reading what the packaging analysis of a merged pull request
-    /// needs.
     fn start_gathering(
         self: &Arc<Self>,
         row: &JobRow,
@@ -745,6 +747,7 @@ impl<E: Executor> Scheduler<E> {
             number,
             manifest_files: packaging.manifest_files,
             build_config_files: packaging.build_config_files,
+            verdict_head: job.renovate_pr().and_then(|pr| pr.head.clone()),
             from: verdict.and_then(|verdict| verdict.from.clone()),
             to: verdict.and_then(|verdict| verdict.to.clone()),
         };
@@ -768,7 +771,6 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    /// The manifest files of `project` when it is a packaging project.
     fn manifest_files(&self, project: &str) -> Result<Option<Vec<String>>, StoreError> {
         Ok(self
             .store
@@ -798,8 +800,8 @@ impl<E: Executor> Scheduler<E> {
 
     /// Creates a job for each gap and records them on the Renovate job in one
     /// store transaction, so a retry after a crash never creates them twice.
-    fn propose_gaps(&self, job_id: i64, gaps: &[Gap]) {
-        match self.store.propose_gaps(job_id, gaps) {
+    fn propose_gaps(&self, job_id: i64, gaps: &[Gap], range: Option<&(String, String)>) {
+        match self.store.propose_gaps(job_id, gaps, range) {
             Ok(row) => {
                 let found = row
                     .job

@@ -165,7 +165,6 @@ fn diff_prompt(diff: &str, body: &str, agent: Agent) -> String {
     text
 }
 
-/// The rules for what counts as a packaging gap, by packaging type.
 fn gap_rules(kind: &str) -> &'static str {
     match kind {
         "snap" => {

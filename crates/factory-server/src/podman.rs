@@ -514,13 +514,10 @@ impl Executor for PodmanExecutor {
                 manifest_changed: false,
             });
         };
-        let details = self.github.pr_details(repo, number).await?;
+        let info = self.github.pr_info(repo, number).await?;
         Ok(Event::RenovateMerged {
             packaging: true,
-            manifest_changed: details
-                .files
-                .iter()
-                .any(|file| manifest_files.contains(file)),
+            manifest_changed: info.files.iter().any(|file| manifest_files.contains(file)),
         })
     }
 
@@ -543,8 +540,12 @@ impl Executor for PodmanExecutor {
                 text,
             });
         }
+        let recorded = (request.verdict_head.as_deref() == Some(details.head.as_str()))
+            .then(|| request.from.clone().zip(request.to.clone()))
+            .flatten();
+        let range = recorded.or_else(|| compare_range(&details.body, &request.upstream));
         let mut upstream = Vec::new();
-        if let (Some(from), Some(to)) = (&request.from, &request.to) {
+        if let Some((from, to)) = &range {
             for path in &request.build_config_files {
                 let text = self
                     .github
@@ -563,8 +564,8 @@ impl Executor for PodmanExecutor {
             pr_body: details.body,
             pr_diff: details.diff,
             manifests,
-            from: request.from,
-            to: request.to,
+            from: range.as_ref().map(|(from, _)| from.clone()),
+            to: range.map(|(_, to)| to),
             upstream,
             existing: Vec::new(),
         })
@@ -576,4 +577,18 @@ impl Executor for PodmanExecutor {
             tracing::warn!("removing {name}: {err}");
         }
     }
+}
+
+/// The refs of the first `github.com/{upstream}/compare/{from}...{to}` link in
+/// a Renovate description, which is how Renovate names the upstream range of
+/// an update.
+fn compare_range(body: &str, upstream: &str) -> Option<(String, String)> {
+    let marker = format!("github.com/{}/compare/", upstream.to_ascii_lowercase());
+    let start = body.to_ascii_lowercase().find(&marker)? + marker.len();
+    let link: String = body[start..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ')' | ']' | '>' | '"' | '\''))
+        .collect();
+    let (from, to) = link.split_once("...")?;
+    (!from.is_empty() && !to.is_empty()).then(|| (from.to_owned(), to.to_owned()))
 }

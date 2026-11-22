@@ -889,6 +889,7 @@ struct JobData {
     models: StageModels,
     efforts: StageEfforts,
     auto_merge: bool,
+    gap_links: Vec<i64>,
 }
 
 fn keep_session_settings(
@@ -949,6 +950,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
     let auto_merge = state
         .store
         .project_auto_merge(&row.project, default_auto_merge)?;
+    let gap_links = gap_links(&state.store, &row)?;
     Ok(JobData {
         row,
         project,
@@ -959,7 +961,25 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         models,
         efforts,
         auto_merge,
+        gap_links,
     })
+}
+
+/// The gap jobs a Renovate job lists that still exist and still name it as
+/// their source.
+fn gap_links(store: &Store, row: &JobRow) -> Result<Vec<i64>, StoreError> {
+    let Some(pr) = row.job.renovate_pr() else {
+        return Ok(Vec::new());
+    };
+    let mut links = Vec::new();
+    for &gap in pr.gaps.iter().flatten() {
+        match store.get(gap) {
+            Ok(found) if found.job.gap_source() == Some((row.id, pr.number)) => links.push(gap),
+            Ok(_) | Err(StoreError::NotFound(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(links)
 }
 
 async fn show_job(
@@ -984,6 +1004,7 @@ async fn show_job(
         &data.models,
         &data.efforts,
         data.auto_merge,
+        &data.gap_links,
     ))
 }
 
@@ -1007,6 +1028,7 @@ async fn job_fragment(
         &data.models,
         &data.efforts,
         data.auto_merge,
+        &data.gap_links,
     ))
 }
 
