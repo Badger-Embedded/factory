@@ -119,9 +119,7 @@ test('a job created after page load appears and keeps the typed request', async 
   await expect(request).toHaveValue('A half-typed request');
 });
 
-// Skipped until the details-state.js fix lands: the board swaps with outerHTML and the
-// script reopens the section on the replaced element. Change test.fixme to test then.
-test.fixme('an opened Show older disclosure stays open across a poll', async ({ page, factory, project }) => {
+test('an opened Show older disclosure stays open across a poll', async ({ page, factory, project }) => {
   for (let number = 1; number <= 6; number++) {
     factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', `Old change ${number}`);
   }
@@ -136,7 +134,7 @@ test.fixme('an opened Show older disclosure stays open across a poll', async ({ 
   await expect(older).toHaveJSProperty('open', true);
 });
 
-test.fixme('a closed Show older disclosure stays closed when another region swaps', async ({ page, factory, project }) => {
+test('a closed Show older disclosure stays closed when another region swaps', async ({ page, factory, project }) => {
   for (let number = 1; number <= 6; number++) {
     factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', `Old change ${number}`);
   }
