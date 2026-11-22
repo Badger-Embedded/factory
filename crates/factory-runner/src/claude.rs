@@ -48,6 +48,7 @@ impl AgentBackend for ClaudeAgent {
         PromptStyle {
             rules_doc: Agent::Claude.rules_doc(),
             review_method: REVIEW_METHOD,
+            schema_in_prompt: None,
         }
     }
 

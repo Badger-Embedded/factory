@@ -284,6 +284,9 @@ pub async fn run(
             run.agent.id()
         ));
     }
+    for line in backend.start_log() {
+        log(line);
+    }
     let mut command = Command::new(&config.podman);
     command.args(podman_args(config, run));
     // An environment credential reaches the container through podman's own

@@ -9,6 +9,7 @@ mod agent;
 mod checks;
 mod claude;
 mod codex;
+mod copilot;
 mod files;
 mod git;
 mod github;

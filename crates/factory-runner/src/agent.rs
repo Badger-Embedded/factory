@@ -16,6 +16,7 @@ use factory_core::{Agent, Event, PlanUsage};
 
 use crate::claude::ClaudeAgent;
 use crate::codex::CodexAgent;
+use crate::copilot::CopilotAgent;
 use crate::outcome::Expect;
 use crate::stream::LogLine;
 use crate::worker::{McpUnavailable, SessionRun, WorkerConfig, WorkerRun};
@@ -52,6 +53,12 @@ pub struct PromptStyle {
     /// factory's review skill through `--plugin-dir`, so its wording names the
     /// skill; Codex has no such flag, so its wording names the skill's path.
     pub review_method: &'static str,
+    /// The instruction a prompt carries when the harness has no output-schema
+    /// flag, so the agent must end with the JSON itself. [`prompt`](crate::prompt)
+    /// writes this sentence, then the stage's schema, after the outcome
+    /// paragraph. Claude and Codex pass the schema to their CLI, so they set
+    /// `None` and the prompt carries no schema.
+    pub schema_in_prompt: Option<&'static str>,
 }
 
 /// What everything agent-specific hides behind, so the worker names no one
@@ -107,6 +114,13 @@ pub trait AgentBackend: Sync {
     /// The command and its arguments after the image: the whole agent
     /// invocation the worker runs.
     fn command(&self, config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString>;
+
+    /// Log lines the worker writes once, before it reads any output, so a run
+    /// that ends with no output still carries them. Copilot notes here that its
+    /// runs are not counted in the job cost. The default is none.
+    fn start_log(&self) -> Vec<LogLine> {
+        Vec::new()
+    }
 
     /// Parses one stdout line into the generic items the worker consumes. The
     /// run's [`Expect`] decides what the final result means.
@@ -175,15 +189,14 @@ pub struct RunResult {
     pub cost_usd: Option<f64>,
 }
 
-/// The backend for `agent`. Claude and Codex have one: [`ClaudeAgent`] and
-/// [`CodexAgent`]. It returns [`Option`] so an agent registered before its
-/// backend lands can report `None`. Copilot is such an agent today: its backend
-/// lands in a later change, so it reports `None`.
+/// The backend for `agent`: [`ClaudeAgent`], [`CodexAgent`] or
+/// [`CopilotAgent`]. It returns [`Option`] so an agent registered before its
+/// backend lands can report `None`; every agent has one today.
 #[must_use]
 pub fn backend(agent: Agent) -> Option<&'static dyn AgentBackend> {
     match agent {
         Agent::Claude => Some(&ClaudeAgent),
         Agent::Codex => Some(&CodexAgent),
-        Agent::Copilot => None,
+        Agent::Copilot => Some(&CopilotAgent),
     }
 }

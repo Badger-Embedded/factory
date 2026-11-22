@@ -1,7 +1,7 @@
 //! Tests for the agent registry: the Claude and Codex entries each carry their
 //! credential, worker image, config directory, settings page and stage-panel
-//! suggestions. The Copilot entry is available but has no backend or login
-//! wired, so its run gates on the credential.
+//! suggestions. The Copilot entry is available and has a worker backend, but no
+//! login or settings page is wired yet, so its run gates on the credential.
 
 use std::sync::Arc;
 
@@ -51,7 +51,8 @@ fn the_copilot_entry_is_available_and_gates_on_its_credential() {
     assert_eq!(copilot.default_effort(), "medium");
 
     assert_eq!(copilot.settings_url(), None);
-    assert_eq!(copilot.host_config_dir(), None);
+    // The backend now exists, so the registry derives its config directory.
+    assert_eq!(copilot.host_config_dir(), Some("copilot"));
     assert_eq!(copilot.model_suggestions(), [] as [&str; 0]);
     let settings = Settings {
         worker_image: "localhost/factory-worker:latest".into(),

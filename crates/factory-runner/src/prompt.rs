@@ -107,7 +107,20 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
          done. Use outcome \"{questions}\" only when you need an answer from the requester to \
          continue, and list the questions."
     );
+    append_schema(&mut text, agent, expect);
     text
+}
+
+/// Appends the stage's JSON schema to the prompt when the agent's backend has
+/// no output-schema flag and asks for it in the prompt. The backend owns the
+/// wording, so this names no harness. A backend that passes the schema to its
+/// CLI leaves it empty and nothing is appended.
+fn append_schema(text: &mut String, agent: Agent, expect: Expect) {
+    if let Some(instruction) = style(agent).schema_in_prompt {
+        let schema = serde_json::to_string_pretty(&expect.schema())
+            .unwrap_or_else(|_| expect.schema().to_string());
+        let _ = write!(text, "\n\n{instruction}\n\n{schema}");
+    }
 }
 
 /// What a review pass reads besides the diff.
@@ -198,6 +211,7 @@ fn review_prompt(context: &ReviewContext, agent: Agent) -> String {
         "End with outcome \"approve\" when the change is ready to merge, or \"changes\" with \
          feedback the author can act on when it is not.",
     );
+    append_schema(&mut text, agent, Expect::Review);
     text
 }
 

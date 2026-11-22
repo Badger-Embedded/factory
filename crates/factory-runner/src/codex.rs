@@ -71,6 +71,7 @@ impl AgentBackend for CodexAgent {
         PromptStyle {
             rules_doc: Agent::Codex.rules_doc(),
             review_method: REVIEW_METHOD,
+            schema_in_prompt: None,
         }
     }
 
