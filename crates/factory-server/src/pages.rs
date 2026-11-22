@@ -177,7 +177,7 @@ pub fn index(
         &html! {
             @if let Some(selected) = selected {
                 div.status-row {
-                    (self::workers(workers, jobs, selected))
+                    (self::workers(workers, jobs, project_names, selected))
                     (plan_usage_region(plan_usage))
                 }
                 (composer(selected))
@@ -206,9 +206,12 @@ pub struct Workers {
 
 /// One tile per worker slot. A busy tile names the job, its stage and how
 /// long it has held the slot. Slots are account-wide, so a job of another
-/// project shows that project's name. A job waiting for you holds no slot,
-/// so a full row of busy tiles is why a new job has not started.
-pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Region {
+/// project shows that project's name. A job in a project the viewer does not
+/// collaborate on, named in `visible`, shows a plain busy tile with only the
+/// time, so the count stays right without leaking the job's id, project,
+/// stage or request. A job waiting for you holds no slot, so a full row of
+/// busy tiles is why a new job has not started.
+pub fn workers(workers: &Workers, jobs: &[JobRow], visible: &[String], project: &str) -> Region {
     let count = workers.limit.max(
         workers
             .busy
@@ -222,7 +225,9 @@ pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Region {
         ul.worker-slots {
                 @for number in 1..=count {
                     @let slot = workers.busy.iter().find(|slot| slot.number == number);
-                    @let row = slot.and_then(|slot| jobs.iter().find(|row| row.id == slot.job_id));
+                    @let row = slot
+                        .and_then(|slot| jobs.iter().find(|row| row.id == slot.job_id))
+                        .filter(|row| visible.iter().any(|name| name == &row.project));
                     @match (slot, row) {
                         (Some(slot), Some(row)) => {
                             li.worker.busy {
@@ -238,7 +243,7 @@ pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Region {
                         (Some(slot), None) => {
                             li.worker.busy {
                                 span.worker-name { "Worker " (number) }
-                                span.worker-job { "#" (slot.job_id) }
+                                span.worker-job { "busy" }
                                 span.worker-time { (held_for(workers.now - slot.since)) }
                             }
                         }

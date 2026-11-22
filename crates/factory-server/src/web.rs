@@ -343,8 +343,6 @@ fn load_board(
     login: &str,
     project: Option<String>,
 ) -> Result<BoardData, AppError> {
-    // Only the login's own projects: the picker lists them and a project the
-    // login does not collaborate on reads as unknown, so its board 404s.
     let names = state.store.projects_for(login)?;
     let selected = match project {
         Some(name) if !names.iter().any(|known| known == &name) => {
@@ -408,9 +406,13 @@ async fn plan_usage_fragment(
     headers: HeaderMap,
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
-    // The tile is factory-wide, but it belongs on a board, so a login with no
-    // project of its own sees none and polls for none.
-    if state.store.projects_for(&user(&headers))?.is_empty() {
+    let names = state.store.projects_for(&user(&headers))?;
+    if let Some(project) = &query.project
+        && !names.iter().any(|known| known == project)
+    {
+        return Err(AppError::UnknownProject(project.clone()));
+    }
+    if names.is_empty() {
         return Ok(html! {}.into_response());
     }
     let region = pages::plan_usage(usage_tile(&state).as_ref());
@@ -456,7 +458,7 @@ async fn workers_fragment(
     };
     Ok(region_response(
         version.as_deref(),
-        pages::workers(&data.workers, &data.jobs, project),
+        pages::workers(&data.workers, &data.jobs, &data.names, project),
     ))
 }
 
@@ -639,13 +641,7 @@ async fn create_job(
         }
     }
     let project = project.unwrap_or_default();
-    // A project the login does not collaborate on reads as unknown, so posting
-    // to it is refused exactly as posting to one that is not there.
-    let known = state.projects.lookup(&project)?.is_some()
-        && state.store.is_collaborator(&project, &user(&headers))?;
-    if !known {
-        return Err(AppError::BadRequest(format!("unknown project {project:?}")));
-    }
+    visible_project(&state, &headers, &project)?;
     let request = request.unwrap_or_default();
     let request = request.trim();
     if request.is_empty() {
@@ -1343,8 +1339,8 @@ fn mcp_server_page_with(
         return Err(AppError::NotFound(format!("no MCP server named {name:?}")));
     };
     let usage = state
-        .projects
-        .names()?
+        .store
+        .projects_for(&user(headers))?
         .into_iter()
         .map(|project| {
             let settings = server_settings(state, &project, server.clone())?;
@@ -1859,10 +1855,15 @@ async fn edit_mcp_server(
     // An edit that deletes stored values waits for the operator to confirm it.
     let deletes = state.store.mcp_edit_deletes(&name, url, &form.headers)?;
     if !deletes.is_empty() && !form.confirm {
+        let visible = state.store.projects_for(&user(&headers))?;
+        let shown = deletes
+            .into_iter()
+            .filter(|(project, _)| visible.iter().any(|name| name == project))
+            .collect();
         let pending = pages::PendingEdit {
             url: url.to_owned(),
             headers: form.headers,
-            deletes,
+            deletes: shown,
         };
         return mcp_server_page_with(&state, &headers, &name, None, Some(&pending), None);
     }
