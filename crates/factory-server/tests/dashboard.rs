@@ -8401,7 +8401,73 @@ async fn settings_opens_the_first_own_project_or_onboarding_without_one() {
     let empty = dashboard_with(Arc::new(Store::open_in_memory().unwrap()));
     let reply = empty.get("/settings").await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(reply.location.as_deref(), Some("/onboard"));
+    assert_eq!(reply.location.as_deref(), Some("/settings/notifications"));
+}
+
+#[tokio::test]
+async fn a_login_with_no_user_settings_row_has_notifications_on() {
+    let store = Store::open_in_memory().unwrap();
+    assert!(store.notifications_enabled("nobody@example.com").unwrap());
+    store.set_notifications("a@x", false).unwrap();
+    assert!(!store.notifications_enabled("a@x").unwrap());
+    assert!(store.notifications_enabled("b@y").unwrap());
+    store.set_notifications("a@x", true).unwrap();
+    assert!(store.notifications_enabled("a@x").unwrap());
+}
+
+#[tokio::test]
+async fn the_notifications_page_saves_the_setting_for_the_current_login_only() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    let uri = "/settings/notifications";
+    let page = dashboard.get_as("bob@example.com", uri).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Browser notifications for my jobs"));
+    assert!(page.body.contains("name=\"notifications\""));
+    assert!(page.body.contains("checked"));
+
+    // An unticked checkbox posts nothing.
+    let saved = dashboard.post_as("bob@example.com", uri, "").await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert!(saved.body.contains("Saved."));
+    assert!(
+        !dashboard
+            .store
+            .notifications_enabled("bob@example.com")
+            .unwrap()
+    );
+    assert!(dashboard.store.notifications_enabled(USER).unwrap());
+    let page = dashboard.get_as("bob@example.com", uri).await;
+    assert!(!page.body.contains("checked"));
+
+    dashboard
+        .post_as("bob@example.com", uri, "notifications=on")
+        .await;
+    assert!(
+        dashboard
+            .store
+            .notifications_enabled("bob@example.com")
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn the_notifications_page_opens_for_a_non_admin_with_only_the_you_and_projects_groups() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    let body = dashboard
+        .get_as("nobody@example.com", "/settings/notifications")
+        .await
+        .body;
+    assert!(body.contains(">You<"));
+    assert!(body.contains("aria-current=\"page\""));
+    assert!(body.contains("id=\"notification-permission\""));
+    for hidden in [
+        "Integrations",
+        "Default gates",
+        ">Agents<",
+        "/settings/workers",
+    ] {
+        assert!(!body.contains(hidden), "{hidden}");
+    }
 }
 
 #[tokio::test]
@@ -9271,7 +9337,7 @@ async fn the_removal_notice_shows_on_the_page_settings_lands_on() {
         .get_as(STRANGER, "/settings?notice=Removed%20project%20gone.")
         .await;
     let landing = page.location.unwrap();
-    assert!(landing.starts_with("/onboard?notice="));
+    assert!(landing.starts_with("/settings/notifications?notice="));
     let page = dashboard.get_as(STRANGER, &landing).await;
     assert!(page.body.contains("Removed project gone."));
 }
