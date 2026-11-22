@@ -1,4 +1,5 @@
-//! The "Sign in with `ChatGPT`" flow on the Codex settings page.
+//! The device-login flow on an agent's settings page, such as "Sign in with
+//! `ChatGPT`" for Codex. A [`LoginSpec`] holds what differs per agent.
 //!
 //! A `ChatGPT` Plus or Pro subscription has no pasteable access token, so the
 //! only way into the factory is the `auth.json` a `codex login` writes. This
@@ -30,19 +31,69 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::secrets::{SecretStore, validate_codex_auth};
+use crate::secrets::{SecretError, SecretStore, validate_codex_auth};
 
-/// The container the login runs in. One at a time, so the name is fixed and
-/// Cancel can remove it.
-const CONTAINER_NAME: &str = "factory-codex-login";
+/// What one agent's device login needs: the container it runs, the command, the
+/// config directory it writes the credential into, and how the factory reads
+/// that credential back, checks it and stores it. [`DeviceLogin`] and
+/// [`PodmanLogin`] hold no agent-specific values of their own; an agent adds a
+/// spec like [`LoginSpec::CODEX`].
+#[derive(Clone, Copy)]
+pub struct LoginSpec {
+    /// The container the login runs in. One login runs at a time, so the name
+    /// is fixed and Cancel can remove it.
+    pub container_name: &'static str,
+    /// The prefix of the fresh directory made under the scratch directory for
+    /// each login.
+    pub scratch_prefix: &'static str,
+    /// The command run in the worker image.
+    pub command: &'static [&'static str],
+    /// The environment variable that points the agent at its config directory.
+    pub home_env: &'static str,
+    /// Where the config directory is mounted inside the container.
+    pub home_mount: &'static str,
+    /// Writes the config files the login needs into the fresh config directory.
+    pub prepare: fn(home: &Path) -> std::io::Result<()>,
+    /// Reads the credential the container wrote into the config directory, or
+    /// `None` when there is none.
+    pub read_back: fn(home: &Path) -> Option<String>,
+    /// Whether the credential read back is one the factory accepts.
+    pub validate: fn(credential: &str) -> bool,
+    /// Stores an accepted credential in the secret store.
+    pub store: fn(secrets: &dyn SecretStore, credential: &str) -> Result<(), SecretError>,
+    /// The reason shown when the operator does not finish within the timeout.
+    pub timeout_reason: &'static str,
+}
 
-/// `CODEX_HOME` inside the login container, mounted from a fresh host directory.
-const CODEX_HOME: &str = "/codex";
+impl LoginSpec {
+    /// `codex login --device-auth`, which writes `auth.json`.
+    pub const CODEX: LoginSpec = LoginSpec {
+        container_name: "factory-codex-login",
+        scratch_prefix: "codex-login-",
+        command: &["codex", "login", "--device-auth"],
+        home_env: "CODEX_HOME",
+        home_mount: "/codex",
+        prepare: codex_prepare,
+        read_back: codex_read_back,
+        validate: |auth| validate_codex_auth(auth).is_ok(),
+        store: |secrets, auth| secrets.set_codex_auth(auth),
+        timeout_reason: "It was not finished within fifteen minutes. Start it again, or \
+                         paste a login below.",
+    };
+}
 
-/// The `config.toml` written into the login's `CODEX_HOME`, so Codex keeps the
-/// credentials in `auth.json` rather than an OS keyring the container has no
-/// access to.
-const CONFIG_TOML: &str = "cli_auth_credentials_store = \"file\"\n";
+/// Writes the `config.toml` that makes Codex keep its credentials in
+/// `auth.json` rather than an OS keyring the container has no access to.
+fn codex_prepare(home: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        home.join("config.toml"),
+        "cli_auth_credentials_store = \"file\"\n",
+    )
+}
+
+fn codex_read_back(home: &Path) -> Option<String> {
+    std::fs::read_to_string(home.join("auth.json")).ok()
+}
 
 /// The login ends in failure when the operator does not finish it within this.
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(15);
@@ -54,14 +105,14 @@ const RECENT_LINES: usize = 6;
 /// return.
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Starts the `codex login --device-auth` container and gives a handle to its
-/// output and lifetime. The podman implementation runs the real container; a
+/// Starts the login container and gives a handle to its output and lifetime. The podman implementation runs the real container; a
 /// test supplies a fake that prints a URL and a code and then writes
 /// `auth.json`, so the flow is exercised with no container.
 pub trait LoginSpawner: Send + Sync {
-    /// Starts the login named `name` from `image`, with `CODEX_HOME` mounted
-    /// from `codex_home` on the host, which already holds a `config.toml`. The
-    /// container writes `auth.json` into `codex_home` on success.
+    /// Starts the login named `name` from `image`, with the agent's config
+    /// directory mounted from `codex_home` on the host, which already holds the
+    /// files [`LoginSpec::prepare`] wrote. The container writes the credential
+    /// into it on success.
     fn spawn(
         &self,
         name: String,
@@ -119,9 +170,10 @@ struct State {
 /// The one device login a factory runs at a time. Shared by the settings
 /// handlers.
 pub struct DeviceLogin {
+    spec: LoginSpec,
     secrets: Arc<dyn SecretStore>,
     spawner: Arc<dyn LoginSpawner>,
-    /// The directory each login's `CODEX_HOME` is made in. The factory hands
+    /// The directory each login's config directory is made in. The factory hands
     /// this path to podman, so it must have the same path on the host as in the
     /// factory container, as the data directory does; the container's `/tmp`
     /// does not exist on the host.
@@ -133,7 +185,7 @@ pub struct DeviceLogin {
 impl DeviceLogin {
     /// Builds the coordinator from the secret store the login is saved to, the
     /// spawner that runs the container, and the directory each login's
-    /// `CODEX_HOME` is made in.
+    /// config directory is made in.
     #[must_use]
     pub fn new(
         secrets: Arc<dyn SecretStore>,
@@ -141,6 +193,18 @@ impl DeviceLogin {
         scratch: PathBuf,
     ) -> Self {
         Self::with_timeout(secrets, spawner, scratch, LOGIN_TIMEOUT)
+    }
+
+    /// Builds the coordinator for the agent `spec` describes, with the standard
+    /// timeout.
+    #[must_use]
+    pub fn for_spec(
+        spec: LoginSpec,
+        secrets: Arc<dyn SecretStore>,
+        spawner: Arc<dyn LoginSpawner>,
+        scratch: PathBuf,
+    ) -> Self {
+        Self::for_spec_with_timeout(spec, secrets, spawner, scratch, LOGIN_TIMEOUT)
     }
 
     /// As [`DeviceLogin::new`], with the timeout given, so a test can end a
@@ -152,7 +216,20 @@ impl DeviceLogin {
         scratch: PathBuf,
         timeout: Duration,
     ) -> Self {
+        Self::for_spec_with_timeout(LoginSpec::CODEX, secrets, spawner, scratch, timeout)
+    }
+
+    /// As [`DeviceLogin::for_spec`], with the timeout given.
+    #[must_use]
+    pub fn for_spec_with_timeout(
+        spec: LoginSpec,
+        secrets: Arc<dyn SecretStore>,
+        spawner: Arc<dyn LoginSpawner>,
+        scratch: PathBuf,
+        timeout: Duration,
+    ) -> Self {
         DeviceLogin {
+            spec,
             secrets,
             spawner,
             scratch,
@@ -171,8 +248,8 @@ impl DeviceLogin {
 
     /// Starts a login in a container from `image`, unless one is already
     /// running, in which case the running one is left alone. A fresh directory
-    /// under the scratch directory becomes the container's `CODEX_HOME`; the
-    /// container writes `auth.json` there, and the run task reads it back and
+    /// under the scratch directory becomes the container's config directory; the
+    /// container writes the credential there, and the run task reads it back and
     /// deletes the directory when it ends.
     pub async fn start(&self, image: String) {
         let mut state = self.state.lock().await;
@@ -181,7 +258,7 @@ impl DeviceLogin {
         }
         let dir = std::fs::create_dir_all(&self.scratch).and_then(|()| {
             tempfile::Builder::new()
-                .prefix("codex-login-")
+                .prefix(self.spec.scratch_prefix)
                 .tempdir_in(&self.scratch)
         });
         let dir = match dir {
@@ -193,7 +270,7 @@ impl DeviceLogin {
                 return;
             }
         };
-        if let Err(err) = std::fs::write(dir.path().join("config.toml"), CONFIG_TOML) {
+        if let Err(err) = (self.spec.prepare)(dir.path()) {
             state.view = LoginView::Failed {
                 reason: format!("Could not write the login config: {err}"),
             };
@@ -205,6 +282,7 @@ impl DeviceLogin {
         drop(state);
 
         let task = RunTask {
+            spec: self.spec,
             secrets: Arc::clone(&self.secrets),
             spawner: Arc::clone(&self.spawner),
             state: Arc::clone(&self.state),
@@ -226,6 +304,7 @@ impl DeviceLogin {
 
 /// One run of the login flow, spawned as a task by [`DeviceLogin::start`].
 struct RunTask {
+    spec: LoginSpec,
     secrets: Arc<dyn SecretStore>,
     spawner: Arc<dyn LoginSpawner>,
     state: Arc<Mutex<State>>,
@@ -234,14 +313,14 @@ struct RunTask {
 
 impl RunTask {
     /// Runs the container to the end, publishing the URL and code as they
-    /// arrive, then stores the `auth.json` Codex wrote or reports why it could
+    /// arrive, then stores the credential the container wrote or reports why it could
     /// not. The container is removed on a cancel or the timeout. `dir` holds the
-    /// container's `CODEX_HOME` and is deleted when this returns.
+    /// container's config directory and is deleted when this returns.
     async fn run(self, image: String, dir: tempfile::TempDir, cancel: oneshot::Receiver<()>) {
         let home = dir.path().to_owned();
         let mut process = match self
             .spawner
-            .spawn(CONTAINER_NAME.to_owned(), image, home.clone())
+            .spawn(self.spec.container_name.to_owned(), image, home.clone())
             .await
         {
             Ok(process) => process,
@@ -283,12 +362,7 @@ impl RunTask {
                 }
                 () = &mut timeout => {
                     process.kill().await;
-                    self.fail(
-                        "It was not finished within fifteen minutes. Start it again, or \
-                         paste a login below."
-                            .to_owned(),
-                    )
-                    .await;
+                    self.fail(self.spec.timeout_reason.to_owned()).await;
                     return;
                 }
             }
@@ -303,9 +377,9 @@ impl RunTask {
     /// code was non-zero, so a login that succeeded but exited oddly is kept;
     /// an invalid or missing file is a failure with the container's last output.
     async fn finish(&self, succeeded: bool, home: &Path, recent: &VecDeque<String>) {
-        match std::fs::read_to_string(home.join("auth.json")) {
-            Ok(auth) if validate_codex_auth(&auth).is_ok() => {
-                if let Err(err) = self.secrets.set_codex_auth(&auth) {
+        match (self.spec.read_back)(home) {
+            Some(credential) if (self.spec.validate)(&credential) => {
+                if let Err(err) = (self.spec.store)(self.secrets.as_ref(), &credential) {
                     self.fail(format!("The login could not be saved: {err}"))
                         .await;
                 } else {
@@ -462,6 +536,7 @@ fn looks_secret(token: &str) -> bool {
 
 /// Runs the login in a real podman container from the worker image.
 pub struct PodmanLogin {
+    spec: LoginSpec,
     /// The podman binary and the network the container joins to reach `ChatGPT`.
     /// The image comes from the Workers setting on each login.
     config: WorkerConfig,
@@ -473,7 +548,13 @@ impl PodmanLogin {
     /// agents or worker volumes.
     #[must_use]
     pub fn new(config: WorkerConfig) -> Self {
-        PodmanLogin { config }
+        Self::for_spec(LoginSpec::CODEX, config)
+    }
+
+    /// As [`PodmanLogin::new`], for the agent `spec` describes.
+    #[must_use]
+    pub fn for_spec(spec: LoginSpec, config: WorkerConfig) -> Self {
+        PodmanLogin { spec, config }
     }
 }
 
@@ -482,7 +563,7 @@ impl LoginSpawner for PodmanLogin {
         &self,
         name: String,
         image: String,
-        codex_home: PathBuf,
+        home: PathBuf,
     ) -> BoxFuture<'_, std::io::Result<Box<dyn LoginProcess>>> {
         Box::pin(async move {
             // Remove a container left by a login that outlived a crash, so the
@@ -496,20 +577,18 @@ impl LoginSpawner for PodmanLogin {
                 "--name".into(),
                 name.clone().into(),
                 "--env".into(),
-                format!("CODEX_HOME={CODEX_HOME}").into(),
+                format!("{}={}", self.spec.home_env, self.spec.home_mount).into(),
             ];
             if let Some(network) = &self.config.network {
                 args.push("--network".into());
                 args.push(network.into());
             }
-            let mut mount = OsString::from(codex_home.as_os_str());
-            mount.push(format!(":{CODEX_HOME}"));
+            let mut mount = OsString::from(home.as_os_str());
+            mount.push(format!(":{}", self.spec.home_mount));
             args.push("--volume".into());
             args.push(mount);
             args.push(image.into());
-            args.push("codex".into());
-            args.push("login".into());
-            args.push("--device-auth".into());
+            args.extend(self.spec.command.iter().map(OsString::from));
 
             let mut child = Command::new(&self.config.podman)
                 .args(&args)
@@ -569,7 +648,7 @@ impl LoginProcess for PodmanProcess {
     fn kill(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             if let Err(err) = remove_container(&self.config, &self.name).await {
-                tracing::warn!("removing the Codex login container: {err}");
+                tracing::warn!("removing the login container {}: {err}", self.name);
             }
             let _ = self.child.start_kill();
         })
