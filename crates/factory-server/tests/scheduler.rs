@@ -577,6 +577,24 @@ async fn cancelling_a_job_stops_its_run() {
 }
 
 #[tokio::test]
+async fn removing_a_project_stops_the_running_job() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+
+    store.remove_project("maestro").unwrap();
+    scheduler.tick().await.unwrap();
+
+    assert_eq!(scheduler.running(), Vec::<i64>::new());
+    assert_eq!(*executor.stopped.lock().unwrap(), [id]);
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Cancelled);
+    scheduler.tick().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_failed_run_fails_the_job() {
     let (store, executor, scheduler) = setup(|_| Event::AgentFailed {
         reason: "the worker exited (exit status: 125) without a result".into(),

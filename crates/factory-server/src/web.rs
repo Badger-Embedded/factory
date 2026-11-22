@@ -135,6 +135,7 @@ pub fn app(
             "/settings/projects/{project}/collaborators/remove",
             post(remove_project_collaborator),
         )
+        .route("/settings/projects/{project}/remove", post(remove_project))
         .route("/settings/agents/claude/token", post(save_claude_token))
         .route(
             "/settings/agents/claude/token/clear",
@@ -1181,12 +1182,25 @@ async fn request_changes(
 async fn settings_home(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<NoticeQuery>,
 ) -> Result<Redirect, AppError> {
     let names = state.store.projects_for(&user(&headers))?;
+    let tail = match &query.notice {
+        Some(notice) => format!("?notice={}", query_escape(notice)),
+        None => String::new(),
+    };
     Ok(match names.first() {
-        Some(name) => Redirect::to(&format!("/settings/projects/{}", query_escape(name))),
-        None => Redirect::to("/onboard"),
+        Some(name) => Redirect::to(&format!("/settings/projects/{}{tail}", query_escape(name))),
+        None => Redirect::to(&format!("/onboard{tail}")),
     })
+}
+
+/// A notice carried across a redirect in the query string, so the page the
+/// redirect lands on can show it. `/settings` passes it on to the project or
+/// onboarding page it redirects to.
+#[derive(Deserialize)]
+struct NoticeQuery {
+    notice: Option<String>,
 }
 
 fn settings_nav(state: &AppState, login: &str) -> Result<pages::SettingsNav, StoreError> {
@@ -1397,6 +1411,8 @@ fn project_page(
 #[derive(Deserialize)]
 struct StageQuery {
     stage: Option<String>,
+    /// A notice forwarded from `/settings`, such as after a project is removed.
+    notice: Option<String>,
 }
 
 impl StageQuery {
@@ -1497,7 +1513,14 @@ async fn show_project_settings(
     Path(name): Path<String>,
     Query(query): Query<StageQuery>,
 ) -> Result<Markup, AppError> {
-    project_page(&state, &headers, &name, query.part(), None, None)
+    project_page(
+        &state,
+        &headers,
+        &name,
+        query.part(),
+        query.notice.as_deref(),
+        None,
+    )
 }
 
 fn default_effort() -> String {
@@ -1723,6 +1746,42 @@ async fn remove_project_collaborator(
         None,
     )?
     .into_response())
+}
+
+#[derive(Deserialize)]
+struct RemoveProjectForm {
+    #[serde(default)]
+    confirm: String,
+}
+
+/// Removes a project once a collaborator typed its name. Any other name redraws
+/// the project's page with the problem and changes nothing. On success it wakes
+/// the scheduler, so `stop()` ends the container of a job the removal cancelled,
+/// then redirects to `/settings` with a notice, since the project the user was
+/// on is gone.
+async fn remove_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<RemoveProjectForm>,
+) -> Result<Response, AppError> {
+    visible_project(&state, &headers, &project)?;
+    if form.confirm.trim() != project {
+        let problem = format!("Nothing was removed. Type {project} to remove the project.");
+        return Ok(project_page(
+            &state,
+            &headers,
+            &project,
+            pages::PipelinePart::parse(None),
+            None,
+            Some(&problem),
+        )?
+        .into_response());
+    }
+    state.store.remove_project(&project)?;
+    state.wake.notify_one();
+    let notice = format!("Removed project {project}.");
+    Ok(Redirect::to(&format!("/settings?notice={}", query_escape(&notice))).into_response())
 }
 
 /// One server's settings as a project's page for it shows them.
@@ -2322,7 +2381,7 @@ struct OnboardForm {
     action: String,
 }
 
-async fn show_onboard(headers: HeaderMap) -> Markup {
+async fn show_onboard(headers: HeaderMap, Query(query): Query<NoticeQuery>) -> Markup {
     let view = pages::OnboardView {
         name: "",
         repo: "",
@@ -2332,7 +2391,7 @@ async fn show_onboard(headers: HeaderMap) -> Markup {
         auto_merge: false,
         llm_review: false,
     };
-    pages::onboard(&user(&headers), &view, None)
+    pages::onboard(&user(&headers), &view, None, query.notice.as_deref())
 }
 
 /// Runs the checks, and on `create` or `skip` with no error, onboards the
@@ -2366,6 +2425,31 @@ async fn submit_onboard(
     let llm_review = form.llm_review.is_some();
 
     let mut report = onboard_report(&state, effective_name, repo, base).await?;
+
+    // A name whose earlier project was removed may still have job rows, which
+    // expiry has not deleted yet. Clear them, the way expiry does, before
+    // onboarding, so the new project's collaborators never see the old jobs. A
+    // leftover job still running is left alone and onboarding is refused, since
+    // deleting a job mid-run would orphan its container.
+    if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
+        let leftover = state.store.job_ids_for(effective_name)?;
+        let busy: HashSet<i64> = state
+            .slots
+            .busy()
+            .into_iter()
+            .map(|slot| slot.job_id)
+            .collect();
+        if leftover.iter().any(|id| busy.contains(id)) {
+            report.errors.push(
+                "This name's removed project still has a job finishing. Try again in a minute."
+                    .to_owned(),
+            );
+        } else {
+            for id in &leftover {
+                state.store.delete_job(*id, &state.data_dir)?;
+            }
+        }
+    }
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         let checks = (!checks.is_empty()).then_some(checks);
@@ -2411,7 +2495,7 @@ async fn submit_onboard(
         auto_merge,
         llm_review,
     };
-    Ok(pages::onboard(&user(&headers), &view, Some(&report)).into_response())
+    Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response())
 }
 
 /// The name a project is created under: the typed name, or the repository name

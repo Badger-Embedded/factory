@@ -1527,6 +1527,86 @@ impl Store {
         Ok(())
     }
 
+    /// The ids of the jobs of `project`, oldest first. These stay after the
+    /// project is removed, until job expiry deletes them, so re-onboarding the
+    /// name reads them to clear the leftover jobs first.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn job_ids_for(&self, project: &str) -> Result<Vec<i64>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id FROM jobs WHERE project = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([project], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Removes project `name` in one transaction: cancels its unfinished jobs,
+    /// and deletes its configuration, its collaborators, its stored MCP header
+    /// values and the cost history of its jobs.
+    ///
+    /// Each job that is not already merged, failed or cancelled gets
+    /// [`Event::Cancel`] applied and a factory log line, exactly as the Cancel
+    /// button does, so once the caller wakes the scheduler, `stop()` ends any
+    /// container a cancelled job was running. The job rows, their logs and their
+    /// directories stay until the 30-day expiry removes them, see
+    /// [`Self::delete_job`], and open pull requests are left alone.
+    ///
+    /// The deleted configuration is the project's rows in `projects`,
+    /// `project_models`, `project_settings`, `project_gates`, `project_efforts`,
+    /// `project_agents`, `project_mcp`, `project_mcp_tools`,
+    /// `project_mcp_tool_refreshes`, `project_totals` and
+    /// `project_collaborators`, its MCP header values in `secrets`, its
+    /// `job_costs` rows, and the `cost` rows in `job_events` for its jobs. With
+    /// no collaborator rows left, the project and its surviving jobs are visible
+    /// to nobody.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error. Nothing is written when it fails.
+    pub fn remove_project(&self, name: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM jobs WHERE project = ?1 ORDER BY id")?;
+            let rows = stmt.query_map([name], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for id in &ids {
+            let mut row = Self::load(&tx, *id)?;
+            if !row.job.is_finished() {
+                Self::apply_in(&tx, &mut row, Event::Cancel)?;
+                tx.execute(
+                    "INSERT INTO logs (job_id, kind, text) VALUES (?1, 'factory', ?2)",
+                    params![id, "Cancelled because the project was removed."],
+                )?;
+            }
+            tx.execute("DELETE FROM job_costs WHERE job_id = ?1", [id])?;
+            tx.execute(
+                "DELETE FROM job_events WHERE job_id = ?1 AND event = 'cost'",
+                [id],
+            )?;
+        }
+        for table in [
+            "project_models",
+            "project_settings",
+            "project_gates",
+            "project_efforts",
+            "project_agents",
+            "project_mcp",
+            "project_mcp_tools",
+            "project_mcp_tool_refreshes",
+            "project_totals",
+            "project_collaborators",
+            "secrets",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;
+        }
+        tx.execute("DELETE FROM projects WHERE name = ?1", [name])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Fails on a database error.

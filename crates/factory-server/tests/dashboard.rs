@@ -8959,3 +8959,242 @@ fn start_review() -> Event {
         head: format!("head{n}"),
     }
 }
+
+/// A dashboard over a file-backed store, so a test can read the tables through a
+/// second connection. The project `maestro` is onboarded by `alice`.
+fn file_dashboard() -> (Dashboard, tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    (dashboard_with(store), dir, path)
+}
+
+fn count(path: &Path, sql: &str, project: &str) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(sql, [project], |row| row.get(0))
+        .unwrap()
+}
+
+/// Gives `project` a row in every table a removal deletes from, and one cost.
+fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
+    let store = &dashboard.store;
+    store
+        .save_project_models(project, &StageModels::default())
+        .unwrap();
+    store.save_project_settings(project, true, true).unwrap();
+    store
+        .put_secret(
+            factory_server::SecretRef {
+                project,
+                server: "context7",
+                header: "Authorization",
+            },
+            "local",
+            b"sealed",
+        )
+        .unwrap();
+    store.add_cost(job, 1.5, false).unwrap();
+}
+
+#[tokio::test]
+async fn removing_a_project_cancels_its_jobs_and_deletes_its_data() {
+    let (dashboard, _dir, path) = file_dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    fill_project(&dashboard, "maestro", id);
+
+    let reply = dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location.as_deref(),
+        Some("/settings?notice=Removed%20project%20maestro.")
+    );
+
+    let row = dashboard.store.get(id).unwrap();
+    assert_eq!(row.job.stage(), &Stage::Cancelled);
+    let log = dashboard.store.logs(id, 1).unwrap().pop().unwrap();
+    assert_eq!(log.text, "Cancelled because the project was removed.");
+
+    for (table, column) in [
+        ("projects", "name"),
+        ("project_models", "project"),
+        ("project_settings", "project"),
+        ("project_gates", "project"),
+        ("project_efforts", "project"),
+        ("project_agents", "project"),
+        ("project_mcp", "project"),
+        ("project_mcp_tools", "project"),
+        ("project_mcp_tool_refreshes", "project"),
+        ("project_totals", "project"),
+        ("project_collaborators", "project"),
+        ("secrets", "project"),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1");
+        assert_eq!(count(&path, &sql, "maestro"), 0, "{table}");
+    }
+    let costs = "SELECT COUNT(*) FROM job_costs WHERE job_id IN
+                 (SELECT id FROM jobs WHERE project = ?1)";
+    assert_eq!(count(&path, costs, "maestro"), 0);
+    let events = "SELECT COUNT(*) FROM job_events WHERE event = 'cost' AND job_id IN
+                  (SELECT id FROM jobs WHERE project = ?1)";
+    assert_eq!(count(&path, events, "maestro"), 0);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM jobs WHERE project = ?1",
+            "maestro"
+        ),
+        1
+    );
+
+    assert_eq!(
+        dashboard.get("/?project=maestro").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        dashboard.get(&format!("/jobs/{id}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn removing_a_project_without_its_name_changes_nothing() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    for form in ["confirm=", "confirm=maestr", "confirm=other", ""] {
+        let reply = dashboard
+            .post("/settings/projects/maestro/remove", form)
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{form}");
+        assert!(reply.body.contains("Nothing was removed."), "{form}");
+    }
+    assert!(dashboard.store.project("maestro").unwrap().is_some());
+    assert!(dashboard.store.is_collaborator("maestro", USER).unwrap());
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Requested
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_remove_a_project() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_as(
+            STRANGER,
+            "/settings/projects/maestro/remove",
+            "confirm=maestro",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(dashboard.store.project("maestro").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn the_project_page_has_a_remove_project_form() {
+    let page = dashboard().get("/settings/projects/maestro").await;
+    assert!(
+        page.body
+            .contains("action=\"/settings/projects/maestro/remove\"")
+    );
+    assert!(page.body.contains("Remove maestro"));
+}
+
+#[tokio::test]
+async fn the_removal_notice_shows_on_the_page_settings_lands_on() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .get("/settings?notice=Removed%20project%20gone.")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let landing = reply.location.unwrap();
+    let page = dashboard.get(&landing).await;
+    assert!(page.body.contains("Removed project gone."));
+    let page = dashboard
+        .get_as(STRANGER, "/settings?notice=Removed%20project%20gone.")
+        .await;
+    let landing = page.location.unwrap();
+    assert!(landing.starts_with("/onboard?notice="));
+    let page = dashboard.get_as(STRANGER, &landing).await;
+    assert!(page.body.contains("Removed project gone."));
+}
+
+#[tokio::test]
+async fn onboarding_a_removed_name_again_starts_with_an_empty_board() {
+    let (dashboard, _dir, _path) = file_dashboard();
+    let id = dashboard.new_job().await;
+    let job_dir = dashboard.data.path().join("jobs").join(id.to_string());
+    fs::create_dir_all(&job_dir).unwrap();
+    dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    assert!(dashboard.store.get(id).is_ok());
+
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fmaestro&name=maestro&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(matches!(
+        dashboard.store.get(id),
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(!job_dir.exists());
+
+    let board = dashboard
+        .get_as("bob@example.com", "/?project=maestro")
+        .await;
+    assert_eq!(board.status, StatusCode::OK);
+    assert!(!board.body.contains("Add a reboot button</a>"));
+    assert_eq!(
+        collaborator_logins(&dashboard, "maestro"),
+        vec!["bob@example.com".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn onboarding_is_refused_while_a_leftover_job_holds_a_slot() {
+    let (dashboard, _dir, _path) = file_dashboard();
+    let id = dashboard.new_job().await;
+    dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    dashboard.slots.take(id, 0);
+
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fmaestro&name=maestro&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Try again in a minute."));
+    assert!(dashboard.store.get(id).is_ok());
+    assert!(dashboard.store.project("maestro").unwrap().is_none());
+
+    dashboard.slots.free(id);
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fmaestro&name=maestro&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+}
