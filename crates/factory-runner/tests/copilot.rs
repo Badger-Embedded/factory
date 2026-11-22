@@ -5,12 +5,15 @@
 //! not exercise; see `copilot_image.rs` for the image side and "Copilot CLI
 //! facts" in docs/design.md for the event shapes.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use factory_core::{Agent, AgentResult, Event};
 use factory_runner::{
     AgentItem, Expect, LogLine, McpConfig, RunResult, SessionRun, WorkerConfig, WorkerRun, backend,
+    run,
 };
 
 const SESSION: &str = "d3c2f38c-6c9e-4528-9666-a9c3d7aff405";
@@ -208,20 +211,22 @@ fn a_run_with_no_active_server_passes_no_mcp_config_or_token() {
 }
 
 #[test]
-fn the_reviewer_loads_the_skill_through_plugin_dir_when_the_agents_dir_is_mounted() {
+fn the_reviewer_loads_the_skill_through_plugin_dir_in_both_agents_dir_configs() {
     let dir = tempfile::tempdir().unwrap();
     let run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
 
-    // With no agents directory, no --plugin-dir flag.
-    let bare = strings(&factory_runner::podman_args(&WorkerConfig::default(), &run));
-    assert!(!bare.iter().any(|arg| arg == "--plugin-dir"), "{bare:?}");
-
-    let config = WorkerConfig {
-        agents_dir: Some(dir.path().join("agents")),
-        ..WorkerConfig::default()
-    };
-    let args = strings(&factory_runner::podman_args(&config, &run));
-    assert_eq!(value_after(&args, "--plugin-dir"), "/factory-agents");
+    // The image bakes the skills at /factory-agents, so the flag is passed
+    // whether or not the factory mounts its own copy there.
+    for config in [
+        WorkerConfig::default(),
+        WorkerConfig {
+            agents_dir: Some(dir.path().join("agents")),
+            ..WorkerConfig::default()
+        },
+    ] {
+        let args = strings(&factory_runner::podman_args(&config, &run));
+        assert_eq!(value_after(&args, "--plugin-dir"), "/factory-agents");
+    }
 }
 
 #[test]
@@ -253,8 +258,8 @@ fn the_success_fixture_parses_into_the_reply_and_a_result() {
         &fs::read_to_string(fixture("copilot-success.jsonl")).unwrap(),
     );
 
-    // The final assistant.message carries the reply; the streaming deltas are
-    // ephemeral and skipped, so the text logs once.
+    // The streaming deltas are ephemeral and skipped, so the reply logs once. The
+    // usage checkpoint and the result line add the counts and the cost note.
     let logs: Vec<&LogLine> = items
         .iter()
         .filter_map(|item| match item {
@@ -262,7 +267,17 @@ fn the_success_fixture_parses_into_the_reply_and_a_result() {
             _ => None,
         })
         .collect();
-    assert_eq!(logs, [&LogLine::Text("pong".into())]);
+    assert_eq!(
+        logs,
+        [
+            &LogLine::Text("pong".into()),
+            &LogLine::Other(
+                "Copilot usage: 1 premium request(s), 6.2503 AI credits, 4 input and 4 output tokens"
+                    .into()
+            ),
+            &LogLine::Other("Copilot runs are not counted in the job cost.".into()),
+        ]
+    );
 
     // session.start reports the id the factory resumes with.
     let sessions: Vec<&String> = items
@@ -488,4 +503,57 @@ fn last_result(items: &[AgentItem]) -> RunResult {
             _ => None,
         })
         .expect("a result")
+}
+
+fn intermediate_then_failure() -> String {
+    let outcome = r#"{"outcome":"approve"}"#;
+    let intermediate = serde_json::json!({
+        "type": "assistant.message",
+        "data": { "content": outcome, "toolRequests": [{"name": "bash"}] },
+    });
+    let result = r#"{"type":"result","exitCode":1,"usage":{"premiumRequests":0}}"#;
+    format!("{intermediate}\n{result}\n")
+}
+
+#[test]
+fn a_message_that_requested_a_tool_is_not_a_result() {
+    let items = parse(Expect::Review, &intermediate_then_failure());
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, AgentItem::Result(_))),
+        "{items:?}"
+    );
+    assert!(items.iter().any(|item| matches!(
+        item,
+        AgentItem::Log(LogLine::Text(text)) if text.contains("approve")
+    )));
+}
+
+#[tokio::test]
+async fn a_run_that_fails_after_an_intermediate_message_ends_on_the_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout.jsonl");
+    fs::write(&stdout, intermediate_then_failure()).unwrap();
+    let podman = support::executable(
+        dir.path(),
+        "podman",
+        &format!("#!/bin/bash\ncat '{}'\nexit 1\n", stdout.display()),
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let mut worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    worker.expect = Expect::Review;
+
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+
+    match report.event {
+        Event::ReviewFailed { reason } => {
+            assert!(reason.contains("the Copilot run failed"), "{reason}");
+        }
+        other => panic!("expected ReviewFailed, got {other:?}"),
+    }
+    assert_eq!(report.cost_usd, None);
 }

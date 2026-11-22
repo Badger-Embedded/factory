@@ -52,9 +52,12 @@ const SCHEMA_IN_PROMPT: &str = "This agent has no structured-output mode, so pro
      outcome and nothing else: no sentence before it and none after. A single ```json fenced \
      block around the whole message is allowed. The JSON must match this schema:";
 
-/// The review-method paragraph for a Copilot run. Copilot loads the factory's
-/// review skill through `--plugin-dir`, as Claude does, so the wording names
-/// the skill rather than a path.
+/// The once-per-run note that a Copilot run adds no cost, logged on the final
+/// `result` line. See Job cost in the design doc.
+const COST_NOTE: &str = "Copilot runs are not counted in the job cost.";
+
+/// The review-method paragraph for a Copilot run. Every run passes
+/// `--plugin-dir`, so the wording names the skill rather than a path.
 const REVIEW_METHOD: &str = "The factory's review skill describes the method. The repository you \
      are reviewing may carry its own review, lint or project skills; use them, since they know \
      rules this prompt does not.\n\n";
@@ -64,9 +67,6 @@ pub struct CopilotAgent;
 
 impl AgentBackend for CopilotAgent {
     fn credential(&self) -> Credential {
-        // The stored login is a non-expiring `gho_` OAuth token the CLI does not
-        // refresh, so it passes by name, unlike Codex's `auth.json`. See the
-        // "Copilot CLI facts" gate result in the design doc.
         Credential::Env(CREDENTIAL_ENV)
     }
 
@@ -91,10 +91,6 @@ impl AgentBackend for CopilotAgent {
     }
 
     fn session_for(&self, host_config_dir: &Path, id: &str) -> SessionRun {
-        // Copilot keeps each session's events under `session-state/<id>/`, so a
-        // stored id with that directory resumes and anything else starts afresh.
-        // The factory picks the id, so a run that died before Copilot wrote the
-        // directory begins again under the same id.
         if host_config_dir.join("session-state").join(id).is_dir() {
             SessionRun::Resume(id.to_owned())
         } else {
@@ -103,42 +99,36 @@ impl AgentBackend for CopilotAgent {
     }
 
     fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
-        // The MCP run token, by name only, for a run with at least one active
-        // server. A run with none passes none, so it gets no token.
         match run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             Some(mcp) => vec![(MCP_TOKEN_ENV, mcp.token.as_str())],
             None => Vec::new(),
         }
     }
 
-    fn command(&self, config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
+    fn command(&self, _config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
+        let (session_flag, session_id) = match &run.session {
+            SessionRun::Start(id) => ("--session-id", id),
+            SessionRun::Resume(id) => ("--resume", id),
+        };
         let mut copilot: Vec<String> = vec![
             "copilot".into(),
             "-p".into(),
             run.prompt.clone(),
             "--output-format".into(),
             "json".into(),
-            // The container is the sandbox, as it is for Claude and Codex, so
-            // every tool, path and URL is allowed and nothing waits on a prompt.
             "--allow-all".into(),
             "--no-ask-user".into(),
             "--no-color".into(),
-            // Stay on the baked-in release even when a newer one sits in the
-            // package cache, and send no telemetry.
+            // Without this, a newer version in the package cache runs instead of
+            // the image's pinned one.
             "--no-auto-update".into(),
             "--disable-client-telemetry".into(),
             // The built-in GitHub MCP server would reach GitHub with the login
-            // token; a worker gets no GitHub tools, so turn it off.
+            // token, so a worker gets no GitHub tools.
             "--disable-builtin-mcps".into(),
+            session_flag.into(),
+            session_id.clone(),
         ];
-        // A new session names the factory's UUID with `--session-id`, as Claude
-        // does; a resumed run names it with `--resume`.
-        let (session_flag, session_id) = match &run.session {
-            SessionRun::Start(id) => ("--session-id", id),
-            SessionRun::Resume(id) => ("--resume", id),
-        };
-        copilot.push(session_flag.into());
-        copilot.push(session_id.clone());
         if let Some(model) = run.model.as_deref().filter(|model| !model.is_empty()) {
             copilot.push("--model".into());
             copilot.push(model.into());
@@ -150,20 +140,15 @@ impl AgentBackend for CopilotAgent {
                 .unwrap_or_else(|| Agent::Copilot.default_effort())
                 .into(),
         );
-        // One `http` MCP entry per active server, pointed at the proxy. The run
-        // token is named, not spelled out: the header carries `${FACTORY_MCP_TOKEN}`
-        // and the CLI expands it from the environment. A run with no active
-        // server adds nothing.
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             copilot.push("--additional-mcp-config".into());
             copilot.push(mcp_config(mcp));
         }
-        // The reviewer run loads the factory's review skill from the mounted
-        // agents directory, the same flag Claude uses.
-        if config.agents_dir.is_some() {
-            copilot.push("--plugin-dir".into());
-            copilot.push(AGENTS_DIR.into());
-        }
+        // The image bakes the review skills at `/factory-agents` whether or not
+        // the factory mounts its own copy there, so the flag always resolves and
+        // the review wording can name the skill rather than a path.
+        copilot.push("--plugin-dir".into());
+        copilot.push(AGENTS_DIR.into());
         copilot.into_iter().map(OsString::from).collect()
     }
 
@@ -206,8 +191,6 @@ fn parse_copilot(expect: Expect, line: &str) -> Vec<AgentItem> {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return vec![AgentItem::Log(LogLine::Other(line.to_owned()))];
     };
-    // A transient event, such as a streaming delta, is not part of the record
-    // the parser reads.
     if value.get("ephemeral").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
     }
@@ -217,7 +200,7 @@ fn parse_copilot(expect: Expect, line: &str) -> Vec<AgentItem> {
             .map(|id| AgentItem::Session(id.to_owned()))
             .into_iter()
             .collect(),
-        Some("assistant.message") => parse_message(expect, string_at(data, "content")),
+        Some("assistant.message") => parse_message(expect, data),
         Some("tool.execution_start") => parse_tool_start(data),
         Some("tool.execution_complete") => parse_tool_complete(data),
         Some("session.warning") => string_at(data, "message")
@@ -225,24 +208,35 @@ fn parse_copilot(expect: Expect, line: &str) -> Vec<AgentItem> {
             .map(|message| AgentItem::Log(LogLine::Other(message.to_owned())))
             .into_iter()
             .collect(),
+        Some("session.usage_checkpoint") => usage_log(data).into_iter().collect(),
         Some("result") => parse_result(expect, &value),
         _ => Vec::new(),
     }
 }
 
-/// Turns a non-ephemeral `assistant.message` into its log line and, when it
-/// carries text, the result. A message with no content, such as a turn that
-/// only requested tools, gives nothing, so the last message with text decides
-/// the run.
-fn parse_message(expect: Expect, content: Option<&str>) -> Vec<AgentItem> {
-    let Some(text) = content.filter(|text| !text.trim().is_empty()) else {
+/// Turns a non-ephemeral `assistant.message` into its log line and, when the
+/// message is the final answer, the result. A message that requested a tool is
+/// not the final answer, so it logs its text but sets no result: a run that
+/// fails before its answer then ends on the failure, not on a message it wrote
+/// on the way there. Among final-answer messages the last one wins, since `run`
+/// keeps the latest result.
+fn parse_message(expect: Expect, data: Option<&Value>) -> Vec<AgentItem> {
+    let Some(text) = string_at(data, "content").filter(|text| !text.trim().is_empty()) else {
         return Vec::new();
     };
-    vec![
-        AgentItem::Log(LogLine::Text(text.to_owned())),
-        // The last message with text wins: `run` keeps the latest result.
-        AgentItem::Result(message_result(expect, text)),
-    ]
+    let mut items = vec![AgentItem::Log(LogLine::Text(text.to_owned()))];
+    if !requested_tools(data) {
+        items.push(AgentItem::Result(message_result(expect, text)));
+    }
+    items
+}
+
+/// Whether an `assistant.message` carries a non-empty `toolRequests` list, which
+/// a message that precedes a tool call does and a final answer does not.
+fn requested_tools(data: Option<&Value>) -> bool {
+    data.and_then(|data| data.get("toolRequests"))
+        .and_then(Value::as_array)
+        .is_some_and(|requests| !requests.is_empty())
 }
 
 /// Turns the final assistant message into a run result. The text must be the
@@ -278,7 +272,6 @@ fn unfence(text: &str) -> &str {
     let Some(inner) = rest.strip_suffix("```") else {
         return text;
     };
-    // Drop the language tag or blank that follows the opening fence on its line.
     inner.split_once('\n').map_or("", |(_, body)| body).trim()
 }
 
@@ -291,8 +284,6 @@ fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {
         return Vec::new();
     };
     let tool = string_at(Some(data), "toolName").unwrap_or_default();
-    // An MCP tool names its server; the proxy routes it, so the log reads like
-    // Claude's and Codex's `mcp__<server>__<tool>`.
     if let Some(server) = string_at(Some(data), "mcpServerName")
         .or_else(|| string_at(Some(data), "mcpConfigServerName"))
     {
@@ -302,8 +293,6 @@ fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {
             summary: String::new(),
         })];
     }
-    // A shell tool carries `shellToolInfo`, absent on every other tool, with the
-    // command the CLI runs.
     if let Some(shell) = data.get("shellToolInfo") {
         let command = string_at(Some(shell), "displayCommand")
             .or_else(|| string_at(data.get("arguments"), "command"))
@@ -313,7 +302,6 @@ fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {
             summary: first_line(command),
         })];
     }
-    // A built-in file edit names the path in its arguments.
     if is_edit_tool(tool) {
         let path = edit_path(data.get("arguments")).unwrap_or(tool);
         return vec![AgentItem::Log(LogLine::Tool {
@@ -343,19 +331,43 @@ fn parse_tool_complete(data: Option<&Value>) -> Vec<AgentItem> {
     Vec::new()
 }
 
-/// The failure for a run whose final `result` reports a non-zero `exitCode`. The
-/// human cause is on stderr, not in the stream, so the reason names the code.
-/// The run uses this only when no assistant message arrived, so a final message
-/// still decides the run.
+/// The final `result` line: the once-per-run note that Copilot runs carry no
+/// cost, and, when `exitCode` is non-zero, the failure. The human cause of a
+/// failure is on stderr, not in the stream, so the reason names the code; the
+/// run uses the failure only when no final message arrived.
 fn parse_result(expect: Expect, value: &Value) -> Vec<AgentItem> {
+    let mut items = vec![AgentItem::Log(LogLine::Other(COST_NOTE.to_owned()))];
     let code = value.get("exitCode").and_then(Value::as_i64).unwrap_or(0);
-    if code == 0 {
-        return Vec::new();
+    if code != 0 {
+        items.push(AgentItem::Failure(failed_event(
+            expect,
+            format!("the Copilot run failed: the CLI exited with code {code}"),
+        )));
     }
-    vec![AgentItem::Failure(failed_event(
-        expect,
-        format!("the Copilot run failed: the CLI exited with code {code}"),
-    ))]
+    items
+}
+
+/// The log line that records what a `session.usage_checkpoint` reports: premium
+/// requests, AI credits and token counts. The factory keeps no dollar cost for a
+/// Copilot run (see Job cost), so these counts go to the job log alone.
+fn usage_log(data: Option<&Value>) -> Option<AgentItem> {
+    let data = data?;
+    let count = |key: &str| data.get(key).and_then(Value::as_i64).unwrap_or(0);
+    #[allow(clippy::cast_precision_loss)]
+    let credits = count("totalNanoAiu") as f64 / 1e9;
+    let tokens = |key: &str| {
+        data.pointer(&format!(
+            "/accountingSnapshot/tokenDetails/{key}/tokenCount"
+        ))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+    };
+    Some(AgentItem::Log(LogLine::Other(format!(
+        "Copilot usage: {} premium request(s), {credits:.4} AI credits, {} input and {} output tokens",
+        count("totalPremiumRequests"),
+        tokens("input"),
+        tokens("output"),
+    ))))
 }
 
 /// Whether a built-in tool name writes a file, so its call logs as an edit.
