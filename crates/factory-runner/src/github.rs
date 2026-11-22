@@ -3,12 +3,19 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use factory_core::PrDescription;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const MAX_LOG: usize = 30_000;
+/// The largest diff [`GitHub::pr_details`] returns. A larger one is an error,
+/// because a review of a cut diff could approve changes it never saw.
+const MAX_DIFF: usize = 200_000;
+/// The most changed files GitHub's compare API lists.
+const COMPARE_FILE_LIMIT: usize = 300;
 
 /// Talks to GitHub through the `gh` CLI with the factory's token.
 #[derive(Debug, Clone)]
@@ -107,6 +114,118 @@ pub enum Observation {
     /// Open, every check passed and no comment is waiting for the agent.
     Ready,
     Nothing,
+}
+
+/// An open pull request that Renovate made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenovatePr {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// The SHA of the pull request's head commit.
+    pub head: String,
+}
+
+/// What an agent needs to judge a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrDetails {
+    pub title: String,
+    pub body: String,
+    /// The SHA of the pull request's head commit.
+    pub head: String,
+    pub files: Vec<String>,
+    /// The complete diff.
+    pub diff: String,
+}
+
+#[derive(Deserialize)]
+struct PullJson {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    html_url: String,
+    user: Option<Login>,
+    head: HeadJson,
+}
+
+#[derive(Deserialize)]
+struct HeadJson {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsJson {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    head_ref_oid: String,
+    #[serde(default)]
+    files: Vec<FileJson>,
+}
+
+#[derive(Deserialize)]
+struct FileJson {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ContentJson {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    content: String,
+    encoding: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompareJson {
+    #[serde(default)]
+    files: Vec<CompareFileJson>,
+}
+
+#[derive(Deserialize)]
+struct CompareFileJson {
+    filename: String,
+    patch: Option<String>,
+}
+
+/// Whether the REST API's `user.login` belongs to Renovate. The REST API
+/// reports the app as `renovate[bot]`, while `gh pr list` reports it as
+/// `app/renovate`.
+#[must_use]
+pub fn is_renovate_login(login: &str) -> bool {
+    login == "renovate[bot]" || login == "renovate"
+}
+
+/// Parses the pull requests API output, one JSON object per line, and keeps
+/// the ones Renovate opened.
+///
+/// # Errors
+///
+/// Fails when a line does not parse.
+pub fn parse_renovate_prs(lines: &str) -> Result<Vec<RenovatePr>, String> {
+    let mut prs = Vec::new();
+    for line in lines.lines().filter(|line| !line.trim().is_empty()) {
+        let pull: PullJson =
+            serde_json::from_str(line).map_err(|err| format!("pull request list: {err}"))?;
+        if pull.user.is_some_and(|user| is_renovate_login(&user.login)) {
+            prs.push(RenovatePr {
+                number: pull.number,
+                title: pull.title,
+                url: pull.html_url,
+                head: pull.head.sha,
+            });
+        }
+    }
+    Ok(prs)
+}
+
+fn is_not_found(err: &str) -> bool {
+    err.contains("HTTP 404")
 }
 
 #[derive(Deserialize)]
@@ -563,6 +682,275 @@ impl GitHub {
         )
         .await
         .map(|_| ())
+    }
+
+    /// The open pull requests that Renovate made against `base`.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails or its output does not parse.
+    pub async fn renovate_prs(&self, repo: &str, base: &str) -> Result<Vec<RenovatePr>, String> {
+        let base_field = format!("base={base}");
+        let lines = self
+            .run(
+                &[
+                    "api",
+                    "--paginate",
+                    "--method",
+                    "GET",
+                    &format!("repos/{repo}/pulls"),
+                    "-f",
+                    "state=open",
+                    "-f",
+                    &base_field,
+                    "-f",
+                    "per_page=100",
+                    "--jq",
+                    ".[]",
+                ],
+                None,
+            )
+            .await?;
+        parse_renovate_prs(&lines)
+    }
+
+    /// The title, description, head, changed files and diff of a pull
+    /// request.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when a call fails or its output does not parse.
+    pub async fn pr_details(&self, repo: &str, number: u64) -> Result<PrDetails, String> {
+        let number_text = number.to_string();
+        let view = self
+            .run(
+                &[
+                    "pr",
+                    "view",
+                    &number_text,
+                    "--repo",
+                    repo,
+                    "--json",
+                    "title,body,headRefOid,files",
+                ],
+                None,
+            )
+            .await?;
+        let view: DetailsJson =
+            serde_json::from_str(&view).map_err(|err| format!("gh pr view output: {err}"))?;
+        let diff = self
+            .run(&["pr", "diff", &number_text, "--repo", repo], None)
+            .await?;
+        if diff.len() > MAX_DIFF {
+            return Err(format!(
+                "the diff of pull request {number} is {} bytes, over the limit of {MAX_DIFF}, so it cannot be reviewed in full",
+                diff.len()
+            ));
+        }
+        Ok(PrDetails {
+            title: view.title,
+            body: view.body,
+            head: view.head_ref_oid,
+            files: view.files.into_iter().map(|file| file.path).collect(),
+            diff,
+        })
+    }
+
+    /// Posts a comment on the pull request.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails.
+    pub async fn comment(&self, repo: &str, number: u64, body: &str) -> Result<(), String> {
+        let number_text = number.to_string();
+        self.run(
+            &[
+                "pr",
+                "comment",
+                &number_text,
+                "--repo",
+                repo,
+                "--body-file",
+                "-",
+            ],
+            Some(body),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Approves the pull request with `body` as the review text.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails.
+    pub async fn approve(&self, repo: &str, number: u64, body: &str) -> Result<(), String> {
+        let number_text = number.to_string();
+        self.run(
+            &[
+                "pr",
+                "review",
+                &number_text,
+                "--repo",
+                repo,
+                "--approve",
+                "--body-file",
+                "-",
+            ],
+            Some(body),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Squash-merges the pull request and deletes its branch, only while its
+    /// head is still `head`. GitHub refuses the merge when someone pushed
+    /// since, so a commit nobody checked never lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message, such as when the head moved.
+    pub async fn merge_head(&self, repo: &str, number: u64, head: &str) -> Result<(), String> {
+        let number_text = number.to_string();
+        self.run(
+            &[
+                "pr",
+                "merge",
+                &number_text,
+                "--repo",
+                repo,
+                "--squash",
+                "--delete-branch",
+                "--match-head-commit",
+                head,
+            ],
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The text of `path` at `git_ref`, or `None` when the file or the ref
+    /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails for another reason, or when
+    /// the path is not a file.
+    pub async fn file_at(
+        &self,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<String>, String> {
+        let out = match self
+            .run(
+                &[
+                    "api",
+                    "--method",
+                    "GET",
+                    &format!("repos/{repo}/contents/{path}"),
+                    "-f",
+                    &format!("ref={git_ref}"),
+                ],
+                None,
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let content: ContentJson =
+            serde_json::from_str(&out).map_err(|err| format!("contents of {path}: {err}"))?;
+        if content.kind.as_deref() != Some("file") {
+            return Err(format!(
+                "{path} is a {} and not a file",
+                content.kind.as_deref().unwrap_or("thing of unknown type")
+            ));
+        }
+        match content.encoding.as_deref() {
+            Some("base64") => {}
+            // GitHub leaves the content empty for a file over 1 MB.
+            Some("none") => return self.raw_file(repo, path, git_ref).await,
+            other => {
+                return Err(format!(
+                    "contents of {path} have the unknown encoding {}",
+                    other.unwrap_or("none given")
+                ));
+            }
+        }
+        let packed: String = content.content.split_whitespace().collect();
+        let bytes = STANDARD
+            .decode(packed)
+            .map_err(|err| format!("contents of {path}: {err}"))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    async fn raw_file(
+        &self,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<String>, String> {
+        match self
+            .run(
+                &[
+                    "api",
+                    "--method",
+                    "GET",
+                    "-H",
+                    "Accept: application/vnd.github.raw+json",
+                    &format!("repos/{repo}/contents/{path}"),
+                    "-f",
+                    &format!("ref={git_ref}"),
+                ],
+                None,
+            )
+            .await
+        {
+            Ok(text) => Ok(Some(text)),
+            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The patch GitHub reports for `path` between the refs `from` and `to`,
+    /// or `None` when a ref is unknown or the file did not change.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails for another reason, when its
+    /// output does not parse, or when the comparison lists the most files
+    /// GitHub shows and `path` is not among them.
+    pub async fn compare_patch(
+        &self,
+        repo: &str,
+        from: &str,
+        to: &str,
+        path: &str,
+    ) -> Result<Option<String>, String> {
+        let out = match self
+            .run(
+                &["api", &format!("repos/{repo}/compare/{from}...{to}")],
+                None,
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let compare: CompareJson =
+            serde_json::from_str(&out).map_err(|err| format!("compare {from}...{to}: {err}"))?;
+        let listed = compare.files.len();
+        match compare.files.into_iter().find(|file| file.filename == path) {
+            Some(file) => Ok(file.patch),
+            None if listed >= COMPARE_FILE_LIMIT => Err(format!(
+                "compare {from}...{to} lists {listed} files, GitHub's limit, so it cannot show whether {path} changed"
+            )),
+            None => Ok(None),
+        }
     }
 
     /// # Errors

