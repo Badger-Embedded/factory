@@ -140,7 +140,7 @@ fn copilot_read_back(home: &Path) -> Result<String, ReadBackError> {
             nested: tokens.map(|tokens| {
                 (
                     "authTokens",
-                    tokens.keys().map(|key| scrub_line(key)).collect(),
+                    tokens.keys().map(|key| scrub_name(key)).collect(),
                 )
             }),
         })
@@ -257,11 +257,11 @@ fn scrubbed_listing(home: &Path) -> String {
         if is_dir {
             let inner: Vec<String> = entries(&home.join(&name))
                 .into_iter()
-                .map(|(inner, _)| scrub_line(&inner))
+                .map(|(inner, _)| scrub_name(&inner))
                 .collect();
-            out.push(format!("{}/ [{}]", scrub_line(&name), inner.join(", ")));
+            out.push(format!("{}/ [{}]", scrub_name(&name), inner.join(", ")));
         } else {
-            out.push(scrub_line(&name));
+            out.push(scrub_name(&name));
         }
     }
     out.truncate(LIMIT);
@@ -288,7 +288,7 @@ fn read_credential_file(home: &Path, file: &'static str) -> Result<String, ReadB
 fn scrubbed_keys(value: &serde_json::Value) -> Vec<String> {
     value
         .as_object()
-        .map(|object| object.keys().map(|key| scrub_line(key)).collect())
+        .map(|object| object.keys().map(|key| scrub_name(key)).collect())
         .unwrap_or_default()
 }
 
@@ -733,6 +733,29 @@ fn scrub_line(line: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A file or key name with every token-like run replaced by `[redacted]`. A
+/// run is a stretch of token-alphabet characters, so a token joined to other
+/// text by a character outside the alphabet, as in `credential:gho_...`, is
+/// found inside the name.
+fn scrub_name(name: &str) -> String {
+    let in_alphabet = |c: char| c.is_ascii_alphanumeric() || "-_.+/=".contains(c);
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while !rest.is_empty() {
+        let split = rest
+            .find(|c: char| in_alphabet(c) != in_alphabet(rest.chars().next().unwrap_or(' ')))
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(split);
+        if run.starts_with(in_alphabet) && looks_secret(run) {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        rest = tail;
+    }
+    out
 }
 
 /// Whether a token looks like a secret: a JWT or an API key by its prefix, or

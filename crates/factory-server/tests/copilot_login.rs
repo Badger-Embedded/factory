@@ -208,6 +208,13 @@ async fn directory_names_that_look_like_tokens_are_redacted_in_both_listings() {
         let home = harness.spawner.homes()[0].clone();
         let inner = "ghu_innerabcdefghijklmnopqrstuvwxyz0123";
         std::fs::write(home.join(TOKEN), "").unwrap();
+        std::fs::write(home.join(format!("credential:{TOKEN}")), "").unwrap();
+        std::fs::create_dir(home.join(format!("dir:{TOKEN}"))).unwrap();
+        std::fs::write(
+            home.join(format!("dir:{TOKEN}")).join(format!("x:{inner}")),
+            "",
+        )
+        .unwrap();
         std::fs::create_dir(home.join("logs")).unwrap();
         std::fs::write(home.join("logs").join(inner), "").unwrap();
         std::fs::create_dir(home.join(format!("{inner}-dir"))).unwrap();
@@ -216,6 +223,11 @@ async fn directory_names_that_look_like_tokens_are_redacted_in_both_listings() {
         let failed = harness.poll_fragment("could not store a token").await;
         assert!(failed.contains("[redacted]"), "{failed}");
         assert!(failed.contains("logs/ [[redacted]]"), "{failed}");
+        assert!(failed.contains("credential:[redacted]"), "{failed}");
+        assert!(
+            failed.contains("dir:[redacted]/ [x:[redacted]]"),
+            "{failed}"
+        );
         assert!(!failed.contains(TOKEN), "{failed}");
         assert!(!failed.contains("ghu_inner"), "{failed}");
     }
