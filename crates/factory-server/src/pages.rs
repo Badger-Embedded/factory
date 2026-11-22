@@ -203,10 +203,6 @@ pub fn index(
     )
 }
 
-/// A one-line ask for the browser's notification permission. It sits outside
-/// the polled regions and stays hidden until the script finds the API present
-/// and the permission still `default`, so it never shows once the user has
-/// answered. Without JavaScript it does not show at all.
 fn permission_bar() -> Markup {
     html! {
         div.card #permission-bar hidden {
@@ -3508,9 +3504,6 @@ fn status(job: &Job, auto_merge: bool) -> Status {
     Status { lane, class, text }
 }
 
-/// Why a job needs its requester, as the notification endpoint reports it:
-/// `needs-you` for the board's Needs you section, `failed` for a failed job
-/// that is not dismissed. It reads the same `status` as the board.
 pub fn attention(job: &Job, auto_merge: bool) -> Option<&'static str> {
     match status(job, auto_merge).lane {
         Lane::You => Some("needs-you"),
@@ -3519,7 +3512,6 @@ pub fn attention(job: &Job, auto_merge: bool) -> Option<&'static str> {
     }
 }
 
-/// The request's first line, cut to 80 characters, as the board titles a job.
 pub fn job_title(job: &Job) -> String {
     first_line(job.request())
 }

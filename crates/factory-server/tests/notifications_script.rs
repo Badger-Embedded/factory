@@ -3,8 +3,6 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// Runs `static/notifications.js` against a fake browser: one poll per entry
-/// of the response list, with `localStorage` carried across them.
 const HARNESS: &str = r#"
 const fs = require("fs");
 const [path, permission, responses] = process.argv.slice(1);
@@ -101,4 +99,75 @@ fn nothing_shows_without_permission_or_when_disabled() {
         &[on(&[]), serde_json::json!({"enabled": false, "items": []})],
     );
     assert_eq!(off["shown"].as_array().unwrap().len(), 0);
+}
+
+const TABS: &str = r#"
+const fs = require("fs");
+const [path, seedKey] = process.argv.slice(1);
+const shown = [];
+const storage = { "factory.notified": seedKey };
+global.localStorage = {
+  getItem: (k) => (k in storage ? storage[k] : null),
+  setItem: (k, v) => { storage[k] = v; },
+};
+function Notification(title, options) { shown.push({ title, ...options }); }
+Notification.permission = "granted";
+global.window = { Notification, focus() {}, open() {} };
+global.Notification = Notification;
+let tail = Promise.resolve();
+const lock = { request: (name, task) => { const run = tail.then(task); tail = run.catch(() => {}); return run; } };
+Object.defineProperty(global, "navigator", { value: { locks: lock }, configurable: true });
+const requests = [];
+global.fetch = () => new Promise((resolve) => requests.push(resolve));
+const ticks = [];
+global.setInterval = (fn) => { ticks.push(fn); return 0; };
+const code = fs.readFileSync(path, "utf8");
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+const reply = (items) => ({ ok: true, json: () => Promise.resolve({ enabled: true, items }) });
+const item = (n) => ({ key: "1:" + n, job: 1, title: "t", kind: "needs-you", url: "/jobs/1" });
+(async () => {
+  new Function(code)();
+  new Function(code)();
+  await tick();
+  const started = requests.length;
+  ticks[0]();
+  await tick();
+  const overlapping = requests.length;
+  requests.shift()(reply([item(5)]));
+  await tick();
+  await tick();
+  const second = requests.length;
+  requests.shift()(reply([item(6)]));
+  await tick();
+  await tick();
+  console.log(JSON.stringify({ started, overlapping, second, shown, stored: storage["factory.notified"] }));
+})();
+"#;
+
+#[test]
+fn tabs_fetch_in_turn_so_an_older_response_cannot_roll_the_keys_back() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static/notifications.js");
+    let output = Command::new("node")
+        .args(["-e", TABS])
+        .arg(script)
+        .arg("[]")
+        .output()
+        .expect("node runs; the dev shell provides it");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(out["started"], 1);
+    assert_eq!(out["overlapping"], 1);
+    assert_eq!(out["second"], 1);
+    let tags: Vec<_> = out["shown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|note| note["tag"].as_str().unwrap())
+        .collect();
+    assert_eq!(tags, ["1:5", "1:6"]);
+    assert_eq!(out["stored"], "[\"1:6\"]");
 }

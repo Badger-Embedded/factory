@@ -483,9 +483,6 @@ async fn index(
     ))
 }
 
-/// What `static/notifications.js` polls: whether the login wants browser
-/// notifications and the jobs it requested that need it, from one job list.
-/// Only a project the login still collaborates on counts, as on the board.
 async fn notifications(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -504,16 +501,14 @@ async fn notifications(
             state.store.project_auto_merge(&name, default)?,
         );
     }
-    let events = state.store.latest_event_ids()?;
     let items: Vec<_> = state
         .store
-        .list()?
+        .list_with_latest_event()?
         .iter()
-        .filter(|row| row.requested_by == login)
-        .filter_map(|row| {
+        .filter(|(row, _)| row.requested_by == login)
+        .filter_map(|(row, event)| {
             let merge = *auto_merge.get(&row.project)?;
             let kind = pages::attention(&row.job, merge)?;
-            let event = events.get(&row.id).copied().unwrap_or(0);
             Some(serde_json::json!({
                 "key": format!("{}:{event}", row.id),
                 "job": row.id,

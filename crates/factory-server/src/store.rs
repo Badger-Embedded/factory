@@ -597,17 +597,26 @@ impl Store {
         rows.map(|row| parse_row(row?)).collect()
     }
 
-    /// The id of the latest `job_events` row of each job that has one, in one
-    /// query. It changes whenever the job changes state.
+    /// All jobs, newest first, each with the id of its latest `job_events`
+    /// row, or 0 when it has none. One statement reads both, so a job's state
+    /// and its event id always match.
     ///
     /// # Errors
     ///
-    /// Fails on a database error.
-    pub fn latest_event_ids(&self) -> Result<HashMap<i64, i64>, StoreError> {
+    /// Fails on a database error or a stored job that does not parse.
+    pub fn list_with_latest_event(&self) -> Result<Vec<(JobRow, i64)>, StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT job_id, MAX(id) FROM job_events GROUP BY job_id")?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut stmt = conn.prepare(
+            "SELECT id, project, requested_by, created_at, job,
+                    COALESCE((SELECT MAX(id) FROM job_events WHERE job_id = jobs.id), 0)
+             FROM jobs ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((raw_row(row)?, row.get::<_, i64>(5)?)))?;
+        rows.map(|row| {
+            let (raw, event) = row?;
+            Ok((parse_row(raw)?, event))
+        })
+        .collect()
     }
 
     /// The ids of jobs created more than `days` days ago.

@@ -9781,3 +9781,26 @@ async fn the_board_asks_for_permission_only_while_notifications_are_on() {
             .contains("Get a browser notification when a job needs you")
     );
 }
+
+#[tokio::test]
+async fn the_job_list_pairs_each_job_with_its_latest_event() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    to_spec_approval(&dashboard, first);
+    let rows = dashboard.store.list_with_latest_event().unwrap();
+    assert_eq!(rows.len(), 2);
+    let (newer, newer_event) = &rows[0];
+    let (older, older_event) = &rows[1];
+    assert_eq!((newer.id, older.id), (second, first));
+    assert!(*older_event > *newer_event);
+    let before = *older_event;
+
+    dashboard.apply(first, Event::Approve);
+    let rows = dashboard.store.list_with_latest_event().unwrap();
+    assert!(rows[1].1 > before);
+    assert_eq!(
+        rows[1].0.job.stage(),
+        dashboard.store.get(first).unwrap().job.stage()
+    );
+}

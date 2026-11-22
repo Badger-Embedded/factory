@@ -1,10 +1,8 @@
 (function () {
-  // Shows a browser notification for each job of the user that needs them or
-  // failed. The server lists such jobs with a key that changes on every new
-  // event, and the keys already shown live in localStorage, so a reload or a
-  // second tab does not repeat one.
   if (!("Notification" in window)) return;
   var STORE = "factory.notified";
+  var LOCK = "factory-notifications";
+  var pending = false;
 
   function stored() {
     try {
@@ -28,9 +26,8 @@
     };
   }
 
-  function poll() {
-    if (Notification.permission !== "granted") return;
-    fetch("/notifications", { headers: { Accept: "application/json" } })
+  function fetchAndShow() {
+    return fetch("/notifications", { headers: { Accept: "application/json" } })
       .then(function (response) {
         return response.ok ? response.json() : null;
       })
@@ -42,14 +39,30 @@
         data.items.forEach(function (item) {
           if (seen.indexOf(item.key) === -1 && !first) show(item);
         });
-        var keys = data.items.map(function (item) {
-          return item.key;
-        });
         try {
-          localStorage.setItem(STORE, JSON.stringify(keys));
+          localStorage.setItem(
+            STORE,
+            JSON.stringify(
+              data.items.map(function (item) {
+                return item.key;
+              })
+            )
+          );
         } catch (e) {}
       })
       .catch(function () {});
+  }
+
+  function poll() {
+    if (pending || Notification.permission !== "granted") return;
+    pending = true;
+    var done = function () {
+      pending = false;
+    };
+    var run = navigator.locks
+      ? navigator.locks.request(LOCK, fetchAndShow)
+      : fetchAndShow();
+    run.then(done, done);
   }
 
   poll();
