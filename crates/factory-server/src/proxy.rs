@@ -313,15 +313,32 @@ pub fn proxy_app(
     upstreams: Arc<dyn Upstreams>,
     report: ProxyEventFn,
 ) -> Router {
+    proxy_app_with_roots(tokens, upstreams, report, Vec::new())
+}
+
+/// As [`proxy_app`], with `roots` trusted next to the built-in roots, for an
+/// upstream whose certificate is not from a public CA.
+///
+/// # Panics
+///
+/// As [`proxy_app`].
+pub fn proxy_app_with_roots(
+    tokens: Arc<RunTokens>,
+    upstreams: Arc<dyn Upstreams>,
+    report: ProxyEventFn,
+    roots: Vec<reqwest::Certificate>,
+) -> Router {
     // No redirect is followed, so a 3xx cannot carry the project's headers to
     // another host; it is returned to the worker as-is. A connect timeout
     // bounds the wait to reach a server; there is no total timeout, so a
     // streaming response may stay open as long as the run.
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .expect("build the MCP proxy HTTP client");
+        .connect_timeout(CONNECT_TIMEOUT);
+    for root in roots {
+        builder = builder.add_root_certificate(root);
+    }
+    let client = builder.build().expect("build the MCP proxy HTTP client");
     let state = ProxyState {
         tokens,
         upstreams,

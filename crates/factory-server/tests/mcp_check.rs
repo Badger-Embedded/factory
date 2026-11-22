@@ -1,11 +1,12 @@
 //! Tests for the real MCP connection check client, [`HttpMcpChecker`]. A local
 //! fake MCP server stands in for a real one, so the tests reach only
-//! `127.0.0.1` and open no outside connection. The checker connects over plain
-//! HTTP; production uses the same code path against an `https` server, the way
-//! `tests/proxy.rs` does.
+//! `127.0.0.1` and open no outside connection. Most tests connect over plain
+//! HTTP. One serves TLS with a test CA to check `FACTORY_MCP_CA_FILE`'s roots.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod support;
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -505,4 +506,25 @@ async fn a_tools_list_error_fails_the_listing_without_header_values() {
     assert!(reason.contains("-32603"), "{reason}");
     assert!(reason.contains("[redacted]"), "{reason}");
     assert!(!reason.contains("sk-secret-123"), "{reason}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_https_server_passes_only_with_its_ca_as_an_extra_root() {
+    let app = Router::new()
+        .route("/mcp", any(mcp_json))
+        .with_state(Arc::new(Fake::default()));
+    let tls = support::serve_tls(app).await;
+    let url = format!("{}/mcp", tls.base);
+
+    let without = HttpMcpChecker::new().check(&url, Vec::new()).await;
+    assert!(
+        without == CheckOutcome::Unreachable,
+        "an unknown CA is not trusted: {without:?}",
+    );
+
+    let roots = reqwest::Certificate::from_pem_bundle(tls.ca_pem.as_bytes()).unwrap();
+    let with = HttpMcpChecker::with_roots(roots)
+        .check(&url, Vec::new())
+        .await;
+    assert!(matches!(with, CheckOutcome::Ok { .. }), "{with:?}");
 }

@@ -9,9 +9,27 @@ use factory_server::{
     LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin,
     Projects, ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
     StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
-    master_key_from_env, parse_admins, proxy_app,
+    master_key_from_env, parse_admins, proxy_app_with_roots,
 };
 use tokio::sync::Notify;
+
+/// The extra root certificates from the PEM file `FACTORY_MCP_CA_FILE`, or none
+/// when it is unset or empty. The path is used exactly as set. A file that cannot be read or holds no valid
+/// certificate fails startup, so a typo does not leave a server untrusted.
+fn mcp_roots() -> Result<Vec<reqwest::Certificate>, Box<dyn Error>> {
+    let Some(path) = env::var_os("FACTORY_MCP_CA_FILE").filter(|path| !path.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let shown = path.to_string_lossy();
+    let pem = std::fs::read(&path)
+        .map_err(|err| format!("FACTORY_MCP_CA_FILE {shown}: cannot read: {err}"))?;
+    let roots = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|err| format!("FACTORY_MCP_CA_FILE {shown}: invalid PEM: {err}"))?;
+    if roots.is_empty() {
+        return Err(format!("FACTORY_MCP_CA_FILE {shown}: no certificate found").into());
+    }
+    Ok(roots)
+}
 
 fn path_var(name: &str, default: &str) -> PathBuf {
     env::var_os(name).map_or_else(|| PathBuf::from(default), PathBuf::from)
@@ -40,6 +58,7 @@ async fn start_mcp_proxy(
     store: Arc<Store>,
     secrets: Arc<dyn SecretStore>,
     warnings: Arc<McpWarnings>,
+    roots: Vec<reqwest::Certificate>,
 ) -> Result<Arc<RunTokens>, Box<dyn Error>> {
     let run_tokens = Arc::new(RunTokens::new());
     let upstreams: Arc<dyn Upstreams> = Arc::new(StoreUpstreams::new(store, secrets));
@@ -61,7 +80,7 @@ async fn start_mcp_proxy(
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("MCP proxy listening on http://{listen}");
-    let app = proxy_app(Arc::clone(&run_tokens), upstreams, report);
+    let app = proxy_app_with_roots(Arc::clone(&run_tokens), upstreams, report, roots);
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::error!("the MCP proxy stopped: {err}");
@@ -206,11 +225,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // credential never enters a worker. It listens on its own port, separate
     // from the dashboard, and honours per-run tokens held only in memory. No
     // token exists until a run issues one, so every request before that is 401.
+    let mcp_roots = mcp_roots()?;
     let run_tokens = start_mcp_proxy(
         &proxy_listen,
         Arc::clone(&store),
         Arc::clone(&secrets),
         Arc::clone(&mcp_warnings),
+        mcp_roots.clone(),
     )
     .await?;
 
@@ -261,7 +282,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // The per-project MCP connection check uses a real HTTP client that follows
     // no redirect and bounds the wait, the same way the proxy's client does.
-    let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::new());
+    let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::with_roots(mcp_roots));
 
     let device_login = codex_device_login(&secrets, worker_network.clone(), &data_dir);
     let copilot_login = copilot_device_login(&secrets, worker_network.clone(), &data_dir);

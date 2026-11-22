@@ -33,3 +33,6 @@ http-body-util = "0.1.5"
 scraper = "0.23.1"
 tokio-stream = "0.1.17"
 tower = { version = "0.5.3", features = ["util"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+rcgen = "0.13"
+tokio-rustls = "0.26"
