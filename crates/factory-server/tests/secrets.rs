@@ -411,10 +411,6 @@ fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
         .set_copilot_token("gho_copilottoken")
         .expect("set copilot token");
 
-    // Read every reserved row's raw bytes, then plant each one in each of the
-    // other three rows and confirm it fails to decrypt there. Every ordered pair
-    // among the three rows is covered, so a ciphertext cannot be moved in any
-    // direction.
     let raw = |reference| {
         store
             .get_secret(reference)
@@ -661,6 +657,15 @@ fn validate_copilot_token_refuses_classic_unknown_and_empty() {
     assert_eq!(
         validate_copilot_token("  \n"),
         Err(CopilotTokenError::Empty)
+    );
+}
+
+#[test]
+fn validate_copilot_token_explains_a_prefix_without_a_value() {
+    let err = validate_copilot_token("gho_").expect_err("prefix only");
+    assert_eq!(
+        err.to_string(),
+        "the Copilot token must start with gho_, ghu_ or github_pat_ and have a value after the prefix",
     );
 }
 

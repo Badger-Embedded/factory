@@ -30,7 +30,7 @@ impl fmt::Display for CopilotTokenError {
             ),
             CopilotTokenError::UnknownFormat => write!(
                 f,
-                "the Copilot token must start with gho_, ghu_ or github_pat_"
+                "the Copilot token must start with gho_, ghu_ or github_pat_ and have a value after the prefix"
             ),
         }
     }

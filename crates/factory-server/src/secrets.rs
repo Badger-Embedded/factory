@@ -232,10 +232,6 @@ const CODEX_AUTH_REF: SecretRef<'static> = SecretRef {
     header: "codex-auth",
 };
 
-/// The `secrets` row that holds the account-wide Copilot token. Like
-/// [`CLAUDE_TOKEN_REF`] its `server` is empty, so deleting any MCP server,
-/// including one named `copilot`, never matches it. Its `header` differs from
-/// the Claude and Codex rows', so the reserved rows never collide.
 const COPILOT_TOKEN_REF: SecretRef<'static> = SecretRef {
     project: "",
     server: "",
@@ -554,10 +550,6 @@ const CLAUDE_TOKEN_AAD: &[u8] = b"factory:claude-token:v1";
 /// name's length, so it can never equal an MCP row's associated data.
 const CODEX_AUTH_AAD: &[u8] = b"factory:codex-auth:v1";
 
-/// The associated data bound into the Copilot token ciphertext. It is a fixed
-/// domain tag distinct from [`CLAUDE_TOKEN_AAD`] and [`CODEX_AUTH_AAD`] and
-/// from the length-framed triple [`associated_data`] builds, so a ciphertext
-/// moved between any two of these rows fails to decrypt in either direction.
 const COPILOT_TOKEN_AAD: &[u8] = b"factory:copilot-token:v1";
 
 /// Why a pasted or captured file was refused as a Codex subscription login.
