@@ -7,6 +7,7 @@
 //! e2e_fixture project --db P --name N --login L [--login L ...]
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
 //! e2e_fixture apply --db P --job ID --event start|approve|cancel
+//! e2e_fixture log --db P --job ID --text TEXT [--count N]
 //! ```
 //!
 //! `job` prints the new job's id.
@@ -196,6 +197,14 @@ fn main() -> Result<()> {
         }
         "apply" => {
             store.apply(one("job")?.parse()?, event_named(one("event")?)?)?;
+        }
+        "log" => {
+            let job = one("job")?.parse()?;
+            let text = one("text")?;
+            let count: usize = flags.get("count").map_or(Ok(1), |v| v[0].parse())?;
+            for n in 1..=count {
+                store.append_factory_log(job, &format!("{text} {n}"))?;
+            }
         }
         other => return Err(format!("unknown subcommand {other}").into()),
     }
