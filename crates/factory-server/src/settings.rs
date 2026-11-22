@@ -20,6 +20,12 @@ pub struct Settings {
     /// The default gates. Onboarding a project copies them into the project's
     /// own gates, and a job copies its project's gates when it is created.
     pub gates: Gates,
+    /// Times the factory reruns failed CI on a Renovate pull request's head
+    /// commit before it asks an agent. 0 sends the first failure to the agent.
+    pub renovate_auto_reruns: u32,
+    /// Reruns one head commit gets before the factory stops triage. At least 1
+    /// and at least `renovate_auto_reruns`.
+    pub renovate_total_reruns: u32,
 }
 
 impl Default for Settings {
@@ -31,6 +37,8 @@ impl Default for Settings {
             worker_cpus: "4".into(),
             poll_seconds: 60,
             gates: Gates::default(),
+            renovate_auto_reruns: 3,
+            renovate_total_reruns: 7,
         }
     }
 }

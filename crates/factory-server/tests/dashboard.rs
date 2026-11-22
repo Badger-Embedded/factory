@@ -9490,6 +9490,7 @@ const ADMIN_ROUTES: &[&str] = &[
     "/settings/workers",
     "/settings/gates",
     "/settings/github",
+    "/settings/renovate",
     "/settings/claude",
     "/settings/agents/claude",
     "/settings/agents/claude/token",
@@ -9544,12 +9545,63 @@ async fn an_admin_opens_the_factory_settings_pages_and_sees_their_groups() {
         "/settings/workers",
         "/settings/gates",
         "/settings/github",
+        "/settings/renovate",
         "/settings/agents/codex",
         "/settings/mcp",
     ] {
         let reply = dashboard.get_as("boss@example.com", uri).await;
         assert_eq!(reply.status, StatusCode::OK, "GET {uri}");
         assert!(reply.body.contains("Integrations"), "{uri}");
+        assert!(reply.body.contains("href=\"/settings/renovate\""), "{uri}");
+    }
+    let body = dashboard
+        .get_as("boss@example.com", "/settings/renovate")
+        .await
+        .body;
+    assert!(body.contains("name=\"auto_reruns\""));
+    assert!(body.contains("value=\"3\""));
+    assert!(body.contains("value=\"7\""));
+    let other = dashboard.get_as(USER, "/settings/projects/maestro").await.body;
+    assert!(!other.contains("/settings/renovate"));
+}
+
+#[tokio::test]
+async fn an_admin_saves_the_renovate_limits() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    let reply = dashboard
+        .post_as(
+            "boss@example.com",
+            "/settings/renovate",
+            "auto_reruns=0&total_reruns=2",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    let settings = dashboard.store.settings().unwrap();
+    assert_eq!(settings.renovate_auto_reruns, 0);
+    assert_eq!(settings.renovate_total_reruns, 2);
+}
+
+#[tokio::test]
+async fn the_renovate_page_refuses_bad_limits_and_stores_nothing() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    let before = dashboard.store.settings().unwrap();
+    for form in [
+        "auto_reruns=0&total_reruns=0",
+        "auto_reruns=4&total_reruns=3",
+        "auto_reruns=x&total_reruns=3",
+        "auto_reruns=2.5&total_reruns=7",
+        "auto_reruns=1&total_reruns=2.5",
+        "auto_reruns=-1&total_reruns=3",
+        "auto_reruns=&total_reruns=",
+    ] {
+        let reply = dashboard
+            .post_as("boss@example.com", "/settings/renovate", form)
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{form}");
+        assert!(reply.body.contains("card failed"), "{form}");
+        assert!(!reply.body.contains("Saved."), "{form}");
+        assert_eq!(dashboard.store.settings().unwrap(), before, "{form}");
     }
 }
 
