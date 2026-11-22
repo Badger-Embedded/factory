@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -2172,7 +2174,7 @@ async fn the_job_page_links_the_project_to_its_repository() {
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(
         page.body
-            .contains(r#"<a href="https://github.com/Badger-Embedded/maestro">maestro</a>"#)
+            .contains(r#"<a href="https://github.com/Badger-Embedded/maestro" target="_blank" rel="noopener noreferrer">maestro</a>"#)
     );
 }
 
@@ -2199,8 +2201,26 @@ async fn the_job_page_links_a_numbered_pull_request() {
         page.body
             .contains(r#"<a href="https://github.com/Badger-Embedded/maestro/pull/7" target="_blank" rel="noopener noreferrer">#7</a>"#)
     );
-    assert_eq!(page.body.matches("target=").count(), 1);
-    assert_eq!(page.body.matches("noopener").count(), 1);
+    assert_eq!(page.body.matches("target=").count(), 2);
+    assert_eq!(page.body.matches("noopener noreferrer").count(), 2);
+
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert!(fragment.body.contains(
+        r#"<a href="https://github.com/Badger-Embedded/maestro/pull/7" target="_blank" rel="noopener noreferrer">#7</a>"#
+    ));
+}
+
+#[tokio::test]
+async fn external_links_open_in_a_new_tab_and_internal_links_do_not() {
+    let dashboard = dashboard();
+    let id = with_plan(&dashboard, vec![planned("x", Some(7))]).await;
+
+    support::check_link_targets(&dashboard.get("/").await.body);
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert_eq!(support::check_link_targets(&page.body), 2);
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await;
+    assert!(support::check_link_targets(&fragment.body) >= 1);
+    support::check_link_targets(&dashboard.settings_pages().await);
 }
 
 #[tokio::test]

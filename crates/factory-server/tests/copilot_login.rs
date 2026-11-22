@@ -1,3 +1,5 @@
+mod support;
+
 #[path = "support/copilot_harness.rs"]
 mod harness;
 
@@ -28,7 +30,10 @@ async fn the_url_and_code_show_without_color_codes_then_the_token_is_stored() {
     assert_eq!(start.headers["location"], "/settings/agents/copilot");
 
     let waiting = harness.poll_fragment("1234-5678").await;
-    assert!(waiting.contains("https://github.com/login/device"));
+    assert!(waiting.contains(
+        r#"<a href="https://github.com/login/device" target="_blank" rel="noopener noreferrer">"#
+    ));
+    assert_eq!(support::check_link_targets(&waiting), 1);
     assert!(!waiting.contains("94m"));
     assert_eq!(harness.spawner.spawned(), ["factory-copilot-login"]);
 
