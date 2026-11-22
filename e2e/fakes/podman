@@ -1,7 +1,35 @@
 #!/usr/bin/env bash
 # Stands in for podman. The browser tests never start a container.
-if [ "$1" = rm ]; then
-  exit 0
-fi
+#
+# `rm --force --ignore NAME` kills the fake login `NAME` started, if any.
+# `run ... --name NAME ... IMAGE codex|copilot login ...` acts out a device
+# login: it prints a URL and a code, then waits until `rm` kills it. The pid file
+# sits in the working directory, which is the server's own temporary directory.
+case "$1" in
+  rm)
+    name="${*: -1}"
+    pidfile="$PWD/.fake-podman-$name.pid"
+    if [ -f "$pidfile" ]; then
+      kill "$(cat "$pidfile")" 2>/dev/null
+      rm -f "$pidfile"
+    fi
+    exit 0
+    ;;
+  run)
+    name=
+    previous=
+    for arg in "$@"; do
+      [ "$previous" = --name ] && name="$arg"
+      previous="$arg"
+    done
+    case " $* " in
+      *" codex login "* | *" copilot login "*)
+        echo $$ >"$PWD/.fake-podman-$name.pid"
+        echo "Open https://github.com/login/device and enter ABCD-EFGH"
+        exec sleep 600
+        ;;
+    esac
+    ;;
+esac
 echo "fake podman: no response is set up for: $*" >&2
 exit 1
