@@ -95,14 +95,13 @@ const respond = (request, snapshot, items) =>
 storage["factory.notified.seed"] = JSON.stringify({ snapshot: [1, 0], keys: [] });
 new Function(code)();
 new Function(code)();
-const [first, second] = requests.splice(0);
-respond(first, [1, 1], [item(1)]);
+const [tabOneFirstPoll, tabTwoPoll] = requests.splice(0);
+respond(tabOneFirstPoll, [1, 1], [item(1)]);
 ticks[0]();
-const [third] = requests.splice(0);
-// The second tab reads the first tab's entry at snapshot 1. Before it
-// stores, the first tab stores snapshot 6. The second tab's response is older.
-global.afterRead = () => respond(third, [1, 6], [item(6)]);
-respond(second, [1, 5], [item(5)]);
+const [tabOneSecondPoll] = requests.splice(0);
+const tabOneStoresSnapshot6 = () => respond(tabOneSecondPoll, [1, 6], [item(6)]);
+global.afterRead = tabOneStoresSnapshot6;
+respond(tabTwoPoll, [1, 5], [item(5)]);
 const afterRace = latest();
 ticks[0]();
 respond(requests.shift(), [1, 7], [item(6)]);
