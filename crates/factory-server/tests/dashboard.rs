@@ -3675,8 +3675,6 @@ async fn the_form_has_the_paste_script_and_a_thumbnail_list() {
     assert!(page.body.contains("text files or ZIP archives"));
 }
 
-// Firefox hid the row on mousedown over the label, because a label cannot
-// take focus. A focusable row keeps `:focus-within` matching.
 #[tokio::test]
 async fn a_press_in_the_composer_attachment_row_keeps_the_form_open() {
     let dashboard = dashboard();
