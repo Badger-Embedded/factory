@@ -952,11 +952,12 @@ impl GitHub {
     }
 
     /// The patch GitHub reports for `path` between the refs `from` and `to`,
-    /// or `None` when a ref is unknown or the file did not change.
+    /// or `None` when the file did not change.
     ///
     /// # Errors
     ///
-    /// Returns gh's message when the call fails for another reason, when its
+    /// Returns an error naming the refs when GitHub does not know one of them,
+    /// gh's message when the call fails for another reason, when its
     /// output does not parse, or when the comparison lists the most files
     /// GitHub shows and `path` is not among them.
     pub async fn compare_patch(
@@ -974,7 +975,11 @@ impl GitHub {
             .await
         {
             Ok(out) => out,
-            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) if is_not_found(&err) => {
+                return Err(format!(
+                    "compare {from}...{to} is not a valid comparison in {repo}"
+                ));
+            }
             Err(err) => return Err(err),
         };
         let compare: CompareJson =

@@ -274,6 +274,7 @@ fn gh_executor(
              \"pr view\") cat '{}';;\n\
              \"pr diff\") if [ -f '{diff}' ]; then cat '{diff}'; else head -c {diff_bytes} /dev/zero | tr '\\0' x; fi;;\n\
              \"api --method\") echo '{{\"content\":\"bmFtZQ==\",\"type\":\"file\",\"encoding\":\"base64\"}}';;\n\
+             \"api repos/up/app/compare/nope\"*) echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;\n\
              \"api repos/up/app/compare/\"*) echo '{{\"files\":[{{\"filename\":\"CMakeLists.txt\",\"patch\":\"@@ new\"}}]}}';;\n\
              esac\n",
             calls.display(),
@@ -370,7 +371,7 @@ async fn a_manual_merge_before_any_verdict_takes_the_range_from_the_pull_request
 
 const BUMP_DIFF: &str = "diff --git a/snap/snapcraft.yaml b/snap/snapcraft.yaml\n\
 --- a/snap/snapcraft.yaml\n+++ b/snap/snapcraft.yaml\n@@ -1,3 +1,3 @@\n name: app\n\
--    source-tag: b9692\n+    source-tag: b9716\n";
+-    base: core22\n+    base: core24\n-    source-tag: b9692\n+    source-tag: b9716\n";
 
 #[tokio::test]
 async fn a_manual_merge_without_a_compare_link_takes_the_range_from_the_manifest_diff() {
@@ -390,6 +391,42 @@ async fn a_manual_merge_without_a_compare_link_takes_the_range_from_the_manifest
             .unwrap()
             .contains("repos/up/app/compare/b9692...b9716")
     );
+}
+
+#[tokio::test]
+async fn two_different_version_bumps_in_the_manifest_diff_block_the_analysis() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff = format!("{BUMP_DIFF}-    source-tag: c1\n+    source-tag: c2\n");
+    std::fs::write(dir.path().join("diff.txt"), diff).unwrap();
+    let (podman, _) = gh_executor(dir.path(), &view("h1", "Bumps app.", &[]), 10);
+
+    let err = podman
+        .gather_packaging(packaging_request(None, None))
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("blocked"), "{err}");
+}
+
+#[tokio::test]
+async fn a_comparison_github_rejects_blocks_the_analysis() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, _) = gh_executor(
+        dir.path(),
+        &view(
+            "h1",
+            "[c](https://github.com/up/app/compare/nope...gone)",
+            &[],
+        ),
+        10,
+    );
+
+    let err = podman
+        .gather_packaging(packaging_request(None, None))
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("not a valid comparison"), "{err}");
 }
 
 #[tokio::test]

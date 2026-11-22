@@ -602,45 +602,46 @@ fn compare_range(body: &str, upstream: &str) -> Option<(String, String)> {
     (!from.is_empty() && !to.is_empty()).then(|| (from.to_owned(), to.to_owned()))
 }
 
-/// The old and new version a pull request diff changes in one of the manifest
-/// files: the first removed line followed by an added line that differs in one
-/// token that contains a digit.
+/// Manifest keys that name the upstream source version.
+const VERSION_KEYS: [&str; 4] = ["source-tag", "source-commit", "tag", "commit"];
+
+/// The old and new upstream version a pull request diff changes in the
+/// manifest files, read from a removed and an added line of the same
+/// version key. `None` when no such change exists or when the changes name
+/// more than one pair of versions.
 fn manifest_range(diff: &str, manifest_files: &[String]) -> Option<(String, String)> {
     let mut in_manifest = false;
-    let mut removed: Option<&str> = None;
+    let mut removed: Vec<(String, String)> = Vec::new();
+    let mut found: Vec<(String, String)> = Vec::new();
     for line in diff.lines() {
         if let Some(header) = line.strip_prefix("diff --git ") {
             in_manifest = manifest_files
                 .iter()
                 .any(|path| header.ends_with(&format!(" b/{path}")));
-            removed = None;
+            removed.clear();
         } else if !in_manifest || line.starts_with("---") || line.starts_with("+++") {
         } else if let Some(old) = line.strip_prefix('-') {
-            removed = Some(old);
+            removed.extend(version_field(old));
         } else if let Some(new) = line.strip_prefix('+') {
-            if let Some(range) = removed.take().and_then(|old| changed_version(old, new)) {
-                return Some(range);
+            if let Some((key, to)) = version_field(new)
+                && let Some((_, from)) = removed.iter().find(|(k, v)| *k == key && *v != to)
+            {
+                found.push((from.clone(), to));
             }
         } else {
-            removed = None;
+            removed.clear();
         }
     }
-    None
+    found.dedup();
+    match found.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
-fn changed_version(old: &str, new: &str) -> Option<(String, String)> {
-    let tokens = |line: &'_ str| -> Vec<String> {
-        line.split(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '"' | '\'' | ','))
-            .filter(|token| !token.is_empty())
-            .map(str::to_owned)
-            .collect()
-    };
-    let (old, new) = (tokens(old), tokens(new));
-    if old.len() != new.len() {
-        return None;
-    }
-    let mut changed = old.iter().zip(&new).filter(|(a, b)| a != b);
-    let (from, to) = changed.next()?;
-    (changed.next().is_none() && from.contains(|c: char| c.is_ascii_digit()))
-        .then(|| (from.clone(), to.clone()))
+fn version_field(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+    (VERSION_KEYS.contains(&key) && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
 }
