@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::extract::multipart::{Field, Multipart, MultipartError};
 use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use factory_core::{Event, Gates, Stage};
@@ -61,6 +62,7 @@ struct AppState {
     device_login: Arc<DeviceLogin>,
     onboarding: Arc<tokio::sync::Mutex<()>>,
     copilot_login: Arc<DeviceLogin>,
+    admins: Arc<Vec<String>>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -91,7 +93,24 @@ pub fn app(
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
     copilot_login: Arc<DeviceLogin>,
+    admins: Vec<String>,
 ) -> Router {
+    let state = AppState {
+        store,
+        projects,
+        wake,
+        data_dir,
+        plan_usage,
+        github,
+        slots,
+        secrets,
+        checker,
+        registry,
+        device_login,
+        onboarding: Arc::new(tokio::sync::Mutex::new(())),
+        copilot_login,
+        admins: Arc::new(admins),
+    };
     Router::new()
         .route("/", get(index))
         .route("/fragments/plan-usage", get(plan_usage_fragment))
@@ -122,11 +141,6 @@ pub fn app(
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(settings_home))
-        .route("/settings/workers", get(show_workers).post(save_workers))
-        .route("/settings/gates", get(show_gates).post(save_gates))
-        .route("/settings/github", get(show_github).post(save_github))
-        .route("/settings/claude", get(redirect_claude))
-        .route("/settings/agents/claude", get(show_claude))
         .route(
             "/settings/projects/{name}",
             get(show_project_settings).post(save_project_models),
@@ -140,6 +154,27 @@ pub fn app(
             post(remove_project_collaborator),
         )
         .route("/settings/projects/{project}/remove", post(remove_project))
+        .route(
+            "/settings/projects/{project}/mcp/{server}",
+            get(show_project_mcp).post(save_project_mcp),
+        )
+        .route(
+            "/settings/projects/{project}/mcp/{server}/check",
+            post(check_mcp_server),
+        )
+        .merge(admin_routes(state.clone()))
+        .with_state(state)
+}
+
+/// Every factory-wide settings route sits in this router, behind
+/// `require_admin`, so a route added here cannot skip the admin check.
+fn admin_routes(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/settings/workers", get(show_workers).post(save_workers))
+        .route("/settings/gates", get(show_gates).post(save_gates))
+        .route("/settings/github", get(show_github).post(save_github))
+        .route("/settings/claude", get(redirect_claude))
+        .route("/settings/agents/claude", get(show_claude))
         .route("/settings/agents/claude/token", post(save_claude_token))
         .route(
             "/settings/agents/claude/token/clear",
@@ -168,30 +203,40 @@ pub fn app(
             get(show_mcp_server).post(edit_mcp_server),
         )
         .route("/settings/mcp/{name}/delete", post(delete_mcp_server))
-        .route(
-            "/settings/projects/{project}/mcp/{server}",
-            get(show_project_mcp).post(save_project_mcp),
-        )
-        .route(
-            "/settings/projects/{project}/mcp/{server}/check",
-            post(check_mcp_server),
-        )
         .merge(copilot_routes())
-        .with_state(AppState {
-            store,
-            projects,
-            wake,
-            data_dir,
-            plan_usage,
-            github,
-            slots,
-            secrets,
-            checker,
-            registry,
-            device_login,
-            onboarding: Arc::new(tokio::sync::Mutex::new(())),
-            copilot_login,
-        })
+        .route_layer(middleware::from_fn_with_state(state, require_admin))
+}
+
+/// The admin list used when `FACTORY_ADMINS` is unset.
+pub const DEFAULT_ADMINS: &str = "talhahavadar@hotmail.com";
+
+/// Parses the `FACTORY_ADMINS` value: comma-separated logins, whitespace
+/// trimmed, empty entries dropped. `None` gives `DEFAULT_ADMINS`.
+pub fn parse_admins(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or(DEFAULT_ADMINS)
+        .split(',')
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Refuses a login outside the admin list with 403, before the handler runs.
+async fn require_admin(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if state.admins.contains(&user(request.headers())) {
+        return next.run(request).await;
+    }
+    let status = StatusCode::FORBIDDEN;
+    (
+        status,
+        pages::error(status, "This page is for factory admins."),
+    )
+        .into_response()
 }
 
 fn copilot_routes() -> Router<AppState> {
@@ -1228,6 +1273,7 @@ struct NoticeQuery {
 
 fn settings_nav(state: &AppState, login: &str) -> Result<pages::SettingsNav, StoreError> {
     Ok(pages::SettingsNav {
+        admin: state.admins.iter().any(|admin| admin == login),
         projects: state.store.projects_for(login)?,
         servers: state
             .store

@@ -9,7 +9,7 @@ use factory_server::{
     LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin,
     Projects, ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
     StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
-    master_key_from_env, proxy_app,
+    master_key_from_env, parse_admins, proxy_app,
 };
 use tokio::sync::Notify;
 
@@ -283,6 +283,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             agents,
             device_login,
             copilot_login,
+            parse_admins(env::var("FACTORY_ADMINS").ok().as_deref()),
         ),
     )
     .with_graceful_shutdown(async {

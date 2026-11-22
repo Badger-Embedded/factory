@@ -212,6 +212,18 @@ fn dashboard_with_secrets(
     github: Arc<dyn RepoChecker>,
     secrets: Arc<dyn SecretStore>,
 ) -> Dashboard {
+    // The collaborator-scoping tests read admin pages as these logins.
+    let admins = [USER, STRANGER, MAESTRO_ONLY].map(str::to_owned).to_vec();
+    dashboard_with_admins(store, github, secrets, admins)
+}
+
+/// As [`dashboard_with_secrets`], with the factory admin list given.
+fn dashboard_with_admins(
+    store: Arc<Store>,
+    github: Arc<dyn RepoChecker>,
+    secrets: Arc<dyn SecretStore>,
+    admins: Vec<String>,
+) -> Dashboard {
     for (name, _) in store.list_projects().unwrap() {
         store.add_collaborator(&name, USER, "test").unwrap();
     }
@@ -250,6 +262,7 @@ fn dashboard_with_secrets(
             registry,
             device_login,
             copilot_login,
+            admins,
         ),
         store,
         data,
@@ -2239,6 +2252,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
             Arc::new(NoLogin),
             std::env::temp_dir(),
         )),
+        vec![USER.to_owned()],
     );
     let page = Dashboard {
         store: dashboard.store.clone(),
@@ -9405,4 +9419,122 @@ async fn concurrent_onboarding_of_one_name_cannot_delete_the_new_projects_jobs()
     assert_eq!(second.status, StatusCode::OK);
     assert!(second.body.contains("already exists"));
     assert!(store.get(new).is_ok());
+}
+
+const ADMIN_ROUTES: &[&str] = &[
+    "/settings/workers",
+    "/settings/gates",
+    "/settings/github",
+    "/settings/claude",
+    "/settings/agents/claude",
+    "/settings/agents/claude/token",
+    "/settings/agents/codex",
+    "/settings/agents/codex/auth",
+    "/settings/agents/codex/login",
+    "/settings/agents/codex/prices",
+    "/settings/mcp",
+    "/settings/mcp/anything",
+    "/settings/mcp/anything/delete",
+];
+
+fn admin_dashboard(admins: &[&str]) -> Dashboard {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    dashboard_with_admins(
+        store,
+        Arc::new(FakeRepos::fit()),
+        secrets,
+        admins.iter().map(|login| (*login).to_owned()).collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_login_outside_the_admin_list_gets_403_on_every_factory_settings_route() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    for uri in ADMIN_ROUTES {
+        let reply = dashboard.get_as(USER, uri).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "GET {uri}");
+        assert!(reply.body.contains("This page is for factory admins."));
+        let reply = dashboard.post_as(USER, uri, "name=x").await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "POST {uri}");
+    }
+}
+
+#[tokio::test]
+async fn an_admin_opens_the_factory_settings_pages_and_sees_their_groups() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    for uri in [
+        "/settings/workers",
+        "/settings/gates",
+        "/settings/github",
+        "/settings/agents/codex",
+        "/settings/mcp",
+    ] {
+        let reply = dashboard.get_as("boss@example.com", uri).await;
+        assert_eq!(reply.status, StatusCode::OK, "GET {uri}");
+        assert!(reply.body.contains("Integrations"), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn the_sidebar_hides_the_factory_groups_from_a_non_admin() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    let body = dashboard
+        .get_as(USER, "/settings/projects/maestro")
+        .await
+        .body;
+    for hidden in [
+        "Integrations",
+        "Default gates",
+        ">Agents<",
+        "/settings/workers",
+    ] {
+        assert!(!body.contains(hidden), "{hidden}");
+    }
+    assert!(body.contains("maestro"));
+}
+
+#[tokio::test]
+async fn the_pipeline_panel_links_the_server_registry_only_for_an_admin() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    dashboard
+        .store
+        .add_collaborator("maestro", "boss@example.com", "test")
+        .unwrap();
+    let uri = "/settings/projects/maestro";
+    let admin = dashboard.get_as("boss@example.com", uri).await.body;
+    let other = dashboard.get_as(USER, uri).await.body;
+    assert!(admin.contains("href=\"/settings/mcp\""));
+    assert!(!other.contains("href=\"/settings/mcp"));
+}
+
+#[tokio::test]
+async fn the_admin_list_gets_exactly_the_logins_it_names() {
+    let dashboard = admin_dashboard(&["a@x", "b@y"]);
+    for (login, status) in [
+        ("a@x", StatusCode::OK),
+        ("b@y", StatusCode::OK),
+        ("c@z", StatusCode::FORBIDDEN),
+        ("local", StatusCode::FORBIDDEN),
+    ] {
+        let reply = dashboard.get_as(login, "/settings/workers").await;
+        assert_eq!(reply.status, status, "{login}");
+    }
+}
+
+#[test]
+fn factory_admins_parse_trims_drops_empties_and_defaults() {
+    use factory_server::parse_admins;
+    assert_eq!(parse_admins(None), ["talhahavadar@hotmail.com"]);
+    assert_eq!(parse_admins(Some(" a@x , ,b@y,")), ["a@x", "b@y"]);
+    assert_eq!(parse_admins(Some("")), Vec::<String>::new());
 }

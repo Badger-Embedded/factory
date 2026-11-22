@@ -543,6 +543,8 @@ pub struct AgentNav {
 
 /// What the settings sidebar lists besides its fixed entries.
 pub struct SettingsNav {
+    /// Whether the login is a factory admin, who sees the factory-wide groups.
+    pub admin: bool,
     /// Onboarded project names, in name order.
     pub projects: Vec<String>,
     /// Registered MCP server names, in the registry's order.
@@ -590,24 +592,26 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
     let in_mcp = matches!(current, SettingsPage::Mcp | SettingsPage::McpServer(_));
     html! {
         nav.settings-nav aria-label="Settings" {
-            p.settings-group { "Factory" }
-            (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
-            (entry("/settings/gates".into(), "Default gates", &SettingsPage::Gates))
-            (entry("/settings/github".into(), "GitHub", &SettingsPage::Github))
-            p.settings-group { "Agents" }
-            @for agent in &nav.agents {
-                @match (agent.available, &agent.url) {
-                    (true, Some(url)) => (entry(url.clone(), &agent.name, &SettingsPage::Agent(agent.id.clone()))),
-                    _ => span.settings-link.settings-disabled {
-                        (agent.name)
-                        span.settings-note { "Not available yet" }
-                    },
+            @if nav.admin {
+                p.settings-group { "Factory" }
+                (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
+                (entry("/settings/gates".into(), "Default gates", &SettingsPage::Gates))
+                (entry("/settings/github".into(), "GitHub", &SettingsPage::Github))
+                p.settings-group { "Agents" }
+                @for agent in &nav.agents {
+                    @match (agent.available, &agent.url) {
+                        (true, Some(url)) => (entry(url.clone(), &agent.name, &SettingsPage::Agent(agent.id.clone()))),
+                        _ => span.settings-link.settings-disabled {
+                            (agent.name)
+                            span.settings-note { "Not available yet" }
+                        },
+                    }
                 }
-            }
-            p.settings-group { "Integrations" }
-            a.settings-link href="/settings/mcp" aria-current=[in_mcp.then_some("page")] {
-                "MCP servers"
-                span.settings-count { (nav.servers.len()) }
+                p.settings-group { "Integrations" }
+                a.settings-link href="/settings/mcp" aria-current=[in_mcp.then_some("page")] {
+                    "MCP servers"
+                    span.settings-count { (nav.servers.len()) }
+                }
             }
             p.settings-group { "Projects" }
             @for project in &nav.projects {
@@ -1320,8 +1324,8 @@ pub fn settings_project(
         &html! {
             h1 { (project.name) }
             p.meta { "The path a job takes. Select a stage to set its model, effort and MCP servers, or a ✋ to change that approval gate. " (RUNS_KEEP_VALUES) }
-            (project_form(project, selected))
-            (project_servers_card(project))
+            (project_form(project, selected, nav.admin))
+            (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
                 div.card.failed { (problem) }
             }
@@ -1389,12 +1393,12 @@ fn project_collaborators_card(project: &ProjectSettings) -> Markup {
 
 /// The MCP servers card on a project's page: each server with its state for
 /// this project and a link to the project's page for it.
-fn project_servers_card(project: &ProjectSettings) -> Markup {
+fn project_servers_card(project: &ProjectSettings, admin: bool) -> Markup {
     html! {
         div.card {
             h2 { "MCP servers" }
             @if project.servers.is_empty() {
-                p.meta { "No servers yet. " a href="/settings/mcp" { "Add one" } "." }
+                p.meta { "No servers yet." @if admin { " " a href="/settings/mcp" { "Add one" } "." } }
             }
             @for server in &project.servers {
                 @let on = server.tools.iter().filter(|tool| !tool.disabled).count();
@@ -1437,9 +1441,12 @@ pub fn settings_project_mcp(
             }
             h1 { (server.name) " for " (project) }
             p.meta {
-                "The server's URL and header names are on "
-                a href={ "/settings/mcp/" (crate::web::query_escape(&server.name)) } { "its own page" }
-                ". The values here are this project's alone."
+                @if nav.admin {
+                    "The server's URL and header names are on "
+                    a href={ "/settings/mcp/" (crate::web::query_escape(&server.name)) } { "its own page" }
+                    ". "
+                }
+                "The values here are this project's alone."
             }
             @if !secrets_available {
                 p.hint.bad { "The master key is missing, so header values cannot be saved. The enabled switch, stages and tools still save." }
@@ -1772,7 +1779,7 @@ fn stage_on(stages: McpStages, stage: &str) -> bool {
 /// the one form and only the selected one shows, so a save posts every field
 /// and a hidden panel's values are kept. `SETTINGS_PIPELINE` switches panels
 /// without a reload and keeps the nodes in step with the fields.
-fn project_form(project: &ProjectSettings, selected: PipelinePart) -> Markup {
+fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) -> Markup {
     let name = &project.name;
     let href = |part: PipelinePart| {
         format!(
@@ -1831,7 +1838,7 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart) -> Markup {
                 }
             }
             @for stage in STAGES {
-                (stage_panel(project, stage, selected == PipelinePart::Stage(stage)))
+                (stage_panel(project, stage, selected == PipelinePart::Stage(stage), admin))
             }
             @for (_, gate) in GATE_AFTER {
                 (gate_panel(project, gate, selected == PipelinePart::Gate(gate)))
@@ -1902,7 +1909,7 @@ fn gate_node(project: &ProjectSettings, gate: &str, selected: bool, href: &str) 
     }
 }
 
-fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool) -> Markup {
+fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bool) -> Markup {
     let name = &project.name;
     let model = stage_model(&project.models, stage).unwrap_or_default();
     let effort = stage_effort(&project.efforts, stage);
@@ -1962,7 +1969,7 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool) -> Markup
             div.field {
                 span.label { "MCP servers in this stage" }
                 @if project.servers.is_empty() {
-                    p.hint { "No servers yet. " a href="/settings/mcp" { "Add one" } "." }
+                    p.hint { "No servers yet." @if admin { " " a href="/settings/mcp" { "Add one" } "." } }
                 }
                 @for server in &project.servers {
                     label.check {
