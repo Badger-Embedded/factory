@@ -750,27 +750,16 @@ async fn an_earlier_task_cannot_remove_the_entry_of_its_replacement() {
     assert!(!slots.has_task(7));
 }
 
-fn thread_is_sleeping(stat_path: &str) -> bool {
-    let stat = std::fs::read_to_string(stat_path).unwrap();
-    let after_name = stat.rsplit_once(')').unwrap().1;
-    after_name.trim_start().starts_with('S')
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_registered_while_the_previous_task_ends_keeps_its_entry() {
     let slots = Arc::new(WorkerSlots::new());
     let (go, go_signal) = std::sync::mpsc::channel::<()>();
-    let (at_lock, at_lock_signal) = std::sync::mpsc::channel::<String>();
     let (done, done_signal) = std::sync::mpsc::channel::<()>();
 
     slots.register_task(7, true, |id| {
         let slots = Arc::clone(&slots);
         std::thread::spawn(move || {
             go_signal.recv().unwrap();
-            let thread = std::fs::read_link("/proc/thread-self").unwrap();
-            at_lock
-                .send(format!("/proc/{}/stat", thread.display()))
-                .unwrap();
             slots.finish_task(7, id);
             done.send(()).unwrap();
         });
@@ -779,10 +768,12 @@ async fn a_replacement_registered_while_the_previous_task_ends_keeps_its_entry()
 
     slots.register_task(7, true, |_| {
         go.send(()).unwrap();
-        let stat_path = at_lock_signal.recv_timeout(Duration::from_secs(5)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !thread_is_sleeping(&stat_path) {
-            assert!(Instant::now() < deadline, "the earlier task never blocked");
+        while slots.finishes_that_waited() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the earlier task never waited for the registry"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         tokio::spawn(std::future::pending())

@@ -2,7 +2,8 @@
 //! fills and frees the slots, and the dashboard, which shows them.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinHandle;
@@ -41,6 +42,7 @@ pub struct WorkerSlots {
     /// Slot number to job id and start time.
     slots: Mutex<BTreeMap<usize, (i64, i64)>>,
     tasks: Mutex<Tasks>,
+    finishes_that_waited: AtomicUsize,
     pass: tokio::sync::Mutex<()>,
 }
 
@@ -104,7 +106,14 @@ impl WorkerSlots {
     /// Removes the entry of task `id` once it has finished. An entry that a
     /// stop owns, or that a newer task replaced, stays.
     pub fn finish_task(&self, job_id: i64, id: TaskId) {
-        let mut tasks = self.tasks();
+        let mut tasks = match self.tasks.try_lock() {
+            Ok(tasks) => tasks,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                self.finishes_that_waited.fetch_add(1, Ordering::SeqCst);
+                self.tasks()
+            }
+        };
         if tasks
             .by_job
             .get(&job_id)
@@ -112,6 +121,13 @@ impl WorkerSlots {
         {
             tasks.by_job.remove(&job_id);
         }
+    }
+
+    /// How many times [`Self::finish_task`] found the registry locked and had
+    /// to wait for it.
+    #[must_use]
+    pub fn finishes_that_waited(&self) -> usize {
+        self.finishes_that_waited.load(Ordering::SeqCst)
     }
 
     /// Whether `job_id` still has a task or a stop in progress, so its files
