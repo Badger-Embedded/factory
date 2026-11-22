@@ -1054,18 +1054,22 @@ struct LoginUi {
     base: &'static str,
     id: &'static str,
     button: &'static str,
+    /// The heading when the container exited but nothing was stored.
+    not_stored: &'static str,
 }
 
 const CODEX_LOGIN: LoginUi = LoginUi {
     base: "/settings/agents/codex",
     id: "codex-login",
     button: "Sign in with ChatGPT",
+    not_stored: "The login finished, but the factory could not store the login.",
 };
 
 const COPILOT_LOGIN: LoginUi = LoginUi {
     base: "/settings/agents/copilot",
     id: "copilot-login",
     button: "Sign in with GitHub",
+    not_stored: "The login finished, but the factory could not store a token.",
 };
 
 fn login_fragment(
@@ -1104,8 +1108,14 @@ fn login_fragment(
                         button.primary disabled[!secrets_available] { "Sign in again" }
                     }
                 }
-                LoginView::Failed { reason } => {
-                    p.bad { "The login did not finish." }
+                LoginView::Failed { reason } | LoginView::NotStored { reason } => {
+                    p.bad {
+                        @if matches!(login, LoginView::NotStored { .. }) {
+                            (ui.not_stored)
+                        } @else {
+                            "The login did not finish."
+                        }
+                    }
                     pre.login-reason { (reason) }
                     form method="post" action=(start) {
                         button.primary disabled[!secrets_available] { "Try again" }

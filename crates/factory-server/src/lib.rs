@@ -28,7 +28,7 @@ pub use codex::{CodexLogin, CodexRun};
 pub use copilot::{CopilotTokenError, validate_copilot_token};
 pub use cost::{codex_cost, format_cost, merge_fraction};
 pub use device_login::{
-    DeviceLogin, LoginProcess, LoginSpawner, LoginSpec, LoginView, PodmanLogin,
+    DeviceLogin, LoginProcess, LoginSpawner, LoginSpec, LoginView, PodmanLogin, ReadBackError,
 };
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
