@@ -125,6 +125,9 @@ pub enum Published {
     /// This pull request for the branch was merged before the push, so the
     /// factory pushed nothing.
     AlreadyMerged(u64),
+    /// The branch has no commits after the base branch, so the factory
+    /// pushed nothing and opened no pull request.
+    Empty,
 }
 
 #[allow(
@@ -261,7 +264,9 @@ pub trait Executor: Send + Sync + 'static {
 
     /// Pushes the branch and opens or updates its pull request. When a pull
     /// request for the branch is already merged, it pushes nothing and
-    /// reports that pull request instead.
+    /// reports that pull request instead. When the branch has no commits
+    /// after the base branch, it pushes nothing and reports
+    /// [`Published::Empty`].
     fn publish(
         &self,
         request: PublishRequest,
@@ -864,6 +869,7 @@ impl<E: Executor> Scheduler<E> {
                 job_id,
                 &format!("Pushing {} to {}.", request.branch, request.repo),
             );
+            let (branch, base) = (request.branch.clone(), request.base.clone());
             match scheduler.executor.publish(request).await {
                 Ok(Published::Open(number)) => {
                     scheduler.note(job_id, &format!("Pull request #{number} is up to date."));
@@ -876,6 +882,13 @@ impl<E: Executor> Scheduler<E> {
                     );
                     scheduler.apply(job_id, Event::Published { number });
                     scheduler.apply(job_id, Event::Merged);
+                }
+                Ok(Published::Empty) => {
+                    scheduler.note(
+                        job_id,
+                        &format!("{branch} has no commits after {base}, so there is nothing to publish. The factory skips this pull request."),
+                    );
+                    scheduler.apply(job_id, Event::NothingToPublish);
                 }
                 Err(err) => scheduler.retry_later(&settings, job_id, &err),
             }

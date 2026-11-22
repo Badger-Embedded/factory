@@ -1322,6 +1322,31 @@ async fn a_pull_request_merged_before_the_push_moves_the_job_on() {
 }
 
 #[tokio::test]
+async fn a_branch_with_nothing_to_publish_skips_the_pull_request() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Ok(Published::Empty));
+
+    step(&scheduler).await;
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 1 });
+    assert!(job.is_skipped(0));
+    assert_eq!(job.plan()[0].number, None);
+    let logs = store.logs(id, 10).unwrap();
+    assert!(
+        logs.iter()
+            .any(|line| line.text.contains("nothing to publish")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
 async fn review_comments_reach_the_agent_once() {
     let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
     quick_polls(&store);

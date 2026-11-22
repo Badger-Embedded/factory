@@ -112,6 +112,7 @@ impl Event {
             Event::ReviewFailed { .. } => "review-failed",
             Event::Merged => "merged",
             Event::ClosedUnmerged => "closed-unmerged",
+            Event::NothingToPublish => "nothing-to-publish",
             Event::Cancel => "cancel",
             Event::Retry => "retry",
             Event::Dismiss => "dismiss",

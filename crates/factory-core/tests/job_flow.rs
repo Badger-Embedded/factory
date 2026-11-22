@@ -391,6 +391,72 @@ fn merge_is_rejected_before_the_pull_request_exists() {
 }
 
 #[test]
+fn a_pull_request_with_nothing_to_publish_is_skipped() {
+    let mut job = implementing(&["first", "second", "third"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    apply(&mut job, Event::Merged);
+
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    assert_eq!(job.next_command(), Some(Command::Publish { pr: 1 }));
+    apply(&mut job, Event::NothingToPublish);
+    assert!(job.is_skipped(1));
+    assert!(!job.is_skipped(0));
+    assert_eq!(job.plan()[1].number, None);
+    assert_runs(
+        &job,
+        Session::Pr(2),
+        Task::Implement {
+            pr: planned("third"),
+        },
+    );
+}
+
+#[test]
+fn skipping_the_last_pull_request_finishes_the_job() {
+    let mut job = implementing(&["only"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::NothingToPublish);
+    assert!(job.is_skipped(0));
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert_eq!(job.turn(), &Turn::Done);
+}
+
+#[test]
+fn nothing_to_publish_on_an_open_pull_request_fails_the_job() {
+    let mut job = watching(9);
+    apply(
+        &mut job,
+        Event::ReviewComments {
+            comments: "nit".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    assert_eq!(job.stage(), &Stage::PrOpen { pr: 0 });
+
+    apply(&mut job, Event::NothingToPublish);
+    assert!(!job.is_skipped(0));
+    let Stage::Failed { reason, retry, .. } = job.stage() else {
+        panic!("{:?}", job.stage());
+    };
+    assert!(reason.contains("#9"), "{reason}");
+    assert_eq!(retry, &None);
+}
+
+#[test]
+fn nothing_to_publish_outside_pr_open_is_rejected() {
+    let mut job = implementing(&["only"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    let before = job.clone();
+    assert!(job.apply(Event::NothingToPublish).is_err());
+    assert_eq!(job, before);
+}
+
+#[test]
 fn merging_while_the_agent_fixes_review_comments_moves_on() {
     let mut job = implementing(&["first", "second"]);
     apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));

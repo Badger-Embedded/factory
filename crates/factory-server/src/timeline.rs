@@ -144,6 +144,7 @@ fn note(step: &mut Step, event: &JobEvent) {
         "review-approved" => Some("LLM review approved"),
         "review-changes" => Some("LLM review asked for changes"),
         "review-failed" => Some("LLM review run failed"),
+        "nothing-to-publish" => Some("No commits to publish, so the factory skipped it"),
         "retry" => Some("You retried the job"),
         "cancel" => Some("You cancelled the job"),
         _ => None,
@@ -334,6 +335,7 @@ fn pr_group(
                 span.pr-name {
                     "PR " (pr + 1) " of " (job.plan().len())
                     @if let Some(number) = planned.number { " · #" (number) }
+                    @if job.is_skipped(pr) { " · skipped" }
                 }
                 @if finished {
                     span.when { (duration(seconds)) @if usd > 0.0 { " · " (format_cost(usd)) } }

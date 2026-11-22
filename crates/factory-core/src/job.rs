@@ -65,6 +65,10 @@ pub struct Job {
     /// [`Event::StartReview`]. Recorded on the pass when it ends.
     #[serde(default)]
     review_head: Option<String>,
+    /// The plan indexes of the pull requests the factory skipped because
+    /// their branch had no commits to publish. See [`Event::NothingToPublish`].
+    #[serde(default)]
+    skipped: Vec<usize>,
 }
 
 /// Whether the reviewer has approved the current head of a pull request.
@@ -448,6 +452,12 @@ pub enum Event {
     },
     Merged,
     ClosedUnmerged,
+    /// The pull request's branch has no commits after the base branch, so
+    /// there is nothing to push. This happens when an earlier pull request
+    /// already made the change. A pull request with no number is skipped and
+    /// the job moves on to the next one. An open one fails the job, since
+    /// pushing the empty branch would close it.
+    NothingToPublish,
     Cancel,
     /// Resume a job that failed because it used up its failed rounds or an
     /// agent run failed. See [`Job::can_retry`].
@@ -508,6 +518,7 @@ impl Job {
             review: ReviewState::Pending,
             reviews: Vec::new(),
             review_head: None,
+            skipped: Vec::new(),
         }
     }
 
@@ -559,6 +570,13 @@ impl Job {
     #[must_use]
     pub fn review_state(&self) -> ReviewState {
         self.review
+    }
+
+    /// Whether the factory skipped planned pull request `pr` because its
+    /// branch had nothing to publish.
+    #[must_use]
+    pub fn is_skipped(&self, pr: usize) -> bool {
+        self.skipped.contains(&pr)
     }
 
     /// The review passes so far, oldest first.
@@ -795,6 +813,10 @@ impl Job {
                 self.review = ReviewState::Pending;
                 (S::CiAndReview { pr }, Turn::Factory)
             }
+            (S::PrOpen { pr }, Turn::Factory, E::NothingToPublish) => {
+                let pr = *pr;
+                self.skip(pr)
+            }
             (S::CiAndReview { pr }, Turn::Factory, E::CiFailed { log }) => {
                 self.fail_round(S::CiAndReview { pr: *pr }, Turn::Agent(Task::FixCi { log }))
             }
@@ -821,12 +843,7 @@ impl Job {
             (S::Verifying { .. } | S::PrOpen { .. } | S::CiAndReview { .. }, _, E::Merged)
                 if pr.is_some_and(|pr| self.plan[pr].number.is_some()) =>
             {
-                let next = pr.map_or(0, |pr| pr + 1);
-                if next < self.plan.len() {
-                    self.implement(next)
-                } else {
-                    (S::Merged, Turn::Done)
-                }
+                self.after(pr.unwrap_or(0))
             }
             (
                 S::Verifying { .. } | S::PrOpen { .. } | S::CiAndReview { .. },
@@ -864,6 +881,34 @@ impl Job {
                 pr: self.plan[pr].clone(),
             }),
         )
+    }
+
+    fn skip(&mut self, pr: usize) -> (Stage, Turn) {
+        match self.plan[pr].number {
+            None => {
+                self.skipped.push(pr);
+                self.after(pr)
+            }
+            Some(number) => (
+                Self::failed(
+                    format!(
+                        "the branch of pull request #{number} has no commits after the base \
+                         branch, and pushing it would close the pull request"
+                    ),
+                    None,
+                ),
+                Turn::Done,
+            ),
+        }
+    }
+
+    fn after(&self, pr: usize) -> (Stage, Turn) {
+        let next = pr + 1;
+        if next < self.plan.len() {
+            self.implement(next)
+        } else {
+            (Stage::Merged, Turn::Done)
+        }
     }
 
     fn fail_round(&mut self, stage: Stage, next: Turn) -> (Stage, Turn) {
