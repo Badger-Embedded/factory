@@ -62,7 +62,6 @@ test('a job that starts to need you raises one notification', async ({ page, fac
     '--request',
     'A job the agent is working on',
   );
-  const other = factory.fixture('job', '--project', project, '--stage', 'requested');
   await stubNotification(page, 'granted');
 
   const first = polled(page);
@@ -76,10 +75,9 @@ test('a job that starts to need you raises one notification', async ({ page, fac
     `Job #${id} needs you`,
   ]);
 
-  // An unrelated event moves the snapshot, so a new stored entry shows a poll that still lists the
-  // job was handled.
+  // Every read moves the snapshot, so a new stored entry shows the browser handled another poll
+  // that still lists the job.
   const before = await storedSnapshots(page);
-  factory.fixture('apply', '--job', other, '--event', 'start');
   await expect.poll(() => storedSnapshots(page)).not.toEqual(before);
   expect(await page.evaluate(() => window.__notes.length)).toBe(1);
 });
@@ -150,6 +148,12 @@ test.describe('the notifications page', () => {
       'Browser permission: granted.',
     );
     await expect(permission.getByRole('button')).toBeHidden();
+
+    await toggle.check();
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(page.getByText('Saved.')).toBeVisible();
+    await page.goto('/settings/notifications');
+    await expect(toggle).toBeChecked();
   });
 
   test('the notifications page says when the browser blocks notifications', async ({ page }) => {
