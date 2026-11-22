@@ -521,6 +521,9 @@ pub struct AgentChoice {
     /// The level the panel preselects for this agent when the saved level is not
     /// one of its own.
     pub default_effort: String,
+    /// The model ids the panel suggests for this agent, as chips and as the
+    /// model field's datalist.
+    pub models: Vec<String>,
 }
 
 /// One server's block inside a project's form: whether the project runs it, the
@@ -1828,9 +1831,6 @@ const STAGES: [&str; 5] = ["clarify", "spec", "plan", "implement", "review"];
 /// The gate after each stage that has one.
 const GATE_AFTER: [(&str, &str); 3] =
     [("spec", "spec"), ("plan", "plan"), ("implement", "publish")];
-/// Model aliases the stage panel offers. Any other model ID can be typed.
-const MODEL_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
-
 impl PipelinePart {
     /// The part named by a `?stage=` value. An unknown or missing value
     /// selects the first stage.
@@ -1979,9 +1979,25 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) 
             .collect(),
     )
     .to_string();
+    // Each agent's model suggestions, read by the pipeline script to redraw a
+    // stage's chips, datalist and hint when its agent switches. The CLI is named
+    // by the agent's id.
+    let agent_models = serde_json::Value::Object(
+        project
+            .agents
+            .iter()
+            .map(|choice| {
+                (
+                    choice.id.clone(),
+                    serde_json::json!({ "models": choice.models, "cli": choice.id }),
+                )
+            })
+            .collect(),
+    )
+    .to_string();
     html! {
         form.card.settings-form.pipeline-form method="post" action=(href(selected))
-            data-agent-efforts=(agent_efforts) {
+            data-agent-efforts=(agent_efforts) data-agent-models=(agent_models) {
             input type="hidden" name="gates" value="on";
             @for server in &project.servers {
                 input type="hidden" name={ "mcp." (server.name) ".pipeline" } value="on";
@@ -2025,9 +2041,6 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) 
                     }
                     p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
                 }
-            }
-            datalist #model-aliases {
-                @for alias in MODEL_ALIASES { option value=(alias) {} }
             }
             (save_bar(&format!("Save {name}")))
         }
@@ -2087,6 +2100,11 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bo
     let model = stage_model(&project.models, stage).unwrap_or_default();
     let effort = stage_effort(&project.efforts, stage);
     let agent = stage_agent(&project.agent_selection, stage);
+    let suggestions: &[String] = project
+        .agents
+        .iter()
+        .find(|choice| choice.id == agent)
+        .map_or(&[], |choice| &choice.models);
     html! {
         div.pipe-panel data-panel=(stage) hidden[!selected] {
             h2 { (stage[..1].to_uppercase()) (stage[1..]) " stage" }
@@ -2117,15 +2135,18 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bo
             }
             div.field {
                 label for={ (name) "-" (stage) } { "Model" }
-                div.model-chips {
+                div.model-chips data-model-chips=(stage) data-agent=(agent) {
                     button.chip type="button" data-model="" data-model-for=(stage) { "CLI default" }
-                    @for alias in MODEL_ALIASES {
-                        button.chip type="button" data-model=(alias) data-model-for=(stage) { (alias) }
+                    @for suggestion in suggestions {
+                        button.chip type="button" data-model=(suggestion) data-model-for=(stage) { (suggestion) }
                     }
                 }
-                input id={ (name) "-" (stage) } type="text" name=(stage) list="model-aliases"
+                input id={ (name) "-" (stage) } type="text" name=(stage) list={ "model-suggestions-" (stage) }
                     placeholder="CLI default" value=(model) data-model-input=(stage);
-                p.hint { "An alias or any model ID. Empty runs the model the installed claude CLI picks." }
+                datalist id={ "model-suggestions-" (stage) } {
+                    @for suggestion in suggestions { option value=(suggestion) {} }
+                }
+                p.hint data-model-hint=(stage) { "An alias or any model ID. Empty runs the model the installed " (agent) " CLI picks." }
             }
             div.field {
                 span.label { "Effort" }
