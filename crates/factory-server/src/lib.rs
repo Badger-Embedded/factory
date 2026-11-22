@@ -59,4 +59,4 @@ pub use store::{
 pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;
 pub use web::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, USER_HEADER, app};
-pub use workers::{Slot, WorkerSlots};
+pub use workers::{Slot, TaskId, WorkerSlots};

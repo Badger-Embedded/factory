@@ -1214,9 +1214,31 @@ pub fn settings_project(
                 div.card.failed { (problem) }
             }
             (project_collaborators_card(project))
+            (remove_project_card(project))
             script { (PreEscaped(SETTINGS_PIPELINE)) }
         },
     )
+}
+
+fn remove_project_card(project: &ProjectSettings) -> Markup {
+    html! {
+        form.card.danger-card method="post"
+            action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/remove" } {
+            h2 { "Remove project" }
+            p.hint {
+                "Cancels any running job, which stops its container, and deletes this "
+                "project's settings, its collaborators, its stored MCP header values and the "
+                "cost history of its jobs. The job rows stay until they expire, and open pull "
+                "requests are left alone. This cannot be undone. Type the project name to confirm."
+            }
+            div.row {
+                input.grow type="text" name="confirm" aria-label="Project name"
+                    autocomplete="off" autocapitalize="none" spellcheck="false"
+                    placeholder=(project.name);
+                button.danger { "Remove " (project.name) }
+            }
+        }
+    }
 }
 
 fn project_collaborators_card(project: &ProjectSettings) -> Markup {
@@ -2123,13 +2145,21 @@ pub struct OnboardView<'a> {
 /// flags. The second step appears only after the checks in `report` pass, so
 /// the operator cannot create a project the checks reject. Before the first
 /// submit `report` is `None` and only step 1 shows.
-pub fn onboard(user: &str, view: &OnboardView<'_>, report: Option<&RepoReport>) -> Markup {
+pub fn onboard(
+    user: &str,
+    view: &OnboardView<'_>,
+    report: Option<&RepoReport>,
+    notice: Option<&str>,
+) -> Markup {
     let show_step2 = report.is_some_and(|report| report.errors.is_empty());
     layout(
         user,
         "Onboard a project",
         &html! {
             h1 { "Onboard a project" }
+            @if let Some(notice) = notice {
+                div.card.saved { (notice) }
+            }
             p.meta { "The factory checks the repository as the bot before it creates anything. It creates no project while a required check fails." }
             form.card method="post" action="/onboard" {
                 h2 { "Project" }

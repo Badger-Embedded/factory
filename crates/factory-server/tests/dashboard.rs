@@ -14,7 +14,7 @@ use factory_core::{
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin, GitHubRepos,
     LocalSecrets, LoginProcess, LoginSpawner, MASTER_KEY_LEN, McpChecker, McpTool, Permission,
-    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, SecretStore, Settings,
+    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, RepoReport, SecretStore, Settings,
     StageAgents, StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER,
     UnavailableSecrets, WorkerSlots, app,
 };
@@ -9072,4 +9072,321 @@ fn start_review() -> Event {
     Event::StartReview {
         head: format!("head{n}"),
     }
+}
+
+fn file_dashboard() -> (Dashboard, tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    (dashboard_with(store), dir, path)
+}
+
+fn count(path: &Path, sql: &str, project: &str) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(sql, [project], |row| row.get(0))
+        .unwrap()
+}
+
+fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
+    let store = &dashboard.store;
+    store
+        .save_project_models(project, &StageModels::default())
+        .unwrap();
+    store.save_project_settings(project, true, true).unwrap();
+    store
+        .put_secret(
+            factory_server::SecretRef {
+                project,
+                server: "context7",
+                header: "Authorization",
+            },
+            "local",
+            b"sealed",
+        )
+        .unwrap();
+    store.add_cost(job, 1.5, false).unwrap();
+}
+
+#[tokio::test]
+async fn removing_a_project_cancels_its_jobs_and_deletes_its_data() {
+    let (dashboard, _dir, path) = file_dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    fill_project(&dashboard, "maestro", id);
+
+    let reply = dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location.as_deref(),
+        Some("/settings?notice=Removed%20project%20maestro.")
+    );
+
+    let row = dashboard.store.get(id).unwrap();
+    assert_eq!(row.job.stage(), &Stage::Cancelled);
+    let log = dashboard.store.logs(id, 1).unwrap().pop().unwrap();
+    assert_eq!(log.text, "Cancelled because the project was removed.");
+
+    for (table, column) in [
+        ("projects", "name"),
+        ("project_models", "project"),
+        ("project_settings", "project"),
+        ("project_gates", "project"),
+        ("project_efforts", "project"),
+        ("project_agents", "project"),
+        ("project_mcp", "project"),
+        ("project_mcp_tools", "project"),
+        ("project_mcp_tool_refreshes", "project"),
+        ("project_totals", "project"),
+        ("project_collaborators", "project"),
+        ("secrets", "project"),
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1");
+        assert_eq!(count(&path, &sql, "maestro"), 0, "{table}");
+    }
+    let costs = "SELECT COUNT(*) FROM job_costs WHERE job_id IN
+                 (SELECT id FROM jobs WHERE project = ?1)";
+    assert_eq!(count(&path, costs, "maestro"), 0);
+    let events = "SELECT COUNT(*) FROM job_events WHERE event = 'cost' AND job_id IN
+                  (SELECT id FROM jobs WHERE project = ?1)";
+    assert_eq!(count(&path, events, "maestro"), 0);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT COUNT(*) FROM jobs WHERE project = ?1",
+            "maestro"
+        ),
+        1
+    );
+
+    assert_eq!(
+        dashboard.get("/?project=maestro").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        dashboard.get(&format!("/jobs/{id}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn removing_a_project_without_its_name_changes_nothing() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    for form in [
+        "confirm=",
+        "confirm=maestr",
+        "confirm=other",
+        "confirm=%20maestro%20",
+        "",
+    ] {
+        let reply = dashboard
+            .post("/settings/projects/maestro/remove", form)
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{form}");
+        assert!(reply.body.contains("Nothing was removed."), "{form}");
+    }
+    assert!(dashboard.store.project("maestro").unwrap().is_some());
+    assert!(dashboard.store.is_collaborator("maestro", USER).unwrap());
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Requested
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_remove_a_project() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_as(
+            STRANGER,
+            "/settings/projects/maestro/remove",
+            "confirm=maestro",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(dashboard.store.project("maestro").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn the_project_page_has_a_remove_project_form() {
+    let page = dashboard().get("/settings/projects/maestro").await;
+    assert!(
+        page.body
+            .contains("action=\"/settings/projects/maestro/remove\"")
+    );
+    assert!(page.body.contains("Remove maestro"));
+}
+
+#[tokio::test]
+async fn the_removal_notice_shows_on_the_page_settings_lands_on() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .get("/settings?notice=Removed%20project%20gone.")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let landing = reply.location.unwrap();
+    let page = dashboard.get(&landing).await;
+    assert!(page.body.contains("Removed project gone."));
+    let page = dashboard
+        .get_as(STRANGER, "/settings?notice=Removed%20project%20gone.")
+        .await;
+    let landing = page.location.unwrap();
+    assert!(landing.starts_with("/onboard?notice="));
+    let page = dashboard.get_as(STRANGER, &landing).await;
+    assert!(page.body.contains("Removed project gone."));
+}
+
+#[tokio::test]
+async fn onboarding_a_removed_name_again_starts_with_an_empty_board() {
+    let (dashboard, _dir, _path) = file_dashboard();
+    let id = dashboard.new_job().await;
+    let job_dir = dashboard.data.path().join("jobs").join(id.to_string());
+    fs::create_dir_all(&job_dir).unwrap();
+    dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    assert!(dashboard.store.get(id).is_ok());
+
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fmaestro&name=maestro&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(matches!(
+        dashboard.store.get(id),
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(!job_dir.exists());
+
+    let board = dashboard
+        .get_as("bob@example.com", "/?project=maestro")
+        .await;
+    assert_eq!(board.status, StatusCode::OK);
+    assert!(!board.body.contains("Add a reboot button</a>"));
+    assert_eq!(
+        collaborator_logins(&dashboard, "maestro"),
+        vec!["bob@example.com".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
+    let (dashboard, _dir, _path) = file_dashboard();
+    let id = dashboard.new_job().await;
+    dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    dashboard
+        .slots
+        .register_task(id, false, |_| tokio::spawn(std::future::pending()));
+
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fmaestro&name=maestro&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Try again in a minute."));
+    assert!(dashboard.store.get(id).is_ok());
+    assert!(dashboard.store.project("maestro").unwrap().is_none());
+
+    dashboard.slots.begin_stop(id).unwrap();
+    dashboard.slots.end_stop(id);
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fmaestro&name=maestro&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+}
+
+struct GatedChecker {
+    calls: std::sync::atomic::AtomicUsize,
+    gate: tokio::sync::Semaphore,
+}
+
+impl RepoChecker for GatedChecker {
+    fn check<'a>(
+        &'a self,
+        _repo: &'a str,
+        _base: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.gate.acquire().await.unwrap().forget();
+            }
+            Ok(RepoReport {
+                errors: Vec::new(),
+                warnings: Vec::new(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn concurrent_onboarding_of_one_name_cannot_delete_the_new_projects_jobs() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project("maestro", "acme/old", "main", None, Some("alice"))
+        .unwrap();
+    let old = store.create("maestro", "alice", "Old request").unwrap();
+    store.remove_project("maestro").unwrap();
+    let checker = Arc::new(GatedChecker {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let dashboard = Arc::new(dashboard_with_github(
+        Arc::clone(&store),
+        Arc::clone(&checker) as Arc<dyn RepoChecker>,
+    ));
+    let onboard = |login: &'static str| {
+        let dashboard = Arc::clone(&dashboard);
+        tokio::spawn(async move {
+            dashboard
+                .post_as(
+                    login,
+                    "/onboard",
+                    "repo=acme%2Fnew&name=maestro&action=skip",
+                )
+                .await
+        })
+    };
+
+    let first = onboard("bob@example.com");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let second = onboard("carol@example.com");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(checker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    checker.gate.add_permits(1);
+    let first = first.await.unwrap();
+    assert_eq!(first.status, StatusCode::SEE_OTHER);
+    assert!(matches!(store.get(old), Err(StoreError::NotFound(_))));
+    let new = store
+        .create("maestro", "bob@example.com", "New request")
+        .unwrap();
+    let second = second.await.unwrap();
+    assert_eq!(second.status, StatusCode::OK);
+    assert!(second.body.contains("already exists"));
+    assert!(store.get(new).is_ok());
 }

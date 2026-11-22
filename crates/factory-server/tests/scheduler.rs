@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
@@ -13,7 +13,7 @@ use factory_server::{
     McpRuntime, McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
     RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
     StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport,
-    WatchRequest, format_cost, ready_action, watch_only_event,
+    WatchRequest, WorkerSlots, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -42,6 +42,8 @@ struct FakeExecutor {
     /// thread id, in run order. A run with none reports no id, as Claude does.
     sessions: Mutex<VecDeque<String>>,
     stopped: Mutex<Vec<i64>>,
+    stop_gate: Semaphore,
+    watch_gate: Semaphore,
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
     summarized: Mutex<Vec<SummaryRequest>>,
@@ -64,6 +66,8 @@ impl FakeExecutor {
             unavailable: Mutex::new(VecDeque::new()),
             sessions: Mutex::new(VecDeque::new()),
             stopped: Mutex::new(Vec::new()),
+            stop_gate: Semaphore::new(Semaphore::MAX_PERMITS),
+            watch_gate: Semaphore::new(Semaphore::MAX_PERMITS),
             checks: Mutex::new(VecDeque::new()),
             checks_run: Mutex::new(Vec::new()),
             summarized: Mutex::new(Vec::new()),
@@ -74,6 +78,14 @@ impl FakeExecutor {
             reruns: Mutex::new(VecDeque::new()),
             rerun_requests: Mutex::new(Vec::new()),
         })
+    }
+
+    fn hold_stops(&self) {
+        self.stop_gate.forget_permits(Semaphore::MAX_PERMITS);
+    }
+
+    fn hold_watches(&self) {
+        self.watch_gate.forget_permits(Semaphore::MAX_PERMITS);
     }
 
     fn release(&self, runs: usize) {
@@ -170,6 +182,7 @@ impl Executor for FakeExecutor {
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
+        self.watch_gate.acquire().await.unwrap().forget();
         tokio::task::yield_now().await;
         self.watched.lock().unwrap().push(request);
         self.watches
@@ -194,6 +207,7 @@ impl Executor for FakeExecutor {
     }
 
     async fn stop(&self, job_id: i64) {
+        self.stop_gate.acquire().await.unwrap().forget();
         self.stopped.lock().unwrap().push(job_id);
     }
 }
@@ -574,6 +588,200 @@ async fn cancelling_a_job_stops_its_run() {
         "{}",
         last.text
     );
+}
+
+#[tokio::test]
+async fn removing_a_project_stops_the_running_job() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+
+    store.remove_project("maestro").unwrap();
+    scheduler.tick().await.unwrap();
+
+    assert_eq!(scheduler.running(), Vec::<i64>::new());
+    assert_eq!(*executor.stopped.lock().unwrap(), [id]);
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Cancelled);
+    scheduler.tick().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_run_that_ends_after_the_project_was_removed_records_no_cost() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+
+    store.remove_project("maestro").unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+
+    let costs = store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event == "cost")
+        .count();
+    assert_eq!(costs, 0);
+    assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
+}
+
+#[tokio::test]
+async fn a_job_has_a_task_until_its_stop_has_finished() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let slots = scheduler.slots();
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+    assert!(slots.has_task(id));
+
+    executor.hold_stops();
+    store.remove_project("maestro").unwrap();
+    let ticking = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move { scheduler.tick().await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(slots.busy().len(), 0);
+    assert!(slots.has_task(id));
+    assert!(executor.stopped.lock().unwrap().is_empty());
+
+    executor.stop_gate.add_permits(1);
+    ticking.await.unwrap();
+    assert!(!slots.has_task(id));
+    assert_eq!(*executor.stopped.lock().unwrap(), [id]);
+}
+
+#[tokio::test]
+async fn a_factory_task_counts_as_a_task_for_its_job() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let slots = scheduler.slots();
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    executor.hold_watches();
+    scheduler.tick().await.unwrap();
+    assert_eq!(slots.busy().len(), 0);
+    assert!(slots.has_task(id));
+
+    executor.watch_gate.add_permits(1);
+    wait_idle(&scheduler).await;
+    assert!(!slots.has_task(id));
+}
+
+#[tokio::test]
+async fn the_pass_lock_is_held_while_a_stop_is_in_progress() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let slots = scheduler.slots();
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+
+    executor.hold_stops();
+    store.remove_project("maestro").unwrap();
+    let ticking = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move { scheduler.tick().await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let waiting = tokio::time::timeout(Duration::from_millis(50), slots.lock_pass()).await;
+    assert!(waiting.is_err());
+
+    executor.stop_gate.add_permits(1);
+    ticking.await.unwrap();
+    let _pass = slots.lock_pass().await;
+    assert!(!slots.has_task(id));
+}
+
+#[tokio::test]
+async fn a_pass_that_read_a_job_before_its_removal_does_not_start_it() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let slots = scheduler.slots();
+    let running = store.create("maestro", "alice", "first").unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+    store.apply(running, Event::Cancel).unwrap();
+    let queued = store.create("maestro", "alice", "second").unwrap();
+
+    executor.hold_stops();
+    let ticking = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move { scheduler.tick().await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    store.remove_project("maestro").unwrap();
+    let cleanup = tokio::time::timeout(Duration::from_millis(50), slots.lock_pass()).await;
+    assert!(cleanup.is_err());
+
+    executor.stop_gate.add_permits(1);
+    ticking.await.unwrap();
+    let _pass = slots.lock_pass().await;
+    assert_eq!(executor.requests().len(), 1);
+    assert!(!slots.has_task(queued));
+    assert_eq!(store.get(queued).unwrap().job.stage(), &Stage::Cancelled);
+}
+
+#[tokio::test]
+async fn an_earlier_task_cannot_remove_the_entry_of_its_replacement() {
+    let slots = WorkerSlots::new();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        slots.register_task(7, false, |id| {
+            ids.push(id);
+            tokio::spawn(std::future::pending())
+        });
+    }
+
+    slots.finish_task(7, ids[0]);
+    assert!(slots.has_task(7));
+
+    slots.finish_task(7, ids[1]);
+    assert!(!slots.has_task(7));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_registered_while_the_previous_task_ends_keeps_its_entry() {
+    let slots = Arc::new(WorkerSlots::new());
+    let (go, go_signal) = std::sync::mpsc::channel::<()>();
+    let (done, done_signal) = std::sync::mpsc::channel::<()>();
+
+    slots.register_task(7, true, |id| {
+        let slots = Arc::clone(&slots);
+        std::thread::spawn(move || {
+            go_signal.recv().unwrap();
+            slots.finish_task(7, id);
+            done.send(()).unwrap();
+        });
+        tokio::spawn(std::future::pending())
+    });
+
+    slots.register_task(7, true, |_| {
+        go.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slots.finishes_that_waited() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the earlier task never waited for the registry"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        tokio::spawn(std::future::pending())
+    });
+    done_signal.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    assert!(slots.has_task(7));
+    assert_eq!(slots.running(), [7]);
 }
 
 #[tokio::test]
