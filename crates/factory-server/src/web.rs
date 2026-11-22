@@ -176,6 +176,7 @@ fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/settings/workers", get(show_workers).post(save_workers))
         .route("/settings/gates", get(show_gates).post(save_gates))
         .route("/settings/github", get(show_github).post(save_github))
+        .route("/settings/renovate", get(show_renovate).post(save_renovate))
         .route("/settings/claude", get(redirect_claude))
         .route("/settings/agents/claude", get(show_claude))
         .route("/settings/agents/claude/token", post(save_claude_token))
@@ -1417,6 +1418,21 @@ fn github_page(
     ))
 }
 
+fn renovate_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+    problem: Option<&str>,
+) -> Result<Markup, AppError> {
+    Ok(pages::settings_renovate(
+        &user(headers),
+        &settings_nav(state, &user(headers))?,
+        &state.store.settings()?,
+        notice,
+        problem,
+    ))
+}
+
 fn claude_page(
     state: &AppState,
     headers: &HeaderMap,
@@ -1650,6 +1666,13 @@ async fn show_github(
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
     github_page(&state, &headers, None)
+}
+
+async fn show_renovate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    renovate_page(&state, &headers, None, None)
 }
 
 async fn show_claude(
@@ -2274,6 +2297,51 @@ struct GatesForm {
 #[derive(Deserialize)]
 struct GithubForm {
     poll_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct RenovateForm {
+    #[serde(default)]
+    auto_reruns: String,
+    #[serde(default)]
+    total_reruns: String,
+}
+
+fn parse_renovate_limits(form: &RenovateForm) -> Result<(u32, u32), String> {
+    let whole = |value: &str, name: &str| {
+        value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{name} must be a whole number"))
+    };
+    let auto = whole(&form.auto_reruns, "Automatic reruns")?;
+    let total = whole(&form.total_reruns, "Total reruns")?;
+    if total < 1 {
+        return Err("Total reruns must be at least 1".into());
+    }
+    if auto > total {
+        return Err("Automatic reruns must not be more than total reruns".into());
+    }
+    Ok((auto, total))
+}
+
+async fn save_renovate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RenovateForm>,
+) -> Result<Markup, AppError> {
+    let (auto, total) = match parse_renovate_limits(&form) {
+        Ok(limits) => limits,
+        Err(problem) => return renovate_page(&state, &headers, None, Some(&problem)),
+    };
+    let settings = Settings {
+        renovate_auto_reruns: auto,
+        renovate_total_reruns: total,
+        ..state.store.settings()?
+    };
+    state.store.save_settings(&settings)?;
+    state.wake.notify_one();
+    renovate_page(&state, &headers, Some("Saved."), None)
 }
 
 /// A trimmed text field, or a 400 that names the field when it is empty.

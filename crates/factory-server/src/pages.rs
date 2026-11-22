@@ -543,6 +543,7 @@ pub enum SettingsPage {
     Workers,
     Gates,
     Github,
+    Renovate,
     /// An agent's account page, named by the agent's id.
     Agent(String),
     Mcp,
@@ -619,6 +620,7 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
                 (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
                 (entry("/settings/gates".into(), "Default gates", &SettingsPage::Gates))
                 (entry("/settings/github".into(), "GitHub", &SettingsPage::Github))
+                (entry("/settings/renovate".into(), "Renovate", &SettingsPage::Renovate))
                 p.settings-group { "Agents" }
                 @for agent in &nav.agents {
                     @match (agent.available, &agent.url) {
@@ -802,6 +804,44 @@ pub fn settings_github(
                     input #poll_seconds type="number" name="poll_seconds" min="10" required
                         value=(settings.poll_seconds);
                     p.hint { "Also the wait before retrying a failed push or GitHub call." }
+                }
+                (save_bar("Save"))
+            }
+        },
+    )
+}
+
+pub fn settings_renovate(
+    user: &str,
+    nav: &SettingsNav,
+    settings: &Settings,
+    notice: Option<&str>,
+    problem: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Renovate,
+        "Renovate",
+        notice,
+        &html! {
+            h1 { "Renovate" }
+            p.meta { "Limits for Renovate pull requests, shared by every project. A change applies on the next look at a pull request." }
+            @if let Some(problem) = problem {
+                div.card.failed { (problem) }
+            }
+            form.card.settings-form method="post" action="/settings/renovate" {
+                div.field {
+                    label for="auto_reruns" { "Automatic reruns" }
+                    input #auto_reruns type="number" name="auto_reruns" min="0" step="1" required
+                        value=(settings.renovate_auto_reruns);
+                    p.hint { "Reruns of failed CI on one head commit before an agent looks at the failure. 0 sends the first failure to the agent." }
+                }
+                div.field {
+                    label for="total_reruns" { "Total reruns" }
+                    input #total_reruns type="number" name="total_reruns" min="1" step="1" required
+                        value=(settings.renovate_total_reruns);
+                    p.hint { "Reruns one head commit gets before the factory comments and stops. Not less than the automatic reruns." }
                 }
                 (save_bar("Save"))
             }
