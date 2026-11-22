@@ -4,6 +4,7 @@
 
 mod support;
 
+use std::io::Read;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -90,20 +91,42 @@ async fn the_dashboard_check_trusts_the_ca_in_the_file() {
     assert!(body.contains("Connected: stub"), "{body}");
 }
 
+/// Runs the binary and returns its stderr if it exits within the deadline. A
+/// binary that keeps serving is killed and reaped, and the test fails.
+fn start_and_wait(command: &mut Command) -> String {
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success(), "the start should fail");
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            return stderr;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the binary kept running with a bad FACTORY_MCP_CA_FILE");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn an_invalid_file_stops_the_start_with_an_error_naming_it() {
     let dir = tempfile::tempdir().unwrap();
     let ca_file = dir.path().join("ca.pem");
     std::fs::write(&ca_file, "not a certificate").unwrap();
 
-    let output = factory(dir.path(), &ca_file, free_port()).output().unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = start_and_wait(&mut factory(dir.path(), &ca_file, free_port()));
     assert!(stderr.contains("FACTORY_MCP_CA_FILE"), "{stderr}");
 
     let missing = dir.path().join("missing.pem");
-    let output = factory(dir.path(), &missing, free_port()).output().unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = start_and_wait(&mut factory(dir.path(), &missing, free_port()));
     assert!(stderr.contains("cannot read"), "{stderr}");
 }
