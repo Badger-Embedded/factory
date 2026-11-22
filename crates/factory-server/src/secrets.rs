@@ -1,6 +1,6 @@
 //! Encrypted storage for the factory's at-rest credentials: per-project MCP
-//! header values, the account-wide Claude token and the account-wide Codex
-//! login.
+//! header values, the account-wide Claude token, the account-wide Codex login
+//! and the account-wide Copilot token.
 //!
 //! A header value for an MCP server is a credential, so it must not sit in
 //! SQLite as plain text. The Claude subscription token from `claude
@@ -14,11 +14,11 @@
 //! through [`Store`]. Each row records its backend, so an external backend can
 //! be added without a schema change for existing rows.
 //!
-//! The Claude token and the Codex login each live in one reserved row keyed
-//! apart from every project/server/header credential and from each other, with
-//! its own associated data, so deleting or renaming an MCP server never touches
-//! either and a ciphertext moved between the Claude token row, the Codex row
-//! and an MCP header row fails to decrypt.
+//! The Claude token, the Codex login and the Copilot token each live in one
+//! reserved row keyed apart from every project/server/header credential and
+//! from each other, with its own associated data, so deleting or renaming an
+//! MCP server never touches any of them and a ciphertext moved between the
+//! three rows and an MCP header row fails to decrypt.
 
 use std::fmt;
 use std::sync::Arc;
@@ -179,6 +179,34 @@ pub trait SecretStore: Send + Sync {
     ///
     /// Fails on a storage error.
     fn clear_codex_auth(&self) -> Result<(), SecretError>;
+
+    /// The stored Copilot token, or `None` when none is set. This is the
+    /// account-wide GitHub token the Copilot workers use, kept in its own
+    /// reserved row apart from the MCP header values, the Claude token and the
+    /// Codex login.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable, when the stored value does not
+    /// decrypt, or on a storage error.
+    fn copilot_token(&self) -> Result<Option<String>, SecretError>;
+
+    /// Stores `value` as the Copilot token, replacing any token already there.
+    /// The caller validates it with [`crate::validate_copilot_token`] first; the store
+    /// keeps the bytes as given.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn set_copilot_token(&self, value: &str) -> Result<(), SecretError>;
+
+    /// Deletes the stored Copilot token. Clearing a token that is not there is
+    /// fine.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error.
+    fn clear_copilot_token(&self) -> Result<(), SecretError>;
 }
 
 /// The `secrets` row that holds the account-wide Claude token. Its `server` is
@@ -202,6 +230,12 @@ const CODEX_AUTH_REF: SecretRef<'static> = SecretRef {
     project: "",
     server: "",
     header: "codex-auth",
+};
+
+const COPILOT_TOKEN_REF: SecretRef<'static> = SecretRef {
+    project: "",
+    server: "",
+    header: "copilot-token",
 };
 
 /// The local encrypted backend. It holds the cipher built from the master key
@@ -323,6 +357,25 @@ impl SecretStore for LocalSecrets {
         self.store.delete_secret(CODEX_AUTH_REF)?;
         Ok(())
     }
+
+    fn copilot_token(&self) -> Result<Option<String>, SecretError> {
+        let Some((backend, stored)) = self.store.get_secret(COPILOT_TOKEN_REF)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open(&backend, &stored, COPILOT_TOKEN_AAD)?))
+    }
+
+    fn set_copilot_token(&self, value: &str) -> Result<(), SecretError> {
+        let stored = self.seal(COPILOT_TOKEN_AAD, value)?;
+        self.store
+            .put_secret(COPILOT_TOKEN_REF, LOCAL_BACKEND, &stored)?;
+        Ok(())
+    }
+
+    fn clear_copilot_token(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(COPILOT_TOKEN_REF)?;
+        Ok(())
+    }
 }
 
 /// The backend used in place of [`LocalSecrets`] when no usable master key is
@@ -384,6 +437,19 @@ impl SecretStore for UnavailableSecrets {
 
     fn clear_codex_auth(&self) -> Result<(), SecretError> {
         self.store.delete_secret(CODEX_AUTH_REF)?;
+        Ok(())
+    }
+
+    fn copilot_token(&self) -> Result<Option<String>, SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn set_copilot_token(&self, _value: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn clear_copilot_token(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(COPILOT_TOKEN_REF)?;
         Ok(())
     }
 }
@@ -483,6 +549,8 @@ const CLAUDE_TOKEN_AAD: &[u8] = b"factory:claude-token:v1";
 /// direction. Its first eight bytes read as a u64 far larger than any header
 /// name's length, so it can never equal an MCP row's associated data.
 const CODEX_AUTH_AAD: &[u8] = b"factory:codex-auth:v1";
+
+const COPILOT_TOKEN_AAD: &[u8] = b"factory:copilot-token:v1";
 
 /// Why a pasted or captured file was refused as a Codex subscription login.
 /// None of these variants carry any part of the input, so a logged or
