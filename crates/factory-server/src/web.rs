@@ -865,10 +865,6 @@ struct JobData {
     auto_merge: bool,
 }
 
-/// Replaces the current step's model and effort with the session's recorded
-/// ones when the session runs on another agent than the stage now names. The
-/// scheduler gives such a run the session's settings, so the timeline badge
-/// shows those and not the stage's, which belong to the stage's new agent.
 fn keep_session_settings(
     state: &AppState,
     row: &JobRow,
@@ -896,7 +892,8 @@ fn keep_session_settings(
         ),
         Expect::Review => (&mut models.review, &mut efforts.review, &agents.review),
     };
-    if Agent::from_id(stage_agent).unwrap_or(DEFAULT_AGENT) == last.agent {
+    let on_stage_agent = Agent::from_id(stage_agent).unwrap_or(DEFAULT_AGENT) == last.agent;
+    if on_stage_agent && !state.slots.has_task(row.id) {
         return Ok(());
     }
     *effort = last

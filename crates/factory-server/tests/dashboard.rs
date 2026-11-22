@@ -5756,8 +5756,6 @@ async fn the_running_step_badge_shows_the_effort_and_stays_compact() {
 
 #[tokio::test]
 async fn the_running_step_badge_shows_the_settings_of_a_session_on_another_agent() {
-    // Job 47: the session runs on Claude while the stage names Copilot, so the
-    // badge shows what the run was given, not the stage's Copilot settings.
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     dashboard.apply(id, Event::Start);
@@ -5785,6 +5783,31 @@ async fn the_running_step_badge_shows_the_settings_of_a_session_on_another_agent
     dashboard
         .store
         .save_project_models("maestro", &models(Some("claude-sonnet-5.5"), None))
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let badge = agent_badge(timeline_step(&page.body, "clarifying"));
+    assert_eq!(badge, "sonnet · high");
+
+    dashboard
+        .slots
+        .register_task(id, true, |_| tokio::spawn(std::future::pending()));
+    let claude = agents("claude", "claude", "claude", "claude", "claude");
+    dashboard
+        .store
+        .save_project_efforts(
+            "maestro",
+            &efforts("xhigh", "medium", "medium", "medium", "medium"),
+            &claude,
+        )
+        .unwrap();
+    dashboard
+        .store
+        .save_project_agents("maestro", &claude)
+        .unwrap();
+    dashboard
+        .store
+        .save_project_models("maestro", &models(Some("opus"), None))
         .unwrap();
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;

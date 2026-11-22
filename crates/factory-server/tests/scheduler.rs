@@ -3071,56 +3071,91 @@ async fn a_resumed_session_keeps_the_agent_recorded_on_it() {
     assert_eq!(clarify.agent, Agent::Codex);
 }
 
-fn copilot_clarify() -> StageAgents {
+fn copilot_implement() -> StageAgents {
     StageAgents {
-        clarify: "copilot".into(),
+        implement: "copilot".into(),
         ..StageAgents::default()
     }
 }
 
-fn clarify_model(model: &str) -> StageModels {
+fn implement_model(model: &str) -> StageModels {
     StageModels {
-        clarify: Some(model.to_owned()),
+        implement: Some(model.to_owned()),
         ..StageModels::default()
     }
 }
 
-fn clarify_effort(level: &str) -> StageEfforts {
+fn implement_effort(level: &str) -> StageEfforts {
     StageEfforts {
-        clarify: level.to_owned(),
+        implement: level.to_owned(),
         ..StageEfforts::default()
     }
 }
 
+fn to_implement(store: &Store) -> i64 {
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    let planned = factory_core::PlannedPr {
+        title: "maestrod: add a reboot endpoint".into(),
+        summary: "POST /reboot".into(),
+        number: None,
+        description: None,
+        notes: None,
+    };
+    store
+        .apply(id, Event::Agent(AgentResult::Plan(vec![planned])))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    id
+}
+
 #[tokio::test]
-async fn a_resumed_session_keeps_its_model_and_effort_when_the_stage_agent_changes() {
-    // Job 47: a Claude session asked questions, the stage moved to Copilot with
-    // a Copilot model id, and the answer run passed that id to Claude, which
-    // refused it.
-    let (store, executor, scheduler) = setup(one_pass);
+async fn a_resumed_implement_session_keeps_its_model_and_effort_when_the_stage_moves_to_copilot() {
+    let (store, executor, scheduler) = setup(|request| {
+        if request.prompt.contains("answered") {
+            Event::Agent(AgentResult::CommitsReady(ready()))
+        } else {
+            questions()
+        }
+    });
     store
-        .save_project_models("maestro", &clarify_model("sonnet"))
+        .save_project_models("maestro", &implement_model("sonnet"))
         .unwrap();
     store
-        .save_project_efforts("maestro", &clarify_effort("high"), &StageAgents::default())
+        .save_project_efforts(
+            "maestro",
+            &implement_effort("high"),
+            &StageAgents::default(),
+        )
         .unwrap();
-    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    let id = to_implement(&store);
     executor.release(2);
     step(&scheduler).await;
 
     store
-        .save_project_agents("maestro", &copilot_clarify())
+        .save_project_agents("maestro", &copilot_implement())
         .unwrap();
     store
-        .save_project_models("maestro", &clarify_model("claude-sonnet-5.5"))
+        .save_project_models("maestro", &implement_model("claude-sonnet-5.5"))
         .unwrap();
     store
-        .save_project_efforts("maestro", &clarify_effort("low"), &copilot_clarify())
+        .save_project_efforts("maestro", &implement_effort("low"), &copilot_implement())
         .unwrap();
     store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
     step(&scheduler).await;
 
     let requests = executor.requests();
+    assert_eq!(requests[0].expect, Expect::Commits);
+    assert_eq!(requests[1].expect, Expect::Commits);
     assert_eq!(requests[1].agent, Agent::Claude);
     assert_eq!(model_of(&requests[1]), "sonnet");
     assert_eq!(effort_of(&requests[1]), "high");
@@ -3135,7 +3170,7 @@ async fn a_resumed_session_keeps_its_model_and_effort_when_the_stage_agent_chang
         notes,
         [
             "This session started on Claude, so it stays on Claude with its earlier model. \
-          The clarify stage is now set to Copilot, which new sessions use."
+          The implement stage is now set to Copilot, which new sessions use."
         ]
     );
 }
@@ -3144,18 +3179,17 @@ async fn a_resumed_session_keeps_its_model_and_effort_when_the_stage_agent_chang
 async fn a_session_with_no_recorded_settings_resumes_with_no_model_and_the_default_effort() {
     let (store, executor, scheduler) = setup(one_pass);
     store
-        .save_project_agents("maestro", &copilot_clarify())
+        .save_project_agents("maestro", &copilot_implement())
         .unwrap();
     store
-        .save_project_models("maestro", &clarify_model("claude-sonnet-5.5"))
+        .save_project_models("maestro", &implement_model("claude-sonnet-5.5"))
         .unwrap();
     store
-        .save_project_efforts("maestro", &clarify_effort("high"), &copilot_clarify())
+        .save_project_efforts("maestro", &implement_effort("high"), &copilot_implement())
         .unwrap();
-    let id = store.create("maestro", "alice", "Add a button").unwrap();
-    // A session row from before the columns existed records the agent only.
+    let id = to_implement(&store);
     store
-        .session_uuid(id, factory_core::Session::Planning, Agent::Claude)
+        .session_uuid(id, factory_core::Session::Pr(0), Agent::Claude)
         .unwrap();
     executor.release(1);
     step(&scheduler).await;
@@ -3170,12 +3204,12 @@ async fn a_session_with_no_recorded_settings_resumes_with_no_model_and_the_defau
 async fn a_fresh_copilot_stage_runs_with_its_model() {
     let (store, executor, scheduler) = setup(one_pass);
     store
-        .save_project_agents("maestro", &copilot_clarify())
+        .save_project_agents("maestro", &copilot_implement())
         .unwrap();
     store
-        .save_project_models("maestro", &clarify_model("claude-sonnet-5.5"))
+        .save_project_models("maestro", &implement_model("claude-sonnet-5.5"))
         .unwrap();
-    store.create("maestro", "alice", "Add a button").unwrap();
+    to_implement(&store);
     executor.release(1);
     step(&scheduler).await;
 

@@ -52,7 +52,6 @@ fn stage_agent(agents: &StageAgents, expect: Expect) -> Agent {
     Agent::from_id(id).unwrap_or(DEFAULT_AGENT)
 }
 
-/// The settings name of the stage `expect` runs in.
 fn stage_name(expect: Expect) -> &'static str {
     match expect {
         Expect::Clarify => "clarify",
@@ -624,11 +623,9 @@ impl<E: Executor> Scheduler<E> {
     /// change reaches a job in flight at its next run.
     /// Builds the run for the agent stage `expect` of job `row`, with the
     /// servers it left out for an undecryptable secret. The model, the effort
-    /// and the agent read from the project's per-stage settings on the same
+    /// and the agent all read from the project's per-stage settings on the same
     /// mapping, and the session's recorded agent wins over the stage's for a
-    /// resumed session, see [`stage_agent`] and [`Store::session_uuid`]. A
-    /// resumed session whose agent differs from the stage's keeps the model and
-    /// effort it last ran with, see [`Store::session_settings`].
+    /// resumed session, see [`stage_agent`] and [`Store::session_uuid`].
     fn agent_request(
         &self,
         row: &JobRow,
@@ -662,8 +659,6 @@ impl<E: Executor> Scheduler<E> {
                 .record_session_settings(row.id, session, model.as_deref(), &effort)?;
             (model, effort)
         } else {
-            // The stage's model and effort belong to the stage's new agent, which
-            // this session does not run on, so it keeps what it last ran with.
             let last = self.store.session_settings(row.id, session)?;
             let effort = last
                 .as_ref()

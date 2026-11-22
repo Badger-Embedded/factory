@@ -545,10 +545,6 @@ impl Store {
         if has_session_cost == 0 {
             conn.execute("ALTER TABLE sessions ADD COLUMN cost_usd REAL", [])?;
         }
-        // `model` and `effort` hold what the session last ran with on its own
-        // agent, so a resumed session keeps them after the stage moves to
-        // another agent. A row from before reads null for both: no model, which
-        // is the CLI default, and the agent's default effort.
         for column in ["model", "effort"] {
             let has: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
