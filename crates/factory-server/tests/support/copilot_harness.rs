@@ -31,6 +31,8 @@ pub fn config_json(token: &str) -> String {
 pub enum Outcome {
     Success(String),
     Failure,
+    /// Exits 0 and writes no `config.json`.
+    ExitedClean,
 }
 
 #[derive(Clone)]
@@ -122,7 +124,7 @@ impl LoginProcess for FakeProcess {
     }
 
     fn wait(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
-        Box::pin(async move { matches!(self.outcome, Outcome::Success(_)) })
+        Box::pin(async move { !matches!(self.outcome, Outcome::Failure) })
     }
 
     fn kill(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {

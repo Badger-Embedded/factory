@@ -133,7 +133,12 @@ async fn a_config_with_no_token_fails_the_login() {
     harness.poll_fragment("1234-5678").await;
     harness.spawner.finish();
 
-    harness.poll_fragment("did not finish").await;
+    let failed = harness.poll_fragment("could not store a token").await;
+    assert!(failed.contains("held no token"), "{failed}");
+    assert!(failed.contains("Keys under authTokens: none"), "{failed}");
+    assert!(failed.contains("The directory holds:"), "{failed}");
+    assert!(failed.contains("settings.json"), "{failed}");
+    assert!(!failed.contains("did not finish"));
     assert!(harness.secrets.copilot_token().unwrap().is_none());
 }
 
@@ -149,8 +154,131 @@ async fn a_token_the_cli_would_refuse_is_not_stored() {
     harness.poll_fragment("1234-5678").await;
     harness.spawner.finish();
 
-    harness.poll_fragment("did not finish").await;
+    let failed = harness.poll_fragment("could not store a token").await;
+    assert!(
+        failed.contains("classic personal access tokens are not supported"),
+        "{failed}"
+    );
+    assert!(!failed.contains("ghp_abcdefghij"));
     assert!(harness.secrets.copilot_token().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_clean_exit_with_no_credential_file_says_so() {
+    let harness = harness();
+    let mut lines = prompt();
+    lines.push("Waiting for authorization...".to_owned());
+    lines.push("Signed in successfully as alice.".to_owned());
+    harness.spawner.set(Script {
+        lines,
+        outcome: Outcome::ExitedClean,
+    });
+
+    harness.post("/settings/agents/copilot/login", "").await;
+    harness.poll_fragment("1234-5678").await;
+    harness.spawner.finish();
+
+    let failed = harness.poll_fragment("could not store a token").await;
+    assert!(failed.contains("wrote no credential file"), "{failed}");
+    assert!(failed.contains("no config.json"), "{failed}");
+    assert!(failed.contains("settings.json"), "{failed}");
+    assert!(
+        failed.contains("The container&#39;s last output:")
+            || failed.contains("The container's last output:")
+    );
+    assert!(failed.contains("Signed in successfully as alice."));
+    assert!(!failed.contains("did not finish"));
+    assert!(harness.secrets.copilot_token().unwrap().is_none());
+    assert!(!harness.spawner.homes()[0].exists());
+}
+
+#[tokio::test]
+async fn directory_names_that_look_like_tokens_are_redacted_in_both_listings() {
+    for outcome in [
+        Outcome::ExitedClean,
+        Outcome::Success(r#"{"authTokens":{}}"#.to_owned()),
+    ] {
+        let harness = harness();
+        harness.spawner.set(Script {
+            lines: prompt(),
+            outcome,
+        });
+        harness.post("/settings/agents/copilot/login", "").await;
+        harness.poll_fragment("1234-5678").await;
+        let home = harness.spawner.homes()[0].clone();
+        let inner = "ghu_innerabcdefghijklmnopqrstuvwxyz0123";
+        std::fs::write(home.join(TOKEN), "").unwrap();
+        std::fs::write(home.join(format!("credential:{TOKEN}")), "").unwrap();
+        std::fs::create_dir(home.join(format!("dir:{TOKEN}"))).unwrap();
+        std::fs::write(
+            home.join(format!("dir:{TOKEN}")).join(format!("x:{inner}")),
+            "",
+        )
+        .unwrap();
+        std::fs::create_dir(home.join("logs")).unwrap();
+        std::fs::write(home.join("logs").join(inner), "").unwrap();
+        std::fs::create_dir(home.join(format!("{inner}-dir"))).unwrap();
+        harness.spawner.finish();
+
+        let failed = harness.poll_fragment("could not store a token").await;
+        assert!(failed.contains("[redacted]"), "{failed}");
+        assert!(failed.contains("logs/ [[redacted]]"), "{failed}");
+        assert!(failed.contains("credential:[redacted]"), "{failed}");
+        assert!(
+            failed.contains("dir:[redacted]/ [x:[redacted]]"),
+            "{failed}"
+        );
+        assert!(!failed.contains(TOKEN), "{failed}");
+        assert!(!failed.contains("ghu_inner"), "{failed}");
+    }
+}
+
+#[tokio::test]
+async fn a_config_the_factory_cannot_read_shows_the_io_error() {
+    let harness = harness();
+    harness.spawner.set(Script {
+        lines: prompt(),
+        outcome: Outcome::ExitedClean,
+    });
+    harness.post("/settings/agents/copilot/login", "").await;
+    harness.poll_fragment("1234-5678").await;
+    // A directory in place of the file fails to read for any user, root included.
+    std::fs::create_dir(harness.spawner.homes()[0].join("config.json")).unwrap();
+    harness.spawner.finish();
+
+    let failed = harness.poll_fragment("could not store a token").await;
+    assert!(failed.contains("could not read config.json"), "{failed}");
+    assert!(failed.contains("Is a directory"), "{failed}");
+}
+
+#[tokio::test]
+async fn a_config_that_is_not_json_shows_a_position_and_no_content() {
+    let harness = harness();
+    harness.spawner.set(Script {
+        lines: prompt(),
+        outcome: Outcome::Success(format!("\"{TOKEN}\" nope")),
+    });
+    harness.post("/settings/agents/copilot/login", "").await;
+    harness.poll_fragment("1234-5678").await;
+    harness.spawner.finish();
+
+    let failed = harness.poll_fragment("could not store a token").await;
+    assert!(failed.contains("not valid JSON"), "{failed}");
+    assert!(!failed.contains(TOKEN));
+}
+
+#[tokio::test]
+async fn a_failed_login_deletes_its_directory() {
+    let harness = harness();
+    harness.spawner.set(Script {
+        lines: prompt(),
+        outcome: Outcome::Failure,
+    });
+    harness.post("/settings/agents/copilot/login", "").await;
+    harness.poll_fragment("1234-5678").await;
+    harness.spawner.finish();
+    harness.poll_fragment("did not finish").await;
+    assert!(!harness.spawner.homes()[0].exists());
 }
 
 #[tokio::test]

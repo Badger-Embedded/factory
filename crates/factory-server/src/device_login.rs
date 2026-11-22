@@ -56,10 +56,12 @@ pub struct LoginSpec {
     /// Writes the config files the login needs into the fresh config directory.
     pub prepare: fn(home: &Path) -> std::io::Result<()>,
     /// Reads the credential the container wrote into the config directory, or
-    /// `None` when there is none.
-    pub read_back: fn(home: &Path) -> Option<String>,
-    /// Whether the credential read back is one the factory accepts.
-    pub validate: fn(credential: &str) -> bool,
+    /// says why there is none.
+    pub read_back: fn(home: &Path) -> Result<String, ReadBackError>,
+    /// Checks that the credential read back is one the factory accepts. The
+    /// error is shown on the page, so it must not contain any part of the
+    /// credential.
+    pub validate: fn(credential: &str) -> Result<(), String>,
     /// Stores an accepted credential in the secret store.
     pub store: fn(secrets: &dyn SecretStore, credential: &str) -> Result<(), SecretError>,
     /// The reason shown when the operator does not finish within the timeout.
@@ -76,7 +78,7 @@ impl LoginSpec {
         home_mount: "/codex",
         prepare: codex_prepare,
         read_back: codex_read_back,
-        validate: |auth| validate_codex_auth(auth).is_ok(),
+        validate: |auth| validate_codex_auth(auth).map_err(|err| err.to_string()),
         store: |secrets, auth| secrets.set_codex_auth(auth),
         timeout_reason: "It was not finished within fifteen minutes. Start it again, or \
                          paste a login below.",
@@ -92,7 +94,11 @@ impl LoginSpec {
         home_mount: "/copilot",
         prepare: copilot_prepare,
         read_back: copilot_read_back,
-        validate: |token| validate_copilot_token(token).is_ok(),
+        validate: |token| {
+            validate_copilot_token(token)
+                .map(drop)
+                .map_err(|err| err.to_string())
+        },
         store: |secrets, token| secrets.set_copilot_token(token),
         timeout_reason: "It was not finished within fifteen minutes. Start it again, or \
                          paste a token below.",
@@ -109,14 +115,35 @@ fn copilot_prepare(home: &Path) -> std::io::Result<()> {
     )
 }
 
-fn copilot_read_back(home: &Path) -> Option<String> {
-    let config = std::fs::read_to_string(home.join("config.json")).ok()?;
-    let config: serde_json::Value = serde_json::from_str(&config).ok()?;
-    config
-        .get("authTokens")?
-        .as_object()?
-        .values()
-        .find_map(|entry| entry.get("token")?.as_str().map(str::to_owned))
+fn copilot_read_back(home: &Path) -> Result<String, ReadBackError> {
+    const FILE: &str = "config.json";
+    let config = read_credential_file(home, FILE)?;
+    let config: serde_json::Value =
+        serde_json::from_str(&config).map_err(|err| ReadBackError::NotJson {
+            file: FILE,
+            line: err.line(),
+            column: err.column(),
+        })?;
+    let tokens = config
+        .get("authTokens")
+        .and_then(|tokens| tokens.as_object());
+    tokens
+        .and_then(|tokens| {
+            tokens
+                .values()
+                .find_map(|entry| entry.get("token")?.as_str().map(str::to_owned))
+        })
+        .ok_or_else(|| ReadBackError::NoToken {
+            file: FILE,
+            keys: scrubbed_keys(&config),
+            listing: scrubbed_listing(home),
+            nested: tokens.map(|tokens| {
+                (
+                    "authTokens",
+                    tokens.keys().map(|key| scrub_name(key)).collect(),
+                )
+            }),
+        })
 }
 
 /// Writes the `config.toml` that makes Codex keep its credentials in
@@ -128,8 +155,141 @@ fn codex_prepare(home: &Path) -> std::io::Result<()> {
     )
 }
 
-fn codex_read_back(home: &Path) -> Option<String> {
-    std::fs::read_to_string(home.join("auth.json")).ok()
+fn codex_read_back(home: &Path) -> Result<String, ReadBackError> {
+    read_credential_file(home, "auth.json")
+}
+
+/// Why the factory found no credential in the config directory after the
+/// container exited. [`Display`](std::fmt::Display) is shown on the page, so it
+/// carries file names and key names and never a value from the file.
+#[derive(Debug)]
+pub enum ReadBackError {
+    /// The container wrote no `file`. `listing` names what the directory holds.
+    Missing { file: &'static str, listing: String },
+    /// The factory could not read `file`.
+    Unreadable {
+        file: &'static str,
+        error: std::io::Error,
+    },
+    /// `file` is not valid JSON. The position is shown, not the parser's
+    /// message, which can quote the content.
+    NotJson {
+        file: &'static str,
+        line: usize,
+        column: usize,
+    },
+    /// `file` parsed but holds no token. `keys` are its top-level keys,
+    /// `nested` the key names under the object that should hold the token, and
+    /// `listing` names what the directory holds.
+    NoToken {
+        file: &'static str,
+        keys: Vec<String>,
+        listing: String,
+        nested: Option<(&'static str, Vec<String>)>,
+    },
+}
+
+impl std::fmt::Display for ReadBackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadBackError::Missing { file, listing } => {
+                write!(
+                    f,
+                    "The CLI wrote no credential file: there is no {file} in its config \
+                     directory. The directory holds: {listing}."
+                )
+            }
+            ReadBackError::Unreadable { file, error } => {
+                write!(f, "The factory could not read {file}: {error}.")
+            }
+            ReadBackError::NotJson { file, line, column } => {
+                write!(
+                    f,
+                    "The credential file {file} is not valid JSON (line {line}, column {column})."
+                )
+            }
+            ReadBackError::NoToken {
+                file,
+                keys,
+                nested,
+                listing,
+            } => {
+                write!(
+                    f,
+                    "The credential file {file} held no token. Its top-level keys: {}.",
+                    names(keys)
+                )?;
+                if let Some((object, inner)) = nested {
+                    write!(f, " Keys under {object}: {}.", names(inner))?;
+                }
+                write!(f, " The directory holds: {listing}.")
+            }
+        }
+    }
+}
+
+fn names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn scrubbed_listing(home: &Path) -> String {
+    const LIMIT: usize = 60;
+    fn entries(dir: &Path) -> Vec<(String, bool)> {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(String, bool)> = read
+            .filter_map(Result::ok)
+            .map(|entry| {
+                let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                (entry.file_name().to_string_lossy().into_owned(), is_dir)
+            })
+            .collect();
+        found.sort();
+        found
+    }
+    let mut out = Vec::new();
+    for (name, is_dir) in entries(home) {
+        if is_dir {
+            let inner: Vec<String> = entries(&home.join(&name))
+                .into_iter()
+                .map(|(inner, _)| scrub_name(&inner))
+                .collect();
+            out.push(format!("{}/ [{}]", scrub_name(&name), inner.join(", ")));
+        } else {
+            out.push(scrub_name(&name));
+        }
+    }
+    out.truncate(LIMIT);
+    if out.is_empty() {
+        "nothing".to_owned()
+    } else {
+        out.join(", ")
+    }
+}
+
+fn read_credential_file(home: &Path, file: &'static str) -> Result<String, ReadBackError> {
+    std::fs::read_to_string(home.join(file)).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ReadBackError::Missing {
+                file,
+                listing: scrubbed_listing(home),
+            }
+        } else {
+            ReadBackError::Unreadable { file, error }
+        }
+    })
+}
+
+fn scrubbed_keys(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_object()
+        .map(|object| object.keys().map(|key| scrub_name(key)).collect())
+        .unwrap_or_default()
 }
 
 /// The login ends in failure when the operator does not finish it within this.
@@ -186,6 +346,9 @@ pub enum LoginView {
     SignedIn,
     /// The login ended with no stored login, for `reason`.
     Failed { reason: String },
+    /// The container exited on its own, with code 0 or after leaving a
+    /// credential file, but the factory stored nothing, for `reason`.
+    NotStored { reason: String },
 }
 
 impl LoginView {
@@ -409,30 +572,45 @@ impl RunTask {
         self.finish(succeeded, &home, &recent).await;
     }
 
-    /// Stores the `auth.json` the container wrote, or reports why the login did
-    /// not produce one. A valid file is stored even when the container's exit
-    /// code was non-zero, so a login that succeeded but exited oddly is kept;
-    /// an invalid or missing file is a failure with the container's last output.
+    /// Stores the credential the container wrote, or reports why it could not.
+    /// A valid file is stored even when the container's exit code was non-zero,
+    /// so a login that succeeded but exited oddly is kept. Otherwise the reason
+    /// names what went wrong and is followed by the container's last output.
+    /// The view is [`LoginView::NotStored`] when the container exited 0 or left
+    /// a credential file, and [`LoginView::Failed`] when it exited non-zero
+    /// with no file.
     async fn finish(&self, succeeded: bool, home: &Path, recent: &VecDeque<String>) {
-        match (self.spec.read_back)(home) {
-            Some(credential) if (self.spec.validate)(&credential) => {
-                if let Err(err) = (self.spec.store)(self.secrets.as_ref(), &credential) {
-                    self.fail(format!("The login could not be saved: {err}"))
+        let (cause, file_present) = match (self.spec.read_back)(home) {
+            Ok(credential) => match (self.spec.validate)(&credential) {
+                Ok(()) => {
+                    if let Err(err) = (self.spec.store)(self.secrets.as_ref(), &credential) {
+                        self.publish(LoginView::NotStored {
+                            reason: format!("The login could not be saved: {err}"),
+                        })
                         .await;
-                } else {
-                    self.publish(LoginView::SignedIn).await;
-                }
-            }
-            _ => {
-                let reason = match scrub_lines(recent) {
-                    Some(tail) => format!("The container's last output:\n{tail}"),
-                    None if succeeded => {
-                        "The container exited without writing a usable login.".to_owned()
+                    } else {
+                        self.publish(LoginView::SignedIn).await;
                     }
-                    None => "The container exited before signing in.".to_owned(),
-                };
-                self.fail(reason).await;
+                    return;
+                }
+                Err(err) => (format!("The credential was refused: {err}."), true),
+            },
+            Err(err) => (
+                err.to_string(),
+                !matches!(err, ReadBackError::Missing { .. }),
+            ),
+        };
+        let reason = match scrub_lines(recent) {
+            Some(tail) => format!("{cause}\n\nThe container's last output:\n{tail}"),
+            None if succeeded => {
+                format!("{cause}\n\nThe container exited without writing a usable login.")
             }
+            None => format!("{cause}\n\nThe container exited before signing in."),
+        };
+        if succeeded || file_present {
+            self.publish(LoginView::NotStored { reason }).await;
+        } else {
+            self.fail(reason).await;
         }
     }
 
@@ -555,6 +733,25 @@ fn scrub_line(line: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn scrub_name(name: &str) -> String {
+    let in_alphabet = |c: char| c.is_ascii_alphanumeric() || "-_.+/=".contains(c);
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while !rest.is_empty() {
+        let split = rest
+            .find(|c: char| in_alphabet(c) != in_alphabet(rest.chars().next().unwrap_or(' ')))
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(split);
+        if run.starts_with(in_alphabet) && looks_secret(run) {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        rest = tail;
+    }
+    out
 }
 
 /// Whether a token looks like a secret: a JWT or an API key by its prefix, or

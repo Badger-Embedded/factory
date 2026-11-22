@@ -12,7 +12,7 @@ use std::time::Duration;
 use factory_runner::WorkerConfig;
 use factory_server::{
     DeviceLogin, LocalSecrets, LoginProcess, LoginSpawner, LoginSpec, LoginView, MASTER_KEY_LEN,
-    PodmanLogin, SecretStore, Store,
+    PodmanLogin, ReadBackError, SecretStore, Store,
 };
 
 fn spec() -> LoginSpec {
@@ -23,8 +23,21 @@ fn spec() -> LoginSpec {
         home_env: "TOOL_HOME",
         home_mount: "/tool",
         prepare: |home| std::fs::write(home.join("prepared"), "yes"),
-        read_back: |home| std::fs::read_to_string(home.join("token.txt")).ok(),
-        validate: |credential| credential.starts_with("gho_"),
+        read_back: |home| {
+            std::fs::read_to_string(home.join("token.txt")).map_err(|error| {
+                ReadBackError::Unreadable {
+                    file: "token.txt",
+                    error,
+                }
+            })
+        },
+        validate: |credential| {
+            if credential.starts_with("gho_") {
+                Ok(())
+            } else {
+                Err("the test validator wants gho_".to_owned())
+            }
+        },
         store: |secrets, credential| secrets.set_copilot_token(credential),
         timeout_reason: "the test login timed out",
     }
@@ -132,7 +145,11 @@ async fn a_custom_spec_prepares_reads_back_validates_and_stores() {
 #[tokio::test]
 async fn a_custom_spec_refuses_a_credential_its_validator_rejects() {
     let (view, _seen, secrets, _data) = run("ghp_classic").await;
-    assert!(matches!(view, LoginView::Failed { .. }), "{view:?}");
+    let LoginView::NotStored { reason } = view else {
+        panic!("{view:?}");
+    };
+    assert!(reason.contains("the test validator wants gho_"), "{reason}");
+    assert!(!reason.contains("ghp_classic"), "{reason}");
     assert!(secrets.copilot_token().unwrap().is_none());
 }
 
