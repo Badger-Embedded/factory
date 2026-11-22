@@ -3,7 +3,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use factory_core::{
     Agent, AgentResult, DEFAULT_AGENT, Event, Gates, Job, Rejected, Session, Stage,
@@ -188,6 +187,9 @@ CREATE TABLE IF NOT EXISTS user_settings (
     notifications INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS store_boots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT
+);
 ";
 
 /// A file attached to a request. `name` is the generated name on disk, such
@@ -276,7 +278,7 @@ pub struct CodexPrice {
 /// The jobs, kept in SQLite. Each job is stored as JSON in one row.
 pub struct Store {
     conn: Mutex<Connection>,
-    /// When the store opened, in milliseconds since the Unix epoch.
+    /// How many times the database has been opened, from `store_boots`.
     epoch: u64,
     reads: AtomicU64,
 }
@@ -284,9 +286,9 @@ pub struct Store {
 /// The jobs as one read saw them, each with the id of its latest
 /// `job_events` row.
 pub struct Snapshot {
-    /// Orders snapshots from the same store: the epoch of the store, then a
-    /// count that rises with each read. A later read has a greater pair, also
-    /// after a restart.
+    /// Orders snapshots: the number of times the database has been opened,
+    /// then a count that rises with each read. A later read has a greater
+    /// pair, also after a restart, and no clock is involved.
     pub order: (u64, u64),
     pub jobs: Vec<(JobRow, i64)>,
 }
@@ -464,11 +466,11 @@ impl Store {
                 [],
             )?;
         }
+        conn.execute("INSERT INTO store_boots DEFAULT VALUES", [])?;
+        let epoch = u64::try_from(conn.last_insert_rowid()).unwrap_or(0);
         Ok(Store {
             conn: Mutex::new(conn),
-            epoch: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0)),
+            epoch,
             reads: AtomicU64::new(0),
         })
     }

@@ -4,12 +4,21 @@
   var LOCK = "factory-notifications";
   var pending = false;
 
-  function stored() {
-    try {
-      var state = JSON.parse(localStorage.getItem(STORE));
-      if (state && Array.isArray(state.keys) && Array.isArray(state.snapshot)) return state;
-    } catch (e) {}
-    return null;
+  var TAB = STORE + "." + Math.random().toString(36).slice(2);
+
+  function entries() {
+    var found = [];
+    for (var i = 0; i < localStorage.length; i++) {
+      var name = localStorage.key(i);
+      if (name.indexOf(STORE + ".") !== 0) continue;
+      try {
+        var state = JSON.parse(localStorage.getItem(name));
+        if (state && Array.isArray(state.keys) && Array.isArray(state.snapshot)) {
+          found.push({ name: name, state: state });
+        }
+      } catch (e) {}
+    }
+    return found;
   }
 
   function newer(a, b) {
@@ -30,15 +39,18 @@
   }
 
   function update(data) {
-    var state = stored();
-    if (state && !newer(data.snapshot, state.snapshot)) return;
-    var seen = state ? state.keys : [];
+    var found = entries();
+    var best = null;
+    found.forEach(function (entry) {
+      if (!best || newer(entry.state.snapshot, best.snapshot)) best = entry.state;
+    });
+    if (best && !newer(data.snapshot, best.snapshot)) return;
     data.items.forEach(function (item) {
-      if (state && seen.indexOf(item.key) === -1) show(item);
+      if (best && best.keys.indexOf(item.key) === -1) show(item);
     });
     try {
       localStorage.setItem(
-        STORE,
+        TAB,
         JSON.stringify({
           snapshot: data.snapshot,
           keys: data.items.map(function (item) {
@@ -46,6 +58,11 @@
           }),
         })
       );
+      found.forEach(function (entry) {
+        if (entry.name !== TAB && newer(data.snapshot, entry.state.snapshot)) {
+          localStorage.removeItem(entry.name);
+        }
+      });
     } catch (e) {}
   }
 

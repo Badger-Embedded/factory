@@ -9824,6 +9824,27 @@ fn a_job_that_changes_between_the_two_reads_keeps_its_state_and_event_together()
 }
 
 #[test]
+fn a_reopened_database_orders_its_reads_after_the_earlier_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let mut last = Store::open(&path)
+        .unwrap()
+        .list_with_latest_event()
+        .unwrap()
+        .order;
+    for _ in 0..3 {
+        let order = Store::open(&path)
+            .unwrap()
+            .list_with_latest_event()
+            .unwrap()
+            .order;
+        assert_eq!(order.1, 1);
+        assert!(order > last);
+        last = order;
+    }
+}
+
+#[test]
 fn each_read_of_the_jobs_orders_after_the_one_before() {
     let store = Store::open_in_memory().unwrap();
     let first = store.list_with_latest_event().unwrap().order;

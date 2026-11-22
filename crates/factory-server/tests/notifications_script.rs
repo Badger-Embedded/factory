@@ -3,47 +3,115 @@ use std::process::Command;
 
 use serde_json::Value;
 
-const HARNESS: &str = r#"
+const BROWSER: &str = r#"
 const fs = require("fs");
-const [path, permission, responses] = process.argv.slice(1);
 const shown = [];
 const storage = {};
 global.localStorage = {
-  getItem: (k) => (k in storage ? storage[k] : null),
+  get length() { return Object.keys(storage).length; },
+  key: (i) => Object.keys(storage)[i] ?? null,
+  getItem: (k) => {
+    const value = k in storage ? storage[k] : null;
+    if (global.afterRead) { const hook = global.afterRead; global.afterRead = null; hook(); }
+    return value;
+  },
   setItem: (k, v) => { storage[k] = v; },
+  removeItem: (k) => { delete storage[k]; },
 };
 function Notification(title, options) { shown.push({ title, ...options }); }
-Notification.permission = permission;
 global.Notification = Notification;
 global.window = { Notification, focus() {}, open() {} };
+const load = (path) => fs.readFileSync(path, "utf8");
+const latest = () => {
+  let best = null;
+  for (const [name, value] of Object.entries(storage)) {
+    if (!name.startsWith("factory.notified.")) continue;
+    const state = JSON.parse(value);
+    const [a, b] = state.snapshot;
+    if (!best || a > best.snapshot[0] || (a === best.snapshot[0] && b > best.snapshot[1])) best = state;
+  }
+  return best;
+};
+const item = (n) => ({ key: "1:" + n, job: 1, title: "Add a button", kind: "needs-you", url: "/jobs/1" });
+const body = (snapshot, items) => ({ enabled: true, snapshot, items });
+"#;
+
+const SEQUENTIAL: &str = r"
+const [path, permission, responses] = process.argv.slice(1);
+Notification.permission = permission;
 const queue = JSON.parse(responses).map((r, i) => ({ snapshot: [1, i + 1], ...r }));
 global.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve(queue.shift()) });
 global.setInterval = () => 0;
-const code = fs.readFileSync(path, "utf8");
+const code = load(path);
 (async () => {
   const total = queue.length;
   for (let i = 0; i < total; i++) {
     new Function(code)();
     await new Promise((resolve) => setImmediate(resolve));
   }
-  console.log(JSON.stringify({ shown, stored: storage["factory.notified"] ?? null }));
+  console.log(JSON.stringify({ shown, latest: latest() }));
 })();
+";
+
+const INTERLEAVED: &str = r#"
+const [path] = process.argv.slice(1);
+Notification.permission = "granted";
+Object.defineProperty(global, "navigator", { value: {}, configurable: true });
+Date.now = () => 100;
+
+function Sync() { this.state = null; this.value = undefined; this.handlers = []; }
+Sync.prototype.then = function (ok, err) {
+  const next = new Sync();
+  this.handlers.push({ ok, err, next });
+  if (this.state) flush(this);
+  return next;
+};
+Sync.prototype.catch = function (err) { return this.then(undefined, err); };
+function settle(p, state, value) { p.state = state; p.value = value; flush(p); }
+function flush(p) {
+  const handlers = p.handlers;
+  p.handlers = [];
+  for (const h of handlers) {
+    const cb = p.state === "ok" ? h.ok : h.err;
+    if (!cb) { settle(h.next, p.state, p.value); continue; }
+    try {
+      const result = cb(p.value);
+      if (result && typeof result.then === "function") {
+        result.then((v) => settle(h.next, "ok", v), (e) => settle(h.next, "err", e));
+      } else settle(h.next, "ok", result);
+    } catch (e) { settle(h.next, "err", e); }
+  }
+}
+const done = (value) => { const p = new Sync(); settle(p, "ok", value); return p; };
+
+const requests = [];
+global.fetch = () => { const p = new Sync(); requests.push(p); return p; };
+const ticks = [];
+global.setInterval = (fn) => { ticks.push(fn); return 0; };
+const code = load(path);
+const respond = (request, snapshot, items) =>
+  settle(request, "ok", { ok: true, json: () => done(body(snapshot, items)) });
+
+storage["factory.notified.seed"] = JSON.stringify({ snapshot: [1, 0], keys: [] });
+new Function(code)();
+new Function(code)();
+const [first, second] = requests.splice(0);
+// The tab that started first gets the newer snapshot from the server. The
+// other tab has read the stored state when the first one finishes its write.
+global.afterRead = () => respond(first, [1, 6], [item(6)]);
+respond(second, [1, 5], [item(5)]);
+const afterRace = latest();
+ticks[0]();
+respond(requests.shift(), [1, 7], [item(6)]);
+console.log(JSON.stringify({ shown, afterRace, latest: latest() }));
 "#;
 
-fn item(job: u64, event: u64, kind: &str) -> Value {
-    serde_json::json!({
-        "key": format!("{job}:{event}"), "job": job, "title": "Add a button",
-        "kind": kind, "url": format!("/jobs/{job}"),
-    })
-}
-
-fn run(permission: &str, responses: &[Value]) -> Value {
+fn node(harness: &str, args: &[&str]) -> Value {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static/notifications.js");
     let output = Command::new("node")
-        .args(["-e", HARNESS])
+        .args(["-e", &format!("{BROWSER}{harness}")])
         .arg(script)
-        .arg(permission)
-        .arg(serde_json::to_string(responses).unwrap())
+        .args(args)
         .output()
         .expect("node runs; the dev shell provides it");
     assert!(
@@ -54,25 +122,47 @@ fn run(permission: &str, responses: &[Value]) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn keys(out: &Value) -> Vec<String> {
-    let state: Value = serde_json::from_str(out["stored"].as_str().unwrap()).unwrap();
-    state["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|key| key.as_str().unwrap().to_owned())
-        .collect()
+fn item(job: u64, event: u64, kind: &str) -> Value {
+    serde_json::json!({
+        "key": format!("{job}:{event}"), "job": job, "title": "Add a button",
+        "kind": kind, "url": format!("/jobs/{job}"),
+    })
+}
+
+fn run(permission: &str, responses: &[Value]) -> Value {
+    node(
+        SEQUENTIAL,
+        &[permission, &serde_json::to_string(responses).unwrap()],
+    )
 }
 
 fn on(items: &[Value]) -> Value {
     serde_json::json!({ "enabled": true, "items": items })
 }
 
+fn keys(state: &Value) -> Vec<&str> {
+    state["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key.as_str().unwrap())
+        .collect()
+}
+
+fn tags(out: &Value) -> Vec<&str> {
+    out["shown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|note| note["tag"].as_str().unwrap())
+        .collect()
+}
+
 #[test]
 fn the_first_poll_stores_the_keys_without_notifying() {
     let out = run("granted", &[on(&[item(1, 5, "needs-you")])]);
     assert_eq!(out["shown"].as_array().unwrap().len(), 0);
-    assert_eq!(keys(&out), ["1:5"]);
+    assert_eq!(keys(&out["latest"]), ["1:5"]);
 }
 
 #[test]
@@ -97,7 +187,7 @@ fn a_new_key_notifies_once_and_a_repeat_does_not() {
 #[test]
 fn keys_of_jobs_no_longer_listed_are_dropped() {
     let out = run("granted", &[on(&[item(1, 5, "failed")]), on(&[])]);
-    assert_eq!(keys(&out), Vec::<&str>::new());
+    assert_eq!(keys(&out["latest"]), Vec::<&str>::new());
 }
 
 #[test]
@@ -111,98 +201,17 @@ fn nothing_shows_without_permission_or_when_disabled() {
     assert_eq!(off["shown"].as_array().unwrap().len(), 0);
 }
 
-const TABS: &str = r#"
-const fs = require("fs");
-const [path, withLocks] = process.argv.slice(1);
-const shown = [];
-const storage = { "factory.notified": JSON.stringify({ snapshot: [1, 0], keys: [] }) };
-global.localStorage = {
-  getItem: (k) => (k in storage ? storage[k] : null),
-  setItem: (k, v) => { storage[k] = v; },
-};
-function Notification(title, options) { shown.push({ title, ...options }); }
-Notification.permission = "granted";
-global.window = { Notification, focus() {}, open() {} };
-global.Notification = Notification;
-Date.now = () => 100;
-let tail = Promise.resolve();
-const request = (name, task) => { const run = tail.then(task); tail = run.catch(() => {}); return run; };
-const locks = withLocks === "locks" ? { request } : undefined;
-Object.defineProperty(global, "navigator", { value: { locks }, configurable: true });
-const requests = [];
-global.fetch = () => new Promise((resolve) => requests.push(resolve));
-const ticks = [];
-global.setInterval = (fn) => { ticks.push(fn); return 0; };
-const code = fs.readFileSync(path, "utf8");
-const tick = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
-const reply = (snapshot, n) => ({
-  ok: true,
-  json: () => Promise.resolve({
-    enabled: true, snapshot,
-    items: [{ key: "1:" + n, job: 1, title: "t", kind: "needs-you", url: "/jobs/1" }],
-  }),
-});
-(async () => {
-  new Function(code)();
-  new Function(code)();
-  await tick();
-  const started = requests.length;
-  ticks[0]();
-  await tick();
-  const overlapping = requests.length;
-  if (withLocks === "locks") {
-    requests.shift()(reply([1, 5], 5));
-    await tick();
-    requests.shift()(reply([1, 6], 6));
-  } else {
-    requests[1](reply([1, 6], 6));
-    await tick();
-    requests[0](reply([1, 5], 5));
-  }
-  await tick();
-  console.log(JSON.stringify({ started, overlapping, shown, stored: storage["factory.notified"] }));
-})();
-"#;
-
-fn tabs(locks: &str) -> Value {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static/notifications.js");
-    let output = Command::new("node")
-        .args(["-e", TABS])
-        .arg(script)
-        .arg(locks)
-        .output()
-        .expect("node runs; the dev shell provides it");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+#[test]
+fn a_tab_that_read_the_state_before_a_newer_write_cannot_overwrite_it() {
+    let out = node(INTERLEAVED, &[]);
+    assert_eq!(out["afterRace"]["snapshot"], serde_json::json!([1, 6]));
+    assert_eq!(keys(&out["afterRace"]), ["1:6"]);
+    assert_eq!(
+        tags(&out).iter().filter(|tag| **tag == "1:6").count(),
+        1,
+        "a key shown once is not shown again: {:?}",
+        tags(&out)
     );
-    serde_json::from_slice(&output.stdout).unwrap()
-}
-
-fn tags(out: &Value) -> Vec<&str> {
-    out["shown"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|note| note["tag"].as_str().unwrap())
-        .collect()
-}
-
-#[test]
-fn without_web_locks_an_older_snapshot_that_arrives_last_is_discarded_at_equal_times() {
-    let out = tabs("none");
-    assert_eq!(out["started"], 2);
-    assert_eq!(out["overlapping"], 2);
-    assert_eq!(tags(&out), ["1:6"]);
-    assert_eq!(keys(&out), ["1:6"]);
-}
-
-#[test]
-fn with_web_locks_the_tabs_fetch_one_after_the_other() {
-    let out = tabs("locks");
-    assert_eq!(out["started"], 1);
-    assert_eq!(out["overlapping"], 1);
-    assert_eq!(tags(&out), ["1:5", "1:6"]);
-    assert_eq!(keys(&out), ["1:6"]);
+    assert_eq!(out["latest"]["snapshot"], serde_json::json!([1, 7]));
+    assert_eq!(keys(&out["latest"]), ["1:6"]);
 }
