@@ -25,6 +25,8 @@ pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
+const NOTIFICATIONS: &str = include_str!("../static/notifications.js");
+const PERMISSION_BAR: &str = include_str!("../static/permission-bar.js");
 const NOTIFICATION_PERMISSION: &str = include_str!("../static/notification-permission.js");
 const SETTINGS_FORM: &str = include_str!("../static/settings-form.js");
 const MCP_TOOLS: &str = include_str!("../static/mcp-tools.js");
@@ -129,6 +131,7 @@ fn page(user: &str, title: &str, nav: &Markup, body: &Markup) -> Markup {
                     }
                 }
                 main { (body) }
+                script { (PreEscaped(NOTIFICATIONS)) }
             }
         }
     }
@@ -162,6 +165,7 @@ pub fn index(
     plan_usage: Option<&UsageTile>,
     auto_merge: bool,
     workers: &Workers,
+    notifications: bool,
 ) -> Markup {
     let all: Vec<&JobRow> = jobs
         .iter()
@@ -176,6 +180,9 @@ pub fn index(
         "Jobs",
         &nav,
         &html! {
+            @if notifications {
+                (permission_bar())
+            }
             @if let Some(selected) = selected {
                 div.status-row {
                     (self::workers(workers, jobs, project_names, selected))
@@ -194,6 +201,21 @@ pub fn index(
             script { (PreEscaped(LOCAL_TIME)) }
         },
     )
+}
+
+/// A one-line ask for the browser's notification permission. It sits outside
+/// the polled regions and stays hidden until the script finds the API present
+/// and the permission still `default`, so it never shows once the user has
+/// answered. Without JavaScript it does not show at all.
+fn permission_bar() -> Markup {
+    html! {
+        div.card #permission-bar hidden {
+            "Get a browser notification when a job needs you "
+            button.primary type="button" { "Allow" }
+            " " a href="/settings/notifications" { "Notification settings" }
+            script { (PreEscaped(PERMISSION_BAR)) }
+        }
+    }
 }
 
 /// The worker slots at render time: the limit from the settings, the slots
@@ -3484,6 +3506,22 @@ fn status(job: &Job, auto_merge: bool) -> Status {
         }
     };
     Status { lane, class, text }
+}
+
+/// Why a job needs its requester, as the notification endpoint reports it:
+/// `needs-you` for the board's Needs you section, `failed` for a failed job
+/// that is not dismissed. It reads the same `status` as the board.
+pub fn attention(job: &Job, auto_merge: bool) -> Option<&'static str> {
+    match status(job, auto_merge).lane {
+        Lane::You => Some("needs-you"),
+        Lane::Failed => Some("failed"),
+        Lane::Agent | Lane::Factory | Lane::Done => None,
+    }
+}
+
+/// The request's first line, cut to 80 characters, as the board titles a job.
+pub fn job_title(job: &Job) -> String {
+    first_line(job.request())
 }
 
 fn turn_badge(job: &Job, auto_merge: bool) -> Markup {

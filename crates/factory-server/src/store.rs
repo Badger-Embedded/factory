@@ -597,6 +597,19 @@ impl Store {
         rows.map(|row| parse_row(row?)).collect()
     }
 
+    /// The id of the latest `job_events` row of each job that has one, in one
+    /// query. It changes whenever the job changes state.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn latest_event_ids(&self) -> Result<HashMap<i64, i64>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT job_id, MAX(id) FROM job_events GROUP BY job_id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// The ids of jobs created more than `days` days ago.
     ///
     /// # Errors
