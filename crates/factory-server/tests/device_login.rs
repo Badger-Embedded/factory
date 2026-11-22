@@ -15,7 +15,6 @@ use factory_server::{
     PodmanLogin, SecretStore, Store,
 };
 
-/// A spec unlike Codex's in every field, storing into the Copilot row.
 fn spec() -> LoginSpec {
     LoginSpec {
         container_name: "factory-test-login",
@@ -31,14 +30,11 @@ fn spec() -> LoginSpec {
     }
 }
 
-/// What the fake container saw and writes.
 struct Seen {
     name: String,
     prepared: bool,
 }
 
-/// Spawns a container that prints nothing and writes `credential` to
-/// `token.txt` in its config directory.
 struct CredentialSpawner {
     credential: String,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -80,8 +76,6 @@ impl LoginProcess for Writer {
     }
 }
 
-/// Runs a login with `credential` written by the container, and returns its
-/// final view, what the container saw and the secret store.
 async fn run(
     credential: &str,
 ) -> (
@@ -129,7 +123,6 @@ async fn a_custom_spec_prepares_reads_back_validates_and_stores() {
         Some("gho_abcdefghijklmnopqrstuvwxyz0123456789")
     );
     assert!(secrets.codex_auth().unwrap().is_none());
-    // The scratch directory is deleted when the login ends.
     let left = std::fs::read_dir(data.path().join("scratch"))
         .unwrap()
         .count();
@@ -143,8 +136,6 @@ async fn a_custom_spec_refuses_a_credential_its_validator_rejects() {
     assert!(secrets.copilot_token().unwrap().is_none());
 }
 
-/// A fake `podman` that appends each invocation's arguments, one per line and
-/// a blank line after, to `log`.
 fn fake_podman(dir: &Path, log: &Path) -> PathBuf {
     let path = dir.join("podman");
     std::fs::write(
