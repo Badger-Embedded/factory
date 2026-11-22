@@ -184,9 +184,8 @@ pub fn index(
                 (board(&all, costs, auto_merge, selected))
                 (stats(totals, selected))
             } @else {
-                (plan_usage_region(plan_usage))
                 div.card {
-                    p.empty { "No projects are configured." }
+                    p.empty { "You are not a collaborator on any project." }
                     p { a.nav href="/onboard" { "Onboard a project" } }
                 }
             }

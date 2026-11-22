@@ -173,6 +173,12 @@ const WEBP: &[u8] = b"RIFF\x04\0\0\0WEBPVP8 ";
 const ZIP: &[u8] = b"PK\x03\x04 a zip archive";
 const TEXT: &[u8] = b"a log line\n";
 
+/// The Tailscale login every dashboard request carries unless a test sends its
+/// own. [`dashboard_with_secrets`] seeds it as a collaborator on every project
+/// in the store, so the access checks let these requests through; a test that
+/// needs a non-collaborator sends a different login.
+const USER: &str = "alice@example.com";
+
 fn dashboard() -> Dashboard {
     dashboard_for("Badger-Embedded/maestro")
 }
@@ -206,6 +212,13 @@ fn dashboard_with_secrets(
     github: Arc<dyn RepoChecker>,
     secrets: Arc<dyn SecretStore>,
 ) -> Dashboard {
+    // Every request a test sends acts as `USER`, so that login has to be a
+    // collaborator on each project the test touches. Projects onboarded through
+    // the router carry their requester already; these are the ones seeded in
+    // the store before the dashboard is built.
+    for (name, _) in store.list_projects().unwrap() {
+        store.add_collaborator(&name, USER, "test").unwrap();
+    }
     let projects = Arc::new(Projects::from_store(Arc::clone(&store)));
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
@@ -267,8 +280,19 @@ impl Dashboard {
     }
 
     async fn get(&self, uri: &str) -> Reply {
-        self.send(Request::get(uri).body(Body::empty()).unwrap())
-            .await
+        self.get_as(USER, uri).await
+    }
+
+    /// A GET sent as `login`, for the access checks that read the collaborator
+    /// set; the plain `get` sends [`USER`].
+    async fn get_as(&self, login: &str, uri: &str) -> Reply {
+        self.send(
+            Request::get(uri)
+                .header(USER_HEADER, login)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
     }
 
     /// Every settings page joined into one body: the factory pages, the MCP
@@ -304,10 +328,16 @@ impl Dashboard {
     }
 
     async fn post(&self, uri: &str, form: &str) -> Reply {
+        self.post_as(USER, uri, form).await
+    }
+
+    /// A form POST sent as `login`, for the access checks that read the
+    /// collaborator set; the plain `post` sends [`USER`].
+    async fn post_as(&self, login: &str, uri: &str, form: &str) -> Reply {
         self.send(
             Request::post(uri)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .header(USER_HEADER, "alice@example.com")
+                .header(USER_HEADER, login)
                 .body(Body::from(form.to_owned()))
                 .unwrap(),
         )
@@ -315,6 +345,16 @@ impl Dashboard {
     }
 
     async fn post_job(&self, project: &str, request: &str, images: &[(&str, &[u8])]) -> Reply {
+        self.post_job_as(USER, project, request, images).await
+    }
+
+    async fn post_job_as(
+        &self,
+        login: &str,
+        project: &str,
+        request: &str,
+        images: &[(&str, &[u8])],
+    ) -> Reply {
         let mut body = Vec::new();
         let mut part = |disposition: String, content: &[u8]| {
             body.extend_from_slice(format!("--{BOUNDARY}\r\n{disposition}\r\n\r\n").as_bytes());
@@ -344,7 +384,7 @@ impl Dashboard {
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={BOUNDARY}"),
                 )
-                .header(USER_HEADER, "alice@example.com")
+                .header(USER_HEADER, login)
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -392,7 +432,7 @@ impl Dashboard {
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={BOUNDARY}"),
                 )
-                .header(USER_HEADER, "alice@example.com")
+                .header(USER_HEADER, USER)
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -443,6 +483,13 @@ async fn a_request_becomes_a_job_owned_by_the_tailscale_user() {
 #[tokio::test]
 async fn without_the_tailscale_header_the_user_is_local() {
     let dashboard = dashboard();
+    // A missing header reads as `local`, so that login has to be a collaborator
+    // for the post to land; the test is about the login value, not the access
+    // rule.
+    dashboard
+        .store
+        .add_collaborator("maestro", "local", "test")
+        .unwrap();
     let reply = dashboard
         .send(
             Request::post("/jobs")
@@ -1288,9 +1335,10 @@ async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
     // No project yet: the new-job form offers none.
     assert!(!dashboard.get("/").await.body.contains("widgets"));
 
-    // Onboard one while the dashboard runs, as the wizard will.
+    // Onboard one while the dashboard runs, as the wizard will, with the
+    // request's login as its collaborator.
     store
-        .create_project("widgets", "acme/widgets", "main", None, Some("alice"))
+        .create_project("widgets", "acme/widgets", "main", None, Some(USER))
         .unwrap();
 
     // It shows on the board selector, the settings page and the new-job form
@@ -2264,9 +2312,144 @@ async fn the_board_shows_only_the_selected_project() {
 }
 
 #[tokio::test]
-async fn an_unknown_project_in_the_index_is_a_bad_request() {
+async fn an_unknown_project_in_the_index_is_not_found() {
+    // An unknown project and one the login may not see both 404, so a project a
+    // login does not collaborate on does not leak through a different status.
     let page = dashboard().get("/?project=nope").await;
-    assert_eq!(page.status, StatusCode::BAD_REQUEST);
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+}
+
+/// A login that collaborates on none of the test's projects.
+const STRANGER: &str = "mallory@example.com";
+
+#[tokio::test]
+async fn a_non_collaborators_board_is_the_empty_state() {
+    // `two_projects` seeds USER on maestro and tool; the stranger is on neither.
+    let page = two_projects().get_as(STRANGER, "/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body
+            .contains("You are not a collaborator on any project.")
+    );
+    // The picker is gone, so no project the stranger may not see is listed.
+    assert!(!page.body.contains("<select id=\"project\""));
+    assert!(!page.body.contains("<option"));
+    assert!(!page.body.contains("maestro"));
+    assert!(page.body.contains("href=\"/onboard\""));
+}
+
+#[tokio::test]
+async fn a_hidden_project_board_and_fragments_are_not_found() {
+    let dashboard = two_projects();
+    for uri in [
+        "/?project=maestro",
+        "/fragments/board?project=maestro",
+        "/fragments/stats?project=maestro",
+        "/fragments/workers?project=maestro",
+    ] {
+        assert_eq!(
+            dashboard.get_as(STRANGER, uri).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    // A hidden project answers exactly as one that was never onboarded.
+    let hidden = dashboard.get_as(STRANGER, "/?project=maestro").await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    assert!(hidden.body.contains("no project maestro"));
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_see_or_act_on_a_job() {
+    let dashboard = two_projects();
+    let id = dashboard.new_job().await; // USER's job, in maestro.
+
+    // Every read of the job answers like an unknown one: "no job <id>".
+    for uri in [
+        format!("/jobs/{id}"),
+        format!("/jobs/{id}/fragment"),
+        format!("/jobs/{id}/edit"),
+        format!("/jobs/{id}/images/image-1.png"),
+    ] {
+        let reply = dashboard.get_as(STRANGER, &uri).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(reply.body.contains(&format!("no job {id}")), "{uri}");
+    }
+
+    // Every write refuses it too, so it cannot be cancelled, approved or retried.
+    for route in ["cancel", "approve", "retry", "dismiss"] {
+        let reply = dashboard
+            .post_as(STRANGER, &format!("/jobs/{id}/{route}"), "")
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{route}");
+    }
+    // The job itself did not move.
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Requested
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_post_a_job_to_a_project() {
+    let dashboard = two_projects();
+    let reply = dashboard
+        .post_job_as(STRANGER, "maestro", "A change the stranger wants", &[])
+        .await;
+    // Refused the same way a post to a project that does not exist is.
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_hidden_projects_settings_pages_are_not_found() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    for uri in [
+        "/settings/projects/maestro",
+        "/settings/projects/maestro/mcp/context7",
+    ] {
+        assert_eq!(
+            dashboard.get_as(STRANGER, uri).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        dashboard
+            .post_as(STRANGER, "/settings/projects/maestro", "clarify=opus")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // The check never runs for a project the stranger may not see.
+    assert_eq!(
+        dashboard
+            .post_as(
+                STRANGER,
+                "/settings/projects/maestro/mcp/context7/check",
+                ""
+            )
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(dashboard.checker.calls(), 0);
+}
+
+#[tokio::test]
+async fn the_settings_sidebar_lists_only_the_logins_own_projects() {
+    let dashboard = two_projects();
+    // The stranger onboards a project of their own, so a factory page renders
+    // for them, and its sidebar must show that project but not the others.
+    dashboard
+        .store
+        .create_project("stray", "o/stray", "main", None, Some(STRANGER))
+        .unwrap();
+    let body = dashboard.get_as(STRANGER, "/settings/workers").await.body;
+    assert!(body.contains("/settings/projects/stray"));
+    assert!(!body.contains("/settings/projects/maestro"));
+    assert!(!body.contains("/settings/projects/tool"));
 }
 
 #[tokio::test]
@@ -7659,7 +7842,7 @@ async fn the_check_route_404s_for_an_unknown_project_or_server() {
 }
 
 #[tokio::test]
-async fn settings_opens_the_first_project_or_workers_without_one() {
+async fn settings_opens_the_first_own_project_or_onboarding_without_one() {
     let reply = two_projects().get("/settings").await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert_eq!(
@@ -7667,10 +7850,12 @@ async fn settings_opens_the_first_project_or_workers_without_one() {
         Some("/settings/projects/maestro")
     );
 
+    // A login that collaborates on no project has no settings project to open,
+    // so it goes to onboarding.
     let empty = dashboard_with(Arc::new(Store::open_in_memory().unwrap()));
     let reply = empty.get("/settings").await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(reply.location.as_deref(), Some("/settings/workers"));
+    assert_eq!(reply.location.as_deref(), Some("/onboard"));
 }
 
 #[tokio::test]
