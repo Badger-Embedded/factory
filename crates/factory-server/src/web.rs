@@ -27,7 +27,8 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectTotals, Store, StoreError,
+    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectTotals,
+    Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -512,7 +513,7 @@ async fn notifications(
     let items: Vec<_> = snapshot
         .jobs
         .iter()
-        .filter(|(row, _)| row.requested_by == login)
+        .filter(|(row, _)| row.requested_by == login || row.requested_by == FACTORY_REQUESTER)
         .filter_map(|(row, event)| {
             let merge = *auto_merge.get(&row.project)?;
             let kind = pages::attention(&row.job, merge)?;
