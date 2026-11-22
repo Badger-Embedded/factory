@@ -54,9 +54,11 @@ pub fn validate_copilot_token(input: &str) -> Result<&str, CopilotTokenError> {
     if token.starts_with("ghp_") {
         return Err(CopilotTokenError::Classic);
     }
-    let has_body = ["gho_", "ghu_", "github_pat_"]
-        .iter()
-        .any(|prefix| token.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty()));
+    let has_body = ["gho_", "ghu_", "github_pat_"].iter().any(|prefix| {
+        token
+            .strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty())
+    });
     if has_body {
         Ok(token)
     } else {

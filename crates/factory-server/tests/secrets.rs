@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use factory_server::{
-    CodexAuthError, CopilotTokenError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef,
-    SecretStore, Store, UnavailableSecrets, validate_codex_auth, validate_copilot_token,
+    CodexAuthError, CopilotTokenError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError,
+    SecretRef, SecretStore, Store, UnavailableSecrets, validate_codex_auth, validate_copilot_token,
 };
 
 fn store() -> Arc<Store> {
@@ -421,7 +421,10 @@ fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
             .expect("raw row")
             .expect("row exists")
     };
-    let rows = [("header", header), ("claude", claude), ("codex", codex),
+    let rows = [
+        ("header", header),
+        ("claude", claude),
+        ("codex", codex),
         ("copilot", copilot),
     ];
     for (source_name, source) in rows {
@@ -655,7 +658,10 @@ fn validate_copilot_token_refuses_classic_unknown_and_empty() {
             "{input:?}",
         );
     }
-    assert_eq!(validate_copilot_token("  \n"), Err(CopilotTokenError::Empty));
+    assert_eq!(
+        validate_copilot_token("  \n"),
+        Err(CopilotTokenError::Empty)
+    );
 }
 
 #[test]
