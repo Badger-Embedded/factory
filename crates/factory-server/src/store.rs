@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use factory_core::{
     Agent, AgentResult, DEFAULT_AGENT, Event, Gates, Job, Rejected, Session, Stage,
@@ -274,6 +276,19 @@ pub struct CodexPrice {
 /// The jobs, kept in SQLite. Each job is stored as JSON in one row.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// When the store opened, in milliseconds since the Unix epoch.
+    epoch: u64,
+    reads: AtomicU64,
+}
+
+/// The jobs as one read saw them, each with the id of its latest
+/// `job_events` row.
+pub struct Snapshot {
+    /// Orders snapshots from the same store: the epoch of the store, then a
+    /// count that rises with each read. A later read has a greater pair, also
+    /// after a restart.
+    pub order: (u64, u64),
+    pub jobs: Vec<(JobRow, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,6 +466,10 @@ impl Store {
         }
         Ok(Store {
             conn: Mutex::new(conn),
+            epoch: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0)),
+            reads: AtomicU64::new(0),
         })
     }
 
@@ -598,25 +617,56 @@ impl Store {
     }
 
     /// All jobs, newest first, each with the id of its latest `job_events`
-    /// row, or 0 when it has none. One statement reads both, so a job's state
-    /// and its event id always match.
+    /// row, or 0 when it has none. Both come from one read transaction, so a
+    /// job's state and its event id always match.
     ///
     /// # Errors
     ///
     /// Fails on a database error or a stored job that does not parse.
-    pub fn list_with_latest_event(&self) -> Result<Vec<(JobRow, i64)>, StoreError> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, project, requested_by, created_at, job,
-                    COALESCE((SELECT MAX(id) FROM job_events WHERE job_id = jobs.id), 0)
-             FROM jobs ORDER BY id DESC",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((raw_row(row)?, row.get::<_, i64>(5)?)))?;
-        rows.map(|row| {
-            let (raw, event) = row?;
-            Ok((parse_row(raw)?, event))
+    pub fn list_with_latest_event(&self) -> Result<Snapshot, StoreError> {
+        self.list_with_latest_event_between(|| {})
+    }
+
+    /// [`Store::list_with_latest_event`] that runs `between` after the jobs
+    /// are read and before the event ids are. Tests use it to change a job at
+    /// that point, from another connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    #[doc(hidden)]
+    pub fn list_with_latest_event_between(
+        &self,
+        between: impl FnOnce(),
+    ) -> Result<Snapshot, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let jobs = {
+            let mut stmt = tx.prepare(
+                "SELECT id, project, requested_by, created_at, job FROM jobs ORDER BY id DESC",
+            )?;
+            let rows = stmt.query_map([], raw_row)?;
+            rows.map(|row| parse_row(row?))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        between();
+        let events: HashMap<i64, i64> = {
+            let mut stmt = tx.prepare("SELECT job_id, MAX(id) FROM job_events GROUP BY job_id")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        tx.commit()?;
+        let jobs = jobs
+            .into_iter()
+            .map(|row| {
+                let event = events.get(&row.id).copied().unwrap_or(0);
+                (row, event)
+            })
+            .collect();
+        Ok(Snapshot {
+            order: (self.epoch, self.reads.fetch_add(1, Ordering::SeqCst) + 1),
+            jobs,
         })
-        .collect()
     }
 
     /// The ids of jobs created more than `days` days ago.

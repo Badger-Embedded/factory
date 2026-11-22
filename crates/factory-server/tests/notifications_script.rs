@@ -16,7 +16,7 @@ function Notification(title, options) { shown.push({ title, ...options }); }
 Notification.permission = permission;
 global.Notification = Notification;
 global.window = { Notification, focus() {}, open() {} };
-const queue = JSON.parse(responses);
+const queue = JSON.parse(responses).map((r, i) => ({ snapshot: [1, i + 1], ...r }));
 global.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve(queue.shift()) });
 global.setInterval = () => 0;
 const code = fs.readFileSync(path, "utf8");
@@ -113,9 +113,9 @@ fn nothing_shows_without_permission_or_when_disabled() {
 
 const TABS: &str = r#"
 const fs = require("fs");
-const [path] = process.argv.slice(1);
+const [path, withLocks] = process.argv.slice(1);
 const shown = [];
-const storage = { "factory.notified": JSON.stringify({ at: 0, keys: [] }) };
+const storage = { "factory.notified": JSON.stringify({ snapshot: [1, 0], keys: [] }) };
 global.localStorage = {
   getItem: (k) => (k in storage ? storage[k] : null),
   setItem: (k, v) => { storage[k] = v; },
@@ -124,16 +124,24 @@ function Notification(title, options) { shown.push({ title, ...options }); }
 Notification.permission = "granted";
 global.window = { Notification, focus() {}, open() {} };
 global.Notification = Notification;
-let clock = 100;
-Date.now = () => clock++;
+Date.now = () => 100;
+let tail = Promise.resolve();
+const request = (name, task) => { const run = tail.then(task); tail = run.catch(() => {}); return run; };
+const locks = withLocks === "locks" ? { request } : undefined;
+Object.defineProperty(global, "navigator", { value: { locks }, configurable: true });
 const requests = [];
 global.fetch = () => new Promise((resolve) => requests.push(resolve));
 const ticks = [];
 global.setInterval = (fn) => { ticks.push(fn); return 0; };
 const code = fs.readFileSync(path, "utf8");
-const tick = () => new Promise((resolve) => setImmediate(resolve));
-const reply = (items) => ({ ok: true, json: () => Promise.resolve({ enabled: true, items }) });
-const item = (n) => ({ key: "1:" + n, job: 1, title: "t", kind: "needs-you", url: "/jobs/1" });
+const tick = async () => { for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve)); };
+const reply = (snapshot, n) => ({
+  ok: true,
+  json: () => Promise.resolve({
+    enabled: true, snapshot,
+    items: [{ key: "1:" + n, job: 1, title: "t", kind: "needs-you", url: "/jobs/1" }],
+  }),
+});
 (async () => {
   new Function(code)();
   new Function(code)();
@@ -142,22 +150,26 @@ const item = (n) => ({ key: "1:" + n, job: 1, title: "t", kind: "needs-you", url
   ticks[0]();
   await tick();
   const overlapping = requests.length;
-  requests[1](reply([item(6)]));
-  await tick();
-  await tick();
-  requests[0](reply([item(5)]));
-  await tick();
+  if (withLocks === "locks") {
+    requests.shift()(reply([1, 5], 5));
+    await tick();
+    requests.shift()(reply([1, 6], 6));
+  } else {
+    requests[1](reply([1, 6], 6));
+    await tick();
+    requests[0](reply([1, 5], 5));
+  }
   await tick();
   console.log(JSON.stringify({ started, overlapping, shown, stored: storage["factory.notified"] }));
 })();
 "#;
 
-#[test]
-fn an_older_response_that_arrives_last_is_discarded() {
+fn tabs(locks: &str) -> Value {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static/notifications.js");
     let output = Command::new("node")
         .args(["-e", TABS])
         .arg(script)
+        .arg(locks)
         .output()
         .expect("node runs; the dev shell provides it");
     assert!(
@@ -165,15 +177,32 @@ fn an_older_response_that_arrives_last_is_discarded() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let out: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(out["started"], 2);
-    assert_eq!(out["overlapping"], 2);
-    let tags: Vec<_> = out["shown"]
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn tags(out: &Value) -> Vec<&str> {
+    out["shown"]
         .as_array()
         .unwrap()
         .iter()
         .map(|note| note["tag"].as_str().unwrap())
-        .collect();
-    assert_eq!(tags, ["1:6"]);
+        .collect()
+}
+
+#[test]
+fn without_web_locks_an_older_snapshot_that_arrives_last_is_discarded_at_equal_times() {
+    let out = tabs("none");
+    assert_eq!(out["started"], 2);
+    assert_eq!(out["overlapping"], 2);
+    assert_eq!(tags(&out), ["1:6"]);
+    assert_eq!(keys(&out), ["1:6"]);
+}
+
+#[test]
+fn with_web_locks_the_tabs_fetch_one_after_the_other() {
+    let out = tabs("locks");
+    assert_eq!(out["started"], 1);
+    assert_eq!(out["overlapping"], 1);
+    assert_eq!(tags(&out), ["1:5", "1:6"]);
     assert_eq!(keys(&out), ["1:6"]);
 }

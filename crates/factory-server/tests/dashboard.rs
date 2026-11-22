@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -9654,7 +9653,10 @@ async fn notifications_list_a_job_at_the_spec_gate_and_a_new_key_at_the_plan_gat
     assert!(item["key"].as_str().unwrap().starts_with(&format!("{id}:")));
     assert_ne!(item["title"].as_str().unwrap(), "");
 
-    assert_eq!(notifications_as(&dashboard, USER).await, first);
+    assert_eq!(
+        notifications_as(&dashboard, USER).await["items"],
+        first["items"]
+    );
 
     dashboard.apply(id, Event::Approve);
     dashboard.apply(
@@ -9681,10 +9683,9 @@ async fn notifications_go_only_to_the_requester() {
         .unwrap();
     let id = dashboard.new_job().await;
     to_spec_approval(&dashboard, id);
-    assert_eq!(
-        notifications_as(&dashboard, "bob@example.com").await,
-        json!({"enabled": true, "items": []})
-    );
+    let bob = notifications_as(&dashboard, "bob@example.com").await;
+    assert_eq!(bob["enabled"], true);
+    assert_eq!(bob["items"], json!([]));
     assert_eq!(
         notifications_as(&dashboard, USER).await["items"]
             .as_array()
@@ -9784,8 +9785,11 @@ async fn the_board_asks_for_permission_only_while_notifications_are_on() {
 }
 
 #[test]
-fn a_job_listed_while_it_changes_state_keeps_its_state_and_event_together() {
-    let store = Arc::new(Store::open_in_memory().unwrap());
+fn a_job_that_changes_between_the_two_reads_keeps_its_state_and_event_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    let other = Store::open(&path).unwrap();
     store
         .create_project(
             "maestro",
@@ -9795,35 +9799,43 @@ fn a_job_listed_while_it_changes_state_keeps_its_state_and_event_together() {
             Some("a"),
         )
         .unwrap();
-    let writer = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || {
-            for _ in 0..150 {
-                let id = store.create("maestro", "a", "Add a button").unwrap();
-                store.apply(id, Event::Start).unwrap();
-                store
-                    .apply(id, Event::Agent(AgentResult::Clarified))
-                    .unwrap();
-                store
-                    .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
-                    .unwrap();
-                store.apply(id, Event::Approve).unwrap();
-            }
+    let id = store.create("maestro", "a", "Add a button").unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
+        .unwrap();
+    let before = store.list_with_latest_event().unwrap().jobs;
+    let (job, event) = (before[0].0.clone(), before[0].1);
+
+    let during = store
+        .list_with_latest_event_between(|| {
+            other.apply(id, Event::Approve).unwrap();
         })
-    };
-    let mut seen: HashMap<i64, String> = HashMap::new();
-    while !writer.is_finished() {
-        for (row, event) in store.list_with_latest_event().unwrap() {
-            let state = format!("{}/{}", row.job.stage().name(), row.job.turn().name());
-            assert_eq!(seen.entry(event).or_insert_with(|| state.clone()), &state);
-        }
-    }
-    writer.join().unwrap();
-    for (row, event) in store.list_with_latest_event().unwrap() {
-        let last = store.events(row.id).unwrap().pop().unwrap();
-        assert_eq!(last.stage, row.job.stage().name());
-        assert_eq!(last.turn, row.job.turn().name());
-        let state = format!("{}/{}", last.stage, last.turn);
-        assert_eq!(seen.get(&event).unwrap_or(&state), &state);
-    }
+        .unwrap()
+        .jobs;
+    assert_eq!(during[0], (job, event));
+
+    let after = store.list_with_latest_event().unwrap().jobs;
+    assert!(after[0].1 > event);
+    assert_ne!(after[0].0.job.stage(), during[0].0.job.stage());
+}
+
+#[test]
+fn each_read_of_the_jobs_orders_after_the_one_before() {
+    let store = Store::open_in_memory().unwrap();
+    let first = store.list_with_latest_event().unwrap().order;
+    let second = store.list_with_latest_event().unwrap().order;
+    assert!(second > first);
+}
+
+#[tokio::test]
+async fn each_notifications_response_carries_a_greater_snapshot_than_the_last() {
+    let dashboard = dashboard();
+    let first = notifications_as(&dashboard, USER).await["snapshot"].clone();
+    let second = notifications_as(&dashboard, USER).await["snapshot"].clone();
+    let pair = |value: &serde_json::Value| (value[0].as_u64().unwrap(), value[1].as_u64().unwrap());
+    assert!(pair(&second) > pair(&first));
 }

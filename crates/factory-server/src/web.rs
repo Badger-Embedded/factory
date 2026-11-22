@@ -501,9 +501,9 @@ async fn notifications(
             state.store.project_auto_merge(&name, default)?,
         );
     }
-    let items: Vec<_> = state
-        .store
-        .list_with_latest_event()?
+    let snapshot = state.store.list_with_latest_event()?;
+    let items: Vec<_> = snapshot
+        .jobs
         .iter()
         .filter(|(row, _)| row.requested_by == login)
         .filter_map(|(row, event)| {
@@ -518,9 +518,11 @@ async fn notifications(
             }))
         })
         .collect();
-    Ok(axum::Json(
-        serde_json::json!({ "enabled": true, "items": items }),
-    ))
+    Ok(axum::Json(serde_json::json!({
+        "enabled": true,
+        "snapshot": [snapshot.order.0, snapshot.order.1],
+        "items": items,
+    })))
 }
 
 /// Serves the plan usage tile on its own, from the same cache `index` reads. A
