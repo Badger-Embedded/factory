@@ -202,7 +202,7 @@ impl<T: GitHubRepos + Send + Sync> RepoChecker for T {
 
 /// Whether `repo` is `owner/name` with two non-empty parts and only characters
 /// GitHub allows in a repository path.
-fn well_formed(repo: &str) -> bool {
+pub(crate) fn well_formed(repo: &str) -> bool {
     let mut parts = repo.split('/');
     let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;

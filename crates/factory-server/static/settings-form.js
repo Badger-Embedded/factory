@@ -1,11 +1,10 @@
 // The save bar of each settings form. Once an input of a `.settings-form`
 // changes, its bar reads "Unsaved changes." and leaving the page asks first.
-// Saving that form does not ask; submitting a different form on the page does,
-// so its unsaved changes are not lost. Without this script the bar still holds
-// the form's submit button, so the form saves the same way.
+// Without this script the bar still holds the form's submit button, so the form
+// saves the same way.
 (function () {
   var dirty = new Set();
-  var submitting = false;
+  var submitting = null;
 
   function mark(event) {
     var form = event.target.closest && event.target.closest(".settings-form");
@@ -37,12 +36,15 @@
     true,
   );
   document.addEventListener("submit", function (event) {
-    if (event.target.closest && event.target.closest(".settings-form")) {
-      submitting = true;
-    }
+    submitting =
+      (event.target.closest && event.target.closest(".settings-form")) || null;
   });
   window.addEventListener("beforeunload", function (event) {
-    if (submitting || dirty.size === 0) return;
+    var unsaved = false;
+    dirty.forEach(function (form) {
+      if (form !== submitting) unsaved = true;
+    });
+    if (!unsaved) return;
     event.preventDefault();
     event.returnValue = "";
   });

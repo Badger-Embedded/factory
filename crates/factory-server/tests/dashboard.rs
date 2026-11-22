@@ -2680,6 +2680,8 @@ const DOM_LIB: &str = r#"
     var pipelineInput = NODES[pipelineInputId];
     var collabAddForm = NODES[collabAddFormId];
     var collabRemoveForm = NODES[collabRemoveFormId];
+    var maintenanceForm = NODES[maintenanceFormId];
+    var maintenanceInput = NODES[maintenanceInputId];
 "#;
 
 #[derive(serde::Serialize)]
@@ -2741,6 +2743,21 @@ fn settings_form_setup(body: &str) -> String {
         }
         false
     };
+    let maintenance_form_id = form_posting_to("/settings/projects/maestro/maintenance");
+    let within = |form: i64, mut id: i64| {
+        while let Ok(index) = usize::try_from(id) {
+            if id == form {
+                return true;
+            }
+            id = nodes[index].parent;
+        }
+        false
+    };
+    let maintenance_input_id = nodes
+        .iter()
+        .find(|n| n.tag == "input" && within(maintenance_form_id, n.id))
+        .expect("an input in the maintenance form")
+        .id;
     let pipeline_input_id = nodes
         .iter()
         .find(|n| {
@@ -2749,7 +2766,7 @@ fn settings_form_setup(body: &str) -> String {
         })
         .map_or(pipeline_form_id, |n| n.id);
     format!(
-        "var RAW = {}; var pipelineFormId = {pipeline_form_id}; var pipelineInputId = {pipeline_input_id}; var collabAddFormId = {}; var collabRemoveFormId = {};\n",
+        "var RAW = {}; var pipelineFormId = {pipeline_form_id}; var pipelineInputId = {pipeline_input_id}; var collabAddFormId = {}; var collabRemoveFormId = {}; var maintenanceFormId = {maintenance_form_id}; var maintenanceInputId = {maintenance_input_id};\n",
         serde_json::to_string(&nodes).unwrap(),
         form_posting_to("/settings/projects/maestro/collaborators"),
         form_posting_to("/settings/projects/maestro/collaborators/remove"),
@@ -2793,6 +2810,57 @@ async fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
     assert!(!beforeunload_warns_after(
         &setup,
         "fire(winListeners, \"beforeunload\", null);"
+    ));
+}
+
+#[tokio::test]
+async fn maintenance_edits_mark_the_page_unsaved_until_that_form_saves() {
+    let body = dashboard().get("/settings/projects/maestro").await.body;
+    let setup = settings_form_setup(&body);
+    let edit = "fire(docListeners, \"input\", maintenanceInput);";
+    let leave = "fire(winListeners, \"beforeunload\", null);";
+    let after = |submit: &str| format!("{edit}{submit}{leave}");
+    assert!(beforeunload_warns_after(&setup, &after("")));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &after("fire(docListeners, \"submit\", collabAddForm);")
+    ));
+    assert!(!beforeunload_warns_after(
+        &setup,
+        &after("fire(docListeners, \"submit\", maintenanceForm);")
+    ));
+}
+
+#[tokio::test]
+async fn saving_one_settings_form_keeps_the_prompt_for_the_other() {
+    let body = dashboard().get("/settings/projects/maestro").await.body;
+    let setup = settings_form_setup(&body);
+    let dirty_then_submit = |input: &str, form: &str| {
+        format!(
+            "fire(docListeners, \"input\", {input});\
+             fire(docListeners, \"submit\", {form});\
+             fire(winListeners, \"beforeunload\", null);"
+        )
+    };
+    let both = "fire(docListeners, \"input\", pipelineInput);\
+                fire(docListeners, \"input\", maintenanceInput);";
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("pipelineInput", "maintenanceForm")
+    ));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("maintenanceInput", "pipelineForm")
+    ));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &format!(
+            "{both}fire(docListeners, \"submit\", pipelineForm);fire(winListeners, \"beforeunload\", null);"
+        )
+    ));
+    assert!(!beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("pipelineInput", "pipelineForm")
     ));
 }
 
@@ -8548,7 +8616,12 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
         "/settings/projects/maestro",
     ] {
         let body = dashboard.get(uri).await.body;
-        assert_eq!(body.matches(r#"class="save-bar""#).count(), 1, "{uri}");
+        let bars = if uri == "/settings/projects/maestro" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(body.matches(r#"class="save-bar""#).count(), bars, "{uri}");
         assert!(body.contains(r#"class="card settings-form"#), "{uri}");
         assert!(body.contains("beforeunload"), "{uri}");
     }
@@ -9200,6 +9273,15 @@ fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
         .unwrap();
     store.save_project_settings(project, true, true).unwrap();
     store
+        .save_project_maintenance(
+            project,
+            &factory_server::Maintenance {
+                renovate: true,
+                packaging: None,
+            },
+        )
+        .unwrap();
+    store
         .put_secret(
             factory_server::SecretRef {
                 project,
@@ -9246,6 +9328,7 @@ async fn removing_a_project_cancels_its_jobs_and_deletes_its_data() {
         ("project_mcp_tool_refreshes", "project"),
         ("project_totals", "project"),
         ("project_collaborators", "project"),
+        ("project_maintenance", "project"),
         ("secrets", "project"),
     ] {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1");
@@ -9915,4 +9998,203 @@ async fn each_notifications_response_carries_a_greater_snapshot_than_the_last() 
     let second = notifications_as(&dashboard, USER).await["snapshot"].clone();
     let pair = |value: &serde_json::Value| (value[0].as_u64().unwrap(), value[1].as_u64().unwrap());
     assert!(pair(&second) > pair(&first));
+}
+
+const PACKAGING_FIELDS: [&str; 4] = [
+    "name=\"packaging_type\"",
+    "name=\"manifest_files\"",
+    "name=\"build_config_files\"",
+    "name=\"upstream_repo\"",
+];
+
+const PACKAGING_FORM: &str = "renovate=on&packaging=on&packaging_type=deb\
+    &manifest_files=%20debian/control%20%0D%0A%0D%0Asnap/snapcraft.yaml\
+    &build_config_files=&upstream_repo=o%2Ftool";
+
+#[tokio::test]
+async fn a_project_starts_with_both_maintenance_switches_off_and_no_packaging_fields() {
+    let dashboard = dashboard();
+    assert_eq!(
+        dashboard.store.project_maintenance("maestro").unwrap(),
+        factory_server::Maintenance::default()
+    );
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert!(page.body.contains("name=\"renovate\""));
+    assert!(page.body.contains("name=\"packaging\""));
+    for field in PACKAGING_FIELDS {
+        assert!(!page.body.contains(field), "{field}");
+    }
+}
+
+#[tokio::test]
+async fn a_project_made_before_the_table_existed_reads_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    store
+        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .unwrap();
+    drop(store);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DROP TABLE project_maintenance", [])
+        .unwrap();
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.project_maintenance("maestro").unwrap(),
+        factory_server::Maintenance::default()
+    );
+}
+
+#[tokio::test]
+async fn ticking_packaging_without_a_manifest_redraws_the_fields_and_stores_nothing() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/maintenance",
+            "renovate=on&packaging=on",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Give at least one manifest file."));
+    for field in PACKAGING_FIELDS {
+        assert!(reply.body.contains(field), "{field}");
+    }
+    assert!(
+        reply
+            .body
+            .contains("name=\"packaging\" value=\"on\" checked")
+    );
+    assert_eq!(
+        dashboard.store.project_maintenance("maestro").unwrap(),
+        factory_server::Maintenance::default()
+    );
+}
+
+#[tokio::test]
+async fn a_packaging_save_saves_and_renders_the_stored_values() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post("/settings/projects/maestro/maintenance", PACKAGING_FORM)
+        .await;
+    assert!(reply.body.contains("Saved."));
+    let stored = dashboard.store.project_maintenance("maestro").unwrap();
+    assert!(stored.renovate);
+    let packaging = stored.packaging.unwrap();
+    assert_eq!(packaging.kind, factory_server::PackagingType::Deb);
+    assert_eq!(
+        packaging.manifest_files,
+        ["debian/control", "snap/snapcraft.yaml"]
+    );
+    assert_eq!(packaging.build_config_files, Vec::<String>::new());
+    assert_eq!(packaging.upstream_repo, "o/tool");
+
+    let page = dashboard.get("/settings/projects/maestro").await;
+    for field in PACKAGING_FIELDS {
+        assert!(page.body.contains(field), "{field}");
+    }
+    assert!(page.body.contains("debian/control\nsnap/snapcraft.yaml"));
+    assert!(page.body.contains("value=\"o/tool\""));
+    assert!(page.body.contains("<option value=\"deb\" selected"));
+}
+
+#[tokio::test]
+async fn each_refused_maintenance_save_leaves_the_stored_row_unchanged() {
+    let dashboard = dashboard();
+    dashboard
+        .post("/settings/projects/maestro/maintenance", PACKAGING_FORM)
+        .await;
+    let before = dashboard.store.project_maintenance("maestro").unwrap();
+    for (form, message) in [
+        (
+            "packaging=on&manifest_files=a&upstream_repo=o%2Ftool",
+            "needs Renovate pull requests on",
+        ),
+        (
+            "renovate=on&packaging=on&manifest_files=%0D%0A&upstream_repo=o%2Ftool",
+            "at least one manifest file",
+        ),
+        (
+            "renovate=on&packaging=on&manifest_files=a&upstream_repo=tool",
+            "owner/name",
+        ),
+        (
+            "renovate=on&packaging=on&manifest_files=a&upstream_repo=a%2Fb%2Fc",
+            "owner/name",
+        ),
+        (
+            "renovate=on&packaging=on&packaging_type=rpm&manifest_files=a&upstream_repo=o%2Ft",
+            "snap, deb or other",
+        ),
+    ] {
+        let reply = dashboard
+            .post("/settings/projects/maestro/maintenance", form)
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{form}");
+        assert!(reply.body.contains(message), "{form}");
+        assert_eq!(
+            dashboard.store.project_maintenance("maestro").unwrap(),
+            before,
+            "{form}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn turning_packaging_off_hides_its_fields_again() {
+    let dashboard = dashboard();
+    dashboard
+        .post("/settings/projects/maestro/maintenance", PACKAGING_FORM)
+        .await;
+    let reply = dashboard
+        .post("/settings/projects/maestro/maintenance", "renovate=on")
+        .await;
+    assert!(reply.body.contains("Saved."));
+    for field in PACKAGING_FIELDS {
+        assert!(!reply.body.contains(field), "{field}");
+    }
+    let stored = dashboard.store.project_maintenance("maestro").unwrap();
+    assert!(stored.renovate && stored.packaging.is_none());
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_save_maintenance_settings() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_as(
+            STRANGER,
+            "/settings/projects/maestro/maintenance",
+            "renovate=on",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .renovate
+    );
+}
+
+#[test]
+fn maintenance_settings_round_trip_through_the_store() {
+    let store = Store::open_in_memory().unwrap();
+    let packaging = factory_server::Packaging {
+        kind: factory_server::PackagingType::Other,
+        manifest_files: vec!["a.yaml".into(), "b dir/c.yaml".into()],
+        build_config_files: vec!["CMakeLists.txt".into()],
+        upstream_repo: "o/tool".into(),
+    };
+    let maintenance = factory_server::Maintenance {
+        renovate: true,
+        packaging: Some(packaging),
+    };
+    assert!(maintenance.check().is_ok());
+    store.save_project_maintenance("p", &maintenance).unwrap();
+    assert_eq!(store.project_maintenance("p").unwrap(), maintenance);
+    let off = factory_server::Maintenance::default();
+    store.save_project_maintenance("p", &off).unwrap();
+    assert_eq!(store.project_maintenance("p").unwrap(), off);
+    assert_eq!(store.project_maintenance("other").unwrap(), off);
 }
