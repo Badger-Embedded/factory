@@ -1776,6 +1776,7 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
             worker_memory: "6g".into(),
             worker_cpus: "6".into(),
             gates: Gates::default(),
+            ..factory_server::Settings::default()
         }
     );
 }
@@ -9561,7 +9562,10 @@ async fn an_admin_opens_the_factory_settings_pages_and_sees_their_groups() {
     assert!(body.contains("name=\"auto_reruns\""));
     assert!(body.contains("value=\"3\""));
     assert!(body.contains("value=\"7\""));
-    let other = dashboard.get_as(USER, "/settings/projects/maestro").await.body;
+    let other = dashboard
+        .get_as(USER, "/settings/projects/maestro")
+        .await
+        .body;
     assert!(!other.contains("/settings/renovate"));
 }
 
