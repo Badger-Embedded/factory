@@ -12,11 +12,11 @@ use factory_core::{
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
 use factory_server::{
-    AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin, GitHubRepos,
-    LocalSecrets, LoginProcess, LoginSpawner, MASTER_KEY_LEN, McpChecker, McpTool, Permission,
-    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, RepoReport, SecretStore, Settings,
-    StageAgents, StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER,
-    UnavailableSecrets, WorkerSlots, app,
+    AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin,
+    FACTORY_REQUESTER, GitHubRepos, LocalSecrets, LoginProcess, LoginSpawner, MASTER_KEY_LEN,
+    McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo,
+    RepoReport, SecretStore, Settings, StageAgents, StageEfforts, StageModels, Store, StoreError,
+    ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -9774,6 +9774,33 @@ fn to_review(dashboard: &Dashboard, id: i64) {
     dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 15 });
+}
+
+#[tokio::test]
+async fn a_factory_job_notifies_every_collaborator_with_notifications_on() {
+    let dashboard = dashboard();
+    let store = &dashboard.store;
+    store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+    store
+        .add_collaborator("maestro", "carol@example.com", "test")
+        .unwrap();
+    store.set_notifications("carol@example.com", false).unwrap();
+    let id = store
+        .create("maestro", FACTORY_REQUESTER, "Bump a crate")
+        .unwrap();
+    to_spec_approval(&dashboard, id);
+
+    for login in [USER, "bob@example.com"] {
+        let items = notifications_as(&dashboard, login).await["items"].clone();
+        assert_eq!(items[0]["job"], id, "{login}");
+        assert_eq!(items[0]["kind"], "needs-you", "{login}");
+    }
+    for login in ["carol@example.com", "mallory@example.com"] {
+        let items = notifications_as(&dashboard, login).await["items"].clone();
+        assert_eq!(items, json!([]), "{login}");
+    }
 }
 
 #[tokio::test]

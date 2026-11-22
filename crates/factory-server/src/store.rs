@@ -15,6 +15,9 @@ use crate::projects::{Project, StageAgents, StageEfforts, StageModels};
 use crate::secrets::SecretRef;
 use crate::settings::Settings;
 
+/// The requester of a job the factory creates on its own, with no person behind it.
+pub const FACTORY_REQUESTER: &str = "factory";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS projects (
     name TEXT PRIMARY KEY,
