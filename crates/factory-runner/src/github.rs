@@ -174,6 +174,8 @@ struct FileJson {
 
 #[derive(Deserialize)]
 struct ContentJson {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     content: String,
     encoding: Option<String>,
@@ -861,9 +863,22 @@ impl GitHub {
         };
         let content: ContentJson =
             serde_json::from_str(&out).map_err(|err| format!("contents of {path}: {err}"))?;
-        if content.encoding.as_deref() != Some("base64") {
+        if content.kind.as_deref() != Some("file") {
+            return Err(format!(
+                "{path} is a {} and not a file",
+                content.kind.as_deref().unwrap_or("thing of unknown type")
+            ));
+        }
+        match content.encoding.as_deref() {
+            Some("base64") => {}
             // GitHub leaves the content empty for a file over 1 MB.
-            return self.raw_file(repo, path, git_ref).await;
+            Some("none") => return self.raw_file(repo, path, git_ref).await,
+            other => {
+                return Err(format!(
+                    "contents of {path} have the unknown encoding {}",
+                    other.unwrap_or("none given")
+                ));
+            }
         }
         let packed: String = content.content.split_whitespace().collect();
         let bytes = STANDARD

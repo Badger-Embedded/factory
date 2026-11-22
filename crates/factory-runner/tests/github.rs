@@ -689,7 +689,7 @@ async fn file_at_decodes_the_content_and_maps_404_to_none() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls) = recording_github(
         dir.path(),
-        r#"echo '{"content": "aGVsbG8g\nd29ybGQ=\n", "encoding": "base64"}'"#,
+        r#"echo '{"content": "aGVsbG8g\nd29ybGQ=\n", "type": "file", "encoding": "base64"}'"#,
     );
     assert_eq!(
         github
@@ -774,7 +774,7 @@ async fn file_at_fetches_the_raw_file_when_the_content_is_not_inline() {
         r#"if [[ "$*" == *raw+json* ]]; then
   printf 'big file text'
 else
-  echo '{"content": "", "encoding": "none"}'
+  echo '{"type": "file", "content": "", "encoding": "none"}'
 fi"#,
     );
     assert_eq!(
@@ -814,4 +814,21 @@ printf ']}'"#,
             .unwrap(),
         Some("@@".into())
     );
+}
+
+#[tokio::test]
+async fn file_at_errors_for_a_submodule_and_a_directory() {
+    for body in [
+        r#"echo '{"type": "submodule", "name": "vendor", "sha": "abc"}'"#,
+        r#"echo '{"type": "symlink", "target": "x"}'"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (github, calls) = recording_github(dir.path(), body);
+        let err = github.file_at("o/r", "vendor", "main").await.unwrap_err();
+        assert!(err.contains("not a file"), "{err}");
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(dir.path(), r#"echo '[{"type": "file"}]'"#);
+    assert!(github.file_at("o/r", "dir", "main").await.is_err());
 }
