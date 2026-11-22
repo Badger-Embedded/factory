@@ -2771,7 +2771,7 @@ fn flow_index(stage: &Stage) -> Option<usize> {
         Stage::PrOpen { .. } => 6,
         Stage::CiAndReview { .. } => 7,
         Stage::Merged => 8,
-        Stage::Cancelled | Stage::Failed { .. } => return None,
+        Stage::Renovate | Stage::Cancelled | Stage::Failed { .. } => return None,
     })
 }
 
@@ -3656,6 +3656,7 @@ fn stage_label(job: &Job) -> String {
         Stage::Verifying { pr } => format!("verifying, {}", of(*pr)),
         Stage::PrOpen { pr } => format!("pr-open, {}", of(*pr)),
         Stage::CiAndReview { pr } => format!("ci-and-review, {}", of(*pr)),
+        Stage::Renovate => "renovate".into(),
         Stage::Merged => "merged".into(),
         Stage::Cancelled => "cancelled".into(),
         Stage::Failed { .. } => "failed".into(),
@@ -3687,7 +3688,13 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
                 )
             }
             Some(
-                Command::RunAgent { .. } | Command::Summarize { .. } | Command::RerunCi { .. },
+                Command::RunAgent { .. }
+                | Command::Summarize { .. }
+                | Command::RerunCi { .. }
+                | Command::WatchRenovate { .. }
+                | Command::RerunRenovate { .. }
+                | Command::PostComment { .. }
+                | Command::MergeRenovate { .. },
             )
             | None => "Waiting for a free worker.".into(),
         },
@@ -3716,6 +3723,8 @@ pub(crate) fn task_label(task: &Task) -> &'static str {
         Task::AddressReview { .. } => "addressing review comments",
         Task::Rebase { .. } => "rebasing onto the newest base branch to resolve a conflict",
         Task::Review => "reviewing the pull request",
+        Task::AnalyzeFailure { .. } => "reading the CI failure log",
+        Task::CheckDiff { .. } => "checking the diff of the update",
     }
 }
 

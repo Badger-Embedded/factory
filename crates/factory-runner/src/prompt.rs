@@ -98,6 +98,10 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
              Address them and commit."
         ),
         Task::Review => return review_prompt(&ReviewContext::default(), agent),
+        Task::AnalyzeFailure { log } => {
+            return failure_prompt(log, agent);
+        }
+        Task::CheckDiff { diff, body } => return diff_prompt(diff, body, agent),
     };
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
@@ -121,6 +125,46 @@ fn append_schema(text: &mut String, agent: Agent, expect: Expect) {
             .unwrap_or_else(|_| expect.schema().to_string());
         let _ = write!(text, "\n\n{instruction}\n\n{schema}");
     }
+}
+
+/// The prompt for the failure analysis of a Renovate pull request. The
+/// factory reruns the failed runs a few times before it asks, so the log is
+/// one that kept failing.
+fn failure_prompt(log: &str, agent: Agent) -> String {
+    let mut text = format!(
+        "CI failed on a Renovate pull request that updates a dependency, and reruns of the \
+         failed runs did not fix it. This is the log:\n\n{log}\n\n\
+         Decide whether the failure is transient or caused by the update. A transient \
+         failure has nothing to do with the update: a flaky test, a network error, a \
+         runner that ran out of resources or an unavailable service. A failure caused by \
+         the update is one the new version explains, such as a changed API, a failing \
+         test of the updated package or a build that no longer resolves. Read the \
+         repository where the log leaves the question open. Do not change any files and do \
+         not push.\n\n\
+         End with outcome \"transient\" or \"caused_by_update\", and a reason that cites \
+         the lines of the log that show it."
+    );
+    append_schema(&mut text, agent, Expect::FailureAnalysis);
+    text
+}
+
+/// The prompt for the diff check of a Renovate pull request. The worker has
+/// no GitHub token, so the prompt carries the diff.
+fn diff_prompt(diff: &str, body: &str, agent: Agent) -> String {
+    let mut text = format!(
+        "This is a Renovate pull request, and all its checks passed. Its description:\n\n\
+         {body}\n\n\
+         Its diff:\n\n{diff}\n\n\
+         Decide whether the diff is safe to merge without a person reading it. The diff is \
+         safe when it changes only dependency or packaging version files. Any other change \
+         is unsafe, such as source code, CI workflows, scripts or configuration that does \
+         more than pin a version. Do not change any files and do not push.\n\n\
+         End with outcome \"safe\" or \"unsafe\", a reason that names the files that decide \
+         it, and a short summary of the update. When the diff shows the upstream versions \
+         or refs the update moves between, give them as \"from\" and \"to\"."
+    );
+    append_schema(&mut text, agent, Expect::DiffCheck);
+    text
 }
 
 /// What a review pass reads besides the diff.

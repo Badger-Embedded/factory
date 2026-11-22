@@ -1,7 +1,8 @@
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Command, Event, Gates, Job, MAX_FAILED_ROUNDS,
-    MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, Question, Rejected, RetryTarget, ReviewPass,
-    ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
+    AgentResult, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event, Gates, Job, JobKind,
+    MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, PrDiff, Question, Rejected,
+    RenovateCi, RenovateWait, RetryLimits, RetryTarget, ReviewPass, ReviewState, ReviewStop,
+    Session, Stage, Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -2207,4 +2208,600 @@ fn start_review() -> Event {
     Event::StartReview {
         head: format!("head{n}"),
     }
+}
+
+const LIMITS: RetryLimits = RetryLimits { auto: 3, total: 7 };
+
+fn renovate_job() -> Job {
+    Job::renovate(
+        42,
+        "chore(deps): update serde to v1.0.2",
+        "https://github.com/o/r/pull/42",
+    )
+}
+
+fn observe(job: &mut Job, head: &str, ci: RenovateCi, limits: RetryLimits, auto_merge: bool) {
+    apply(
+        job,
+        Event::RenovateObserved {
+            head: head.into(),
+            ci,
+            limits,
+            auto_merge,
+        },
+    );
+}
+
+fn failed(log: &str) -> RenovateCi {
+    RenovateCi::Failed { log: log.into() }
+}
+
+fn passed() -> RenovateCi {
+    RenovateCi::Passed {
+        details: Some(Box::new(PrDiff {
+            diff: "+serde = 1.0.2".into(),
+            body: "Bumps serde".into(),
+        })),
+    }
+}
+
+fn pr_of(job: &Job) -> &factory_core::RenovatePr {
+    job.renovate_pr().expect("a Renovate job")
+}
+
+/// Fails CI on `head` and runs the factory's rerun, as many times as the job
+/// asks for a rerun with no agent.
+fn rerun_ci(job: &mut Job, head: &str, limits: RetryLimits) {
+    observe(job, head, failed("log"), limits, false);
+    assert!(
+        matches!(job.turn(), Turn::RerunCi { .. }),
+        "expected a rerun, got {:?}",
+        job.turn()
+    );
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::RerunRenovate { number: 42, .. })
+    ));
+    apply(job, Event::CiRerun);
+    assert_eq!(job.turn(), &Turn::Factory);
+}
+
+fn post_comment(job: &mut Job) -> String {
+    let Some(Command::PostComment { number: 42, body }) = job.next_command() else {
+        panic!("expected a comment, got {:?}", job.next_command());
+    };
+    apply(job, Event::Commented);
+    body
+}
+
+fn waits(job: &Job, state: RenovateWait) {
+    assert_eq!(job.stage(), &Stage::Renovate);
+    assert!(
+        matches!(job.turn(), Turn::User(Ask::Renovate { state: s, .. }) if *s == state),
+        "expected {state:?}, got {:?}",
+        job.turn()
+    );
+}
+
+#[test]
+fn a_renovate_job_starts_watching_its_pull_request() {
+    let job = renovate_job();
+    assert_eq!(job.stage(), &Stage::Renovate);
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(job.request(), "chore(deps): update serde to v1.0.2");
+    assert_eq!(pr_of(&job).number, 42);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchRenovate {
+            number: 42,
+            verdict_head: None,
+            watch_only: false
+        })
+    );
+}
+
+#[test]
+fn a_stored_job_without_a_kind_loads_as_a_request() {
+    let mut stored =
+        serde_json::to_value(Job::new("add a reboot button", Gates::default())).unwrap();
+    stored.as_object_mut().unwrap().remove("kind").unwrap();
+    let job: Job = serde_json::from_value(stored).unwrap();
+    assert_eq!(job.kind(), &JobKind::Request);
+    assert!(job.renovate_pr().is_none());
+}
+
+#[test]
+fn a_renovate_job_survives_a_round_trip_through_json() {
+    let mut job = renovate_job();
+    observe(&mut job, "h1", failed("log"), LIMITS, false);
+    let back: Job = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+    assert_eq!(job, back);
+}
+
+#[test]
+fn pending_ci_and_no_checks_leave_the_job_running_and_never_merge() {
+    for ci in [RenovateCi::NoChecks, RenovateCi::Pending] {
+        let mut job = renovate_job();
+        observe(&mut job, "h1", ci, LIMITS, true);
+        assert_eq!(job.turn(), &Turn::Factory);
+        assert!(matches!(
+            job.next_command(),
+            Some(Command::WatchRenovate { .. })
+        ));
+    }
+}
+
+#[test]
+fn failing_ci_gets_the_automatic_reruns_and_then_the_agent() {
+    let mut job = renovate_job();
+    for n in 1..=3 {
+        observe(&mut job, "h1", failed("log"), LIMITS, false);
+        assert_eq!(
+            job.turn(),
+            &Turn::RerunCi {
+                reason: format!("automatic rerun {n} of 3")
+            }
+        );
+        apply(&mut job, Event::CiRerun);
+    }
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (3, 3));
+    observe(&mut job, "h1", failed("the log"), LIMITS, false);
+    assert_runs(
+        &job,
+        Session::Renovate,
+        Task::AnalyzeFailure {
+            log: "the log".into(),
+        },
+    );
+}
+
+#[test]
+fn one_automatic_rerun_sends_the_second_failure_to_the_agent() {
+    let limits = RetryLimits { auto: 1, total: 7 };
+    let mut job = renovate_job();
+    rerun_ci(&mut job, "h1", limits);
+    observe(&mut job, "h1", failed("log"), limits, false);
+    assert!(matches!(
+        job.turn(),
+        Turn::Agent(Task::AnalyzeFailure { .. })
+    ));
+}
+
+#[test]
+fn zero_automatic_reruns_send_the_first_failure_to_the_agent() {
+    let limits = RetryLimits { auto: 0, total: 2 };
+    let mut job = renovate_job();
+    observe(&mut job, "h1", failed("log"), limits, false);
+    assert!(matches!(
+        job.turn(),
+        Turn::Agent(Task::AnalyzeFailure { .. })
+    ));
+}
+
+#[test]
+fn a_transient_verdict_reruns_and_counts_toward_the_total_only() {
+    let mut job = renovate_job();
+    for _ in 0..3 {
+        rerun_ci(&mut job, "h1", LIMITS);
+    }
+    observe(&mut job, "h1", failed("log"), LIMITS, false);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "registry timeout".into(),
+        }),
+    );
+    assert_eq!(
+        job.turn(),
+        &Turn::RerunCi {
+            reason: "transient failure: registry timeout".into()
+        }
+    );
+    apply(&mut job, Event::CiRerun);
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (4, 3));
+    assert_eq!(job.turn(), &Turn::Factory);
+}
+
+#[test]
+fn a_caused_by_update_verdict_posts_one_comment_and_stops_triage() {
+    let mut job = renovate_job();
+    let limits = RetryLimits { auto: 0, total: 7 };
+    observe(&mut job, "h1", failed("log"), limits, false);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: false,
+            reason: "the API was removed".into(),
+        }),
+    );
+    let body = post_comment(&mut job);
+    assert!(body.contains("the API was removed"));
+    waits(&job, RenovateWait::Stopped);
+    assert!(pr_of(&job).stopped.is_some());
+    assert_eq!(
+        pr_of(&job).comments,
+        [("h1".to_owned(), CommentKind::CausedByUpdate)]
+    );
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchRenovate {
+            number: 42,
+            verdict_head: None,
+            watch_only: true
+        })
+    );
+
+    // Watching the same failing head again reruns nothing and posts nothing.
+    let before = job.clone();
+    observe(&mut job, "h1", failed("log"), limits, false);
+    assert_eq!(job, before);
+}
+
+#[test]
+fn the_total_limit_posts_one_comment_naming_the_reruns_and_stops() {
+    let mut job = renovate_job();
+    for _ in 0..3 {
+        rerun_ci(&mut job, "h1", LIMITS);
+    }
+    for _ in 3..7 {
+        observe(&mut job, "h1", failed("log"), LIMITS, false);
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::FailureVerdict {
+                transient: true,
+                reason: "flaky".into(),
+            }),
+        );
+        apply(&mut job, Event::CiRerun);
+    }
+    assert_eq!(pr_of(&job).reruns, 7);
+    observe(&mut job, "h1", failed("log"), LIMITS, false);
+    let body = post_comment(&mut job);
+    assert!(body.contains("7 reruns"), "{body}");
+    waits(&job, RenovateWait::Stopped);
+    assert_eq!(pr_of(&job).reruns, 7);
+}
+
+#[test]
+fn a_total_of_four_stops_after_four_reruns() {
+    let limits = RetryLimits { auto: 3, total: 4 };
+    let mut job = renovate_job();
+    for _ in 0..3 {
+        rerun_ci(&mut job, "h1", limits);
+    }
+    observe(&mut job, "h1", failed("log"), limits, false);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "flaky".into(),
+        }),
+    );
+    apply(&mut job, Event::CiRerun);
+    observe(&mut job, "h1", failed("log"), limits, false);
+    assert!(post_comment(&mut job).contains("4 reruns"));
+    waits(&job, RenovateWait::Stopped);
+}
+
+#[test]
+fn a_lowered_total_stops_a_job_that_already_has_more_reruns() {
+    let mut job = renovate_job();
+    for _ in 0..3 {
+        rerun_ci(&mut job, "h1", LIMITS);
+    }
+    for _ in 3..5 {
+        observe(&mut job, "h1", failed("log"), LIMITS, false);
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::FailureVerdict {
+                transient: true,
+                reason: "flaky".into(),
+            }),
+        );
+        apply(&mut job, Event::CiRerun);
+    }
+    assert_eq!(pr_of(&job).reruns, 5);
+    let lowered = RetryLimits { auto: 3, total: 4 };
+    observe(&mut job, "h1", failed("log"), lowered, false);
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::PostComment { .. })
+    ));
+    assert!(post_comment(&mut job).contains("5 reruns"));
+    waits(&job, RenovateWait::Stopped);
+}
+
+#[test]
+fn a_new_head_resets_the_counters_and_the_stop() {
+    let limits = RetryLimits { auto: 1, total: 1 };
+    let mut job = renovate_job();
+    rerun_ci(&mut job, "h1", limits);
+    observe(&mut job, "h1", failed("log"), limits, false);
+    post_comment(&mut job);
+    waits(&job, RenovateWait::Stopped);
+
+    observe(&mut job, "h2", failed("log"), limits, false);
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (0, 0));
+    assert_eq!(pr_of(&job).stopped, None);
+    assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+}
+
+#[test]
+fn the_stopped_comment_is_posted_once_per_head() {
+    let limits = RetryLimits { auto: 0, total: 1 };
+    let mut job = renovate_job();
+    observe(&mut job, "h1", failed("log"), limits, false);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "flaky".into(),
+        }),
+    );
+    apply(&mut job, Event::CiRerun);
+    observe(&mut job, "h1", failed("log"), limits, false);
+    post_comment(&mut job);
+
+    // Retry resets the counters on the same head. A second stop posts nothing.
+    apply(&mut job, Event::Retry);
+    apply(&mut job, Event::CiRerun);
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (0, 0));
+    let limits = RetryLimits { auto: 0, total: 0 };
+    observe(&mut job, "h1", failed("log"), limits, false);
+    waits(&job, RenovateWait::Stopped);
+    assert_eq!(pr_of(&job).comments.len(), 1);
+
+    // Another head gets its own comment.
+    observe(&mut job, "h2", failed("log"), limits, false);
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::PostComment { .. })
+    ));
+}
+
+#[test]
+fn retry_resumes_a_stopped_job_with_both_counters_at_zero() {
+    let limits = RetryLimits { auto: 1, total: 1 };
+    let mut job = renovate_job();
+    rerun_ci(&mut job, "h1", limits);
+    observe(&mut job, "h1", failed("log"), limits, false);
+    post_comment(&mut job);
+    assert!(job.can_retry());
+
+    apply(&mut job, Event::Retry);
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::RerunRenovate { number: 42, .. })
+    ));
+    apply(&mut job, Event::CiRerun);
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (0, 0));
+    assert_eq!(pr_of(&job).stopped, None);
+    assert_eq!(job.turn(), &Turn::Factory);
+
+    // A job that does not wait stopped cannot retry.
+    assert!(!job.can_retry());
+    assert!(job.clone().apply(Event::Retry).is_err());
+}
+
+#[test]
+fn passing_ci_asks_the_agent_to_check_the_diff_once_per_head() {
+    let mut job = renovate_job();
+    observe(&mut job, "h1", passed(), LIMITS, true);
+    assert_runs(
+        &job,
+        Session::Renovate,
+        Task::CheckDiff {
+            diff: "+serde = 1.0.2".into(),
+            body: "Bumps serde".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+            safe: true,
+            reason: "only a version changes".into(),
+            summary: "serde 1.0.1 to 1.0.2".into(),
+            from: Some("v1.0.1".into()),
+            to: Some("v1.0.2".into()),
+        }))),
+    );
+    let verdict = pr_of(&job).verdict.clone().unwrap();
+    assert_eq!(verdict.head, "h1");
+    assert_eq!(verdict.from.as_deref(), Some("v1.0.1"));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchRenovate {
+            number: 42,
+            verdict_head: Some("h1".into()),
+            watch_only: false
+        })
+    );
+
+    // A new head gets a new check.
+    observe(&mut job, "h2", passed(), LIMITS, true);
+    assert!(matches!(job.turn(), Turn::Agent(Task::CheckDiff { .. })));
+    assert_eq!(pr_of(&job).verdict, None);
+}
+
+fn with_safe_verdict(auto_merge: bool) -> Job {
+    let mut job = renovate_job();
+    observe(&mut job, "h1", passed(), LIMITS, auto_merge);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+            safe: true,
+            reason: "only a version changes".into(),
+            summary: "bump".into(),
+            from: None,
+            to: None,
+        }))),
+    );
+    job
+}
+
+#[test]
+fn a_safe_verdict_with_auto_merge_on_approves_and_merges_that_head() {
+    let mut job = with_safe_verdict(true);
+    observe(
+        &mut job,
+        "h1",
+        RenovateCi::Passed { details: None },
+        LIMITS,
+        true,
+    );
+    assert_eq!(
+        job.next_command(),
+        Some(Command::MergeRenovate {
+            number: 42,
+            head: "h1".into()
+        })
+    );
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert_eq!(job.turn(), &Turn::Done);
+    assert!(job.is_finished());
+}
+
+#[test]
+fn a_safe_verdict_with_auto_merge_off_waits_as_ready_to_merge() {
+    let mut job = with_safe_verdict(false);
+    observe(
+        &mut job,
+        "h1",
+        RenovateCi::Passed { details: None },
+        LIMITS,
+        false,
+    );
+    waits(&job, RenovateWait::Ready);
+    assert!(!job.can_retry());
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::WatchRenovate {
+            watch_only: false,
+            ..
+        })
+    ));
+
+    // Turning auto-merge on merges the ready job on the next watch.
+    observe(
+        &mut job,
+        "h1",
+        RenovateCi::Passed { details: None },
+        LIMITS,
+        true,
+    );
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::MergeRenovate { .. })
+    ));
+}
+
+#[test]
+fn an_unsafe_verdict_posts_one_comment_and_never_merges() {
+    let mut job = renovate_job();
+    observe(&mut job, "h1", passed(), LIMITS, true);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+            safe: false,
+            reason: "it edits a workflow".into(),
+            summary: "bump".into(),
+            from: None,
+            to: None,
+        }))),
+    );
+    assert!(post_comment(&mut job).contains("it edits a workflow"));
+    waits(&job, RenovateWait::Unsafe);
+    assert!(!job.can_retry());
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::WatchRenovate {
+            watch_only: true,
+            ..
+        })
+    ));
+
+    let before = job.clone();
+    observe(
+        &mut job,
+        "h1",
+        RenovateCi::Passed { details: None },
+        LIMITS,
+        true,
+    );
+    assert_eq!(job, before);
+    assert_eq!(
+        pr_of(&job).comments,
+        [("h1".to_owned(), CommentKind::Unsafe)]
+    );
+}
+
+#[test]
+fn a_renovate_job_is_merged_or_cancelled_from_any_wait() {
+    let mut merged = renovate_job();
+    apply(&mut merged, Event::Merged);
+    assert_eq!(merged.stage(), &Stage::Merged);
+
+    let mut closed = renovate_job();
+    observe(
+        &mut closed,
+        "h1",
+        failed("log"),
+        RetryLimits { auto: 0, total: 1 },
+        false,
+    );
+    apply(&mut closed, Event::ClosedUnmerged);
+    assert_eq!(closed.stage(), &Stage::Cancelled);
+    assert_eq!(closed.turn(), &Turn::Done);
+    assert!(closed.is_finished());
+}
+
+#[test]
+fn a_failed_renovate_agent_run_retries_the_same_task() {
+    let mut job = renovate_job();
+    observe(
+        &mut job,
+        "h1",
+        failed("log"),
+        RetryLimits { auto: 0, total: 7 },
+        false,
+    );
+    let task = Task::AnalyzeFailure { log: "log".into() };
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "the agent run ended with error_max_turns".into(),
+        },
+    );
+    assert!(job.can_retry());
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Renovate);
+    assert_eq!(job.turn(), &Turn::Agent(task));
+    assert_eq!(pr_of(&job).head.as_deref(), Some("h1"));
+}
+
+#[test]
+fn a_renovate_job_rejects_events_that_do_not_fit() {
+    let mut job = renovate_job();
+    assert!(job.apply(Event::CiRerun).is_err());
+    assert!(job.apply(Event::Commented).is_err());
+    assert!(job.apply(Event::Start).is_err());
+    observe(
+        &mut job,
+        "h1",
+        failed("log"),
+        RetryLimits { auto: 0, total: 0 },
+        false,
+    );
+    // The comment is posted before the next observation.
+    assert!(
+        job.apply(Event::RenovateObserved {
+            head: "h1".into(),
+            ci: RenovateCi::Pending,
+            limits: LIMITS,
+            auto_merge: false,
+        })
+        .is_err()
+    );
 }

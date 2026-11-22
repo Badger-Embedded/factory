@@ -3111,6 +3111,7 @@ fn session_key(session: Session) -> String {
         Session::Plan => "plan".to_owned(),
         Session::Pr(pr) => format!("pr-{pr}"),
         Session::Review(pr) => format!("review-{pr}"),
+        Session::Renovate => "renovate".to_owned(),
     }
 }
 

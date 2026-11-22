@@ -507,6 +507,7 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
+        Expect::FailureAnalysis | Expect::DiffCheck => unreachable!("this job is no Renovate job"),
     });
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -2533,6 +2534,7 @@ fn one_pass(request: &AgentRequest) -> Event {
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
+        Expect::FailureAnalysis | Expect::DiffCheck => unreachable!("this job is no Renovate job"),
     }
 }
 

@@ -15,6 +15,7 @@ impl Stage {
             Stage::Verifying { .. } => "verifying",
             Stage::PrOpen { .. } => "pr-open",
             Stage::CiAndReview { .. } => "ci-and-review",
+            Stage::Renovate => "renovate",
             Stage::Merged => "merged",
             Stage::Cancelled => "cancelled",
             Stage::Failed { .. } => "failed",
@@ -49,6 +50,8 @@ impl Task {
             Task::AddressReview { .. } => "address-review",
             Task::Rebase { .. } => "rebase",
             Task::Review => "review",
+            Task::AnalyzeFailure { .. } => "analyze-failure",
+            Task::CheckDiff { .. } => "check-diff",
         }
     }
 }
@@ -62,6 +65,7 @@ impl Ask {
             Ask::PlanApproval => "plan-approval",
             Ask::PublishApproval { .. } => "publish-approval",
             Ask::ReviewStopped { .. } => "review-stopped",
+            Ask::Renovate { .. } => "renovate",
         }
     }
 }
@@ -93,6 +97,8 @@ impl Event {
                 AgentResult::Plan(_) => "agent:plan",
                 AgentResult::CommitsReady(_) => "agent:commits-ready",
                 AgentResult::RerunCi { .. } => "agent:rerun-ci",
+                AgentResult::FailureVerdict { .. } => "agent:failure-verdict",
+                AgentResult::DiffVerdict { .. } => "agent:diff-verdict",
             },
             Event::AgentFailed { .. } => "agent-failed",
             Event::Answer(_) => "answer",
@@ -110,6 +116,8 @@ impl Event {
             Event::ReviewApproved => "review-approved",
             Event::ReviewChanges { .. } => "review-changes",
             Event::ReviewFailed { .. } => "review-failed",
+            Event::RenovateObserved { .. } => "renovate-observed",
+            Event::Commented => "commented",
             Event::Merged => "merged",
             Event::ClosedUnmerged => "closed-unmerged",
             Event::NothingToPublish => "nothing-to-publish",

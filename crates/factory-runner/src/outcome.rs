@@ -1,4 +1,6 @@
-use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question, Stage, Task};
+use factory_core::{
+    AgentResult, DiffVerdict, Event, PlannedPr, PrDescription, Question, Stage, Task,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -17,6 +19,13 @@ pub enum Expect {
     /// feedback. The other stages instead end with `questions` or their own
     /// done outcome.
     Review,
+    /// The failure analysis of a Renovate pull request. It ends with
+    /// `transient` or `caused_by_update`, each with a reason, and never asks
+    /// a question.
+    FailureAnalysis,
+    /// The diff check of a Renovate pull request. It ends with `safe` or
+    /// `unsafe`, with a reason and a summary, and never asks a question.
+    DiffCheck,
 }
 
 impl Expect {
@@ -39,6 +48,11 @@ impl Expect {
     /// or `changes` verdict of its own.
     #[must_use]
     pub fn for_task(stage: &Stage, task: &Task) -> Option<Self> {
+        match (stage, task) {
+            (Stage::Renovate, Task::AnalyzeFailure { .. }) => return Some(Expect::FailureAnalysis),
+            (Stage::Renovate, Task::CheckDiff { .. }) => return Some(Expect::DiffCheck),
+            _ => {}
+        }
         match (Self::for_stage(stage)?, task) {
             (Expect::Commits, Task::FixCi { .. }) => Some(Expect::FixCi),
             (_, Task::Review) => Some(Expect::Review),
@@ -47,7 +61,8 @@ impl Expect {
     }
 
     /// The outcomes a run may end with. Every stage run may end with
-    /// questions; a review run ends with `approve` or `changes`.
+    /// questions; a review run ends with `approve` or `changes`, and the two
+    /// Renovate runs with their verdicts.
     #[must_use]
     pub fn outcomes(self) -> Vec<&'static str> {
         let done = match self {
@@ -56,6 +71,8 @@ impl Expect {
             Expect::Plan => "plan",
             Expect::Commits | Expect::FixCi => "commits_ready",
             Expect::Review => return vec!["approve", "changes"],
+            Expect::FailureAnalysis => return vec!["transient", "caused_by_update"],
+            Expect::DiffCheck => return vec!["safe", "unsafe"],
         };
         let mut outcomes = vec!["questions", done];
         if self == Expect::FixCi {
@@ -85,6 +102,9 @@ impl Expect {
                 "required": ["outcome"],
                 "additionalProperties": false
             });
+        }
+        if let Some(schema) = self.renovate_schema() {
+            return schema;
         }
         let mut properties = json!({
             "outcome": { "type": "string", "enum": self.outcomes() },
@@ -133,7 +153,7 @@ impl Expect {
                 });
             }
             // Review returns its own schema above, before this match.
-            Expect::Clarify | Expect::Review => {}
+            Expect::Clarify | Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => {}
         }
         if self == Expect::FixCi {
             properties["reason"] = json!({
@@ -147,6 +167,57 @@ impl Expect {
             "required": ["outcome"],
             "additionalProperties": false
         })
+    }
+
+    /// The schema of the two Renovate runs, or `None` for another run.
+    fn renovate_schema(self) -> Option<Value> {
+        match self {
+            Expect::FailureAnalysis => Some(json!({
+                "type": "object",
+                "properties": {
+                    "outcome": {
+                        "type": "string",
+                        "enum": self.outcomes(),
+                        "description": "transient when the failure has nothing to do with the update and a rerun may pass, caused_by_update when the update makes CI fail."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why, citing the lines of the log that show it."
+                    }
+                },
+                "required": ["outcome", "reason"],
+                "additionalProperties": false
+            })),
+            Expect::DiffCheck => Some(json!({
+                "type": "object",
+                "properties": {
+                    "outcome": {
+                        "type": "string",
+                        "enum": self.outcomes(),
+                        "description": "safe when the diff changes only dependency or packaging version files, unsafe otherwise."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why, naming the files that decide it."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "A short summary of the update: what moves from which version to which."
+                    },
+                    "from": {
+                        "type": "string",
+                        "description": "The upstream ref the update moves from, such as a version tag, when the diff shows it."
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "The upstream ref the update moves to, when the diff shows it."
+                    }
+                },
+                "required": ["outcome", "reason", "summary"],
+                "additionalProperties": false
+            })),
+            _ => None,
+        }
     }
 
     /// The schema Codex gets through `codex exec --output-schema`. The strict
@@ -207,6 +278,9 @@ struct Output {
     plan: Option<Vec<PlanEntry>>,
     pull_request: Option<PrDescription>,
     reason: Option<String>,
+    summary: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -312,7 +386,38 @@ fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, St
     let output: Output = serde_json::from_value(output)
         .map_err(|err| format!("the agent's structured output does not parse: {err}"))?;
 
+    let reason = output.reason.filter(|reason| !reason.trim().is_empty());
     match (expect, output.outcome.as_str()) {
+        (Expect::FailureAnalysis, outcome @ ("transient" | "caused_by_update")) => {
+            match reason {
+                Some(reason) => Ok(AgentResult::FailureVerdict {
+                    transient: outcome == "transient",
+                    reason,
+                }),
+                None => Err(format!(
+                    "the agent ended with outcome {outcome} but gave no reason"
+                )),
+            }
+        }
+        (Expect::DiffCheck, outcome @ ("safe" | "unsafe")) => {
+            let summary = output.summary.filter(|summary| !summary.trim().is_empty());
+            match (reason, summary) {
+                (Some(reason), Some(summary)) => Ok(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+                    safe: outcome == "safe",
+                    reason,
+                    summary,
+                    from: output.from.filter(|from| !from.trim().is_empty()),
+                    to: output.to.filter(|to| !to.trim().is_empty()),
+                }))),
+                _ => Err(format!(
+                    "the agent ended with outcome {outcome} but gave no reason or no summary"
+                )),
+            }
+        }
+        (Expect::FailureAnalysis | Expect::DiffCheck, other) => Err(format!(
+            "the agent ended with outcome {other:?}, expected one of {:?}",
+            expect.outcomes()
+        )),
         (_, "questions") => {
             let questions = output.questions.unwrap_or_default();
             if questions.is_empty() {
@@ -353,9 +458,9 @@ fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, St
                     .into(),
             ),
         },
-        (Expect::FixCi, "rerun_ci") => match output.reason {
-            Some(reason) if !reason.trim().is_empty() => Ok(AgentResult::RerunCi { reason }),
-            _ => Err("the agent ended with outcome rerun_ci but gave no reason".into()),
+        (Expect::FixCi, "rerun_ci") => match reason {
+            Some(reason) => Ok(AgentResult::RerunCi { reason }),
+            None => Err("the agent ended with outcome rerun_ci but gave no reason".into()),
         },
         (_, other) => Err(format!(
             "the agent ended with outcome {other:?}, expected one of {:?}",
