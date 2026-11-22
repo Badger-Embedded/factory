@@ -5,15 +5,18 @@ use std::time::{Duration, Instant};
 
 use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
-    PrDescription, Question, ReviewState, Stage, Turn,
+    PrDescription, Question, RenovateCi, RenovateWait, ReviewState, Stage, Turn,
 };
-use factory_runner::{Expect, LogLine, McpUnavailable, Observation, Rerun, RunReport, TokenUsage};
+use factory_runner::{
+    Expect, LogLine, McpUnavailable, Observation, RenovatePr, Rerun, RunReport, TokenUsage,
+    is_renovate_login,
+};
 use factory_server::{
     AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink, McpProjectSettings,
     McpRuntime, McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
-    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
-    StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport,
-    WatchRequest, WorkerSlots, format_cost, ready_action, watch_only_event,
+    RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink,
+    Settings, StageAgents, StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets,
+    WatchReport, WatchRequest, WorkerSlots, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -53,6 +56,24 @@ struct FakeExecutor {
     watched: Mutex<Vec<WatchRequest>>,
     reruns: Mutex<VecDeque<Result<Rerun, String>>>,
     rerun_requests: Mutex<Vec<RerunRequest>>,
+    /// Open pull requests as `(author, base, pull request)`.
+    renovate_open: Mutex<Vec<(String, String, RenovatePr)>>,
+    renovate_listed: Mutex<Vec<(String, String)>>,
+    /// What the next look at a Renovate pull request finds.
+    renovate_now: Mutex<RenovateNow>,
+    renovate_watched: Mutex<Vec<RenovateWatchRequest>>,
+    comments: Mutex<Vec<(u64, String)>>,
+    /// Each approval and squash merge of `(number, head)`.
+    merged: Mutex<Vec<(u64, String)>>,
+}
+
+/// The state the fake reports for the Renovate pull request.
+#[derive(Clone)]
+enum RenovateNow {
+    Nothing,
+    Ci(&'static str, RenovateCi),
+    Merged,
+    Closed,
 }
 
 impl FakeExecutor {
@@ -77,6 +98,12 @@ impl FakeExecutor {
             watched: Mutex::new(Vec::new()),
             reruns: Mutex::new(VecDeque::new()),
             rerun_requests: Mutex::new(Vec::new()),
+            renovate_open: Mutex::new(Vec::new()),
+            renovate_listed: Mutex::new(Vec::new()),
+            renovate_now: Mutex::new(RenovateNow::Nothing),
+            renovate_watched: Mutex::new(Vec::new()),
+            comments: Mutex::new(Vec::new()),
+            merged: Mutex::new(Vec::new()),
         })
     }
 
@@ -204,6 +231,68 @@ impl Executor for FakeExecutor {
             .unwrap()
             .pop_front()
             .unwrap_or(Ok(Rerun::Started(vec![7])))
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn renovate_prs(&self, repo: &str, base: &str) -> Result<Vec<RenovatePr>, String> {
+        self.renovate_listed
+            .lock()
+            .unwrap()
+            .push((repo.to_owned(), base.to_owned()));
+        Ok(self
+            .renovate_open
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(author, pr_base, _)| is_renovate_login(author) && pr_base == base)
+            .map(|(_, _, pr)| pr.clone())
+            .collect())
+    }
+
+    async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
+        tokio::task::yield_now().await;
+        let now = self.renovate_now.lock().unwrap().clone();
+        self.renovate_watched.lock().unwrap().push(request.clone());
+        Ok(match now {
+            RenovateNow::Nothing => None,
+            RenovateNow::Merged => Some(Event::Merged),
+            RenovateNow::Closed => Some(Event::ClosedUnmerged),
+            RenovateNow::Ci(head, ci) => {
+                if request.watch_only && request.known_head.as_deref() == Some(head) {
+                    return Ok(None);
+                }
+                let ci = match ci {
+                    RenovateCi::Passed { details }
+                        if request.verdict_head.as_deref() == Some(head) =>
+                    {
+                        drop(details);
+                        RenovateCi::Passed { details: None }
+                    }
+                    ci => ci,
+                };
+                Some(Event::RenovateObserved {
+                    head: head.into(),
+                    ci,
+                    limits: request.limits,
+                    auto_merge: request.auto_merge,
+                })
+            }
+        })
+    }
+
+    async fn comment(&self, _repo: &str, number: u64, body: &str) -> Result<(), String> {
+        tokio::task::yield_now().await;
+        self.comments
+            .lock()
+            .unwrap()
+            .push((number, body.to_owned()));
+        Ok(())
+    }
+
+    async fn merge_renovate(&self, _repo: &str, number: u64, head: &str) -> Result<(), String> {
+        tokio::task::yield_now().await;
+        self.merged.lock().unwrap().push((number, head.to_owned()));
+        Ok(())
     }
 
     async fn stop(&self, job_id: i64) {
@@ -3965,7 +4054,8 @@ async fn renovate_runs_get_their_own_sessions_on_the_review_stage_settings() {
     });
     review_stage_settings(&store);
     let id = store
-        .create_renovate("maestro", 7, "Update serde", "https://example/pull/7")
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
         .unwrap();
     executor.release(10);
 
@@ -4025,5 +4115,376 @@ async fn renovate_runs_get_their_own_sessions_on_the_review_stage_settings() {
         assert_eq!(request.model.as_deref(), Some("review-model"));
         assert_eq!(request.effort.as_deref(), Some("high"));
         assert_eq!(mcp_stage(request), ["review-only"]);
+    }
+}
+
+fn renovate_pr(number: u64) -> RenovatePr {
+    RenovatePr {
+        number,
+        title: format!("Update dependency {number}"),
+        url: format!("https://github.com/Badger-Embedded/maestro/pull/{number}"),
+        head: "h1".into(),
+    }
+}
+
+fn enable_renovate(store: &Store) {
+    store
+        .save_project_maintenance(
+            "maestro",
+            &factory_server::Maintenance {
+                renovate: true,
+                packaging: None,
+            },
+        )
+        .unwrap();
+}
+
+/// A scheduler for a project with the Renovate switch on and one pull request
+/// from `renovate[bot]`, with no wait between looks.
+fn renovate_setup(
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    i64,
+) {
+    let (store, executor, scheduler) = setup(respond);
+    quick_polls(&store);
+    enable_renovate(&store);
+    let id = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    executor.release(50);
+    (store, executor, scheduler, id)
+}
+
+fn pr_of(store: &Store, id: i64) -> factory_core::RenovatePr {
+    store.get(id).unwrap().job.renovate_pr().unwrap().clone()
+}
+
+async fn step_until(scheduler: &Arc<Scheduler<FakeExecutor>>, mut done: impl FnMut() -> bool) {
+    for _ in 0..80 {
+        if done() {
+            return;
+        }
+        step(scheduler).await;
+    }
+    panic!("the condition never held");
+}
+
+fn failing(head: &'static str) -> RenovateNow {
+    RenovateNow::Ci(head, RenovateCi::Failed { log: "boom".into() })
+}
+
+fn passed(head: &'static str) -> RenovateNow {
+    RenovateNow::Ci(
+        head,
+        RenovateCi::Passed {
+            details: Some(Box::new(factory_core::PrDiff {
+                diff: "+serde = 1.0.2".into(),
+                body: "Bumps serde".into(),
+            })),
+        },
+    )
+}
+
+fn needs_you(store: &Store, id: i64) -> Option<RenovateWait> {
+    match store.get(id).unwrap().job.turn() {
+        Turn::User(Ask::Renovate { state, .. }) => Some(*state),
+        _ => None,
+    }
+}
+
+fn transient_runs(request: &AgentRequest) -> Event {
+    match request.expect {
+        Expect::FailureAnalysis => Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "the runner lost its network".into(),
+        }),
+        _ => Event::AgentFailed {
+            reason: "unexpected run".into(),
+        },
+    }
+}
+
+fn verdict(safe: bool) -> impl Fn(&AgentRequest) -> Event + Send + Sync + 'static {
+    move |_| {
+        Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe,
+                reason: if safe {
+                    "only a version bump".into()
+                } else {
+                    "it also edits the build script".into()
+                },
+                summary: "Bumps serde to 1.0.2".into(),
+                from: None,
+                to: None,
+            },
+        )))
+    }
+}
+
+fn set_limits(store: &Store, auto: u32, total: u32) {
+    let mut settings = store.settings().unwrap();
+    settings.renovate_auto_reruns = auto;
+    settings.renovate_total_reruns = total;
+    store.save_settings(&settings).unwrap();
+}
+
+#[tokio::test]
+async fn discovery_makes_one_job_per_renovate_pull_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&db).unwrap());
+    let executor = FakeExecutor::new(|_| questions());
+    enable_renovate(&store);
+    {
+        let mut open = executor.renovate_open.lock().unwrap();
+        open.push(("renovate[bot]".into(), "main".into(), renovate_pr(7)));
+        open.push(("dependabot[bot]".into(), "main".into(), renovate_pr(8)));
+        open.push(("renovate[bot]".into(), "next".into(), renovate_pr(9)));
+    }
+    let build = |store: &Arc<Store>| {
+        let projects: Projects = [(
+            "maestro".to_owned(),
+            Project {
+                repo: "Badger-Embedded/maestro".into(),
+                base: "main".into(),
+                checks: None,
+                models: StageModels::default(),
+                auto_merge: false,
+                llm_review: false,
+            },
+        )]
+        .into_iter()
+        .collect();
+        Scheduler::new(
+            Arc::clone(store),
+            Arc::new(projects),
+            Arc::clone(&executor),
+            Arc::new(Notify::new()),
+            PathBuf::new(),
+            mcp_runtime(store).0,
+        )
+    };
+
+    let scheduler = build(&store);
+    step(&scheduler).await;
+    let jobs = store.list().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].requested_by, "factory");
+    assert_eq!(jobs[0].job.renovate_pr().unwrap().number, 7);
+
+    step(&scheduler).await;
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(
+        executor.renovate_listed.lock().unwrap().len(),
+        1,
+        "a project is listed at most once per discovery interval"
+    );
+
+    drop(scheduler);
+    let reopened = Arc::new(Store::open(&db).unwrap());
+    let scheduler = build(&reopened);
+    step(&scheduler).await;
+    assert_eq!(executor.renovate_listed.lock().unwrap().len(), 2);
+    assert_eq!(reopened.list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_project_without_the_switch_is_never_listed() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    executor.renovate_open.lock().unwrap().push((
+        "renovate[bot]".into(),
+        "main".into(),
+        renovate_pr(7),
+    ));
+    step(&scheduler).await;
+    assert!(executor.renovate_listed.lock().unwrap().is_empty());
+    assert_eq!(store.list().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn failing_ci_is_rerun_three_times_before_an_agent_reads_it() {
+    let (store, executor, scheduler, id) = renovate_setup(|request| {
+        assert_eq!(request.expect, Expect::FailureAnalysis);
+        assert_eq!(request.branch, None);
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: false,
+            reason: "the new API drops a method".into(),
+        })
+    });
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), 3);
+    assert_eq!(executor.requests().len(), 1);
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Stopped));
+    let comments = executor.comments.lock().unwrap().clone();
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].1.contains("the new API drops a method"));
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn one_automatic_rerun_sends_the_second_failure_to_the_agent() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    set_limits(&store, 1, 7);
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || !executor.requests().is_empty()).await;
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), 1);
+    step(&scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(pr_of(&store, id).reruns, 2, "a transient verdict reruns");
+    assert!(executor.comments.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn triage_stops_after_the_total_reruns_and_restarts_on_a_new_head_or_retry() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    for _ in 0..4 {
+        step(&scheduler).await;
+    }
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), 7);
+    assert_eq!(pr_of(&store, id).reruns, 7);
+    let comments = executor.comments.lock().unwrap().clone();
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].1.contains("7 reruns"));
+    let Turn::User(Ask::Renovate { reason, .. }) = store.get(id).unwrap().job.turn().clone() else {
+        panic!("the job should wait for the user");
+    };
+    assert!(reason.contains("7 reruns"));
+
+    *executor.renovate_now.lock().unwrap() = failing("h2");
+    step_until(&scheduler, || {
+        pr_of(&store, id).head.as_deref() == Some("h2")
+    })
+    .await;
+    assert!(pr_of(&store, id).reruns <= 1);
+
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    set_limits(&store, 3, 4);
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    assert_eq!(pr_of(&store, id).reruns, 4, "the saved total of 4 applies");
+
+    let before = executor.rerun_requests.lock().unwrap().len();
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), before + 1);
+    assert_eq!(pr_of(&store, id).reruns, 0);
+    assert_eq!(pr_of(&store, id).auto_reruns, 0);
+}
+
+#[tokio::test]
+async fn a_lowered_total_stops_a_job_that_is_already_past_it() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || pr_of(&store, id).reruns == 5).await;
+    set_limits(&store, 3, 4);
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    assert_eq!(pr_of(&store, id).reruns, 5);
+    for _ in 0..3 {
+        step(&scheduler).await;
+    }
+    assert_eq!(pr_of(&store, id).reruns, 5, "no rerun after the stop");
+}
+
+#[tokio::test]
+async fn a_safe_update_merges_only_with_auto_merge_on() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    for _ in 0..2 {
+        step(&scheduler).await;
+    }
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Ready));
+    assert!(executor.merged.lock().unwrap().is_empty());
+    assert_eq!(
+        pr_of(&store, id).verdict.unwrap().summary,
+        "Bumps serde to 1.0.2"
+    );
+
+    store.save_project_auto_merge("maestro", true).unwrap();
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert_eq!(*executor.merged.lock().unwrap(), [(7, "h1".to_owned())]);
+    assert_eq!(
+        executor.requests().len(),
+        1,
+        "no analysis run without packaging"
+    );
+}
+
+#[tokio::test]
+async fn an_unsafe_update_is_never_merged() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(false));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    for _ in 0..3 {
+        step(&scheduler).await;
+    }
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Unsafe));
+    assert!(executor.merged.lock().unwrap().is_empty());
+    let comments = executor.comments.lock().unwrap().clone();
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].1.contains("it also edits the build script"));
+}
+
+#[tokio::test]
+async fn a_pull_request_with_no_checks_is_not_merged() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = RenovateNow::Ci("h1", RenovateCi::NoChecks);
+    for _ in 0..3 {
+        step(&scheduler).await;
+    }
+    assert!(executor.merged.lock().unwrap().is_empty());
+    assert_eq!(executor.requests().len(), 0);
+    assert_eq!(*store.get(id).unwrap().job.stage(), Stage::Renovate);
+}
+
+#[tokio::test]
+async fn a_merge_by_a_person_finishes_the_job_and_a_close_cancels_it() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    *executor.renovate_now.lock().unwrap() = RenovateNow::Merged;
+    step(&scheduler).await;
+    assert_eq!(*store.get(id).unwrap().job.stage(), Stage::Merged);
+
+    let other = store
+        .create_renovate_job("maestro", 8, "Update tokio", "https://example/pull/8")
+        .unwrap()
+        .unwrap();
+    *executor.renovate_now.lock().unwrap() = RenovateNow::Closed;
+    step(&scheduler).await;
+    assert_eq!(*store.get(other).unwrap().job.stage(), Stage::Cancelled);
+}
+
+#[tokio::test]
+async fn what_the_factory_posts_on_renovate_pull_requests_is_plain() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    let mut bodies: Vec<String> = executor
+        .comments
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, body)| body.clone())
+        .collect();
+    bodies.push(factory_server::APPROVAL.to_owned());
+    assert!(bodies.len() > 1);
+    for body in bodies {
+        assert!(body.is_ascii(), "{body}");
+        assert!(!body.contains("Moon Skywalker"));
     }
 }

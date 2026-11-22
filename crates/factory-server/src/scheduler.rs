@@ -6,10 +6,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use factory_core::{
-    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, Job, PrDescription, ReviewState, Session,
-    Stage,
+    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, Job, PrDescription, RetryLimits,
+    ReviewState, Session, Stage,
 };
-use factory_runner::{Expect, LogLine, McpConfig, Observation, Rerun, RunReport, job_prompt};
+use factory_runner::{
+    Expect, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport, job_prompt,
+};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -25,6 +27,15 @@ use crate::workers::{WorkerSlots, unix_now};
 
 /// How often the loop looks at the jobs when nothing wakes it.
 const POLL: Duration = Duration::from_secs(5);
+
+/// The least time between two lists of a project's Renovate pull requests.
+/// The spec asks for a pass at least every 10 minutes, so this leaves room
+/// for a slow pass.
+pub const RENOVATE_DISCOVERY: Duration = Duration::from_mins(5);
+
+/// The review text of the approval of a safe Renovate update.
+pub const APPROVAL: &str = "Every check passed and the diff changes only dependency or packaging \
+                        version files.";
 
 /// A finished job is deleted once it is this many days old, counted from
 /// `created_at`.
@@ -216,6 +227,26 @@ pub fn watch_only_event(observation: &Observation) -> Option<Event> {
     }
 }
 
+/// One look at a Renovate pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenovateWatchRequest {
+    pub job_id: i64,
+    pub repo: String,
+    pub number: u64,
+    /// The head the job has a diff verdict for. The executor fetches the diff
+    /// only for another head.
+    pub verdict_head: Option<String>,
+    /// The head the job last saw, which a `watch_only` look compares with.
+    pub known_head: Option<String>,
+    /// The job waits for the user, so the executor reports only a merge, a
+    /// close, or a new head commit.
+    pub watch_only: bool,
+    /// The retry limits saved now, read on every watch.
+    pub limits: RetryLimits,
+    /// The project's auto-merge flag now.
+    pub auto_merge: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RerunRequest {
     pub job_id: i64,
@@ -290,6 +321,37 @@ pub trait Executor: Send + Sync + 'static {
     /// GitHub stops reporting the old failure, so the next watch does not
     /// count it again.
     fn rerun(&self, request: RerunRequest) -> impl Future<Output = Result<Rerun, String>> + Send;
+
+    /// Lists the open pull requests Renovate made against `base`.
+    fn renovate_prs(
+        &self,
+        repo: &str,
+        base: &str,
+    ) -> impl Future<Output = Result<Vec<RenovatePr>, String>> + Send;
+
+    /// Looks at a Renovate pull request and returns the event to report, or
+    /// `None` when there is nothing to report.
+    fn watch_renovate(
+        &self,
+        request: RenovateWatchRequest,
+    ) -> impl Future<Output = Result<Option<Event>, String>> + Send;
+
+    /// Posts `body` as a comment on the pull request.
+    fn comment(
+        &self,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Approves the pull request with a plain review text and squash-merges
+    /// `head`, and only that head.
+    fn merge_renovate(
+        &self,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) -> impl Future<Output = Result<(), String>> + Send;
 
     /// Stops whatever runs for job `job_id`. Called when the job no longer
     /// wants the run, such as after a cancel.
@@ -389,6 +451,8 @@ pub struct Scheduler<E> {
     not_before: Mutex<HashMap<i64, Instant>>,
     slots: Arc<WorkerSlots>,
     mcp: McpRuntime,
+    /// When each project's Renovate pull requests were last listed.
+    discovered: Mutex<HashMap<String, Instant>>,
 }
 
 impl<E: Executor> Scheduler<E> {
@@ -409,6 +473,7 @@ impl<E: Executor> Scheduler<E> {
             not_before: Mutex::new(HashMap::new()),
             slots: Arc::new(WorkerSlots::new()),
             mcp,
+            discovered: Mutex::new(HashMap::new()),
         })
     }
 
@@ -446,6 +511,7 @@ impl<E: Executor> Scheduler<E> {
     pub async fn tick(self: &Arc<Self>) -> Result<(), StoreError> {
         let _pass = self.slots.lock_pass().await;
         let settings = self.store.settings()?;
+        self.discover_renovate().await?;
         let mut rows = self.store.list()?;
         rows.reverse();
         self.stop_unwanted(&rows).await?;
@@ -508,10 +574,133 @@ impl<E: Executor> Scheduler<E> {
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
                     self.spawn(row.id, Kind::Factory, async move {
-                        scheduler.rerun(&settings, request, &reason).await;
+                        scheduler.rerun(&settings, request, &reason, true).await;
                     });
                 }
+                renovate @ (Command::RerunRenovate { .. }
+                | Command::WatchRenovate { .. }
+                | Command::PostComment { .. }
+                | Command::MergeRenovate { .. })
+                    if self.due(row.id) =>
+                {
+                    self.renovate_command(&row, &job, &project, &settings, renovate)?;
+                }
                 _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the factory turn of a Renovate job.
+    fn renovate_command(
+        self: &Arc<Self>,
+        row: &JobRow,
+        job: &Job,
+        project: &Project,
+        settings: &Settings,
+        command: Command,
+    ) -> Result<(), StoreError> {
+        let id = row.id;
+        match command {
+            Command::RerunRenovate { number, reason } => {
+                let request = RerunRequest {
+                    job_id: id,
+                    repo: project.repo.clone(),
+                    number,
+                };
+                let scheduler = Arc::clone(self);
+                let settings = settings.clone();
+                self.spawn(id, Kind::Factory, async move {
+                    scheduler.rerun(&settings, request, &reason, false).await;
+                });
+            }
+            Command::WatchRenovate {
+                number,
+                verdict_head,
+                watch_only,
+            } => {
+                let request = RenovateWatchRequest {
+                    job_id: id,
+                    repo: project.repo.clone(),
+                    number,
+                    verdict_head,
+                    known_head: job.renovate_pr().and_then(|pr| pr.head.clone()),
+                    watch_only,
+                    limits: RetryLimits {
+                        auto: settings.renovate_auto_reruns,
+                        total: settings.renovate_total_reruns,
+                    },
+                    auto_merge: self
+                        .store
+                        .project_auto_merge(&row.project, project.auto_merge)?,
+                };
+                let scheduler = Arc::clone(self);
+                let settings = settings.clone();
+                self.spawn(id, Kind::Factory, async move {
+                    scheduler.watch_renovate(&settings, request).await;
+                });
+            }
+            Command::PostComment { number, body } => {
+                let repo = project.repo.clone();
+                let scheduler = Arc::clone(self);
+                let settings = settings.clone();
+                self.spawn(id, Kind::Factory, async move {
+                    scheduler
+                        .post_comment(&settings, id, &repo, number, &body)
+                        .await;
+                });
+            }
+            Command::MergeRenovate { number, head } => {
+                let repo = project.repo.clone();
+                let scheduler = Arc::clone(self);
+                let settings = settings.clone();
+                self.spawn(id, Kind::Factory, async move {
+                    scheduler
+                        .merge_renovate(&settings, id, &repo, number, &head)
+                        .await;
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Lists the Renovate pull requests of each project with the switch on, at
+    /// most once per [`RENOVATE_DISCOVERY`], and creates a job for each one
+    /// that has none. A project with the switch off gets no call. A listing
+    /// that fails is logged and tried again on the next pass.
+    async fn discover_renovate(&self) -> Result<(), StoreError> {
+        for (name, project) in self.projects.list()? {
+            if !self.store.project_maintenance(&name)?.renovate {
+                continue;
+            }
+            let due = self
+                .discovered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&name)
+                .is_none_or(|last| last.elapsed() >= RENOVATE_DISCOVERY);
+            if !due {
+                continue;
+            }
+            let listed = self
+                .executor
+                .renovate_prs(&project.repo, &project.base)
+                .await;
+            let prs = match listed {
+                Ok(prs) => prs,
+                Err(err) => {
+                    tracing::error!("listing the Renovate pull requests of {name}: {err}");
+                    continue;
+                }
+            };
+            self.discovered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(name.clone(), Instant::now());
+            for pr in prs {
+                self.store
+                    .create_renovate_job(&name, pr.number, &pr.title, &pr.url)?;
             }
         }
         Ok(())
@@ -1147,13 +1336,70 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
-    async fn rerun(&self, settings: &Settings, request: RerunRequest, reason: &str) {
+    async fn watch_renovate(&self, settings: &Settings, request: RenovateWatchRequest) {
+        let job_id = request.job_id;
+        self.wait(settings, job_id);
+        match self.executor.watch_renovate(request).await {
+            Ok(Some(event)) => self.apply(job_id, event),
+            Ok(None) => {}
+            Err(err) => self.retry_later(settings, job_id, &err),
+        }
+    }
+
+    async fn post_comment(
+        &self,
+        settings: &Settings,
+        job_id: i64,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) {
+        match self.executor.comment(repo, number, body).await {
+            Ok(()) => {
+                self.note(job_id, &format!("Commented on #{number}: {body}"));
+                self.apply(job_id, Event::Commented);
+            }
+            Err(err) => self.retry_later(settings, job_id, &err),
+        }
+    }
+
+    async fn merge_renovate(
+        &self,
+        settings: &Settings,
+        job_id: i64,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) {
+        match self.executor.merge_renovate(repo, number, head).await {
+            Ok(()) => {
+                self.note(
+                    job_id,
+                    &format!(
+                        "Approved and merged #{number}: its checks passed and auto-merge is on."
+                    ),
+                );
+                self.apply(job_id, Event::Merged);
+            }
+            Err(err) => self.retry_later(settings, job_id, &err),
+        }
+    }
+
+    async fn rerun(
+        &self,
+        settings: &Settings,
+        request: RerunRequest,
+        reason: &str,
+        agent_asked: bool,
+    ) {
         let job_id = request.job_id;
         let number = request.number;
-        self.note(
-            job_id,
-            &format!("The agent asked to rerun CI on #{number}: {reason}"),
-        );
+        let text = if agent_asked {
+            format!("The agent asked to rerun CI on #{number}: {reason}")
+        } else {
+            format!("Rerunning CI on #{number}: {reason}")
+        };
+        self.note(job_id, &text);
         match self.executor.rerun(request).await {
             Ok(rerun) => {
                 let text = match rerun {

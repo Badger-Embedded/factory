@@ -5,18 +5,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use factory_core::{Agent, Event};
+use factory_core::{Agent, Event, PrDiff, RenovateCi};
 use factory_runner::{
-    BranchSummary, Credential, Git, GitHub, Observation, Rerun, RunReport, SessionRun,
-    WorkerConfig, WorkerRun, backend, observe, place_files, place_images, remove_container, run,
-    run_checks, show_files, show_images,
+    BranchSummary, Ci, Credential, Git, GitHub, Observation, PrState, RenovatePr, Rerun, RunReport,
+    SessionRun, WorkerConfig, WorkerRun, backend, observe, place_files, place_images,
+    remove_container, run, run_checks, show_files, show_images,
 };
 
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
-    AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published, ReadyAction,
-    RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action,
-    watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published,
+    ReadyAction, RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest, WatchReport,
+    WatchRequest, ready_action, watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -438,6 +438,59 @@ impl Executor for PodmanExecutor {
         self.github
             .rerun_failed(&request.repo, request.number)
             .await
+    }
+
+    async fn renovate_prs(&self, repo: &str, base: &str) -> Result<Vec<RenovatePr>, String> {
+        self.github.renovate_prs(repo, base).await
+    }
+
+    async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
+        let status = self.github.status(&request.repo, request.number).await?;
+        let ci = match status.state {
+            PrState::Merged => return Ok(Some(Event::Merged)),
+            PrState::Closed => return Ok(Some(Event::ClosedUnmerged)),
+            PrState::Open => status.ci,
+        };
+        if request.watch_only && request.known_head.as_deref() == Some(status.head.as_str()) {
+            return Ok(None);
+        }
+        let ci = match ci {
+            Ci::NoChecks => RenovateCi::NoChecks,
+            Ci::Pending => RenovateCi::Pending,
+            Ci::Failed(checks) => RenovateCi::Failed {
+                log: self.github.failure_report(&request.repo, &checks).await,
+            },
+            Ci::Passed => {
+                let details = if request.verdict_head.as_deref() == Some(status.head.as_str()) {
+                    None
+                } else {
+                    let details = self
+                        .github
+                        .pr_details(&request.repo, request.number)
+                        .await?;
+                    Some(Box::new(PrDiff {
+                        diff: details.diff,
+                        body: details.body,
+                    }))
+                };
+                RenovateCi::Passed { details }
+            }
+        };
+        Ok(Some(Event::RenovateObserved {
+            head: status.head,
+            ci,
+            limits: request.limits,
+            auto_merge: request.auto_merge,
+        }))
+    }
+
+    async fn comment(&self, repo: &str, number: u64, body: &str) -> Result<(), String> {
+        self.github.comment(repo, number, body).await
+    }
+
+    async fn merge_renovate(&self, repo: &str, number: u64, head: &str) -> Result<(), String> {
+        self.github.approve(repo, number, APPROVAL).await?;
+        self.github.merge_head(repo, number, head).await
     }
 
     async fn stop(&self, job_id: i64) {

@@ -2122,6 +2122,43 @@ async fn a_stopped_review_offers_a_retry_that_moves_the_job_on() {
 }
 
 #[tokio::test]
+async fn a_renovate_job_shows_on_the_board_and_its_page_and_retries_from_it() {
+    let dashboard = dashboard();
+    let url = "https://github.com/Badger-Embedded/maestro/pull/7";
+    let id = dashboard
+        .store
+        .create_renovate_job("maestro", 7, "Update dependency serde", url)
+        .unwrap()
+        .unwrap();
+    dashboard.apply(
+        id,
+        Event::RenovateObserved {
+            head: "abc1234".into(),
+            ci: factory_core::RenovateCi::Failed { log: "boom".into() },
+            limits: factory_core::RetryLimits { auto: 0, total: 0 },
+            auto_merge: false,
+        },
+    );
+    dashboard.apply(id, Event::Commented);
+
+    let board = dashboard.get("/").await.body;
+    assert!(board.contains("Update dependency serde"));
+    assert!(board.contains("Renovate"));
+    assert!(board.contains(&format!("href=\"{url}\"")));
+    assert!(board.contains("title=\"factory\""));
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains("Triage stopped"));
+    assert!(page.contains("Reruns on this head commit: 0 of 7"));
+    assert!(page.contains(&format!("href=\"{url}\"")));
+    assert!(page.contains(&format!("action=\"/jobs/{id}/retry\"")));
+
+    let reply = dashboard.post(&format!("/jobs/{id}/retry"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert!(matches!(dashboard.turn(id), Turn::RerunCi { .. }));
+}
+
+#[tokio::test]
 async fn the_job_page_has_no_review_card_without_passes() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;

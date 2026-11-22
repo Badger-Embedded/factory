@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, Gates, Job, PlanUsageSnapshot, Stage, Task, Turn, UsageWindow,
-    Verdict,
+    Ask, BranchSummary, Command, Gates, Job, PlanUsageSnapshot, RenovatePr, RenovateWait, Stage,
+    Task, Turn, UsageWindow, Verdict,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -2696,6 +2696,7 @@ fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Ma
                         (first_line(row.job.request()))
                     }
                     div.job-sub {
+                        (renovate_link(&row.job))
                         (turn_badge(&row.job, auto_merge))
                         @if !row.job.is_finished() { (flow_steps(&row.job)) }
                         @if let Some(detail) = row_detail(&row.job) {
@@ -3213,6 +3214,9 @@ fn job_header(
             h1 { "#" (id) " " (first_line(job.request())) }
             (cost_badge(false, cost_usd, estimated))
         }
+        @if job.renovate_pr().is_some() {
+            p.meta { (renovate_link(job)) }
+        }
         p.meta {
             @if let Some(url) = repo_url {
                 a href=(url) { (row.project) }
@@ -3220,6 +3224,38 @@ fn job_header(
                 (row.project)
             }
             " · requested by " (row.requested_by) " · " (crate::localtime::date_time(&row.created_at))
+        }
+    }
+}
+
+/// The "Renovate" badge and the link to the pull request of a Renovate job.
+fn renovate_link(job: &Job) -> Markup {
+    html! {
+        @if let Some(pr) = job.renovate_pr() {
+            span.badge.factory { "Renovate" }
+            a.renovate-pr href=(pr.url) { "#" (pr.number) }
+        }
+    }
+}
+
+/// The triage state of a Renovate job: the reruns on the current head against
+/// the limits, the diff check's verdict and the summary of the update.
+fn renovate_details(pr: &RenovatePr, settings: &Settings) -> Markup {
+    html! {
+        ul.renovate-details {
+            li {
+                "Reruns on this head commit: " (pr.reruns) " of " (settings.renovate_total_reruns)
+                " (" (pr.auto_reruns) " of " (settings.renovate_auto_reruns)
+                " automatic, before an agent reads the failure)"
+            }
+            @if let Some(verdict) = &pr.verdict {
+                li {
+                    "Diff check: "
+                    @if verdict.safe { "safe" } @else { "unsafe" }
+                    ". " (verdict.reason)
+                }
+                li { "Summary: " (verdict.summary) }
+            }
         }
     }
 }
@@ -3481,6 +3517,40 @@ fn log_card(logs: &[LogEntry]) -> Markup {
     }
 }
 
+/// The Needs you card of a Renovate job that waits for a person.
+fn renovate_wait_card(
+    id: i64,
+    job: &Job,
+    settings: &Settings,
+    reason: &str,
+    state: RenovateWait,
+) -> Markup {
+    let heading = match state {
+        RenovateWait::Stopped => "Triage stopped",
+        RenovateWait::Ready => "Ready to merge",
+        RenovateWait::Unsafe => "The update is not safe to merge",
+    };
+    html! {
+        div.card.needs-you {
+            div.card-head {
+                span.badge.you { "needs you" }
+                h2 { (heading) }
+            }
+            p.status-detail { (reason) }
+            @if let Some(pr) = job.renovate_pr() {
+                (renovate_details(pr, settings))
+            }
+            @if job.can_retry() {
+                div.row.actions {
+                    form method="post" action={ "/jobs/" (id) "/retry" } {
+                        button.primary { "Retry" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Markup {
     match (job.stage(), job.turn()) {
         (_, Turn::User(Ask::Answers { questions })) => html! {
@@ -3532,6 +3602,18 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
                 summary: Some(summary),
             }),
         ) => publish_card(id, job, *pr, summary),
+        (_, Turn::User(Ask::Renovate { reason, state })) => {
+            renovate_wait_card(id, job, settings, reason, *state)
+        }
+        (Stage::Renovate, _) => html! {
+            div.card.status {
+                (turn_badge(job, auto_merge))
+                span.status-detail { (turn_detail(job, settings, auto_merge)) }
+                @if let Some(pr) = job.renovate_pr() {
+                    (renovate_details(pr, settings))
+                }
+            }
+        },
         (_, Turn::User(Ask::ReviewStopped { reason, .. })) => html! {
             div.card.needs-you {
                 div.card-head {
@@ -3703,14 +3785,22 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
                     settings.poll_seconds
                 )
             }
+            Some(Command::WatchRenovate { number, .. }) => format!(
+                "The factory watches pull request #{number}. It waits for CI, reruns failed \
+                 runs within the limits, and looks every {} seconds.",
+                settings.poll_seconds
+            ),
+            Some(Command::PostComment { number, .. }) => {
+                format!("The factory is commenting on pull request #{number}.")
+            }
+            Some(Command::MergeRenovate { number, .. }) => {
+                format!("The factory is approving and merging pull request #{number}.")
+            }
             Some(
                 Command::RunAgent { .. }
                 | Command::Summarize { .. }
                 | Command::RerunCi { .. }
-                | Command::WatchRenovate { .. }
-                | Command::RerunRenovate { .. }
-                | Command::PostComment { .. }
-                | Command::MergeRenovate { .. },
+                | Command::RerunRenovate { .. },
             )
             | None => "Waiting for a free worker.".into(),
         },
