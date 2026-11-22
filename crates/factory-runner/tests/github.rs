@@ -662,10 +662,13 @@ async fn comment_and_approve_send_the_body_on_stdin() {
     let stdin = dir.path().join("stdin");
     let (github, calls) = recording_github(dir.path(), &format!("cat >> '{}'", stdin.display()));
     github.comment("o/r", 5, "It stopped.").await.unwrap();
-    github.approve("o/r", 5, "Looks safe.").await.unwrap();
+    github
+        .approve("o/r", 5, "abc123", "Looks safe.")
+        .await
+        .unwrap();
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr comment 5 --repo o/r --body-file -\npr review 5 --repo o/r --approve --body-file -\n"
+        "pr comment 5 --repo o/r --body-file -\napi --method POST repos/o/r/pulls/5/reviews -f event=APPROVE -f commit_id=abc123 -F body=@-\n"
     );
     assert_eq!(
         fs::read_to_string(&stdin).unwrap(),
@@ -831,4 +834,14 @@ async fn file_at_errors_for_a_submodule_and_a_directory() {
     let dir = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(dir.path(), r#"echo '[{"type": "file"}]'"#);
     assert!(github.file_at("o/r", "dir", "main").await.is_err());
+}
+
+#[tokio::test]
+async fn approve_names_the_checked_commit_so_a_later_head_is_not_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(dir.path(), "");
+    github.approve("o/r", 5, "checked1", "ok").await.unwrap();
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("commit_id=checked1"), "{calls}");
+    assert!(!calls.contains("pr review"), "{calls}");
 }

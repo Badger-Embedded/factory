@@ -1484,6 +1484,23 @@ fn a_review_worker_passes_the_model_and_gets_no_github_token() {
     );
 }
 
+#[test]
+fn renovate_runs_get_no_github_credentials() {
+    for expect in [Expect::FailureAnalysis, Expect::DiffCheck] {
+        let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+        run.expect = expect;
+        let args = strings(&podman_args(&WorkerConfig::default(), &run));
+
+        assert_eq!(value_after(&args, "--env"), "CLAUDE_CODE_OAUTH_TOKEN");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("GH_TOKEN") || arg.contains("GITHUB_TOKEN")),
+            "a Renovate run gets no GitHub credentials"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_review_run_that_dies_without_a_result_fails_closed() {
     let dir = tempfile::tempdir().unwrap();

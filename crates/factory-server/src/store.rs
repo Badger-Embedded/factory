@@ -196,6 +196,12 @@ CREATE TABLE IF NOT EXISTS project_maintenance (
     build_config_files TEXT NOT NULL DEFAULT '[]',
     upstream_repo TEXT
 );
+CREATE TABLE IF NOT EXISTS renovate_prs (
+    project TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    job_id INTEGER NOT NULL,
+    PRIMARY KEY (project, number)
+);
 CREATE TABLE IF NOT EXISTS user_settings (
     login TEXT PRIMARY KEY,
     notifications INTEGER NOT NULL DEFAULT 1,
@@ -689,53 +695,72 @@ impl Store {
     ) -> Result<i64, StoreError> {
         let gates = self.project_gates(project)?;
         let new = Job::new(request, gates);
-        let job = serde_json::to_string(&new)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO jobs (project, requested_by, job) VALUES (?1, ?2, ?3)",
-            params![project, requested_by, job],
-        )?;
-        let id = tx.last_insert_rowid();
-        Self::record(&tx, id, "created", &new, None, None)?;
-        tx.execute(
-            "INSERT INTO project_totals (project, jobs_created) VALUES (?1, 1)
-             ON CONFLICT (project) DO UPDATE SET jobs_created = jobs_created + 1",
-            [project],
-        )?;
+        let id = Self::insert_job(&tx, project, requested_by, &new)?;
         tx.commit()?;
         Ok(id)
     }
 
     /// Creates the job that triages Renovate pull request `number` of
-    /// `project`. The requester is `factory`.
+    /// `project`. The requester is `factory`. The `renovate_prs` row and the
+    /// job go in one transaction, so a pull request never gets a second job,
+    /// across restarts too. Returns `None` when the pull request already has
+    /// one, even when that job is finished.
     ///
     /// # Errors
     ///
     /// Fails on a database error.
-    pub fn create_renovate(
+    pub fn create_renovate_job(
         &self,
         project: &str,
         number: u64,
         title: &str,
         url: &str,
-    ) -> Result<i64, StoreError> {
+    ) -> Result<Option<i64>, StoreError> {
         let new = Job::renovate(number, title, url);
-        let job = serde_json::to_string(&new)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let number = i64::try_from(number).unwrap_or(i64::MAX);
+        let known = tx
+            .query_row(
+                "SELECT 1 FROM renovate_prs WHERE project = ?1 AND number = ?2",
+                params![project, number],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if known {
+            return Ok(None);
+        }
+        let id = Self::insert_job(&tx, project, FACTORY_REQUESTER, &new)?;
         tx.execute(
-            "INSERT INTO jobs (project, requested_by, job) VALUES (?1, 'factory', ?2)",
-            params![project, job],
+            "INSERT INTO renovate_prs (project, number, job_id) VALUES (?1, ?2, ?3)",
+            params![project, number, id],
+        )?;
+        tx.commit()?;
+        Ok(Some(id))
+    }
+
+    /// Inserts `job` with its `created` event and counts it in the project's
+    /// totals.
+    fn insert_job(
+        tx: &Transaction<'_>,
+        project: &str,
+        requested_by: &str,
+        job: &Job,
+    ) -> Result<i64, StoreError> {
+        tx.execute(
+            "INSERT INTO jobs (project, requested_by, job) VALUES (?1, ?2, ?3)",
+            params![project, requested_by, serde_json::to_string(job)?],
         )?;
         let id = tx.last_insert_rowid();
-        Self::record(&tx, id, "created", &new, None, None)?;
+        Self::record(tx, id, "created", job, None, None)?;
         tx.execute(
             "INSERT INTO project_totals (project, jobs_created) VALUES (?1, 1)
              ON CONFLICT (project) DO UPDATE SET jobs_created = jobs_created + 1",
             [project],
         )?;
-        tx.commit()?;
         Ok(id)
     }
 
@@ -1827,7 +1852,7 @@ impl Store {
     /// `project_models`, `project_settings`, `project_gates`, `project_efforts`,
     /// `project_agents`, `project_mcp`, `project_mcp_tools`,
     /// `project_mcp_tool_refreshes`, `project_totals` and
-    /// `project_collaborators`, `project_maintenance`, its MCP header values in `secrets`, its
+    /// `project_collaborators`, `project_maintenance`, `renovate_prs`, its MCP header values in `secrets`, its
     /// `job_costs` rows, and the `cost` rows in `job_events` for its jobs. With
     /// no collaborator rows left, the project and its surviving jobs are visible
     /// to nobody. A run that finishes after the removal cannot record its cost:
@@ -1876,6 +1901,7 @@ impl Store {
             "project_totals",
             "project_collaborators",
             "project_maintenance",
+            "renovate_prs",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;

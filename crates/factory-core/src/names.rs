@@ -110,6 +110,8 @@ impl Event {
             Event::Published { .. } => "published",
             Event::CiFailed { .. } => "ci-failed",
             Event::CiRerun => "ci-rerun",
+            Event::NothingToRerun => "nothing-to-rerun",
+            Event::MergeFailed => "merge-failed",
             Event::Conflicted { .. } => "conflicted",
             Event::ReviewComments { .. } => "review-comments",
             Event::StartReview { .. } => "start-review",
