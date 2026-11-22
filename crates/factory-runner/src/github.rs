@@ -126,6 +126,16 @@ pub struct RenovatePr {
     pub head: String,
 }
 
+/// A pull request without its diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrInfo {
+    pub title: String,
+    pub body: String,
+    /// The SHA of the pull request's head commit.
+    pub head: String,
+    pub files: Vec<String>,
+}
+
 /// What an agent needs to judge a pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrDetails {
@@ -714,20 +724,19 @@ impl GitHub {
         parse_renovate_prs(&lines)
     }
 
-    /// The title, description, head, changed files and diff of a pull
-    /// request.
+    /// The title, description, head and changed files of a pull request,
+    /// without its diff.
     ///
     /// # Errors
     ///
-    /// Returns gh's message when a call fails or its output does not parse.
-    pub async fn pr_details(&self, repo: &str, number: u64) -> Result<PrDetails, String> {
-        let number_text = number.to_string();
+    /// Returns gh's message when the call fails or its output does not parse.
+    pub async fn pr_info(&self, repo: &str, number: u64) -> Result<PrInfo, String> {
         let view = self
             .run(
                 &[
                     "pr",
                     "view",
-                    &number_text,
+                    &number.to_string(),
                     "--repo",
                     repo,
                     "--json",
@@ -738,8 +747,24 @@ impl GitHub {
             .await?;
         let view: DetailsJson =
             serde_json::from_str(&view).map_err(|err| format!("gh pr view output: {err}"))?;
+        Ok(PrInfo {
+            title: view.title,
+            body: view.body,
+            head: view.head_ref_oid,
+            files: view.files.into_iter().map(|file| file.path).collect(),
+        })
+    }
+
+    /// The title, description, head, changed files and diff of a pull
+    /// request.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when a call fails or its output does not parse.
+    pub async fn pr_details(&self, repo: &str, number: u64) -> Result<PrDetails, String> {
+        let info = self.pr_info(repo, number).await?;
         let diff = self
-            .run(&["pr", "diff", &number_text, "--repo", repo], None)
+            .run(&["pr", "diff", &number.to_string(), "--repo", repo], None)
             .await?;
         if diff.len() > MAX_DIFF {
             return Err(format!(
@@ -748,10 +773,10 @@ impl GitHub {
             ));
         }
         Ok(PrDetails {
-            title: view.title,
-            body: view.body,
-            head: view.head_ref_oid,
-            files: view.files.into_iter().map(|file| file.path).collect(),
+            title: info.title,
+            body: info.body,
+            head: info.head,
+            files: info.files,
             diff,
         })
     }
@@ -927,11 +952,12 @@ impl GitHub {
     }
 
     /// The patch GitHub reports for `path` between the refs `from` and `to`,
-    /// or `None` when a ref is unknown or the file did not change.
+    /// or `None` when the file did not change.
     ///
     /// # Errors
     ///
-    /// Returns gh's message when the call fails for another reason, when its
+    /// Returns an error naming the refs when GitHub does not know one of them,
+    /// gh's message when the call fails for another reason, when its
     /// output does not parse, or when the comparison lists the most files
     /// GitHub shows and `path` is not among them.
     pub async fn compare_patch(
@@ -949,7 +975,11 @@ impl GitHub {
             .await
         {
             Ok(out) => out,
-            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) if is_not_found(&err) => {
+                return Err(format!(
+                    "compare {from}...{to} is not a valid comparison in {repo}"
+                ));
+            }
             Err(err) => return Err(err),
         };
         let compare: CompareJson =

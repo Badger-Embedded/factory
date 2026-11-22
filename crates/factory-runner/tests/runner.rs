@@ -1491,7 +1491,11 @@ fn a_review_worker_passes_the_model_and_gets_no_github_token() {
 
 #[test]
 fn renovate_runs_get_no_github_credentials() {
-    for expect in [Expect::FailureAnalysis, Expect::DiffCheck] {
+    for expect in [
+        Expect::FailureAnalysis,
+        Expect::DiffCheck,
+        Expect::PackagingGaps,
+    ] {
         let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
         run.expect = expect;
         let args = strings(&podman_args(&WorkerConfig::default(), &run));
@@ -1703,4 +1707,115 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
         assert!(text.contains("Do not change any files"));
         assert!(!text.contains("Moon Skywalker"));
     }
+}
+
+fn gaps_task() -> Task {
+    Task::FindGaps {
+        context: Box::new(factory_core::PackagingContext {
+            kind: "snap".into(),
+            upstream_repo: "up/app".into(),
+            pr_title: "Update app".into(),
+            pr_body: "Bumps app".into(),
+            pr_diff: "+app 2".into(),
+            manifests: vec![factory_core::FileText {
+                path: "snap/snapcraft.yaml".into(),
+                text: Some("name: app".into()),
+            }],
+            from: Some("v1".into()),
+            to: Some("v2".into()),
+            upstream: vec![factory_core::FileText {
+                path: "CMakeLists.txt".into(),
+                text: Some("+option(NEW_FLAG)".into()),
+            }],
+            existing: vec![factory_core::ExistingGap {
+                request: "Add the old flag\n\nd".into(),
+                dismissed: false,
+            }],
+        }),
+    }
+}
+
+#[test]
+fn the_gap_analysis_has_a_schema_and_parses_its_result() {
+    use factory_runner::event_from_output;
+    let schema = Expect::PackagingGaps.schema();
+    assert_eq!(schema["properties"]["outcome"]["enum"], json!(["gaps"]));
+    let item = &schema["properties"]["gaps"]["items"];
+    for field in ["title", "description", "evidence", "current", "suggestion"] {
+        assert!(item["properties"][field].is_object(), "{field}");
+    }
+    let strict = Expect::PackagingGaps.strict_schema();
+    assert_eq!(
+        strict["properties"]["gaps"]["items"]["additionalProperties"],
+        json!(false)
+    );
+
+    let gap = json!({
+        "title": "Add NEW_FLAG", "description": "d", "evidence": "e",
+        "current": "c", "suggestion": "s"
+    });
+    assert_eq!(
+        event_from_output(
+            Expect::PackagingGaps,
+            Some(json!({"outcome": "gaps", "gaps": [gap]}))
+        ),
+        Event::Agent(AgentResult::Gaps(vec![factory_core::Gap {
+            title: "Add NEW_FLAG".into(),
+            description: "d".into(),
+            evidence: "e".into(),
+            current: "c".into(),
+            suggestion: "s".into(),
+        }]))
+    );
+    assert_eq!(
+        event_from_output(
+            Expect::PackagingGaps,
+            Some(json!({"outcome": "gaps", "gaps": []}))
+        ),
+        Event::Agent(AgentResult::Gaps(Vec::new()))
+    );
+    for output in [
+        json!({"outcome": "gaps"}),
+        json!({"outcome": "gaps", "gaps": [{"title": "", "description": "d", "evidence": "e", "current": "c", "suggestion": "s"}]}),
+        json!({"outcome": "questions", "questions": ["why"]}),
+    ] {
+        let event = event_from_output(Expect::PackagingGaps, Some(output.clone()));
+        assert!(
+            matches!(event, Event::AgentFailed { .. }),
+            "{output} gave {event:?}"
+        );
+    }
+}
+
+#[test]
+fn the_gap_prompt_carries_the_input_and_the_rules_of_its_type() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let text = prompt(&gaps_task(), Expect::PackagingGaps, agent);
+        for needle in [
+            "name: app",
+            "+app 2",
+            "+option(NEW_FLAG)",
+            "Add the old flag",
+            "cmake-parameters",
+            "stage-packages",
+            "internal refactors",
+            "Do not change any files",
+        ] {
+            assert!(text.contains(needle), "missing {needle}");
+        }
+        assert!(!text.contains("Moon Skywalker"));
+    }
+    let Task::FindGaps { mut context } = gaps_task() else {
+        unreachable!()
+    };
+    context.kind = "deb".into();
+    context.from = None;
+    context.to = None;
+    let text = prompt(
+        &Task::FindGaps { context },
+        Expect::PackagingGaps,
+        Agent::Claude,
+    );
+    assert!(text.contains("Build-Depends") && text.contains("debian/patches"));
+    assert!(text.contains("unavailable"));
 }

@@ -760,13 +760,11 @@ async fn compare_patch_returns_the_patch_of_the_matching_file() {
         missing.path(),
         "echo 'gh: Not Found (HTTP 404)' >&2\nexit 1",
     );
-    assert_eq!(
-        github
-            .compare_patch("up/stream", "v1", "v2", "a")
-            .await
-            .unwrap(),
-        None
-    );
+    let err = github
+        .compare_patch("up/stream", "v1", "v2", "a")
+        .await
+        .unwrap_err();
+    assert!(err.contains("not a valid comparison"), "{err}");
 }
 
 #[tokio::test]

@@ -2909,3 +2909,147 @@ fn a_proposal_rejects_edit_and_retry() {
     }
     assert_eq!(job, before);
 }
+
+fn context() -> factory_core::PackagingContext {
+    factory_core::PackagingContext {
+        kind: "snap".into(),
+        upstream_repo: "up/app".into(),
+        pr_title: "Update app".into(),
+        pr_body: "Bumps app".into(),
+        pr_diff: "+app 2".into(),
+        manifests: Vec::new(),
+        from: None,
+        to: None,
+        upstream: Vec::new(),
+        existing: Vec::new(),
+    }
+}
+
+fn gap() -> factory_core::Gap {
+    factory_core::Gap {
+        title: "Add the flag".into(),
+        description: "d".into(),
+        evidence: "e".into(),
+        current: "c".into(),
+        suggestion: "s".into(),
+    }
+}
+
+fn gathering() -> Job {
+    let mut job = renovate_job();
+    apply(
+        &mut job,
+        Event::RenovateMerged {
+            packaging: true,
+            manifest_changed: true,
+        },
+    );
+    job
+}
+
+#[test]
+fn a_merge_without_a_changed_manifest_or_a_packaging_project_ends_the_job() {
+    for (packaging, manifest_changed) in [(false, false), (false, true), (true, false)] {
+        let mut job = renovate_job();
+        apply(
+            &mut job,
+            Event::RenovateMerged {
+                packaging,
+                manifest_changed,
+            },
+        );
+        assert_eq!(job.stage(), &Stage::Merged);
+        assert!(job.is_finished());
+    }
+}
+
+#[test]
+fn a_merged_manifest_gathers_then_analyses_then_proposes_then_ends() {
+    let mut job = gathering();
+    assert_eq!(job.stage(), &Stage::Packaging);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::GatherPackaging { number: 42 })
+    );
+
+    apply(&mut job, Event::PackagingGathered(Box::new(context())));
+    assert!(matches!(job.turn(), Turn::Agent(Task::FindGaps { .. })));
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::RunAgent {
+            task: Task::FindGaps { .. },
+            ..
+        })
+    ));
+
+    apply(&mut job, Event::Agent(AgentResult::Gaps(vec![gap()])));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::ProposeGaps {
+            gaps: vec![gap()],
+            range: None
+        })
+    );
+
+    apply(&mut job, Event::GapsProposed { jobs: vec![5, 6] });
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert!(job.is_finished());
+    assert_eq!(pr_of(&job).gaps, Some(vec![5, 6]));
+}
+
+#[test]
+fn the_proposal_carries_the_range_the_analysis_compared() {
+    let mut job = gathering();
+    let mut context = context();
+    context.from = Some("v1".into());
+    context.to = Some("v2".into());
+    apply(&mut job, Event::PackagingGathered(Box::new(context)));
+    apply(&mut job, Event::Agent(AgentResult::Gaps(vec![gap()])));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::ProposeGaps {
+            gaps: vec![gap()],
+            range: Some(("v1".into(), "v2".into()))
+        })
+    );
+}
+
+#[test]
+fn a_merge_that_turns_out_not_to_need_analysis_ends_a_job_waiting_to_gather() {
+    let mut job = gathering();
+    apply(
+        &mut job,
+        Event::RenovateMerged {
+            packaging: false,
+            manifest_changed: false,
+        },
+    );
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert!(job.is_finished());
+    assert_eq!(pr_of(&job).gaps, None);
+}
+
+#[test]
+fn no_gaps_is_a_valid_result() {
+    let mut job = gathering();
+    apply(&mut job, Event::PackagingGathered(Box::new(context())));
+    apply(&mut job, Event::Agent(AgentResult::Gaps(Vec::new())));
+    apply(&mut job, Event::GapsProposed { jobs: Vec::new() });
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert_eq!(pr_of(&job).gaps, Some(Vec::new()));
+}
+
+#[test]
+fn a_failed_analysis_run_can_be_retried() {
+    let mut job = gathering();
+    apply(&mut job, Event::PackagingGathered(Box::new(context())));
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "timed out".into(),
+        },
+    );
+    assert!(job.can_retry());
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Packaging);
+}

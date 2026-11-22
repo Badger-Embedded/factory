@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use factory_core::{Agent, Event, PrDiff, RenovateCi};
+use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
 use factory_runner::{
     BranchSummary, Ci, Credential, Git, GitHub, Observation, PrState, RenovatePr, Rerun, RunReport,
     SessionRun, WorkerConfig, WorkerRun, backend, observe, place_files, place_images,
@@ -14,9 +14,9 @@ use factory_runner::{
 
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published,
-    ReadyAction, RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest, WatchReport,
-    WatchRequest, ready_action, watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PackagingRequest, PublishRequest,
+    Published, ReadyAction, RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest,
+    WatchReport, WatchRequest, ready_action, watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -447,7 +447,16 @@ impl Executor for PodmanExecutor {
     async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
         let status = self.github.status(&request.repo, request.number).await?;
         let ci = match status.state {
-            PrState::Merged => return Ok(Some(Event::Merged)),
+            PrState::Merged => {
+                let event = self
+                    .renovate_merged(
+                        &request.repo,
+                        request.number,
+                        request.manifest_files.as_deref(),
+                    )
+                    .await?;
+                return Ok(Some(event));
+            }
             PrState::Closed => return Ok(Some(Event::ClosedUnmerged)),
             PrState::Open => status.ci,
         };
@@ -493,10 +502,173 @@ impl Executor for PodmanExecutor {
         self.github.merge_head(repo, number, head).await
     }
 
+    async fn renovate_merged(
+        &self,
+        repo: &str,
+        number: u64,
+        manifest_files: Option<&[String]>,
+    ) -> Result<Event, String> {
+        let Some(manifest_files) = manifest_files else {
+            return Ok(Event::RenovateMerged {
+                packaging: false,
+                manifest_changed: false,
+            });
+        };
+        let info = self.github.pr_info(repo, number).await?;
+        Ok(Event::RenovateMerged {
+            packaging: true,
+            manifest_changed: info.files.iter().any(|file| manifest_files.contains(file)),
+        })
+    }
+
+    async fn gather_packaging(
+        &self,
+        request: PackagingRequest,
+    ) -> Result<PackagingContext, String> {
+        let details = self
+            .github
+            .pr_details(&request.repo, request.number)
+            .await?;
+        let mut manifests = Vec::new();
+        for path in &request.manifest_files {
+            let text = self
+                .github
+                .file_at(&request.repo, path, &request.base)
+                .await?;
+            manifests.push(FileText {
+                path: path.clone(),
+                text,
+            });
+        }
+        let recorded = (request.verdict_head.as_deref() == Some(details.head.as_str()))
+            .then(|| request.from.clone().zip(request.to.clone()))
+            .flatten();
+        let range = recorded
+            .or_else(|| compare_range(&details.body, &request.upstream))
+            .or_else(|| manifest_range(&details.diff, &request.manifest_files));
+        if range.is_none() && !request.build_config_files.is_empty() {
+            return Err(format!(
+                "the upstream comparison for pull request #{} is blocked: no recorded verdict, \
+                 compare link or manifest version change gives the old and new version",
+                request.number
+            ));
+        }
+        let mut upstream = Vec::new();
+        if let Some((from, to)) = &range {
+            for path in &request.build_config_files {
+                let text = self
+                    .github
+                    .compare_patch(&request.upstream, from, to, path)
+                    .await?;
+                upstream.push(FileText {
+                    path: path.clone(),
+                    text,
+                });
+            }
+        }
+        Ok(PackagingContext {
+            kind: String::new(),
+            upstream_repo: request.upstream,
+            pr_title: details.title,
+            pr_body: details.body,
+            pr_diff: details.diff,
+            manifests,
+            from: range.as_ref().map(|(from, _)| from.clone()),
+            to: range.map(|(_, to)| to),
+            upstream,
+            existing: Vec::new(),
+        })
+    }
+
     async fn stop(&self, job_id: i64) {
         let name = Self::container(job_id);
         if let Err(err) = remove_container(&self.base, &name).await {
             tracing::warn!("removing {name}: {err}");
         }
     }
+}
+
+/// The refs of the first `github.com/{upstream}/compare/{from}...{to}` link in
+/// a Renovate description, which is how Renovate names the upstream range of
+/// an update.
+fn compare_range(body: &str, upstream: &str) -> Option<(String, String)> {
+    let marker = format!("github.com/{}/compare/", upstream.to_ascii_lowercase());
+    let start = body.to_ascii_lowercase().find(&marker)? + marker.len();
+    let link: String = body[start..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ')' | ']' | '>' | '"' | '\''))
+        .collect();
+    let (from, to) = link.split_once("...")?;
+    (!from.is_empty() && !to.is_empty()).then(|| (from.to_owned(), to.to_owned()))
+}
+
+/// Manifest keys that name the upstream source version.
+const VERSION_KEYS: [&str; 4] = ["source-tag", "source-commit", "tag", "commit"];
+
+/// The old and new upstream version a pull request diff changes in the
+/// manifest files. A replacement block is a run of removed and added lines
+/// that context lines, hunk headers and file boundaries end. Within a block,
+/// each version key must have exactly one removed and one added line, and
+/// only one key in one block may change. `None` otherwise, so a diff that
+/// does not say which old value became which new one gives no range.
+fn manifest_range(diff: &str, manifest_files: &[String]) -> Option<(String, String)> {
+    let mut found = None;
+    let mut removed: Vec<(String, String)> = Vec::new();
+    let mut added: Vec<(String, String)> = Vec::new();
+    let mut in_manifest = false;
+    for line in diff.lines().map(Some).chain([None]) {
+        let change = line.filter(|line| {
+            in_manifest
+                && (line.starts_with('-') || line.starts_with('+'))
+                && !line.starts_with("---")
+                && !line.starts_with("+++")
+        });
+        if let Some(line) = change {
+            if let Some(old) = line.strip_prefix('-') {
+                removed.extend(version_field(old));
+            } else if let Some(new) = line.strip_prefix('+') {
+                added.extend(version_field(new));
+            }
+            continue;
+        }
+        if !file_range(&removed, &added, &mut found) {
+            return None;
+        }
+        removed.clear();
+        added.clear();
+        if let Some(header) = line.and_then(|line| line.strip_prefix("diff --git ")) {
+            in_manifest = manifest_files
+                .iter()
+                .any(|path| header.ends_with(&format!(" b/{path}")));
+        }
+    }
+    found
+}
+
+/// Records the version change of one block in `found`. Returns false when
+/// the block's changes are ambiguous or a second change appears.
+fn file_range(
+    removed: &[(String, String)],
+    added: &[(String, String)],
+    found: &mut Option<(String, String)>,
+) -> bool {
+    for key in VERSION_KEYS {
+        let from: Vec<_> = removed.iter().filter(|(k, _)| k == key).collect();
+        let to: Vec<_> = added.iter().filter(|(k, _)| k == key).collect();
+        match (from.as_slice(), to.as_slice()) {
+            ([], []) => {}
+            ([(_, from)], [(_, to)]) if from != to && found.is_none() => {
+                *found = Some((from.clone(), to.clone()));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn version_field(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+    (VERSION_KEYS.contains(&key) && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
 }

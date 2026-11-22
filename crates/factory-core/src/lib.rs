@@ -12,9 +12,10 @@ mod usage;
 
 pub use agent::{Agent, DEFAULT_AGENT, UnknownAgent};
 pub use job::{
-    AgentResult, Answered, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event, Gates,
-    Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, PrDiff, Question,
-    Rejected, RenovateCi, RenovatePr, RenovateVerdict, RenovateWait, RetryLimits, RetryTarget,
-    ReviewPass, ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
+    AgentResult, Answered, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event,
+    ExistingGap, FileText, Gap, Gates, Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
+    PackagingContext, PlannedPr, PrDescription, PrDiff, Question, Rejected, RenovateCi, RenovatePr,
+    RenovateVerdict, RenovateWait, RetryLimits, RetryTarget, ReviewPass, ReviewState, ReviewStop,
+    Session, Stage, Task, Turn, Verdict,
 };
 pub use usage::{ParseError, PlanUsage, PlanUsageSnapshot, UsageWindow};

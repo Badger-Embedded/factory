@@ -250,7 +250,9 @@ fn model<'a>(job: &Job, models: &'a StageModels) -> Option<&'a str> {
         Expect::Spec => &models.spec,
         Expect::Plan => &models.plan,
         Expect::Commits | Expect::FixCi => &models.implement,
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => &models.review,
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
+            &models.review
+        }
     };
     Some(model.as_deref().unwrap_or("default"))
 }
@@ -266,7 +268,9 @@ fn effort<'a>(job: &Job, efforts: &'a StageEfforts) -> Option<&'a str> {
         Expect::Spec => &efforts.spec,
         Expect::Plan => &efforts.plan,
         Expect::Commits | Expect::FixCi => &efforts.implement,
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => &efforts.review,
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
+            &efforts.review
+        }
     };
     Some(effort.as_str())
 }

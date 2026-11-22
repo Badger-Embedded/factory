@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
-    PrDescription, Question, RenovateCi, RenovateWait, ReviewState, Stage, Turn,
+    PackagingContext, PrDescription, Question, RenovateCi, RenovateWait, ReviewState, Stage, Turn,
 };
 use factory_runner::{
     Expect, LogLine, McpUnavailable, Observation, RenovatePr, Rerun, RunReport, TokenUsage,
@@ -67,6 +67,12 @@ struct FakeExecutor {
     merged: Mutex<Vec<(u64, String)>>,
     merge_failures: Mutex<VecDeque<RenovateNow>>,
     approved: Mutex<Vec<(u64, String)>>,
+    /// The files the merged pull request changed.
+    pr_files: Mutex<Vec<String>>,
+    gathered: Mutex<Vec<factory_server::PackagingRequest>>,
+    /// The range the fake resolves from the merged pull request when the
+    /// request has none.
+    resolved_range: Mutex<Option<(String, String)>>,
 }
 
 /// The state the fake reports for the Renovate pull request.
@@ -108,6 +114,9 @@ impl FakeExecutor {
             merged: Mutex::new(Vec::new()),
             merge_failures: Mutex::new(VecDeque::new()),
             approved: Mutex::new(Vec::new()),
+            pr_files: Mutex::new(Vec::new()),
+            gathered: Mutex::new(Vec::new()),
+            resolved_range: Mutex::new(None),
         })
     }
 
@@ -259,7 +268,14 @@ impl Executor for FakeExecutor {
         self.renovate_watched.lock().unwrap().push(request.clone());
         Ok(match now {
             RenovateNow::Nothing => None,
-            RenovateNow::Merged => Some(Event::Merged),
+            RenovateNow::Merged => Some(
+                self.renovate_merged(
+                    &request.repo,
+                    request.number,
+                    request.manifest_files.as_deref(),
+                )
+                .await?,
+            ),
             RenovateNow::Closed => Some(Event::ClosedUnmerged),
             RenovateNow::Ci(head, ci) => {
                 if request.watch_only && request.known_head.as_deref() == Some(head) {
@@ -291,6 +307,67 @@ impl Executor for FakeExecutor {
             .unwrap()
             .push((number, body.to_owned()));
         Ok(())
+    }
+
+    async fn renovate_merged(
+        &self,
+        _repo: &str,
+        _number: u64,
+        manifest_files: Option<&[String]>,
+    ) -> Result<Event, String> {
+        tokio::task::yield_now().await;
+        let files = self.pr_files.lock().unwrap();
+        Ok(Event::RenovateMerged {
+            packaging: manifest_files.is_some(),
+            manifest_changed: manifest_files
+                .is_some_and(|manifests| files.iter().any(|file| manifests.contains(file))),
+        })
+    }
+
+    async fn gather_packaging(
+        &self,
+        request: factory_server::PackagingRequest,
+    ) -> Result<PackagingContext, String> {
+        tokio::task::yield_now().await;
+        let resolved = self.resolved_range.lock().unwrap().clone();
+        let (from, to) = match (&request.from, &request.to, resolved) {
+            (Some(from), Some(to), _) => (Some(from.clone()), Some(to.clone())),
+            (_, _, Some((from, to))) => (Some(from), Some(to)),
+            _ => (None, None),
+        };
+        let upstream = match (&from, &to) {
+            (Some(_), Some(_)) => request
+                .build_config_files
+                .iter()
+                .map(|path| factory_core::FileText {
+                    path: path.clone(),
+                    text: Some(format!("+option(NEW_FLAG) in {path}")),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let manifests = request
+            .manifest_files
+            .iter()
+            .map(|path| factory_core::FileText {
+                path: path.clone(),
+                text: Some(format!("content of {path}")),
+            })
+            .collect();
+        let context = PackagingContext {
+            kind: String::new(),
+            upstream_repo: request.upstream.clone(),
+            pr_title: "Update serde".into(),
+            pr_body: "Bumps serde".into(),
+            pr_diff: "+serde = 1.0.2".into(),
+            manifests,
+            from,
+            to,
+            upstream,
+            existing: Vec::new(),
+        };
+        self.gathered.lock().unwrap().push(request);
+        Ok(context)
     }
 
     async fn merge_renovate(&self, _repo: &str, number: u64, head: &str) -> Result<(), String> {
@@ -608,7 +685,9 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
-        Expect::FailureAnalysis | Expect::DiffCheck => unreachable!("this job is no Renovate job"),
+        Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
+            unreachable!("this job is no Renovate job")
+        }
     });
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -2635,7 +2714,9 @@ fn one_pass(request: &AgentRequest) -> Event {
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
-        Expect::FailureAnalysis | Expect::DiffCheck => unreachable!("this job is no Renovate job"),
+        Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
+            unreachable!("this job is no Renovate job")
+        }
     }
 }
 
@@ -4616,4 +4697,216 @@ async fn a_proposed_job_takes_no_worker_and_runs_after_approval_to_the_gates() {
     assert_eq!(job.turn(), &Turn::User(Ask::PlanApproval));
     let expects: Vec<Expect> = executor.requests().iter().map(|r| r.expect).collect();
     assert_eq!(expects, [Expect::Clarify, Expect::Spec, Expect::Plan]);
+}
+
+fn packaging_project(store: &Store) {
+    store
+        .save_project_maintenance(
+            "maestro",
+            &factory_server::Maintenance {
+                renovate: true,
+                packaging: Some(factory_server::Packaging {
+                    kind: factory_server::PackagingType::Snap,
+                    manifest_files: vec!["snap/snapcraft.yaml".into()],
+                    build_config_files: vec!["CMakeLists.txt".into()],
+                    upstream_repo: "upstream/app".into(),
+                }),
+            },
+        )
+        .unwrap();
+}
+
+fn gap(title: &str) -> factory_core::Gap {
+    factory_core::Gap {
+        title: title.into(),
+        description: "A new option".into(),
+        evidence: "CMakeLists.txt adds option(NEW_FLAG)".into(),
+        current: "cmake-parameters lacks it".into(),
+        suggestion: "Add -DNEW_FLAG=ON".into(),
+    }
+}
+
+/// Answers the diff check with refs and the packaging analysis with `gaps`.
+fn packaging_runs(
+    gaps: Vec<factory_core::Gap>,
+) -> impl Fn(&AgentRequest) -> Event + Send + Sync + 'static {
+    move |request| match request.expect {
+        Expect::DiffCheck => Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe: true,
+                reason: "only a version bump".into(),
+                summary: "Bumps app".into(),
+                from: Some("v1".into()),
+                to: Some("v2".into()),
+            },
+        ))),
+        Expect::PackagingGaps => Event::Agent(AgentResult::Gaps(gaps.clone())),
+        other => unreachable!("unexpected run {other:?}"),
+    }
+}
+
+/// Merges the pull request through the factory, which has the manifest
+/// changed or not as `files` says.
+async fn merge_with(
+    store: &Store,
+    executor: &FakeExecutor,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+    id: i64,
+    files: &[&str],
+) {
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.pr_files.lock().unwrap() = files.iter().map(|f| (*f).to_owned()).collect();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    step_until(scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+}
+
+fn analysis_runs(executor: &FakeExecutor) -> usize {
+    executor
+        .requests()
+        .iter()
+        .filter(|request| request.expect == Expect::PackagingGaps)
+        .count()
+}
+
+#[tokio::test]
+async fn a_merge_in_a_project_that_is_not_packaging_runs_no_analysis() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(vec![gap("x")]));
+    merge_with(&store, &executor, &scheduler, id, &["snap/snapcraft.yaml"]).await;
+    assert_eq!(analysis_runs(&executor), 0);
+    assert!(executor.gathered.lock().unwrap().is_empty());
+    assert_eq!(pr_of(&store, id).gaps, None);
+}
+
+#[tokio::test]
+async fn a_merge_that_changed_no_manifest_runs_no_analysis() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(vec![gap("x")]));
+    packaging_project(&store);
+    merge_with(&store, &executor, &scheduler, id, &["Cargo.lock"]).await;
+    assert_eq!(analysis_runs(&executor), 0);
+    assert_eq!(store.gap_jobs("maestro").unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn the_analysis_reads_the_manifest_the_upstream_patch_and_the_existing_gaps() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(Vec::new()));
+    packaging_project(&store);
+    store
+        .create_gap_job("maestro", 99, 3, "Add the old flag\n\nDetails")
+        .unwrap();
+    merge_with(&store, &executor, &scheduler, id, &["snap/snapcraft.yaml"]).await;
+
+    assert_eq!(analysis_runs(&executor), 1);
+    let request = executor
+        .requests()
+        .into_iter()
+        .find(|request| request.expect == Expect::PackagingGaps)
+        .unwrap();
+    for needle in [
+        "snap",
+        "content of snap/snapcraft.yaml",
+        "+option(NEW_FLAG) in CMakeLists.txt",
+        "Add the old flag",
+        "v1",
+        "v2",
+    ] {
+        assert!(request.prompt.contains(needle), "missing {needle}");
+    }
+    let gathered = executor.gathered.lock().unwrap();
+    assert_eq!(gathered.len(), 1);
+    assert_eq!(gathered[0].base, "main");
+    assert_eq!(gathered[0].upstream, "upstream/app");
+}
+
+#[tokio::test]
+async fn each_gap_becomes_a_proposal_job_of_the_factory() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(vec![
+        gap("Add NEW_FLAG"),
+        gap("Add other flag"),
+    ]));
+    packaging_project(&store);
+    merge_with(&store, &executor, &scheduler, id, &["snap/snapcraft.yaml"]).await;
+
+    let jobs = pr_of(&store, id).gaps.unwrap();
+    assert_eq!(jobs.len(), 2);
+    for job in jobs {
+        let row = store.get(job).unwrap();
+        assert_eq!(row.requested_by, "factory");
+        assert_eq!(row.job.stage(), &Stage::Proposed);
+        assert!(row.job.request().contains("moving upstream from v1 to v2"));
+        assert_eq!(row.job.gap_source(), Some((id, 7)));
+    }
+    assert_eq!(
+        executor
+            .requests()
+            .iter()
+            .filter(|r| r.job_id != id)
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_empty_analysis_creates_no_jobs() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(Vec::new()));
+    packaging_project(&store);
+    merge_with(&store, &executor, &scheduler, id, &["snap/snapcraft.yaml"]).await;
+    assert_eq!(pr_of(&store, id).gaps, Some(Vec::new()));
+    assert_eq!(store.gap_jobs("maestro").unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn the_proposal_text_names_the_range_resolved_from_the_merged_pull_request() {
+    let (store, executor, scheduler, id) = renovate_setup(|request| match request.expect {
+        Expect::DiffCheck => Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe: true,
+                reason: "only a version bump".into(),
+                summary: "Bumps app".into(),
+                from: None,
+                to: None,
+            },
+        ))),
+        _ => Event::Agent(AgentResult::Gaps(vec![gap("Add NEW_FLAG")])),
+    });
+    packaging_project(&store);
+    *executor.resolved_range.lock().unwrap() = Some(("v3".into(), "v4".into()));
+    merge_with(&store, &executor, &scheduler, id, &["snap/snapcraft.yaml"]).await;
+
+    let jobs = pr_of(&store, id).gaps.unwrap();
+    let text = store.get(jobs[0]).unwrap().job.request().to_owned();
+    assert!(text.contains("moving upstream from v3 to v4"), "{text}");
+    let request = executor
+        .requests()
+        .into_iter()
+        .find(|request| request.expect == Expect::PackagingGaps)
+        .unwrap();
+    assert!(request.prompt.contains("v3") && request.prompt.contains("v4"));
+}
+
+#[tokio::test]
+async fn turning_packaging_off_between_the_merge_and_the_gathering_ends_the_job() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(vec![gap("x")]));
+    packaging_project(&store);
+    store
+        .apply(
+            id,
+            Event::RenovateMerged {
+                packaging: true,
+                manifest_changed: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(*store.get(id).unwrap().job.stage(), Stage::Packaging);
+    enable_renovate(&store);
+
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert!(executor.gathered.lock().unwrap().is_empty());
+    assert_eq!(analysis_runs(&executor), 0);
+    assert_eq!(pr_of(&store, id).gaps, None);
 }

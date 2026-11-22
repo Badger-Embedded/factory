@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use factory_core::{
-    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, Job, PrDescription, RetryLimits,
-    ReviewState, Session, Stage,
+    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, ExistingGap, Gap, Job, PackagingContext,
+    PrDescription, RetryLimits, ReviewState, Session, Stage,
 };
 use factory_runner::{
     Expect, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport, job_prompt,
@@ -58,7 +58,9 @@ fn stage_agent(agents: &StageAgents, expect: Expect) -> Agent {
         Expect::Spec => &agents.spec,
         Expect::Plan => &agents.plan,
         Expect::Commits | Expect::FixCi => &agents.implement,
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => &agents.review,
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
+            &agents.review
+        }
     };
     Agent::from_id(id).unwrap_or(DEFAULT_AGENT)
 }
@@ -69,7 +71,9 @@ fn stage_name(expect: Expect) -> &'static str {
         Expect::Spec => "spec",
         Expect::Plan => "plan",
         Expect::Commits | Expect::FixCi => "implement",
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => "review",
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
+            "review"
+        }
     }
 }
 
@@ -245,6 +249,30 @@ pub struct RenovateWatchRequest {
     pub limits: RetryLimits,
     /// The project's auto-merge flag now.
     pub auto_merge: bool,
+    /// The manifest files of a packaging project, or `None` for another
+    /// project. They tell the executor whether a merge starts the packaging
+    /// analysis.
+    pub manifest_files: Option<Vec<String>>,
+}
+
+/// What the packaging analysis of a merged Renovate pull request reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagingRequest {
+    /// The maintained repository as `owner/name`.
+    pub repo: String,
+    /// The upstream repository as `owner/name`.
+    pub upstream: String,
+    /// The base branch, where the manifest files are read after the merge.
+    pub base: String,
+    pub number: u64,
+    pub manifest_files: Vec<String>,
+    pub build_config_files: Vec<String>,
+    /// The head commit the diff check's refs belong to. The executor uses the
+    /// refs only for a merge of this head.
+    pub verdict_head: Option<String>,
+    /// The upstream refs the diff check found.
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +380,24 @@ pub trait Executor: Send + Sync + 'static {
         number: u64,
         head: &str,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// The event for a merged Renovate pull request. `manifest_files` is
+    /// `Some` for a packaging project, and the event then says whether the
+    /// pull request changed one of them.
+    fn renovate_merged(
+        &self,
+        repo: &str,
+        number: u64,
+        manifest_files: Option<&[String]>,
+    ) -> impl Future<Output = Result<Event, String>> + Send;
+
+    /// Reads the pull request, the manifest files on the base branch and the
+    /// upstream patches for the packaging analysis. The result has no
+    /// packaging type and no existing gap jobs; the scheduler adds them.
+    fn gather_packaging(
+        &self,
+        request: PackagingRequest,
+    ) -> impl Future<Output = Result<PackagingContext, String>> + Send;
 
     /// Stops whatever runs for job `job_id`. Called when the job no longer
     /// wants the run, such as after a cancel.
@@ -580,10 +626,14 @@ impl<E: Executor> Scheduler<E> {
                 renovate @ (Command::RerunRenovate { .. }
                 | Command::WatchRenovate { .. }
                 | Command::PostComment { .. }
-                | Command::MergeRenovate { .. })
+                | Command::MergeRenovate { .. }
+                | Command::GatherPackaging { .. })
                     if self.due(row.id) =>
                 {
                     self.renovate_command(&row, &job, &project, &settings, renovate)?;
+                }
+                Command::ProposeGaps { gaps, range } => {
+                    self.propose_gaps(row.id, &gaps, range.as_ref());
                 }
                 _ => {}
             }
@@ -633,6 +683,7 @@ impl<E: Executor> Scheduler<E> {
                     auto_merge: self
                         .store
                         .project_auto_merge(&row.project, project.auto_merge)?,
+                    manifest_files: self.manifest_files(&row.project)?,
                 };
                 let scheduler = Arc::clone(self);
                 let settings = settings.clone();
@@ -652,17 +703,118 @@ impl<E: Executor> Scheduler<E> {
             }
             Command::MergeRenovate { number, head } => {
                 let repo = project.repo.clone();
+                let manifest_files = self.manifest_files(&row.project)?;
                 let scheduler = Arc::clone(self);
                 let settings = settings.clone();
                 self.spawn(id, Kind::Factory, async move {
                     scheduler
-                        .merge_renovate(&settings, id, &repo, number, &head)
+                        .merge_renovate(&settings, id, &repo, number, &head, manifest_files)
                         .await;
                 });
+            }
+            Command::GatherPackaging { number } => {
+                self.start_gathering(row, job, project, settings, number)?;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn start_gathering(
+        self: &Arc<Self>,
+        row: &JobRow,
+        job: &Job,
+        project: &Project,
+        settings: &Settings,
+        number: u64,
+    ) -> Result<(), StoreError> {
+        let id = row.id;
+        let Some(packaging) = self.store.project_maintenance(&row.project)?.packaging else {
+            self.apply(
+                id,
+                Event::RenovateMerged {
+                    packaging: false,
+                    manifest_changed: false,
+                },
+            );
+            return Ok(());
+        };
+        let verdict = job.renovate_pr().and_then(|pr| pr.verdict.as_ref());
+        let request = PackagingRequest {
+            repo: project.repo.clone(),
+            upstream: packaging.upstream_repo,
+            base: project.base.clone(),
+            number,
+            manifest_files: packaging.manifest_files,
+            build_config_files: packaging.build_config_files,
+            verdict_head: job.renovate_pr().and_then(|pr| pr.head.clone()),
+            from: verdict.and_then(|verdict| verdict.from.clone()),
+            to: verdict.and_then(|verdict| verdict.to.clone()),
+        };
+        let kind = packaging.kind.as_str().to_owned();
+        let existing = self
+            .store
+            .gap_jobs(&row.project)?
+            .into_iter()
+            .map(|gap| ExistingGap {
+                request: gap.request,
+                dismissed: gap.dismissed,
+            })
+            .collect();
+        let scheduler = Arc::clone(self);
+        let settings = settings.clone();
+        self.spawn(id, Kind::Factory, async move {
+            scheduler
+                .gather_packaging(&settings, id, request, kind, existing)
+                .await;
+        });
+        Ok(())
+    }
+
+    fn manifest_files(&self, project: &str) -> Result<Option<Vec<String>>, StoreError> {
+        Ok(self
+            .store
+            .project_maintenance(project)?
+            .packaging
+            .map(|packaging| packaging.manifest_files))
+    }
+
+    async fn gather_packaging(
+        &self,
+        settings: &Settings,
+        job_id: i64,
+        request: PackagingRequest,
+        kind: String,
+        existing: Vec<ExistingGap>,
+    ) {
+        self.wait(settings, job_id);
+        match self.executor.gather_packaging(request).await {
+            Ok(mut context) => {
+                context.kind = kind;
+                context.existing = existing;
+                self.apply(job_id, Event::PackagingGathered(Box::new(context)));
+            }
+            Err(err) => self.retry_later(settings, job_id, &err),
+        }
+    }
+
+    /// Creates a job for each gap and records them on the Renovate job in one
+    /// store transaction, so a retry after a crash never creates them twice.
+    fn propose_gaps(&self, job_id: i64, gaps: &[Gap], range: Option<&(String, String)>) {
+        match self.store.propose_gaps(job_id, gaps, range) {
+            Ok(row) => {
+                let found = row
+                    .job
+                    .renovate_pr()
+                    .and_then(|pr| pr.gaps.as_ref())
+                    .map_or(0, Vec::len);
+                self.note(
+                    job_id,
+                    &format!("The packaging analysis found {found} gap(s)."),
+                );
+            }
+            Err(err) => self.report(job_id, Err(err)),
+        }
     }
 
     /// Lists the Renovate pull requests of each project with the switch on, at
@@ -829,7 +981,10 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Spec => models.spec,
                 Expect::Plan => models.plan,
                 Expect::Commits | Expect::FixCi => models.implement,
-                Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => models.review,
+                Expect::Review
+                | Expect::FailureAnalysis
+                | Expect::DiffCheck
+                | Expect::PackagingGaps => models.review,
             };
             let efforts = self.store.project_efforts(&row.project)?;
             let effort = match expect {
@@ -837,7 +992,10 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Spec => efforts.spec,
                 Expect::Plan => efforts.plan,
                 Expect::Commits | Expect::FixCi => efforts.implement,
-                Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => efforts.review,
+                Expect::Review
+                | Expect::FailureAnalysis
+                | Expect::DiffCheck
+                | Expect::PackagingGaps => efforts.review,
             };
             self.store
                 .record_session_settings(row.id, session, model.as_deref(), &effort)?;
@@ -924,9 +1082,10 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Spec => settings.stages.spec,
                 Expect::Plan => settings.stages.plan,
                 Expect::Commits | Expect::FixCi => settings.stages.implement,
-                Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => {
-                    settings.stages.review
-                }
+                Expect::Review
+                | Expect::FailureAnalysis
+                | Expect::DiffCheck
+                | Expect::PackagingGaps => settings.stages.review,
             };
             if !(settings.enabled && in_stage) {
                 continue;
@@ -1370,6 +1529,7 @@ impl<E: Executor> Scheduler<E> {
         repo: &str,
         number: u64,
         head: &str,
+        manifest_files: Option<Vec<String>>,
     ) {
         match self.executor.merge_renovate(repo, number, head).await {
             Ok(()) => {
@@ -1379,7 +1539,20 @@ impl<E: Executor> Scheduler<E> {
                         "Approved and merged #{number}: its checks passed and auto-merge is on."
                     ),
                 );
-                self.apply(job_id, Event::Merged);
+                // The merge is done. When the factory cannot read the pull
+                // request now, the job goes back to watching, which finds it
+                // merged.
+                match self
+                    .executor
+                    .renovate_merged(repo, number, manifest_files.as_deref())
+                    .await
+                {
+                    Ok(event) => self.apply(job_id, event),
+                    Err(err) => {
+                        self.retry_later(settings, job_id, &err);
+                        self.apply(job_id, Event::MergeFailed);
+                    }
+                }
             }
             Err(err) => {
                 self.retry_later(settings, job_id, &err);

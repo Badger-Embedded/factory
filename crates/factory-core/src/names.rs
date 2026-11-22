@@ -16,6 +16,7 @@ impl Stage {
             Stage::PrOpen { .. } => "pr-open",
             Stage::CiAndReview { .. } => "ci-and-review",
             Stage::Renovate => "renovate",
+            Stage::Packaging => "packaging",
             Stage::Proposed => "proposed",
             Stage::Dismissed => "dismissed",
             Stage::Merged => "merged",
@@ -54,6 +55,7 @@ impl Task {
             Task::Review => "review",
             Task::AnalyzeFailure { .. } => "analyze-failure",
             Task::CheckDiff { .. } => "check-diff",
+            Task::FindGaps { .. } => "find-gaps",
         }
     }
 }
@@ -102,6 +104,7 @@ impl Event {
                 AgentResult::RerunCi { .. } => "agent:rerun-ci",
                 AgentResult::FailureVerdict { .. } => "agent:failure-verdict",
                 AgentResult::DiffVerdict { .. } => "agent:diff-verdict",
+                AgentResult::Gaps(_) => "agent:gaps",
             },
             Event::AgentFailed { .. } => "agent-failed",
             Event::Answer(_) => "answer",
@@ -124,6 +127,9 @@ impl Event {
             Event::RenovateObserved { .. } => "renovate-observed",
             Event::Commented => "commented",
             Event::Merged => "merged",
+            Event::RenovateMerged { .. } => "renovate-merged",
+            Event::PackagingGathered(_) => "packaging-gathered",
+            Event::GapsProposed { .. } => "gaps-proposed",
             Event::ClosedUnmerged => "closed-unmerged",
             Event::NothingToPublish => "nothing-to-publish",
             Event::Cancel => "cancel",

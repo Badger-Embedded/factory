@@ -137,6 +137,78 @@ pub struct PrDiff {
     pub body: String,
 }
 
+/// A packaging gap: something an upstream update introduced that the
+/// packaging does not reflect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gap {
+    pub title: String,
+    pub description: String,
+    /// What upstream changed, quoted from its diff or release notes.
+    pub evidence: String,
+    /// What the packaging has now.
+    pub current: String,
+    pub suggestion: String,
+}
+
+impl Gap {
+    /// The request text of the job that implements the gap. It starts with
+    /// the title, so a later analysis can tell what the job covers. `range`
+    /// is the upstream refs the update moved between, when known.
+    #[must_use]
+    pub fn request(&self, number: u64, range: Option<(&str, &str)>) -> String {
+        let mut text = format!(
+            "{}\n\n{}\n\nUpstream evidence:\n\n{}\n\nCurrent packaging:\n\n{}\n\n\
+             Suggested change:\n\n{}\n\nFound after Renovate pull request #{number} merged",
+            self.title, self.description, self.evidence, self.current, self.suggestion
+        );
+        if let Some((from, to)) = range {
+            text.push_str(", moving upstream from ");
+            text.push_str(from);
+            text.push_str(" to ");
+            text.push_str(to);
+        }
+        text.push('.');
+        text
+    }
+}
+
+/// A file the packaging analysis reads. `text` is `None` when the file does
+/// not exist at the ref read, or, for an upstream patch, did not change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileText {
+    pub path: String,
+    pub text: Option<String>,
+}
+
+/// A gap job the project already has, so the analysis leaves out what it
+/// covers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistingGap {
+    pub request: String,
+    /// The user dismissed the job. Otherwise it is proposed or in progress.
+    pub dismissed: bool,
+}
+
+/// What the packaging analysis of a merged Renovate pull request reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackagingContext {
+    /// The packaging type: `snap`, `deb` or `other`.
+    pub kind: String,
+    pub upstream_repo: String,
+    pub pr_title: String,
+    pub pr_body: String,
+    pub pr_diff: String,
+    /// The manifest files as they are on the base branch after the merge.
+    pub manifests: Vec<FileText>,
+    /// The upstream refs the update moved between. `None` when the diff
+    /// check never ran, because a person merged first.
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// The upstream patch of each configured build config file.
+    pub upstream: Vec<FileText>,
+    pub existing: Vec<ExistingGap>,
+}
+
 /// The state of a Renovate pull request's checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenovateCi {
@@ -176,6 +248,11 @@ enum Pending {
     },
     /// Approve, then merge the recorded head.
     Merge,
+    /// Create a job for each gap, then finish.
+    Propose {
+        gaps: Vec<Gap>,
+        range: Option<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +283,10 @@ pub struct RenovatePr {
     /// The agent runs started so far. Each run has its own session.
     #[serde(default)]
     pub runs: u32,
+    /// The gap jobs the packaging analysis created, or `None` while it has
+    /// not run. An empty list means it found no gaps.
+    #[serde(default)]
+    pub gaps: Option<Vec<i64>>,
     #[serde(default)]
     pending: Option<Pending>,
     #[serde(default)]
@@ -442,6 +523,9 @@ pub enum Stage {
     },
     /// Watching a Renovate pull request. See [`JobKind::Renovate`].
     Renovate,
+    /// The packaging analysis of a merged Renovate pull request. See
+    /// [`JobKind::Renovate`].
+    Packaging,
     /// A gap job waits for the user to approve or dismiss it. It holds no
     /// worker and runs no agent. See [`JobKind::Gap`].
     Proposed,
@@ -635,6 +719,12 @@ pub enum Task {
         diff: String,
         body: String,
     },
+    /// Compare the upstream build configuration with the packaging manifest
+    /// after a merged Renovate pull request. The factory passes everything
+    /// the run reads.
+    FindGaps {
+        context: Box<PackagingContext>,
+    },
 }
 
 /// The agent session a run uses. Clarifying has one, the spec has one, and
@@ -717,6 +807,18 @@ pub enum Command {
         number: u64,
         head: String,
     },
+    /// Read what the packaging analysis of the merged pull request needs,
+    /// then report [`Event::PackagingGathered`].
+    GatherPackaging {
+        number: u64,
+    },
+    /// Create a job for each gap and report [`Event::GapsProposed`], in one
+    /// store transaction.
+    ProposeGaps {
+        gaps: Vec<Gap>,
+        /// The upstream versions the analysis compared, for the request text.
+        range: Option<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,6 +841,8 @@ pub enum AgentResult {
     },
     /// The diff check of a Renovate pull request.
     DiffVerdict(Box<DiffVerdict>),
+    /// The packaging analysis: the gaps it found, possibly none.
+    Gaps(Vec<Gap>),
 }
 
 /// What the diff check of a Renovate pull request returns.
@@ -824,6 +928,19 @@ pub enum Event {
     /// The factory posted the comment of [`Command::PostComment`].
     Commented,
     Merged,
+    /// A Renovate pull request merged. `packaging` says the project is a
+    /// packaging project and `manifest_changed` that the pull request changed
+    /// a configured manifest file. Only both start the packaging analysis.
+    RenovateMerged {
+        packaging: bool,
+        manifest_changed: bool,
+    },
+    /// The factory read what the packaging analysis needs.
+    PackagingGathered(Box<PackagingContext>),
+    /// The factory created a job for each gap, listed by id.
+    GapsProposed {
+        jobs: Vec<i64>,
+    },
     ClosedUnmerged,
     /// The pull request's branch has no commits after the base branch, so
     /// there is nothing to push. This happens when an earlier pull request
@@ -934,6 +1051,7 @@ impl Job {
             stopped: None,
             comments: Vec::new(),
             runs: 0,
+            gaps: None,
             pending: None,
             rerun: RerunKind::Auto,
         }));
@@ -1062,6 +1180,13 @@ impl Job {
                 })
             }
             (_, Stage::Renovate) => self.renovate_command(),
+            (Turn::Factory, Stage::Packaging) => self.renovate_pr().map(|pr| match &pr.pending {
+                Some(Pending::Propose { gaps, range }) => Command::ProposeGaps {
+                    gaps: gaps.clone(),
+                    range: range.clone(),
+                },
+                _ => Command::GatherPackaging { number: pr.number },
+            }),
             (Turn::RerunCi { reason }, Stage::CiAndReview { pr }) => {
                 self.plan[*pr].number.map(|number| Command::RerunCi {
                     pr: *pr,
@@ -1086,7 +1211,7 @@ impl Job {
                     number,
                     head: pr.head.clone()?,
                 },
-                None => Command::WatchRenovate {
+                None | Some(Pending::Propose { .. }) => Command::WatchRenovate {
                     number,
                     verdict_head: pr.verdict.as_ref().map(|verdict| verdict.head.clone()),
                     watch_only: false,
@@ -1217,6 +1342,7 @@ impl Job {
             ) => return self.deliver_review(event),
 
             (S::Renovate, _, event) => return self.deliver_renovate(event),
+            (S::Packaging, _, event) => return self.deliver_packaging(event),
 
             (S::Proposed, Turn::User(Ask::Proposal), E::Approve) => (S::Requested, Turn::Factory),
 
@@ -1425,10 +1551,63 @@ impl Job {
                 pr.decide(ci, limits, auto_merge)
             }
             (_, E::Merged) => return Ok((Stage::Merged, Turn::Done)),
+            (
+                _,
+                E::RenovateMerged {
+                    packaging,
+                    manifest_changed,
+                },
+            ) => {
+                if !(packaging && manifest_changed) {
+                    return Ok((Stage::Merged, Turn::Done));
+                }
+                pr.pending = None;
+                return Ok((Stage::Packaging, Turn::Factory));
+            }
             (_, E::ClosedUnmerged) => return Ok((Stage::Cancelled, Turn::Done)),
             (_, event) => return Err(self.unexpected(event)),
         };
         Ok((Stage::Renovate, next))
+    }
+
+    /// Handles the events of the packaging analysis of a merged Renovate
+    /// pull request.
+    fn deliver_packaging(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
+        use Event as E;
+
+        let turn = self.turn.clone();
+        let Some(pr) = self.renovate_mut() else {
+            return Err(self.unexpected(event));
+        };
+        let next = match (&turn, event) {
+            (Turn::Factory, E::PackagingGathered(context)) if pr.pending.is_none() => {
+                pr.runs += 1;
+                Turn::Agent(Task::FindGaps { context })
+            }
+            (Turn::Agent(Task::FindGaps { context }), E::Agent(AgentResult::Gaps(gaps))) => {
+                let range = context.from.clone().zip(context.to.clone());
+                pr.pending = Some(Pending::Propose { gaps, range });
+                Turn::Factory
+            }
+            (
+                Turn::Factory,
+                E::RenovateMerged {
+                    packaging,
+                    manifest_changed,
+                },
+            ) if pr.pending.is_none() && !(packaging && manifest_changed) => {
+                return Ok((Stage::Merged, Turn::Done));
+            }
+            (Turn::Factory, E::GapsProposed { jobs })
+                if matches!(pr.pending, Some(Pending::Propose { .. })) =>
+            {
+                pr.pending = None;
+                pr.gaps = Some(jobs);
+                return Ok((Stage::Merged, Turn::Done));
+            }
+            (_, event) => return Err(self.unexpected(event)),
+        };
+        Ok((Stage::Packaging, next))
     }
 
     fn renovate_mut(&mut self) -> Option<&mut RenovatePr> {
