@@ -30,25 +30,18 @@ pub fn config_json(token: &str) -> String {
     )
 }
 
-/// What the fake container does once its output is closed.
 #[derive(Clone)]
 pub enum Outcome {
-    /// Writes this `config.json` into `COPILOT_HOME` and exits with success.
     Success(String),
-    /// Exits with failure and writes no file.
     Failure,
 }
 
-/// The script one login runs: the lines it prints, then its outcome.
 #[derive(Clone)]
 pub struct Script {
     pub lines: Vec<String>,
     pub outcome: Outcome,
 }
 
-/// A login spawner the test configures with a script. It records the containers
-/// it spawned and killed, and holds the signal that closes the running
-/// container's output.
 #[derive(Default)]
 pub struct FakeSpawner {
     script: Mutex<Option<Script>>,
@@ -63,8 +56,6 @@ impl FakeSpawner {
         *self.script.lock().unwrap() = Some(script);
     }
 
-    /// Closes the running container's output, so the flow reads back `config.json`
-    /// and resolves to signed-in or failed.
     pub fn finish(&self) {
         self.finish.notify_one();
     }
@@ -77,7 +68,6 @@ impl FakeSpawner {
         self.spawned.lock().unwrap().clone()
     }
 
-    /// The `COPILOT_HOME` host directory each login was started with.
     pub fn homes(&self) -> Vec<PathBuf> {
         self.homes.lock().unwrap().clone()
     }
@@ -111,8 +101,6 @@ impl LoginSpawner for FakeSpawner {
     }
 }
 
-/// A running fake login container. It prints its scripted lines, then blocks
-/// until the test closes it, then applies its outcome.
 pub struct FakeProcess {
     name: String,
     lines: VecDeque<String>,
@@ -142,13 +130,11 @@ impl LoginProcess for FakeProcess {
 
     fn kill(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.killed.lock().unwrap().push(self.name.clone());
-        // Unblock a next_line waiting on the close signal, so the task ends.
         self.finish.notify_one();
         Box::pin(std::future::ready(()))
     }
 }
 
-/// A repository checker the onboarding wizard never reaches in these tests.
 pub struct NoRepos;
 
 impl RepoChecker for NoRepos {
@@ -161,7 +147,6 @@ impl RepoChecker for NoRepos {
     }
 }
 
-/// An MCP checker the Copilot pages never reach.
 pub struct NoChecker;
 
 impl McpChecker for NoChecker {
@@ -182,8 +167,6 @@ pub struct Harness {
     pub data: tempfile::TempDir,
 }
 
-/// The login timeout for the tests that are not about the timeout. It is long
-/// enough that a slow poll never ends a login early.
 pub const LONG_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn harness() -> Harness {
@@ -193,15 +176,12 @@ pub fn harness() -> Harness {
     harness_with(&store, secrets, LONG_TIMEOUT)
 }
 
-/// A harness whose store is unavailable, so the login button and the paste
-/// field are disabled.
 pub fn harness_unavailable() -> Harness {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let secrets: Arc<dyn SecretStore> = Arc::new(UnavailableSecrets::new(Arc::clone(&store)));
     harness_with(&store, secrets, LONG_TIMEOUT)
 }
 
-/// A harness whose login times out quickly, for the timeout test.
 pub fn harness_fast_timeout() -> Harness {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let secrets: Arc<dyn SecretStore> =
@@ -287,9 +267,6 @@ impl Harness {
         .await
     }
 
-    /// Polls the login fragment until `want` appears in it, or fails after a
-    /// bounded wait. It returns the matching body so a test can make more
-    /// assertions on it.
     pub async fn poll_fragment(&self, want: &str) -> String {
         for _ in 0..200 {
             let reply = self.get("/settings/agents/copilot/login/fragment").await;

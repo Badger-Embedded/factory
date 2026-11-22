@@ -12,7 +12,6 @@ use harness::{Outcome, Script, config_json, harness, harness_fast_timeout};
 
 const TOKEN: &str = "gho_abcdefghijklmnopqrstuvwxyz0123456789";
 
-/// The prompt as `copilot login --device-code` prints it, colored.
 fn prompt() -> Vec<String> {
     vec![
         "To authenticate, visit \u{1b}[94mhttps://github.com/login/device\u{1b}[0m and enter code \u{1b}[1m1234-5678\u{1b}[0m"
@@ -29,7 +28,8 @@ async fn the_url_and_code_show_without_color_codes_then_the_token_is_stored() {
     });
 
     let start = harness.post("/settings/agents/copilot/login", "").await;
-    assert_eq!(start.status, StatusCode::OK);
+    assert_eq!(start.status, StatusCode::SEE_OTHER);
+    assert_eq!(start.headers["location"], "/settings/agents/copilot");
 
     let waiting = harness.poll_fragment("1234-5678").await;
     assert!(waiting.contains("https://github.com/login/device"));
@@ -60,7 +60,8 @@ async fn signing_in_reloads_the_page_so_the_stored_status_updates() {
             .contains("No token is stored.")
     );
 
-    harness.post("/settings/agents/copilot/login", "").await;
+    let start = harness.post("/settings/agents/copilot/login", "").await;
+    assert_eq!(start.status, StatusCode::SEE_OTHER);
     let waiting = harness.get("/settings/agents/copilot/login/fragment").await;
     assert!(waiting.headers.get("hx-refresh").is_none());
 
@@ -159,7 +160,8 @@ async fn cancel_removes_the_container_and_stores_nothing() {
     let reply = harness
         .post("/settings/agents/copilot/login/cancel", "")
         .await;
-    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.headers["location"], "/settings/agents/copilot");
     for _ in 0..200 {
         if !harness.spawner.killed().is_empty() {
             break;

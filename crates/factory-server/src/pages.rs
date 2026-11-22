@@ -1013,7 +1013,6 @@ fn login_fragment(
     }
 }
 
-/// The Cancel button shown while a login runs. It removes the container.
 fn login_cancel(ui: &LoginUi) -> Markup {
     html! {
         form method="post" action=(format!("{}/login/cancel", ui.base)) {
