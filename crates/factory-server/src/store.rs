@@ -203,7 +203,8 @@ CREATE TABLE IF NOT EXISTS renovate_prs (
     PRIMARY KEY (project, number)
 );
 CREATE TABLE IF NOT EXISTS dismissed_gaps (
-    job_id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
     project TEXT NOT NULL,
     source_job INTEGER NOT NULL,
     source_pr INTEGER NOT NULL,
@@ -811,9 +812,11 @@ impl Store {
     }
 
     /// The gap jobs of `project` that are waiting for approval, still
-    /// running or dismissed, newest first. A dismissal is kept in its own
-    /// table, so it outlives the job's expiry and a dismissed gap is not
-    /// proposed again. A gap job that ended another way is not listed.
+    /// running or dismissed. Live jobs come first, newest first, then the
+    /// dismissals, newest first. A dismissal is kept in its own table under
+    /// an identity of its own, because SQLite may reuse a deleted job's id.
+    /// It outlives the job's expiry, so a dismissed gap is not proposed
+    /// again. A gap job that ended another way is not listed.
     ///
     /// # Errors
     ///
@@ -831,20 +834,19 @@ impl Store {
             let Some((source_job, source_pr)) = row.job.gap_source() else {
                 continue;
             };
-            let dismissed = *row.job.stage() == Stage::Dismissed;
-            if dismissed || !row.job.is_finished() {
+            if !row.job.is_finished() {
                 gaps.push(GapJob {
                     id: row.id,
                     source_job,
                     source_pr,
                     request: row.job.request().to_owned(),
-                    dismissed,
+                    dismissed: false,
                 });
             }
         }
         let mut stmt = conn.prepare(
             "SELECT job_id, source_job, source_pr, request FROM dismissed_gaps
-             WHERE project = ?1 ORDER BY job_id DESC",
+             WHERE project = ?1 ORDER BY id DESC",
         )?;
         let kept = stmt.query_map([project], |r| {
             Ok(GapJob {
@@ -856,12 +858,8 @@ impl Store {
             })
         })?;
         for gap in kept {
-            let gap = gap?;
-            if !gaps.iter().any(|g| g.id == gap.id) {
-                gaps.push(gap);
-            }
+            gaps.push(gap?);
         }
-        gaps.sort_by_key(|g| std::cmp::Reverse(g.id));
         Ok(gaps)
     }
 
@@ -1070,7 +1068,7 @@ impl Store {
             (row.job.stage(), row.job.gap_source())
         {
             tx.execute(
-                "INSERT OR REPLACE INTO dismissed_gaps
+                "INSERT INTO dismissed_gaps
                  (job_id, project, source_job, source_pr, request)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![

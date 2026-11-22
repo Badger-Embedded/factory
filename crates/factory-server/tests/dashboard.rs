@@ -10811,3 +10811,47 @@ async fn a_stale_proposal_approval_cannot_pass_a_later_gate_or_change_the_reques
     assert_eq!(row.job.stage(), &Stage::Spec);
     assert_eq!(row.job.turn(), &Turn::User(Ask::SpecApproval));
 }
+
+#[tokio::test]
+async fn a_reused_job_id_does_not_hide_or_replace_an_earlier_dismissal() {
+    let dashboard = dashboard();
+    let store = &dashboard.store;
+    let first = store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+    dashboard.apply(first, Event::Dismiss);
+    store.delete_job(first, Path::new("/nonexistent")).unwrap();
+
+    let reused = store
+        .create_gap_job("maestro", 1, 43, "Drop the old flag")
+        .unwrap();
+    assert_eq!(reused, first, "SQLite reuses the highest id");
+    let gaps = store.gap_jobs("maestro").unwrap();
+    let seen: Vec<(&str, bool)> = gaps
+        .iter()
+        .map(|g| (g.request.as_str(), g.dismissed))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("Drop the old flag", false),
+            ("Add the new build flag", true)
+        ]
+    );
+
+    dashboard.apply(reused, Event::Dismiss);
+    store.delete_job(reused, Path::new("/nonexistent")).unwrap();
+    let seen: Vec<(String, bool)> = store
+        .gap_jobs("maestro")
+        .unwrap()
+        .into_iter()
+        .map(|g| (g.request, g.dismissed))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("Drop the old flag".to_owned(), true),
+            ("Add the new build flag".to_owned(), true)
+        ]
+    );
+}
