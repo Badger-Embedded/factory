@@ -20,10 +20,12 @@ use tokio::sync::Notify;
 use tower::ServiceExt;
 
 /// The `config.json` a Copilot login writes: the same token under two
-/// `authTokens` entries, as the pinned CLI does.
+/// `authTokens` entries, under the two comment lines the pinned CLI puts first.
 pub fn config_json(token: &str) -> String {
     format!(
-        r#"{{"authTokens":{{"https://github.com:alice:github":{{"token":"{token}"}},"https://github.com:alice":{{"token":"{token}"}}}},"loggedInUsers":[],"lastLoggedInUser":null}}"#
+        r#"// User settings belong in settings.json.
+// This file is managed automatically.
+{{"authTokens":{{"https://github.com:alice:github":{{"token":"{token}"}},"https://github.com:alice":{{"token":"{token}"}}}},"loggedInUsers":[],"lastLoggedInUser":null}}"#
     )
 }
 

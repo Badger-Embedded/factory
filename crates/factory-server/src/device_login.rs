@@ -118,6 +118,12 @@ fn copilot_prepare(home: &Path) -> std::io::Result<()> {
 fn copilot_read_back(home: &Path) -> Result<String, ReadBackError> {
     const FILE: &str = "config.json";
     let config = read_credential_file(home, FILE)?;
+    // The CLI starts the file with `//` comment lines, which JSON does not allow.
+    let config: String = config
+        .lines()
+        .skip_while(|line| line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let config: serde_json::Value =
         serde_json::from_str(&config).map_err(|err| ReadBackError::NotJson {
             file: FILE,
