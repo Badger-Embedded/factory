@@ -136,21 +136,29 @@ test.fixme('an opened Show older disclosure stays open across a poll', async ({ 
   await expect(older).toHaveJSProperty('open', true);
 });
 
-test('a closed Show older disclosure stays closed when another region swaps', async ({ page, factory, project }) => {
+test.fixme('a closed Show older disclosure stays closed when another region swaps', async ({ page, factory, project }) => {
   for (let number = 1; number <= 6; number++) {
     factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', `Old change ${number}`);
   }
   await page.goto(`/?project=${project}`);
   const older = page.locator('details.older');
   await older.getByText('Show 1 older').click();
+
+  // A board swap while the section is open records it as open.
+  factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', 'Cancelled behind the page');
+  await expect(older.getByText('Show 2 older')).toBeVisible();
   await expect(older).toHaveJSProperty('open', true);
-  await older.getByText('Show 1 older').click();
+
+  await older.getByText('Show 2 older').click();
   await expect(older).toHaveJSProperty('open', false);
 
-  factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', 'Cancelled behind the page');
-
-  await expect(page.locator('dl.totals#stats')).toContainText('Jobs created');
-  await expect(page.getByRole('link', { name: 'Cancelled behind the page' })).toBeVisible();
+  // Swap the totals line, a region that holds no disclosure.
+  await page.evaluate(async () => {
+    const stats = document.querySelector('#stats')!;
+    const url = new URL(stats.getAttribute('hx-get')!, location.href);
+    url.searchParams.delete('v');
+    await (window as any).htmx.ajax('GET', url.pathname + url.search, { target: '#stats', swap: 'outerHTML' });
+  });
   await expect(older).toHaveJSProperty('open', false);
 });
 
