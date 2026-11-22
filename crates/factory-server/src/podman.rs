@@ -606,38 +606,62 @@ fn compare_range(body: &str, upstream: &str) -> Option<(String, String)> {
 const VERSION_KEYS: [&str; 4] = ["source-tag", "source-commit", "tag", "commit"];
 
 /// The old and new upstream version a pull request diff changes in the
-/// manifest files. Each version key must have exactly one removed and one
-/// added line, and only one key may change. `None` otherwise, so a diff that
-/// does not say which old value became which new one gives no range.
+/// manifest files. Within one manifest, each version key must have exactly
+/// one removed and one added line, and only one key in one manifest may
+/// change. `None` otherwise, so a diff that does not say which old value
+/// became which new one gives no range.
 fn manifest_range(diff: &str, manifest_files: &[String]) -> Option<(String, String)> {
-    let mut in_manifest = false;
+    let mut found = None;
     let mut removed: Vec<(String, String)> = Vec::new();
     let mut added: Vec<(String, String)> = Vec::new();
-    for line in diff.lines() {
-        if let Some(header) = line.strip_prefix("diff --git ") {
-            in_manifest = manifest_files
-                .iter()
-                .any(|path| header.ends_with(&format!(" b/{path}")));
-        } else if !in_manifest || line.starts_with("---") || line.starts_with("+++") {
-        } else if let Some(old) = line.strip_prefix('-') {
-            removed.extend(version_field(old));
-        } else if let Some(new) = line.strip_prefix('+') {
-            added.extend(version_field(new));
+    let mut in_manifest = false;
+    let sections = diff.lines().map(Some).chain([None]);
+    for line in sections {
+        let header = line.and_then(|line| line.strip_prefix("diff --git "));
+        if line.is_none() || header.is_some() {
+            if in_manifest && !file_range(&removed, &added, &mut found) {
+                return None;
+            }
+            removed.clear();
+            added.clear();
+            in_manifest = header.is_some_and(|header| {
+                manifest_files
+                    .iter()
+                    .any(|path| header.ends_with(&format!(" b/{path}")))
+            });
+        } else if let Some(line) = line.filter(|_| in_manifest) {
+            if line.starts_with("---") || line.starts_with("+++") {
+                continue;
+            }
+            if let Some(old) = line.strip_prefix('-') {
+                removed.extend(version_field(old));
+            } else if let Some(new) = line.strip_prefix('+') {
+                added.extend(version_field(new));
+            }
         }
     }
-    let mut found = None;
+    found
+}
+
+/// Records the version change of one manifest in `found`. Returns false when
+/// the manifest's changes are ambiguous or a second change appears.
+fn file_range(
+    removed: &[(String, String)],
+    added: &[(String, String)],
+    found: &mut Option<(String, String)>,
+) -> bool {
     for key in VERSION_KEYS {
         let from: Vec<_> = removed.iter().filter(|(k, _)| k == key).collect();
         let to: Vec<_> = added.iter().filter(|(k, _)| k == key).collect();
         match (from.as_slice(), to.as_slice()) {
             ([], []) => {}
             ([(_, from)], [(_, to)]) if from != to && found.is_none() => {
-                found = Some((from.clone(), to.clone()));
+                *found = Some((from.clone(), to.clone()));
             }
-            _ => return None,
+            _ => return false,
         }
     }
-    found
+    true
 }
 
 fn version_field(line: &str) -> Option<(String, String)> {
