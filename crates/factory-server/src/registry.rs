@@ -116,6 +116,7 @@ impl AgentEntry<'_> {
         match self.agent {
             Agent::Claude => Some("/settings/agents/claude"),
             Agent::Codex => Some("/settings/agents/codex"),
+            Agent::Copilot => None,
         }
     }
 
@@ -126,6 +127,7 @@ impl AgentEntry<'_> {
         match self.agent {
             Agent::Claude => &CLAUDE_MODELS,
             Agent::Codex => &CODEX_MODELS,
+            Agent::Copilot => &[],
         }
     }
 
@@ -148,9 +150,10 @@ impl AgentEntry<'_> {
     #[must_use]
     pub fn image(&self, settings: &Settings) -> Option<String> {
         match self.agent {
-            // One worker image carries both agents, so both run in the
-            // `worker_image` setting edited on the Workers page.
+            // One worker image carries the agents that have a backend, so they
+            // run in the `worker_image` setting edited on the Workers page.
             Agent::Claude | Agent::Codex => Some(settings.worker_image.clone()),
+            Agent::Copilot => None,
         }
     }
 
@@ -165,6 +168,7 @@ impl AgentEntry<'_> {
     /// start without it. Claude resolves the subscription token afresh and fails
     /// with "no Claude token is set" when none is stored or in the environment;
     /// Codex resolves the stored `auth.json` and fails with "no Codex login is
+    /// set"; Copilot has no stored login and fails with "no Copilot login is
     /// set". A run gates on the credential before any container starts, so a
     /// token or login saved on the settings page reaches the next run.
     ///
@@ -179,6 +183,7 @@ impl AgentEntry<'_> {
                 .resolve()
                 .ok_or_else(|| "no Claude token is set".to_owned()),
             Agent::Codex => self.registry.codex_login.credential(),
+            Agent::Copilot => Err("no Copilot login is set".to_owned()),
         }
     }
 }

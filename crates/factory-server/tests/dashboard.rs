@@ -5089,11 +5089,16 @@ async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_selectable
         5,
         "Claude should be preselected in all five stages",
     );
-    // Codex is listed and selectable now, so it is not marked unavailable and
-    // not preselected over Claude.
     assert!(page.body.contains("value=\"codex\""));
-    assert!(!page.body.contains("Not available yet"));
     assert!(!page.body.contains("value=\"codex\" checked"));
+    assert!(!page.body.contains("value=\"codex\" disabled"));
+    assert_eq!(
+        page.body.matches("value=\"copilot\"").count(),
+        5,
+        "Copilot should be a radio in all five stages",
+    );
+    assert!(!page.body.contains("value=\"copilot\" checked"));
+    assert!(!page.body.contains("value=\"copilot\" disabled"));
 }
 
 #[tokio::test]
@@ -7965,10 +7970,12 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
     assert!(body.contains(r#"href="/settings/agents/claude""#));
     assert!(!body.contains("Claude account"));
 
-    // Codex runs now, so it is listed with a link and no "Not available yet".
     assert!(body.contains("Codex"));
     assert!(body.contains(r#"href="/settings/agents/codex""#));
-    assert!(!body.contains("Not available yet"));
+
+    assert!(body.contains("Copilot"));
+    assert!(!body.contains(r#"href="/settings/agents/copilot""#));
+    assert!(body.contains("Not available yet"));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;
