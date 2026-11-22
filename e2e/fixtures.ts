@@ -10,7 +10,6 @@ export const test = base.extend<
   { project: string },
   { factory: Factory }
 >({
-  // One server and database per worker, so workers never share state.
   factory: [
     async ({}, use) => {
       const { factory, stop } = await startFactory();
@@ -25,7 +24,6 @@ export const test = base.extend<
   extraHTTPHeaders: async ({}, use) => {
     await use({ 'Tailscale-User-Login': ADMIN });
   },
-  // A project of its own, so a test can change state without touching others.
   project: async ({ factory }, use, testInfo) => {
     const name = `p${testInfo.workerIndex}-${testInfo.parallelIndex}-${counter++}`;
     factory.fixture('project', '--name', name, '--login', ADMIN);

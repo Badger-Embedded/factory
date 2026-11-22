@@ -120,9 +120,6 @@ test('a job created after page load appears and keeps the typed request', async 
 });
 
 test('an opened Show older disclosure stays open across a poll', async ({ page, factory, project }) => {
-  // The board swaps with outerHTML, and details-state.js restores the open state on
-  // the replaced element, which is no longer in the page. Remove this line with the fix.
-  test.fail();
   for (let number = 1; number <= 6; number++) {
     factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', `Old change ${number}`);
   }
