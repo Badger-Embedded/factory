@@ -1855,6 +1855,7 @@ async fn edit_mcp_server(
     // An edit that deletes stored values waits for the operator to confirm it.
     let deletes = state.store.mcp_edit_deletes(&name, url, &form.headers)?;
     if !deletes.is_empty() && !form.confirm {
+        let total = deletes.len();
         let visible = state.store.projects_for(&user(&headers))?;
         let shown = deletes
             .into_iter()
@@ -1864,6 +1865,7 @@ async fn edit_mcp_server(
             url: url.to_owned(),
             headers: form.headers,
             deletes: shown,
+            total,
         };
         return mcp_server_page_with(&state, &headers, &name, None, Some(&pending), None);
     }

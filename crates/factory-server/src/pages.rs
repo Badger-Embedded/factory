@@ -1061,12 +1061,16 @@ pub struct ServerUsage {
 }
 
 /// A server edit held back because saving it deletes stored values. The page
-/// shows the posted `url` and `headers` and names each value it deletes, as
-/// `(project, header)`, with a button that saves anyway.
+/// shows the posted `url` and `headers`, names each value it deletes in a
+/// project the viewer collaborates on as `(project, header)`, and counts the
+/// rest under `total`, with a button that saves anyway. `total` is every value
+/// the edit deletes, so the button states the full effect, while `deletes`
+/// names only the ones the viewer may see.
 pub struct PendingEdit {
     pub url: String,
     pub headers: Vec<String>,
     pub deletes: Vec<(String, String)>,
+    pub total: usize,
 }
 
 /// The state of a server's page beyond the server itself.
@@ -1410,7 +1414,7 @@ fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup 
     });
     let label = pending.map_or_else(
         || "Save".to_owned(),
-        |pending| match pending.deletes.len() {
+        |pending| match pending.total {
             1 => "Save and delete 1 value".to_owned(),
             n => format!("Save and delete {n} values"),
         },
@@ -1418,11 +1422,17 @@ fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup 
     html! {
         form.card.settings-form method="post" action=(action) {
             @if let Some(pending) = pending {
+                @let hidden = pending.total - pending.deletes.len();
                 div.confirm {
                     p { strong { "Not saved yet." } " Saving this change deletes these stored values, and each project must enter them again:" }
                     ul {
                         @for (project, header) in &pending.deletes {
                             li { (project) ": " code { (header) } }
+                        }
+                        @if hidden == 1 {
+                            li { "1 value in a project you cannot see" }
+                        } @else if hidden > 1 {
+                            li { (hidden) " values in projects you cannot see" }
                         }
                     }
                     input type="hidden" name="confirm" value="on";

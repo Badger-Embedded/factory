@@ -479,8 +479,6 @@ async fn a_request_becomes_a_job_owned_by_the_tailscale_user() {
 #[tokio::test]
 async fn without_the_tailscale_header_the_user_is_local() {
     let dashboard = dashboard();
-    // The test checks the login value, not the access rule, so `local` must be
-    // a collaborator for the headerless post to land.
     dashboard
         .store
         .add_collaborator("maestro", "local", "test")
@@ -6292,7 +6290,6 @@ async fn a_tile_for_another_projects_job_names_that_project() {
     assert!(worker_tiles(&maestro).contains("#1 tool · requested"));
 }
 
-/// A login that collaborates on maestro but not on tool.
 const MAESTRO_ONLY: &str = "carol@example.com";
 
 #[tokio::test]
@@ -6430,7 +6427,6 @@ async fn the_plan_usage_fragment_404s_for_a_project_the_login_cannot_see() {
     let dashboard = two_projects();
     dashboard.usage.record(usage(USAGE_WITH_FABLE), REPORTED_AT);
 
-    // A login that collaborates on no project.
     assert_eq!(
         dashboard
             .get_as(STRANGER, "/fragments/plan-usage?project=maestro")
@@ -6442,7 +6438,6 @@ async fn the_plan_usage_fragment_404s_for_a_project_the_login_cannot_see() {
     assert_eq!(none.status, StatusCode::OK);
     assert!(!none.body.contains("plan-usage"));
 
-    // A login that collaborates on a different project.
     dashboard
         .store
         .add_collaborator("tool", STRANGER, "test")
@@ -8227,7 +8222,7 @@ async fn a_servers_usage_card_lists_only_the_logins_own_projects() {
 }
 
 #[tokio::test]
-async fn a_held_back_edit_names_only_the_logins_own_projects() {
+async fn a_held_back_edit_counts_every_value_but_names_only_the_logins_own() {
     let dashboard = two_projects();
     dashboard
         .store
@@ -8246,9 +8241,31 @@ async fn a_held_back_edit_names_only_the_logins_own_projects() {
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.body.contains("Not saved yet."));
+    assert!(reply.body.contains("Save and delete 2 values"));
     assert!(reply.body.contains("maestro: <code>Authorization</code>"));
     assert!(!reply.body.contains("tool: <code>Authorization</code>"));
-    assert!(reply.body.contains("Save and delete 1 value"));
+    assert!(reply.body.contains("1 value in a project you cannot see"));
+}
+
+#[tokio::test]
+async fn a_held_back_edit_hides_every_affected_project_from_a_non_collaborator() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+    store_value_for(&dashboard, "tool", "Bearer sk-y");
+
+    let reply = dashboard
+        .post_as(
+            STRANGER,
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=X-Api-Key",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Save and delete 2 values"));
+    assert!(reply.body.contains("2 values in projects you cannot see"));
+    assert!(!reply.body.contains("maestro: <code>Authorization</code>"));
+    assert!(!reply.body.contains("tool: <code>Authorization</code>"));
 }
 
 #[tokio::test]
