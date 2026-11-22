@@ -78,27 +78,22 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     env,
     cwd: dir,
     stdio: ['ignore', 'ignore', 'inherit'],
+    detached: true,
   });
   const url = `http://127.0.0.1:${port}`;
   try {
     await waitForServer(`${url}/`, child);
   } catch (error) {
-    child.kill();
+    process.kill(-child.pid!, 'SIGKILL');
     fs.rmSync(dir, { recursive: true, force: true });
     throw error;
   }
   return {
     factory: { url, db, fixture },
     async stop() {
-      // A fake login that no test cancelled would sleep on after the server is gone.
-      for (const file of fs.readdirSync(dir).filter((f) => /^\.fake-podman-.*\.pid$/.test(f))) {
-        try {
-          process.kill(Number(fs.readFileSync(path.join(dir, file), 'utf8')), 'SIGKILL');
-        } catch {
-          // The login already ended.
-        }
-      }
-      child.kill();
+      // The server leads its own process group, so one kill also reaches a fake login
+      // that no test cancelled, including one that starts as the server stops.
+      process.kill(-child.pid!, 'SIGKILL');
       await new Promise((resolve) => child.once('exit', resolve));
       fs.rmSync(dir, { recursive: true, force: true });
     },
