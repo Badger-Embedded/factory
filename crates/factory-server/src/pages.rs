@@ -290,7 +290,7 @@ fn composer(project: &str) -> Markup {
                     placeholder={ "Describe a change for " (project) "…" } {}
                 button.primary { "Request" }
             }
-            div.composer-more {
+            div.composer-more tabindex="-1" {
                 div.file-picker {
                     input #images type="file" name="images" multiple class="visually-hidden";
                     label.file-button for="images" { "Attach files" }

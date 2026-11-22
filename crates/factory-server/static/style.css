@@ -239,6 +239,10 @@ a.worker-job:hover { color: var(--accent); }
 .composer:focus-within textarea,
 .composer textarea:not(:placeholder-shown) { min-height: 7em; resize: vertical; }
 .composer-more { display: none; padding: var(--space-8) var(--space-8) var(--space-4); }
+/* The row has tabindex="-1" so a mouse press on the label or hint moves focus
+   to the row, not to the body. Otherwise :focus-within stops matching and the
+   row hides before the click lands. */
+.composer-more:focus { outline: none; }
 .composer:focus-within .composer-more,
 .composer:has(textarea:not(:placeholder-shown)) .composer-more,
 .composer:has(.pasted-images li) .composer-more { display: block; }
