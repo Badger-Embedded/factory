@@ -15,6 +15,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::check::{CheckOutcome, McpChecker, ToolList};
+use crate::copilot::validate_copilot_token;
 use crate::device_login::DeviceLogin;
 use crate::github::{RepoChecker, RepoReport};
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
@@ -59,6 +60,7 @@ struct AppState {
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
     onboarding: Arc<tokio::sync::Mutex<()>>,
+    copilot_login: Arc<DeviceLogin>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -88,6 +90,7 @@ pub fn app(
     checker: Arc<dyn McpChecker>,
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
+    copilot_login: Arc<DeviceLogin>,
 ) -> Router {
     Router::new()
         .route("/", get(index))
@@ -173,6 +176,7 @@ pub fn app(
             "/settings/projects/{project}/mcp/{server}/check",
             post(check_mcp_server),
         )
+        .merge(copilot_routes())
         .with_state(AppState {
             store,
             projects,
@@ -186,7 +190,28 @@ pub fn app(
             registry,
             device_login,
             onboarding: Arc::new(tokio::sync::Mutex::new(())),
+            copilot_login,
         })
+}
+
+/// The Copilot settings page and its login and token routes.
+fn copilot_routes() -> Router<AppState> {
+    Router::new()
+        .route("/settings/agents/copilot", get(show_copilot))
+        .route("/settings/agents/copilot/token", post(save_copilot_token))
+        .route(
+            "/settings/agents/copilot/token/clear",
+            post(clear_copilot_token),
+        )
+        .route("/settings/agents/copilot/login", post(start_copilot_login))
+        .route(
+            "/settings/agents/copilot/login/fragment",
+            get(copilot_login_fragment),
+        )
+        .route(
+            "/settings/agents/copilot/login/cancel",
+            post(cancel_copilot_login),
+        )
 }
 
 fn user(headers: &HeaderMap) -> String {
@@ -1312,6 +1337,26 @@ async fn codex_page(
     ))
 }
 
+/// The Copilot account page: whether a token is stored and the state of a
+/// device login. The token never reaches the page.
+async fn copilot_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let stored =
+        state.secrets.available() && state.secrets.copilot_token().ok().flatten().is_some();
+    let login = state.copilot_login.snapshot().await;
+    Ok(pages::settings_copilot(
+        &user(headers),
+        &settings_nav(state, &user(headers))?,
+        stored,
+        &login,
+        state.secrets.available(),
+        notice,
+    ))
+}
+
 /// The `last_refresh` time of a stored `auth.json` as a `YYYY-MM-DD HH:MM:SS`
 /// string for the dashboard time helper, or `None` when the field is absent or
 /// not an RFC 3339 time. The time carries no secret.
@@ -2273,6 +2318,78 @@ async fn cancel_codex_login(
 ) -> Result<Markup, AppError> {
     state.device_login.cancel().await;
     codex_page(&state, &headers, None).await
+}
+
+async fn show_copilot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    copilot_page(&state, &headers, None).await
+}
+
+#[derive(Deserialize)]
+struct CopilotTokenForm {
+    #[serde(default)]
+    token: String,
+}
+
+/// Replaces the stored Copilot token with the pasted one. An empty field keeps
+/// the stored token. A token the Copilot CLI would refuse is refused with a
+/// message that never echoes the input, and stores nothing. The next Copilot
+/// run reads the token afresh, so a save applies with no restart.
+async fn save_copilot_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CopilotTokenForm>,
+) -> Result<Markup, AppError> {
+    if form.token.trim().is_empty() {
+        return copilot_page(&state, &headers, Some("Saved.")).await;
+    }
+    match validate_copilot_token(&form.token) {
+        Ok(token) => {
+            state.secrets.set_copilot_token(token)?;
+            copilot_page(&state, &headers, Some("Saved.")).await
+        }
+        Err(err) => copilot_page(&state, &headers, Some(&err.to_string())).await,
+    }
+}
+
+/// Clears the stored Copilot token. Clearing works even when the master key is
+/// missing, so a token stranded by a lost key can still be removed.
+async fn clear_copilot_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    state.secrets.clear_copilot_token()?;
+    copilot_page(&state, &headers, Some("Cleared.")).await
+}
+
+/// Starts the Copilot device login, or leaves a running one alone, then redraws
+/// the page with the login area polling for the URL and code.
+async fn start_copilot_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    let image = state.store.settings()?.worker_image;
+    state.copilot_login.start(image).await;
+    copilot_page(&state, &headers, None).await
+}
+
+/// The login area the page polls for the URL, the code, success or a failure
+/// reason.
+async fn copilot_login_fragment(State(state): State<AppState>) -> Markup {
+    let login = state.copilot_login.snapshot().await;
+    pages::copilot_login_fragment(&login, state.secrets.available())
+}
+
+/// Cancels a running Copilot login, which removes its container, then redraws
+/// the page.
+async fn cancel_copilot_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    state.copilot_login.cancel().await;
+    copilot_page(&state, &headers, None).await
 }
 
 #[derive(Deserialize)]

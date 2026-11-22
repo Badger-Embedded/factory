@@ -16,8 +16,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_server::{
     AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, LocalSecrets, LoginProcess, LoginSpawner,
-    MASTER_KEY_LEN, McpChecker, PlanUsageCache, Projects, RepoChecker, RepoReport, SecretStore,
-    Store, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    LoginSpec, MASTER_KEY_LEN, McpChecker, PlanUsageCache, Projects, RepoChecker, RepoReport,
+    SecretStore, Store, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -235,6 +235,13 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
         Arc::new(NoChecker) as Arc<dyn McpChecker>,
         registry,
         device_login,
+        Arc::new(DeviceLogin::for_spec_with_timeout(
+            LoginSpec::COPILOT,
+            Arc::clone(&secrets),
+            Arc::clone(&spawner) as Arc<dyn LoginSpawner>,
+            data.path().join("copilot-login"),
+            timeout,
+        )),
     );
     Harness {
         router,

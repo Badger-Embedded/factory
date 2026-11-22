@@ -31,6 +31,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use crate::copilot::validate_copilot_token;
 use crate::secrets::{SecretError, SecretStore, validate_codex_auth};
 
 /// What one agent's device login needs: the container it runs, the command, the
@@ -80,6 +81,47 @@ impl LoginSpec {
         timeout_reason: "It was not finished within fifteen minutes. Start it again, or \
                          paste a login below.",
     };
+}
+
+impl LoginSpec {
+    /// `copilot login --device-code`, which writes its token into `config.json`
+    /// once `settings.json` allows plaintext storage.
+    pub const COPILOT: LoginSpec = LoginSpec {
+        container_name: "factory-copilot-login",
+        scratch_prefix: "copilot-login-",
+        command: &["copilot", "login", "--device-code"],
+        home_env: "COPILOT_HOME",
+        home_mount: "/copilot",
+        prepare: copilot_prepare,
+        read_back: copilot_read_back,
+        validate: |token| validate_copilot_token(token).is_ok(),
+        store: |secrets, token| secrets.set_copilot_token(token),
+        timeout_reason: "It was not finished within fifteen minutes. Start it again, or \
+                         paste a token below.",
+    };
+}
+
+/// Writes the `settings.json` that makes Copilot keep its token in
+/// `config.json`. The container has no keychain and no terminal to answer the
+/// prompt that otherwise asks before storing it in plaintext.
+fn copilot_prepare(home: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        home.join("settings.json"),
+        "{\"storeTokenPlaintext\": true}\n",
+    )
+}
+
+/// The token Copilot wrote under `authTokens` in `config.json`. Each entry holds
+/// the same token for one host and account, so the first one with a token is
+/// enough.
+fn copilot_read_back(home: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(home.join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&config).ok()?;
+    config
+        .get("authTokens")?
+        .as_object()?
+        .values()
+        .find_map(|entry| entry.get("token")?.as_str().map(str::to_owned))
 }
 
 /// Writes the `config.toml` that makes Codex keep its credentials in

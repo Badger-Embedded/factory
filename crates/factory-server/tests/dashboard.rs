@@ -230,6 +230,12 @@ fn dashboard_with_secrets(
         Arc::new(NoLogin),
         std::env::temp_dir(),
     ));
+    let copilot_login = Arc::new(DeviceLogin::for_spec(
+        factory_server::LoginSpec::COPILOT,
+        Arc::clone(&secrets),
+        Arc::new(NoLogin),
+        std::env::temp_dir(),
+    ));
     Dashboard {
         router: app(
             store.clone(),
@@ -243,6 +249,7 @@ fn dashboard_with_secrets(
             Arc::clone(&checker) as Arc<dyn McpChecker>,
             registry,
             device_login,
+            copilot_login,
         ),
         store,
         data,
@@ -2222,6 +2229,12 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
             Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
         )),
         Arc::new(DeviceLogin::new(
+            Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
+            Arc::new(NoLogin),
+            std::env::temp_dir(),
+        )),
+        Arc::new(DeviceLogin::for_spec(
+            factory_server::LoginSpec::COPILOT,
             Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
             Arc::new(NoLogin),
             std::env::temp_dir(),
@@ -8423,12 +8436,15 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
     assert!(body.contains(r#"href="/settings/agents/codex""#));
 
     assert!(body.contains("Copilot"));
-    assert!(!body.contains(r#"href="/settings/agents/copilot""#));
-    assert!(body.contains("Not available yet"));
+    assert!(body.contains(r#"href="/settings/agents/copilot""#));
+    assert!(!body.contains("Not available yet"));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;
     assert!(body.contains(r#"href="/settings/agents/claude" aria-current="page""#));
+
+    let body = dashboard.get("/settings/agents/copilot").await.body;
+    assert!(body.contains(r#"href="/settings/agents/copilot" aria-current="page""#));
 }
 
 #[tokio::test]
