@@ -7,14 +7,14 @@
 //   move the job and the page shows it: "answering the questions hands the job
 //   to the agent", "approving the spec hands the job to the agent", "approving
 //   the plan starts the implementation", "requesting changes sends the job back
-//   to the agent", "cancelling a job stops it", "retrying a failed job queues it
-//   again", "dismissing a failed job takes it off the Failed section"
+//   to the agent", "cancelling a job stops it", "retrying a failed job resumes
+//   it", "dismissing a failed job takes it off the Failed section"
 // - Editing the request of a queued job saves the new text:
 //   "editing a queued job's request saves the new text"
 // - A state change on the server shows without a reload:
 //   "a state change on the server appears without a reload"
 // - Typed text in a form field survives that update, and the log keeps its
-//   scroll position: "text typed in an answer field survives an update",
+//   scroll position: "a draft survives a state change while its field has focus",
 //   "the log keeps its scroll position when a poll swaps it"
 // - Times render in the browser's time zone on load and after a poll:
 //   "times render in the browser's time zone on load and after a poll"
@@ -64,6 +64,7 @@ test('answering the questions hands the job to the agent', async ({ page, factor
 
   await expect(page).toHaveURL(new RegExp(`/jobs/${id}$`));
   await expect(status(page).locator('.badge')).toHaveText('agent working');
+  await expect(status(page)).toContainText('The agent is reading your answers.');
   await expect(page.getByRole('button', { name: 'Send answers' })).toHaveCount(0);
 });
 
@@ -75,7 +76,7 @@ test('approving the spec hands the job to the agent', async ({ page, factory, pr
   await page.getByRole('button', { name: 'Approve spec' }).click();
 
   await expect(status(page).locator('.badge')).toHaveText('agent working');
-  await expect(status(page)).toContainText('The agent is');
+  await expect(status(page)).toContainText('The agent is writing the plan.');
   await expect(page.getByRole('button', { name: 'Approve spec' })).toHaveCount(0);
 });
 
@@ -87,6 +88,7 @@ test('approving the plan starts the implementation', async ({ page, factory, pro
   await page.getByRole('button', { name: 'Approve plan' }).click();
 
   await expect(status(page).locator('.badge')).toHaveText('agent working');
+  await expect(status(page)).toContainText('The agent is implementing the pull request.');
   await expect(page.getByRole('button', { name: 'Approve plan' })).toHaveCount(0);
 });
 
@@ -98,6 +100,7 @@ test('requesting changes sends the job back to the agent', async ({ page, factor
   await page.getByRole('button', { name: 'Request changes' }).click();
 
   await expect(status(page).locator('.badge')).toHaveText('agent working');
+  await expect(status(page)).toContainText('The agent is revising after your feedback.');
   await expect(page.getByRole('button', { name: 'Request changes' })).toHaveCount(0);
 });
 
@@ -119,6 +122,7 @@ test('retrying a failed job resumes it', async ({ page, factory, project }) => {
   await page.getByRole('button', { name: 'Retry' }).click();
 
   await expect(status(page).locator('.badge')).toHaveText('agent working');
+  await expect(status(page)).toContainText('The agent is reading the repository.');
   await expect(page.getByText('The job failed')).toHaveCount(0);
 });
 
@@ -166,21 +170,22 @@ test('a state change on the server appears without a reload', async ({ page, fac
   expect(await page.evaluate(() => (window as unknown as { loadedOnce?: boolean }).loadedOnce)).toBe(true);
 });
 
-test('text typed in an answer field survives an update', async ({ page, factory, project }) => {
-  const id = newJob(factory, project, 'questions');
+test('a draft survives a state change while its field has focus', async ({ page, factory, project }) => {
+  const id = newJob(factory, project, 'spec');
   await page.goto(`/jobs/${id}`);
-  const answer = page.locator('#answer_0');
-  await answer.click();
-  await answer.pressSequentially('half an answer');
+  const feedback = page.getByPlaceholder('Or say what should change');
+  await feedback.click();
+  await feedback.pressSequentially('also cover the second hub');
 
-  factory.fixture('log', '--job', id, '--text', 'update while typing');
-  await expect(page.locator('#job-log .log-text')).toHaveText('update while typing 1');
-  await expect(answer).toHaveValue('half an answer');
-  await expect(answer).toBeFocused();
+  factory.fixture('apply', '--job', id, '--event', 'approve');
 
-  factory.fixture('apply', '--job', id, '--event', 'cancel');
-  await answer.blur();
-  await expect(status(page).locator('.badge')).toHaveText('cancelled');
+  await expect(page.locator('#job-timeline li[aria-current="step"] .step-name')).toHaveText('plan');
+  await expect(feedback).toHaveValue('also cover the second hub');
+  await expect(feedback).toBeFocused();
+
+  await feedback.blur();
+  await expect(status(page)).toContainText('The agent is writing the plan.');
+  await expect(feedback).toHaveCount(0);
 });
 
 test('the log keeps its scroll position when a poll swaps it', async ({ page, factory, project }) => {
