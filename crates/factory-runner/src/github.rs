@@ -11,7 +11,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const MAX_LOG: usize = 30_000;
-const MAX_DIFF: usize = 60_000;
+/// The largest diff [`GitHub::pr_details`] returns. A larger one is an error,
+/// because a review of a cut diff could approve changes it never saw.
+const MAX_DIFF: usize = 200_000;
+/// The most changed files GitHub's compare API lists.
+const COMPARE_FILE_LIMIT: usize = 300;
 
 /// Talks to GitHub through the `gh` CLI with the factory's token.
 #[derive(Debug, Clone)]
@@ -130,7 +134,7 @@ pub struct PrDetails {
     /// The SHA of the pull request's head commit.
     pub head: String,
     pub files: Vec<String>,
-    /// The diff, cut to [`MAX_DIFF`] bytes with a closing line that says so.
+    /// The complete diff.
     pub diff: String,
 }
 
@@ -170,7 +174,9 @@ struct FileJson {
 
 #[derive(Deserialize)]
 struct ContentJson {
+    #[serde(default)]
     content: String,
+    encoding: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -733,15 +739,12 @@ impl GitHub {
         let diff = self
             .run(&["pr", "diff", &number_text, "--repo", repo], None)
             .await?;
-        let diff = if diff.len() > MAX_DIFF {
-            format!(
-                "{}\n[The diff was cut here. It is {} bytes and only the first {MAX_DIFF} are shown.]\n",
-                head(&diff, MAX_DIFF),
+        if diff.len() > MAX_DIFF {
+            return Err(format!(
+                "the diff of pull request {number} is {} bytes, over the limit of {MAX_DIFF}, so it cannot be reviewed in full",
                 diff.len()
-            )
-        } else {
-            diff
-        };
+            ));
+        }
         Ok(PrDetails {
             title: view.title,
             body: view.body,
@@ -858,6 +861,10 @@ impl GitHub {
         };
         let content: ContentJson =
             serde_json::from_str(&out).map_err(|err| format!("contents of {path}: {err}"))?;
+        if content.encoding.as_deref() != Some("base64") {
+            // GitHub leaves the content empty for a file over 1 MB.
+            return self.raw_file(repo, path, git_ref).await;
+        }
         let packed: String = content.content.split_whitespace().collect();
         let bytes = STANDARD
             .decode(packed)
@@ -865,13 +872,42 @@ impl GitHub {
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
+    async fn raw_file(
+        &self,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<String>, String> {
+        match self
+            .run(
+                &[
+                    "api",
+                    "--method",
+                    "GET",
+                    "-H",
+                    "Accept: application/vnd.github.raw+json",
+                    &format!("repos/{repo}/contents/{path}"),
+                    "-f",
+                    &format!("ref={git_ref}"),
+                ],
+                None,
+            )
+            .await
+        {
+            Ok(text) => Ok(Some(text)),
+            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// The patch GitHub reports for `path` between the refs `from` and `to`,
     /// or `None` when a ref is unknown or the file did not change.
     ///
     /// # Errors
     ///
-    /// Returns gh's message when the call fails for another reason, or when
-    /// its output does not parse.
+    /// Returns gh's message when the call fails for another reason, when its
+    /// output does not parse, or when the comparison lists the most files
+    /// GitHub shows and `path` is not among them.
     pub async fn compare_patch(
         &self,
         repo: &str,
@@ -892,11 +928,14 @@ impl GitHub {
         };
         let compare: CompareJson =
             serde_json::from_str(&out).map_err(|err| format!("compare {from}...{to}: {err}"))?;
-        Ok(compare
-            .files
-            .into_iter()
-            .find(|file| file.filename == path)
-            .and_then(|file| file.patch))
+        let listed = compare.files.len();
+        match compare.files.into_iter().find(|file| file.filename == path) {
+            Some(file) => Ok(file.patch),
+            None if listed >= COMPARE_FILE_LIMIT => Err(format!(
+                "compare {from}...{to} lists {listed} files, GitHub's limit, so it cannot show whether {path} changed"
+            )),
+            None => Ok(None),
+        }
     }
 
     /// # Errors
@@ -1015,15 +1054,4 @@ fn tail(text: &str, max: usize) -> &str {
         start += 1;
     }
     &text[start..]
-}
-
-fn head(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
