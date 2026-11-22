@@ -21,6 +21,7 @@ pub struct WorkerSlots {
     slots: Mutex<BTreeMap<usize, (i64, i64)>>,
     /// Jobs with a scheduler task that has not ended, or a stop in progress.
     tasks: Mutex<BTreeSet<i64>>,
+    pass: tokio::sync::Mutex<()>,
 }
 
 impl WorkerSlots {
@@ -46,6 +47,13 @@ impl WorkerSlots {
     /// Frees the slot `job_id` holds, if any.
     pub fn free(&self, job_id: i64) {
         self.slots().retain(|_, (id, _)| *id != job_id);
+    }
+
+    /// Waits for the lock the scheduler holds for a whole pass over the jobs.
+    /// A caller that deletes a job holds it, so it never runs beside a pass
+    /// that read the job before the deletion.
+    pub async fn lock_pass(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.pass.lock().await
     }
 
     /// Marks `job_id` as having a task, from the spawn until the task has ended

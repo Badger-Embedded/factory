@@ -42,10 +42,7 @@ struct FakeExecutor {
     /// thread id, in run order. A run with none reports no id, as Claude does.
     sessions: Mutex<VecDeque<String>>,
     stopped: Mutex<Vec<i64>>,
-    /// Holds each `stop` until the test adds a permit. It starts with so many
-    /// permits that a stop never waits unless a test calls `hold_stops`.
     stop_gate: Semaphore,
-    /// As `stop_gate`, for `watch`.
     watch_gate: Semaphore,
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
@@ -679,6 +676,60 @@ async fn a_factory_task_counts_as_a_task_for_its_job() {
     executor.watch_gate.add_permits(1);
     wait_idle(&scheduler).await;
     assert!(!slots.has_task(id));
+}
+
+#[tokio::test]
+async fn the_pass_lock_is_held_while_a_stop_is_in_progress() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let slots = scheduler.slots();
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+
+    executor.hold_stops();
+    store.remove_project("maestro").unwrap();
+    let ticking = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move { scheduler.tick().await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let waiting = tokio::time::timeout(Duration::from_millis(50), slots.lock_pass()).await;
+    assert!(waiting.is_err());
+
+    executor.stop_gate.add_permits(1);
+    ticking.await.unwrap();
+    let _pass = slots.lock_pass().await;
+    assert!(!slots.has_task(id));
+}
+
+#[tokio::test]
+async fn a_pass_that_read_a_job_before_its_removal_does_not_start_it() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let slots = scheduler.slots();
+    let running = store.create("maestro", "alice", "first").unwrap();
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+    store.apply(running, Event::Cancel).unwrap();
+    let queued = store.create("maestro", "alice", "second").unwrap();
+
+    executor.hold_stops();
+    let ticking = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move { scheduler.tick().await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    store.remove_project("maestro").unwrap();
+    let cleanup = tokio::time::timeout(Duration::from_millis(50), slots.lock_pass()).await;
+    assert!(cleanup.is_err());
+
+    executor.stop_gate.add_permits(1);
+    ticking.await.unwrap();
+    let _pass = slots.lock_pass().await;
+    assert_eq!(executor.requests().len(), 1);
+    assert!(!slots.has_task(queued));
+    assert_eq!(store.get(queued).unwrap().job.stage(), &Stage::Cancelled);
 }
 
 #[tokio::test]

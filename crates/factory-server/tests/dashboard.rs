@@ -8960,8 +8960,6 @@ fn start_review() -> Event {
     }
 }
 
-/// A dashboard over a file-backed store, so a test can read the tables through a
-/// second connection. The project `maestro` is onboarded by `alice`.
 fn file_dashboard() -> (Dashboard, tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("factory.db");
@@ -8985,7 +8983,6 @@ fn count(path: &Path, sql: &str, project: &str) -> i64 {
         .unwrap()
 }
 
-/// Gives `project` a row in every table a removal deletes from, and one cost.
 fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
     let store = &dashboard.store;
     store
@@ -9205,8 +9202,6 @@ async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
 }
 
-/// A checker whose first check waits for a permit, so a test can hold one
-/// onboarding request at the checks while a second one arrives.
 struct GatedChecker {
     calls: std::sync::atomic::AtomicUsize,
     gate: tokio::sync::Semaphore,

@@ -449,6 +449,7 @@ impl<E: Executor> Scheduler<E> {
     ///
     /// Fails when the store cannot be read.
     pub async fn tick(self: &Arc<Self>) -> Result<(), StoreError> {
+        let _pass = self.slots.lock_pass().await;
         let settings = self.store.settings()?;
         let mut rows = self.store.list()?;
         rows.reverse();
@@ -466,7 +467,11 @@ impl<E: Executor> Scheduler<E> {
                 if !workers_free {
                     continue;
                 }
-                job = self.store.apply(row.id, Event::Start)?.job;
+                job = match self.store.apply(row.id, Event::Start) {
+                    Ok(started) => started.job,
+                    Err(StoreError::Rejected(_) | StoreError::NotFound(_)) => continue,
+                    Err(err) => return Err(err),
+                };
             }
             let Some(command) = job.next_command() else {
                 continue;
@@ -1209,8 +1214,9 @@ impl<E: Executor> Scheduler<E> {
         let handle = tokio::spawn(async move {
             work.await;
             scheduler.slots.free(job_id);
-            scheduler.slots.end_task(job_id);
-            scheduler.tasks().remove(&job_id);
+            if scheduler.tasks().remove(&job_id).is_some() {
+                scheduler.slots.end_task(job_id);
+            }
             scheduler.wake.notify_one();
         });
         tasks.insert(job_id, Task { kind, handle });

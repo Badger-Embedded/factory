@@ -2421,6 +2421,7 @@ async fn submit_onboard(
     let mut report = onboard_report(&state, effective_name, repo, base).await?;
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
+        let _pass = state.slots.lock_pass().await;
         let leftover = state.store.job_ids_for(effective_name)?;
         if leftover.iter().any(|id| state.slots.has_task(*id)) {
             report.errors.push(
