@@ -191,7 +191,6 @@ async fn a_copilot_run_with_no_login_fails_before_any_container() {
     let mut request = request();
     request.agent = factory_core::Agent::Copilot;
 
-    // No login yet: the run fails at the gate, before a checkout or container.
     let first = executor
         .run_agent(
             &Settings::default(),
@@ -203,8 +202,6 @@ async fn a_copilot_run_with_no_login_fails_before_any_container() {
     assert_eq!(reason(first), "no Copilot login is set");
     assert!(!data_dir.path().join("jobs").join("7").exists());
 
-    // Save a token, as the settings page would. The next run gets past the gate
-    // and fails later at the checkout, so Retry after a login runs the task.
     secrets.set_copilot_token("gho_saved").unwrap();
     let second = executor
         .run_agent(

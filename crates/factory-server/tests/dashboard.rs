@@ -5272,7 +5272,6 @@ fn a_copilot_session_records_and_keeps_copilot() {
         .session_uuid(id, Session::Planning, Agent::Copilot)
         .unwrap();
     assert_eq!(started, Agent::Copilot);
-    // The stage moves to Claude, but the session resumes on Copilot.
     let (again, resumed) = store
         .session_uuid(id, Session::Planning, Agent::Claude)
         .unwrap();
@@ -5292,7 +5291,6 @@ fn copilot_efforts_run_low_through_max_and_reject_other_levels() {
         )
         .unwrap();
 
-    // `minimal` is a Codex level and no level of Copilot: rejected, nothing written.
     let err = store
         .save_project_efforts(
             "maestro",
@@ -5323,8 +5321,6 @@ async fn saving_copilot_for_a_stage_stores_it_and_an_unsupported_effort_stores_n
         )
     };
 
-    // `minimal` is no Copilot level: 400, and neither the agent nor the effort
-    // is written.
     let reply = dashboard
         .post("/settings/projects/maestro", &form("minimal"))
         .await;
@@ -5338,7 +5334,6 @@ async fn saving_copilot_for_a_stage_stores_it_and_an_unsupported_effort_stores_n
         StageEfforts::default()
     );
 
-    // `max` is a Copilot level, so the same form saves.
     let reply = dashboard
         .post("/settings/projects/maestro", &form("max"))
         .await;

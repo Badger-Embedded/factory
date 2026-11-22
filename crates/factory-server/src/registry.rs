@@ -132,8 +132,6 @@ impl AgentEntry<'_> {
         match self.agent {
             Agent::Claude => Some("/settings/agents/claude"),
             Agent::Codex => Some("/settings/agents/codex"),
-            // The page arrives with the Copilot settings PR; until then the
-            // sidebar lists Copilot without a link rather than a dead one.
             Agent::Copilot => None,
         }
     }
