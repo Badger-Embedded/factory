@@ -2597,9 +2597,6 @@ async fn a_non_collaborator_cannot_add_or_remove_collaborators() {
     );
 }
 
-/// A class-only CSS matcher over the parsed node tree, enough for the selectors
-/// `settings-form.js` uses: class compounds, the descendant combinator and
-/// selector lists.
 const DOM_LIB: &str = r#"
     function parseList(sel) { return sel.split(",").map(function (s) { return s.trim(); }).filter(Boolean); }
     function parseComplex(sel) { return sel.trim().split(" ").filter(Boolean).map(function (c) { return c.split(".").filter(Boolean); }); }
@@ -2665,10 +2662,6 @@ struct DomNode {
     action: Option<String>,
 }
 
-/// JavaScript that rebuilds `body` as a node tree for [`DOM_LIB`] and names the
-/// pipeline form, an input inside it, and the two collaborator forms by their
-/// `action`. Real ancestry is preserved, so `closest(".settings-form")` in
-/// `settings-form.js` sees the page's actual class placement and nesting.
 fn settings_form_setup(body: &str) -> String {
     let doc = scraper::Html::parse_document(body);
     let mut nodes: Vec<DomNode> = Vec::new();
