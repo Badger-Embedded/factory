@@ -621,11 +621,6 @@ impl<E: Executor> Scheduler<E> {
     /// [`Scheduler::agent`] revokes it when the worker exits. The scheduler
     /// reads the registry and the project's settings on every run, so a settings
     /// change reaches a job in flight at its next run.
-    /// Builds the run for the agent stage `expect` of job `row`, with the
-    /// servers it left out for an undecryptable secret. The model, the effort
-    /// and the agent all read from the project's per-stage settings on the same
-    /// mapping, and the session's recorded agent wins over the stage's for a
-    /// resumed session, see [`stage_agent`] and [`Store::session_uuid`].
     fn agent_request(
         &self,
         row: &JobRow,
