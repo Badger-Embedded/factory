@@ -85,6 +85,10 @@ pub enum JobKind {
     /// A Renovate pull request the factory watches. It skips every stage of a
     /// request and ends when the pull request merges or closes.
     Renovate(Box<RenovatePr>),
+    /// A packaging gap the factory found after merging Renovate pull request
+    /// `source_pr`, found by job `source_job`. It waits for approval at
+    /// [`Stage::Proposed`], then runs like a request.
+    Gap { source_job: i64, source_pr: u64 },
 }
 
 /// How many times the factory reruns failed CI on one head commit of a
@@ -438,6 +442,11 @@ pub enum Stage {
     },
     /// Watching a Renovate pull request. See [`JobKind::Renovate`].
     Renovate,
+    /// A gap job waits for the user to approve or dismiss it. It holds no
+    /// worker and runs no agent. See [`JobKind::Gap`].
+    Proposed,
+    /// The user dismissed a gap job at [`Stage::Proposed`]. It never ran.
+    Dismissed,
     Merged,
     Cancelled,
     Failed {
@@ -510,6 +519,8 @@ pub enum Ask {
         #[serde(default)]
         stop: ReviewStop,
     },
+    /// A gap job waits for the user to approve or dismiss it.
+    Proposal,
     /// A Renovate job waits for the user. `reason` says why in words.
     Renovate {
         reason: String,
@@ -885,6 +896,26 @@ impl Job {
         }
     }
 
+    /// A gap job found by job `source_job` after Renovate pull request
+    /// `source_pr` merged. It waits at [`Stage::Proposed`] and holds `gates`
+    /// for the run that follows an approval.
+    #[must_use]
+    pub fn proposal(
+        request: impl Into<String>,
+        gates: Gates,
+        source_job: i64,
+        source_pr: u64,
+    ) -> Self {
+        let mut job = Job::new(request, gates);
+        job.stage = Stage::Proposed;
+        job.turn = Turn::User(Ask::Proposal);
+        job.kind = JobKind::Gap {
+            source_job,
+            source_pr,
+        };
+        job
+    }
+
     /// A job that watches Renovate pull request `number`. Its request text is
     /// the pull request's title.
     #[must_use]
@@ -919,7 +950,19 @@ impl Job {
     pub fn renovate_pr(&self) -> Option<&RenovatePr> {
         match &self.kind {
             JobKind::Renovate(pr) => Some(&**pr),
-            JobKind::Request => None,
+            JobKind::Request | JobKind::Gap { .. } => None,
+        }
+    }
+
+    /// The Renovate job and pull request number a gap job came from.
+    #[must_use]
+    pub fn gap_source(&self) -> Option<(i64, u64)> {
+        match &self.kind {
+            JobKind::Gap {
+                source_job,
+                source_pr,
+            } => Some((*source_job, *source_pr)),
+            _ => None,
         }
     }
 
@@ -1175,6 +1218,8 @@ impl Job {
 
             (S::Renovate, _, event) => return self.deliver_renovate(event),
 
+            (S::Proposed, Turn::User(Ask::Proposal), E::Approve) => (S::Requested, Turn::Factory),
+
             (
                 S::Implementing { .. }
                 | S::Verifying { .. }
@@ -1389,7 +1434,7 @@ impl Job {
     fn renovate_mut(&mut self) -> Option<&mut RenovatePr> {
         match &mut self.kind {
             JobKind::Renovate(pr) => Some(&mut **pr),
-            JobKind::Request => None,
+            JobKind::Request | JobKind::Gap { .. } => None,
         }
     }
 
@@ -1661,6 +1706,7 @@ impl Job {
 
     fn dismiss(&mut self) -> Result<(Stage, Turn), Rejected> {
         match &self.stage {
+            Stage::Proposed => Ok((Stage::Dismissed, Turn::Done)),
             Stage::Failed {
                 reason,
                 retry,
@@ -1677,16 +1723,17 @@ impl Job {
         }
     }
 
-    /// Whether a failed job was dismissed from the board. False for every
-    /// other stage.
+    /// Whether a failed or proposed job was dismissed from the board. False
+    /// for every other stage.
     #[must_use]
     pub fn is_dismissed(&self) -> bool {
         matches!(
             self.stage,
-            Stage::Failed {
-                dismissed: true,
-                ..
-            }
+            Stage::Dismissed
+                | Stage::Failed {
+                    dismissed: true,
+                    ..
+                }
         )
     }
 
@@ -1747,7 +1794,7 @@ impl Job {
     pub fn is_finished(&self) -> bool {
         matches!(
             self.stage,
-            Stage::Merged | Stage::Cancelled | Stage::Failed { .. }
+            Stage::Merged | Stage::Cancelled | Stage::Dismissed | Stage::Failed { .. }
         )
     }
 

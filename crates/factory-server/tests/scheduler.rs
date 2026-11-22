@@ -4560,3 +4560,60 @@ async fn a_failing_check_with_no_actions_run_is_not_counted_as_a_rerun() {
     assert_eq!(executor.comments.lock().unwrap().len(), 1);
     assert_eq!(executor.requests().len(), 0);
 }
+
+#[tokio::test]
+async fn a_proposed_job_takes_no_worker_and_runs_after_approval_to_the_gates() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Clarify => Event::Agent(AgentResult::Clarified),
+        Expect::Spec => Event::Agent(AgentResult::Spec("spec".into())),
+        Expect::Plan => Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+            title: "a: b".into(),
+            summary: "c".into(),
+            number: None,
+            description: None,
+            notes: None,
+        }])),
+        other => unreachable!("unexpected run {other:?}"),
+    });
+    store
+        .save_project_gates(
+            "maestro",
+            Gates {
+                spec: true,
+                plan: true,
+                publish: false,
+            },
+        )
+        .unwrap();
+    executor.release(10);
+    let id = store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+
+    for _ in 0..3 {
+        scheduler.tick().await.unwrap();
+    }
+    assert_eq!(scheduler.running(), Vec::<i64>::new());
+    assert_eq!(executor.requests().len(), 0);
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Proposed);
+
+    store.approve_proposal(id, "alice").unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Spec);
+    assert_eq!(
+        store.get(id).unwrap().job.turn(),
+        &Turn::User(Ask::SpecApproval)
+    );
+
+    store.apply(id, Event::Approve).unwrap();
+    scheduler.tick().await.unwrap();
+    wait_idle(&scheduler).await;
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.stage(), &Stage::Plan);
+    assert_eq!(job.turn(), &Turn::User(Ask::PlanApproval));
+    let expects: Vec<Expect> = executor.requests().iter().map(|r| r.expect).collect();
+    assert_eq!(expects, [Expect::Clarify, Expect::Spec, Expect::Plan]);
+}

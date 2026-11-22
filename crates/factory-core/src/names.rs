@@ -16,6 +16,8 @@ impl Stage {
             Stage::PrOpen { .. } => "pr-open",
             Stage::CiAndReview { .. } => "ci-and-review",
             Stage::Renovate => "renovate",
+            Stage::Proposed => "proposed",
+            Stage::Dismissed => "dismissed",
             Stage::Merged => "merged",
             Stage::Cancelled => "cancelled",
             Stage::Failed { .. } => "failed",
@@ -66,6 +68,7 @@ impl Ask {
             Ask::PublishApproval { .. } => "publish-approval",
             Ask::ReviewStopped { .. } => "review-stopped",
             Ask::Renovate { .. } => "renovate",
+            Ask::Proposal => "proposal",
         }
     }
 }

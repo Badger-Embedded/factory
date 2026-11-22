@@ -2725,7 +2725,7 @@ fn row_detail(job: &Job) -> Option<String> {
             dismissed: false,
             ..
         } => Some(first_line(reason)),
-        Stage::Failed { .. } | Stage::Merged | Stage::Cancelled => None,
+        Stage::Failed { .. } | Stage::Merged | Stage::Cancelled | Stage::Dismissed => None,
         _ => Some(stage_label(job)),
     }
 }
@@ -2743,6 +2743,12 @@ fn row_actions(row: &JobRow, lane: Lane) -> Markup {
                     form.approve method="post" action={ (page) "/approve" } {
                         input type="hidden" name="project" value=(row.project);
                         button.primary { "Approve " (gate) }
+                    }
+                } @else if *row.job.stage() == Stage::Proposed {
+                    a.link-button href=(page) { "Open" }
+                    form.approve method="post" action={ (page) "/approve" } {
+                        input type="hidden" name="project" value=(row.project);
+                        button.primary { "Approve" }
                     }
                 } @else {
                     a.link-button href=(page) { "Open" }
@@ -2792,7 +2798,11 @@ fn flow_index(stage: &Stage) -> Option<usize> {
         Stage::PrOpen { .. } => 6,
         Stage::CiAndReview { .. } => 7,
         Stage::Merged => 8,
-        Stage::Renovate | Stage::Cancelled | Stage::Failed { .. } => return None,
+        Stage::Renovate
+        | Stage::Proposed
+        | Stage::Dismissed
+        | Stage::Cancelled
+        | Stage::Failed { .. } => return None,
     })
 }
 
@@ -2940,7 +2950,7 @@ pub fn job_fragment(
 fn terminal(job: &Job) -> bool {
     matches!(
         job.stage(),
-        Stage::Merged | Stage::Failed { .. } | Stage::Cancelled
+        Stage::Merged | Stage::Failed { .. } | Stage::Cancelled | Stage::Dismissed
     )
 }
 
@@ -3551,6 +3561,34 @@ fn renovate_wait_card(
     }
 }
 
+fn proposal_card(id: i64, job: &Job) -> Markup {
+    html! {
+        div.card.needs-you {
+            div.card-head {
+                span.badge.you { "proposal" }
+                h2 { "The factory proposes this change" }
+            }
+            @if let Some((source, number)) = job.gap_source() {
+                p.meta {
+                    "Found after Renovate pull request #" (number) " merged, in "
+                    a href={ "/jobs/" (source) } { "job " (source) }
+                    "."
+                }
+            }
+            pre.doc { (job.request()) }
+            p.hint { "Approve to run it as a job of your own, with this project's gates. Dismiss to drop it for good." }
+            div.row.actions {
+                form method="post" action={ "/jobs/" (id) "/approve" } {
+                    button.primary { "Approve" }
+                }
+                form method="post" action={ "/jobs/" (id) "/dismiss" } {
+                    button { "Dismiss" }
+                }
+            }
+        }
+    }
+}
+
 fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Markup {
     match (job.stage(), job.turn()) {
         (_, Turn::User(Ask::Answers { questions })) => html! {
@@ -3605,7 +3643,8 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
         (_, Turn::User(Ask::Renovate { reason, state })) => {
             renovate_wait_card(id, job, settings, reason, *state)
         }
-        (Stage::Renovate | Stage::Merged | Stage::Cancelled, _) => html! {
+        (Stage::Proposed, _) => proposal_card(id, job),
+        (Stage::Renovate | Stage::Merged | Stage::Cancelled | Stage::Dismissed, _) => html! {
             div.card.status {
                 (turn_badge(job, auto_merge))
                 span.status-detail { (turn_detail(job, settings, auto_merge)) }
@@ -3697,13 +3736,15 @@ fn status(job: &Job, auto_merge: bool) -> Status {
     let (lane, class, text) = match (job.stage(), job.turn()) {
         (Stage::Merged, _) => (Lane::Done, "ok", "merged"),
         (
-            Stage::Failed {
+            Stage::Dismissed
+            | Stage::Failed {
                 dismissed: true, ..
             },
             _,
         ) => (Lane::Done, "factory", "dismissed"),
         (Stage::Failed { .. }, _) => (Lane::Failed, "bad", "failed"),
         (Stage::Cancelled, _) => (Lane::Done, "factory", "cancelled"),
+        (Stage::Proposed, _) => (Lane::You, "you", "proposal"),
         (Stage::Requested, _) => (Lane::Factory, "factory", "queued"),
         (_, Turn::User(_)) if !collecting(job) => (Lane::You, "you", "needs you"),
         _ if in_review(job) && auto_merge => (Lane::Factory, "factory", "merges when green"),
@@ -3755,6 +3796,8 @@ fn stage_label(job: &Job) -> String {
         Stage::PrOpen { pr } => format!("pr-open, {}", of(*pr)),
         Stage::CiAndReview { pr } => format!("ci-and-review, {}", of(*pr)),
         Stage::Renovate => "renovate".into(),
+        Stage::Proposed => "proposal".into(),
+        Stage::Dismissed => "dismissed".into(),
         Stage::Merged => "merged".into(),
         Stage::Cancelled => "cancelled".into(),
         Stage::Failed { .. } => "failed".into(),
@@ -3811,6 +3854,7 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
         Turn::User(_) => "Waiting for you.".into(),
         Turn::Done => match job.stage() {
             Stage::Merged => "Every planned pull request is merged.".into(),
+            Stage::Dismissed => "This proposal was dismissed.".into(),
             _ => "This job is cancelled.".into(),
         },
     }

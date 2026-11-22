@@ -10641,3 +10641,123 @@ fn maintenance_settings_round_trip_through_the_store() {
     assert_eq!(store.project_maintenance("p").unwrap(), off);
     assert_eq!(store.project_maintenance("other").unwrap(), off);
 }
+
+#[tokio::test]
+async fn a_proposal_shows_a_card_and_row_actions_in_needs_you() {
+    let dashboard = dashboard();
+    let id = dashboard
+        .store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+
+    let body = dashboard.get("/").await.body;
+    assert_eq!(lanes_of(&body, id), ["inbox-you"]);
+    let lane = lane_html(&body, "inbox-you");
+    assert!(lane.contains(">proposal</span>"));
+    assert!(lane.contains(&format!("action=\"/jobs/{id}/approve\"")));
+    assert!(lane.contains("name=\"project\" value=\"maestro\""));
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains("Add the new build flag"));
+    assert!(page.contains(&format!("action=\"/jobs/{id}/approve\"")));
+    assert!(page.contains(&format!("action=\"/jobs/{id}/dismiss\"")));
+}
+
+#[tokio::test]
+async fn approving_a_proposal_makes_the_approver_the_requester() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+    let id = dashboard
+        .store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+    assert_eq!(
+        dashboard.store.get(id).unwrap().requested_by,
+        FACTORY_REQUESTER
+    );
+
+    let reply = dashboard
+        .post_as("bob@example.com", &format!("/jobs/{id}/approve"), "")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let row = dashboard.store.get(id).unwrap();
+    assert_eq!(row.requested_by, "bob@example.com");
+    assert_eq!(row.job.stage(), &Stage::Requested);
+}
+
+#[tokio::test]
+async fn dismissing_a_proposal_moves_it_to_done_with_a_dismissed_badge() {
+    let dashboard = dashboard();
+    let id = dashboard
+        .store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+
+    let reply = dashboard.post(&format!("/jobs/{id}/dismiss"), "").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        dashboard.store.get(id).unwrap().requested_by,
+        FACTORY_REQUESTER
+    );
+
+    let body = dashboard.get("/").await.body;
+    assert_eq!(lanes_of(&body, id), ["inbox-done"]);
+    assert!(lane_html(&body, "inbox-done").contains(">dismissed</span>"));
+    assert!(!body.contains("inbox-you"));
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains(">dismissed</span>"));
+    assert!(!page.contains(&format!("action=\"/jobs/{id}/approve\"")));
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_approve_or_dismiss_a_proposal() {
+    let dashboard = dashboard();
+    let id = dashboard
+        .store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+
+    for route in ["approve", "dismiss"] {
+        let reply = dashboard
+            .post_as(STRANGER, &format!("/jobs/{id}/{route}"), "")
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{route}");
+    }
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Proposed
+    );
+}
+
+#[tokio::test]
+async fn a_proposal_notifies_every_collaborator_and_after_approval_only_the_approver() {
+    let dashboard = dashboard();
+    let store = &dashboard.store;
+    store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+    let id = store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+
+    for login in [USER, "bob@example.com"] {
+        let items = notifications_as(&dashboard, login).await["items"].clone();
+        assert_eq!(items[0]["job"], id, "{login}");
+        assert_eq!(items[0]["kind"], "needs-you", "{login}");
+    }
+    assert_eq!(
+        notifications_as(&dashboard, "mallory@example.com").await["items"],
+        json!([])
+    );
+
+    store.approve_proposal(id, "bob@example.com").unwrap();
+    dashboard.apply(id, Event::Start);
+    dashboard.apply(id, Event::Agent(AgentResult::Clarified));
+    dashboard.apply(id, Event::Agent(AgentResult::Spec("spec".into())));
+    let bob = notifications_as(&dashboard, "bob@example.com").await["items"].clone();
+    assert_eq!(bob[0]["job"], id);
+    assert_eq!(notifications_as(&dashboard, USER).await["items"], json!([]));
+}

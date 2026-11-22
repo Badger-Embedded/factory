@@ -2839,3 +2839,73 @@ fn a_renovate_job_rejects_events_that_do_not_fit() {
         .is_err()
     );
 }
+
+fn proposal() -> Job {
+    Job::proposal(
+        "Add the new build flag",
+        Gates {
+            spec: true,
+            plan: true,
+            publish: false,
+        },
+        7,
+        42,
+    )
+}
+
+#[test]
+fn a_proposal_waits_for_the_user_and_runs_nothing() {
+    let job = proposal();
+    assert_eq!(job.stage(), &Stage::Proposed);
+    assert_eq!(job.turn(), &Turn::User(Ask::Proposal));
+    assert_eq!(job.next_command(), None);
+    assert_eq!(job.gap_source(), Some((7, 42)));
+    assert!(!job.is_finished());
+    assert!(!job.can_retry());
+}
+
+#[test]
+fn approving_a_proposal_queues_it_with_its_gates() {
+    let mut job = proposal();
+    apply(&mut job, Event::Approve);
+    assert_eq!(job.stage(), &Stage::Requested);
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert!(job.gates().spec && job.gates().plan);
+
+    apply(&mut job, Event::Start);
+    assert_eq!(job.stage(), &Stage::Clarifying);
+    assert_eq!(job.gap_source(), Some((7, 42)));
+}
+
+#[test]
+fn dismissing_a_proposal_ends_it_dismissed() {
+    let mut job = proposal();
+    apply(&mut job, Event::Dismiss);
+    assert_eq!(job.stage(), &Stage::Dismissed);
+    assert_eq!(job.turn(), &Turn::Done);
+    assert!(job.is_dismissed());
+    assert!(job.is_finished());
+    assert!(!job.can_retry());
+    assert_eq!(job.next_command(), None);
+
+    let before = job.clone();
+    for event in [Event::Dismiss, Event::Approve, Event::Retry] {
+        assert!(matches!(job.apply(event), Err(Rejected::Unexpected { .. })));
+    }
+    assert_eq!(job, before);
+}
+
+#[test]
+fn a_proposal_rejects_edit_and_retry() {
+    let mut job = proposal();
+    let before = job.clone();
+    for event in [
+        Event::Edit {
+            request: "other".into(),
+        },
+        Event::Retry,
+    ] {
+        assert!(matches!(job.apply(event), Err(Rejected::Unexpected { .. })));
+    }
+    assert_eq!(job, before);
+}

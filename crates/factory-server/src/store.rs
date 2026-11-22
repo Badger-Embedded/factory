@@ -742,6 +742,77 @@ impl Store {
         Ok(Some(id))
     }
 
+    /// Creates a gap job in `project`, found by job `source_job` after
+    /// Renovate pull request `source_pr` merged. The requester is `factory`,
+    /// and the job waits for approval with the project's current gates.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn create_gap_job(
+        &self,
+        project: &str,
+        source_job: i64,
+        source_pr: u64,
+        text: &str,
+    ) -> Result<i64, StoreError> {
+        let gates = self.project_gates(project)?;
+        let new = Job::proposal(text, gates, source_job, source_pr);
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let id = Self::insert_job(&tx, project, FACTORY_REQUESTER, &new)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Approves the gap job `id` for `login`. The job moves to `requested`
+    /// and `login` becomes its requester in one transaction, so the two never
+    /// disagree.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Rejected`] when the job is not waiting for
+    /// approval, and then nothing is saved.
+    pub fn approve_proposal(&self, id: i64, login: &str) -> Result<JobRow, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, id)?;
+        Self::apply_in(&tx, &mut row, Event::Approve)?;
+        tx.execute(
+            "UPDATE jobs SET requested_by = ?1 WHERE id = ?2",
+            params![login, id],
+        )?;
+        login.clone_into(&mut row.requested_by);
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// The gap jobs of `project` that are waiting for approval, still running
+    /// or dismissed, newest first. A gap job that ended another way is not
+    /// listed.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    pub fn gap_jobs(&self, project: &str) -> Result<Vec<JobRow>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, project, requested_by, created_at, job FROM jobs
+             WHERE project = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([project], raw_row)?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let row = parse_row(row?)?;
+            let wanted = row.job.gap_source().is_some()
+                && (!row.job.is_finished() || *row.job.stage() == Stage::Dismissed);
+            if wanted {
+                jobs.push(row);
+            }
+        }
+        Ok(jobs)
+    }
+
     /// Inserts `job` with its `created` event and counts it in the project's
     /// totals.
     fn insert_job(
