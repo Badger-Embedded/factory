@@ -202,6 +202,14 @@ CREATE TABLE IF NOT EXISTS renovate_prs (
     job_id INTEGER NOT NULL,
     PRIMARY KEY (project, number)
 );
+CREATE TABLE IF NOT EXISTS dismissed_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    project TEXT NOT NULL,
+    source_job INTEGER NOT NULL,
+    source_pr INTEGER NOT NULL,
+    request TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS user_settings (
     login TEXT PRIMARY KEY,
     notifications INTEGER NOT NULL DEFAULT 1,
@@ -394,6 +402,16 @@ pub struct Snapshot {
     /// pair, also after a restart, and no clock is involved.
     pub order: (u64, u64),
     pub jobs: Vec<(JobRow, i64)>,
+}
+
+/// A gap job as the packaging analysis sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapJob {
+    pub id: i64,
+    pub source_job: i64,
+    pub source_pr: u64,
+    pub request: String,
+    pub dismissed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -742,6 +760,109 @@ impl Store {
         Ok(Some(id))
     }
 
+    /// Creates a gap job in `project`, found by job `source_job` after
+    /// Renovate pull request `source_pr` merged. The requester is `factory`,
+    /// and the job waits for approval with the project's current gates.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn create_gap_job(
+        &self,
+        project: &str,
+        source_job: i64,
+        source_pr: u64,
+        text: &str,
+    ) -> Result<i64, StoreError> {
+        let gates = self.project_gates(project)?;
+        let new = Job::proposal(text, gates, source_job, source_pr);
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let id = Self::insert_job(&tx, project, FACTORY_REQUESTER, &new)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Approves the gap job `id` for `login`. The job moves to `requested`
+    /// and `login` becomes its requester in one transaction, so the two never
+    /// disagree.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Rejected`] when the job is not waiting for
+    /// approval, and then nothing is saved.
+    pub fn approve_proposal(&self, id: i64, login: &str) -> Result<JobRow, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, id)?;
+        if *row.job.stage() != Stage::Proposed {
+            return Err(StoreError::Rejected(Rejected::Unexpected {
+                stage: row.job.stage().clone(),
+                event: Event::Approve,
+            }));
+        }
+        Self::apply_in(&tx, &mut row, Event::Approve)?;
+        tx.execute(
+            "UPDATE jobs SET requested_by = ?1 WHERE id = ?2",
+            params![login, id],
+        )?;
+        login.clone_into(&mut row.requested_by);
+        tx.commit()?;
+        Ok(row)
+    }
+
+    /// The gap jobs of `project` that are waiting for approval, still
+    /// running or dismissed. Live jobs come first, newest first, then the
+    /// dismissals, newest first. A dismissal is kept in its own table under
+    /// an identity of its own, because SQLite may reuse a deleted job's id.
+    /// It outlives the job's expiry, so a dismissed gap is not proposed
+    /// again. A gap job that ended another way is not listed.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    pub fn gap_jobs(&self, project: &str) -> Result<Vec<GapJob>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, project, requested_by, created_at, job FROM jobs
+             WHERE project = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([project], raw_row)?;
+        let mut gaps = Vec::new();
+        for row in rows {
+            let row = parse_row(row?)?;
+            let Some((source_job, source_pr)) = row.job.gap_source() else {
+                continue;
+            };
+            if !row.job.is_finished() {
+                gaps.push(GapJob {
+                    id: row.id,
+                    source_job,
+                    source_pr,
+                    request: row.job.request().to_owned(),
+                    dismissed: false,
+                });
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT job_id, source_job, source_pr, request FROM dismissed_gaps
+             WHERE project = ?1 ORDER BY id DESC",
+        )?;
+        let kept = stmt.query_map([project], |r| {
+            Ok(GapJob {
+                id: r.get(0)?,
+                source_job: r.get(1)?,
+                source_pr: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                request: r.get(3)?,
+                dismissed: true,
+            })
+        })?;
+        for gap in kept {
+            gaps.push(gap?);
+        }
+        Ok(gaps)
+    }
+
     /// Inserts `job` with its `created` event and counts it in the project's
     /// totals.
     fn insert_job(
@@ -943,6 +1064,22 @@ impl Store {
             "UPDATE jobs SET job = ?1 WHERE id = ?2",
             params![serde_json::to_string(&row.job)?, row.id],
         )?;
+        if let (Stage::Dismissed, Some((source_job, source_pr))) =
+            (row.job.stage(), row.job.gap_source())
+        {
+            tx.execute(
+                "INSERT INTO dismissed_gaps
+                 (job_id, project, source_job, source_pr, request)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    row.id,
+                    row.project,
+                    source_job,
+                    i64::try_from(source_pr).unwrap_or(i64::MAX),
+                    row.job.request()
+                ],
+            )?;
+        }
         if !was_merged && *row.job.stage() == Stage::Merged {
             tx.execute(
                 "INSERT INTO project_totals (project, jobs_merged) VALUES (?1, 1)
@@ -1902,6 +2039,7 @@ impl Store {
             "project_collaborators",
             "project_maintenance",
             "renovate_prs",
+            "dismissed_gaps",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;

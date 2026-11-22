@@ -1282,8 +1282,14 @@ async fn approve(
     Path(id): Path<i64>,
     Form(form): Form<ApproveForm>,
 ) -> Result<Redirect, AppError> {
-    visible_job(&state, &headers, id)?;
-    let redirect = apply(&state, id, Event::Approve)?;
+    let row = visible_job(&state, &headers, id)?;
+    let redirect = if *row.job.stage() == Stage::Proposed {
+        state.store.approve_proposal(id, &user(&headers))?;
+        state.wake.notify_one();
+        job_redirect(id)
+    } else {
+        apply(&state, id, Event::Approve)?
+    };
     board_redirect(&state, form.project, redirect)
 }
 
