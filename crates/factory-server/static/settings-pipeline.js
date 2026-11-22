@@ -13,6 +13,8 @@
   // radios can be redrawn when a stage's agent switches.
   var AGENT_EFFORTS = JSON.parse(form.dataset.agentEfforts || "{}");
 
+  var AGENT_MODELS = JSON.parse(form.dataset.agentModels || "{}");
+
   // The effort levels of the agent a stage is set to, lowest first.
   function effortsFor(stage) {
     var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
@@ -81,6 +83,45 @@
     setEffortLabel(stage, selected);
   }
 
+  function redrawModels(stage) {
+    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+    var spec = agent && AGENT_MODELS[agent.value];
+    var chips = form.querySelector('[data-model-chips="' + stage + '"]');
+    var input = form.querySelector('[data-model-input="' + stage + '"]');
+    if (!spec || !chips || !input) return;
+    var previous = AGENT_MODELS[chips.dataset.agent];
+    var datalist = form.querySelector("#" + input.getAttribute("list"));
+    var hint = form.querySelector('[data-model-hint="' + stage + '"]');
+    chips.dataset.agent = agent.value;
+    chips.textContent = "";
+    [""].concat(spec.models).forEach(function (model) {
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip";
+      chip.dataset.model = model;
+      chip.dataset.modelFor = stage;
+      chip.textContent = model || "CLI default";
+      chips.appendChild(chip);
+    });
+    if (datalist) {
+      datalist.textContent = "";
+      spec.models.forEach(function (model) {
+        var option = document.createElement("option");
+        option.value = model;
+        datalist.appendChild(option);
+      });
+    }
+    if (hint) {
+      hint.textContent =
+        "An alias or any model ID. Empty runs the model the installed " + spec.cli + " CLI picks.";
+    }
+    var value = input.value.trim();
+    if (value !== "" && previous && previous.models.indexOf(value) >= 0) {
+      input.value = "";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
   function setGateNode(box) {
     var node = form.querySelector('[data-gate-node="' + box.dataset.gate + '"]');
     var changed = box.checked !== (box.dataset.default === "on");
@@ -124,7 +165,9 @@
     if (target.type === "radio" && target.name.endsWith("_effort")) {
       setEffortLabel(target.name.slice(0, -"_effort".length), target.value);
     } else if (target.type === "radio" && target.name.endsWith("_agent")) {
-      redrawEfforts(target.name.slice(0, -"_agent".length));
+      var agentStage = target.name.slice(0, -"_agent".length);
+      redrawEfforts(agentStage);
+      redrawModels(agentStage);
     } else if (target.dataset.gate) {
       setGateNode(target);
     } else if (target.name === "llm_review") {

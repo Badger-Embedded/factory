@@ -1696,6 +1696,11 @@ fn project_settings(
                 .map(|&level| level.to_owned())
                 .collect(),
             default_effort: entry.default_effort().to_owned(),
+            models: entry
+                .model_suggestions()
+                .iter()
+                .map(|&model| model.to_owned())
+                .collect(),
         })
         .collect();
     Ok(ProjectSettings {

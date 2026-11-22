@@ -5193,6 +5193,80 @@ async fn the_pipeline_form_carries_each_agents_effort_levels_for_the_panel_scrip
 }
 
 #[tokio::test]
+async fn each_stage_panel_offers_its_saved_agents_models_and_cli_hint() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("claude", "codex", "copilot", "copilot", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    let panel = |stage: &str| {
+        let start = page.body.find(&format!("data-panel=\"{stage}\"")).unwrap();
+        let rest = &page.body[start..];
+        let end = rest.find("data-model-hint").unwrap();
+        let hint = rest[end..].find("</p>").unwrap();
+        rest[..end + hint].to_owned()
+    };
+    let chips = |html: &str| -> Vec<String> {
+        html.split("data-model-for=")
+            .skip(1)
+            .map(|part| {
+                part.split('>')
+                    .nth(1)
+                    .unwrap()
+                    .split('<')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+
+    let claude = panel("clarify");
+    assert_eq!(
+        chips(&claude),
+        ["CLI default", "fable", "opus", "sonnet", "haiku"]
+    );
+    assert!(claude.contains("installed claude CLI picks"));
+    assert!(claude.contains("<datalist id=\"model-suggestions-clarify\">"));
+
+    let codex = panel("spec");
+    assert_eq!(
+        chips(&codex),
+        ["CLI default", "gpt-6.1-sol", "gpt-6.1-codex"]
+    );
+    assert!(codex.contains("installed codex CLI picks"));
+
+    let copilot = panel("implement");
+    assert_eq!(
+        chips(&copilot),
+        [
+            "CLI default",
+            "claude-sonnet-5.5",
+            "claude-opus-5.5",
+            "gpt-6.2-sol",
+            "gemini-3.8-flash"
+        ],
+    );
+    assert!(copilot.contains("installed copilot CLI picks"));
+    assert!(copilot.contains("<option value=\"gemini-3.8-flash\">"));
+    for alias in ["fable", "opus", "sonnet", "haiku"] {
+        assert!(
+            !copilot.contains(&format!("value=\"{alias}\"")),
+            "a Copilot stage offers Claude's {alias}",
+        );
+    }
+    assert!(!page.body.contains("model-aliases"));
+    for agent in ["claude", "codex", "copilot"] {
+        assert!(page.body.contains(&format!("&quot;{agent}&quot;")));
+    }
+    assert!(page.body.contains("data-agent-models="));
+}
+
+#[tokio::test]
 async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("factory.db");
