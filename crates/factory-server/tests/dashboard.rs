@@ -10256,6 +10256,117 @@ async fn notifications_list_a_job_at_the_spec_gate_and_a_new_key_at_the_plan_gat
     assert_ne!(second["items"][0]["key"], item["key"]);
 }
 
+fn observe_renovate(dashboard: &Dashboard, id: i64, head: &str, ci: factory_core::RenovateCi) {
+    dashboard.apply(
+        id,
+        Event::RenovateObserved {
+            head: head.into(),
+            ci,
+            limits: factory_core::RetryLimits { auto: 0, total: 7 },
+            auto_merge: false,
+        },
+    );
+}
+
+fn passed_with_details() -> factory_core::RenovateCi {
+    factory_core::RenovateCi::Passed {
+        details: Some(Box::new(factory_core::PrDiff {
+            diff: "+serde = 1.0.2".into(),
+            body: "Bumps serde".into(),
+        })),
+    }
+}
+
+fn renovate_to_ready(dashboard: &Dashboard, id: i64, head: &str) {
+    observe_renovate(dashboard, id, head, passed_with_details());
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe: true,
+                reason: "only a version bump".into(),
+                summary: "Bumps serde".into(),
+                from: None,
+                to: None,
+            },
+        ))),
+    );
+    observe_renovate(
+        dashboard,
+        id,
+        head,
+        factory_core::RenovateCi::Passed { details: None },
+    );
+    assert!(matches!(
+        dashboard.turn(id),
+        Turn::User(Ask::Renovate {
+            state: factory_core::RenovateWait::Ready,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_ready_renovate_job_keeps_its_notification_key_between_watches() {
+    let dashboard = dashboard();
+    let id = dashboard
+        .store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    renovate_to_ready(&dashboard, id, "h1");
+    let events = dashboard.store.events(id).unwrap().len();
+    let first = notifications_as(&dashboard, USER).await["items"].clone();
+    assert_eq!(first.as_array().unwrap().len(), 1);
+    assert_eq!(first[0]["kind"], "needs-you");
+
+    for _ in 0..3 {
+        observe_renovate(
+            &dashboard,
+            id,
+            "h1",
+            factory_core::RenovateCi::Passed { details: None },
+        );
+    }
+    assert_eq!(dashboard.store.events(id).unwrap().len(), events);
+    assert_eq!(notifications_as(&dashboard, USER).await["items"], first);
+
+    renovate_to_ready(&dashboard, id, "h2");
+    let second = notifications_as(&dashboard, USER).await["items"].clone();
+    assert_eq!(second.as_array().unwrap().len(), 1);
+    assert_eq!(second[0]["kind"], "needs-you");
+    assert_ne!(second[0]["key"], first[0]["key"]);
+}
+
+#[tokio::test]
+async fn repeated_renovate_watches_of_pending_or_missing_checks_record_nothing() {
+    let dashboard = dashboard();
+    for (n, ci) in [
+        factory_core::RenovateCi::Pending,
+        factory_core::RenovateCi::NoChecks,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = dashboard
+            .store
+            .create_renovate_job(
+                "maestro",
+                10 + n as u64,
+                "Update serde",
+                "https://example/pull/7",
+            )
+            .unwrap()
+            .unwrap();
+        observe_renovate(&dashboard, id, "h1", ci.clone());
+        let events = dashboard.store.events(id).unwrap().len();
+        for _ in 0..3 {
+            observe_renovate(&dashboard, id, "h1", ci.clone());
+        }
+        assert_eq!(dashboard.store.events(id).unwrap().len(), events);
+    }
+}
+
 #[tokio::test]
 async fn notifications_go_only_to_the_requester() {
     let dashboard = dashboard();
