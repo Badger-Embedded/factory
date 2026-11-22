@@ -1088,7 +1088,9 @@ impl Store {
     }
 
     /// Applies `event` to `row`, saves the job, adds the event to its history
-    /// and counts a first arrival at `Merged` in the project totals.
+    /// and counts a first arrival at `Merged` in the project totals. An
+    /// `Event::RenovateObserved` that leaves the job unchanged does none of
+    /// these.
     fn apply_in(tx: &Transaction<'_>, row: &mut JobRow, event: Event) -> Result<(), StoreError> {
         let was_merged = *row.job.stage() == Stage::Merged;
         let name = event.name();
@@ -1101,7 +1103,6 @@ impl Store {
         let observed = matches!(event, Event::RenovateObserved { .. });
         let before = observed.then(|| row.job.clone());
         row.job.apply(event).map_err(StoreError::Rejected)?;
-        // An unchanged look at a Renovate pull request would change the job's notification key.
         if before.is_some_and(|before| before == row.job) {
             return Ok(());
         }
