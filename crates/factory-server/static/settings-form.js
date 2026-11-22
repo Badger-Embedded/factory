@@ -1,8 +1,7 @@
 // The save bar of each settings form. Once an input of a `.settings-form`
 // changes, its bar reads "Unsaved changes." and leaving the page asks first.
-// Saving that form does not ask for its own changes; submitting a different
-// form on the page does, and so does saving a form while another settings form
-// has unsaved changes, so those changes are not lost. Without this script the bar still holds
+// Saving that form does not ask; submitting a different form on the page does,
+// so its unsaved changes are not lost. Without this script the bar still holds
 // the form's submit button, so the form saves the same way.
 (function () {
   var dirty = new Set();
