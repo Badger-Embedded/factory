@@ -1103,7 +1103,7 @@ fn login_fragment(
                     (login_cancel(ui))
                 }
                 LoginView::Waiting { url, code } => {
-                    p { "Open " a href=(url) target="_blank" rel="noopener" { (url) } " and enter this code:" }
+                    p { "Open " (external_link(url, url)) " and enter this code:" }
                     p.code-prompt { code { (code) } }
                     p.meta { "Waiting for you to finish in the browser…" }
                     (login_cancel(ui))
@@ -1382,6 +1382,11 @@ fn server_usage_card(server: &str, usage: &[ServerUsage]) -> Markup {
             }
         }
     }
+}
+
+/// Every link to a site outside the factory goes through this function.
+fn external_link(href: &str, label: impl maud::Render) -> Markup {
+    html! { a href=(href) target="_blank" rel="noopener noreferrer" { (label) } }
 }
 
 fn project_mcp_href(project: &str, server: &str) -> String {
@@ -3215,7 +3220,7 @@ fn job_header(
         }
         p.meta {
             @if let Some(url) = repo_url {
-                a href=(url) { (row.project) }
+                (external_link(url, &row.project))
             } @else {
                 (row.project)
             }
@@ -3396,7 +3401,7 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
                             @if let Some(number) = pr.number {
                                 " · "
                                 @if let Some(url) = repo_url {
-                                    a href={ (url) "/pull/" (number) } target="_blank" rel="noopener noreferrer" { "#" (number) }
+                                    (external_link(&format!("{url}/pull/{number}"), html! { "#" (number) }))
                                 } @else {
                                     "#" (number)
                                 }

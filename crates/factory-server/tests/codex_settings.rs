@@ -408,7 +408,9 @@ async fn device_login_shows_the_url_and_code_then_signs_in() {
     assert_eq!(start.status, StatusCode::OK);
 
     let waiting = harness.poll_fragment("WDJB-MJHT").await;
-    assert!(waiting.contains("https://auth.openai.com/device"));
+    assert!(waiting.contains(
+        r#"<a href="https://auth.openai.com/device" target="_blank" rel="noopener noreferrer">"#
+    ));
     assert_eq!(harness.spawner.spawned().len(), 1);
 
     // The operator finished in the browser, so the container writes auth.json
