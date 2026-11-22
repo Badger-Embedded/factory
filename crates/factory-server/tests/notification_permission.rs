@@ -1,7 +1,3 @@
-//! Tests for `static/notification-permission.js`, run under node with a fake
-//! page and a fake `Notification`: the permission line and Allow button for
-//! each permission state, and the display after the Allow click resolves.
-
 use std::path::PathBuf;
 use std::process::Command;
 
