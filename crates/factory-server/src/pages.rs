@@ -1220,9 +1220,6 @@ pub fn settings_project(
     )
 }
 
-/// The "Remove project" card at the bottom of a project's page, open to any
-/// collaborator. It names what removal cancels and deletes, and takes a
-/// type-the-name confirmation, the same pattern as deleting an MCP server.
 fn remove_project_card(project: &ProjectSettings) -> Markup {
     html! {
         form.card.danger-card method="post"

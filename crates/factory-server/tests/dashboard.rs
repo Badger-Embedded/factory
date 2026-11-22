@@ -14,7 +14,7 @@ use factory_core::{
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin, GitHubRepos,
     LocalSecrets, LoginProcess, LoginSpawner, MASTER_KEY_LEN, McpChecker, McpTool, Permission,
-    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, SecretStore, Settings,
+    PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo, RepoReport, SecretStore, Settings,
     StageAgents, StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER,
     UnavailableSecrets, WorkerSlots, app,
 };
@@ -9073,7 +9073,13 @@ async fn removing_a_project_cancels_its_jobs_and_deletes_its_data() {
 async fn removing_a_project_without_its_name_changes_nothing() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
-    for form in ["confirm=", "confirm=maestr", "confirm=other", ""] {
+    for form in [
+        "confirm=",
+        "confirm=maestr",
+        "confirm=other",
+        "confirm=%20maestro%20",
+        "",
+    ] {
         let reply = dashboard
             .post("/settings/projects/maestro/remove", form)
             .await;
@@ -9168,13 +9174,13 @@ async fn onboarding_a_removed_name_again_starts_with_an_empty_board() {
 }
 
 #[tokio::test]
-async fn onboarding_is_refused_while_a_leftover_job_holds_a_slot() {
+async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
     let (dashboard, _dir, _path) = file_dashboard();
     let id = dashboard.new_job().await;
     dashboard
         .post("/settings/projects/maestro/remove", "confirm=maestro")
         .await;
-    dashboard.slots.take(id, 0);
+    dashboard.slots.begin_task(id);
 
     let reply = dashboard
         .post_as(
@@ -9188,7 +9194,7 @@ async fn onboarding_is_refused_while_a_leftover_job_holds_a_slot() {
     assert!(dashboard.store.get(id).is_ok());
     assert!(dashboard.store.project("maestro").unwrap().is_none());
 
-    dashboard.slots.free(id);
+    dashboard.slots.end_task(id);
     let reply = dashboard
         .post_as(
             "bob@example.com",
@@ -9197,4 +9203,78 @@ async fn onboarding_is_refused_while_a_leftover_job_holds_a_slot() {
         )
         .await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
+}
+
+/// A checker whose first check waits for a permit, so a test can hold one
+/// onboarding request at the checks while a second one arrives.
+struct GatedChecker {
+    calls: std::sync::atomic::AtomicUsize,
+    gate: tokio::sync::Semaphore,
+}
+
+impl RepoChecker for GatedChecker {
+    fn check<'a>(
+        &'a self,
+        _repo: &'a str,
+        _base: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                self.gate.acquire().await.unwrap().forget();
+            }
+            Ok(RepoReport {
+                errors: Vec::new(),
+                warnings: Vec::new(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn concurrent_onboarding_of_one_name_cannot_delete_the_new_projects_jobs() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project("maestro", "acme/old", "main", None, Some("alice"))
+        .unwrap();
+    let old = store.create("maestro", "alice", "Old request").unwrap();
+    store.remove_project("maestro").unwrap();
+    let checker = Arc::new(GatedChecker {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let dashboard = Arc::new(dashboard_with_github(
+        Arc::clone(&store),
+        Arc::clone(&checker) as Arc<dyn RepoChecker>,
+    ));
+    let onboard = |login: &'static str| {
+        let dashboard = Arc::clone(&dashboard);
+        tokio::spawn(async move {
+            dashboard
+                .post_as(
+                    login,
+                    "/onboard",
+                    "repo=acme%2Fnew&name=maestro&action=skip",
+                )
+                .await
+        })
+    };
+
+    let first = onboard("bob@example.com");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let second = onboard("carol@example.com");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(checker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    checker.gate.add_permits(1);
+    let first = first.await.unwrap();
+    assert_eq!(first.status, StatusCode::SEE_OTHER);
+    assert!(matches!(store.get(old), Err(StoreError::NotFound(_))));
+    let new = store
+        .create("maestro", "bob@example.com", "New request")
+        .unwrap();
+    let second = second.await.unwrap();
+    assert_eq!(second.status, StatusCode::OK);
+    assert!(second.body.contains("already exists"));
+    assert!(store.get(new).is_ok());
 }

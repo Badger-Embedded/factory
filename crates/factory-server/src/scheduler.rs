@@ -570,12 +570,14 @@ impl<E: Executor> Scheduler<E> {
                 {
                     task.handle.abort();
                     self.slots.free(row.id);
-                    unwanted.push(row.id);
+                    unwanted.push((row.id, task.handle));
                 }
             }
         }
-        for id in unwanted {
+        for (id, handle) in unwanted {
+            let _ = handle.await;
             self.executor.stop(id).await;
+            self.slots.end_task(id);
             self.store.append_factory_log(
                 id,
                 "Stopped the running step because the job no longer needs it.",
@@ -1203,9 +1205,11 @@ impl<E: Executor> Scheduler<E> {
         if kind == Kind::Worker {
             self.slots.take(job_id, unix_now());
         }
+        self.slots.begin_task(job_id);
         let handle = tokio::spawn(async move {
             work.await;
             scheduler.slots.free(job_id);
+            scheduler.slots.end_task(job_id);
             scheduler.tasks().remove(&job_id);
             scheduler.wake.notify_one();
         });

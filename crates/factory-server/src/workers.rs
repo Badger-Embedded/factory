@@ -1,7 +1,7 @@
 //! Which job holds which worker slot, shared between the scheduler, which
 //! fills and frees the slots, and the dashboard, which shows them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,8 @@ pub struct Slot {
 pub struct WorkerSlots {
     /// Slot number to job id and start time.
     slots: Mutex<BTreeMap<usize, (i64, i64)>>,
+    /// Jobs with a scheduler task that has not ended, or a stop in progress.
+    tasks: Mutex<BTreeSet<i64>>,
 }
 
 impl WorkerSlots {
@@ -46,6 +48,24 @@ impl WorkerSlots {
         self.slots().retain(|_, (id, _)| *id != job_id);
     }
 
+    /// Marks `job_id` as having a task, from the spawn until the task has ended
+    /// and any container stop has finished.
+    pub fn begin_task(&self, job_id: i64) {
+        self.tasks().insert(job_id);
+    }
+
+    /// Clears the mark [`Self::begin_task`] set.
+    pub fn end_task(&self, job_id: i64) {
+        self.tasks().remove(&job_id);
+    }
+
+    /// Whether `job_id` still has a task or a stop in progress, so its files
+    /// and rows are not safe to delete.
+    #[must_use]
+    pub fn has_task(&self, job_id: i64) -> bool {
+        self.tasks().contains(&job_id)
+    }
+
     /// The busy slots, by slot number.
     #[must_use]
     pub fn busy(&self) -> Vec<Slot> {
@@ -61,6 +81,10 @@ impl WorkerSlots {
 
     fn slots(&self) -> MutexGuard<'_, BTreeMap<usize, (i64, i64)>> {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn tasks(&self) -> MutexGuard<'_, BTreeSet<i64>> {
+        self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

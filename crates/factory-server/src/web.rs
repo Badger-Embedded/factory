@@ -58,6 +58,7 @@ struct AppState {
     checker: Arc<dyn McpChecker>,
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
+    onboarding: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -184,6 +185,7 @@ pub fn app(
             checker,
             registry,
             device_login,
+            onboarding: Arc::new(tokio::sync::Mutex::new(())),
         })
 }
 
@@ -1195,9 +1197,6 @@ async fn settings_home(
     })
 }
 
-/// A notice carried across a redirect in the query string, so the page the
-/// redirect lands on can show it. `/settings` passes it on to the project or
-/// onboarding page it redirects to.
 #[derive(Deserialize)]
 struct NoticeQuery {
     notice: Option<String>,
@@ -1411,7 +1410,6 @@ fn project_page(
 #[derive(Deserialize)]
 struct StageQuery {
     stage: Option<String>,
-    /// A notice forwarded from `/settings`, such as after a project is removed.
     notice: Option<String>,
 }
 
@@ -1754,11 +1752,6 @@ struct RemoveProjectForm {
     confirm: String,
 }
 
-/// Removes a project once a collaborator typed its name. Any other name redraws
-/// the project's page with the problem and changes nothing. On success it wakes
-/// the scheduler, so `stop()` ends the container of a job the removal cancelled,
-/// then redirects to `/settings` with a notice, since the project the user was
-/// on is gone.
 async fn remove_project(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1766,7 +1759,7 @@ async fn remove_project(
     Form(form): Form<RemoveProjectForm>,
 ) -> Result<Response, AppError> {
     visible_project(&state, &headers, &project)?;
-    if form.confirm.trim() != project {
+    if form.confirm != project {
         let problem = format!("Nothing was removed. Type {project} to remove the project.");
         return Ok(project_page(
             &state,
@@ -2424,22 +2417,12 @@ async fn submit_onboard(
     let auto_merge = form.auto_merge.is_some();
     let llm_review = form.llm_review.is_some();
 
+    let _one_onboarding_at_a_time = state.onboarding.lock().await;
     let mut report = onboard_report(&state, effective_name, repo, base).await?;
 
-    // A name whose earlier project was removed may still have job rows, which
-    // expiry has not deleted yet. Clear them, the way expiry does, before
-    // onboarding, so the new project's collaborators never see the old jobs. A
-    // leftover job still running is left alone and onboarding is refused, since
-    // deleting a job mid-run would orphan its container.
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         let leftover = state.store.job_ids_for(effective_name)?;
-        let busy: HashSet<i64> = state
-            .slots
-            .busy()
-            .into_iter()
-            .map(|slot| slot.job_id)
-            .collect();
-        if leftover.iter().any(|id| busy.contains(id)) {
+        if leftover.iter().any(|id| state.slots.has_task(*id)) {
             report.errors.push(
                 "This name's removed project still has a job finishing. Try again in a minute."
                     .to_owned(),

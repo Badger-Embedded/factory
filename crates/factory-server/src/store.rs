@@ -171,6 +171,9 @@ CREATE TABLE IF NOT EXISTS project_mcp_tool_refreshes (
     latest INTEGER NOT NULL,
     PRIMARY KEY (project, server)
 );
+CREATE TABLE IF NOT EXISTS cost_closed_jobs (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs (id)
+);
 CREATE TABLE IF NOT EXISTS project_collaborators (
     project TEXT NOT NULL,
     login TEXT NOT NULL,
@@ -629,6 +632,7 @@ impl Store {
             "pr_watermarks",
             "logs",
             "sessions",
+            "cost_closed_jobs",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
@@ -880,6 +884,17 @@ impl Store {
         usd: f64,
         estimated: bool,
     ) -> Result<(), StoreError> {
+        let closed = tx
+            .query_row(
+                "SELECT 1 FROM cost_closed_jobs WHERE job_id = ?1",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if closed {
+            return Ok(());
+        }
         let row = Self::load(tx, id)?;
         Self::record_cost(tx, id, "cost", &row.job, None, Some(usd), estimated)?;
         tx.execute(
@@ -1559,7 +1574,9 @@ impl Store {
     /// `project_collaborators`, its MCP header values in `secrets`, its
     /// `job_costs` rows, and the `cost` rows in `job_events` for its jobs. With
     /// no collaborator rows left, the project and its surviving jobs are visible
-    /// to nobody.
+    /// to nobody. A run that finishes after the removal cannot record its cost:
+    /// [`Self::add_cost`] and [`Self::add_session_cost`] skip a job of a removed
+    /// project.
     ///
     /// # Errors
     ///
@@ -1584,6 +1601,10 @@ impl Store {
             tx.execute("DELETE FROM job_costs WHERE job_id = ?1", [id])?;
             tx.execute(
                 "DELETE FROM job_events WHERE job_id = ?1 AND event = 'cost'",
+                [id],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO cost_closed_jobs (job_id) VALUES (?1)",
                 [id],
             )?;
         }
