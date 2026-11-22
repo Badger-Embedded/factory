@@ -2307,7 +2307,6 @@ struct RenovateForm {
     total_reruns: String,
 }
 
-/// Checks the two Renovate limits, returning them or the message to show.
 fn parse_renovate_limits(form: &RenovateForm) -> Result<(u32, u32), String> {
     let whole = |value: &str, name: &str| {
         value
