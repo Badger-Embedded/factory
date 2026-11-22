@@ -476,12 +476,11 @@ async fn index(
 ) -> Result<Response, AppError> {
     let login = user(&headers);
     let explicit = query.project.is_some();
-    let requested = match query.project {
-        Some(name) => Some(name),
-        None => {
-            let names = state.store.projects_for(&login)?;
-            remembered_project(&headers).filter(|name| names.contains(name))
-        }
+    let requested = if let Some(name) = query.project {
+        Some(name)
+    } else {
+        let names = state.store.projects_for(&login)?;
+        remembered_project(&headers).filter(|name| names.contains(name))
     };
     let data = load_board(&state, &login, requested)?;
     let plan_usage = usage_tile(&state);

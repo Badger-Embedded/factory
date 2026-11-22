@@ -2578,10 +2578,7 @@ async fn an_unusual_project_name_round_trips_through_the_cookie() {
     let uri = "/?project=my%20proj%3B%20%C3%A9%2Cx";
     let cookie = project_cookie(&dashboard.get(uri).await).unwrap();
     let page = dashboard.get_with_cookie(USER, "/", &cookie).await;
-    assert!(
-        page.body
-            .contains("<option selected>my proj; é,x</option>")
-    );
+    assert!(page.body.contains("<option selected>my proj; é,x</option>"));
 }
 
 const STRANGER: &str = "mallory@example.com";
