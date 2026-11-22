@@ -2432,7 +2432,6 @@ async fn the_settings_sidebar_lists_only_the_logins_own_projects() {
     assert!(!body.contains("/settings/projects/tool"));
 }
 
-/// The collaborators a project has, by login, oldest first.
 fn collaborator_logins(dashboard: &Dashboard, project: &str) -> Vec<String> {
     dashboard
         .store
@@ -2462,7 +2461,6 @@ async fn a_collaborator_adds_a_login_that_then_sees_the_board() {
             .unwrap()
     );
 
-    // The added login now sees the project's board.
     let board = dashboard.get_as("bob@example.com", "/").await;
     assert_eq!(board.status, StatusCode::OK);
     assert!(board.body.contains("maestro"));
@@ -2517,7 +2515,6 @@ async fn an_empty_or_duplicate_collaborator_is_refused() {
 #[tokio::test]
 async fn a_collaborator_removes_another_while_more_than_one_remains() {
     let dashboard = dashboard();
-    // maestro starts with "alice" (the onboarding login) and USER.
     assert!(collaborator_logins(&dashboard, "maestro").len() >= 2);
 
     let reply = dashboard
@@ -2530,7 +2527,6 @@ async fn a_collaborator_removes_another_while_more_than_one_remains() {
     assert!(reply.body.contains("Removed alice."));
     assert!(!dashboard.store.is_collaborator("maestro", "alice").unwrap());
 
-    // The removed login can no longer see the project's board.
     let hidden = dashboard.get_as("alice", "/?project=maestro").await;
     assert_eq!(hidden.status, StatusCode::NOT_FOUND);
 }
@@ -2552,7 +2548,6 @@ async fn removing_oneself_redirects_to_settings() {
 #[tokio::test]
 async fn the_last_collaborator_cannot_be_removed() {
     let dashboard = dashboard();
-    // Leave USER as the only collaborator on maestro.
     dashboard
         .store
         .remove_collaborator("maestro", "alice")
@@ -2562,12 +2557,10 @@ async fn the_last_collaborator_cannot_be_removed() {
         vec![USER.to_owned()]
     );
 
-    // With one collaborator left, the page renders no Remove control.
     let page = dashboard.get("/settings/projects/maestro").await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(!page.body.contains("/collaborators/remove"));
 
-    // A crafted POST that would remove the last one is refused.
     let reply = dashboard
         .post(
             "/settings/projects/maestro/collaborators/remove",
@@ -2602,6 +2595,27 @@ async fn a_non_collaborator_cannot_add_or_remove_collaborators() {
             .is_collaborator("maestro", "bob@example.com")
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn the_collaborator_forms_are_not_settings_forms() {
+    // settings-form.js skips the leave-the-page prompt only when a .settings-form
+    // is submitted, so the collaborator forms must not carry that class. If they
+    // did, submitting one would drop unsaved pipeline edits without asking.
+    let dashboard = dashboard();
+    let body = dashboard.get("/settings/projects/maestro").await.body;
+    for action in [
+        "/settings/projects/maestro/collaborators",
+        "/settings/projects/maestro/collaborators/remove",
+    ] {
+        let needle = format!("action=\"{action}\"");
+        let at = body
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no form posts to {action}"));
+        let open = body[..at].rfind("<form").unwrap();
+        assert!(!body[open..at].contains("settings-form"), "{action}");
+    }
+    assert!(body.contains("class=\"card settings-form pipeline-form\""));
 }
 
 #[tokio::test]

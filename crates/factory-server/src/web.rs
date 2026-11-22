@@ -1661,9 +1661,6 @@ struct CollaboratorForm {
     login: String,
 }
 
-/// Adds a typed login as a collaborator on the project. Any collaborator may
-/// add. An empty or already-listed login is refused on the project page with a
-/// message and adds nothing. The project page redraws with the new row.
 async fn add_project_collaborator(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1694,11 +1691,6 @@ async fn add_project_collaborator(
     )
 }
 
-/// Removes a collaborator from the project. Any collaborator may remove any
-/// collaborator, itself included, while more than one remains. The store
-/// refuses the last one with [`StoreError::LastCollaborator`], which this turns
-/// into a message on the project page. A login that removes itself can no
-/// longer see the project, so it is redirected to `/settings` instead.
 async fn remove_project_collaborator(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1719,6 +1711,8 @@ async fn remove_project_collaborator(
         }
         Err(err) => return Err(err.into()),
     }
+    // A login that removed itself can no longer read the project page, so it
+    // lands on /settings rather than a 404.
     if login == user(&headers) {
         return Ok(Redirect::to("/settings").into_response());
     }
