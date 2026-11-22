@@ -73,6 +73,7 @@ fn an_agent_event_names_its_result() {
         "checks-failed"
     );
     assert_eq!(Event::ReviewApproved.name(), "review-approved");
+    assert_eq!(Event::NothingToPublish.name(), "nothing-to-publish");
     assert_eq!(Event::Retry.name(), "retry");
 }
 

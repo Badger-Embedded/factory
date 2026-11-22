@@ -359,6 +359,10 @@ impl Executor for PodmanExecutor {
             return Ok(Published::AlreadyMerged(number));
         }
         let workspace = self.job_dir(request.job_id).join("work");
+        let summary = self.git.summarize_branch(&workspace, &request.base).await?;
+        if summary.commits.is_empty() {
+            return Ok(Published::Empty);
+        }
         self.git.push(&workspace, &request.branch).await?;
         self.github
             .open_pr(

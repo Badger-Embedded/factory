@@ -5301,6 +5301,39 @@ async fn each_planned_pull_request_has_its_own_group() {
 }
 
 #[tokio::test]
+async fn a_skipped_pull_request_says_so_on_the_job_page() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![
+            planned("worker: install the tool", None),
+            planned("core: use it", None),
+        ])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::NothingToPublish);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let timeline = &page.body[page.body.find("id=\"job-timeline\"").unwrap()..];
+    assert!(timeline.contains("PR 1 of 2 · skipped"), "{timeline}");
+    assert!(
+        timeline.contains("No commits to publish, so the factory skipped it"),
+        "{timeline}"
+    );
+    assert!(!timeline.contains("PR 2 of 2 · skipped"), "{timeline}");
+    assert!(
+        page.body.contains("· skipped: nothing to publish"),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
 async fn a_failed_job_marks_the_step_it_failed_in() {
     let dashboard = dashboard();
     let id = failed_out_of_rounds(&dashboard).await;

@@ -3008,6 +3008,7 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
                                     "#" (number)
                                 }
                             }
+                            @if job.is_skipped(index) { " · skipped: nothing to publish" }
                             div.summary { (pr.summary) }
                             @if let Some(notes) = &pr.notes {
                                 details.notes data-key={ "plan-notes-" (index) } {
