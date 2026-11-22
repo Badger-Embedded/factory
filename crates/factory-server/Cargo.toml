@@ -28,6 +28,8 @@ uuid = { version = "1.29.3", features = ["v4"] }
 
 [dev-dependencies]
 base64 = "0.23.1"
+boa_engine = "0.20.0"
 http-body-util = "0.1.5"
+scraper = "0.23.1"
 tokio-stream = "0.1.17"
 tower = { version = "0.5.3", features = ["util"] }

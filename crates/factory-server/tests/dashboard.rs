@@ -2432,6 +2432,341 @@ async fn the_settings_sidebar_lists_only_the_logins_own_projects() {
     assert!(!body.contains("/settings/projects/tool"));
 }
 
+fn collaborator_logins(dashboard: &Dashboard, project: &str) -> Vec<String> {
+    dashboard
+        .store
+        .collaborators(project)
+        .unwrap()
+        .into_iter()
+        .map(|collaborator| collaborator.login)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_collaborator_adds_a_login_that_then_sees_the_board() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators",
+            "login=bob@example.com",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Added bob@example.com."));
+    assert!(reply.body.contains("bob@example.com"));
+    assert!(
+        dashboard
+            .store
+            .is_collaborator("maestro", "bob@example.com")
+            .unwrap()
+    );
+
+    let board = dashboard.get_as("bob@example.com", "/").await;
+    assert_eq!(board.status, StatusCode::OK);
+    assert!(board.body.contains("maestro"));
+    assert!(
+        !board
+            .body
+            .contains("You are not a collaborator on any project.")
+    );
+}
+
+#[tokio::test]
+async fn a_typed_collaborator_login_is_trimmed() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/projects/maestro/collaborators",
+            "login=%20%20bob%40example.com%20%20",
+        )
+        .await;
+    assert!(
+        dashboard
+            .store
+            .is_collaborator("maestro", "bob@example.com")
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_empty_or_duplicate_collaborator_is_refused() {
+    let dashboard = dashboard();
+    let before = collaborator_logins(&dashboard, "maestro");
+
+    let empty = dashboard
+        .post("/settings/projects/maestro/collaborators", "login=%20%20")
+        .await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(
+        empty
+            .body
+            .contains("Type a Tailscale login to add a collaborator.")
+    );
+
+    let duplicate = dashboard
+        .post("/settings/projects/maestro/collaborators", "login=alice")
+        .await;
+    assert_eq!(duplicate.status, StatusCode::OK);
+    assert!(duplicate.body.contains("alice is already a collaborator."));
+
+    assert_eq!(collaborator_logins(&dashboard, "maestro"), before);
+}
+
+#[tokio::test]
+async fn a_collaborator_removes_another_while_more_than_one_remains() {
+    let dashboard = dashboard();
+    assert!(collaborator_logins(&dashboard, "maestro").len() >= 2);
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators/remove",
+            "login=alice",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Removed alice."));
+    assert!(!dashboard.store.is_collaborator("maestro", "alice").unwrap());
+
+    let hidden = dashboard.get_as("alice", "/?project=maestro").await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn removing_oneself_redirects_to_settings() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators/remove",
+            &format!("login={USER}"),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/settings"));
+    assert!(!dashboard.store.is_collaborator("maestro", USER).unwrap());
+}
+
+#[tokio::test]
+async fn the_last_collaborator_cannot_be_removed() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .remove_collaborator("maestro", "alice")
+        .unwrap();
+    assert_eq!(
+        collaborator_logins(&dashboard, "maestro"),
+        vec![USER.to_owned()]
+    );
+
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page.body.contains("/collaborators/remove"));
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators/remove",
+            &format!("login={USER}"),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply
+            .body
+            .contains("A project needs at least one collaborator. Remove the project instead.")
+    );
+    assert!(dashboard.store.is_collaborator("maestro", USER).unwrap());
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_add_or_remove_collaborators() {
+    let dashboard = two_projects();
+    for route in ["collaborators", "collaborators/remove"] {
+        let reply = dashboard
+            .post_as(
+                STRANGER,
+                &format!("/settings/projects/maestro/{route}"),
+                "login=bob@example.com",
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{route}");
+    }
+    assert!(
+        !dashboard
+            .store
+            .is_collaborator("maestro", "bob@example.com")
+            .unwrap()
+    );
+}
+
+const DOM_LIB: &str = r#"
+    function parseList(sel) { return sel.split(",").map(function (s) { return s.trim(); }).filter(Boolean); }
+    function parseComplex(sel) { return sel.trim().split(" ").filter(Boolean).map(function (c) { return c.split(".").filter(Boolean); }); }
+    function matchCompound(node, classes) { for (var i = 0; i < classes.length; i++) { if (node.classes.indexOf(classes[i]) < 0) return false; } return true; }
+    function matchComplex(node, compounds) {
+      if (!matchCompound(node, compounds[compounds.length - 1])) return false;
+      var anc = node.parent, i = compounds.length - 2;
+      while (i >= 0) {
+        var ok = false;
+        while (anc) { if (matchCompound(anc, compounds[i])) { anc = anc.parent; ok = true; break; } anc = anc.parent; }
+        if (!ok) return false;
+        i--;
+      }
+      return true;
+    }
+    function matchesSel(node, sel) { return parseList(sel).some(function (s) { return matchComplex(node, parseComplex(s)); }); }
+    function firstDescendant(node, sel) {
+      for (var i = 0; i < node.children.length; i++) {
+        var c = node.children[i];
+        if (matchesSel(c, sel)) return c;
+        var d = firstDescendant(c, sel);
+        if (d) return d;
+      }
+      return null;
+    }
+    var NODES = {};
+    RAW.forEach(function (r) { NODES[r.id] = { id: r.id, tag: r.tag, classes: r.classes.slice(), action: r.action, textContent: "", parent: null, children: [] }; });
+    RAW.forEach(function (r) { var n = NODES[r.id]; if (r.parent >= 0) { n.parent = NODES[r.parent]; NODES[r.parent].children.push(n); } });
+    var ALL = Object.keys(NODES).map(function (k) { return NODES[k]; });
+    ALL.forEach(function (node) {
+      node.closest = function (sel) { var n = node; while (n) { if (matchesSel(n, sel)) return n; n = n.parent; } return null; };
+      node.matches = function (sel) { return matchesSel(node, sel); };
+      node.querySelector = function (sel) { return firstDescendant(node, sel); };
+      node.classList = { add: function (c) { if (node.classes.indexOf(c) < 0) node.classes.push(c); }, contains: function (c) { return node.classes.indexOf(c) >= 0; } };
+    });
+    var docListeners = {};
+    var winListeners = {};
+    var document = {
+      addEventListener: function (type, fn) { (docListeners[type] = docListeners[type] || []).push(fn); },
+      querySelectorAll: function (sel) { return ALL.filter(function (n) { return matchesSel(n, sel); }); },
+    };
+    var window = {
+      addEventListener: function (type, fn) { (winListeners[type] = winListeners[type] || []).push(fn); },
+    };
+    function fire(listeners, type, target) {
+      var prevented = false;
+      var event = { target: target, preventDefault: function () { prevented = true; }, returnValue: null };
+      (listeners[type] || []).forEach(function (fn) { fn(event); });
+      return prevented;
+    }
+    var pipelineForm = NODES[pipelineFormId];
+    var pipelineInput = NODES[pipelineInputId];
+    var collabAddForm = NODES[collabAddFormId];
+    var collabRemoveForm = NODES[collabRemoveFormId];
+"#;
+
+#[derive(serde::Serialize)]
+struct DomNode {
+    id: i64,
+    parent: i64,
+    tag: String,
+    classes: Vec<String>,
+    action: Option<String>,
+}
+
+fn settings_form_setup(body: &str) -> String {
+    let doc = scraper::Html::parse_document(body);
+    let mut nodes: Vec<DomNode> = Vec::new();
+    let mut ids = std::collections::HashMap::new();
+    for node in doc.tree.root().descendants() {
+        let Some(el) = node.value().as_element() else {
+            continue;
+        };
+        let id = i64::try_from(nodes.len()).unwrap();
+        ids.insert(node.id(), id);
+        let parent = node
+            .parent()
+            .and_then(|p| ids.get(&p.id()).copied())
+            .unwrap_or(-1);
+        let classes = el
+            .attr("class")
+            .map(|c| c.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default();
+        nodes.push(DomNode {
+            id,
+            parent,
+            tag: el.name().to_owned(),
+            classes,
+            action: el.attr("action").map(str::to_owned),
+        });
+    }
+    let form_posting_to = |action: &str| {
+        nodes
+            .iter()
+            .find(|n| n.tag == "form" && n.action.as_deref() == Some(action))
+            .unwrap_or_else(|| panic!("no form posts to {action}"))
+            .id
+    };
+    let pipeline_form_id = nodes
+        .iter()
+        .find(|n| {
+            n.classes.iter().any(|c| c == "settings-form")
+                && n.classes.iter().any(|c| c == "pipeline-form")
+        })
+        .expect("the pipeline settings form")
+        .id;
+    let descends_from_pipeline = |mut id: i64| {
+        while let Ok(index) = usize::try_from(id) {
+            if id == pipeline_form_id {
+                return true;
+            }
+            id = nodes[index].parent;
+        }
+        false
+    };
+    let pipeline_input_id = nodes
+        .iter()
+        .find(|n| {
+            matches!(n.tag.as_str(), "input" | "select" | "textarea")
+                && descends_from_pipeline(n.id)
+        })
+        .map_or(pipeline_form_id, |n| n.id);
+    format!(
+        "var RAW = {}; var pipelineFormId = {pipeline_form_id}; var pipelineInputId = {pipeline_input_id}; var collabAddFormId = {}; var collabRemoveFormId = {};\n",
+        serde_json::to_string(&nodes).unwrap(),
+        form_posting_to("/settings/projects/maestro/collaborators"),
+        form_posting_to("/settings/projects/maestro/collaborators/remove"),
+    )
+}
+
+fn beforeunload_warns_after(setup: &str, actions: &str) -> bool {
+    let script = include_str!("../static/settings-form.js");
+    let code = format!("{setup}{DOM_LIB}{script}\n{actions}");
+    let mut context = boa_engine::Context::default();
+    context
+        .eval(boa_engine::Source::from_bytes(&code))
+        .unwrap()
+        .as_boolean()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
+    let body = dashboard().get("/settings/projects/maestro").await.body;
+    let setup = settings_form_setup(&body);
+    let dirty_then_submit = |form| {
+        format!(
+            "fire(docListeners, \"input\", pipelineInput);\
+             fire(docListeners, \"submit\", {form});\
+             fire(winListeners, \"beforeunload\", null);"
+        )
+    };
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("collabAddForm")
+    ));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("collabRemoveForm")
+    ));
+    assert!(!beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("pipelineForm")
+    ));
+    assert!(!beforeunload_warns_after(
+        &setup,
+        "fire(winListeners, \"beforeunload\", null);"
+    ));
+}
+
 #[tokio::test]
 async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
     let page = two_projects().get("/?project=tool").await;

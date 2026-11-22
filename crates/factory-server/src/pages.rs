@@ -14,7 +14,7 @@ use crate::mcp::{McpServer, McpStages, McpToolState};
 use crate::projects::Project;
 use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
-use crate::store::{CodexPrice, JobEvent, JobFile, JobRow, LogEntry, ProjectTotals};
+use crate::store::{CodexPrice, Collaborator, JobEvent, JobFile, JobRow, LogEntry, ProjectTotals};
 use crate::timeline::timeline;
 use crate::workers::Slot;
 
@@ -479,6 +479,8 @@ pub struct ProjectSettings {
     pub default_gates: Gates,
     /// One per registered server, in the registry's order.
     pub servers: Vec<ServerSettings>,
+    /// The project's collaborators, oldest first, for the Collaborators card.
+    pub collaborators: Vec<Collaborator>,
 }
 
 /// One agent the stage panel's agent control offers: its stable id, the name
@@ -1195,6 +1197,7 @@ pub fn settings_project(
     project: &ProjectSettings,
     selected: PipelinePart,
     notice: Option<&str>,
+    problem: Option<&str>,
 ) -> Markup {
     settings_page(
         user,
@@ -1207,9 +1210,47 @@ pub fn settings_project(
             p.meta { "The path a job takes. Select a stage to set its model, effort and MCP servers, or a ✋ to change that approval gate. " (RUNS_KEEP_VALUES) }
             (project_form(project, selected))
             (project_servers_card(project))
+            @if let Some(problem) = problem {
+                div.card.failed { (problem) }
+            }
+            (project_collaborators_card(project))
             script { (PreEscaped(SETTINGS_PIPELINE)) }
         },
     )
+}
+
+fn project_collaborators_card(project: &ProjectSettings) -> Markup {
+    let base = format!(
+        "/settings/projects/{}/collaborators",
+        crate::web::query_escape(&project.name)
+    );
+    let removable = project.collaborators.len() > 1;
+    html! {
+        div.card {
+            h2 { "Collaborators" }
+            p.hint { "Everyone who can see this project and its jobs. Add a collaborator by their Tailscale login. Any collaborator can add or remove others." }
+            @for collaborator in &project.collaborators {
+                div.server-row {
+                    span.server-name { (collaborator.login) }
+                    span.hint.server-url {
+                        "added by " (collaborator.added_by) " · " (crate::localtime::date_time(&collaborator.added_at))
+                    }
+                    @if removable {
+                        form method="post" action={ (base) "/remove" } {
+                            input type="hidden" name="login" value=(collaborator.login);
+                            button.danger { "Remove" }
+                        }
+                    }
+                }
+            }
+            form.row method="post" action=(base) {
+                input.grow type="text" name="login" aria-label="Tailscale login"
+                    autocomplete="off" autocapitalize="none" spellcheck="false"
+                    placeholder="name@example.com";
+                button { "Add collaborator" }
+            }
+        }
+    }
 }
 
 /// The MCP servers card on a project's page: each server with its state for
