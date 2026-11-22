@@ -606,37 +606,38 @@ fn compare_range(body: &str, upstream: &str) -> Option<(String, String)> {
 const VERSION_KEYS: [&str; 4] = ["source-tag", "source-commit", "tag", "commit"];
 
 /// The old and new upstream version a pull request diff changes in the
-/// manifest files, read from a removed and an added line of the same
-/// version key. `None` when no such change exists or when the changes name
-/// more than one pair of versions.
+/// manifest files. Each version key must have exactly one removed and one
+/// added line, and only one key may change. `None` otherwise, so a diff that
+/// does not say which old value became which new one gives no range.
 fn manifest_range(diff: &str, manifest_files: &[String]) -> Option<(String, String)> {
     let mut in_manifest = false;
     let mut removed: Vec<(String, String)> = Vec::new();
-    let mut found: Vec<(String, String)> = Vec::new();
+    let mut added: Vec<(String, String)> = Vec::new();
     for line in diff.lines() {
         if let Some(header) = line.strip_prefix("diff --git ") {
             in_manifest = manifest_files
                 .iter()
                 .any(|path| header.ends_with(&format!(" b/{path}")));
-            removed.clear();
         } else if !in_manifest || line.starts_with("---") || line.starts_with("+++") {
         } else if let Some(old) = line.strip_prefix('-') {
             removed.extend(version_field(old));
         } else if let Some(new) = line.strip_prefix('+') {
-            if let Some((key, to)) = version_field(new)
-                && let Some((_, from)) = removed.iter().find(|(k, v)| *k == key && *v != to)
-            {
-                found.push((from.clone(), to));
-            }
-        } else {
-            removed.clear();
+            added.extend(version_field(new));
         }
     }
-    found.dedup();
-    match found.as_slice() {
-        [only] => Some(only.clone()),
-        _ => None,
+    let mut found = None;
+    for key in VERSION_KEYS {
+        let from: Vec<_> = removed.iter().filter(|(k, _)| k == key).collect();
+        let to: Vec<_> = added.iter().filter(|(k, _)| k == key).collect();
+        match (from.as_slice(), to.as_slice()) {
+            ([], []) => {}
+            ([(_, from)], [(_, to)]) if from != to && found.is_none() => {
+                found = Some((from.clone(), to.clone()));
+            }
+            _ => return None,
+        }
     }
+    found
 }
 
 fn version_field(line: &str) -> Option<(String, String)> {
