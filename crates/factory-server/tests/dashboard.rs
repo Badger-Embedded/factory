@@ -313,6 +313,17 @@ impl Dashboard {
         .await
     }
 
+    async fn get_with_cookie(&self, login: &str, uri: &str, cookie: &str) -> Reply {
+        self.send(
+            Request::get(uri)
+                .header(USER_HEADER, login)
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
     /// Every settings page joined into one body: the factory pages, the MCP
     /// servers page, each server's page and each project's page.
     async fn settings_pages(&self) -> String {
@@ -2436,7 +2447,139 @@ async fn an_unknown_project_in_the_index_is_not_found() {
     assert_eq!(page.status, StatusCode::NOT_FOUND);
 }
 
-/// A login that collaborates on none of the test's projects.
+fn project_cookie(reply: &Reply) -> Option<String> {
+    reply
+        .headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .find(|value| value.starts_with("factory_project="))
+        .map(|value| value.split(';').next().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn selecting_a_project_sets_the_cookie() {
+    let dashboard = two_projects();
+    let page = dashboard.get("/?project=tool").await;
+    assert_eq!(page.status, StatusCode::OK);
+    let cookie = page.header(header::SET_COOKIE).unwrap();
+    for part in [
+        "factory_project=tool",
+        "Path=/",
+        "SameSite=Lax",
+        "HttpOnly",
+        "Max-Age=",
+    ] {
+        assert!(cookie.contains(part), "{cookie}");
+    }
+    assert!(!cookie.contains("Secure"));
+}
+
+#[tokio::test]
+async fn the_cookie_picks_the_project_after_a_visit_elsewhere() {
+    let dashboard = two_projects();
+    dashboard.new_job().await;
+    dashboard.post_job("tool", "Tool change", &[]).await;
+    let cookie = project_cookie(&dashboard.get("/?project=tool").await).unwrap();
+    let settings = dashboard
+        .get_with_cookie(USER, "/settings/workers", &cookie)
+        .await;
+    assert_eq!(settings.status, StatusCode::OK);
+    assert!(project_cookie(&settings).is_none());
+
+    let page = dashboard.get_with_cookie(USER, "/", &cookie).await;
+    assert!(page.body.contains("<option selected>tool</option>"));
+    assert!(page.body.contains("Tool change"));
+    assert!(project_cookie(&page).is_none());
+}
+
+#[tokio::test]
+async fn an_explicit_project_beats_the_cookie() {
+    let dashboard = two_projects();
+    let page = dashboard
+        .get_with_cookie(USER, "/?project=maestro", "factory_project=tool")
+        .await;
+    assert!(page.body.contains("<option selected>maestro</option>"));
+    assert_eq!(
+        project_cookie(&page).as_deref(),
+        Some("factory_project=maestro")
+    );
+}
+
+#[tokio::test]
+async fn a_stale_or_foreign_cookie_falls_back_to_the_first_project() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .create_project("secret", "o/secret", "main", None, Some("bob@example.com"))
+        .unwrap();
+    for cookie in [
+        "factory_project=nope",
+        "factory_project=secret",
+        "factory_project=%ZZ",
+        "factory_project=%FF",
+        "other=1; factory_project=",
+    ] {
+        let page = dashboard.get_with_cookie(USER, "/", cookie).await;
+        assert_eq!(page.status, StatusCode::OK, "{cookie}");
+        assert!(
+            page.body.contains("<option selected>maestro</option>"),
+            "{cookie}"
+        );
+        assert!(project_cookie(&page).is_none());
+    }
+    let page = dashboard
+        .get_with_cookie(STRANGER, "/", "factory_project=maestro")
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body
+            .contains("You are not a collaborator on any project.")
+    );
+}
+
+#[tokio::test]
+async fn a_missing_project_sets_no_cookie() {
+    let dashboard = two_projects();
+    let page = dashboard.get("/?project=nope").await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+    assert!(page.header(header::SET_COOKIE).is_none());
+    let page = dashboard.get_as(STRANGER, "/?project=maestro").await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+    assert!(page.header(header::SET_COOKIE).is_none());
+}
+
+#[tokio::test]
+async fn the_fragments_set_no_cookie() {
+    let dashboard = two_projects();
+    for uri in [
+        "/fragments/board?project=maestro",
+        "/fragments/stats?project=maestro",
+        "/fragments/workers?project=maestro",
+        "/fragments/plan-usage?project=maestro",
+    ] {
+        let page = dashboard.get(uri).await;
+        assert!(page.header(header::SET_COOKIE).is_none(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn an_unusual_project_name_round_trips_through_the_cookie() {
+    let name = "my proj; é,x";
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .unwrap();
+    store
+        .create_project(name, "o/odd", "main", None, Some("alice"))
+        .unwrap();
+    let dashboard = dashboard_with(store);
+    let uri = "/?project=my%20proj%3B%20%C3%A9%2Cx";
+    let cookie = project_cookie(&dashboard.get(uri).await).unwrap();
+    let page = dashboard.get_with_cookie(USER, "/", &cookie).await;
+    assert!(page.body.contains("<option selected>my proj; é,x</option>"));
+}
+
 const STRANGER: &str = "mallory@example.com";
 
 #[tokio::test]
