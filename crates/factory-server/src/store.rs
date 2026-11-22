@@ -1098,7 +1098,13 @@ impl Store {
             | Event::Agent(AgentResult::RerunCi { reason }) => Some(reason.clone()),
             _ => None,
         };
+        let observed = matches!(event, Event::RenovateObserved { .. });
+        let before = observed.then(|| row.job.clone());
         row.job.apply(event).map_err(StoreError::Rejected)?;
+        // An unchanged look at a Renovate pull request would change the job's notification key.
+        if before.is_some_and(|before| before == row.job) {
+            return Ok(());
+        }
         Self::record(tx, row.id, name, &row.job, detail.as_deref(), None)?;
         tx.execute(
             "UPDATE jobs SET job = ?1 WHERE id = ?2",
