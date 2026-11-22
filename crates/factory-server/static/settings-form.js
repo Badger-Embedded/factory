@@ -1,9 +1,8 @@
 // The save bar of each settings form. Once an input of a `.settings-form`
 // changes, its bar reads "Unsaved changes." and leaving the page asks first.
-// Saving a `.settings-form` does not ask, but submitting another form on the
-// page, such as the collaborator add or remove button, still asks while a
-// `.settings-form` holds unsaved changes. Without this script the bar still
-// holds the form's submit button, so the form saves the same way.
+// Saving that form does not ask; submitting a different form on the page does,
+// so its unsaved changes are not lost. Without this script the bar still holds
+// the form's submit button, so the form saves the same way.
 (function () {
   var dirty = new Set();
   var submitting = false;
@@ -37,9 +36,6 @@
     },
     true,
   );
-  // Only saving a settings form skips the leave-the-page prompt. Submitting
-  // another form, such as a collaborator action, still prompts when a settings
-  // form on the page has unsaved changes, so those changes are not lost unasked.
   document.addEventListener("submit", function (event) {
     if (event.target.closest && event.target.closest(".settings-form")) {
       submitting = true;

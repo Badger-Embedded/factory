@@ -1711,8 +1711,6 @@ async fn remove_project_collaborator(
         }
         Err(err) => return Err(err.into()),
     }
-    // A login that removed itself can no longer read the project page, so it
-    // lands on /settings rather than a 404.
     if login == user(&headers) {
         return Ok(Redirect::to("/settings").into_response());
     }

@@ -2597,25 +2597,85 @@ async fn a_non_collaborator_cannot_add_or_remove_collaborators() {
     );
 }
 
-#[tokio::test]
-async fn the_collaborator_forms_are_not_settings_forms() {
-    // settings-form.js skips the leave-the-page prompt only when a .settings-form
-    // is submitted, so the collaborator forms must not carry that class. If they
-    // did, submitting one would drop unsaved pipeline edits without asking.
-    let dashboard = dashboard();
-    let body = dashboard.get("/settings/projects/maestro").await.body;
-    for action in [
-        "/settings/projects/maestro/collaborators",
-        "/settings/projects/maestro/collaborators/remove",
-    ] {
-        let needle = format!("action=\"{action}\"");
-        let at = body
-            .find(&needle)
-            .unwrap_or_else(|| panic!("no form posts to {action}"));
-        let open = body[..at].rfind("<form").unwrap();
-        assert!(!body[open..at].contains("settings-form"), "{action}");
-    }
-    assert!(body.contains("class=\"card settings-form pipeline-form\""));
+/// Runs `settings-form.js` over a minimal DOM, dispatches `actions`, and returns
+/// whether a following `beforeunload` would warn, meaning it called
+/// `preventDefault`. The DOM holds one dirty-able `.settings-form` pipeline form
+/// and two plain collaborator forms, matching the project settings page.
+fn beforeunload_warns_after(actions: &str) -> bool {
+    const HARNESS: &str = r#"
+        var docListeners = {};
+        var winListeners = {};
+        var document = {
+          addEventListener: function (type, fn) { (docListeners[type] = docListeners[type] || []).push(fn); },
+          querySelectorAll: function () { return []; },
+        };
+        var window = {
+          addEventListener: function (type, fn) { (winListeners[type] = winListeners[type] || []).push(fn); },
+        };
+        function el(classes, parent, bar) {
+          var e = { _classes: classes, parentNode: parent || null };
+          e.closest = function (sel) {
+            var cls = sel.slice(1);
+            var n = e;
+            while (n) { if (n._classes && n._classes.indexOf(cls) >= 0) return n; n = n.parentNode; }
+            return null;
+          };
+          e.matches = function () { return false; };
+          e.querySelector = function (sel) { return sel === ".save-bar" ? (bar || null) : null; };
+          return e;
+        }
+        function makeBar() {
+          var note = { textContent: "" };
+          var classes = ["save-bar"];
+          return {
+            classList: { add: function (c) { classes.push(c); }, contains: function (c) { return classes.indexOf(c) >= 0; } },
+            querySelector: function (sel) { return sel === ".save-bar-note" ? note : null; },
+          };
+        }
+        function fire(listeners, type, target) {
+          var prevented = false;
+          var event = { target: target, preventDefault: function () { prevented = true; }, returnValue: null };
+          (listeners[type] || []).forEach(function (fn) { fn(event); });
+          return prevented;
+        }
+        var pipelineForm = el(["card", "settings-form", "pipeline-form"], null, makeBar());
+        var pipelineInput = el(["pipeline-input"], pipelineForm);
+        var collabAddForm = el(["row"], null);
+        var collabRemoveForm = el([], null);
+    "#;
+    let script = include_str!("../static/settings-form.js");
+    let code = format!("{HARNESS}\n{script}\n{actions}");
+    let mut context = boa_engine::Context::default();
+    context
+        .eval(boa_engine::Source::from_bytes(&code))
+        .unwrap()
+        .as_boolean()
+        .unwrap()
+}
+
+#[test]
+fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
+    let dirty_then_submit = |form| {
+        format!(
+            "fire(docListeners, \"input\", pipelineInput);\
+             fire(docListeners, \"submit\", {form});\
+             fire(winListeners, \"beforeunload\", null);"
+        )
+    };
+    assert!(beforeunload_warns_after(&dirty_then_submit(
+        "collabAddForm"
+    )));
+    assert!(beforeunload_warns_after(&dirty_then_submit(
+        "collabRemoveForm"
+    )));
+    // Saving the pipeline form itself leaves without a warning.
+    assert!(!beforeunload_warns_after(&dirty_then_submit(
+        "pipelineForm"
+    )));
+    // With nothing dirty there is no warning.
+    assert!(!beforeunload_warns_after(
+        "fire(winListeners, \"beforeunload\", null);"
+    ));
 }
 
 #[tokio::test]

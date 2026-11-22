@@ -1219,10 +1219,6 @@ pub fn settings_project(
     )
 }
 
-/// The Collaborators card on a project's page: each collaborator with who added
-/// it and when, a field to add one, and a Remove button on each row. The Remove
-/// button is left off when one collaborator is left, since a project keeps at
-/// least one.
 fn project_collaborators_card(project: &ProjectSettings) -> Markup {
     let base = format!(
         "/settings/projects/{}/collaborators",
