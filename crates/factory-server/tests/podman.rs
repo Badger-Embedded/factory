@@ -213,3 +213,43 @@ async fn a_copilot_run_with_no_login_fails_before_any_container() {
         .await;
     assert_ne!(reason(second), "no Copilot login is set");
 }
+
+#[tokio::test]
+async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_moved() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let gh = dir.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/bash\necho \"$@\" >> '{}'\necho '{{\"headRefOid\":\"unchecked2\"}}'\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let secrets: Arc<dyn SecretStore> = Arc::new(LocalSecrets::new(
+        &[7; MASTER_KEY_LEN],
+        Arc::new(Store::open_in_memory().unwrap()),
+    ));
+    let mut podman = executor(
+        registry(&secrets),
+        dir.path().to_owned(),
+        Arc::new(Store::open_in_memory().unwrap()),
+    );
+    podman.github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+
+    podman.merge_renovate("o/r", 5, "checked1").await.unwrap();
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+    assert!(calls.contains("commit_id=checked1"), "{calls}");
+    assert!(calls.contains("--match-head-commit checked1"), "{calls}");
+    assert!(!calls.contains("unchecked2"), "{calls}");
+}

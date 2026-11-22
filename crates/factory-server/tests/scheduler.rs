@@ -4517,7 +4517,6 @@ async fn a_merge_refused_for_a_moved_head_watches_the_new_head() {
     .await;
     assert_eq!(*executor.merged.lock().unwrap(), [(7, "h2".to_owned())]);
     assert_eq!(executor.requests().len(), 2, "each head gets its own check");
-    // The push landed after the watch of h1, so only h1 was approved then.
     assert_eq!(
         *executor.approved.lock().unwrap(),
         [(7, "h1".to_owned()), (7, "h2".to_owned())]
