@@ -9177,7 +9177,9 @@ async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
     dashboard
         .post("/settings/projects/maestro/remove", "confirm=maestro")
         .await;
-    let mark = dashboard.slots.begin_task(id);
+    dashboard
+        .slots
+        .register_task(id, false, |_| tokio::spawn(std::future::pending()));
 
     let reply = dashboard
         .post_as(
@@ -9191,7 +9193,8 @@ async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
     assert!(dashboard.store.get(id).is_ok());
     assert!(dashboard.store.project("maestro").unwrap().is_none());
 
-    dashboard.slots.end_task(id, mark);
+    dashboard.slots.begin_stop(id).unwrap();
+    dashboard.slots.end_stop(id);
     let reply = dashboard
         .post_as(
             "bob@example.com",

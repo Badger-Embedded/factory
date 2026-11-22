@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +45,7 @@ struct FakeExecutor {
     stopped: Mutex<Vec<i64>>,
     stop_gate: Semaphore,
     watch_gate: Semaphore,
+    watches_started: AtomicUsize,
     checks: Mutex<VecDeque<Result<Event, String>>>,
     checks_run: Mutex<Vec<ChecksRequest>>,
     summarized: Mutex<Vec<SummaryRequest>>,
@@ -68,6 +70,7 @@ impl FakeExecutor {
             stopped: Mutex::new(Vec::new()),
             stop_gate: Semaphore::new(Semaphore::MAX_PERMITS),
             watch_gate: Semaphore::new(Semaphore::MAX_PERMITS),
+            watches_started: AtomicUsize::new(0),
             checks: Mutex::new(VecDeque::new()),
             checks_run: Mutex::new(Vec::new()),
             summarized: Mutex::new(Vec::new()),
@@ -182,6 +185,7 @@ impl Executor for FakeExecutor {
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
+        self.watches_started.fetch_add(1, Ordering::SeqCst);
         self.watch_gate.acquire().await.unwrap().forget();
         tokio::task::yield_now().await;
         self.watched.lock().unwrap().push(request);
@@ -732,17 +736,57 @@ async fn a_pass_that_read_a_job_before_its_removal_does_not_start_it() {
     assert_eq!(store.get(queued).unwrap().job.stage(), &Stage::Cancelled);
 }
 
-#[test]
-fn an_earlier_task_cannot_clear_the_mark_of_its_replacement() {
+#[tokio::test]
+async fn an_earlier_task_cannot_remove_the_entry_of_its_replacement() {
     let slots = WorkerSlots::new();
-    let earlier = slots.begin_task(7);
-    let replacement = slots.begin_task(7);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        slots.register_task(7, false, |id| {
+            ids.push(id);
+            tokio::spawn(std::future::pending())
+        });
+    }
 
-    slots.end_task(7, earlier);
+    slots.finish_task(7, ids[0]);
     assert!(slots.has_task(7));
 
-    slots.end_task(7, replacement);
+    slots.finish_task(7, ids[1]);
     assert!(!slots.has_task(7));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_task_keeps_its_entry_while_the_previous_task_finishes() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let slots = scheduler.slots();
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    executor.hold_watches();
+    let ticking = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move {
+            loop {
+                scheduler.tick().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    for round in 1..=500 {
+        while executor.watches_started.load(Ordering::SeqCst) < round {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            slots.has_task(id) && scheduler.running() == [id],
+            "round {round}: the running task lost its entry"
+        );
+        executor.watch_gate.add_permits(1);
+    }
+    ticking.abort();
 }
 
 #[tokio::test]

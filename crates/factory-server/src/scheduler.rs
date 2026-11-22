@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use factory_core::{
@@ -11,7 +11,6 @@ use factory_core::{
 };
 use factory_runner::{Expect, LogLine, McpConfig, Observation, Rerun, RunReport, job_prompt};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::cost::{codex_cost, format_cost};
@@ -22,7 +21,7 @@ use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
 use crate::store::{JobRow, Store, StoreError};
 use crate::warnings::McpWarnings;
-use crate::workers::{TaskMark, WorkerSlots, unix_now};
+use crate::workers::{WorkerSlots, unix_now};
 
 /// How often the loop looks at the jobs when nothing wakes it.
 const POLL: Duration = Duration::from_secs(5);
@@ -364,12 +363,6 @@ enum Kind {
     Factory,
 }
 
-struct Task {
-    kind: Kind,
-    handle: JoinHandle<()>,
-    mark: TaskMark,
-}
-
 /// Starts queued jobs and carries out each job's next command, with at
 /// most [`Settings::max_workers`] workers at a time.
 ///
@@ -381,7 +374,6 @@ pub struct Scheduler<E> {
     executor: Arc<E>,
     wake: Arc<Notify>,
     data_dir: PathBuf,
-    tasks: Mutex<HashMap<i64, Task>>,
     /// Jobs whose factory step waits until the given time: the next look at
     /// a pull request, or a retry after a failed step.
     not_before: Mutex<HashMap<i64, Instant>>,
@@ -404,7 +396,6 @@ impl<E: Executor> Scheduler<E> {
             executor,
             wake,
             data_dir,
-            tasks: Mutex::new(HashMap::new()),
             not_before: Mutex::new(HashMap::new()),
             slots: Arc::new(WorkerSlots::new()),
             mcp,
@@ -434,14 +425,7 @@ impl<E: Executor> Scheduler<E> {
     /// The jobs with a step in progress.
     #[must_use]
     pub fn running(&self) -> Vec<i64> {
-        let mut ids: Vec<i64> = self
-            .tasks()
-            .iter()
-            .filter(|(_, task)| !task.handle.is_finished())
-            .map(|(id, _)| *id)
-            .collect();
-        ids.sort_unstable();
-        ids
+        self.slots.running()
     }
 
     /// One pass over the jobs, oldest first.
@@ -459,7 +443,7 @@ impl<E: Executor> Scheduler<E> {
         self.clean_merged(&rows)?;
 
         for row in rows {
-            if self.tasks().contains_key(&row.id) {
+            if self.slots.has_task(row.id) {
                 continue;
             }
             let mut job = row.job.clone();
@@ -550,7 +534,7 @@ impl<E: Executor> Scheduler<E> {
     /// on, the way [`Self::purge_expired`] does, so the next pass tries again.
     fn clean_merged(&self, rows: &[JobRow]) -> Result<(), StoreError> {
         for row in rows {
-            if *row.job.stage() != Stage::Merged || self.tasks().contains_key(&row.id) {
+            if *row.job.stage() != Stage::Merged || self.slots.has_task(row.id) {
                 continue;
             }
             match self.store.clean_merged_job(row.id, &self.data_dir) {
@@ -567,23 +551,19 @@ impl<E: Executor> Scheduler<E> {
 
     async fn stop_unwanted(&self, rows: &[JobRow]) -> Result<(), StoreError> {
         let mut unwanted = Vec::new();
-        {
-            let mut tasks = self.tasks();
-            tasks.retain(|_, task| !task.handle.is_finished());
-            for row in rows {
-                if row.job.next_command().is_none()
-                    && let Some(task) = tasks.remove(&row.id)
-                {
-                    task.handle.abort();
-                    self.slots.free(row.id);
-                    unwanted.push((row.id, task.handle, task.mark));
-                }
+        self.slots.prune_tasks();
+        for row in rows {
+            if row.job.next_command().is_none()
+                && let Some(handle) = self.slots.begin_stop(row.id)
+            {
+                self.slots.free(row.id);
+                unwanted.push((row.id, handle));
             }
         }
-        for (id, handle, mark) in unwanted {
+        for (id, handle) in unwanted {
             let _ = handle.await;
             self.executor.stop(id).await;
-            self.slots.end_task(id, mark);
+            self.slots.end_stop(id);
             self.store.append_factory_log(
                 id,
                 "Stopped the running step because the job no longer needs it.",
@@ -593,11 +573,7 @@ impl<E: Executor> Scheduler<E> {
     }
 
     fn workers_free(&self, settings: &Settings) -> bool {
-        let busy = self
-            .tasks()
-            .values()
-            .filter(|task| task.kind == Kind::Worker && !task.handle.is_finished())
-            .count();
+        let busy = self.slots.workers_running();
         busy < settings.max_workers
     }
 
@@ -1207,26 +1183,17 @@ impl<E: Executor> Scheduler<E> {
         work: impl Future<Output = ()> + Send + 'static,
     ) {
         let scheduler = Arc::clone(self);
-        let mut tasks = self.tasks();
-        if kind == Kind::Worker {
+        let worker = kind == Kind::Worker;
+        if worker {
             self.slots.take(job_id, unix_now());
         }
-        let mark = self.slots.begin_task(job_id);
-        let handle = tokio::spawn(async move {
-            work.await;
-            scheduler.slots.free(job_id);
-            let mut tasks = scheduler.tasks();
-            if tasks.get(&job_id).is_some_and(|task| task.mark == mark) {
-                tasks.remove(&job_id);
-            }
-            scheduler.slots.end_task(job_id, mark);
-            drop(tasks);
-            scheduler.wake.notify_one();
+        self.slots.register_task(job_id, worker, |id| {
+            tokio::spawn(async move {
+                work.await;
+                scheduler.slots.free(job_id);
+                scheduler.slots.finish_task(job_id, id);
+                scheduler.wake.notify_one();
+            })
         });
-        tasks.insert(job_id, Task { kind, handle, mark });
-    }
-
-    fn tasks(&self) -> MutexGuard<'_, HashMap<i64, Task>> {
-        self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
