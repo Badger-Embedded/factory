@@ -97,8 +97,6 @@ fn codex_device_login(
     ))
 }
 
-/// The Copilot device login, which runs `copilot login --device-code` the same
-/// way, with its own scratch directory under the data directory.
 fn copilot_device_login(
     secrets: &Arc<dyn SecretStore>,
     network: Option<String>,

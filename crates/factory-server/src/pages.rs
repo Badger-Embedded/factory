@@ -947,14 +947,9 @@ pub fn codex_login_fragment(
     login_fragment(&CODEX_LOGIN, login, secrets_available)
 }
 
-/// What differs between agents in the login area: the URL prefix its forms use,
-/// and the button text.
 struct LoginUi {
-    /// The settings URL of the agent's page, which prefixes the login routes.
     base: &'static str,
-    /// The element id the polling swap targets.
     id: &'static str,
-    /// The text of the sign-in button.
     button: &'static str,
 }
 
@@ -1027,7 +1022,6 @@ fn login_cancel(ui: &LoginUi) -> Markup {
     }
 }
 
-/// The Copilot login area, polled the same way as Codex's.
 pub fn copilot_login_fragment(
     login: &crate::device_login::LoginView,
     secrets_available: bool,
@@ -1035,9 +1029,6 @@ pub fn copilot_login_fragment(
     login_fragment(&COPILOT_LOGIN, login, secrets_available)
 }
 
-/// The Copilot account page: whether a token is stored, the device login, and a
-/// write-only field for a pasted token. The token never reaches the page. There
-/// is no price table, since a Copilot run adds no cost.
 pub fn settings_copilot(
     user: &str,
     nav: &SettingsNav,
@@ -1083,9 +1074,6 @@ pub fn settings_copilot(
     )
 }
 
-/// The paste card, the fallback when device login fails. The field carries no
-/// value, so a stored token is never in the page source. An empty save keeps
-/// the stored token and Clear removes it.
 fn copilot_token_card(stored: bool, secrets_available: bool) -> Markup {
     html! {
         form.card.settings-form method="post" action="/settings/agents/copilot/token" {

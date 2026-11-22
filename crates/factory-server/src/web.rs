@@ -194,7 +194,6 @@ pub fn app(
         })
 }
 
-/// The Copilot settings page and its login and token routes.
 fn copilot_routes() -> Router<AppState> {
     Router::new()
         .route("/settings/agents/copilot", get(show_copilot))
@@ -1337,8 +1336,6 @@ async fn codex_page(
     ))
 }
 
-/// The Copilot account page: whether a token is stored and the state of a
-/// device login. The token never reaches the page.
 async fn copilot_page(
     state: &AppState,
     headers: &HeaderMap,
@@ -2303,15 +2300,12 @@ async fn start_codex_login(
     codex_page(&state, &headers, None).await
 }
 
-/// The login area the page polls for the URL, the code, success or a failure
-/// reason.
 async fn codex_login_fragment(State(state): State<AppState>) -> Markup {
     let login = state.device_login.snapshot().await;
     pages::codex_login_fragment(&login, state.secrets.available())
 }
 
 /// Cancels a running device login, which removes its container, then redraws
-/// the page.
 async fn cancel_codex_login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2333,10 +2327,6 @@ struct CopilotTokenForm {
     token: String,
 }
 
-/// Replaces the stored Copilot token with the pasted one. An empty field keeps
-/// the stored token. A token the Copilot CLI would refuse is refused with a
-/// message that never echoes the input, and stores nothing. The next Copilot
-/// run reads the token afresh, so a save applies with no restart.
 async fn save_copilot_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2354,8 +2344,6 @@ async fn save_copilot_token(
     }
 }
 
-/// Clears the stored Copilot token. Clearing works even when the master key is
-/// missing, so a token stranded by a lost key can still be removed.
 async fn clear_copilot_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2364,8 +2352,6 @@ async fn clear_copilot_token(
     copilot_page(&state, &headers, Some("Cleared.")).await
 }
 
-/// Starts the Copilot device login, or leaves a running one alone, then redraws
-/// the page with the login area polling for the URL and code.
 async fn start_copilot_login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2375,15 +2361,17 @@ async fn start_copilot_login(
     copilot_page(&state, &headers, None).await
 }
 
-/// The login area the page polls for the URL, the code, success or a failure
-/// reason.
-async fn copilot_login_fragment(State(state): State<AppState>) -> Markup {
+async fn copilot_login_fragment(State(state): State<AppState>) -> Response {
     let login = state.copilot_login.snapshot().await;
-    pages::copilot_login_fragment(&login, state.secrets.available())
+    let fragment = pages::copilot_login_fragment(&login, state.secrets.available());
+    if login == crate::device_login::LoginView::SignedIn {
+        // The stored-token status elsewhere on the page is out of date once the
+        // login succeeds, so htmx reloads the whole page.
+        return ([("HX-Refresh", "true")], fragment).into_response();
+    }
+    fragment.into_response()
 }
 
-/// Cancels a running Copilot login, which removes its container, then redraws
-/// the page.
 async fn cancel_copilot_login(
     State(state): State<AppState>,
     headers: HeaderMap,

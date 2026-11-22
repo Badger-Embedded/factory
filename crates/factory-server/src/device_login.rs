@@ -84,8 +84,6 @@ impl LoginSpec {
 }
 
 impl LoginSpec {
-    /// `copilot login --device-code`, which writes its token into `config.json`
-    /// once `settings.json` allows plaintext storage.
     pub const COPILOT: LoginSpec = LoginSpec {
         container_name: "factory-copilot-login",
         scratch_prefix: "copilot-login-",
@@ -111,9 +109,6 @@ fn copilot_prepare(home: &Path) -> std::io::Result<()> {
     )
 }
 
-/// The token Copilot wrote under `authTokens` in `config.json`. Each entry holds
-/// the same token for one host and account, so the first one with a token is
-/// enough.
 fn copilot_read_back(home: &Path) -> Option<String> {
     let config = std::fs::read_to_string(home.join("config.json")).ok()?;
     let config: serde_json::Value = serde_json::from_str(&config).ok()?;

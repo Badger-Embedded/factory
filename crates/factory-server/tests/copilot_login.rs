@@ -46,6 +46,35 @@ async fn the_url_and_code_show_without_color_codes_then_the_token_is_stored() {
 }
 
 #[tokio::test]
+async fn signing_in_reloads_the_page_so_the_stored_status_updates() {
+    let harness = harness();
+    harness.spawner.set(Script {
+        lines: prompt(),
+        outcome: Outcome::Success(config_json(TOKEN)),
+    });
+    assert!(
+        harness
+            .get("/settings/agents/copilot")
+            .await
+            .body
+            .contains("No token is stored.")
+    );
+
+    harness.post("/settings/agents/copilot/login", "").await;
+    let waiting = harness.get("/settings/agents/copilot/login/fragment").await;
+    assert!(waiting.headers.get("hx-refresh").is_none());
+
+    harness.spawner.finish();
+    harness.poll_fragment("Signed in").await;
+    let done = harness.get("/settings/agents/copilot/login/fragment").await;
+    assert_eq!(done.headers.get("hx-refresh").unwrap(), "true");
+
+    let page = harness.get("/settings/agents/copilot").await;
+    assert!(page.body.contains("A token is stored."));
+    assert!(!page.body.contains("No token is stored."));
+}
+
+#[tokio::test]
 async fn the_login_home_is_under_the_data_directory_and_deleted_at_the_end() {
     let harness = harness();
     harness.spawner.set(Script {

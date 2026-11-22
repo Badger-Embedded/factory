@@ -255,16 +255,19 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
 pub struct Reply {
     pub status: StatusCode,
     pub body: String,
+    pub headers: axum::http::HeaderMap,
 }
 
 impl Harness {
     pub async fn send(&self, request: Request<Body>) -> Reply {
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         Reply {
             status,
             body: String::from_utf8_lossy(&bytes).into_owned(),
+            headers,
         }
     }
 
