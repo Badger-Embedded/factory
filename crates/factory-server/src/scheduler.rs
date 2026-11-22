@@ -58,7 +58,7 @@ fn stage_name(expect: Expect) -> &'static str {
         Expect::Spec => "spec",
         Expect::Plan => "plan",
         Expect::Commits | Expect::FixCi => "implement",
-        Expect::Review => "review",
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => "review",
     }
 }
 
