@@ -78,21 +78,27 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     env,
     cwd: dir,
     stdio: ['ignore', 'ignore', 'inherit'],
+    detached: true,
   });
+  // Registered at spawn, so an exit before cleanup is not missed.
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  // The server leads its own process group, so one kill also reaches a fake login
+  // that no test cancelled, including one that starts as the server stops.
+  const cleanup = async () => {
+    try {
+      process.kill(-child.pid!, 'SIGKILL');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    }
+    await exited;
+    fs.rmSync(dir, { recursive: true, force: true });
+  };
   const url = `http://127.0.0.1:${port}`;
   try {
     await waitForServer(`${url}/`, child);
   } catch (error) {
-    child.kill();
-    fs.rmSync(dir, { recursive: true, force: true });
+    await cleanup();
     throw error;
   }
-  return {
-    factory: { url, db, fixture },
-    async stop() {
-      child.kill();
-      await new Promise((resolve) => child.once('exit', resolve));
-      fs.rmSync(dir, { recursive: true, force: true });
-    },
-  };
+  return { factory: { url, db, fixture }, stop: cleanup };
 }
