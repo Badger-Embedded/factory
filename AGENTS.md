@@ -7,3 +7,5 @@ A service on `moon.local` that turns feature requests from a dashboard into pull
 Before you write a commit message, PR description, doc or code comment, load the `unslop` skill and follow it.
 
 A link on a factory page to a site outside the factory opens in a new tab with `target="_blank" rel="noopener noreferrer"`. Render it with `external_link` in `crates/factory-server/src/pages.rs`. Links to factory paths stay in the same tab.
+
+A change to a page's behaviour in the browser, or to a file in `crates/factory-server/static/`, adds or updates a Playwright test in `e2e/tests/`. `nix develop -c just e2e` runs them.

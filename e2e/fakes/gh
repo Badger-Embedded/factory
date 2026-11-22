@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stands in for the GitHub CLI. The browser tests never reach GitHub.
+echo "fake gh: no response is set up for: $*" >&2
+exit 1
