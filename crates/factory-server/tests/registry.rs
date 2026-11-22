@@ -1,6 +1,7 @@
 //! Tests for the agent registry: the Claude and Codex entries each carry their
 //! credential, worker image, config directory, settings page and stage-panel
-//! suggestions.
+//! suggestions. The Copilot entry is available but has no backend or login
+//! wired, so its run gates on the credential.
 
 use std::sync::Arc;
 
@@ -33,10 +34,35 @@ fn registry_with_token(token: Option<&str>) -> AgentRegistry {
 }
 
 #[test]
-fn the_registry_lists_claude_and_codex_in_order() {
+fn the_registry_lists_the_agents_in_order() {
     let registry = registry_with_token(None);
     let ids: Vec<&str> = registry.entries().map(|entry| entry.id()).collect();
-    assert_eq!(ids, ["claude", "codex"]);
+    assert_eq!(ids, ["claude", "codex", "copilot"]);
+}
+
+#[test]
+fn the_copilot_entry_is_available_and_gates_on_its_credential() {
+    let registry = registry_with_token(None);
+    let copilot = registry.entry(Agent::Copilot);
+
+    assert_eq!(copilot.display_name(), "Copilot");
+    assert!(copilot.available());
+    assert_eq!(copilot.efforts(), ["low", "medium", "high", "xhigh", "max"]);
+    assert_eq!(copilot.default_effort(), "medium");
+
+    assert_eq!(copilot.settings_url(), None);
+    assert_eq!(copilot.host_config_dir(), None);
+    assert_eq!(copilot.model_suggestions(), [] as [&str; 0]);
+    let settings = Settings {
+        worker_image: "localhost/factory-worker:latest".into(),
+        ..Settings::default()
+    };
+    assert_eq!(copilot.image(&settings), None);
+
+    assert_eq!(
+        copilot.credential(),
+        Err("no Copilot login is set".to_owned())
+    );
 }
 
 #[test]

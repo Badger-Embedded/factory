@@ -175,13 +175,15 @@ pub struct RunResult {
     pub cost_usd: Option<f64>,
 }
 
-/// The backend for `agent`. Both agents now have one: [`ClaudeAgent`] and
-/// [`CodexAgent`]. It returns [`Option`] so a future agent registered before
-/// its backend lands can report `None`.
+/// The backend for `agent`. Claude and Codex have one: [`ClaudeAgent`] and
+/// [`CodexAgent`]. It returns [`Option`] so an agent registered before its
+/// backend lands can report `None`. Copilot is such an agent today: its backend
+/// lands in a later change, so it reports `None`.
 #[must_use]
 pub fn backend(agent: Agent) -> Option<&'static dyn AgentBackend> {
     match agent {
         Agent::Claude => Some(&ClaudeAgent),
         Agent::Codex => Some(&CodexAgent),
+        Agent::Copilot => None,
     }
 }

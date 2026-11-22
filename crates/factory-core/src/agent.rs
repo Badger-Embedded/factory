@@ -1,9 +1,11 @@
 //! The agents a stage can run on.
 //!
-//! The factory runs every stage with an agent. Claude Code and Codex both run.
+//! The factory runs every stage with an agent. Claude Code and Codex run.
+//! Copilot can be selected for a stage, but it has no backend or stored login,
+//! so a Copilot run fails before it starts.
 //! Each agent has a stable id that the server stores per stage, a display name
-//! for the dashboard, and a flag for whether it can run. A stage with no saved
-//! agent runs on [`DEFAULT_AGENT`].
+//! for the dashboard, and a flag for whether a stage can select it. A stage
+//! with no saved agent runs on [`DEFAULT_AGENT`].
 //!
 //! Each agent carries its own effort levels and default, because the CLIs do not
 //! agree: Claude's `--effort` takes `low` through `max`, and Codex's
@@ -20,6 +22,8 @@ pub enum Agent {
     Claude,
     /// Codex, run with the `codex exec` CLI in a worker.
     Codex,
+    /// GitHub Copilot, run with the `copilot` CLI in a worker.
+    Copilot,
 }
 
 /// The agent a stage runs on when a project saves none.
@@ -34,9 +38,13 @@ const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 /// lands.
 const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 
+/// The effort levels the Copilot agent accepts for `--effort`, lowest first.
+/// From the pinned Copilot CLI, which lists the same levels as Claude.
+const COPILOT_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
 impl Agent {
     /// Every agent, in the order the dashboard lists them.
-    pub const ALL: [Agent; 2] = [Agent::Claude, Agent::Codex];
+    pub const ALL: [Agent; 3] = [Agent::Claude, Agent::Codex, Agent::Copilot];
 
     /// The stable id the server stores and parses. It never changes, because a
     /// rename would orphan every stored stage and session that names it.
@@ -45,6 +53,7 @@ impl Agent {
         match self {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
+            Agent::Copilot => "copilot",
         }
     }
 
@@ -54,44 +63,51 @@ impl Agent {
         match self {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",
+            Agent::Copilot => "Copilot",
         }
     }
 
-    /// Whether the agent can run a stage. Both agents run now.
+    /// Whether a stage can select the agent. Claude and Codex also have a
+    /// backend and a credential, so a run on them executes. A Copilot run has
+    /// neither, so Copilot is selectable but a run on it fails before it starts.
     #[must_use]
     #[allow(clippy::match_same_arms)]
     pub fn available(self) -> bool {
         match self {
             Agent::Claude => true,
             Agent::Codex => true,
+            Agent::Copilot => true,
         }
     }
 
     /// The file a target repository keeps its instructions in for this agent.
-    /// Claude reads `CLAUDE.md`; Codex reads `AGENTS.md`. A prompt that tells
-    /// the agent to follow the repository's rules names this file, so each
-    /// agent is pointed at the one it actually reads.
+    /// Claude reads `CLAUDE.md`; Codex and Copilot read `AGENTS.md`, the shared
+    /// standard. A prompt that tells the agent to follow the repository's rules
+    /// names this file, so each agent is pointed at one it reads. Copilot reads
+    /// both `AGENTS.md` and `CLAUDE.md`, and the prompt names `AGENTS.md`.
     #[must_use]
     pub fn rules_doc(self) -> &'static str {
         match self {
             Agent::Claude => "CLAUDE.md",
-            Agent::Codex => "AGENTS.md",
+            Agent::Codex | Agent::Copilot => "AGENTS.md",
         }
     }
 
     /// The effort levels this agent accepts, lowest first. Claude's are the
     /// levels the `claude` CLI takes for `--effort`; Codex's are the levels the
-    /// Codex CLI takes for `model_reasoning_effort`.
+    /// Codex CLI takes for `model_reasoning_effort`; Copilot's are the levels the
+    /// `copilot` CLI takes for `--effort`.
     #[must_use]
     pub fn efforts(self) -> &'static [&'static str] {
         match self {
             Agent::Claude => &CLAUDE_EFFORTS,
             Agent::Codex => &CODEX_EFFORTS,
+            Agent::Copilot => &COPILOT_EFFORTS,
         }
     }
 
-    /// The effort level a stage runs at when a project saves none. Both agents
-    /// default to `medium` today; the level still belongs to the agent so a
+    /// The effort level a stage runs at when a project saves none. Every agent
+    /// defaults to `medium` today; the level still belongs to the agent so a
     /// future agent can differ, which is why the arms are kept apart.
     #[must_use]
     #[allow(clippy::match_same_arms)]
@@ -99,6 +115,7 @@ impl Agent {
         match self {
             Agent::Claude => "medium",
             Agent::Codex => "medium",
+            Agent::Copilot => "medium",
         }
     }
 
