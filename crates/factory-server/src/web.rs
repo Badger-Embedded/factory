@@ -187,6 +187,32 @@ fn user(headers: &HeaderMap) -> String {
         .to_owned()
 }
 
+/// The project named in a route when the request's login is one of its
+/// collaborators. A project that does not exist, and one the login is not a
+/// collaborator on, both return [`AppError::UnknownProject`], so a project a
+/// login may not see is indistinguishable from one that is not there.
+fn visible_project(state: &AppState, headers: &HeaderMap, name: &str) -> Result<Project, AppError> {
+    let login = user(headers);
+    match state.projects.lookup(name)? {
+        Some(project) if state.store.is_collaborator(name, &login)? => Ok(project),
+        _ => Err(AppError::UnknownProject(name.to_owned())),
+    }
+}
+
+/// The job with `id` when the request's login is a collaborator on the job's
+/// project. An unknown job, and a job in a project the login may not see, both
+/// return [`StoreError::NotFound`], so a job a login may not see looks exactly
+/// like one that is not there.
+fn visible_job(state: &AppState, headers: &HeaderMap, id: i64) -> Result<JobRow, AppError> {
+    let login = user(headers);
+    let row = state.store.get(id)?;
+    if state.store.is_collaborator(&row.project, &login)? {
+        Ok(row)
+    } else {
+        Err(AppError::from(StoreError::NotFound(id)))
+    }
+}
+
 enum AppError {
     BadRequest(String),
     NotFound(String),
@@ -312,11 +338,15 @@ impl BoardData {
     }
 }
 
-fn load_board(state: &AppState, project: Option<String>) -> Result<BoardData, AppError> {
-    let names = state.projects.names()?;
+fn load_board(
+    state: &AppState,
+    login: &str,
+    project: Option<String>,
+) -> Result<BoardData, AppError> {
+    let names = state.store.projects_for(login)?;
     let selected = match project {
         Some(name) if !names.iter().any(|known| known == &name) => {
-            return Err(AppError::BadRequest(format!("unknown project {name:?}")));
+            return Err(AppError::UnknownProject(name));
         }
         Some(name) => Some(name),
         None => names.first().cloned(),
@@ -353,10 +383,11 @@ async fn index(
     headers: HeaderMap,
     Query(query): Query<IndexQuery>,
 ) -> Result<Markup, AppError> {
-    let data = load_board(&state, query.project)?;
+    let login = user(&headers);
+    let data = load_board(&state, &login, query.project)?;
     let plan_usage = usage_tile(&state);
     Ok(pages::index(
-        &user(&headers),
+        &login,
         &data.names,
         data.selected.as_deref(),
         &data.jobs,
@@ -372,10 +403,20 @@ async fn index(
 /// poll whose version still matches gets a 204, so the tile does not redraw.
 async fn plan_usage_fragment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<IndexQuery>,
-) -> Response {
+) -> Result<Response, AppError> {
+    let names = state.store.projects_for(&user(&headers))?;
+    if let Some(project) = &query.project
+        && !names.iter().any(|known| known == project)
+    {
+        return Err(AppError::UnknownProject(project.clone()));
+    }
+    if names.is_empty() {
+        return Ok(html! {}.into_response());
+    }
     let region = pages::plan_usage(usage_tile(&state).as_ref());
-    region_response(query.v.as_deref(), region)
+    Ok(region_response(query.v.as_deref(), region))
 }
 
 /// The plan usage tile, or `None` before any run has reported usage.
@@ -391,10 +432,11 @@ fn usage_tile(state: &AppState) -> Option<pages::UsageTile> {
 
 async fn stats_fragment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
     let version = query.v.clone();
-    let data = load_board(&state, query.project)?;
+    let data = load_board(&state, &user(&headers), query.project)?;
     let Some(project) = data.selected.as_deref() else {
         return Ok(html! {}.into_response());
     };
@@ -406,25 +448,27 @@ async fn stats_fragment(
 
 async fn workers_fragment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
     let version = query.v.clone();
-    let data = load_board(&state, query.project)?;
+    let data = load_board(&state, &user(&headers), query.project)?;
     let Some(project) = data.selected.as_deref() else {
         return Ok(html! {}.into_response());
     };
     Ok(region_response(
         version.as_deref(),
-        pages::workers(&data.workers, &data.jobs, project),
+        pages::workers(&data.workers, &data.jobs, &data.names, project),
     ))
 }
 
 async fn board_fragment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
     let version = query.v.clone();
-    let data = load_board(&state, query.project)?;
+    let data = load_board(&state, &user(&headers), query.project)?;
     let Some(project) = data.selected.as_deref() else {
         return Ok(html! {}.into_response());
     };
@@ -597,9 +641,7 @@ async fn create_job(
         }
     }
     let project = project.unwrap_or_default();
-    if state.projects.lookup(&project)?.is_none() {
-        return Err(AppError::BadRequest(format!("unknown project {project:?}")));
-    }
+    visible_project(&state, &headers, &project)?;
     let request = request.unwrap_or_default();
     let request = request.trim();
     if request.is_empty() {
@@ -723,6 +765,7 @@ async fn show_job(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Markup, AppError> {
+    visible_job(&state, &headers, id)?;
     let data = load_job(&state, id)?;
     let images = state.store.images(id)?;
     let files = state.store.files(id)?;
@@ -747,8 +790,10 @@ async fn show_job(
 /// swaps each region into the open page out of band.
 async fn job_fragment(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Markup, AppError> {
+    visible_job(&state, &headers, id)?;
     let data = load_job(&state, id)?;
     Ok(pages::job_fragment(
         &data.row,
@@ -767,9 +812,11 @@ async fn job_fragment(
 /// stored one, so a request cannot reach any other file.
 async fn show_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((id, name)): Path<(i64, String)>,
 ) -> Result<Response, AppError> {
     let not_found = || AppError::from(StoreError::NotFound(id));
+    visible_job(&state, &headers, id)?;
     let content_type = match name.rsplit_once('.').map(|(_, ext)| ext) {
         Some("png") => "image/png",
         Some("jpg") => "image/jpeg",
@@ -804,9 +851,11 @@ async fn show_image(
 /// never enters the header unencoded.
 async fn show_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((id, name)): Path<(i64, String)>,
 ) -> Result<Response, AppError> {
     let not_found = || AppError::from(StoreError::NotFound(id));
+    visible_job(&state, &headers, id)?;
     let content_type = match name.rsplit_once('.').map(|(_, ext)| ext) {
         Some("txt") => "text/plain; charset=utf-8",
         Some("zip") => "application/zip",
@@ -850,7 +899,7 @@ async fn show_edit(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Response, AppError> {
-    let row = state.store.get(id)?;
+    let row = visible_job(&state, &headers, id)?;
     if *row.job.stage() != Stage::Requested {
         return Ok(job_redirect(id).into_response());
     }
@@ -866,9 +915,11 @@ async fn show_edit(
 /// A job that already started gets a 409 from the store and nothing changes.
 async fn save_edit(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     mut form: Multipart,
 ) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
     let mut request = None;
     let mut removes: Vec<String> = Vec::new();
     let mut attachments = Vec::new();
@@ -1005,9 +1056,11 @@ fn file_ext(name: &str) -> Result<&'static str, AppError> {
 
 async fn answer(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
     let answers = (0..)
         .map_while(|i| form.get(&format!("answer_{i}")))
         .map(|answer| answer.trim().to_owned())
@@ -1023,18 +1076,22 @@ struct ApproveForm {
 
 async fn approve(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<ApproveForm>,
 ) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
     let redirect = apply(&state, id, Event::Approve)?;
     board_redirect(&state, form.project, redirect)
 }
 
 async fn retry(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<ApproveForm>,
 ) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
     let redirect = apply(&state, id, Event::Retry)?;
     state
         .store
@@ -1044,9 +1101,11 @@ async fn retry(
 
 async fn dismiss(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<ApproveForm>,
 ) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
     let redirect = apply(&state, id, Event::Dismiss)?;
     state
         .store
@@ -1091,9 +1150,11 @@ struct Feedback {
 
 async fn request_changes(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<Feedback>,
 ) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
     let feedback = form.feedback.trim();
     if feedback.is_empty() {
         return Err(AppError::BadRequest("the feedback is empty".into()));
@@ -1107,19 +1168,22 @@ async fn request_changes(
     )
 }
 
-/// `/settings` opens the first project's page, or Workers when no project is
-/// onboarded.
-async fn settings_home(State(state): State<AppState>) -> Result<Redirect, AppError> {
-    let names = state.projects.names()?;
+/// `/settings` opens the first project the login collaborates on, or onboarding
+/// when the login has none.
+async fn settings_home(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Redirect, AppError> {
+    let names = state.store.projects_for(&user(&headers))?;
     Ok(match names.first() {
         Some(name) => Redirect::to(&format!("/settings/projects/{}", query_escape(name))),
-        None => Redirect::to("/settings/workers"),
+        None => Redirect::to("/onboard"),
     })
 }
 
-fn settings_nav(state: &AppState) -> Result<pages::SettingsNav, StoreError> {
+fn settings_nav(state: &AppState, login: &str) -> Result<pages::SettingsNav, StoreError> {
     Ok(pages::SettingsNav {
-        projects: state.projects.names()?,
+        projects: state.store.projects_for(login)?,
         servers: state
             .store
             .mcp_servers()?
@@ -1146,7 +1210,7 @@ fn workers_page(
 ) -> Result<Markup, AppError> {
     Ok(pages::settings_workers(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         &state.store.settings()?,
         notice,
     ))
@@ -1159,7 +1223,7 @@ fn gates_page(
 ) -> Result<Markup, AppError> {
     Ok(pages::settings_gates(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         &state.store.settings()?,
         notice,
     ))
@@ -1172,7 +1236,7 @@ fn github_page(
 ) -> Result<Markup, AppError> {
     Ok(pages::settings_github(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         &state.store.settings()?,
         notice,
     ))
@@ -1190,7 +1254,7 @@ fn claude_page(
         state.secrets.available() && state.secrets.claude_token().ok().flatten().is_some();
     Ok(pages::settings_claude(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         claude_token_set,
         state.secrets.available(),
         notice,
@@ -1218,7 +1282,7 @@ async fn codex_page(
     let prices = state.store.codex_prices()?;
     Ok(pages::settings_codex(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         &account,
         &login,
         &prices,
@@ -1246,7 +1310,7 @@ fn mcp_page(
 ) -> Result<Markup, AppError> {
     Ok(pages::settings_mcp(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         &state.store.mcp_servers()?,
         state.secrets.available(),
         notice,
@@ -1275,8 +1339,8 @@ fn mcp_server_page_with(
         return Err(AppError::NotFound(format!("no MCP server named {name:?}")));
     };
     let usage = state
-        .projects
-        .names()?
+        .store
+        .projects_for(&user(headers))?
         .into_iter()
         .map(|project| {
             let settings = server_settings(state, &project, server.clone())?;
@@ -1290,7 +1354,7 @@ fn mcp_server_page_with(
         .collect::<Result<Vec<_>, StoreError>>()?;
     Ok(pages::settings_mcp_server(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         &pages::ServerPage {
             server: &server,
             usage: &usage,
@@ -1308,12 +1372,10 @@ fn project_page(
     selected: pages::PipelinePart,
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
-    let Some(project) = state.projects.lookup(name)? else {
-        return Err(AppError::UnknownProject(name.to_owned()));
-    };
+    let project = visible_project(state, headers, name)?;
     Ok(pages::settings_project(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         &project_settings(state, name, &project)?,
         selected,
         notice,
@@ -1539,9 +1601,7 @@ async fn save_project_models(
     Query(query): Query<StageQuery>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
-    if state.projects.lookup(&name)?.is_none() {
-        return Err(AppError::UnknownProject(name));
-    }
+    visible_project(&state, &headers, &name)?;
     let form = ProjectForm(pairs.into_iter().collect());
     let models = StageModels {
         clarify: form.model("clarify"),
@@ -1615,15 +1675,15 @@ fn server_settings(
     })
 }
 
-/// The project and server named in a project's MCP route, or a 404.
+/// The project and server named in a project's MCP route, or a 404. A project
+/// the login may not see reads as unknown, so its MCP pages 404 like any other.
 fn project_and_server(
     state: &AppState,
+    headers: &HeaderMap,
     project: &str,
     server: &str,
 ) -> Result<McpServer, AppError> {
-    if state.projects.lookup(project)?.is_none() {
-        return Err(AppError::UnknownProject(project.to_owned()));
-    }
+    visible_project(state, headers, project)?;
     state
         .store
         .mcp_server(server)?
@@ -1637,10 +1697,10 @@ fn project_mcp_page(
     server: &str,
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
-    let registered = project_and_server(state, project, server)?;
+    let registered = project_and_server(state, headers, project, server)?;
     Ok(pages::settings_project_mcp(
         &user(headers),
-        &settings_nav(state)?,
+        &settings_nav(state, &user(headers))?,
         project,
         &server_settings(state, project, registered)?,
         state.secrets.available(),
@@ -1666,7 +1726,7 @@ async fn save_project_mcp(
     Path((project, server)): Path<(String, String)>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
-    let registered = project_and_server(&state, &project, &server)?;
+    let registered = project_and_server(&state, &headers, &project, &server)?;
     let form = ProjectForm(pairs.into_iter().collect());
     let base = format!("mcp.{}", registered.name);
     let settings = McpProjectSettings {
@@ -1795,10 +1855,17 @@ async fn edit_mcp_server(
     // An edit that deletes stored values waits for the operator to confirm it.
     let deletes = state.store.mcp_edit_deletes(&name, url, &form.headers)?;
     if !deletes.is_empty() && !form.confirm {
+        let total = deletes.len();
+        let visible = state.store.projects_for(&user(&headers))?;
+        let shown = deletes
+            .into_iter()
+            .filter(|(project, _)| visible.iter().any(|name| name == project))
+            .collect();
         let pending = pages::PendingEdit {
             url: url.to_owned(),
             headers: form.headers,
-            deletes,
+            deletes: shown,
+            total,
         };
         return mcp_server_page_with(&state, &headers, &name, None, Some(&pending), None);
     }
@@ -1838,11 +1905,10 @@ async fn delete_mcp_server(
 /// stored.
 async fn check_mcp_server(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project, server)): Path<(String, String)>,
 ) -> Result<Markup, AppError> {
-    if state.projects.lookup(&project)?.is_none() {
-        return Err(AppError::UnknownProject(project));
-    }
+    visible_project(&state, &headers, &project)?;
     let Some(registered) = state.store.mcp_server(&server)? else {
         return Err(AppError::NotFound(format!(
             "no MCP server named {server:?}"
@@ -2322,7 +2388,12 @@ async fn onboard_report(
     Ok(report)
 }
 
-async fn cancel(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Redirect, AppError> {
+async fn cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
     apply(&state, id, Event::Cancel)
 }
 

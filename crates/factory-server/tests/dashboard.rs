@@ -173,6 +173,12 @@ const WEBP: &[u8] = b"RIFF\x04\0\0\0WEBPVP8 ";
 const ZIP: &[u8] = b"PK\x03\x04 a zip archive";
 const TEXT: &[u8] = b"a log line\n";
 
+/// The Tailscale login every dashboard request carries unless a test sends its
+/// own. [`dashboard_with_secrets`] seeds it as a collaborator on every project
+/// in the store, so the access checks let these requests through; a test that
+/// needs a non-collaborator sends a different login.
+const USER: &str = "alice@example.com";
+
 fn dashboard() -> Dashboard {
     dashboard_for("Badger-Embedded/maestro")
 }
@@ -206,6 +212,9 @@ fn dashboard_with_secrets(
     github: Arc<dyn RepoChecker>,
     secrets: Arc<dyn SecretStore>,
 ) -> Dashboard {
+    for (name, _) in store.list_projects().unwrap() {
+        store.add_collaborator(&name, USER, "test").unwrap();
+    }
     let projects = Arc::new(Projects::from_store(Arc::clone(&store)));
     let data = tempfile::tempdir().unwrap();
     let usage = Arc::new(PlanUsageCache::new());
@@ -267,8 +276,19 @@ impl Dashboard {
     }
 
     async fn get(&self, uri: &str) -> Reply {
-        self.send(Request::get(uri).body(Body::empty()).unwrap())
-            .await
+        self.get_as(USER, uri).await
+    }
+
+    /// A GET sent as `login`, for the access checks that read the collaborator
+    /// set; the plain `get` sends [`USER`].
+    async fn get_as(&self, login: &str, uri: &str) -> Reply {
+        self.send(
+            Request::get(uri)
+                .header(USER_HEADER, login)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
     }
 
     /// Every settings page joined into one body: the factory pages, the MCP
@@ -304,10 +324,16 @@ impl Dashboard {
     }
 
     async fn post(&self, uri: &str, form: &str) -> Reply {
+        self.post_as(USER, uri, form).await
+    }
+
+    /// A form POST sent as `login`, for the access checks that read the
+    /// collaborator set; the plain `post` sends [`USER`].
+    async fn post_as(&self, login: &str, uri: &str, form: &str) -> Reply {
         self.send(
             Request::post(uri)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .header(USER_HEADER, "alice@example.com")
+                .header(USER_HEADER, login)
                 .body(Body::from(form.to_owned()))
                 .unwrap(),
         )
@@ -315,6 +341,16 @@ impl Dashboard {
     }
 
     async fn post_job(&self, project: &str, request: &str, images: &[(&str, &[u8])]) -> Reply {
+        self.post_job_as(USER, project, request, images).await
+    }
+
+    async fn post_job_as(
+        &self,
+        login: &str,
+        project: &str,
+        request: &str,
+        images: &[(&str, &[u8])],
+    ) -> Reply {
         let mut body = Vec::new();
         let mut part = |disposition: String, content: &[u8]| {
             body.extend_from_slice(format!("--{BOUNDARY}\r\n{disposition}\r\n\r\n").as_bytes());
@@ -344,7 +380,7 @@ impl Dashboard {
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={BOUNDARY}"),
                 )
-                .header(USER_HEADER, "alice@example.com")
+                .header(USER_HEADER, login)
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -392,7 +428,7 @@ impl Dashboard {
                     header::CONTENT_TYPE,
                     format!("multipart/form-data; boundary={BOUNDARY}"),
                 )
-                .header(USER_HEADER, "alice@example.com")
+                .header(USER_HEADER, USER)
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -443,6 +479,10 @@ async fn a_request_becomes_a_job_owned_by_the_tailscale_user() {
 #[tokio::test]
 async fn without_the_tailscale_header_the_user_is_local() {
     let dashboard = dashboard();
+    dashboard
+        .store
+        .add_collaborator("maestro", "local", "test")
+        .unwrap();
     let reply = dashboard
         .send(
             Request::post("/jobs")
@@ -464,7 +504,7 @@ async fn without_the_tailscale_header_the_user_is_local() {
 async fn bad_requests_create_no_job() {
     let dashboard = dashboard();
     let unknown = dashboard.post_job("nope", "x", &[]).await;
-    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
     let empty = dashboard.post_job("maestro", "  ", &[]).await;
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     assert_eq!(dashboard.store.list().unwrap().len(), 0);
@@ -1290,7 +1330,7 @@ async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
 
     // Onboard one while the dashboard runs, as the wizard will.
     store
-        .create_project("widgets", "acme/widgets", "main", None, Some("alice"))
+        .create_project("widgets", "acme/widgets", "main", None, Some(USER))
         .unwrap();
 
     // It shows on the board selector, the settings page and the new-job form
@@ -2264,9 +2304,132 @@ async fn the_board_shows_only_the_selected_project() {
 }
 
 #[tokio::test]
-async fn an_unknown_project_in_the_index_is_a_bad_request() {
+async fn an_unknown_project_in_the_index_is_not_found() {
     let page = dashboard().get("/?project=nope").await;
-    assert_eq!(page.status, StatusCode::BAD_REQUEST);
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+}
+
+/// A login that collaborates on none of the test's projects.
+const STRANGER: &str = "mallory@example.com";
+
+#[tokio::test]
+async fn a_non_collaborators_board_is_the_empty_state() {
+    let page = two_projects().get_as(STRANGER, "/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body
+            .contains("You are not a collaborator on any project.")
+    );
+    assert!(!page.body.contains("<select id=\"project\""));
+    assert!(!page.body.contains("<option"));
+    assert!(!page.body.contains("maestro"));
+    assert!(page.body.contains("href=\"/onboard\""));
+}
+
+#[tokio::test]
+async fn a_hidden_project_board_and_fragments_are_not_found() {
+    let dashboard = two_projects();
+    for uri in [
+        "/?project=maestro",
+        "/fragments/board?project=maestro",
+        "/fragments/stats?project=maestro",
+        "/fragments/workers?project=maestro",
+    ] {
+        assert_eq!(
+            dashboard.get_as(STRANGER, uri).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let hidden = dashboard.get_as(STRANGER, "/?project=maestro").await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    assert!(hidden.body.contains("no project maestro"));
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_see_or_act_on_a_job() {
+    let dashboard = two_projects();
+    let id = dashboard.new_job().await;
+
+    for uri in [
+        format!("/jobs/{id}"),
+        format!("/jobs/{id}/fragment"),
+        format!("/jobs/{id}/edit"),
+        format!("/jobs/{id}/images/image-1.png"),
+    ] {
+        let reply = dashboard.get_as(STRANGER, &uri).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(reply.body.contains(&format!("no job {id}")), "{uri}");
+    }
+
+    for route in ["cancel", "approve", "retry", "dismiss"] {
+        let reply = dashboard
+            .post_as(STRANGER, &format!("/jobs/{id}/{route}"), "")
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{route}");
+    }
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Requested
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_post_a_job_to_a_project() {
+    let dashboard = two_projects();
+    let reply = dashboard
+        .post_job_as(STRANGER, "maestro", "A change the stranger wants", &[])
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_hidden_projects_settings_pages_are_not_found() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    for uri in [
+        "/settings/projects/maestro",
+        "/settings/projects/maestro/mcp/context7",
+    ] {
+        assert_eq!(
+            dashboard.get_as(STRANGER, uri).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        dashboard
+            .post_as(STRANGER, "/settings/projects/maestro", "clarify=opus")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        dashboard
+            .post_as(
+                STRANGER,
+                "/settings/projects/maestro/mcp/context7/check",
+                ""
+            )
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(dashboard.checker.calls(), 0);
+}
+
+#[tokio::test]
+async fn the_settings_sidebar_lists_only_the_logins_own_projects() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .create_project("stray", "o/stray", "main", None, Some(STRANGER))
+        .unwrap();
+    let body = dashboard.get_as(STRANGER, "/settings/workers").await.body;
+    assert!(body.contains("/settings/projects/stray"));
+    assert!(!body.contains("/settings/projects/maestro"));
+    assert!(!body.contains("/settings/projects/tool"));
 }
 
 #[tokio::test]
@@ -6127,6 +6290,33 @@ async fn a_tile_for_another_projects_job_names_that_project() {
     assert!(worker_tiles(&maestro).contains("#1 tool · requested"));
 }
 
+const MAESTRO_ONLY: &str = "carol@example.com";
+
+#[tokio::test]
+async fn a_busy_tile_hides_a_job_in_a_project_the_viewer_cannot_see() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .add_collaborator("maestro", MAESTRO_ONLY, "test")
+        .unwrap();
+    let reply = dashboard.post_job("tool", "Secret tool change", &[]).await;
+    let id = job_id(&reply);
+    dashboard.apply(id, Event::Start);
+    dashboard.slots.take(id, now() - 5 * 60);
+
+    for uri in ["/?project=maestro", "/fragments/workers?project=maestro"] {
+        let body = dashboard.get_as(MAESTRO_ONLY, uri).await.body;
+        let tiles = worker_tiles(&body);
+        assert_eq!(tiles.matches("class=\"worker busy\"").count(), 1, "{uri}");
+        assert!(tiles.contains("5 min"), "{uri}");
+        assert!(!tiles.contains(&format!("/jobs/{id}")), "{uri}");
+        assert!(!tiles.contains(&format!("#{id}")), "{uri}");
+        assert!(!tiles.contains("tool"), "{uri}");
+        assert!(!tiles.contains("Secret tool change"), "{uri}");
+        assert!(!tiles.contains("clarifying"), "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn the_workers_fragment_is_only_the_tiles_and_keeps_polling() {
     let dashboard = dashboard();
@@ -6230,6 +6420,35 @@ async fn the_plan_usage_fragment_appears_once_a_run_reports() {
     assert!(reported.contains("<section class=\"plan-usage\">"));
     assert!(reported.contains("Claude plan usage"));
     assert!(reported.contains("Fable"));
+}
+
+#[tokio::test]
+async fn the_plan_usage_fragment_404s_for_a_project_the_login_cannot_see() {
+    let dashboard = two_projects();
+    dashboard.usage.record(usage(USAGE_WITH_FABLE), REPORTED_AT);
+
+    assert_eq!(
+        dashboard
+            .get_as(STRANGER, "/fragments/plan-usage?project=maestro")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let none = dashboard.get_as(STRANGER, "/fragments/plan-usage").await;
+    assert_eq!(none.status, StatusCode::OK);
+    assert!(!none.body.contains("plan-usage"));
+
+    dashboard
+        .store
+        .add_collaborator("tool", STRANGER, "test")
+        .unwrap();
+    assert_eq!(
+        dashboard
+            .get_as(STRANGER, "/fragments/plan-usage?project=maestro")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 /// The version a region's markup carries in its poll URL. The `&` renders as
@@ -7659,7 +7878,7 @@ async fn the_check_route_404s_for_an_unknown_project_or_server() {
 }
 
 #[tokio::test]
-async fn settings_opens_the_first_project_or_workers_without_one() {
+async fn settings_opens_the_first_own_project_or_onboarding_without_one() {
     let reply = two_projects().get("/settings").await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert_eq!(
@@ -7670,7 +7889,7 @@ async fn settings_opens_the_first_project_or_workers_without_one() {
     let empty = dashboard_with(Arc::new(Store::open_in_memory().unwrap()));
     let reply = empty.get("/settings").await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
-    assert_eq!(reply.location.as_deref(), Some("/settings/workers"));
+    assert_eq!(reply.location.as_deref(), Some("/onboard"));
 }
 
 #[tokio::test]
@@ -7973,6 +8192,80 @@ async fn a_servers_page_lists_the_projects_that_use_it() {
     assert!(used.contains("tool"));
     assert!(used.contains("Key missing"));
     assert!(used.contains(r#"href="/settings/projects/tool/mcp/context7""#));
+}
+
+#[tokio::test]
+async fn a_servers_usage_card_lists_only_the_logins_own_projects() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .add_collaborator("maestro", MAESTRO_ONLY, "test")
+        .unwrap();
+    add_context7(&dashboard).await;
+    for project in ["maestro", "tool"] {
+        store_value_for(&dashboard, project, "Bearer sk-x");
+        dashboard
+            .post(
+                &format!("/settings/projects/{project}/mcp/context7"),
+                "mcp.context7.enabled=on&mcp.context7.stage.clarify=on",
+            )
+            .await;
+    }
+
+    let page = dashboard
+        .get_as(MAESTRO_ONLY, "/settings/mcp/context7")
+        .await
+        .body;
+    let used = &page[page.find("Used by").unwrap()..];
+    assert!(used.contains("maestro"));
+    assert!(!used.contains("/settings/projects/tool/mcp/context7"));
+}
+
+#[tokio::test]
+async fn a_held_back_edit_counts_every_value_but_names_only_the_logins_own() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .add_collaborator("maestro", MAESTRO_ONLY, "test")
+        .unwrap();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+    store_value_for(&dashboard, "tool", "Bearer sk-y");
+
+    let reply = dashboard
+        .post_as(
+            MAESTRO_ONLY,
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=X-Api-Key",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Not saved yet."));
+    assert!(reply.body.contains("Save and delete 2 values"));
+    assert!(reply.body.contains("maestro: <code>Authorization</code>"));
+    assert!(!reply.body.contains("tool: <code>Authorization</code>"));
+    assert!(reply.body.contains("1 value in a project you cannot see"));
+}
+
+#[tokio::test]
+async fn a_held_back_edit_hides_every_affected_project_from_a_non_collaborator() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    store_value_for(&dashboard, "maestro", "Bearer sk-x");
+    store_value_for(&dashboard, "tool", "Bearer sk-y");
+
+    let reply = dashboard
+        .post_as(
+            STRANGER,
+            "/settings/mcp/context7",
+            "url=https%3A%2F%2Fmcp.context7.com%2Fmcp&header=X-Api-Key",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Save and delete 2 values"));
+    assert!(reply.body.contains("2 values in projects you cannot see"));
+    assert!(!reply.body.contains("maestro: <code>Authorization</code>"));
+    assert!(!reply.body.contains("tool: <code>Authorization</code>"));
 }
 
 #[tokio::test]

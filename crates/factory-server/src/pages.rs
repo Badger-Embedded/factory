@@ -177,16 +177,15 @@ pub fn index(
         &html! {
             @if let Some(selected) = selected {
                 div.status-row {
-                    (self::workers(workers, jobs, selected))
+                    (self::workers(workers, jobs, project_names, selected))
                     (plan_usage_region(plan_usage))
                 }
                 (composer(selected))
                 (board(&all, costs, auto_merge, selected))
                 (stats(totals, selected))
             } @else {
-                (plan_usage_region(plan_usage))
                 div.card {
-                    p.empty { "No projects are configured." }
+                    p.empty { "You are not a collaborator on any project." }
                     p { a.nav href="/onboard" { "Onboard a project" } }
                 }
             }
@@ -207,9 +206,12 @@ pub struct Workers {
 
 /// One tile per worker slot. A busy tile names the job, its stage and how
 /// long it has held the slot. Slots are account-wide, so a job of another
-/// project shows that project's name. A job waiting for you holds no slot,
-/// so a full row of busy tiles is why a new job has not started.
-pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Region {
+/// project shows that project's name. A job in a project the viewer does not
+/// collaborate on, named in `visible`, shows a plain busy tile with only the
+/// time, so the count stays right without leaking the job's id, project,
+/// stage or request. A job waiting for you holds no slot, so a full row of
+/// busy tiles is why a new job has not started.
+pub fn workers(workers: &Workers, jobs: &[JobRow], visible: &[String], project: &str) -> Region {
     let count = workers.limit.max(
         workers
             .busy
@@ -223,7 +225,9 @@ pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Region {
         ul.worker-slots {
                 @for number in 1..=count {
                     @let slot = workers.busy.iter().find(|slot| slot.number == number);
-                    @let row = slot.and_then(|slot| jobs.iter().find(|row| row.id == slot.job_id));
+                    @let row = slot
+                        .and_then(|slot| jobs.iter().find(|row| row.id == slot.job_id))
+                        .filter(|row| visible.iter().any(|name| name == &row.project));
                     @match (slot, row) {
                         (Some(slot), Some(row)) => {
                             li.worker.busy {
@@ -239,7 +243,7 @@ pub fn workers(workers: &Workers, jobs: &[JobRow], project: &str) -> Region {
                         (Some(slot), None) => {
                             li.worker.busy {
                                 span.worker-name { "Worker " (number) }
-                                span.worker-job { "#" (slot.job_id) }
+                                span.worker-job { "busy" }
                                 span.worker-time { (held_for(workers.now - slot.since)) }
                             }
                         }
@@ -1057,12 +1061,16 @@ pub struct ServerUsage {
 }
 
 /// A server edit held back because saving it deletes stored values. The page
-/// shows the posted `url` and `headers` and names each value it deletes, as
-/// `(project, header)`, with a button that saves anyway.
+/// shows the posted `url` and `headers`, names each value it deletes in a
+/// project the viewer collaborates on as `(project, header)`, and counts the
+/// rest under `total`, with a button that saves anyway. `total` is every value
+/// the edit deletes, so the button states the full effect, while `deletes`
+/// names only the ones the viewer may see.
 pub struct PendingEdit {
     pub url: String,
     pub headers: Vec<String>,
     pub deletes: Vec<(String, String)>,
+    pub total: usize,
 }
 
 /// The state of a server's page beyond the server itself.
@@ -1406,7 +1414,7 @@ fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup 
     });
     let label = pending.map_or_else(
         || "Save".to_owned(),
-        |pending| match pending.deletes.len() {
+        |pending| match pending.total {
             1 => "Save and delete 1 value".to_owned(),
             n => format!("Save and delete {n} values"),
         },
@@ -1414,11 +1422,17 @@ fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup 
     html! {
         form.card.settings-form method="post" action=(action) {
             @if let Some(pending) = pending {
+                @let hidden = pending.total - pending.deletes.len();
                 div.confirm {
                     p { strong { "Not saved yet." } " Saving this change deletes these stored values, and each project must enter them again:" }
                     ul {
                         @for (project, header) in &pending.deletes {
                             li { (project) ": " code { (header) } }
+                        }
+                        @if hidden == 1 {
+                            li { "1 value in a project you cannot see" }
+                        } @else if hidden > 1 {
+                            li { (hidden) " values in projects you cannot see" }
                         }
                     }
                     input type="hidden" name="confirm" value="on";
