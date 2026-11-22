@@ -184,6 +184,35 @@ h2 { font-size: var(--font-size-base); margin: 0 0 var(--space-12); }
   margin-bottom: var(--space-16);
 }
 .status-row > * { min-width: 0; }
+.status-row > #usage:not(:has(.plan-usage)) { display: none; }
+/* Without the script the link is a full-width row of its own, right-aligned,
+   so nothing overlaps it. source-link.js measures the link and adds `corner`,
+   which moves it out of flow to the top right so the tiles and the strip wrap
+   as they do without it. The tiles stop short of the link, the row keeps its
+   height, and `clear` adds a margin to the strip only when it would sit under
+   the link. */
+.status-row.has-source > .source-link { flex-basis: 100%; justify-content: flex-end; }
+.status-row.corner { position: relative; min-height: var(--source-h); }
+.status-row.corner > #workers { max-width: calc(100% - var(--source-w) - var(--space-24)); }
+.status-row.corner.clear > #usage { margin-top: calc(var(--source-h) + var(--space-12)); }
+.status-row.corner > .source-link { position: absolute; top: 0; right: 0; flex-basis: auto; max-width: 50%; }
+.source-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-6);
+  color: var(--muted);
+  font-size: var(--font-size-sm);
+  text-decoration: none;
+}
+.source-link span { overflow-wrap: anywhere; }
+.source-link:hover { color: var(--accent); }
+.source-link:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+@media (max-width: 40rem) {
+  .status-row.corner { min-height: 0; }
+  .status-row.corner > #workers { max-width: none; }
+  .status-row.corner.clear > #usage { margin-top: 0; }
+  .status-row.corner > .source-link { position: static; flex-basis: 100%; max-width: 100%; }
+}
 .worker-slots { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--space-8); }
 .worker {
   display: grid;

@@ -26,6 +26,7 @@ pub const STYLESHEET: &str = include_str!("../static/style.css");
 /// tailnet host it runs on cannot reach one.
 pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
+const SOURCE_LINK: &str = include_str!("../static/source-link.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
 const NOTIFICATIONS: &str = include_str!("../static/notifications.js");
@@ -167,6 +168,7 @@ pub fn index(
     totals: ProjectTotals,
     plan_usage: Option<&UsageTile>,
     auto_merge: bool,
+    repo: Option<&str>,
     workers: &Workers,
     notifications: bool,
 ) -> Markup {
@@ -187,9 +189,15 @@ pub fn index(
                 (permission_bar())
             }
             @if let Some(selected) = selected {
-                div.status-row {
+                div.status-row.has-source[repo.is_some()] {
                     (self::workers(workers, jobs, project_names, selected))
+                    @if let Some(repo) = repo {
+                        (source_link(repo))
+                    }
                     (plan_usage_region(plan_usage))
+                }
+                @if repo.is_some() {
+                    script { (PreEscaped(SOURCE_LINK)) }
                 }
                 (composer(selected))
                 (board(&all, costs, auto_merge, selected))
@@ -1103,7 +1111,7 @@ fn login_fragment(
                     (login_cancel(ui))
                 }
                 LoginView::Waiting { url, code } => {
-                    p { "Open " (external_link(url, url)) " and enter this code:" }
+                    p { "Open " (external_link(url, url, None, None)) " and enter this code:" }
                     p.code-prompt { code { (code) } }
                     p.meta { "Waiting for you to finish in the browser…" }
                     (login_cancel(ui))
@@ -1384,8 +1392,34 @@ fn server_usage_card(server: &str, usage: &[ServerUsage]) -> Markup {
     }
 }
 
-fn external_link(href: &str, label: impl maud::Render) -> Markup {
-    html! { a href=(href) target="_blank" rel="noopener noreferrer" { (label) } }
+fn external_link(
+    href: &str,
+    label: impl maud::Render,
+    class: Option<&str>,
+    title: Option<&str>,
+) -> Markup {
+    html! { a class=[class] href=(href) title=[title] target="_blank" rel="noopener noreferrer" { (label) } }
+}
+
+fn source_link(repo: &str) -> Markup {
+    external_link(
+        &format!("https://github.com/{repo}"),
+        html! { (branch_icon()) span { (repo) } },
+        Some("source-link"),
+        Some("Source on GitHub"),
+    )
+}
+
+fn branch_icon() -> Markup {
+    html! {
+        svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" {
+            circle cx="6" cy="6" r="2.5" {}
+            circle cx="6" cy="18" r="2.5" {}
+            circle cx="18" cy="8" r="2.5" {}
+            path d="M6 8.5v7M18 10.5c0 4-5 4-10.5 7" {}
+        }
+    }
 }
 
 fn project_mcp_href(project: &str, server: &str) -> String {
@@ -3243,7 +3277,7 @@ fn job_header(
         }
         p.meta {
             @if let Some(url) = repo_url {
-                (external_link(url, &row.project))
+                (external_link(url, &row.project, None, None))
             } @else {
                 (row.project)
             }
@@ -3470,7 +3504,7 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
                             @if let Some(number) = pr.number {
                                 " · "
                                 @if let Some(url) = repo_url {
-                                    (external_link(&format!("{url}/pull/{number}"), html! { "#" (number) }))
+                                    (external_link(&format!("{url}/pull/{number}"), html! { "#" (number) }, None, None))
                                 } @else {
                                     "#" (number)
                                 }

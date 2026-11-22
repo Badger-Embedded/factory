@@ -412,6 +412,7 @@ struct BoardData {
     costs: HashMap<i64, f64>,
     totals: ProjectTotals,
     auto_merge: bool,
+    repo: Option<String>,
     workers: Workers,
 }
 
@@ -447,15 +448,17 @@ fn load_board(
     };
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
-    let (totals, auto_merge) = match &selected {
+    let (totals, auto_merge, repo) = match &selected {
         Some(name) => {
-            let default = state.projects.lookup(name)?.is_some_and(|p| p.auto_merge);
+            let project = state.projects.lookup(name)?;
+            let default = project.as_ref().is_some_and(|p| p.auto_merge);
             (
                 state.store.project_totals(name)?,
                 state.store.project_auto_merge(name, default)?,
+                project.map(|p| p.repo),
             )
         }
-        None => (ProjectTotals::default(), false),
+        None => (ProjectTotals::default(), false, None),
     };
     Ok(BoardData {
         names,
@@ -464,6 +467,7 @@ fn load_board(
         costs,
         totals,
         auto_merge,
+        repo,
         workers: Workers {
             limit: state.store.settings()?.max_workers,
             busy: state.slots.busy(),
@@ -491,6 +495,7 @@ async fn index(
         data.totals,
         plan_usage.as_ref(),
         data.auto_merge,
+        data.repo.as_deref(),
         &data.workers,
         notifications,
     );

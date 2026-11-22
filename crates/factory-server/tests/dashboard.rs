@@ -2326,10 +2326,7 @@ async fn only_numbered_pull_requests_in_a_plan_get_links() {
     assert!(page.body.contains("second"));
 }
 
-#[tokio::test]
-async fn a_job_whose_project_is_gone_renders_without_links() {
-    let dashboard = dashboard();
-    let id = with_plan(&dashboard, vec![planned("first", Some(7))]).await;
+fn without_projects(dashboard: &Dashboard) -> Dashboard {
     let router = app(
         dashboard.store.clone(),
         Arc::new(Projects::default()),
@@ -2363,7 +2360,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         )),
         vec![USER.to_owned()],
     );
-    let page = Dashboard {
+    Dashboard {
         store: dashboard.store.clone(),
         router,
         data: tempfile::tempdir().unwrap(),
@@ -2371,13 +2368,79 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         slots: Arc::new(WorkerSlots::new()),
         checker: Arc::new(FakeChecker::default()),
     }
-    .get(&format!("/jobs/{id}"))
-    .await;
+}
+
+#[tokio::test]
+async fn a_job_whose_project_is_gone_renders_without_links() {
+    let dashboard = dashboard();
+    let id = with_plan(&dashboard, vec![planned("first", Some(7))]).await;
+    let page = without_projects(&dashboard)
+        .get(&format!("/jobs/{id}"))
+        .await;
 
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.contains("maestro"));
     assert!(page.body.contains("#7"));
     assert!(!page.body.contains("github.com"));
+}
+
+#[tokio::test]
+async fn the_board_links_the_selected_projects_repository() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/").await;
+    let html = scraper::Html::parse_document(&page.body);
+    let select = |css: &str| scraper::Selector::parse(css).unwrap();
+
+    let link = html
+        .select(&select("div.status-row > a.source-link"))
+        .next()
+        .expect("the status row holds the source link");
+    let attr = |name| link.value().attr(name);
+    assert_eq!(
+        attr("href"),
+        Some("https://github.com/Badger-Embedded/maestro")
+    );
+    assert_eq!(attr("target"), Some("_blank"));
+    assert_eq!(attr("rel"), Some("noopener noreferrer"));
+    assert!(
+        link.text()
+            .collect::<String>()
+            .contains("Badger-Embedded/maestro")
+    );
+    assert!(
+        link.select(&select("svg[aria-hidden=true]"))
+            .next()
+            .is_some()
+    );
+    assert!(
+        html.select(&select("#workers a.source-link, #usage a.source-link"))
+            .next()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn the_board_has_no_source_link_when_the_project_does_not_resolve() {
+    let dashboard = dashboard();
+    let page = without_projects(&dashboard).get("/").await;
+
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page.body.contains("source-link"));
+}
+
+#[tokio::test]
+async fn the_polled_fragments_carry_no_source_link() {
+    let dashboard = dashboard();
+    for path in [
+        "/fragments/workers?project=maestro",
+        "/fragments/plan-usage?project=maestro",
+        "/fragments/board?project=maestro",
+    ] {
+        assert!(
+            !dashboard.get(path).await.body.contains("source-link"),
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]
