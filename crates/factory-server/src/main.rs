@@ -6,8 +6,8 @@ use std::sync::Arc;
 use factory_runner::{Git, GitHub, WorkerConfig};
 use factory_server::{
     AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, GhRepos, HttpMcpChecker, LocalSecrets,
-    McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin, Projects,
-    ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
+    LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin,
+    Projects, ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
     StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
     master_key_from_env, proxy_app,
 };
@@ -94,6 +94,22 @@ fn codex_device_login(
         Arc::clone(secrets),
         Arc::new(PodmanLogin::new(worker_base(network))),
         data_dir.join("codex-login"),
+    ))
+}
+
+fn copilot_device_login(
+    secrets: &Arc<dyn SecretStore>,
+    network: Option<String>,
+    data_dir: &Path,
+) -> Arc<DeviceLogin> {
+    Arc::new(DeviceLogin::for_spec(
+        LoginSpec::COPILOT,
+        Arc::clone(secrets),
+        Arc::new(PodmanLogin::for_spec(
+            LoginSpec::COPILOT,
+            worker_base(network),
+        )),
+        data_dir.join("copilot-login"),
     ))
 }
 
@@ -248,6 +264,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::new());
 
     let device_login = codex_device_login(&secrets, worker_network.clone(), &data_dir);
+    let copilot_login = copilot_device_login(&secrets, worker_network.clone(), &data_dir);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("listening on http://{listen}, database {}", db.display());
@@ -265,6 +282,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             checker,
             agents,
             device_login,
+            copilot_login,
         ),
     )
     .with_graceful_shutdown(async {

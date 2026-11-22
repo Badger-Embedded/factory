@@ -944,40 +944,67 @@ pub fn codex_login_fragment(
     login: &crate::device_login::LoginView,
     secrets_available: bool,
 ) -> Markup {
+    login_fragment(&CODEX_LOGIN, login, secrets_available)
+}
+
+struct LoginUi {
+    base: &'static str,
+    id: &'static str,
+    button: &'static str,
+}
+
+const CODEX_LOGIN: LoginUi = LoginUi {
+    base: "/settings/agents/codex",
+    id: "codex-login",
+    button: "Sign in with ChatGPT",
+};
+
+const COPILOT_LOGIN: LoginUi = LoginUi {
+    base: "/settings/agents/copilot",
+    id: "copilot-login",
+    button: "Sign in with GitHub",
+};
+
+fn login_fragment(
+    ui: &LoginUi,
+    login: &crate::device_login::LoginView,
+    secrets_available: bool,
+) -> Markup {
     use crate::device_login::LoginView;
     let polling = login.active();
+    let start = format!("{}/login", ui.base);
     html! {
-        div.codex-login #codex-login
-            hx-get="/settings/agents/codex/login/fragment"
+        div.agent-login id=(ui.id)
+            hx-get=(format!("{}/login/fragment", ui.base))
             hx-trigger=[polling.then_some(POLL_TRIGGER)]
             hx-swap="outerHTML"
         {
             @match login {
                 LoginView::Idle => {
-                    form method="post" action="/settings/agents/codex/login" {
-                        button.primary disabled[!secrets_available] { "Sign in with ChatGPT" }
+                    form method="post" action=(start) {
+                        button.primary disabled[!secrets_available] { (ui.button) }
                     }
                 }
                 LoginView::Starting => {
                     p.meta { "Starting the login container…" }
-                    (codex_login_cancel())
+                    (login_cancel(ui))
                 }
                 LoginView::Waiting { url, code } => {
                     p { "Open " a href=(url) target="_blank" rel="noopener" { (url) } " and enter this code:" }
                     p.code-prompt { code { (code) } }
                     p.meta { "Waiting for you to finish in the browser…" }
-                    (codex_login_cancel())
+                    (login_cancel(ui))
                 }
                 LoginView::SignedIn => {
                     p.good { "Signed in." }
-                    form method="post" action="/settings/agents/codex/login" {
+                    form method="post" action=(start) {
                         button.primary disabled[!secrets_available] { "Sign in again" }
                     }
                 }
                 LoginView::Failed { reason } => {
                     p.bad { "The login did not finish." }
                     pre.login-reason { (reason) }
-                    form method="post" action="/settings/agents/codex/login" {
+                    form method="post" action=(start) {
                         button.primary disabled[!secrets_available] { "Try again" }
                     }
                 }
@@ -986,11 +1013,96 @@ pub fn codex_login_fragment(
     }
 }
 
-/// The Cancel button shown while a login runs. It removes the container.
-fn codex_login_cancel() -> Markup {
+fn login_cancel(ui: &LoginUi) -> Markup {
     html! {
-        form method="post" action="/settings/agents/codex/login/cancel" {
+        form method="post" action=(format!("{}/login/cancel", ui.base)) {
             button.danger { "Cancel" }
+        }
+    }
+}
+
+pub fn copilot_login_fragment(
+    login: &crate::device_login::LoginView,
+    secrets_available: bool,
+) -> Markup {
+    login_fragment(&COPILOT_LOGIN, login, secrets_available)
+}
+
+pub fn settings_copilot(
+    user: &str,
+    nav: &SettingsNav,
+    stored: bool,
+    login: &crate::device_login::LoginView,
+    secrets_available: bool,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Agent("copilot".to_owned()),
+        "Copilot",
+        notice,
+        &html! {
+            h1 { "Copilot" }
+            div.card {
+                h2 { "GitHub login" }
+                p.hint {
+                    "The factory runs the GitHub Copilot CLI. The GitHub account needs a Copilot \
+                     plan. Do not use moonthebot unless that is intended. The stored token goes \
+                     to Copilot workers, which run it in their container."
+                }
+                @if stored {
+                    p.meta { "A token is stored." }
+                } @else {
+                    p.meta { "No token is stored." }
+                }
+            }
+            div.card {
+                h2 { "Sign in with GitHub" }
+                p.hint {
+                    "The factory starts a container that runs " code { "copilot login --device-code" }
+                    ". Open the link it shows and enter the code to sign the factory in."
+                }
+                @if !secrets_available {
+                    p.hint.bad { "The master key is missing, so a login cannot be saved. Clear still works." }
+                }
+                (login_fragment(&COPILOT_LOGIN, login, secrets_available))
+            }
+            (copilot_token_card(stored, secrets_available))
+        },
+    )
+}
+
+fn copilot_token_card(stored: bool, secrets_available: bool) -> Markup {
+    html! {
+        form.card.settings-form method="post" action="/settings/agents/copilot/token" {
+            h2 { "Paste a token" }
+            p.hint {
+                "A fine-grained personal access token with the Copilot Requests permission, or a \
+                 " code { "gho_" } " or " code { "ghu_" } " token. Classic tokens are not \
+                 supported. Stored encrypted and never shown."
+            }
+            @if !secrets_available {
+                p.hint.bad { "The master key is missing, so a token cannot be saved here." }
+            }
+            div.field {
+                label for="copilot-token" { "Token" }
+                input #copilot-token.wide type="password" name="token"
+                    autocomplete="off" spellcheck="false"
+                    placeholder=(if stored { "set" } else { "not set" })
+                    disabled[!secrets_available];
+                p.hint {
+                    @if stored { "A token is stored. " } @else { "No token is stored. " }
+                    "Paste a new one to replace it. An empty field keeps it."
+                }
+            }
+            div.save-bar {
+                span.save-bar-note { "No unsaved changes." }
+                button.primary disabled[!secrets_available] { "Save token" }
+            }
+            div.danger-zone {
+                button.danger formaction="/settings/agents/copilot/token/clear" formnovalidate { "Clear token" }
+            }
         }
     }
 }

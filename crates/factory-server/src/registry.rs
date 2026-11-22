@@ -132,7 +132,7 @@ impl AgentEntry<'_> {
         match self.agent {
             Agent::Claude => Some("/settings/agents/claude"),
             Agent::Codex => Some("/settings/agents/codex"),
-            Agent::Copilot => None,
+            Agent::Copilot => Some("/settings/agents/copilot"),
         }
     }
 
