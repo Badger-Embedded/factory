@@ -14,18 +14,19 @@ use factory_server::{
 use tokio::sync::Notify;
 
 /// The extra root certificates from the PEM file `FACTORY_MCP_CA_FILE`, or none
-/// when it is unset or empty. A file that cannot be read or holds no valid
+/// when it is unset or empty. The path is used exactly as set. A file that cannot be read or holds no valid
 /// certificate fails startup, so a typo does not leave a server untrusted.
 fn mcp_roots() -> Result<Vec<reqwest::Certificate>, Box<dyn Error>> {
-    let Some(path) = trimmed_var("FACTORY_MCP_CA_FILE") else {
+    let Some(path) = env::var_os("FACTORY_MCP_CA_FILE").filter(|path| !path.is_empty()) else {
         return Ok(Vec::new());
     };
+    let shown = path.to_string_lossy();
     let pem = std::fs::read(&path)
-        .map_err(|err| format!("FACTORY_MCP_CA_FILE {path}: cannot read: {err}"))?;
+        .map_err(|err| format!("FACTORY_MCP_CA_FILE {shown}: cannot read: {err}"))?;
     let roots = reqwest::Certificate::from_pem_bundle(&pem)
-        .map_err(|err| format!("FACTORY_MCP_CA_FILE {path}: invalid PEM: {err}"))?;
+        .map_err(|err| format!("FACTORY_MCP_CA_FILE {shown}: invalid PEM: {err}"))?;
     if roots.is_empty() {
-        return Err(format!("FACTORY_MCP_CA_FILE {path}: no certificate found").into());
+        return Err(format!("FACTORY_MCP_CA_FILE {shown}: no certificate found").into());
     }
     Ok(roots)
 }
