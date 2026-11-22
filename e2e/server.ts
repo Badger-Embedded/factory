@@ -90,6 +90,14 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
   return {
     factory: { url, db, fixture },
     async stop() {
+      // A fake login that no test cancelled would sleep on after the server is gone.
+      for (const file of fs.readdirSync(dir).filter((f) => /^\.fake-podman-.*\.pid$/.test(f))) {
+        try {
+          process.kill(Number(fs.readFileSync(path.join(dir, file), 'utf8')), 'SIGKILL');
+        } catch {
+          // The login already ended.
+        }
+      }
       child.kill();
       await new Promise((resolve) => child.once('exit', resolve));
       fs.rmSync(dir, { recursive: true, force: true });

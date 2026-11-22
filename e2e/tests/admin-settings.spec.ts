@@ -161,7 +161,6 @@ for (const agent of [
   test(`${agent.name} device login shows the code and can be cancelled`, async ({ page }) => {
     await page.goto(`/settings/agents/${agent.path}`);
     await page.getByRole('button', { name: agent.start }).click();
-    // The fake prints its URL and code, and the page shows the code once its poll sees them.
     await expect(page.locator('.code-prompt')).toHaveText('ABCD-EFGH');
     await expect(page.getByText('Waiting for you to finish in the browser…')).toBeVisible();
 
@@ -203,7 +202,6 @@ test('MCP servers: add, edit with header rows, and delete', async ({ page }) => 
   await expect(page.getByText('Added.', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'docs', level: 1 })).toBeVisible();
 
-  // The edit form lists the saved names plus one empty row.
   await expect(headers).toHaveCount(3);
   await expect(headers.nth(0)).toHaveValue('X-Api-Key');
   await expect(headers.nth(1)).toHaveValue('X-Team');
@@ -234,6 +232,10 @@ test('a login that is not an admin is turned away from the factory-wide settings
   await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': COLLABORATOR });
   for (const path of [
     '/settings/workers',
+    '/settings/gates',
+    '/settings/github',
+    '/settings/renovate',
+    '/settings/agents/claude',
     '/settings/agents/codex',
     '/settings/agents/copilot',
     '/settings/mcp',
