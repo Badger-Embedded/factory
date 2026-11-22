@@ -106,8 +106,8 @@ impl LoginSpec {
 }
 
 /// Writes the `settings.json` that makes Copilot keep its token in
-/// `config.json`. The container has no keychain and no terminal to answer the
-/// prompt that otherwise asks before storing it in plaintext.
+/// `config.json`. The container has no keychain, and without this file the CLI
+/// asks before storing the token in plaintext.
 fn copilot_prepare(home: &Path) -> std::io::Result<()> {
     std::fs::write(
         home.join("settings.json"),
