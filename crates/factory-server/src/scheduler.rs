@@ -683,7 +683,7 @@ impl<E: Executor> Scheduler<E> {
             repo: project.repo.clone(),
             base: project.base.clone(),
             branch: match session {
-                Session::Planning | Session::Spec | Session::Plan | Session::Renovate => None,
+                Session::Planning | Session::Spec | Session::Plan | Session::Renovate(_) => None,
                 Session::Pr(pr) | Session::Review(pr) => Some(branch_name(row.id, pr)),
             },
             session_id,

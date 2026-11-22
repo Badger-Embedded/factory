@@ -2348,7 +2348,7 @@ fn failing_ci_gets_the_automatic_reruns_and_then_the_agent() {
     observe(&mut job, "h1", failed("the log"), LIMITS, false);
     assert_runs(
         &job,
-        Session::Renovate,
+        Session::Renovate(1),
         Task::AnalyzeFailure {
             log: "the log".into(),
         },
@@ -2590,7 +2590,7 @@ fn passing_ci_asks_the_agent_to_check_the_diff_once_per_head() {
     observe(&mut job, "h1", passed(), LIMITS, true);
     assert_runs(
         &job,
-        Session::Renovate,
+        Session::Renovate(1),
         Task::CheckDiff {
             diff: "+serde = 1.0.2".into(),
             body: "Bumps serde".into(),
@@ -2779,6 +2779,40 @@ fn a_failed_renovate_agent_run_retries_the_same_task() {
     assert_eq!(job.stage(), &Stage::Renovate);
     assert_eq!(job.turn(), &Turn::Agent(task));
     assert_eq!(pr_of(&job).head.as_deref(), Some("h1"));
+}
+
+#[test]
+fn each_renovate_agent_run_gets_its_own_session_and_a_retry_keeps_it() {
+    let limits = RetryLimits { auto: 0, total: 7 };
+    let mut job = renovate_job();
+    observe(&mut job, "h1", failed("log"), limits, false);
+    assert_runs(
+        &job,
+        Session::Renovate(1),
+        Task::AnalyzeFailure { log: "log".into() },
+    );
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "network".into(),
+        }),
+    );
+    apply(&mut job, Event::CiRerun);
+    observe(&mut job, "h1", passed(), limits, false);
+    let check = Task::CheckDiff {
+        diff: "+serde = 1.0.2".into(),
+        body: "Bumps serde".into(),
+    };
+    assert_runs(&job, Session::Renovate(2), check.clone());
+    apply(
+        &mut job,
+        Event::AgentFailed {
+            reason: "timed out".into(),
+        },
+    );
+    apply(&mut job, Event::Retry);
+    assert_runs(&job, Session::Renovate(2), check);
 }
 
 #[test]

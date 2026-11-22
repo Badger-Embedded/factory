@@ -3892,3 +3892,20 @@ fn start_review() -> Event {
         head: format!("head{n}"),
     }
 }
+
+#[test]
+fn renovate_runs_keep_separate_sessions() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    let (first, _) = store
+        .session_uuid(id, factory_core::Session::Renovate(1), Agent::Claude)
+        .unwrap();
+    let (second, _) = store
+        .session_uuid(id, factory_core::Session::Renovate(2), Agent::Claude)
+        .unwrap();
+    let (again, _) = store
+        .session_uuid(id, factory_core::Session::Renovate(1), Agent::Claude)
+        .unwrap();
+    assert_ne!(first, second);
+    assert_eq!(first, again);
+}

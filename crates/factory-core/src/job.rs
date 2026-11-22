@@ -172,15 +172,11 @@ enum Pending {
     Merge,
 }
 
-/// How the rerun the job waits for counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum RerunKind {
-    /// A rerun with no agent run. Counts toward both limits.
     #[default]
     Auto,
-    /// A rerun the failure analysis asked for. Counts toward the total.
     Analysed,
-    /// A rerun the user asked for with Retry. Counts toward none.
     Retry,
 }
 
@@ -201,6 +197,9 @@ pub struct RenovatePr {
     pub stopped: Option<String>,
     /// The comments posted so far, as `(head, kind)`.
     pub comments: Vec<(String, CommentKind)>,
+    /// The agent runs started so far. Each run has its own session.
+    #[serde(default)]
+    pub runs: u32,
     #[serde(default)]
     pending: Option<Pending>,
     #[serde(default)]
@@ -224,8 +223,6 @@ impl RenovatePr {
         self.rerun = RerunKind::Auto;
     }
 
-    /// Queues the comment of `kind` unless the head already has one, and
-    /// waits for the user.
     fn stop(&mut self, kind: CommentKind, reason: String, body: String) -> Turn {
         let state = if kind == CommentKind::Unsafe {
             RenovateWait::Unsafe
@@ -308,6 +305,7 @@ impl RenovatePr {
                         ),
                     }
                 } else {
+                    self.runs += 1;
                     Turn::Agent(Task::AnalyzeFailure { log })
                 }
             }
@@ -326,10 +324,13 @@ impl RenovatePr {
                         .to_owned(),
                     state: RenovateWait::Ready,
                 }),
-                (None, Some(details)) => Turn::Agent(Task::CheckDiff {
-                    diff: details.diff,
-                    body: details.body,
-                }),
+                (None, Some(details)) => {
+                    self.runs += 1;
+                    Turn::Agent(Task::CheckDiff {
+                        diff: details.diff,
+                        body: details.body,
+                    })
+                }
                 (None, None) => Turn::Factory,
             },
         }
@@ -637,8 +638,8 @@ pub enum Session {
     /// so the reviewer reads the diff without the author's context. It resumes
     /// across passes, so a later pass sees only the commits since the last one.
     Review(usize),
-    /// A run on a Renovate pull request. Each run starts a fresh session.
-    Renovate,
+    /// A run on a Renovate pull request, numbered by `RenovatePr::runs`.
+    Renovate(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -893,6 +894,7 @@ impl Job {
             verdict: None,
             stopped: None,
             comments: Vec::new(),
+            runs: 0,
             pending: None,
             rerun: RerunKind::Auto,
         }));
@@ -1043,9 +1045,6 @@ impl Job {
                 number,
                 reason: reason.clone(),
             }),
-            // A ready job keeps its full watch, so turning on auto-merge
-            // merges it. A stopped or unsafe job only sees a merge, a close
-            // or a new head.
             Turn::User(Ask::Renovate { state, .. }) => Some(Command::WatchRenovate {
                 number,
                 verdict_head: pr.verdict.as_ref().map(|verdict| verdict.head.clone()),
@@ -1372,8 +1371,8 @@ impl Job {
     }
 
     fn session(&self) -> Session {
-        if self.stage == Stage::Renovate {
-            return Session::Renovate;
+        if let Some(pr) = self.renovate_pr() {
+            return Session::Renovate(pr.runs);
         }
         if let (Stage::CiAndReview { pr }, Turn::Agent(Task::Review)) = (&self.stage, &self.turn) {
             return Session::Review(*pr);

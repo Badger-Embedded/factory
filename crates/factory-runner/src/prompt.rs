@@ -127,9 +127,6 @@ fn append_schema(text: &mut String, agent: Agent, expect: Expect) {
     }
 }
 
-/// The prompt for the failure analysis of a Renovate pull request. The
-/// factory reruns the failed runs a few times before it asks, so the log is
-/// one that kept failing.
 fn failure_prompt(log: &str, agent: Agent) -> String {
     let mut text = format!(
         "CI failed on a Renovate pull request that updates a dependency, and reruns of the \
