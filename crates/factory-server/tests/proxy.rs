@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod support;
+
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -14,8 +16,8 @@ use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use factory_server::{
-    LocalSecrets, MASTER_KEY_LEN, McpTool, ProxyEvent, RunTokens, SecretRef, SecretStore, Store,
-    StoreUpstreams, Upstream, Upstreams, proxy_app,
+    LocalSecrets, MASTER_KEY_LEN, McpTool, ProxyEvent, ProxyEventFn, RunTokens, SecretRef,
+    SecretStore, Store, StoreUpstreams, Upstream, Upstreams, proxy_app, proxy_app_with_roots,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -965,4 +967,35 @@ async fn store_upstreams_returns_the_turned_off_tools() {
             .disabled_tools
             .is_empty()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxies_to_an_https_upstream_only_with_its_ca_as_an_extra_root() {
+    let fake = Arc::new(Fake::default());
+    let app = Router::new()
+        .route("/mcp", any(record_and_reply))
+        .with_state(Arc::clone(&fake));
+    let tls = support::serve_tls(app).await;
+    let roots = reqwest::Certificate::from_pem_bundle(tls.ca_pem.as_bytes()).unwrap();
+
+    for (roots, expected) in [
+        (Vec::new(), StatusCode::BAD_GATEWAY),
+        (roots, StatusCode::OK),
+    ] {
+        let tokens = Arc::new(RunTokens::new());
+        let warn: ProxyEventFn = Arc::new(|_| {});
+        let upstreams = fake_upstreams(&format!("{}/mcp", tls.base), &[], &["context7"]);
+        let app = proxy_app_with_roots(Arc::clone(&tokens), upstreams, warn, roots);
+        let proxy = serve(app).await;
+        let token = tokens.issue(7, "maestro", &["context7".to_owned()]);
+        let response = client()
+            .post(format!("{proxy}/mcp/context7"))
+            .bearer_auth(&token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
 }

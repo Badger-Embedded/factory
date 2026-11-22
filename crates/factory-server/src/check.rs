@@ -141,11 +141,38 @@ impl HttpMcpChecker {
     /// happens only on a broken TLS backend, as the proxy's client does.
     #[must_use]
     pub fn with_timeout(total_timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
+        Self::with_roots_and_timeout(Vec::new(), total_timeout)
+    }
+
+    /// Builds the checker with the production timeouts and `roots` trusted next
+    /// to the built-in roots, for a server whose certificate is not from a
+    /// public CA.
+    ///
+    /// # Panics
+    ///
+    /// As [`HttpMcpChecker::with_timeout`].
+    #[must_use]
+    pub fn with_roots(roots: Vec<reqwest::Certificate>) -> Self {
+        Self::with_roots_and_timeout(roots, TOTAL_TIMEOUT)
+    }
+
+    /// As [`HttpMcpChecker::with_roots`], with a chosen total timeout.
+    ///
+    /// # Panics
+    ///
+    /// As [`HttpMcpChecker::with_timeout`].
+    #[must_use]
+    pub fn with_roots_and_timeout(
+        roots: Vec<reqwest::Certificate>,
+        total_timeout: Duration,
+    ) -> Self {
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .expect("build the MCP check HTTP client");
+            .connect_timeout(CONNECT_TIMEOUT);
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+        let client = builder.build().expect("build the MCP check HTTP client");
         HttpMcpChecker {
             client,
             total_timeout,

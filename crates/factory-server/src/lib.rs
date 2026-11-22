@@ -41,6 +41,7 @@ pub use projects::{
 };
 pub use proxy::{
     ProxyEvent, ProxyEventFn, RunTokens, StoreUpstreams, Upstream, Upstreams, proxy_app,
+    proxy_app_with_roots,
 };
 pub use registry::{AgentEntry, AgentRegistry};
 pub use scheduler::{
