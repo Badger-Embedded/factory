@@ -127,6 +127,14 @@ pub fn app(
             "/settings/projects/{name}",
             get(show_project_settings).post(save_project_models),
         )
+        .route(
+            "/settings/projects/{project}/collaborators",
+            post(add_project_collaborator),
+        )
+        .route(
+            "/settings/projects/{project}/collaborators/remove",
+            post(remove_project_collaborator),
+        )
         .route("/settings/agents/claude/token", post(save_claude_token))
         .route(
             "/settings/agents/claude/token/clear",
@@ -1371,6 +1379,7 @@ fn project_page(
     name: &str,
     selected: pages::PipelinePart,
     notice: Option<&str>,
+    problem: Option<&str>,
 ) -> Result<Markup, AppError> {
     let project = visible_project(state, headers, name)?;
     Ok(pages::settings_project(
@@ -1379,6 +1388,7 @@ fn project_page(
         &project_settings(state, name, &project)?,
         selected,
         notice,
+        problem,
     ))
 }
 
@@ -1434,6 +1444,7 @@ fn project_settings(
         gates: state.store.project_gates(name)?,
         default_gates: state.store.settings()?.gates,
         servers,
+        collaborators: state.store.collaborators(name)?,
     })
 }
 
@@ -1486,7 +1497,7 @@ async fn show_project_settings(
     Path(name): Path<String>,
     Query(query): Query<StageQuery>,
 ) -> Result<Markup, AppError> {
-    project_page(&state, &headers, &name, query.part(), None)
+    project_page(&state, &headers, &name, query.part(), None, None)
 }
 
 fn default_effort() -> String {
@@ -1641,7 +1652,85 @@ async fn save_project_models(
     save_posted_gates(&state.store, &name, &form)?;
     save_pipeline_mcp(&state, &name, &form)?;
     state.wake.notify_one();
-    project_page(&state, &headers, &name, query.part(), Some("Saved."))
+    project_page(&state, &headers, &name, query.part(), Some("Saved."), None)
+}
+
+#[derive(Deserialize)]
+struct CollaboratorForm {
+    #[serde(default)]
+    login: String,
+}
+
+/// Adds a typed login as a collaborator on the project. Any collaborator may
+/// add. An empty or already-listed login is refused on the project page with a
+/// message and adds nothing. The project page redraws with the new row.
+async fn add_project_collaborator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<CollaboratorForm>,
+) -> Result<Markup, AppError> {
+    visible_project(&state, &headers, &project)?;
+    let part = pages::PipelinePart::parse(None);
+    let login = form.login.trim();
+    if login.is_empty() {
+        let problem = "Type a Tailscale login to add a collaborator.";
+        return project_page(&state, &headers, &project, part, None, Some(problem));
+    }
+    if state.store.is_collaborator(&project, login)? {
+        let problem = format!("{login} is already a collaborator.");
+        return project_page(&state, &headers, &project, part, None, Some(&problem));
+    }
+    state
+        .store
+        .add_collaborator(&project, login, &user(&headers))?;
+    project_page(
+        &state,
+        &headers,
+        &project,
+        part,
+        Some(&format!("Added {login}.")),
+        None,
+    )
+}
+
+/// Removes a collaborator from the project. Any collaborator may remove any
+/// collaborator, itself included, while more than one remains. The store
+/// refuses the last one with [`StoreError::LastCollaborator`], which this turns
+/// into a message on the project page. A login that removes itself can no
+/// longer see the project, so it is redirected to `/settings` instead.
+async fn remove_project_collaborator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<CollaboratorForm>,
+) -> Result<Response, AppError> {
+    visible_project(&state, &headers, &project)?;
+    let part = pages::PipelinePart::parse(None);
+    let login = form.login.trim();
+    match state.store.remove_collaborator(&project, login) {
+        Ok(()) => {}
+        Err(StoreError::LastCollaborator) => {
+            let problem = StoreError::LastCollaborator.to_string();
+            return Ok(
+                project_page(&state, &headers, &project, part, None, Some(&problem))?
+                    .into_response(),
+            );
+        }
+        Err(err) => return Err(err.into()),
+    }
+    if login == user(&headers) {
+        return Ok(Redirect::to("/settings").into_response());
+    }
+    Ok(project_page(
+        &state,
+        &headers,
+        &project,
+        part,
+        Some(&format!("Removed {login}.")),
+        None,
+    )?
+    .into_response())
 }
 
 /// One server's settings as a project's page for it shows them.

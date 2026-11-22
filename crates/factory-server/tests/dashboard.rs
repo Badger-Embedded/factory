@@ -2432,6 +2432,178 @@ async fn the_settings_sidebar_lists_only_the_logins_own_projects() {
     assert!(!body.contains("/settings/projects/tool"));
 }
 
+/// The collaborators a project has, by login, oldest first.
+fn collaborator_logins(dashboard: &Dashboard, project: &str) -> Vec<String> {
+    dashboard
+        .store
+        .collaborators(project)
+        .unwrap()
+        .into_iter()
+        .map(|collaborator| collaborator.login)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_collaborator_adds_a_login_that_then_sees_the_board() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators",
+            "login=bob@example.com",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Added bob@example.com."));
+    assert!(reply.body.contains("bob@example.com"));
+    assert!(
+        dashboard
+            .store
+            .is_collaborator("maestro", "bob@example.com")
+            .unwrap()
+    );
+
+    // The added login now sees the project's board.
+    let board = dashboard.get_as("bob@example.com", "/").await;
+    assert_eq!(board.status, StatusCode::OK);
+    assert!(board.body.contains("maestro"));
+    assert!(
+        !board
+            .body
+            .contains("You are not a collaborator on any project.")
+    );
+}
+
+#[tokio::test]
+async fn a_typed_collaborator_login_is_trimmed() {
+    let dashboard = dashboard();
+    dashboard
+        .post(
+            "/settings/projects/maestro/collaborators",
+            "login=%20%20bob%40example.com%20%20",
+        )
+        .await;
+    assert!(
+        dashboard
+            .store
+            .is_collaborator("maestro", "bob@example.com")
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn an_empty_or_duplicate_collaborator_is_refused() {
+    let dashboard = dashboard();
+    let before = collaborator_logins(&dashboard, "maestro");
+
+    let empty = dashboard
+        .post("/settings/projects/maestro/collaborators", "login=%20%20")
+        .await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert!(
+        empty
+            .body
+            .contains("Type a Tailscale login to add a collaborator.")
+    );
+
+    let duplicate = dashboard
+        .post("/settings/projects/maestro/collaborators", "login=alice")
+        .await;
+    assert_eq!(duplicate.status, StatusCode::OK);
+    assert!(duplicate.body.contains("alice is already a collaborator."));
+
+    assert_eq!(collaborator_logins(&dashboard, "maestro"), before);
+}
+
+#[tokio::test]
+async fn a_collaborator_removes_another_while_more_than_one_remains() {
+    let dashboard = dashboard();
+    // maestro starts with "alice" (the onboarding login) and USER.
+    assert!(collaborator_logins(&dashboard, "maestro").len() >= 2);
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators/remove",
+            "login=alice",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Removed alice."));
+    assert!(!dashboard.store.is_collaborator("maestro", "alice").unwrap());
+
+    // The removed login can no longer see the project's board.
+    let hidden = dashboard.get_as("alice", "/?project=maestro").await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn removing_oneself_redirects_to_settings() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators/remove",
+            &format!("login={USER}"),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/settings"));
+    assert!(!dashboard.store.is_collaborator("maestro", USER).unwrap());
+}
+
+#[tokio::test]
+async fn the_last_collaborator_cannot_be_removed() {
+    let dashboard = dashboard();
+    // Leave USER as the only collaborator on maestro.
+    dashboard
+        .store
+        .remove_collaborator("maestro", "alice")
+        .unwrap();
+    assert_eq!(
+        collaborator_logins(&dashboard, "maestro"),
+        vec![USER.to_owned()]
+    );
+
+    // With one collaborator left, the page renders no Remove control.
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page.body.contains("/collaborators/remove"));
+
+    // A crafted POST that would remove the last one is refused.
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/collaborators/remove",
+            &format!("login={USER}"),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply
+            .body
+            .contains("A project needs at least one collaborator. Remove the project instead.")
+    );
+    assert!(dashboard.store.is_collaborator("maestro", USER).unwrap());
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_add_or_remove_collaborators() {
+    let dashboard = two_projects();
+    for route in ["collaborators", "collaborators/remove"] {
+        let reply = dashboard
+            .post_as(
+                STRANGER,
+                &format!("/settings/projects/maestro/{route}"),
+                "login=bob@example.com",
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{route}");
+    }
+    assert!(
+        !dashboard
+            .store
+            .is_collaborator("maestro", "bob@example.com")
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
     let page = two_projects().get("/?project=tool").await;
