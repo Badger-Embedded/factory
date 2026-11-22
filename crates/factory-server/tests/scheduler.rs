@@ -463,6 +463,7 @@ async fn a_project_onboarded_while_running_is_picked_up() {
             "Badger-Embedded/maestro",
             "main",
             Some("just lint"),
+            Some("alice"),
         )
         .unwrap();
 

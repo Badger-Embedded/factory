@@ -171,6 +171,13 @@ CREATE TABLE IF NOT EXISTS project_mcp_tool_refreshes (
     latest INTEGER NOT NULL,
     PRIMARY KEY (project, server)
 );
+CREATE TABLE IF NOT EXISTS project_collaborators (
+    project TEXT NOT NULL,
+    login TEXT NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (project, login)
+);
 ";
 
 /// A file attached to a request. `name` is the generated name on disk, such
@@ -180,6 +187,18 @@ CREATE TABLE IF NOT EXISTS project_mcp_tool_refreshes (
 pub struct JobFile {
     pub name: String,
     pub original_name: String,
+}
+
+/// One collaborator of a project: a login that may see and act on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collaborator {
+    /// The collaborator's login, the value `user()` returns.
+    pub login: String,
+    /// The login that added this collaborator, or `migration` for a row the
+    /// startup migration created.
+    pub added_by: String,
+    /// UTC, as SQLite's `CURRENT_TIMESTAMP` writes it.
+    pub added_at: String,
 }
 
 /// One line of a job's log.
@@ -272,6 +291,9 @@ pub enum StoreError {
     /// An agent id that no available agent carries was submitted for a stage.
     /// It is not stored.
     InvalidAgent(String),
+    /// A request tried to remove the sole remaining collaborator of a project.
+    /// The project would then be visible to nobody, so removal is refused.
+    LastCollaborator,
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -292,6 +314,10 @@ impl fmt::Display for StoreError {
             StoreError::InvalidAgent(agent) => {
                 write!(f, "{agent:?} is not an available agent")
             }
+            StoreError::LastCollaborator => write!(
+                f,
+                "A project needs at least one collaborator. Remove the project instead."
+            ),
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
             StoreError::Io(err) => write!(f, "file system: {err}"),
@@ -463,6 +489,10 @@ impl Store {
     /// flags start at their defaults; the settings page saves them into
     /// `project_models` and `project_settings`.
     ///
+    /// `by` is the onboarding login, added as the project's first collaborator
+    /// in the same transaction. It is `None` only for the toml import, whose
+    /// projects the collaborator migration seeds from their jobs instead.
+    ///
     /// # Errors
     ///
     /// Fails with [`StoreError::DuplicateName`] when `name` is taken, with
@@ -474,6 +504,7 @@ impl Store {
         repo: &str,
         base: &str,
         checks: Option<&str>,
+        by: Option<&str>,
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -497,6 +528,13 @@ impl Store {
         )?;
         let gates = Self::settings_in(&tx)?.gates;
         Self::insert_project_gates(&tx, name, gates)?;
+        if let Some(by) = by {
+            tx.execute(
+                "INSERT INTO project_collaborators (project, login, added_by)
+                 VALUES (?1, ?2, ?2)",
+                params![name, by],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1332,6 +1370,158 @@ impl Store {
         };
         for name in names {
             Self::insert_project_gates(&tx, &name, gates)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The collaborators of a project, oldest first, with who added each and
+    /// when.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn collaborators(&self, project: &str) -> Result<Vec<Collaborator>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT login, added_by, added_at FROM project_collaborators
+             WHERE project = ?1 ORDER BY added_at, login",
+        )?;
+        let rows = stmt.query_map([project], |row| {
+            Ok(Collaborator {
+                login: row.get(0)?,
+                added_by: row.get(1)?,
+                added_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether `login` is a collaborator on `project`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn is_collaborator(&self, project: &str, login: &str) -> Result<bool, StoreError> {
+        let found = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM project_collaborators WHERE project = ?1 AND login = ?2",
+                params![project, login],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(found)
+    }
+
+    /// The names of the projects `login` collaborates on, in name order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn projects_for(&self, login: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT project FROM project_collaborators
+             WHERE login = ?1 ORDER BY project",
+        )?;
+        let rows = stmt.query_map([login], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Adds `login` as a collaborator on `project`, added by `by`. A login that
+    /// is already a collaborator is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn add_collaborator(&self, project: &str, login: &str, by: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO project_collaborators (project, login, added_by)
+             VALUES (?1, ?2, ?3)",
+            params![project, login, by],
+        )?;
+        Ok(())
+    }
+
+    /// Removes `login` from `project`'s collaborators.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::LastCollaborator`] when `login` is the sole
+    /// remaining collaborator, since a project with no collaborator is visible
+    /// to nobody. Removing a login that is not a collaborator changes nothing.
+    /// Also fails on a database error.
+    pub fn remove_collaborator(&self, project: &str, login: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM project_collaborators WHERE project = ?1",
+            [project],
+            |row| row.get(0),
+        )?;
+        let is_collaborator = tx
+            .query_row(
+                "SELECT 1 FROM project_collaborators WHERE project = ?1 AND login = ?2",
+                params![project, login],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if is_collaborator && count <= 1 {
+            return Err(StoreError::LastCollaborator);
+        }
+        tx.execute(
+            "DELETE FROM project_collaborators WHERE project = ?1 AND login = ?2",
+            params![project, login],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gives every project that has no collaborator rows one row for each
+    /// distinct `requested_by` login in its jobs, added by `migration`.
+    /// Collaborators did not exist before, so this seeds each project from the
+    /// logins that already requested jobs in it. A project that already has a
+    /// row is skipped, so a later edit survives a restart, and a project with
+    /// no jobs gets no rows, which the log names so the admin can add one.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn migrate_project_collaborators(&self) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let names = {
+            let mut stmt = tx.prepare(
+                "SELECT name FROM projects
+                 WHERE name NOT IN (SELECT project FROM project_collaborators)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for name in names {
+            let logins = {
+                let mut stmt =
+                    tx.prepare("SELECT DISTINCT requested_by FROM jobs WHERE project = ?1")?;
+                let rows = stmt.query_map([&name], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if logins.is_empty() {
+                tracing::warn!(
+                    "project {name:?} has no jobs, so the collaborator migration left it \
+                     with no collaborators; it is visible to nobody until one is added"
+                );
+                continue;
+            }
+            for login in logins {
+                tx.execute(
+                    "INSERT OR IGNORE INTO project_collaborators (project, login, added_by)
+                     VALUES (?1, ?2, 'migration')",
+                    params![name, login],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())

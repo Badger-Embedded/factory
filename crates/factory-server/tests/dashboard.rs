@@ -179,7 +179,9 @@ fn dashboard() -> Dashboard {
 
 fn dashboard_for(repo: &str) -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
-    store.create_project("maestro", repo, "main", None).unwrap();
+    store
+        .create_project("maestro", repo, "main", None, Some("alice"))
+        .unwrap();
     dashboard_with(store)
 }
 
@@ -744,7 +746,13 @@ async fn the_job_header_wraps_created_at_in_a_time_element() {
     let path = dir.path().join("factory.db");
     let store = Arc::new(Store::open(&path).unwrap());
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with(Arc::clone(&store));
     let id = dashboard.new_job().await;
@@ -1248,10 +1256,10 @@ fn the_import_leaves_the_global_auto_merge_migration_to_apply() {
 fn create_project_rejects_a_duplicate_name() {
     let store = Store::open_in_memory().unwrap();
     store
-        .create_project("maestro", "o/one", "main", None)
+        .create_project("maestro", "o/one", "main", None, Some("alice"))
         .unwrap();
     assert!(matches!(
-        store.create_project("maestro", "o/two", "main", None),
+        store.create_project("maestro", "o/two", "main", None, Some("alice")),
         Err(StoreError::DuplicateName(name)) if name == "maestro"
     ));
     // The rejected call wrote nothing.
@@ -1263,10 +1271,10 @@ fn create_project_rejects_a_duplicate_name() {
 fn create_project_rejects_a_duplicate_repo() {
     let store = Store::open_in_memory().unwrap();
     store
-        .create_project("maestro", "o/repo", "main", None)
+        .create_project("maestro", "o/repo", "main", None, Some("alice"))
         .unwrap();
     assert!(matches!(
-        store.create_project("tool", "o/repo", "main", None),
+        store.create_project("tool", "o/repo", "main", None, Some("alice")),
         Err(StoreError::DuplicateRepo(repo)) if repo == "o/repo"
     ));
     assert_eq!(store.list_projects().unwrap().len(), 1);
@@ -1282,7 +1290,7 @@ async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
 
     // Onboard one while the dashboard runs, as the wizard will.
     store
-        .create_project("widgets", "acme/widgets", "main", None)
+        .create_project("widgets", "acme/widgets", "main", None, Some("alice"))
         .unwrap();
 
     // It shows on the board selector, the settings page and the new-job form
@@ -1537,7 +1545,13 @@ async fn storage_and_retention_stay_in_utc() {
     let path = dir.path().join("factory.db");
     let store = Arc::new(Store::open(&path).unwrap());
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with(Arc::clone(&store));
     let id = dashboard.new_job().await;
@@ -2208,10 +2222,10 @@ async fn links_use_the_repository_from_the_project_file() {
 fn two_projects() -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("maestro", "o/maestro", "main", None)
+        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
         .unwrap();
     store
-        .create_project("tool", "o/tool", "main", None)
+        .create_project("tool", "o/tool", "main", None, Some("alice"))
         .unwrap();
     dashboard_with(store)
 }
@@ -2912,7 +2926,13 @@ fn onboarding_copies_the_default_gates_and_later_defaults_leave_the_project_alon
         })
         .unwrap();
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     assert_eq!(store.project_gates("maestro").unwrap(), defaults);
 
@@ -2933,7 +2953,9 @@ fn the_gates_migration_copies_the_global_gates_into_each_project_once() {
     let path = dir.path().join("factory.db");
     let store = Store::open(&path).unwrap();
     for (name, repo) in [("maestro", "o/maestro"), ("factory", "o/factory")] {
-        store.create_project(name, repo, "main", None).unwrap();
+        store
+            .create_project(name, repo, "main", None, Some("alice"))
+            .unwrap();
     }
     // A database from before per-project gates has projects but no gate rows.
     rusqlite::Connection::open(&path)
@@ -2964,6 +2986,109 @@ fn the_gates_migration_copies_the_global_gates_into_each_project_once() {
     store.migrate_project_gates().unwrap();
     assert_eq!(store.project_gates("maestro").unwrap(), no_gates());
     assert_eq!(store.project_gates("factory").unwrap(), global);
+}
+
+#[test]
+fn onboarding_makes_the_onboarding_login_the_only_collaborator() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("factory.db")).unwrap();
+    store
+        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .unwrap();
+
+    let collaborators = store.collaborators("maestro").unwrap();
+    assert_eq!(collaborators.len(), 1);
+    assert_eq!(collaborators[0].login, "alice");
+    assert_eq!(collaborators[0].added_by, "alice");
+    assert!(store.is_collaborator("maestro", "alice").unwrap());
+    assert!(!store.is_collaborator("maestro", "bob").unwrap());
+    assert_eq!(store.projects_for("alice").unwrap(), vec!["maestro"]);
+    assert_eq!(store.projects_for("bob").unwrap().len(), 0);
+}
+
+#[test]
+fn adding_and_removing_collaborators_tracks_who_added_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("factory.db")).unwrap();
+    store
+        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .unwrap();
+
+    store.add_collaborator("maestro", "bob", "alice").unwrap();
+    store.add_collaborator("maestro", "bob", "carol").unwrap();
+    let collaborators = store.collaborators("maestro").unwrap();
+    let logins: Vec<_> = collaborators.iter().map(|c| c.login.as_str()).collect();
+    assert_eq!(logins, ["alice", "bob"]);
+    assert_eq!(collaborators[1].added_by, "alice");
+    assert_eq!(store.projects_for("bob").unwrap(), vec!["maestro"]);
+
+    store.remove_collaborator("maestro", "alice").unwrap();
+    assert!(!store.is_collaborator("maestro", "alice").unwrap());
+    assert_eq!(store.projects_for("alice").unwrap().len(), 0);
+
+    let err = store.remove_collaborator("maestro", "bob").unwrap_err();
+    assert!(matches!(err, StoreError::LastCollaborator));
+    assert_eq!(
+        err.to_string(),
+        "A project needs at least one collaborator. Remove the project instead."
+    );
+    assert!(store.is_collaborator("maestro", "bob").unwrap());
+
+    store.remove_collaborator("maestro", "nobody").unwrap();
+    assert_eq!(store.collaborators("maestro").unwrap().len(), 1);
+}
+
+#[test]
+fn the_collaborator_migration_seeds_each_project_from_its_requesters_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    for (name, repo) in [
+        ("maestro", "o/maestro"),
+        ("factory", "o/factory"),
+        ("empty", "o/empty"),
+    ] {
+        store
+            .create_project(name, repo, "main", None, Some("onboarder"))
+            .unwrap();
+    }
+    store.create("maestro", "alice", "one request").unwrap();
+    store.create("maestro", "bob", "another request").unwrap();
+    store.create("maestro", "alice", "a third request").unwrap();
+    store.create("factory", "carol", "a request").unwrap();
+
+    // A database from before collaborators has projects and jobs but no
+    // collaborator rows.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DELETE FROM project_collaborators", [])
+        .unwrap();
+
+    store.migrate_project_collaborators().unwrap();
+
+    let logins = |project: &str| {
+        let mut logins: Vec<_> = store
+            .collaborators(project)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.login)
+            .collect();
+        logins.sort();
+        logins
+    };
+    assert_eq!(logins("maestro"), ["alice", "bob"]);
+    assert_eq!(logins("factory"), ["carol"]);
+    assert_eq!(store.collaborators("empty").unwrap().len(), 0);
+    assert_eq!(
+        store.collaborators("maestro").unwrap()[0].added_by,
+        "migration"
+    );
+
+    store.remove_collaborator("maestro", "bob").unwrap();
+    store.add_collaborator("maestro", "dave", "alice").unwrap();
+    store.migrate_project_collaborators().unwrap();
+    assert_eq!(logins("maestro"), ["alice", "dave"]);
+    assert_eq!(store.collaborators("empty").unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -4458,10 +4583,16 @@ async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alo
     let path = dir.path().join("factory.db");
     let store = Arc::new(Store::open(&path).unwrap());
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     store
-        .create_project("tool", "Badger-Embedded/tool", "main", None)
+        .create_project("tool", "Badger-Embedded/tool", "main", None, Some("alice"))
         .unwrap();
     let dashboard = dashboard_with(Arc::clone(&store));
 
@@ -4808,7 +4939,13 @@ async fn saving_the_form_persists_the_agents() {
     let path = dir.path().join("factory.db");
     let store = Arc::new(Store::open(&path).unwrap());
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with(Arc::clone(&store));
 
@@ -5322,7 +5459,13 @@ async fn a_job_from_before_the_history_shows_its_steps_without_times() {
     let path = dir.path().join("factory.db");
     let store = Arc::new(Store::open(&path).unwrap());
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with(store);
     let id = dashboard.new_job().await;
@@ -6290,6 +6433,20 @@ async fn skipping_step_two_creates_a_project_with_defaults() {
 }
 
 #[tokio::test]
+async fn onboarding_makes_the_requester_the_only_collaborator() {
+    let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
+    let reply = dashboard
+        .post("/onboard", "repo=acme%2Fwidgets&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+
+    let collaborators = store.collaborators("widgets").unwrap();
+    assert_eq!(collaborators.len(), 1);
+    assert_eq!(collaborators[0].login, "alice@example.com");
+    assert_eq!(collaborators[0].added_by, "alice@example.com");
+}
+
+#[tokio::test]
 async fn step_two_values_are_stored_and_shown_on_the_settings_page() {
     let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
     let reply = dashboard
@@ -6472,7 +6629,7 @@ async fn squash_merge_disabled_is_rejected_with_no_row() {
 async fn a_duplicate_name_is_rejected_with_no_row() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("widgets", "acme/old", "main", None)
+        .create_project("widgets", "acme/old", "main", None, Some("alice"))
         .unwrap();
     rejected(
         Arc::new(FakeRepos::fit()),
@@ -6487,7 +6644,7 @@ async fn a_duplicate_name_is_rejected_with_no_row() {
 async fn a_duplicate_repo_is_rejected_with_no_row() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("other", "acme/widgets", "main", None)
+        .create_project("other", "acme/widgets", "main", None, Some("alice"))
         .unwrap();
     rejected(
         Arc::new(FakeRepos::fit()),
@@ -6911,7 +7068,13 @@ async fn saving_one_projects_mcp_leaves_other_projects_alone() {
 async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with_secrets(
         Arc::clone(&store),
@@ -7052,7 +7215,13 @@ async fn the_clear_control_removes_the_claude_token() {
 async fn without_a_master_key_the_claude_token_field_is_disabled_with_a_message() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("maestro", "Badger-Embedded/maestro", "main", None)
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with_secrets(
         Arc::clone(&store),
