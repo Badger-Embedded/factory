@@ -272,7 +272,7 @@ fn the_success_fixture_parses_into_the_reply_and_a_result() {
         [
             &LogLine::Text("pong".into()),
             &LogLine::Other(
-                "Copilot usage: 6.2503 AI credits; tokens: 4 input, 0 cache read, 24982 cache write, 4 output"
+                "Copilot usage: 1 premium request(s), 6.2503 AI credits; tokens: 4 input, 0 cache read, 24982 cache write, 4 output"
                     .into()
             ),
             &LogLine::Other("Copilot reported 1 premium request(s)".into()),
@@ -614,4 +614,38 @@ async fn the_cost_note_is_logged_once_for_a_run_that_reaches_its_result_line() {
 
     assert_eq!(report.cost_usd, None);
     assert_eq!(cost_notes(&log), 1, "{log:?}");
+}
+
+#[tokio::test]
+async fn a_checkpoint_is_logged_when_the_run_dies_before_its_result_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_text = fs::read_to_string(fixture("copilot-success.jsonl")).unwrap();
+    let checkpoint = fixture_text
+        .lines()
+        .find(|line| line.contains("session.usage_checkpoint"))
+        .unwrap();
+    let stdout = dir.path().join("stdout.jsonl");
+    fs::write(&stdout, format!("{checkpoint}\n")).unwrap();
+    let podman = support::executable(
+        dir.path(),
+        "podman",
+        &format!("#!/bin/bash\ncat '{}'\nexit 137\n", stdout.display()),
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+
+    let mut log = Vec::new();
+    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+
+    assert!(matches!(report.event, Event::AgentFailed { .. }));
+    assert!(
+        log.contains(&LogLine::Other(
+            "Copilot usage: 1 premium request(s), 6.2503 AI credits; tokens: 4 input, 0 cache read, 24982 cache write, 4 output"
+                .into()
+        )),
+        "{log:?}"
+    );
 }

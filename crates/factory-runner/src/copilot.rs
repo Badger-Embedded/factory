@@ -356,7 +356,10 @@ fn checkpoint_log(data: Option<&Value>) -> Option<AgentItem> {
         .unwrap_or(0)
     };
     Some(AgentItem::Log(LogLine::Other(format!(
-        "Copilot usage: {credits:.4} AI credits; tokens: {} input, {} cache read, {} cache write, {} output",
+        "Copilot usage: {} premium request(s), {credits:.4} AI credits; tokens: {} input, {} cache read, {} cache write, {} output",
+        data.get("totalPremiumRequests")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
         tokens("input"),
         tokens("cache_read"),
         tokens("cache_write"),
