@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -9782,25 +9783,47 @@ async fn the_board_asks_for_permission_only_while_notifications_are_on() {
     );
 }
 
-#[tokio::test]
-async fn the_job_list_pairs_each_job_with_its_latest_event() {
-    let dashboard = dashboard();
-    let first = dashboard.new_job().await;
-    let second = dashboard.new_job().await;
-    to_spec_approval(&dashboard, first);
-    let rows = dashboard.store.list_with_latest_event().unwrap();
-    assert_eq!(rows.len(), 2);
-    let (newer, newer_event) = &rows[0];
-    let (older, older_event) = &rows[1];
-    assert_eq!((newer.id, older.id), (second, first));
-    assert!(*older_event > *newer_event);
-    let before = *older_event;
-
-    dashboard.apply(first, Event::Approve);
-    let rows = dashboard.store.list_with_latest_event().unwrap();
-    assert!(rows[1].1 > before);
-    assert_eq!(
-        rows[1].0.job.stage(),
-        dashboard.store.get(first).unwrap().job.stage()
-    );
+#[test]
+fn a_job_listed_while_it_changes_state_keeps_its_state_and_event_together() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("a"),
+        )
+        .unwrap();
+    let writer = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            for _ in 0..150 {
+                let id = store.create("maestro", "a", "Add a button").unwrap();
+                store.apply(id, Event::Start).unwrap();
+                store
+                    .apply(id, Event::Agent(AgentResult::Clarified))
+                    .unwrap();
+                store
+                    .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
+                    .unwrap();
+                store.apply(id, Event::Approve).unwrap();
+            }
+        })
+    };
+    let mut seen: HashMap<i64, String> = HashMap::new();
+    while !writer.is_finished() {
+        for (row, event) in store.list_with_latest_event().unwrap() {
+            let state = format!("{}/{}", row.job.stage().name(), row.job.turn().name());
+            assert_eq!(seen.entry(event).or_insert_with(|| state.clone()), &state);
+        }
+    }
+    writer.join().unwrap();
+    for (row, event) in store.list_with_latest_event().unwrap() {
+        let last = store.events(row.id).unwrap().pop().unwrap();
+        assert_eq!(last.stage, row.job.stage().name());
+        assert_eq!(last.turn, row.job.turn().name());
+        let state = format!("{}/{}", last.stage, last.turn);
+        assert_eq!(seen.get(&event).unwrap_or(&state), &state);
+    }
 }

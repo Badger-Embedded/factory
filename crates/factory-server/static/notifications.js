@@ -1,16 +1,14 @@
 (function () {
   if (!("Notification" in window)) return;
   var STORE = "factory.notified";
-  var LOCK = "factory-notifications";
   var pending = false;
 
   function stored() {
     try {
-      var list = JSON.parse(localStorage.getItem(STORE));
-      return Array.isArray(list) ? list : null;
-    } catch (e) {
-      return null;
-    }
+      var state = JSON.parse(localStorage.getItem(STORE));
+      if (state && Array.isArray(state.keys) && typeof state.at === "number") return state;
+    } catch (e) {}
+    return null;
   }
 
   function show(item) {
@@ -26,43 +24,39 @@
     };
   }
 
-  function fetchAndShow() {
-    return fetch("/notifications", { headers: { Accept: "application/json" } })
+  function poll() {
+    if (pending || Notification.permission !== "granted") return;
+    pending = true;
+    var started = Date.now();
+    var done = function () {
+      pending = false;
+    };
+    fetch("/notifications", { headers: { Accept: "application/json" } })
       .then(function (response) {
         return response.ok ? response.json() : null;
       })
       .then(function (data) {
         if (!data || !data.enabled) return;
-        var seen = stored();
-        var first = seen === null;
-        seen = seen || [];
+        var state = stored();
+        if (state && started < state.at) return;
+        var seen = state ? state.keys : [];
         data.items.forEach(function (item) {
-          if (seen.indexOf(item.key) === -1 && !first) show(item);
+          if (state && seen.indexOf(item.key) === -1) show(item);
         });
         try {
           localStorage.setItem(
             STORE,
-            JSON.stringify(
-              data.items.map(function (item) {
+            JSON.stringify({
+              at: started,
+              keys: data.items.map(function (item) {
                 return item.key;
-              })
-            )
+              }),
+            })
           );
         } catch (e) {}
       })
-      .catch(function () {});
-  }
-
-  function poll() {
-    if (pending || Notification.permission !== "granted") return;
-    pending = true;
-    var done = function () {
-      pending = false;
-    };
-    var run = navigator.locks
-      ? navigator.locks.request(LOCK, fetchAndShow)
-      : fetchAndShow();
-    run.then(done, done);
+      .catch(function () {})
+      .then(done);
   }
 
   poll();
