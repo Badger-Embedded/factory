@@ -166,8 +166,6 @@ pub fn app(
         .with_state(state)
 }
 
-/// Every factory-wide settings route sits in this router, behind
-/// `require_admin`, so a route added here cannot skip the admin check.
 fn admin_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/settings/workers", get(show_workers).post(save_workers))
@@ -222,7 +220,6 @@ pub fn parse_admins(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Refuses a login outside the admin list with 403, before the handler runs.
 async fn require_admin(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,

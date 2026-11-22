@@ -212,12 +212,10 @@ fn dashboard_with_secrets(
     github: Arc<dyn RepoChecker>,
     secrets: Arc<dyn SecretStore>,
 ) -> Dashboard {
-    // The collaborator-scoping tests read admin pages as these logins.
     let admins = [USER, STRANGER, MAESTRO_ONLY].map(str::to_owned).to_vec();
     dashboard_with_admins(store, github, secrets, admins)
 }
 
-/// As [`dashboard_with_secrets`], with the factory admin list given.
 fn dashboard_with_admins(
     store: Arc<Store>,
     github: Arc<dyn RepoChecker>,
