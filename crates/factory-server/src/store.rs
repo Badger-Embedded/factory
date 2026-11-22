@@ -202,6 +202,13 @@ CREATE TABLE IF NOT EXISTS renovate_prs (
     job_id INTEGER NOT NULL,
     PRIMARY KEY (project, number)
 );
+CREATE TABLE IF NOT EXISTS dismissed_gaps (
+    job_id INTEGER PRIMARY KEY,
+    project TEXT NOT NULL,
+    source_job INTEGER NOT NULL,
+    source_pr INTEGER NOT NULL,
+    request TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS user_settings (
     login TEXT PRIMARY KEY,
     notifications INTEGER NOT NULL DEFAULT 1,
@@ -394,6 +401,16 @@ pub struct Snapshot {
     /// pair, also after a restart, and no clock is involved.
     pub order: (u64, u64),
     pub jobs: Vec<(JobRow, i64)>,
+}
+
+/// A gap job as the packaging analysis sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapJob {
+    pub id: i64,
+    pub source_job: i64,
+    pub source_pr: u64,
+    pub request: String,
+    pub dismissed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -777,6 +794,12 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut row = Self::load(&tx, id)?;
+        if *row.job.stage() != Stage::Proposed {
+            return Err(StoreError::Rejected(Rejected::Unexpected {
+                stage: row.job.stage().clone(),
+                event: Event::Approve,
+            }));
+        }
         Self::apply_in(&tx, &mut row, Event::Approve)?;
         tx.execute(
             "UPDATE jobs SET requested_by = ?1 WHERE id = ?2",
@@ -787,30 +810,59 @@ impl Store {
         Ok(row)
     }
 
-    /// The gap jobs of `project` that are waiting for approval, still running
-    /// or dismissed, newest first. A gap job that ended another way is not
-    /// listed.
+    /// The gap jobs of `project` that are waiting for approval, still
+    /// running or dismissed, newest first. A dismissal is kept in its own
+    /// table, so it outlives the job's expiry and a dismissed gap is not
+    /// proposed again. A gap job that ended another way is not listed.
     ///
     /// # Errors
     ///
     /// Fails on a database error or a stored job that does not parse.
-    pub fn gap_jobs(&self, project: &str) -> Result<Vec<JobRow>, StoreError> {
+    pub fn gap_jobs(&self, project: &str) -> Result<Vec<GapJob>, StoreError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, project, requested_by, created_at, job FROM jobs
              WHERE project = ?1 ORDER BY id DESC",
         )?;
         let rows = stmt.query_map([project], raw_row)?;
-        let mut jobs = Vec::new();
+        let mut gaps = Vec::new();
         for row in rows {
             let row = parse_row(row?)?;
-            let wanted = row.job.gap_source().is_some()
-                && (!row.job.is_finished() || *row.job.stage() == Stage::Dismissed);
-            if wanted {
-                jobs.push(row);
+            let Some((source_job, source_pr)) = row.job.gap_source() else {
+                continue;
+            };
+            let dismissed = *row.job.stage() == Stage::Dismissed;
+            if dismissed || !row.job.is_finished() {
+                gaps.push(GapJob {
+                    id: row.id,
+                    source_job,
+                    source_pr,
+                    request: row.job.request().to_owned(),
+                    dismissed,
+                });
             }
         }
-        Ok(jobs)
+        let mut stmt = conn.prepare(
+            "SELECT job_id, source_job, source_pr, request FROM dismissed_gaps
+             WHERE project = ?1 ORDER BY job_id DESC",
+        )?;
+        let kept = stmt.query_map([project], |r| {
+            Ok(GapJob {
+                id: r.get(0)?,
+                source_job: r.get(1)?,
+                source_pr: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                request: r.get(3)?,
+                dismissed: true,
+            })
+        })?;
+        for gap in kept {
+            let gap = gap?;
+            if !gaps.iter().any(|g| g.id == gap.id) {
+                gaps.push(gap);
+            }
+        }
+        gaps.sort_by_key(|g| std::cmp::Reverse(g.id));
+        Ok(gaps)
     }
 
     /// Inserts `job` with its `created` event and counts it in the project's
@@ -1014,6 +1066,22 @@ impl Store {
             "UPDATE jobs SET job = ?1 WHERE id = ?2",
             params![serde_json::to_string(&row.job)?, row.id],
         )?;
+        if let (Stage::Dismissed, Some((source_job, source_pr))) =
+            (row.job.stage(), row.job.gap_source())
+        {
+            tx.execute(
+                "INSERT OR REPLACE INTO dismissed_gaps
+                 (job_id, project, source_job, source_pr, request)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    row.id,
+                    row.project,
+                    source_job,
+                    i64::try_from(source_pr).unwrap_or(i64::MAX),
+                    row.job.request()
+                ],
+            )?;
+        }
         if !was_merged && *row.job.stage() == Stage::Merged {
             tx.execute(
                 "INSERT INTO project_totals (project, jobs_merged) VALUES (?1, 1)
@@ -1973,6 +2041,7 @@ impl Store {
             "project_collaborators",
             "project_maintenance",
             "renovate_prs",
+            "dismissed_gaps",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;

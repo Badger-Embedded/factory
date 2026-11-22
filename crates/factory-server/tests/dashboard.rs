@@ -10761,3 +10761,53 @@ async fn a_proposal_notifies_every_collaborator_and_after_approval_only_the_appr
     assert_eq!(bob[0]["job"], id);
     assert_eq!(notifications_as(&dashboard, USER).await["items"], json!([]));
 }
+
+#[tokio::test]
+async fn a_dismissed_gap_stays_known_after_its_job_expires() {
+    let dashboard = dashboard();
+    let store = &dashboard.store;
+    let kept = store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+    let live = store
+        .create_gap_job("maestro", 1, 43, "Drop the old flag")
+        .unwrap();
+    dashboard.apply(kept, Event::Dismiss);
+    store.delete_job(kept, Path::new("/nonexistent")).unwrap();
+
+    let gaps = store.gap_jobs("maestro").unwrap();
+    let ids: Vec<(i64, bool)> = gaps.iter().map(|g| (g.id, g.dismissed)).collect();
+    assert_eq!(ids, [(live, false), (kept, true)]);
+    assert_eq!(gaps[1].request, "Add the new build flag");
+    assert_eq!(gaps[1].source_pr, 42);
+    assert_eq!(store.gap_jobs("other").unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_stale_proposal_approval_cannot_pass_a_later_gate_or_change_the_requester() {
+    let dashboard = dashboard();
+    let store = &dashboard.store;
+    store
+        .save_project_gates(
+            "maestro",
+            Gates {
+                spec: true,
+                plan: true,
+                publish: false,
+            },
+        )
+        .unwrap();
+    let id = store
+        .create_gap_job("maestro", 1, 42, "Add the new build flag")
+        .unwrap();
+    store.approve_proposal(id, "bob@example.com").unwrap();
+    dashboard.apply(id, Event::Start);
+    dashboard.apply(id, Event::Agent(AgentResult::Clarified));
+    dashboard.apply(id, Event::Agent(AgentResult::Spec("spec".into())));
+
+    assert!(store.approve_proposal(id, "carol@example.com").is_err());
+    let row = store.get(id).unwrap();
+    assert_eq!(row.requested_by, "bob@example.com");
+    assert_eq!(row.job.stage(), &Stage::Spec);
+    assert_eq!(row.job.turn(), &Turn::User(Ask::SpecApproval));
+}
