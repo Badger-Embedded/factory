@@ -1,5 +1,5 @@
 use factory_core::{
-    AgentResult, DiffVerdict, Event, PlannedPr, PrDescription, Question, Stage, Task,
+    AgentResult, DiffVerdict, Event, Gap, PlannedPr, PrDescription, Question, Stage, Task,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,6 +26,9 @@ pub enum Expect {
     /// The diff check of a Renovate pull request. It ends with `safe` or
     /// `unsafe`, with a reason and a summary, and never asks a question.
     DiffCheck,
+    /// The packaging analysis after a merged Renovate pull request. It ends
+    /// with `gaps`, a list that may be empty, and never asks a question.
+    PackagingGaps,
 }
 
 impl Expect {
@@ -51,6 +54,7 @@ impl Expect {
         match (stage, task) {
             (Stage::Renovate, Task::AnalyzeFailure { .. }) => return Some(Expect::FailureAnalysis),
             (Stage::Renovate, Task::CheckDiff { .. }) => return Some(Expect::DiffCheck),
+            (Stage::Packaging, Task::FindGaps { .. }) => return Some(Expect::PackagingGaps),
             _ => {}
         }
         match (Self::for_stage(stage)?, task) {
@@ -61,8 +65,9 @@ impl Expect {
     }
 
     /// The outcomes a run may end with. Every stage run may end with
-    /// questions; a review run ends with `approve` or `changes`, and the two
-    /// Renovate runs with their verdicts.
+    /// questions; a review run ends with `approve` or `changes`, the two
+    /// Renovate runs with their verdicts, and the packaging analysis with
+    /// `gaps`.
     #[must_use]
     pub fn outcomes(self) -> Vec<&'static str> {
         let done = match self {
@@ -73,6 +78,7 @@ impl Expect {
             Expect::Review => return vec!["approve", "changes"],
             Expect::FailureAnalysis => return vec!["transient", "caused_by_update"],
             Expect::DiffCheck => return vec!["safe", "unsafe"],
+            Expect::PackagingGaps => return vec!["gaps"],
         };
         let mut outcomes = vec!["questions", done];
         if self == Expect::FixCi {
@@ -153,7 +159,11 @@ impl Expect {
                 });
             }
             // Review returns its own schema above, before this match.
-            Expect::Clarify | Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => {}
+            Expect::Clarify
+            | Expect::Review
+            | Expect::FailureAnalysis
+            | Expect::DiffCheck
+            | Expect::PackagingGaps => {}
         }
         if self == Expect::FixCi {
             properties["reason"] = json!({
@@ -214,6 +224,48 @@ impl Expect {
                     }
                 },
                 "required": ["outcome", "reason", "summary"],
+                "additionalProperties": false
+            })),
+            Expect::PackagingGaps => Some(json!({
+                "type": "object",
+                "properties": {
+                    "outcome": {
+                        "type": "string",
+                        "enum": self.outcomes()
+                    },
+                    "gaps": {
+                        "type": "array",
+                        "description": "The packaging gaps found, or an empty list when there are none.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "description": "A short title for the gap."
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "What upstream introduced and why the packaging does not reflect it."
+                                },
+                                "evidence": {
+                                    "type": "string",
+                                    "description": "The upstream change that shows it, quoted from the patch or the release notes."
+                                },
+                                "current": {
+                                    "type": "string",
+                                    "description": "What the packaging manifest has now for this."
+                                },
+                                "suggestion": {
+                                    "type": "string",
+                                    "description": "The change to the packaging that closes the gap."
+                                }
+                            },
+                            "required": ["title", "description", "evidence", "current", "suggestion"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["outcome", "gaps"],
                 "additionalProperties": false
             })),
             _ => None,
@@ -281,6 +333,16 @@ struct Output {
     summary: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    gaps: Option<Vec<GapEntry>>,
+}
+
+#[derive(Deserialize)]
+struct GapEntry {
+    title: String,
+    description: String,
+    evidence: String,
+    current: String,
+    suggestion: String,
 }
 
 #[derive(Deserialize)]
@@ -381,6 +443,24 @@ fn review_output(output: Option<Value>) -> Result<Event, String> {
     }
 }
 
+fn gaps_result(entries: Option<Vec<GapEntry>>) -> Result<AgentResult, String> {
+    let entries = entries.ok_or("the agent reported no list of gaps")?;
+    let mut gaps = Vec::new();
+    for entry in entries {
+        if entry.title.trim().is_empty() || entry.description.trim().is_empty() {
+            return Err("the agent reported a gap with no title or no description".into());
+        }
+        gaps.push(Gap {
+            title: entry.title,
+            description: entry.description,
+            evidence: entry.evidence,
+            current: entry.current,
+            suggestion: entry.suggestion,
+        });
+    }
+    Ok(AgentResult::Gaps(gaps))
+}
+
 fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, String> {
     let output = output.ok_or("the agent run ended without structured output")?;
     let output: Output = serde_json::from_value(output)
@@ -414,7 +494,8 @@ fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, St
                 )),
             }
         }
-        (Expect::FailureAnalysis | Expect::DiffCheck, other) => Err(format!(
+        (Expect::PackagingGaps, "gaps") => gaps_result(output.gaps),
+        (Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps, other) => Err(format!(
             "the agent ended with outcome {other:?}, expected one of {:?}",
             expect.outcomes()
         )),

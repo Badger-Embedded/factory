@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use factory_core::{Agent, Answered, Job, PlannedPr, Task, Verdict};
+use factory_core::{Agent, Answered, FileText, Job, PackagingContext, PlannedPr, Task, Verdict};
 
 use crate::agent::{PromptStyle, backend};
 use crate::outcome::Expect;
@@ -102,6 +102,7 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
             return failure_prompt(log, agent);
         }
         Task::CheckDiff { diff, body } => return diff_prompt(diff, body, agent),
+        Task::FindGaps { context } => return gaps_prompt(context, agent),
     };
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
@@ -161,6 +162,129 @@ fn diff_prompt(diff: &str, body: &str, agent: Agent) -> String {
          or refs the update moves between, give them as \"from\" and \"to\"."
     );
     append_schema(&mut text, agent, Expect::DiffCheck);
+    text
+}
+
+/// The rules for what counts as a packaging gap, by packaging type.
+fn gap_rules(kind: &str) -> &'static str {
+    match kind {
+        "snap" => {
+            "For a snap, look for:\n\
+             - new cmake `option()` flags, especially optional features that are off by \
+             default, that `cmake-parameters` in snapcraft.yaml does not set;\n\
+             - optional backends, such as GPU acceleration or hardware-specific libraries, \
+             that `stage-packages` does not include;\n\
+             - new interfaces the snap needs for new hardware access or system features;\n\
+             - new environment variables the upstream binary now respects;\n\
+             - new hooks that would improve the user experience."
+        }
+        "deb" => {
+            "For a deb, look for:\n\
+             - new Build-Depends that optional features need;\n\
+             - new cmake or meson flags in `debian/rules` that enable useful features;\n\
+             - new runtime Depends for optional functionality;\n\
+             - changes to `debian/patches` that may need updating."
+        }
+        _ => {
+            "Look broadly for new build flags, runtime dependencies, optional feature flags \
+             and config files."
+        }
+    }
+}
+
+fn file_section(text: &mut String, title: &str, files: &[FileText], missing: &str) {
+    let _ = write!(text, "{title}\n\n");
+    if files.is_empty() {
+        text.push_str("None are configured.\n\n");
+    }
+    for file in files {
+        match &file.text {
+            Some(content) => {
+                let _ = write!(text, "File {}:\n\n{content}\n\n", file.path);
+            }
+            None => {
+                let _ = write!(text, "File {}: {missing}\n\n", file.path);
+            }
+        }
+    }
+}
+
+/// The prompt for the packaging analysis. The worker has no GitHub token, so
+/// the prompt carries the manifest, the pull request and the upstream patches.
+fn gaps_prompt(context: &PackagingContext, agent: Agent) -> String {
+    let mut text = format!(
+        "A Renovate pull request that updates the upstream project {} merged into this \
+         {} packaging repository. Find the packaging gaps: things the update introduced \
+         upstream that the packaging does not reflect.\n\n",
+        context.upstream_repo, context.kind
+    );
+    let _ = write!(
+        text,
+        "The pull request is titled {:?}. Its description:\n\n{}\n\nIts diff:\n\n{}\n\n",
+        context.pr_title, context.pr_body, context.pr_diff
+    );
+    file_section(
+        &mut text,
+        "The packaging manifest files as they are on the base branch after the merge:",
+        &context.manifests,
+        "it does not exist.",
+    );
+    match (&context.from, &context.to) {
+        (Some(from), Some(to)) => {
+            let _ = write!(
+                text,
+                "The update moves {} from {from} to {to}. These are the upstream changes to \
+                 its build configuration files between the two:\n\n",
+                context.upstream_repo
+            );
+            if context.upstream.is_empty() {
+                text.push_str("No build configuration files are configured. Use the manifest and the release notes in the description.\n\n");
+            }
+            for file in &context.upstream {
+                match &file.text {
+                    Some(patch) => {
+                        let _ = write!(text, "Patch of {}:\n\n{patch}\n\n", file.path);
+                    }
+                    None => {
+                        let _ = write!(text, "{} did not change.\n\n", file.path);
+                    }
+                }
+            }
+        }
+        _ => text.push_str(
+            "The upstream changes are unavailable, because the factory never found the \
+             versions the update moves between. Use the manifest and the release notes in \
+             the description.\n\n",
+        ),
+    }
+    if !context.existing.is_empty() {
+        text.push_str(
+            "The project already has these gap jobs. Leave out a gap that one of them \
+             covers, whether it waits for approval, is in progress or was dismissed:\n",
+        );
+        for existing in &context.existing {
+            let state = if existing.dismissed {
+                "dismissed"
+            } else {
+                "proposed or in progress"
+            };
+            let _ = write!(text, "\n--- {state}\n{}\n", existing.request);
+        }
+        text.push('\n');
+    }
+    let _ = write!(
+        text,
+        "{}\n\n\
+         Do not report internal refactors, test-only changes, removals of deprecated \
+         features, API-only changes with no user-facing effect, or changes the manifest \
+         already reflects. Report each distinct gap once, with the upstream evidence, what \
+         the packaging has now and the change you suggest. Do not change any files and do \
+         not push.\n\n\
+         End with outcome \"gaps\" and the list of gaps. The list is empty when you found \
+         none.",
+        gap_rules(&context.kind)
+    );
+    append_schema(&mut text, agent, Expect::PackagingGaps);
     text
 }
 

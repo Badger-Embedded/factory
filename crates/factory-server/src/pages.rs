@@ -2799,6 +2799,7 @@ fn flow_index(stage: &Stage) -> Option<usize> {
         Stage::CiAndReview { .. } => 7,
         Stage::Merged => 8,
         Stage::Renovate
+        | Stage::Packaging
         | Stage::Proposed
         | Stage::Dismissed
         | Stage::Cancelled
@@ -3267,6 +3268,17 @@ fn renovate_details(pr: &RenovatePr, settings: &Settings) -> Markup {
                 }
                 li { "Summary: " (verdict.summary) }
             }
+            @match &pr.gaps {
+                Some(jobs) if jobs.is_empty() => li { "No gaps found" },
+                Some(jobs) => li {
+                    "Packaging gaps found: "
+                    @for (i, job) in jobs.iter().enumerate() {
+                        @if i > 0 { ", " }
+                        a href={ "/jobs/" (job) } { "job " (job) }
+                    }
+                },
+                None => {}
+            }
         }
     }
 }
@@ -3644,7 +3656,14 @@ fn status_card(id: i64, job: &Job, settings: &Settings, auto_merge: bool) -> Mar
             renovate_wait_card(id, job, settings, reason, *state)
         }
         (Stage::Proposed, _) => proposal_card(id, job),
-        (Stage::Renovate | Stage::Merged | Stage::Cancelled | Stage::Dismissed, _) => html! {
+        (
+            Stage::Renovate
+            | Stage::Packaging
+            | Stage::Merged
+            | Stage::Cancelled
+            | Stage::Dismissed,
+            _,
+        ) => html! {
             div.card.status {
                 (turn_badge(job, auto_merge))
                 span.status-detail { (turn_detail(job, settings, auto_merge)) }
@@ -3796,6 +3815,7 @@ fn stage_label(job: &Job) -> String {
         Stage::PrOpen { pr } => format!("pr-open, {}", of(*pr)),
         Stage::CiAndReview { pr } => format!("ci-and-review, {}", of(*pr)),
         Stage::Renovate => "renovate".into(),
+        Stage::Packaging => "packaging".into(),
         Stage::Proposed => "proposal".into(),
         Stage::Dismissed => "dismissed".into(),
         Stage::Merged => "merged".into(),
@@ -3839,6 +3859,13 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
             Some(Command::MergeRenovate { number, .. }) => {
                 format!("The factory is approving and merging pull request #{number}.")
             }
+            Some(Command::GatherPackaging { number }) => format!(
+                "Pull request #{number} merged. The factory is reading the manifest and the \
+                 upstream changes for the packaging analysis."
+            ),
+            Some(Command::ProposeGaps { .. }) => {
+                "The factory is creating a job for each packaging gap.".into()
+            }
             Some(
                 Command::RunAgent { .. }
                 | Command::Summarize { .. }
@@ -3875,6 +3902,7 @@ pub(crate) fn task_label(task: &Task) -> &'static str {
         Task::Review => "reviewing the pull request",
         Task::AnalyzeFailure { .. } => "reading the CI failure log",
         Task::CheckDiff { .. } => "checking the diff of the update",
+        Task::FindGaps { .. } => "looking for packaging gaps",
     }
 }
 

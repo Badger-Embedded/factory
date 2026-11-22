@@ -916,7 +916,7 @@ fn keep_session_settings(
             &mut efforts.implement,
             &agents.implement,
         ),
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => {
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
             (&mut models.review, &mut efforts.review, &agents.review)
         }
     };

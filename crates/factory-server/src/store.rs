@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, DEFAULT_AGENT, Event, Gates, Job, Rejected, Session, Stage,
+    Agent, AgentResult, DEFAULT_AGENT, Event, Gap, Gates, Job, Rejected, Session, Stage,
 };
 use factory_runner::LogLine;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -781,6 +781,55 @@ impl Store {
         let id = Self::insert_job(&tx, project, FACTORY_REQUESTER, &new)?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Creates a job for each of `gaps` and records their ids on the Renovate
+    /// job `renovate_id` in one transaction, so a retry never creates a gap
+    /// twice. An empty list is valid.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Rejected`] when the Renovate job is not at the
+    /// packaging step, and then nothing is saved.
+    pub fn propose_gaps(&self, renovate_id: i64, gaps: &[Gap]) -> Result<JobRow, StoreError> {
+        let project = self.get(renovate_id)?.project;
+        let gates = self.project_gates(&project)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, renovate_id)?;
+        let mut check = row.job.clone();
+        check
+            .apply(Event::GapsProposed { jobs: Vec::new() })
+            .map_err(StoreError::Rejected)?;
+        let (number, range) = row
+            .job
+            .renovate_pr()
+            .map(|pr| {
+                (
+                    pr.number,
+                    pr.verdict
+                        .as_ref()
+                        .and_then(|v| Some((v.from.clone()?, v.to.clone()?))),
+                )
+            })
+            .ok_or_else(|| {
+                StoreError::Rejected(Rejected::Unexpected {
+                    stage: row.job.stage().clone(),
+                    event: Event::GapsProposed { jobs: Vec::new() },
+                })
+            })?;
+        let mut jobs = Vec::new();
+        for gap in gaps {
+            let text = gap.request(
+                number,
+                range.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+            );
+            let new = Job::proposal(&text, gates, renovate_id, number);
+            jobs.push(Self::insert_job(&tx, &project, FACTORY_REQUESTER, &new)?);
+        }
+        Self::apply_in(&tx, &mut row, Event::GapsProposed { jobs })?;
+        tx.commit()?;
+        Ok(row)
     }
 
     /// Approves the gap job `id` for `login`. The job moves to `requested`

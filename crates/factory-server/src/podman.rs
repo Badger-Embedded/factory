@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use factory_core::{Agent, Event, PrDiff, RenovateCi};
+use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
 use factory_runner::{
     BranchSummary, Ci, Credential, Git, GitHub, Observation, PrState, RenovatePr, Rerun, RunReport,
     SessionRun, WorkerConfig, WorkerRun, backend, observe, place_files, place_images,
@@ -14,9 +14,9 @@ use factory_runner::{
 
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PublishRequest, Published,
-    ReadyAction, RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest, WatchReport,
-    WatchRequest, ready_action, watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PackagingRequest, PublishRequest,
+    Published, ReadyAction, RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest,
+    WatchReport, WatchRequest, ready_action, watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -447,7 +447,16 @@ impl Executor for PodmanExecutor {
     async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
         let status = self.github.status(&request.repo, request.number).await?;
         let ci = match status.state {
-            PrState::Merged => return Ok(Some(Event::Merged)),
+            PrState::Merged => {
+                let event = self
+                    .renovate_merged(
+                        &request.repo,
+                        request.number,
+                        request.manifest_files.as_deref(),
+                    )
+                    .await?;
+                return Ok(Some(event));
+            }
             PrState::Closed => return Ok(Some(Event::ClosedUnmerged)),
             PrState::Open => status.ci,
         };
@@ -491,6 +500,74 @@ impl Executor for PodmanExecutor {
     async fn merge_renovate(&self, repo: &str, number: u64, head: &str) -> Result<(), String> {
         self.github.approve(repo, number, head, APPROVAL).await?;
         self.github.merge_head(repo, number, head).await
+    }
+
+    async fn renovate_merged(
+        &self,
+        repo: &str,
+        number: u64,
+        manifest_files: Option<&[String]>,
+    ) -> Result<Event, String> {
+        let Some(manifest_files) = manifest_files else {
+            return Ok(Event::RenovateMerged {
+                packaging: false,
+                manifest_changed: false,
+            });
+        };
+        let details = self.github.pr_details(repo, number).await?;
+        Ok(Event::RenovateMerged {
+            packaging: true,
+            manifest_changed: details
+                .files
+                .iter()
+                .any(|file| manifest_files.contains(file)),
+        })
+    }
+
+    async fn gather_packaging(
+        &self,
+        request: PackagingRequest,
+    ) -> Result<PackagingContext, String> {
+        let details = self
+            .github
+            .pr_details(&request.repo, request.number)
+            .await?;
+        let mut manifests = Vec::new();
+        for path in &request.manifest_files {
+            let text = self
+                .github
+                .file_at(&request.repo, path, &request.base)
+                .await?;
+            manifests.push(FileText {
+                path: path.clone(),
+                text,
+            });
+        }
+        let mut upstream = Vec::new();
+        if let (Some(from), Some(to)) = (&request.from, &request.to) {
+            for path in &request.build_config_files {
+                let text = self
+                    .github
+                    .compare_patch(&request.upstream, from, to, path)
+                    .await?;
+                upstream.push(FileText {
+                    path: path.clone(),
+                    text,
+                });
+            }
+        }
+        Ok(PackagingContext {
+            kind: String::new(),
+            upstream_repo: request.upstream,
+            pr_title: details.title,
+            pr_body: details.body,
+            pr_diff: details.diff,
+            manifests,
+            from: request.from,
+            to: request.to,
+            upstream,
+            existing: Vec::new(),
+        })
     }
 
     async fn stop(&self, job_id: i64) {

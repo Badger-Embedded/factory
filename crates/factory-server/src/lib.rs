@@ -45,9 +45,9 @@ pub use proxy::{
 pub use registry::{AgentEntry, AgentRegistry};
 pub use scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, McpRuntime,
-    PublishRequest, Published, RENOVATE_DISCOVERY, ReadyAction, RenovateWatchRequest, RerunRequest,
-    Scheduler, SessionSink, SummaryRequest, WatchReport, WatchRequest, branch_name, ready_action,
-    watch_only_event,
+    PackagingRequest, PublishRequest, Published, RENOVATE_DISCOVERY, ReadyAction,
+    RenovateWatchRequest, RerunRequest, Scheduler, SessionSink, SummaryRequest, WatchReport,
+    WatchRequest, branch_name, ready_action, watch_only_event,
 };
 pub use secrets::{
     ClaudeToken, CodexAuthError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError,
