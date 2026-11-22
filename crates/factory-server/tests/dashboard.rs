@@ -2597,10 +2597,6 @@ async fn a_non_collaborator_cannot_add_or_remove_collaborators() {
     );
 }
 
-/// Runs `settings-form.js` over a minimal DOM, dispatches `actions`, and returns
-/// whether a following `beforeunload` would warn, meaning it called
-/// `preventDefault`. The DOM holds one dirty-able `.settings-form` pipeline form
-/// and two plain collaborator forms, matching the project settings page.
 fn beforeunload_warns_after(actions: &str) -> bool {
     const HARNESS: &str = r#"
         var docListeners = {};
@@ -2653,8 +2649,28 @@ fn beforeunload_warns_after(actions: &str) -> bool {
         .unwrap()
 }
 
-#[test]
-fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
+#[tokio::test]
+async fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
+    // The harness assumes the pipeline form is the only `.settings-form` and that
+    // the collaborator forms carry no such class and do not nest inside it. Pin
+    // those facts to the rendered page, or the harness could drift from it.
+    let body = dashboard().get("/settings/projects/maestro").await.body;
+    let pipeline = body
+        .find("<form class=\"card settings-form pipeline-form\"")
+        .expect("the pipeline form is a settings form");
+    let pipeline_end = pipeline + body[pipeline..].find("</form>").unwrap();
+    for action in [
+        "/settings/projects/maestro/collaborators",
+        "/settings/projects/maestro/collaborators/remove",
+    ] {
+        let at = body
+            .find(&format!("action=\"{action}\""))
+            .unwrap_or_else(|| panic!("no form posts to {action}"));
+        let open = body[..at].rfind("<form").unwrap();
+        assert!(!body[open..at].contains("settings-form"), "{action}");
+        assert!(open > pipeline_end, "{action}");
+    }
+
     let dirty_then_submit = |form| {
         format!(
             "fire(docListeners, \"input\", pipelineInput);\
@@ -2668,11 +2684,9 @@ fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
     assert!(beforeunload_warns_after(&dirty_then_submit(
         "collabRemoveForm"
     )));
-    // Saving the pipeline form itself leaves without a warning.
     assert!(!beforeunload_warns_after(&dirty_then_submit(
         "pipelineForm"
     )));
-    // With nothing dirty there is no warning.
     assert!(!beforeunload_warns_after(
         "fire(winListeners, \"beforeunload\", null);"
     ));
