@@ -113,6 +113,7 @@ pub fn app(
     };
     Router::new()
         .route("/", get(index))
+        .route("/notifications", get(notifications))
         .route("/fragments/plan-usage", get(plan_usage_fragment))
         .route("/fragments/stats", get(stats_fragment))
         .route("/fragments/workers", get(workers_fragment))
@@ -467,6 +468,7 @@ async fn index(
     let login = user(&headers);
     let data = load_board(&state, &login, query.project)?;
     let plan_usage = usage_tile(&state);
+    let notifications = state.store.notifications_enabled(&login)?;
     Ok(pages::index(
         &login,
         &data.names,
@@ -477,7 +479,50 @@ async fn index(
         plan_usage.as_ref(),
         data.auto_merge,
         &data.workers,
+        notifications,
     ))
+}
+
+async fn notifications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, AppError> {
+    let login = user(&headers);
+    if !state.store.notifications_enabled(&login)? {
+        return Ok(axum::Json(
+            serde_json::json!({ "enabled": false, "items": [] }),
+        ));
+    }
+    let mut auto_merge = HashMap::new();
+    for name in state.store.projects_for(&login)? {
+        let default = state.projects.lookup(&name)?.is_some_and(|p| p.auto_merge);
+        auto_merge.insert(
+            name.clone(),
+            state.store.project_auto_merge(&name, default)?,
+        );
+    }
+    let snapshot = state.store.list_with_latest_event()?;
+    let items: Vec<_> = snapshot
+        .jobs
+        .iter()
+        .filter(|(row, _)| row.requested_by == login)
+        .filter_map(|(row, event)| {
+            let merge = *auto_merge.get(&row.project)?;
+            let kind = pages::attention(&row.job, merge)?;
+            Some(serde_json::json!({
+                "key": format!("{}:{event}", row.id),
+                "job": row.id,
+                "title": pages::job_title(&row.job),
+                "kind": kind,
+                "url": format!("/jobs/{}", row.id),
+            }))
+        })
+        .collect();
+    Ok(axum::Json(serde_json::json!({
+        "enabled": true,
+        "snapshot": [snapshot.order.0, snapshot.order.1],
+        "items": items,
+    })))
 }
 
 /// Serves the plan usage tile on its own, from the same cache `index` reads. A

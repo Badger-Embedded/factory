@@ -19,6 +19,7 @@ use factory_server::{
     UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
+use serde_json::json;
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
@@ -9604,4 +9605,258 @@ fn factory_admins_parse_trims_drops_empties_and_defaults() {
     assert_eq!(parse_admins(None), ["talhahavadar@hotmail.com"]);
     assert_eq!(parse_admins(Some(" a@x , ,b@y,")), ["a@x", "b@y"]);
     assert_eq!(parse_admins(Some("")), Vec::<String>::new());
+}
+
+async fn notifications_as(dashboard: &Dashboard, login: &str) -> serde_json::Value {
+    let reply = dashboard.get_as(login, "/notifications").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.content_type.as_deref(), Some("application/json"));
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+fn to_plan_approval(dashboard: &Dashboard, id: i64) {
+    to_spec_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![PlannedPr {
+            title: "maestrod: add a reboot endpoint".into(),
+            summary: "POST /reboot".into(),
+            number: None,
+            description: None,
+            notes: None,
+        }])),
+    );
+}
+
+fn to_review(dashboard: &Dashboard, id: i64) {
+    to_plan_approval(dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::ChecksPassed);
+    dashboard.apply(id, Event::Published { number: 15 });
+}
+
+#[tokio::test]
+async fn notifications_list_a_job_at_the_spec_gate_and_a_new_key_at_the_plan_gate() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    assert_eq!(notifications_as(&dashboard, USER).await["items"], json!([]));
+
+    to_spec_approval(&dashboard, id);
+    let first = notifications_as(&dashboard, USER).await;
+    assert_eq!(first["enabled"], true);
+    let item = &first["items"][0];
+    assert_eq!(item["job"], id);
+    assert_eq!(item["kind"], "needs-you");
+    assert_eq!(item["url"], format!("/jobs/{id}"));
+    assert!(item["key"].as_str().unwrap().starts_with(&format!("{id}:")));
+    assert_ne!(item["title"].as_str().unwrap(), "");
+
+    assert_eq!(
+        notifications_as(&dashboard, USER).await["items"],
+        first["items"]
+    );
+
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![PlannedPr {
+            title: "t".into(),
+            summary: "s".into(),
+            number: None,
+            description: None,
+            notes: None,
+        }])),
+    );
+    let second = notifications_as(&dashboard, USER).await;
+    assert_eq!(second["items"][0]["kind"], "needs-you");
+    assert_ne!(second["items"][0]["key"], item["key"]);
+}
+
+#[tokio::test]
+async fn notifications_go_only_to_the_requester() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    let bob = notifications_as(&dashboard, "bob@example.com").await;
+    assert_eq!(bob["enabled"], true);
+    assert_eq!(bob["items"], json!([]));
+    assert_eq!(
+        notifications_as(&dashboard, USER).await["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn notifications_skip_a_project_the_requester_left() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard
+        .store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+    dashboard
+        .store
+        .remove_collaborator("maestro", USER)
+        .unwrap();
+    assert_eq!(notifications_as(&dashboard, USER).await["items"], json!([]));
+}
+
+#[tokio::test]
+async fn a_failed_job_notifies_until_it_is_dismissed() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard.apply(
+        id,
+        Event::AgentFailed {
+            reason: "boom".into(),
+        },
+    );
+    let data = notifications_as(&dashboard, USER).await;
+    assert_eq!(data["items"][0]["kind"], "failed");
+
+    dashboard.apply(id, Event::Dismiss);
+    assert_eq!(notifications_as(&dashboard, USER).await["items"], json!([]));
+}
+
+#[tokio::test]
+async fn a_pull_request_in_review_notifies_only_with_auto_merge_off() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review(&dashboard, id);
+    let data = notifications_as(&dashboard, USER).await;
+    assert_eq!(data["items"][0]["kind"], "needs-you");
+
+    dashboard
+        .store
+        .save_project_auto_merge("maestro", true)
+        .unwrap();
+    assert_eq!(notifications_as(&dashboard, USER).await["items"], json!([]));
+}
+
+#[tokio::test]
+async fn notifications_are_empty_when_the_login_turned_them_off() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.store.set_notifications(USER, false).unwrap();
+    assert_eq!(
+        notifications_as(&dashboard, USER).await,
+        json!({"enabled": false, "items": []})
+    );
+    dashboard.store.set_notifications(USER, true).unwrap();
+    assert_eq!(
+        notifications_as(&dashboard, USER).await["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_board_asks_for_permission_only_while_notifications_are_on() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/").await;
+    assert!(
+        page.body
+            .contains("Get a browser notification when a job needs you")
+    );
+    assert!(page.body.contains("href=\"/settings/notifications\""));
+    assert!(page.body.contains("Notification.permission"));
+
+    dashboard.store.set_notifications(USER, false).unwrap();
+    let page = dashboard.get("/").await;
+    assert!(
+        !page
+            .body
+            .contains("Get a browser notification when a job needs you")
+    );
+}
+
+#[test]
+fn a_job_that_changes_between_the_two_reads_keeps_its_state_and_event_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    let other = Store::open(&path).unwrap();
+    store
+        .create_project(
+            "maestro",
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("a"),
+        )
+        .unwrap();
+    let id = store.create("maestro", "a", "Add a button").unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
+        .unwrap();
+    let before = store.list_with_latest_event().unwrap().jobs;
+    let (job, event) = (before[0].0.clone(), before[0].1);
+
+    let during = store
+        .list_with_latest_event_between(|| {
+            other.apply(id, Event::Approve).unwrap();
+        })
+        .unwrap()
+        .jobs;
+    assert_eq!(during[0], (job, event));
+
+    let after = store.list_with_latest_event().unwrap().jobs;
+    assert!(after[0].1 > event);
+    assert_ne!(after[0].0.job.stage(), during[0].0.job.stage());
+}
+
+#[test]
+fn a_reopened_database_orders_its_reads_after_the_earlier_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let mut last = Store::open(&path)
+        .unwrap()
+        .list_with_latest_event()
+        .unwrap()
+        .order;
+    for _ in 0..3 {
+        let order = Store::open(&path)
+            .unwrap()
+            .list_with_latest_event()
+            .unwrap()
+            .order;
+        assert_eq!(order.1, 1);
+        assert!(order > last);
+        last = order;
+    }
+}
+
+#[test]
+fn each_read_of_the_jobs_orders_after_the_one_before() {
+    let store = Store::open_in_memory().unwrap();
+    let first = store.list_with_latest_event().unwrap().order;
+    let second = store.list_with_latest_event().unwrap().order;
+    assert!(second > first);
+}
+
+#[tokio::test]
+async fn each_notifications_response_carries_a_greater_snapshot_than_the_last() {
+    let dashboard = dashboard();
+    let first = notifications_as(&dashboard, USER).await["snapshot"].clone();
+    let second = notifications_as(&dashboard, USER).await["snapshot"].clone();
+    let pair = |value: &serde_json::Value| (value[0].as_u64().unwrap(), value[1].as_u64().unwrap());
+    assert!(pair(&second) > pair(&first));
 }

@@ -54,7 +54,8 @@ pub use secrets::{
 };
 pub use settings::Settings;
 pub use store::{
-    CodexPrice, Collaborator, JobEvent, JobFile, JobRow, LogEntry, ProjectTotals, Store, StoreError,
+    CodexPrice, Collaborator, JobEvent, JobFile, JobRow, LogEntry, ProjectTotals, Snapshot, Store,
+    StoreError,
 };
 pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
@@ -186,6 +187,9 @@ CREATE TABLE IF NOT EXISTS user_settings (
     notifications INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS store_boots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT
+);
 ";
 
 /// A file attached to a request. `name` is the generated name on disk, such
@@ -274,6 +278,19 @@ pub struct CodexPrice {
 /// The jobs, kept in SQLite. Each job is stored as JSON in one row.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// How many times the database has been opened, from `store_boots`.
+    epoch: u64,
+    reads: AtomicU64,
+}
+
+/// The jobs as one read saw them, each with the id of its latest
+/// `job_events` row.
+pub struct Snapshot {
+    /// Orders snapshots: the number of times the database has been opened,
+    /// then a count that rises with each read. A later read has a greater
+    /// pair, also after a restart, and no clock is involved.
+    pub order: (u64, u64),
+    pub jobs: Vec<(JobRow, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,8 +466,12 @@ impl Store {
                 [],
             )?;
         }
+        conn.execute("INSERT INTO store_boots DEFAULT VALUES", [])?;
+        let epoch = u64::try_from(conn.last_insert_rowid()).unwrap_or(0);
         Ok(Store {
             conn: Mutex::new(conn),
+            epoch,
+            reads: AtomicU64::new(0),
         })
     }
 
@@ -595,6 +616,59 @@ impl Store {
         )?;
         let rows = stmt.query_map([], raw_row)?;
         rows.map(|row| parse_row(row?)).collect()
+    }
+
+    /// All jobs, newest first, each with the id of its latest `job_events`
+    /// row, or 0 when it has none. Both come from one read transaction, so a
+    /// job's state and its event id always match.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    pub fn list_with_latest_event(&self) -> Result<Snapshot, StoreError> {
+        self.list_with_latest_event_between(|| {})
+    }
+
+    /// [`Store::list_with_latest_event`] that runs `between` after the jobs
+    /// are read and before the event ids are. Tests use it to change a job at
+    /// that point, from another connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    #[doc(hidden)]
+    pub fn list_with_latest_event_between(
+        &self,
+        between: impl FnOnce(),
+    ) -> Result<Snapshot, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let jobs = {
+            let mut stmt = tx.prepare(
+                "SELECT id, project, requested_by, created_at, job FROM jobs ORDER BY id DESC",
+            )?;
+            let rows = stmt.query_map([], raw_row)?;
+            rows.map(|row| parse_row(row?))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        between();
+        let events: HashMap<i64, i64> = {
+            let mut stmt = tx.prepare("SELECT job_id, MAX(id) FROM job_events GROUP BY job_id")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        tx.commit()?;
+        let jobs = jobs
+            .into_iter()
+            .map(|row| {
+                let event = events.get(&row.id).copied().unwrap_or(0);
+                (row, event)
+            })
+            .collect();
+        Ok(Snapshot {
+            order: (self.epoch, self.reads.fetch_add(1, Ordering::SeqCst) + 1),
+            jobs,
+        })
     }
 
     /// The ids of jobs created more than `days` days ago.
