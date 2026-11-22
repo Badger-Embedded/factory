@@ -1,7 +1,3 @@
-//! Tests for the Copilot device login on its settings page, driven by a fake
-//! login container. No podman runs: the fake prints Copilot's prompt with ANSI
-//! color, then writes `config.json` or exits in failure.
-
 #[path = "support/copilot_harness.rs"]
 mod harness;
 
@@ -62,6 +58,15 @@ async fn signing_in_reloads_the_page_so_the_stored_status_updates() {
 
     let start = harness.post("/settings/agents/copilot/login", "").await;
     assert_eq!(start.status, StatusCode::SEE_OTHER);
+    let location = start.headers["location"].to_str().unwrap().to_owned();
+    let polling = harness.get(&location).await;
+    assert_eq!(polling.status, StatusCode::OK);
+    assert!(
+        polling
+            .body
+            .contains("/settings/agents/copilot/login/fragment")
+    );
+    assert!(polling.body.contains("hx-trigger"));
     let waiting = harness.get("/settings/agents/copilot/login/fragment").await;
     assert!(waiting.headers.get("hx-refresh").is_none());
 
@@ -70,9 +75,11 @@ async fn signing_in_reloads_the_page_so_the_stored_status_updates() {
     let done = harness.get("/settings/agents/copilot/login/fragment").await;
     assert_eq!(done.headers.get("hx-refresh").unwrap(), "true");
 
-    let page = harness.get("/settings/agents/copilot").await;
+    let page = harness.get(&location).await;
     assert!(page.body.contains("A token is stored."));
     assert!(!page.body.contains("No token is stored."));
+    assert!(!page.body.contains("hx-trigger"));
+    assert_eq!(harness.spawner.spawned().len(), 1);
 }
 
 #[tokio::test]

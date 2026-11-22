@@ -1,7 +1,3 @@
-//! Tests for the Copilot settings page: the stored-token state with no secret
-//! in the HTML, the sidebar entry, the write-only paste field and Clear, and
-//! the disabled state when the store is unavailable.
-
 #[path = "support/copilot_harness.rs"]
 mod harness;
 

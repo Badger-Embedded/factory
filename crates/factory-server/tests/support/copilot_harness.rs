@@ -1,6 +1,3 @@
-//! A fake login container and an app wired to it, shared by the Copilot
-//! settings and login tests.
-
 #![allow(dead_code, reason = "each test binary uses a part of the harness")]
 
 use std::collections::VecDeque;
