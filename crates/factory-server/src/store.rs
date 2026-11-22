@@ -181,6 +181,11 @@ CREATE TABLE IF NOT EXISTS project_collaborators (
     added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (project, login)
 );
+CREATE TABLE IF NOT EXISTS user_settings (
+    login TEXT PRIMARY KEY,
+    notifications INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 ";
 
 /// A file attached to a request. `name` is the generated name on disk, such
@@ -1428,6 +1433,41 @@ impl Store {
             .optional()?
             .is_some();
         Ok(found)
+    }
+
+    /// Whether `login` wants browser notifications. A login with no
+    /// `user_settings` row has them on.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn notifications_enabled(&self, login: &str) -> Result<bool, StoreError> {
+        let stored = self
+            .conn()
+            .query_row(
+                "SELECT notifications FROM user_settings WHERE login = ?1",
+                [login],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        Ok(stored.unwrap_or(true))
+    }
+
+    /// Saves whether `login` wants browser notifications. It writes that
+    /// login's row alone.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_notifications(&self, login: &str, enabled: bool) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO user_settings (login, notifications) VALUES (?1, ?2)
+             ON CONFLICT (login) DO UPDATE SET
+                 notifications = excluded.notifications,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![login, enabled],
+        )?;
+        Ok(())
     }
 
     /// The names of the projects `login` collaborates on, in name order.

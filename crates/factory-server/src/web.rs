@@ -142,6 +142,10 @@ pub fn app(
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(settings_home))
         .route(
+            "/settings/notifications",
+            get(show_notifications).post(save_notifications),
+        )
+        .route(
             "/settings/projects/{name}",
             get(show_project_settings).post(save_project_models),
         )
@@ -1259,8 +1263,46 @@ async fn settings_home(
     };
     Ok(match names.first() {
         Some(name) => Redirect::to(&format!("/settings/projects/{}{tail}", query_escape(name))),
-        None => Redirect::to(&format!("/onboard{tail}")),
+        None => Redirect::to(&format!("/settings/notifications{tail}")),
     })
+}
+
+fn notifications_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    Ok(pages::settings_notifications(
+        &login,
+        &settings_nav(state, &login)?,
+        state.store.notifications_enabled(&login)?,
+        notice,
+    ))
+}
+
+async fn show_notifications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NoticeQuery>,
+) -> Result<Markup, AppError> {
+    notifications_page(&state, &headers, query.notice.as_deref())
+}
+
+#[derive(Deserialize)]
+struct NotificationsForm {
+    notifications: Option<String>,
+}
+
+async fn save_notifications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<NotificationsForm>,
+) -> Result<Markup, AppError> {
+    state
+        .store
+        .set_notifications(&user(&headers), form.notifications.is_some())?;
+    notifications_page(&state, &headers, Some("Saved."))
 }
 
 #[derive(Deserialize)]

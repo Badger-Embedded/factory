@@ -25,6 +25,7 @@ pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
+const NOTIFICATION_PERMISSION: &str = include_str!("../static/notification-permission.js");
 const SETTINGS_FORM: &str = include_str!("../static/settings-form.js");
 const MCP_TOOLS: &str = include_str!("../static/mcp-tools.js");
 const SETTINGS_PIPELINE: &str = include_str!("../static/settings-pipeline.js");
@@ -520,6 +521,7 @@ pub struct HeaderState {
 /// Which settings page is open, so the sidebar marks its entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsPage {
+    Notifications,
     Workers,
     Gates,
     Github,
@@ -592,6 +594,8 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
     let in_mcp = matches!(current, SettingsPage::Mcp | SettingsPage::McpServer(_));
     html! {
         nav.settings-nav aria-label="Settings" {
+            p.settings-group { "You" }
+            (entry("/settings/notifications".into(), "Notifications", &SettingsPage::Notifications))
             @if nav.admin {
                 p.settings-group { "Factory" }
                 (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
@@ -639,6 +643,43 @@ fn save_bar(label: &str) -> Markup {
 }
 
 const RUNS_KEEP_VALUES: &str = "The job loop reads these on every pass. A run that already started keeps the values it started with.";
+
+/// The per-user Notifications page: one checkbox for the login's browser
+/// notifications. `NOTIFICATION_PERMISSION` fills in the browser's permission
+/// state; without JavaScript the line stays hidden and the checkbox still saves.
+pub fn settings_notifications(
+    user: &str,
+    nav: &SettingsNav,
+    enabled: bool,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Notifications,
+        "Notifications",
+        notice,
+        &html! {
+            h1 { "Notifications" }
+            p.meta { "The dashboard notifies you while a factory tab is open in this browser. The setting follows your login to every browser." }
+            form.card.settings-form method="post" action="/settings/notifications" {
+                div.field {
+                    label {
+                        input type="checkbox" name="notifications" value="on" checked[enabled];
+                        " Browser notifications for my jobs"
+                    }
+                    p.hint { "A notification arrives when a job you requested needs you or fails." }
+                }
+                (save_bar("Save"))
+            }
+            div.card #notification-permission hidden {
+                p.permission-state {}
+                button.primary type="button" hidden { "Allow notifications" }
+            }
+            script { (PreEscaped(NOTIFICATION_PERMISSION)) }
+        },
+    )
+}
 
 pub fn settings_workers(
     user: &str,
