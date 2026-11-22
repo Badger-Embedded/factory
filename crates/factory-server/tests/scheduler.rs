@@ -13,7 +13,7 @@ use factory_server::{
     McpRuntime, McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
     RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
     StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport,
-    WatchRequest, format_cost, ready_action, watch_only_event,
+    WatchRequest, WorkerSlots, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -730,6 +730,19 @@ async fn a_pass_that_read_a_job_before_its_removal_does_not_start_it() {
     assert_eq!(executor.requests().len(), 1);
     assert!(!slots.has_task(queued));
     assert_eq!(store.get(queued).unwrap().job.stage(), &Stage::Cancelled);
+}
+
+#[test]
+fn an_earlier_task_cannot_clear_the_mark_of_its_replacement() {
+    let slots = WorkerSlots::new();
+    let earlier = slots.begin_task(7);
+    let replacement = slots.begin_task(7);
+
+    slots.end_task(7, earlier);
+    assert!(slots.has_task(7));
+
+    slots.end_task(7, replacement);
+    assert!(!slots.has_task(7));
 }
 
 #[tokio::test]

@@ -9177,7 +9177,7 @@ async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
     dashboard
         .post("/settings/projects/maestro/remove", "confirm=maestro")
         .await;
-    dashboard.slots.begin_task(id);
+    let mark = dashboard.slots.begin_task(id);
 
     let reply = dashboard
         .post_as(
@@ -9191,7 +9191,7 @@ async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
     assert!(dashboard.store.get(id).is_ok());
     assert!(dashboard.store.project("maestro").unwrap().is_none());
 
-    dashboard.slots.end_task(id);
+    dashboard.slots.end_task(id, mark);
     let reply = dashboard
         .post_as(
             "bob@example.com",

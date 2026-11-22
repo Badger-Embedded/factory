@@ -22,7 +22,7 @@ use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
 use crate::store::{JobRow, Store, StoreError};
 use crate::warnings::McpWarnings;
-use crate::workers::{WorkerSlots, unix_now};
+use crate::workers::{TaskMark, WorkerSlots, unix_now};
 
 /// How often the loop looks at the jobs when nothing wakes it.
 const POLL: Duration = Duration::from_secs(5);
@@ -367,6 +367,7 @@ enum Kind {
 struct Task {
     kind: Kind,
     handle: JoinHandle<()>,
+    mark: TaskMark,
 }
 
 /// Starts queued jobs and carries out each job's next command, with at
@@ -575,14 +576,14 @@ impl<E: Executor> Scheduler<E> {
                 {
                     task.handle.abort();
                     self.slots.free(row.id);
-                    unwanted.push((row.id, task.handle));
+                    unwanted.push((row.id, task.handle, task.mark));
                 }
             }
         }
-        for (id, handle) in unwanted {
+        for (id, handle, mark) in unwanted {
             let _ = handle.await;
             self.executor.stop(id).await;
-            self.slots.end_task(id);
+            self.slots.end_task(id, mark);
             self.store.append_factory_log(
                 id,
                 "Stopped the running step because the job no longer needs it.",
@@ -1210,16 +1211,19 @@ impl<E: Executor> Scheduler<E> {
         if kind == Kind::Worker {
             self.slots.take(job_id, unix_now());
         }
-        self.slots.begin_task(job_id);
+        let mark = self.slots.begin_task(job_id);
         let handle = tokio::spawn(async move {
             work.await;
             scheduler.slots.free(job_id);
-            if scheduler.tasks().remove(&job_id).is_some() {
-                scheduler.slots.end_task(job_id);
+            let mut tasks = scheduler.tasks();
+            if tasks.get(&job_id).is_some_and(|task| task.mark == mark) {
+                tasks.remove(&job_id);
             }
+            scheduler.slots.end_task(job_id, mark);
+            drop(tasks);
             scheduler.wake.notify_one();
         });
-        tasks.insert(job_id, Task { kind, handle });
+        tasks.insert(job_id, Task { kind, handle, mark });
     }
 
     fn tasks(&self) -> MutexGuard<'_, HashMap<i64, Task>> {

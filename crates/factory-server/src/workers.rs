@@ -1,7 +1,7 @@
 //! Which job holds which worker slot, shared between the scheduler, which
 //! fills and frees the slots, and the dashboard, which shows them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,12 +15,18 @@ pub struct Slot {
     pub since: i64,
 }
 
+/// Identifies one task of a job, so an earlier task cannot clear the mark of
+/// the task that replaced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskMark(u64);
+
 #[derive(Debug, Default)]
 pub struct WorkerSlots {
     /// Slot number to job id and start time.
     slots: Mutex<BTreeMap<usize, (i64, i64)>>,
-    /// Jobs with a scheduler task that has not ended, or a stop in progress.
-    tasks: Mutex<BTreeSet<i64>>,
+    /// The mark of each job that has a scheduler task, or a stop in progress,
+    /// and the number of marks issued so far.
+    tasks: Mutex<(BTreeMap<i64, TaskMark>, u64)>,
     pass: tokio::sync::Mutex<()>,
 }
 
@@ -57,21 +63,30 @@ impl WorkerSlots {
     }
 
     /// Marks `job_id` as having a task, from the spawn until the task has ended
-    /// and any container stop has finished.
-    pub fn begin_task(&self, job_id: i64) {
-        self.tasks().insert(job_id);
+    /// and any container stop has finished. A second call for the same job
+    /// replaces the mark.
+    pub fn begin_task(&self, job_id: i64) -> TaskMark {
+        let mut tasks = self.tasks();
+        tasks.1 += 1;
+        let mark = TaskMark(tasks.1);
+        tasks.0.insert(job_id, mark);
+        mark
     }
 
-    /// Clears the mark [`Self::begin_task`] set.
-    pub fn end_task(&self, job_id: i64) {
-        self.tasks().remove(&job_id);
+    /// Clears the mark `begin_task` returned. A job whose mark was replaced
+    /// since keeps the newer one.
+    pub fn end_task(&self, job_id: i64, mark: TaskMark) {
+        let mut tasks = self.tasks();
+        if tasks.0.get(&job_id) == Some(&mark) {
+            tasks.0.remove(&job_id);
+        }
     }
 
     /// Whether `job_id` still has a task or a stop in progress, so its files
     /// and rows are not safe to delete.
     #[must_use]
     pub fn has_task(&self, job_id: i64) -> bool {
-        self.tasks().contains(&job_id)
+        self.tasks().0.contains_key(&job_id)
     }
 
     /// The busy slots, by slot number.
@@ -91,7 +106,7 @@ impl WorkerSlots {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn tasks(&self) -> MutexGuard<'_, BTreeSet<i64>> {
+    fn tasks(&self) -> MutexGuard<'_, (BTreeMap<i64, TaskMark>, u64)> {
         self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
