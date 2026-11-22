@@ -136,6 +136,8 @@ async fn a_config_with_no_token_fails_the_login() {
     let failed = harness.poll_fragment("could not store a token").await;
     assert!(failed.contains("held no token"), "{failed}");
     assert!(failed.contains("Keys under authTokens: none"), "{failed}");
+    assert!(failed.contains("The directory holds:"), "{failed}");
+    assert!(failed.contains("settings.json"), "{failed}");
     assert!(!failed.contains("did not finish"));
     assert!(harness.secrets.copilot_token().unwrap().is_none());
 }
@@ -188,6 +190,35 @@ async fn a_clean_exit_with_no_credential_file_says_so() {
     assert!(!failed.contains("did not finish"));
     assert!(harness.secrets.copilot_token().unwrap().is_none());
     assert!(!harness.spawner.homes()[0].exists());
+}
+
+#[tokio::test]
+async fn directory_names_that_look_like_tokens_are_redacted_in_both_listings() {
+    for outcome in [
+        Outcome::ExitedClean,
+        Outcome::Success(r#"{"authTokens":{}}"#.to_owned()),
+    ] {
+        let harness = harness();
+        harness.spawner.set(Script {
+            lines: prompt(),
+            outcome,
+        });
+        harness.post("/settings/agents/copilot/login", "").await;
+        harness.poll_fragment("1234-5678").await;
+        let home = harness.spawner.homes()[0].clone();
+        let inner = "ghu_innerabcdefghijklmnopqrstuvwxyz0123";
+        std::fs::write(home.join(TOKEN), "").unwrap();
+        std::fs::create_dir(home.join("logs")).unwrap();
+        std::fs::write(home.join("logs").join(inner), "").unwrap();
+        std::fs::create_dir(home.join(format!("{inner}-dir"))).unwrap();
+        harness.spawner.finish();
+
+        let failed = harness.poll_fragment("could not store a token").await;
+        assert!(failed.contains("[redacted]"), "{failed}");
+        assert!(failed.contains("logs/ [[redacted]]"), "{failed}");
+        assert!(!failed.contains(TOKEN), "{failed}");
+        assert!(!failed.contains("ghu_inner"), "{failed}");
+    }
 }
 
 #[tokio::test]

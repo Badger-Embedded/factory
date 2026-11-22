@@ -135,7 +135,8 @@ fn copilot_read_back(home: &Path) -> Result<String, ReadBackError> {
         })
         .ok_or_else(|| ReadBackError::NoToken {
             file: FILE,
-            keys: key_names(&config),
+            keys: scrubbed_keys(&config),
+            listing: scrubbed_listing(home),
             nested: tokens.map(|tokens| {
                 (
                     "authTokens",
@@ -177,11 +178,13 @@ pub enum ReadBackError {
         line: usize,
         column: usize,
     },
-    /// `file` parsed but holds no token. `keys` are its top-level keys and
-    /// `nested` the key names under the object that should hold the token.
+    /// `file` parsed but holds no token. `keys` are its top-level keys,
+    /// `nested` the key names under the object that should hold the token, and
+    /// `listing` names what the directory holds.
     NoToken {
         file: &'static str,
         keys: Vec<String>,
+        listing: String,
         nested: Option<(&'static str, Vec<String>)>,
     },
 }
@@ -205,7 +208,12 @@ impl std::fmt::Display for ReadBackError {
                     "The credential file {file} is not valid JSON (line {line}, column {column})."
                 )
             }
-            ReadBackError::NoToken { file, keys, nested } => {
+            ReadBackError::NoToken {
+                file,
+                keys,
+                nested,
+                listing,
+            } => {
                 write!(
                     f,
                     "The credential file {file} held no token. Its top-level keys: {}.",
@@ -214,7 +222,7 @@ impl std::fmt::Display for ReadBackError {
                 if let Some((object, inner)) = nested {
                     write!(f, " Keys under {object}: {}.", names(inner))?;
                 }
-                Ok(())
+                write!(f, " The directory holds: {listing}.")
             }
         }
     }
@@ -228,8 +236,7 @@ fn names(names: &[String]) -> String {
     }
 }
 
-/// The names in `home`, one level of subdirectories deep, with no contents.
-fn list_directory(home: &Path) -> String {
+fn scrubbed_listing(home: &Path) -> String {
     const LIMIT: usize = 60;
     fn entries(dir: &Path) -> Vec<(String, bool)> {
         let Ok(read) = std::fs::read_dir(dir) else {
@@ -250,11 +257,11 @@ fn list_directory(home: &Path) -> String {
         if is_dir {
             let inner: Vec<String> = entries(&home.join(&name))
                 .into_iter()
-                .map(|(inner, _)| inner)
+                .map(|(inner, _)| scrub_line(&inner))
                 .collect();
-            out.push(format!("{name}/ [{}]", inner.join(", ")));
+            out.push(format!("{}/ [{}]", scrub_line(&name), inner.join(", ")));
         } else {
-            out.push(name);
+            out.push(scrub_line(&name));
         }
     }
     out.truncate(LIMIT);
@@ -270,7 +277,7 @@ fn read_credential_file(home: &Path, file: &'static str) -> Result<String, ReadB
         if error.kind() == std::io::ErrorKind::NotFound {
             ReadBackError::Missing {
                 file,
-                listing: list_directory(home),
+                listing: scrubbed_listing(home),
             }
         } else {
             ReadBackError::Unreadable { file, error }
@@ -278,8 +285,7 @@ fn read_credential_file(home: &Path, file: &'static str) -> Result<String, ReadB
     })
 }
 
-/// The top-level keys of a JSON object, scrubbed of token-like names.
-fn key_names(value: &serde_json::Value) -> Vec<String> {
+fn scrubbed_keys(value: &serde_json::Value) -> Vec<String> {
     value
         .as_object()
         .map(|object| object.keys().map(|key| scrub_line(key)).collect())
