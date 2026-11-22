@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    Agent, AgentResult, Command, Event, Gates, Job, PlanUsage, PlannedPr, PrDescription, Question,
-    Stage, Task, UsageWindow,
+    Agent, AgentResult, Command, DiffVerdict, Event, Gates, Job, PlanUsage, PlannedPr,
+    PrDescription, Question, Stage, Task, UsageWindow,
 };
 use factory_runner::{
     Expect, LogLine, McpConfig, McpServerStatus, PlacedFile, ResultMessage, SessionRun, StreamItem,
@@ -1508,5 +1508,177 @@ fn start_review() -> Event {
     let n = HEADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Event::StartReview {
         head: format!("head{n}"),
+    }
+}
+
+#[test]
+fn the_renovate_tasks_expect_their_verdicts_in_the_renovate_stage() {
+    let analyze = Task::AnalyzeFailure { log: "boom".into() };
+    let check = Task::CheckDiff {
+        diff: "d".into(),
+        body: "b".into(),
+    };
+    assert_eq!(
+        Expect::for_task(&Stage::Renovate, &analyze),
+        Some(Expect::FailureAnalysis)
+    );
+    assert_eq!(
+        Expect::for_task(&Stage::Renovate, &check),
+        Some(Expect::DiffCheck)
+    );
+    assert_eq!(
+        Expect::FailureAnalysis.outcomes(),
+        ["transient", "caused_by_update"]
+    );
+    assert_eq!(Expect::DiffCheck.outcomes(), ["safe", "unsafe"]);
+}
+
+#[test]
+fn the_renovate_schemas_require_a_reason_and_forbid_questions() {
+    let failure = Expect::FailureAnalysis.schema();
+    assert_eq!(failure["required"], json!(["outcome", "reason"]));
+    assert_eq!(
+        failure["properties"]["outcome"]["enum"],
+        json!(["transient", "caused_by_update"])
+    );
+    assert!(failure["properties"]["questions"].is_null());
+
+    let diff = Expect::DiffCheck.schema();
+    assert_eq!(diff["required"], json!(["outcome", "reason", "summary"]));
+    assert_eq!(
+        diff["properties"]["outcome"]["enum"],
+        json!(["safe", "unsafe"])
+    );
+    for key in ["from", "to"] {
+        assert_eq!(diff["properties"][key]["type"], "string");
+    }
+
+    let strict = Expect::DiffCheck.strict_schema();
+    assert_eq!(strict["required"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        strict["properties"]["from"]["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(strict["properties"]["outcome"]["type"], "string");
+}
+
+#[test]
+fn a_failure_analysis_reports_its_verdict() {
+    use factory_runner::event_from_output;
+    assert_eq!(
+        event_from_output(
+            Expect::FailureAnalysis,
+            Some(json!({"outcome": "transient", "reason": "registry timeout"}))
+        ),
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "registry timeout".into()
+        })
+    );
+    assert_eq!(
+        event_from_output(
+            Expect::FailureAnalysis,
+            Some(json!({"outcome": "caused_by_update", "reason": "API removed"}))
+        ),
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: false,
+            reason: "API removed".into()
+        })
+    );
+    for output in [
+        json!({"outcome": "transient"}),
+        json!({"outcome": "transient", "reason": " "}),
+        json!({"outcome": "questions", "questions": ["why?"]}),
+        json!({"outcome": "safe", "reason": "x"}),
+    ] {
+        let event = event_from_output(Expect::FailureAnalysis, Some(output.clone()));
+        assert!(
+            matches!(event, Event::AgentFailed { .. }),
+            "{output} gave {event:?}"
+        );
+    }
+    assert!(matches!(
+        event_from_output(Expect::FailureAnalysis, None),
+        Event::AgentFailed { .. }
+    ));
+}
+
+#[test]
+fn a_diff_check_reports_its_verdict_and_the_refs() {
+    use factory_runner::event_from_output;
+    assert_eq!(
+        event_from_output(
+            Expect::DiffCheck,
+            Some(json!({
+                "outcome": "safe",
+                "reason": "only Cargo.lock changes",
+                "summary": "serde 1.0.1 to 1.0.2",
+                "from": "v1.0.1",
+                "to": "v1.0.2"
+            }))
+        ),
+        Event::Agent(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+            safe: true,
+            reason: "only Cargo.lock changes".into(),
+            summary: "serde 1.0.1 to 1.0.2".into(),
+            from: Some("v1.0.1".into()),
+            to: Some("v1.0.2".into())
+        })))
+    );
+    // Codex writes null for the refs it leaves out, and an empty string reads as absent.
+    assert_eq!(
+        event_from_output(
+            Expect::DiffCheck,
+            Some(json!({
+                "outcome": "unsafe",
+                "reason": "edits a workflow",
+                "summary": "bump",
+                "from": null,
+                "to": ""
+            }))
+        ),
+        Event::Agent(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+            safe: false,
+            reason: "edits a workflow".into(),
+            summary: "bump".into(),
+            from: None,
+            to: None
+        })))
+    );
+    for output in [
+        json!({"outcome": "safe", "reason": "r"}),
+        json!({"outcome": "safe", "summary": "s"}),
+        json!({"outcome": "approve", "reason": "r", "summary": "s"}),
+    ] {
+        let event = event_from_output(Expect::DiffCheck, Some(output.clone()));
+        assert!(
+            matches!(event, Event::AgentFailed { .. }),
+            "{output} gave {event:?}"
+        );
+    }
+}
+
+#[test]
+fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
+    let analyze = Task::AnalyzeFailure {
+        log: "test foo failed".into(),
+    };
+    let check = Task::CheckDiff {
+        diff: "+version = 1.2.3".into(),
+        body: "Bumps serde".into(),
+    };
+    for agent in [Agent::Claude, Agent::Codex] {
+        let text = prompt(&analyze, Expect::FailureAnalysis, agent);
+        assert!(text.contains("test foo failed"));
+        assert!(text.contains("\"transient\"") && text.contains("\"caused_by_update\""));
+        assert!(text.contains("Do not change any files"));
+        assert!(!text.contains("Moon Skywalker"));
+
+        let text = prompt(&check, Expect::DiffCheck, agent);
+        assert!(text.contains("+version = 1.2.3") && text.contains("Bumps serde"));
+        assert!(text.contains("changes only dependency or packaging version files"));
+        assert!(text.contains("\"safe\"") && text.contains("\"unsafe\""));
+        assert!(text.contains("Do not change any files"));
+        assert!(!text.contains("Moon Skywalker"));
     }
 }

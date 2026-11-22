@@ -69,6 +69,282 @@ pub struct Job {
     /// their branch had no commits to publish. See [`Event::NothingToPublish`].
     #[serde(default)]
     skipped: Vec<usize>,
+    /// What the job works on. A job stored before this field existed loads as
+    /// [`JobKind::Request`].
+    #[serde(default)]
+    kind: JobKind,
+}
+
+/// What a job works on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobKind {
+    /// A feature request that goes through the clarify, spec, plan, implement
+    /// and publish stages.
+    #[default]
+    Request,
+    /// A Renovate pull request the factory watches. It skips every stage of a
+    /// request and ends when the pull request merges or closes.
+    Renovate(Box<RenovatePr>),
+}
+
+/// How many times the factory reruns failed CI on one head commit of a
+/// Renovate pull request. The factory reads them on every watch and passes
+/// them in [`Event::RenovateObserved`], so a saved change reaches a job in
+/// flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryLimits {
+    /// Reruns with no agent run, before an agent analyses the failure.
+    pub auto: u32,
+    /// All reruns on one head commit, before the factory stops.
+    pub total: u32,
+}
+
+/// The comments the factory posts on a Renovate pull request, each at most
+/// once per head commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommentKind {
+    /// The failure analysis found that the update causes the failure.
+    CausedByUpdate,
+    /// The diff check found the update unsafe to merge.
+    Unsafe,
+    /// CI still fails after the total reruns.
+    Stopped,
+}
+
+/// The diff check's verdict on one head commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenovateVerdict {
+    pub head: String,
+    pub safe: bool,
+    pub reason: String,
+    pub summary: String,
+    /// The upstream refs the update moves between, when the diff shows them.
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// What the factory read from a pull request whose checks all passed, for the
+/// diff check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDiff {
+    pub diff: String,
+    pub body: String,
+}
+
+/// The state of a Renovate pull request's checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenovateCi {
+    /// No check has reported.
+    NoChecks,
+    Pending,
+    Failed {
+        log: String,
+    },
+    /// Every check passed. `details` is what the diff check reads, and the
+    /// factory fetches it only when the job has no verdict for the head.
+    Passed {
+        details: Option<Box<PrDiff>>,
+    },
+}
+
+/// Why a Renovate job waits for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenovateWait {
+    /// Triage stopped: CI still fails after the total reruns, or the update
+    /// causes the failure. Retry resumes it.
+    Stopped,
+    /// The update is safe and every check passed, but auto-merge is off.
+    Ready,
+    /// The diff check found the update unsafe.
+    Unsafe,
+}
+
+/// What the factory does for a Renovate job before it watches again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum Pending {
+    /// Post `body`, then wait for the user with `then`.
+    Comment {
+        kind: CommentKind,
+        body: String,
+        then: Ask,
+    },
+    /// Approve, then merge the recorded head.
+    Merge,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum RerunKind {
+    #[default]
+    Auto,
+    Analysed,
+    Retry,
+}
+
+/// A Renovate pull request and the factory's triage state for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenovatePr {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// The head commit the counters and the verdict belong to.
+    pub head: Option<String>,
+    /// All reruns on `head`.
+    pub reruns: u32,
+    /// Reruns on `head` that needed no agent run.
+    pub auto_reruns: u32,
+    pub verdict: Option<RenovateVerdict>,
+    /// Why triage stopped on `head`.
+    pub stopped: Option<String>,
+    /// The comments posted so far, as `(head, kind)`.
+    pub comments: Vec<(String, CommentKind)>,
+    /// The agent runs started so far. Each run has its own session.
+    #[serde(default)]
+    pub runs: u32,
+    #[serde(default)]
+    pending: Option<Pending>,
+    #[serde(default)]
+    rerun: RerunKind,
+}
+
+impl RenovatePr {
+    fn commented(&self, kind: CommentKind) -> bool {
+        self.head
+            .as_ref()
+            .is_some_and(|head| self.comments.iter().any(|(h, k)| h == head && *k == kind))
+    }
+
+    fn reset(&mut self, head: String) {
+        self.head = Some(head);
+        self.reruns = 0;
+        self.auto_reruns = 0;
+        self.verdict = None;
+        self.stopped = None;
+        self.pending = None;
+        self.rerun = RerunKind::Auto;
+    }
+
+    fn stop(&mut self, kind: CommentKind, reason: String, body: String) -> Turn {
+        let state = if kind == CommentKind::Unsafe {
+            RenovateWait::Unsafe
+        } else {
+            self.stopped = Some(reason.clone());
+            RenovateWait::Stopped
+        };
+        let then = Ask::Renovate { reason, state };
+        if self.commented(kind) {
+            return Turn::User(then);
+        }
+        self.pending = Some(Pending::Comment { kind, body, then });
+        Turn::Factory
+    }
+
+    fn on_failure_verdict(&mut self, transient: bool, reason: &str) -> Turn {
+        if transient {
+            self.rerun = RerunKind::Analysed;
+            return Turn::RerunCi {
+                reason: format!("transient failure: {reason}"),
+            };
+        }
+        let body =
+            format!("CI fails because of this update, so rerunning it will not help.\n\n{reason}");
+        let reason = format!("CI fails because of the update: {reason}");
+        self.stop(CommentKind::CausedByUpdate, reason, body)
+    }
+
+    /// Records the verdict for the current head. A safe update goes back to
+    /// watching, where the next observation merges it or waits for the user.
+    fn on_diff_verdict(&mut self, found: DiffVerdict) -> Turn {
+        let DiffVerdict {
+            safe,
+            reason,
+            summary,
+            from,
+            to,
+        } = found;
+        self.verdict = Some(RenovateVerdict {
+            head: self.head.clone().unwrap_or_default(),
+            safe,
+            reason: reason.clone(),
+            summary,
+            from,
+            to,
+        });
+        if safe {
+            return Turn::Factory;
+        }
+        let (reason, body) = unsafe_texts(&reason);
+        self.stop(CommentKind::Unsafe, reason, body)
+    }
+
+    /// The rules for one observation of the pull request, after a new head
+    /// has reset the counters. The rerun check on the total limit comes
+    /// first, so a lowered limit stops a job on its next watch.
+    fn decide(&mut self, ci: RenovateCi, limits: RetryLimits, auto_merge: bool) -> Turn {
+        match ci {
+            RenovateCi::NoChecks | RenovateCi::Pending => Turn::Factory,
+            RenovateCi::Failed { log } => {
+                if self.reruns >= limits.total {
+                    let head = self.head.as_deref().unwrap_or_default();
+                    let short = &head[..head.len().min(7)];
+                    let reruns = self.reruns;
+                    self.stop(
+                        CommentKind::Stopped,
+                        format!("CI still fails after {reruns} reruns on this head commit."),
+                        format!(
+                            "CI still fails on {short} after {reruns} reruns. The factory stops \
+                             rerunning it and leaves this pull request to a person."
+                        ),
+                    )
+                } else if self.auto_reruns < limits.auto {
+                    self.rerun = RerunKind::Auto;
+                    Turn::RerunCi {
+                        reason: format!(
+                            "automatic rerun {} of {}",
+                            self.auto_reruns + 1,
+                            limits.auto
+                        ),
+                    }
+                } else {
+                    self.runs += 1;
+                    Turn::Agent(Task::AnalyzeFailure { log })
+                }
+            }
+            RenovateCi::Passed { details } => match (&self.verdict, details) {
+                (Some(verdict), _) if !verdict.safe => {
+                    let (reason, body) = unsafe_texts(&verdict.reason);
+                    self.stop(CommentKind::Unsafe, reason, body)
+                }
+                (Some(_), _) if auto_merge => {
+                    self.pending = Some(Pending::Merge);
+                    Turn::Factory
+                }
+                (Some(_), _) => Turn::User(Ask::Renovate {
+                    reason: "Every check passed and the diff check found the update safe. \
+                             Merge it on GitHub, or turn on auto-merge for the project."
+                        .to_owned(),
+                    state: RenovateWait::Ready,
+                }),
+                (None, Some(details)) => {
+                    self.runs += 1;
+                    Turn::Agent(Task::CheckDiff {
+                        diff: details.diff,
+                        body: details.body,
+                    })
+                }
+                (None, None) => Turn::Factory,
+            },
+        }
+    }
+}
+
+fn unsafe_texts(reason: &str) -> (String, String) {
+    (
+        format!("The diff check found the update unsafe to merge: {reason}"),
+        format!(
+            "The factory does not merge this update, because its diff does more than change \
+             dependency or packaging version files.\n\n{reason}"
+        ),
+    )
 }
 
 /// Whether the reviewer has approved the current head of a pull request.
@@ -158,6 +434,8 @@ pub enum Stage {
     CiAndReview {
         pr: usize,
     },
+    /// Watching a Renovate pull request. See [`JobKind::Renovate`].
+    Renovate,
     Merged,
     Cancelled,
     Failed {
@@ -229,6 +507,11 @@ pub enum Ask {
         /// default and retries as a reviewer-run failure.
         #[serde(default)]
         stop: ReviewStop,
+    },
+    /// A Renovate job waits for the user. `reason` says why in words.
+    Renovate {
+        reason: String,
+        state: RenovateWait,
     },
 }
 
@@ -326,6 +609,19 @@ pub enum Task {
     /// Review the pull request's diff and end with `approve` or `changes`. The
     /// worker gets no GitHub token and reads the diff from the checkout.
     Review,
+    /// Read the log of failed CI on a Renovate pull request, whose automatic
+    /// reruns are used up, and decide whether the failure is transient. The
+    /// worker gets no GitHub token and the factory passes the log.
+    AnalyzeFailure {
+        log: String,
+    },
+    /// Decide whether a Renovate pull request's diff changes only dependency
+    /// or packaging version files. The factory passes the diff and the
+    /// description.
+    CheckDiff {
+        diff: String,
+        body: String,
+    },
 }
 
 /// The agent session a run uses. Clarifying has one, the spec has one, and
@@ -342,6 +638,8 @@ pub enum Session {
     /// so the reviewer reads the diff without the author's context. It resumes
     /// across passes, so a later pass sees only the commits since the last one.
     Review(usize),
+    /// A run on a Renovate pull request, numbered by `RenovatePr::runs`.
+    Renovate(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +678,32 @@ pub enum Command {
         number: u64,
         reason: String,
     },
+    /// Watch a Renovate pull request. `verdict_head` is the head the job has
+    /// a diff verdict for, so the factory fetches the diff only for another
+    /// head. With `watch_only` the factory reports an observation only when
+    /// the head changed, besides a merge or close.
+    WatchRenovate {
+        number: u64,
+        verdict_head: Option<String>,
+        watch_only: bool,
+    },
+    /// Rerun the failed CI runs of a Renovate pull request. The factory logs
+    /// `reason`.
+    RerunRenovate {
+        number: u64,
+        reason: String,
+    },
+    /// Post `body` as a comment on the pull request, then report
+    /// [`Event::Commented`].
+    PostComment {
+        number: u64,
+        body: String,
+    },
+    /// Approve the pull request and squash-merge `head`, and only that head.
+    MergeRenovate {
+        number: u64,
+        head: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +718,25 @@ pub enum AgentResult {
     RerunCi {
         reason: String,
     },
+    /// The failure analysis of a Renovate pull request.
+    FailureVerdict {
+        /// The failure has nothing to do with the update, so a rerun may pass.
+        transient: bool,
+        reason: String,
+    },
+    /// The diff check of a Renovate pull request.
+    DiffVerdict(Box<DiffVerdict>),
+}
+
+/// What the diff check of a Renovate pull request returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffVerdict {
+    pub safe: bool,
+    pub reason: String,
+    pub summary: String,
+    /// The upstream refs the update moves between, when the diff shows them.
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,6 +793,17 @@ pub enum Event {
     ReviewFailed {
         reason: String,
     },
+    /// The factory watched a Renovate pull request. `head` is its head
+    /// commit, `limits` the retry limits now saved and `auto_merge` the
+    /// project's switch now.
+    RenovateObserved {
+        head: String,
+        ci: RenovateCi,
+        limits: RetryLimits,
+        auto_merge: bool,
+    },
+    /// The factory posted the comment of [`Command::PostComment`].
+    Commented,
     Merged,
     ClosedUnmerged,
     /// The pull request's branch has no commits after the base branch, so
@@ -519,6 +873,45 @@ impl Job {
             reviews: Vec::new(),
             review_head: None,
             skipped: Vec::new(),
+            kind: JobKind::Request,
+        }
+    }
+
+    /// A job that watches Renovate pull request `number`. Its request text is
+    /// the pull request's title.
+    #[must_use]
+    pub fn renovate(number: u64, title: impl Into<String>, url: impl Into<String>) -> Self {
+        let title = title.into();
+        let mut job = Job::new(title.clone(), Gates::default());
+        job.stage = Stage::Renovate;
+        job.kind = JobKind::Renovate(Box::new(RenovatePr {
+            number,
+            title,
+            url: url.into(),
+            head: None,
+            reruns: 0,
+            auto_reruns: 0,
+            verdict: None,
+            stopped: None,
+            comments: Vec::new(),
+            runs: 0,
+            pending: None,
+            rerun: RerunKind::Auto,
+        }));
+        job
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &JobKind {
+        &self.kind
+    }
+
+    /// The Renovate pull request the job watches, or `None` for a request.
+    #[must_use]
+    pub fn renovate_pr(&self) -> Option<&RenovatePr> {
+        match &self.kind {
+            JobKind::Renovate(pr) => Some(&**pr),
+            JobKind::Request => None,
         }
     }
 
@@ -617,6 +1010,7 @@ impl Job {
                     watch_only: true,
                 })
             }
+            (_, Stage::Renovate) => self.renovate_command(),
             (Turn::RerunCi { reason }, Stage::CiAndReview { pr }) => {
                 self.plan[*pr].number.map(|number| Command::RerunCi {
                     pr: *pr,
@@ -624,6 +1018,38 @@ impl Job {
                     reason: reason.clone(),
                 })
             }
+            _ => None,
+        }
+    }
+
+    fn renovate_command(&self) -> Option<Command> {
+        let pr = self.renovate_pr()?;
+        let number = pr.number;
+        match &self.turn {
+            Turn::Factory => Some(match &pr.pending {
+                Some(Pending::Comment { body, .. }) => Command::PostComment {
+                    number,
+                    body: body.clone(),
+                },
+                Some(Pending::Merge) => Command::MergeRenovate {
+                    number,
+                    head: pr.head.clone()?,
+                },
+                None => Command::WatchRenovate {
+                    number,
+                    verdict_head: pr.verdict.as_ref().map(|verdict| verdict.head.clone()),
+                    watch_only: false,
+                },
+            }),
+            Turn::RerunCi { reason } => Some(Command::RerunRenovate {
+                number,
+                reason: reason.clone(),
+            }),
+            Turn::User(Ask::Renovate { state, .. }) => Some(Command::WatchRenovate {
+                number,
+                verdict_head: pr.verdict.as_ref().map(|verdict| verdict.head.clone()),
+                watch_only: *state != RenovateWait::Ready,
+            }),
             _ => None,
         }
     }
@@ -738,6 +1164,8 @@ impl Job {
                 | E::ReviewChanges { .. }
                 | E::ReviewFailed { .. }),
             ) => return self.deliver_review(event),
+
+            (S::Renovate, _, event) => return self.deliver_renovate(event),
 
             (
                 S::Implementing { .. }
@@ -859,7 +1287,93 @@ impl Job {
         Ok(next)
     }
 
+    /// Handles the events of a Renovate job. The observation rules live in
+    /// [`RenovatePr::decide`].
+    fn deliver_renovate(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
+        use Event as E;
+
+        let turn = self.turn.clone();
+        let Some(pr) = self.renovate_mut() else {
+            return Err(self.unexpected(event));
+        };
+        let next = match (&turn, event) {
+            (
+                Turn::Agent(Task::AnalyzeFailure { .. }),
+                E::Agent(AgentResult::FailureVerdict { transient, reason }),
+            ) => pr.on_failure_verdict(transient, &reason),
+            (Turn::Agent(Task::CheckDiff { .. }), E::Agent(AgentResult::DiffVerdict(found))) => {
+                pr.on_diff_verdict(*found)
+            }
+            (Turn::RerunCi { .. }, E::CiRerun) => {
+                match pr.rerun {
+                    RerunKind::Auto => {
+                        pr.reruns += 1;
+                        pr.auto_reruns += 1;
+                    }
+                    RerunKind::Analysed => pr.reruns += 1,
+                    RerunKind::Retry => {}
+                }
+                Turn::Factory
+            }
+            (Turn::Factory, E::Commented) => {
+                let Some(Pending::Comment { kind, then, .. }) = pr.pending.take() else {
+                    return Err(self.unexpected(E::Commented));
+                };
+                if let Some(head) = pr.head.clone() {
+                    pr.comments.push((head, kind));
+                }
+                Turn::User(then)
+            }
+            (
+                Turn::Factory | Turn::User(Ask::Renovate { .. }),
+                E::RenovateObserved {
+                    head,
+                    ci,
+                    limits,
+                    auto_merge,
+                },
+            ) => {
+                if matches!(pr.pending, Some(Pending::Comment { .. })) {
+                    return Err(self.unexpected(E::RenovateObserved {
+                        head,
+                        ci,
+                        limits,
+                        auto_merge,
+                    }));
+                }
+                let waiting = matches!(
+                    turn,
+                    Turn::User(Ask::Renovate {
+                        state: RenovateWait::Stopped | RenovateWait::Unsafe,
+                        ..
+                    })
+                );
+                if pr.head.as_deref() != Some(head.as_str()) {
+                    pr.reset(head);
+                } else if waiting {
+                    return Ok((Stage::Renovate, turn));
+                }
+                pr.pending = None;
+                pr.decide(ci, limits, auto_merge)
+            }
+            (_, E::Merged) => return Ok((Stage::Merged, Turn::Done)),
+            (_, E::ClosedUnmerged) => return Ok((Stage::Cancelled, Turn::Done)),
+            (_, event) => return Err(self.unexpected(event)),
+        };
+        Ok((Stage::Renovate, next))
+    }
+
+    fn renovate_mut(&mut self) -> Option<&mut RenovatePr> {
+        match &mut self.kind {
+            JobKind::Renovate(pr) => Some(&mut **pr),
+            JobKind::Request => None,
+        }
+    }
+
     fn session(&self) -> Session {
+        if let Some(pr) = self.renovate_pr() {
+            return Session::Renovate(pr.runs);
+        }
         if let (Stage::CiAndReview { pr }, Turn::Agent(Task::Review)) = (&self.stage, &self.turn) {
             return Session::Review(*pr);
         }
@@ -1059,6 +1573,24 @@ impl Job {
     /// Applies [`Event::Retry`]. A stopped review resumes by its case; every
     /// other job defers to [`Job::retry_step`]. On `Err` the job is unchanged.
     fn retry(&mut self) -> Result<(Stage, Turn), Rejected> {
+        if let Turn::User(Ask::Renovate {
+            state: RenovateWait::Stopped,
+            ..
+        }) = &self.turn
+            && let Some(pr) = self.renovate_mut()
+        {
+            pr.reruns = 0;
+            pr.auto_reruns = 0;
+            pr.stopped = None;
+            pr.rerun = RerunKind::Retry;
+            return Ok((
+                Stage::Renovate,
+                Turn::RerunCi {
+                    reason: "retry requested by the user".to_owned(),
+                },
+            ));
+        }
+
         if let (Stage::CiAndReview { pr }, Turn::User(Ask::ReviewStopped { stop, .. })) =
             (&self.stage, &self.turn)
         {
@@ -1139,10 +1671,14 @@ impl Job {
     /// review on a pull request that has a number, and for a job that failed
     /// because it used up its failed rounds or an agent run failed: one with a
     /// retry target, or a legacy job recognised by its reason that has a pull
-    /// request number. False for every other failure or user ask, and for a
-    /// legacy job with no pull request number.
+    /// request number. A stopped Renovate job can retry too. False for every
+    /// other failure or user ask, and for a legacy job with no pull request
+    /// number.
     #[must_use]
     pub fn can_retry(&self) -> bool {
+        if let Turn::User(Ask::Renovate { state, .. }) = &self.turn {
+            return *state == RenovateWait::Stopped;
+        }
         if let (Stage::CiAndReview { pr }, Turn::User(Ask::ReviewStopped { .. })) =
             (&self.stage, &self.turn)
         {

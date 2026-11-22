@@ -707,6 +707,38 @@ impl Store {
         Ok(id)
     }
 
+    /// Creates the job that triages Renovate pull request `number` of
+    /// `project`. The requester is `factory`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn create_renovate(
+        &self,
+        project: &str,
+        number: u64,
+        title: &str,
+        url: &str,
+    ) -> Result<i64, StoreError> {
+        let new = Job::renovate(number, title, url);
+        let job = serde_json::to_string(&new)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO jobs (project, requested_by, job) VALUES (?1, 'factory', ?2)",
+            params![project, job],
+        )?;
+        let id = tx.last_insert_rowid();
+        Self::record(&tx, id, "created", &new, None, None)?;
+        tx.execute(
+            "INSERT INTO project_totals (project, jobs_created) VALUES (?1, 1)
+             ON CONFLICT (project) DO UPDATE SET jobs_created = jobs_created + 1",
+            [project],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// # Errors
     ///
     /// Fails with [`StoreError::NotFound`] when there is no job `id`.
@@ -3111,6 +3143,7 @@ fn session_key(session: Session) -> String {
         Session::Plan => "plan".to_owned(),
         Session::Pr(pr) => format!("pr-{pr}"),
         Session::Review(pr) => format!("review-{pr}"),
+        Session::Renovate(run) => format!("renovate-{run}"),
     }
 }
 

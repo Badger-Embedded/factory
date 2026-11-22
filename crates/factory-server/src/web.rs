@@ -890,7 +890,9 @@ fn keep_session_settings(
             &mut efforts.implement,
             &agents.implement,
         ),
-        Expect::Review => (&mut models.review, &mut efforts.review, &agents.review),
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => {
+            (&mut models.review, &mut efforts.review, &agents.review)
+        }
     };
     let on_stage_agent = Agent::from_id(stage_agent).unwrap_or(DEFAULT_AGENT) == last.agent;
     if on_stage_agent && !state.slots.has_task(row.id) {

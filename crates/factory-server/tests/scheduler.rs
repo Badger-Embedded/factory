@@ -507,6 +507,7 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
+        Expect::FailureAnalysis | Expect::DiffCheck => unreachable!("this job is no Renovate job"),
     });
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -2533,6 +2534,7 @@ fn one_pass(request: &AgentRequest) -> Event {
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
         Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
+        Expect::FailureAnalysis | Expect::DiffCheck => unreachable!("this job is no Renovate job"),
     }
 }
 
@@ -3888,5 +3890,140 @@ fn start_review() -> Event {
     let n = HEADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Event::StartReview {
         head: format!("head{n}"),
+    }
+}
+
+fn observed(head: &str, ci: factory_core::RenovateCi) -> Event {
+    Event::RenovateObserved {
+        head: head.into(),
+        ci,
+        limits: factory_core::RetryLimits { auto: 0, total: 7 },
+        auto_merge: false,
+    }
+}
+
+fn review_stage_settings(store: &Store) {
+    store
+        .save_project_models(
+            "maestro",
+            &StageModels {
+                clarify: Some("clarify-model".into()),
+                review: Some("review-model".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let agents = StageAgents {
+        review: "codex".into(),
+        ..StageAgents::default()
+    };
+    store.save_project_agents("maestro", &agents).unwrap();
+    store
+        .save_project_efforts(
+            "maestro",
+            &stage_efforts("low", "low", "low", "low", "high"),
+            &agents,
+        )
+        .unwrap();
+    for name in ["clarify-only", "review-only"] {
+        store
+            .create_mcp_server(name, &format!("https://{name}.example/mcp"), &[])
+            .unwrap();
+    }
+    for (name, stages) in [
+        (
+            "clarify-only",
+            McpStages {
+                clarify: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "review-only",
+            McpStages {
+                review: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        store
+            .save_project_mcp("maestro", name, &enabled(stages))
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn renovate_runs_get_their_own_sessions_on_the_review_stage_settings() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::FailureAnalysis => Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "the runner lost its network".into(),
+        }),
+        _ => Event::AgentFailed {
+            reason: "timed out".into(),
+        },
+    });
+    review_stage_settings(&store);
+    let id = store
+        .create_renovate("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap();
+    executor.release(10);
+
+    store
+        .apply(
+            id,
+            observed(
+                "h1",
+                factory_core::RenovateCi::Failed { log: "boom".into() },
+            ),
+        )
+        .unwrap();
+    step(&scheduler).await;
+    assert_eq!(
+        store.get(id).unwrap().job.turn(),
+        &Turn::RerunCi {
+            reason: "transient failure: the runner lost its network".into()
+        }
+    );
+    store.apply(id, Event::CiRerun).unwrap();
+    store
+        .apply(
+            id,
+            observed(
+                "h1",
+                factory_core::RenovateCi::Passed {
+                    details: Some(Box::new(factory_core::PrDiff {
+                        diff: "+serde = 1.0.2".into(),
+                        body: "Bumps serde".into(),
+                    })),
+                },
+            ),
+        )
+        .unwrap();
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let expects: Vec<_> = requests.iter().map(|r| r.expect).collect();
+    assert_eq!(
+        expects,
+        [
+            Expect::FailureAnalysis,
+            Expect::DiffCheck,
+            Expect::DiffCheck
+        ]
+    );
+    assert_ne!(requests[0].session_id, requests[1].session_id);
+    assert_eq!(requests[1].session_id, requests[2].session_id);
+    for request in &requests {
+        assert_eq!(request.agent, Agent::Codex);
+        assert_eq!(request.model.as_deref(), Some("review-model"));
+        assert_eq!(request.effort.as_deref(), Some("high"));
+        assert_eq!(mcp_stage(request), ["review-only"]);
     }
 }

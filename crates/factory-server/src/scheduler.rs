@@ -47,7 +47,7 @@ fn stage_agent(agents: &StageAgents, expect: Expect) -> Agent {
         Expect::Spec => &agents.spec,
         Expect::Plan => &agents.plan,
         Expect::Commits | Expect::FixCi => &agents.implement,
-        Expect::Review => &agents.review,
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => &agents.review,
     };
     Agent::from_id(id).unwrap_or(DEFAULT_AGENT)
 }
@@ -58,7 +58,7 @@ fn stage_name(expect: Expect) -> &'static str {
         Expect::Spec => "spec",
         Expect::Plan => "plan",
         Expect::Commits | Expect::FixCi => "implement",
-        Expect::Review => "review",
+        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => "review",
     }
 }
 
@@ -640,7 +640,7 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Spec => models.spec,
                 Expect::Plan => models.plan,
                 Expect::Commits | Expect::FixCi => models.implement,
-                Expect::Review => models.review,
+                Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => models.review,
             };
             let efforts = self.store.project_efforts(&row.project)?;
             let effort = match expect {
@@ -648,7 +648,7 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Spec => efforts.spec,
                 Expect::Plan => efforts.plan,
                 Expect::Commits | Expect::FixCi => efforts.implement,
-                Expect::Review => efforts.review,
+                Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => efforts.review,
             };
             self.store
                 .record_session_settings(row.id, session, model.as_deref(), &effort)?;
@@ -683,7 +683,7 @@ impl<E: Executor> Scheduler<E> {
             repo: project.repo.clone(),
             base: project.base.clone(),
             branch: match session {
-                Session::Planning | Session::Spec | Session::Plan => None,
+                Session::Planning | Session::Spec | Session::Plan | Session::Renovate(_) => None,
                 Session::Pr(pr) | Session::Review(pr) => Some(branch_name(row.id, pr)),
             },
             session_id,
@@ -735,7 +735,9 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Spec => settings.stages.spec,
                 Expect::Plan => settings.stages.plan,
                 Expect::Commits | Expect::FixCi => settings.stages.implement,
-                Expect::Review => settings.stages.review,
+                Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck => {
+                    settings.stages.review
+                }
             };
             if !(settings.enabled && in_stage) {
                 continue;
