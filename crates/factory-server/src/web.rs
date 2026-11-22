@@ -473,12 +473,20 @@ async fn index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<IndexQuery>,
-) -> Result<Markup, AppError> {
+) -> Result<Response, AppError> {
     let login = user(&headers);
-    let data = load_board(&state, &login, query.project)?;
+    let explicit = query.project.is_some();
+    let requested = match query.project {
+        Some(name) => Some(name),
+        None => {
+            let names = state.store.projects_for(&login)?;
+            remembered_project(&headers).filter(|name| names.contains(name))
+        }
+    };
+    let data = load_board(&state, &login, requested)?;
     let plan_usage = usage_tile(&state);
     let notifications = state.store.notifications_enabled(&login)?;
-    Ok(pages::index(
+    let page = pages::index(
         &login,
         &data.names,
         data.selected.as_deref(),
@@ -489,7 +497,31 @@ async fn index(
         data.auto_merge,
         &data.workers,
         notifications,
-    ))
+    );
+    match data.selected.as_deref().filter(|_| explicit) {
+        Some(name) => {
+            let cookie = format!(
+                "{PROJECT_COOKIE}={}; Path=/; SameSite=Lax; HttpOnly; Max-Age=31536000",
+                query_escape(name)
+            );
+            Ok(([(header::SET_COOKIE, cookie)], page).into_response())
+        }
+        None => Ok(page.into_response()),
+    }
+}
+
+const PROJECT_COOKIE: &str = "factory_project";
+
+/// The project named by the cookie, unchecked. The caller must confirm the
+/// login can see it.
+fn remembered_project(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| pair.trim().strip_prefix(PROJECT_COOKIE)?.strip_prefix('='))
+        .and_then(query_unescape)
 }
 
 async fn notifications(
@@ -1317,6 +1349,23 @@ pub(crate) fn query_escape(value: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
+}
+
+fn query_unescape(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = value.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 #[derive(Deserialize)]
