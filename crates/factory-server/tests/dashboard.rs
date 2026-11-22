@@ -3676,6 +3676,26 @@ async fn the_form_has_the_paste_script_and_a_thumbnail_list() {
 }
 
 #[tokio::test]
+async fn a_press_in_the_composer_attachment_row_keeps_the_form_open() {
+    let dashboard = dashboard();
+    let page = dashboard.get("/").await;
+    assert!(
+        page.body
+            .contains(r#"<div class="composer-more" tabindex="-1">"#)
+    );
+
+    let response = dashboard
+        .router
+        .clone()
+        .oneshot(Request::get("/style.css").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let css = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(css.contains(".composer:focus-within .composer-more"));
+}
+
+#[tokio::test]
 async fn the_job_page_shows_the_images_next_to_the_request() {
     let dashboard = dashboard();
     let id = job_id(
