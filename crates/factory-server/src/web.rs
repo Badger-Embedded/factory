@@ -26,7 +26,9 @@ use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
 use crate::secrets::{SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
-use crate::store::{JobFile, JobRow, ProjectTotals, Store, StoreError};
+use crate::store::{
+    JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectTotals, Store, StoreError,
+};
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
 
@@ -157,6 +159,10 @@ pub fn app(
         .route(
             "/settings/projects/{project}/collaborators/remove",
             post(remove_project_collaborator),
+        )
+        .route(
+            "/settings/projects/{project}/maintenance",
+            post(save_project_maintenance),
         )
         .route("/settings/projects/{project}/remove", post(remove_project))
         .route(
@@ -1582,11 +1588,29 @@ fn project_page(
     notice: Option<&str>,
     problem: Option<&str>,
 ) -> Result<Markup, AppError> {
+    project_page_with(state, headers, name, selected, notice, problem, None)
+}
+
+/// As [`project_page`], with `maintenance` shown in place of the stored
+/// maintenance settings, so a refused save redraws what was posted.
+fn project_page_with(
+    state: &AppState,
+    headers: &HeaderMap,
+    name: &str,
+    selected: pages::PipelinePart,
+    notice: Option<&str>,
+    problem: Option<&str>,
+    maintenance: Option<Maintenance>,
+) -> Result<Markup, AppError> {
     let project = visible_project(state, headers, name)?;
+    let mut settings = project_settings(state, name, &project)?;
+    if let Some(maintenance) = maintenance {
+        settings.maintenance = maintenance;
+    }
     Ok(pages::settings_project(
         &user(headers),
         &settings_nav(state, &user(headers))?,
-        &project_settings(state, name, &project)?,
+        &settings,
         selected,
         notice,
         problem,
@@ -1647,6 +1671,7 @@ fn project_settings(
         default_gates: state.store.settings()?.gates,
         servers,
         collaborators: state.store.collaborators(name)?,
+        maintenance: state.store.project_maintenance(name)?,
     })
 }
 
@@ -1939,6 +1964,73 @@ async fn remove_project_collaborator(
         None,
     )?
     .into_response())
+}
+
+#[derive(Deserialize)]
+struct MaintenanceForm {
+    renovate: Option<String>,
+    packaging: Option<String>,
+    #[serde(default)]
+    packaging_type: String,
+    #[serde(default)]
+    manifest_files: String,
+    #[serde(default)]
+    build_config_files: String,
+    #[serde(default)]
+    upstream_repo: String,
+}
+
+/// One path per line, trimmed, with empty lines dropped.
+fn path_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn save_project_maintenance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<MaintenanceForm>,
+) -> Result<Markup, AppError> {
+    visible_project(&state, &headers, &project)?;
+    let part = pages::PipelinePart::parse(None);
+    let kind = if form.packaging_type.is_empty() {
+        Some(PackagingType::default())
+    } else {
+        PackagingType::parse(&form.packaging_type)
+    };
+    let packaging = form.packaging.is_some().then(|| Packaging {
+        kind: kind.unwrap_or_default(),
+        manifest_files: path_lines(&form.manifest_files),
+        build_config_files: path_lines(&form.build_config_files),
+        upstream_repo: form.upstream_repo.trim().to_owned(),
+    });
+    let maintenance = Maintenance {
+        renovate: form.renovate.is_some(),
+        packaging,
+    };
+    let refusal = match (&maintenance.packaging, kind) {
+        (Some(_), None) => Some("The packaging type must be snap, deb or other.".to_owned()),
+        _ => maintenance.check().err(),
+    };
+    if let Some(problem) = refusal {
+        return project_page_with(
+            &state,
+            &headers,
+            &project,
+            part,
+            None,
+            Some(&problem),
+            Some(maintenance),
+        );
+    }
+    state
+        .store
+        .save_project_maintenance(&project, &maintenance)?;
+    project_page(&state, &headers, &project, part, Some("Saved."), None)
 }
 
 #[derive(Deserialize)]

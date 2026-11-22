@@ -14,7 +14,10 @@ use crate::mcp::{McpServer, McpStages, McpToolState};
 use crate::projects::Project;
 use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
-use crate::store::{CodexPrice, Collaborator, JobEvent, JobFile, JobRow, LogEntry, ProjectTotals};
+use crate::store::{
+    CodexPrice, Collaborator, JobEvent, JobFile, JobRow, LogEntry, Maintenance, PackagingType,
+    ProjectTotals,
+};
 use crate::timeline::timeline;
 use crate::workers::Slot;
 
@@ -500,6 +503,8 @@ pub struct ProjectSettings {
     pub servers: Vec<ServerSettings>,
     /// The project's collaborators, oldest first, for the Collaborators card.
     pub collaborators: Vec<Collaborator>,
+    /// The Renovate and packaging switches and the packaging fields.
+    pub maintenance: Maintenance,
 }
 
 /// One agent the stage panel's agent control offers: its stable id, the name
@@ -1434,6 +1439,7 @@ pub fn settings_project(
             h1 { (project.name) }
             p.meta { "The path a job takes. Select a stage to set its model, effort and MCP servers, or a ✋ to change that approval gate. " (RUNS_KEEP_VALUES) }
             (project_form(project, selected, nav.admin))
+            (project_maintenance_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
                 div.card.failed { (problem) }
@@ -1452,7 +1458,7 @@ fn remove_project_card(project: &ProjectSettings) -> Markup {
             h2 { "Remove project" }
             p.hint {
                 "Cancels any running job, which stops its container, and deletes this "
-                "project's settings, its collaborators, its stored MCP header values and the "
+                "project's settings, its maintenance settings, its collaborators, its stored MCP header values and the "
                 "cost history of its jobs. The job rows stay until they expire, and open pull "
                 "requests are left alone. This cannot be undone. Type the project name to confirm."
             }
@@ -1462,6 +1468,68 @@ fn remove_project_card(project: &ProjectSettings) -> Markup {
                     placeholder=(project.name);
                 button.danger { "Remove " (project.name) }
             }
+        }
+    }
+}
+
+/// The Maintenance card: the Renovate and packaging switches, and the
+/// packaging fields. The fields are left out of the markup while "Packaging
+/// project" is off. An operator ticks the switch and saves; the refused save
+/// redraws the page with the fields, so this works without JavaScript.
+fn project_maintenance_card(project: &ProjectSettings) -> Markup {
+    let maintenance = &project.maintenance;
+    let packaging = maintenance.packaging.as_ref();
+    html! {
+        form.card method="post"
+            action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/maintenance" } {
+            h2 { "Maintenance" }
+            div.field {
+                label.check {
+                    input type="checkbox" name="renovate" value="on" checked[maintenance.renovate];
+                    " Renovate pull requests"
+                }
+                p.hint { "Off by default. Packaging projects need it on: the packaging analysis runs after a merged Renovate pull request." }
+            }
+            div.field {
+                label.check {
+                    input type="checkbox" name="packaging" value="on" checked[packaging.is_some()];
+                    " Packaging project"
+                }
+                p.hint { "Save with this ticked to set the packaging fields." }
+            }
+            @if let Some(packaging) = packaging {
+                div.field {
+                    label for="packaging_type" { "Type" }
+                    select #packaging_type name="packaging_type" {
+                        @for kind in [PackagingType::Snap, PackagingType::Deb, PackagingType::Other] {
+                            option value=(kind.as_str()) selected[kind == packaging.kind] { (kind.as_str()) }
+                        }
+                    }
+                }
+                div.field {
+                    label for="manifest_files" { "Manifest files" }
+                    textarea #manifest_files name="manifest_files" rows="3"
+                        autocapitalize="none" spellcheck="false" {
+                        (packaging.manifest_files.join("\n"))
+                    }
+                    p.hint { "Repository paths, one per line. At least one." }
+                }
+                div.field {
+                    label for="build_config_files" { "Build config files" }
+                    textarea #build_config_files name="build_config_files" rows="3"
+                        autocapitalize="none" spellcheck="false" {
+                        (packaging.build_config_files.join("\n"))
+                    }
+                    p.hint { "Paths in the upstream repository, one per line. May be empty." }
+                }
+                div.field {
+                    label for="upstream_repo" { "Upstream repository" }
+                    input #upstream_repo type="text" name="upstream_repo" autocomplete="off"
+                        autocapitalize="none" spellcheck="false" placeholder="owner/name"
+                        value=(packaging.upstream_repo);
+                }
+            }
+            (save_bar("Save maintenance"))
         }
     }
 }

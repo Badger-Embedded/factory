@@ -182,6 +182,15 @@ CREATE TABLE IF NOT EXISTS project_collaborators (
     added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (project, login)
 );
+CREATE TABLE IF NOT EXISTS project_maintenance (
+    project TEXT PRIMARY KEY,
+    renovate INTEGER NOT NULL DEFAULT 0,
+    packaging INTEGER NOT NULL DEFAULT 0,
+    packaging_type TEXT,
+    manifest_files TEXT NOT NULL DEFAULT '[]',
+    build_config_files TEXT NOT NULL DEFAULT '[]',
+    upstream_repo TEXT
+);
 CREATE TABLE IF NOT EXISTS user_settings (
     login TEXT PRIMARY KEY,
     notifications INTEGER NOT NULL DEFAULT 1,
@@ -199,6 +208,81 @@ CREATE TABLE IF NOT EXISTS store_boots (
 pub struct JobFile {
     pub name: String,
     pub original_name: String,
+}
+
+/// What kind of package a packaging project maintains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PackagingType {
+    #[default]
+    Snap,
+    Deb,
+    Other,
+}
+
+impl PackagingType {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snap => "snap",
+            Self::Deb => "deb",
+            Self::Other => "other",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "snap" => Some(Self::Snap),
+            "deb" => Some(Self::Deb),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+/// The packaging fields of a project that is a packaging project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Packaging {
+    pub kind: PackagingType,
+    /// Repository paths of the packaging manifest.
+    pub manifest_files: Vec<String>,
+    /// Paths in the upstream repository whose changes the analysis reads.
+    pub build_config_files: Vec<String>,
+    /// The upstream repository, `owner/name`.
+    pub upstream_repo: String,
+}
+
+/// A project's maintenance settings. Both switches are off by default.
+/// `packaging` is `Some` exactly when "Packaging project" is on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Maintenance {
+    pub renovate: bool,
+    pub packaging: Option<Packaging>,
+}
+
+impl Maintenance {
+    /// Whether these settings may be saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message to show when packaging is on without Renovate,
+    /// without a manifest file, or with an upstream repository that is not
+    /// `owner/name`.
+    pub fn check(&self) -> Result<(), String> {
+        let Some(packaging) = &self.packaging else {
+            return Ok(());
+        };
+        if !self.renovate {
+            return Err("A packaging project needs Renovate pull requests on: the packaging analysis runs after a merged Renovate pull request.".to_owned());
+        }
+        if packaging.manifest_files.is_empty() {
+            return Err("Give at least one manifest file.".to_owned());
+        }
+        if !crate::github::well_formed(&packaging.upstream_repo) {
+            return Err("The upstream repository must look like owner/name.".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// One collaborator of a project: a login that may see and act on it.
@@ -1685,7 +1769,7 @@ impl Store {
     /// `project_models`, `project_settings`, `project_gates`, `project_efforts`,
     /// `project_agents`, `project_mcp`, `project_mcp_tools`,
     /// `project_mcp_tool_refreshes`, `project_totals` and
-    /// `project_collaborators`, its MCP header values in `secrets`, its
+    /// `project_collaborators`, `project_maintenance`, its MCP header values in `secrets`, its
     /// `job_costs` rows, and the `cost` rows in `job_events` for its jobs. With
     /// no collaborator rows left, the project and its surviving jobs are visible
     /// to nobody. A run that finishes after the removal cannot record its cost:
@@ -1733,6 +1817,7 @@ impl Store {
             "project_mcp_tool_refreshes",
             "project_totals",
             "project_collaborators",
+            "project_maintenance",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;
@@ -2036,6 +2121,90 @@ impl Store {
             )
             .optional()?;
         Ok(stored.unwrap_or(default))
+    }
+
+    /// The maintenance settings of `project`: both switches off when it has
+    /// no row.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored list that does not parse.
+    pub fn project_maintenance(&self, project: &str) -> Result<Maintenance, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT renovate, packaging, packaging_type, manifest_files,
+                        build_config_files, upstream_repo
+                 FROM project_maintenance WHERE project = ?1",
+                [project],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((renovate, packaging, kind, manifest, build, upstream)) = row else {
+            return Ok(Maintenance::default());
+        };
+        let packaging = if packaging {
+            Some(Packaging {
+                kind: kind
+                    .as_deref()
+                    .and_then(PackagingType::parse)
+                    .unwrap_or_default(),
+                manifest_files: serde_json::from_str(&manifest)?,
+                build_config_files: serde_json::from_str(&build)?,
+                upstream_repo: upstream.unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+        Ok(Maintenance {
+            renovate,
+            packaging,
+        })
+    }
+
+    /// Writes the whole maintenance row of `project`. It does not validate;
+    /// call [`Maintenance::check`] first.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_maintenance(
+        &self,
+        project: &str,
+        maintenance: &Maintenance,
+    ) -> Result<(), StoreError> {
+        let packaging = maintenance.packaging.as_ref();
+        self.conn().execute(
+            "INSERT INTO project_maintenance
+                (project, renovate, packaging, packaging_type, manifest_files,
+                 build_config_files, upstream_repo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (project) DO UPDATE SET renovate = excluded.renovate,
+                packaging = excluded.packaging,
+                packaging_type = excluded.packaging_type,
+                manifest_files = excluded.manifest_files,
+                build_config_files = excluded.build_config_files,
+                upstream_repo = excluded.upstream_repo",
+            params![
+                project,
+                maintenance.renovate,
+                packaging.is_some(),
+                packaging.map(|p| p.kind.as_str()),
+                serde_json::to_string(&packaging.map_or(&[][..], |p| &p.manifest_files[..]))?,
+                serde_json::to_string(&packaging.map_or(&[][..], |p| &p.build_config_files[..]))?,
+                packaging.map(|p| p.upstream_repo.as_str()),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Saves a project's auto-merge and LLM-review flags together, so the one
