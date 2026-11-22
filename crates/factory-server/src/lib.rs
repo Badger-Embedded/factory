@@ -27,7 +27,9 @@ pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT, ToolLis
 pub use codex::{CodexLogin, CodexRun};
 pub use copilot::{CopilotTokenError, validate_copilot_token};
 pub use cost::{codex_cost, format_cost, merge_fraction};
-pub use device_login::{DeviceLogin, LoginProcess, LoginSpawner, LoginView, PodmanLogin};
+pub use device_login::{
+    DeviceLogin, LoginProcess, LoginSpawner, LoginSpec, LoginView, PodmanLogin,
+};
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
     check_repo,
