@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use factory_server::{
-    CodexAuthError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef,
-    SecretStore, Store, UnavailableSecrets, validate_codex_auth,
+    CodexAuthError, CopilotTokenError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError, SecretRef,
+    SecretStore, Store, UnavailableSecrets, validate_codex_auth, validate_copilot_token,
 };
 
 fn store() -> Arc<Store> {
@@ -390,12 +390,13 @@ fn deleting_an_mcp_server_named_codex_keeps_the_login() {
 }
 
 #[test]
-fn a_ciphertext_moved_between_the_codex_claude_and_header_rows_fails() {
+fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
     let store = store();
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
     let header = at("maestro", "context7", "Authorization");
     let claude = at("", "", "claude-token");
     let codex = at("", "", "codex-auth");
+    let copilot = at("", "", "copilot-token");
 
     secrets
         .put(header, "Bearer sk-header")
@@ -406,9 +407,12 @@ fn a_ciphertext_moved_between_the_codex_claude_and_header_rows_fails() {
     secrets
         .set_codex_auth(&auth_json("access-token", "refresh-token"))
         .expect("set login");
+    secrets
+        .set_copilot_token("gho_copilottoken")
+        .expect("set copilot token");
 
     // Read every reserved row's raw bytes, then plant each one in each of the
-    // other two rows and confirm it fails to decrypt there. Every ordered pair
+    // other three rows and confirm it fails to decrypt there. Every ordered pair
     // among the three rows is covered, so a ciphertext cannot be moved in any
     // direction.
     let raw = |reference| {
@@ -417,7 +421,9 @@ fn a_ciphertext_moved_between_the_codex_claude_and_header_rows_fails() {
             .expect("raw row")
             .expect("row exists")
     };
-    let rows = [("header", header), ("claude", claude), ("codex", codex)];
+    let rows = [("header", header), ("claude", claude), ("codex", codex),
+        ("copilot", copilot),
+    ];
     for (source_name, source) in rows {
         let (backend, bytes) = raw(source);
         for (dest_name, dest) in rows {
@@ -431,6 +437,7 @@ fn a_ciphertext_moved_between_the_codex_claude_and_header_rows_fails() {
                 "header" => secrets.get(dest),
                 "claude" => secrets.claude_token(),
                 "codex" => secrets.codex_auth(),
+                "copilot" => secrets.copilot_token(),
                 _ => unreachable!(),
             };
             assert!(
@@ -443,6 +450,7 @@ fn a_ciphertext_moved_between_the_codex_claude_and_header_rows_fails() {
                 "header" => secrets.put(dest, "Bearer sk-header"),
                 "claude" => secrets.set_claude_token("sk-ant-oat01-token"),
                 "codex" => secrets.set_codex_auth(&auth_json("access-token", "refresh-token")),
+                "copilot" => secrets.set_copilot_token("gho_copilottoken"),
                 _ => unreachable!(),
             };
             restore.expect("restore the destination row");
@@ -521,4 +529,140 @@ fn a_codex_auth_error_never_echoes_the_input() {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[test]
+fn copilot_token_round_trips() {
+    let secrets = LocalSecrets::new(&key(1), store());
+
+    assert!(secrets.copilot_token().expect("read empty").is_none());
+
+    secrets.set_copilot_token("gho_first").expect("set");
+    assert_eq!(
+        secrets.copilot_token().expect("read stored").as_deref(),
+        Some("gho_first"),
+    );
+
+    secrets.set_copilot_token("gho_second").expect("replace");
+    assert_eq!(
+        secrets.copilot_token().expect("read replaced").as_deref(),
+        Some("gho_second"),
+    );
+
+    secrets.clear_copilot_token().expect("clear");
+    assert!(secrets.copilot_token().expect("read cleared").is_none());
+
+    secrets.clear_copilot_token().expect("clear again");
+}
+
+#[test]
+fn copilot_token_row_holds_no_plaintext() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    secrets
+        .set_copilot_token("gho_plaintext_marker")
+        .expect("set");
+
+    let (backend, bytes) = store
+        .get_secret(at("", "", "copilot-token"))
+        .expect("raw row")
+        .expect("row exists");
+    assert_eq!(backend, LOCAL_BACKEND);
+    assert!(
+        !bytes
+            .windows("gho_plaintext_marker".len())
+            .any(|window| window == b"gho_plaintext_marker"),
+        "the stored bytes must not contain the token",
+    );
+}
+
+#[test]
+fn deleting_an_mcp_server_named_copilot_keeps_the_token() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    secrets.set_copilot_token("gho_keep").expect("set token");
+    secrets
+        .put(at("maestro", "copilot", "Authorization"), "Bearer x")
+        .expect("put header");
+
+    secrets
+        .delete(at("maestro", "copilot", "Authorization"))
+        .expect("delete header");
+    store.delete_mcp_server("copilot").expect("delete server");
+
+    assert_eq!(
+        secrets.copilot_token().expect("read token").as_deref(),
+        Some("gho_keep"),
+    );
+}
+
+#[test]
+fn an_unavailable_store_reports_the_copilot_token_unavailable() {
+    let store = store();
+    let secrets = UnavailableSecrets::new(Arc::clone(&store));
+    assert!(matches!(
+        secrets.copilot_token(),
+        Err(SecretError::Unavailable)
+    ));
+    assert!(matches!(
+        secrets.set_copilot_token("gho_x"),
+        Err(SecretError::Unavailable)
+    ));
+    secrets.clear_copilot_token().expect("clear");
+}
+
+#[test]
+fn an_unavailable_store_still_clears_a_stored_copilot_token() {
+    let store = store();
+    LocalSecrets::new(&key(1), Arc::clone(&store))
+        .set_copilot_token("gho_x")
+        .expect("set");
+    UnavailableSecrets::new(Arc::clone(&store))
+        .clear_copilot_token()
+        .expect("clear");
+    assert!(
+        store
+            .get_secret(at("", "", "copilot-token"))
+            .expect("raw row")
+            .is_none()
+    );
+}
+
+#[test]
+fn validate_copilot_token_accepts_each_supported_prefix_and_trims() {
+    assert_eq!(validate_copilot_token("gho_abc123"), Ok("gho_abc123"));
+    assert_eq!(validate_copilot_token("ghu_abc123"), Ok("ghu_abc123"));
+    assert_eq!(
+        validate_copilot_token("github_pat_11ABC_xyz"),
+        Ok("github_pat_11ABC_xyz"),
+    );
+    assert_eq!(validate_copilot_token("  gho_abc123\n"), Ok("gho_abc123"));
+}
+
+#[test]
+fn validate_copilot_token_refuses_classic_unknown_and_empty() {
+    let classic = validate_copilot_token("ghp_secretclassic").expect_err("classic");
+    assert_eq!(classic, CopilotTokenError::Classic);
+    assert_eq!(
+        classic.to_string(),
+        "classic personal access tokens are not supported; use a fine-grained token with the Copilot Requests permission",
+    );
+
+    for input in ["sk-ant-oat01-abc", "gho_", "github_pat_", "xgho_abc", "a b"] {
+        assert_eq!(
+            validate_copilot_token(input),
+            Err(CopilotTokenError::UnknownFormat),
+            "{input:?}",
+        );
+    }
+    assert_eq!(validate_copilot_token("  \n"), Err(CopilotTokenError::Empty));
+}
+
+#[test]
+fn validate_copilot_token_errors_never_echo_the_input() {
+    for input in ["ghp_secretclassic", "sk-ant-secretvalue", "secretjunk"] {
+        let err = validate_copilot_token(input).expect_err("refused");
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+    }
 }
