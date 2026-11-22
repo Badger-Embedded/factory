@@ -447,6 +447,25 @@ diff --git a/other/snapcraft.yaml b/other/snapcraft.yaml\n\
 }
 
 #[tokio::test]
+async fn a_removal_and_an_addition_in_separate_hunks_request_no_comparison() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff = "diff --git a/snap/snapcraft.yaml b/snap/snapcraft.yaml\n\
+--- a/snap/snapcraft.yaml\n+++ b/snap/snapcraft.yaml\n@@ -1,2 +1,1 @@\n\
+ name: app\n-    source-tag: b9692\n\
+@@ -20,1 +19,2 @@\n part: two\n+    source-tag: b9716\n";
+    std::fs::write(dir.path().join("diff.txt"), diff).unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("h1", "Bumps app.", &[]), 10);
+
+    let err = podman
+        .gather_packaging(packaging_request(None, None))
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("blocked"), "{err}");
+    assert!(!std::fs::read_to_string(&calls).unwrap().contains("compare"));
+}
+
+#[tokio::test]
 async fn a_comparison_github_rejects_blocks_the_analysis() {
     let dir = tempfile::tempdir().unwrap();
     let (podman, _) = gh_executor(
