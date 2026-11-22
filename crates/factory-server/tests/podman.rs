@@ -272,12 +272,13 @@ fn gh_executor(
         format!(
             "#!/bin/bash\necho \"$@\" >> '{}'\ncase \"$1 $2\" in\n\
              \"pr view\") cat '{}';;\n\
-             \"pr diff\") head -c {diff_bytes} /dev/zero | tr '\\0' x;;\n\
+             \"pr diff\") if [ -f '{diff}' ]; then cat '{diff}'; else head -c {diff_bytes} /dev/zero | tr '\\0' x; fi;;\n\
              \"api --method\") echo '{{\"content\":\"bmFtZQ==\",\"type\":\"file\",\"encoding\":\"base64\"}}';;\n\
              \"api repos/up/app/compare/\"*) echo '{{\"files\":[{{\"filename\":\"CMakeLists.txt\",\"patch\":\"@@ new\"}}]}}';;\n\
              esac\n",
             calls.display(),
-            view_file.display()
+            view_file.display(),
+            diff = dir.join("diff.txt").display()
         ),
     )
     .unwrap();
@@ -365,6 +366,43 @@ async fn a_manual_merge_before_any_verdict_takes_the_range_from_the_pull_request
             .unwrap()
             .contains("repos/up/app/compare/v1...v2")
     );
+}
+
+const BUMP_DIFF: &str = "diff --git a/snap/snapcraft.yaml b/snap/snapcraft.yaml\n\
+--- a/snap/snapcraft.yaml\n+++ b/snap/snapcraft.yaml\n@@ -1,3 +1,3 @@\n name: app\n\
+-    source-tag: b9692\n+    source-tag: b9716\n";
+
+#[tokio::test]
+async fn a_manual_merge_without_a_compare_link_takes_the_range_from_the_manifest_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("diff.txt"), BUMP_DIFF).unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("h1", "Bumps app.", &[]), 10);
+
+    let context = podman
+        .gather_packaging(packaging_request(None, None))
+        .await
+        .unwrap();
+
+    assert_eq!(context.from.as_deref(), Some("b9692"));
+    assert_eq!(context.to.as_deref(), Some("b9716"));
+    assert!(
+        std::fs::read_to_string(&calls)
+            .unwrap()
+            .contains("repos/up/app/compare/b9692...b9716")
+    );
+}
+
+#[tokio::test]
+async fn an_unresolvable_range_with_build_config_files_is_reported_as_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, _) = gh_executor(dir.path(), &view("h1", "Bumps app.", &[]), 10);
+
+    let err = podman
+        .gather_packaging(packaging_request(None, None))
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("blocked"), "{err}");
 }
 
 #[tokio::test]

@@ -965,8 +965,6 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
     })
 }
 
-/// The gap jobs a Renovate job lists that still exist and still name it as
-/// their source.
 fn gap_links(store: &Store, row: &JobRow) -> Result<Vec<i64>, StoreError> {
     let Some(pr) = row.job.renovate_pr() else {
         return Ok(Vec::new());

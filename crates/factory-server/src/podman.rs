@@ -543,7 +543,16 @@ impl Executor for PodmanExecutor {
         let recorded = (request.verdict_head.as_deref() == Some(details.head.as_str()))
             .then(|| request.from.clone().zip(request.to.clone()))
             .flatten();
-        let range = recorded.or_else(|| compare_range(&details.body, &request.upstream));
+        let range = recorded
+            .or_else(|| compare_range(&details.body, &request.upstream))
+            .or_else(|| manifest_range(&details.diff, &request.manifest_files));
+        if range.is_none() && !request.build_config_files.is_empty() {
+            return Err(format!(
+                "the upstream comparison for pull request #{} is blocked: no recorded verdict, \
+                 compare link or manifest version change gives the old and new version",
+                request.number
+            ));
+        }
         let mut upstream = Vec::new();
         if let Some((from, to)) = &range {
             for path in &request.build_config_files {
@@ -591,4 +600,47 @@ fn compare_range(body: &str, upstream: &str) -> Option<(String, String)> {
         .collect();
     let (from, to) = link.split_once("...")?;
     (!from.is_empty() && !to.is_empty()).then(|| (from.to_owned(), to.to_owned()))
+}
+
+/// The old and new version a pull request diff changes in one of the manifest
+/// files: the first removed line followed by an added line that differs in one
+/// token that contains a digit.
+fn manifest_range(diff: &str, manifest_files: &[String]) -> Option<(String, String)> {
+    let mut in_manifest = false;
+    let mut removed: Option<&str> = None;
+    for line in diff.lines() {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            in_manifest = manifest_files
+                .iter()
+                .any(|path| header.ends_with(&format!(" b/{path}")));
+            removed = None;
+        } else if !in_manifest || line.starts_with("---") || line.starts_with("+++") {
+        } else if let Some(old) = line.strip_prefix('-') {
+            removed = Some(old);
+        } else if let Some(new) = line.strip_prefix('+') {
+            if let Some(range) = removed.take().and_then(|old| changed_version(old, new)) {
+                return Some(range);
+            }
+        } else {
+            removed = None;
+        }
+    }
+    None
+}
+
+fn changed_version(old: &str, new: &str) -> Option<(String, String)> {
+    let tokens = |line: &'_ str| -> Vec<String> {
+        line.split(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '"' | '\'' | ','))
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let (old, new) = (tokens(old), tokens(new));
+    if old.len() != new.len() {
+        return None;
+    }
+    let mut changed = old.iter().zip(&new).filter(|(a, b)| a != b);
+    let (from, to) = changed.next()?;
+    (changed.next().is_none() && from.contains(|c: char| c.is_ascii_digit()))
+        .then(|| (from.clone(), to.clone()))
 }
