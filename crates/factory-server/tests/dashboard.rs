@@ -2597,50 +2597,146 @@ async fn a_non_collaborator_cannot_add_or_remove_collaborators() {
     );
 }
 
-fn beforeunload_warns_after(actions: &str) -> bool {
-    const HARNESS: &str = r#"
-        var docListeners = {};
-        var winListeners = {};
-        var document = {
-          addEventListener: function (type, fn) { (docListeners[type] = docListeners[type] || []).push(fn); },
-          querySelectorAll: function () { return []; },
+/// A class-only CSS matcher over the parsed node tree, enough for the selectors
+/// `settings-form.js` uses: class compounds, the descendant combinator and
+/// selector lists.
+const DOM_LIB: &str = r#"
+    function parseList(sel) { return sel.split(",").map(function (s) { return s.trim(); }).filter(Boolean); }
+    function parseComplex(sel) { return sel.trim().split(" ").filter(Boolean).map(function (c) { return c.split(".").filter(Boolean); }); }
+    function matchCompound(node, classes) { for (var i = 0; i < classes.length; i++) { if (node.classes.indexOf(classes[i]) < 0) return false; } return true; }
+    function matchComplex(node, compounds) {
+      if (!matchCompound(node, compounds[compounds.length - 1])) return false;
+      var anc = node.parent, i = compounds.length - 2;
+      while (i >= 0) {
+        var ok = false;
+        while (anc) { if (matchCompound(anc, compounds[i])) { anc = anc.parent; ok = true; break; } anc = anc.parent; }
+        if (!ok) return false;
+        i--;
+      }
+      return true;
+    }
+    function matchesSel(node, sel) { return parseList(sel).some(function (s) { return matchComplex(node, parseComplex(s)); }); }
+    function firstDescendant(node, sel) {
+      for (var i = 0; i < node.children.length; i++) {
+        var c = node.children[i];
+        if (matchesSel(c, sel)) return c;
+        var d = firstDescendant(c, sel);
+        if (d) return d;
+      }
+      return null;
+    }
+    var NODES = {};
+    RAW.forEach(function (r) { NODES[r.id] = { id: r.id, tag: r.tag, classes: r.classes.slice(), action: r.action, textContent: "", parent: null, children: [] }; });
+    RAW.forEach(function (r) { var n = NODES[r.id]; if (r.parent >= 0) { n.parent = NODES[r.parent]; NODES[r.parent].children.push(n); } });
+    var ALL = Object.keys(NODES).map(function (k) { return NODES[k]; });
+    ALL.forEach(function (node) {
+      node.closest = function (sel) { var n = node; while (n) { if (matchesSel(n, sel)) return n; n = n.parent; } return null; };
+      node.matches = function (sel) { return matchesSel(node, sel); };
+      node.querySelector = function (sel) { return firstDescendant(node, sel); };
+      node.classList = { add: function (c) { if (node.classes.indexOf(c) < 0) node.classes.push(c); }, contains: function (c) { return node.classes.indexOf(c) >= 0; } };
+    });
+    var docListeners = {};
+    var winListeners = {};
+    var document = {
+      addEventListener: function (type, fn) { (docListeners[type] = docListeners[type] || []).push(fn); },
+      querySelectorAll: function (sel) { return ALL.filter(function (n) { return matchesSel(n, sel); }); },
+    };
+    var window = {
+      addEventListener: function (type, fn) { (winListeners[type] = winListeners[type] || []).push(fn); },
+    };
+    function fire(listeners, type, target) {
+      var prevented = false;
+      var event = { target: target, preventDefault: function () { prevented = true; }, returnValue: null };
+      (listeners[type] || []).forEach(function (fn) { fn(event); });
+      return prevented;
+    }
+    var pipelineForm = NODES[pipelineFormId];
+    var pipelineInput = NODES[pipelineInputId];
+    var collabAddForm = NODES[collabAddFormId];
+    var collabRemoveForm = NODES[collabRemoveFormId];
+"#;
+
+#[derive(serde::Serialize)]
+struct DomNode {
+    id: i64,
+    parent: i64,
+    tag: String,
+    classes: Vec<String>,
+    action: Option<String>,
+}
+
+/// JavaScript that rebuilds `body` as a node tree for [`DOM_LIB`] and names the
+/// pipeline form, an input inside it, and the two collaborator forms by their
+/// `action`. Real ancestry is preserved, so `closest(".settings-form")` in
+/// `settings-form.js` sees the page's actual class placement and nesting.
+fn settings_form_setup(body: &str) -> String {
+    let doc = scraper::Html::parse_document(body);
+    let mut nodes: Vec<DomNode> = Vec::new();
+    let mut ids = std::collections::HashMap::new();
+    for node in doc.tree.root().descendants() {
+        let Some(el) = node.value().as_element() else {
+            continue;
         };
-        var window = {
-          addEventListener: function (type, fn) { (winListeners[type] = winListeners[type] || []).push(fn); },
-        };
-        function el(classes, parent, bar) {
-          var e = { _classes: classes, parentNode: parent || null };
-          e.closest = function (sel) {
-            var cls = sel.slice(1);
-            var n = e;
-            while (n) { if (n._classes && n._classes.indexOf(cls) >= 0) return n; n = n.parentNode; }
-            return null;
-          };
-          e.matches = function () { return false; };
-          e.querySelector = function (sel) { return sel === ".save-bar" ? (bar || null) : null; };
-          return e;
+        let id = i64::try_from(nodes.len()).unwrap();
+        ids.insert(node.id(), id);
+        let parent = node
+            .parent()
+            .and_then(|p| ids.get(&p.id()).copied())
+            .unwrap_or(-1);
+        let classes = el
+            .attr("class")
+            .map(|c| c.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default();
+        nodes.push(DomNode {
+            id,
+            parent,
+            tag: el.name().to_owned(),
+            classes,
+            action: el.attr("action").map(str::to_owned),
+        });
+    }
+    let form_posting_to = |action: &str| {
+        nodes
+            .iter()
+            .find(|n| n.tag == "form" && n.action.as_deref() == Some(action))
+            .unwrap_or_else(|| panic!("no form posts to {action}"))
+            .id
+    };
+    let pipeline_form_id = nodes
+        .iter()
+        .find(|n| {
+            n.classes.iter().any(|c| c == "settings-form")
+                && n.classes.iter().any(|c| c == "pipeline-form")
+        })
+        .expect("the pipeline settings form")
+        .id;
+    let descends_from_pipeline = |mut id: i64| {
+        while let Ok(index) = usize::try_from(id) {
+            if id == pipeline_form_id {
+                return true;
+            }
+            id = nodes[index].parent;
         }
-        function makeBar() {
-          var note = { textContent: "" };
-          var classes = ["save-bar"];
-          return {
-            classList: { add: function (c) { classes.push(c); }, contains: function (c) { return classes.indexOf(c) >= 0; } },
-            querySelector: function (sel) { return sel === ".save-bar-note" ? note : null; },
-          };
-        }
-        function fire(listeners, type, target) {
-          var prevented = false;
-          var event = { target: target, preventDefault: function () { prevented = true; }, returnValue: null };
-          (listeners[type] || []).forEach(function (fn) { fn(event); });
-          return prevented;
-        }
-        var pipelineForm = el(["card", "settings-form", "pipeline-form"], null, makeBar());
-        var pipelineInput = el(["pipeline-input"], pipelineForm);
-        var collabAddForm = el(["row"], null);
-        var collabRemoveForm = el([], null);
-    "#;
+        false
+    };
+    let pipeline_input_id = nodes
+        .iter()
+        .find(|n| {
+            matches!(n.tag.as_str(), "input" | "select" | "textarea")
+                && descends_from_pipeline(n.id)
+        })
+        .map_or(pipeline_form_id, |n| n.id);
+    format!(
+        "var RAW = {}; var pipelineFormId = {pipeline_form_id}; var pipelineInputId = {pipeline_input_id}; var collabAddFormId = {}; var collabRemoveFormId = {};\n",
+        serde_json::to_string(&nodes).unwrap(),
+        form_posting_to("/settings/projects/maestro/collaborators"),
+        form_posting_to("/settings/projects/maestro/collaborators/remove"),
+    )
+}
+
+fn beforeunload_warns_after(setup: &str, actions: &str) -> bool {
     let script = include_str!("../static/settings-form.js");
-    let code = format!("{HARNESS}\n{script}\n{actions}");
+    let code = format!("{setup}{DOM_LIB}{script}\n{actions}");
     let mut context = boa_engine::Context::default();
     context
         .eval(boa_engine::Source::from_bytes(&code))
@@ -2651,26 +2747,8 @@ fn beforeunload_warns_after(actions: &str) -> bool {
 
 #[tokio::test]
 async fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
-    // The harness assumes the pipeline form is the only `.settings-form` and that
-    // the collaborator forms carry no such class and do not nest inside it. Pin
-    // those facts to the rendered page, or the harness could drift from it.
     let body = dashboard().get("/settings/projects/maestro").await.body;
-    let pipeline = body
-        .find("<form class=\"card settings-form pipeline-form\"")
-        .expect("the pipeline form is a settings form");
-    let pipeline_end = pipeline + body[pipeline..].find("</form>").unwrap();
-    for action in [
-        "/settings/projects/maestro/collaborators",
-        "/settings/projects/maestro/collaborators/remove",
-    ] {
-        let at = body
-            .find(&format!("action=\"{action}\""))
-            .unwrap_or_else(|| panic!("no form posts to {action}"));
-        let open = body[..at].rfind("<form").unwrap();
-        assert!(!body[open..at].contains("settings-form"), "{action}");
-        assert!(open > pipeline_end, "{action}");
-    }
-
+    let setup = settings_form_setup(&body);
     let dirty_then_submit = |form| {
         format!(
             "fire(docListeners, \"input\", pipelineInput);\
@@ -2678,16 +2756,20 @@ async fn a_collaborator_submit_keeps_the_unsaved_pipeline_prompt() {
              fire(winListeners, \"beforeunload\", null);"
         )
     };
-    assert!(beforeunload_warns_after(&dirty_then_submit(
-        "collabAddForm"
-    )));
-    assert!(beforeunload_warns_after(&dirty_then_submit(
-        "collabRemoveForm"
-    )));
-    assert!(!beforeunload_warns_after(&dirty_then_submit(
-        "pipelineForm"
-    )));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("collabAddForm")
+    ));
+    assert!(beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("collabRemoveForm")
+    ));
     assert!(!beforeunload_warns_after(
+        &setup,
+        &dirty_then_submit("pipelineForm")
+    ));
+    assert!(!beforeunload_warns_after(
+        &setup,
         "fire(winListeners, \"beforeunload\", null);"
     ));
 }
