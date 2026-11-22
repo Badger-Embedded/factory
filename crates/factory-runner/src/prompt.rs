@@ -270,7 +270,9 @@ const DECISIONS_RULE: &str = "The requester's answers and the approved spec are 
 /// `mcp_servers` is the run's active MCP server names, in config order. When it
 /// is non-empty the prompt ends with a paragraph that names them and tells the
 /// agent to load their tools first, so a later step reaches a tool the harness
-/// would otherwise keep behind a search. It is empty for a run with no server.
+/// would otherwise keep behind a search. It also says that a gateway server's
+/// listed tools only search for and run other tools. It is empty for a run with
+/// no server.
 #[must_use]
 pub fn job_prompt(
     job: &Job,
@@ -321,7 +323,11 @@ fn append_mcp(text: &mut String, servers: &[String]) {
     let _ = write!(
         text,
         "\n\nThis run has these MCP servers: {names}. Before you start, load the tools each one \
-         exposes and read what they do, so you know them when a later step needs one."
+         exposes and read what they do, so you know them when a later step needs one. Some servers \
+         are gateways: the tools they expose search for and run other tools that are not listed up \
+         front. For such a server, the loaded tools are not all it offers. When a step needs an \
+         outside app or data source, ask the server's search tool for it before you decide no tool \
+         exists, and run what it finds through the server's own execute tool."
     );
 }
 
