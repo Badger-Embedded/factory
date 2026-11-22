@@ -3913,11 +3913,16 @@ fn review_stage_settings(store: &Store) {
             },
         )
         .unwrap();
+    let agents = StageAgents {
+        review: "codex".into(),
+        ..StageAgents::default()
+    };
+    store.save_project_agents("maestro", &agents).unwrap();
     store
         .save_project_efforts(
             "maestro",
             &stage_efforts("low", "low", "low", "low", "high"),
-            &StageAgents::default(),
+            &agents,
         )
         .unwrap();
     for name in ["clarify-only", "review-only"] {
@@ -4016,7 +4021,7 @@ async fn renovate_runs_get_their_own_sessions_on_the_review_stage_settings() {
     assert_ne!(requests[0].session_id, requests[1].session_id);
     assert_eq!(requests[1].session_id, requests[2].session_id);
     for request in &requests {
-        assert_eq!(request.agent, Agent::Claude);
+        assert_eq!(request.agent, Agent::Codex);
         assert_eq!(request.model.as_deref(), Some("review-model"));
         assert_eq!(request.effort.as_deref(), Some("high"));
         assert_eq!(mcp_stage(request), ["review-only"]);
