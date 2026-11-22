@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent TEXT NOT NULL DEFAULT 'claude',
     agent_session TEXT,
     cost_usd REAL,
+    model TEXT,
+    effort TEXT,
     PRIMARY KEY (job_id, session)
 );
 CREATE TABLE IF NOT EXISTS logs (
@@ -298,6 +300,14 @@ pub struct Collaborator {
     pub added_by: String,
     /// UTC, as SQLite's `CURRENT_TIMESTAMP` writes it.
     pub added_at: String,
+}
+
+/// What a session last ran with: its agent and that agent's model and effort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub agent: Agent,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// One line of a job's log.
@@ -534,6 +544,23 @@ impl Store {
         )?;
         if has_session_cost == 0 {
             conn.execute("ALTER TABLE sessions ADD COLUMN cost_usd REAL", [])?;
+        }
+        // `model` and `effort` hold what the session last ran with on its own
+        // agent, so a resumed session keeps them after the stage moves to
+        // another agent. A row from before reads null for both: no model, which
+        // is the CLI default, and the agent's default effort.
+        for column in ["model", "effort"] {
+            let has: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if has == 0 {
+                conn.execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
+            }
         }
         // `estimated` marks a cost row the factory estimated rather than read
         // from the agent, such as a Codex run's cost from the price table, so the
@@ -2313,6 +2340,55 @@ impl Store {
         // than failing the run.
         let agent = Agent::from_id(&agent_id).unwrap_or(DEFAULT_AGENT);
         Ok((uuid, agent))
+    }
+
+    /// The agent and the model and effort `session` of job `job_id` last ran
+    /// with, or `None` when the session has no row yet. The model and effort
+    /// read `None` for a row from before they were recorded.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn session_settings(
+        &self,
+        job_id: i64,
+        session: Session,
+    ) -> Result<Option<SessionSettings>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT agent, model, effort FROM sessions WHERE job_id = ?1 AND session = ?2",
+                params![job_id, session_key(session)],
+                |row| {
+                    let agent_id: String = row.get(0)?;
+                    Ok(SessionSettings {
+                        agent: Agent::from_id(&agent_id).unwrap_or(DEFAULT_AGENT),
+                        model: row.get(1)?,
+                        effort: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Records the model and effort a run of `session` of job `job_id` starts
+    /// with, for the runs that resume it after the stage's agent changes.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn record_session_settings(
+        &self,
+        job_id: i64,
+        session: Session,
+        model: Option<&str>,
+        effort: &str,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE sessions SET model = ?3, effort = ?4 WHERE job_id = ?1 AND session = ?2",
+            params![job_id, session_key(session), model, effort],
+        )?;
+        Ok(())
     }
 
     /// The id the agent reported for `session` of job `job_id`, such as Codex's

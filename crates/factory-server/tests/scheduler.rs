@@ -3071,6 +3071,119 @@ async fn a_resumed_session_keeps_the_agent_recorded_on_it() {
     assert_eq!(clarify.agent, Agent::Codex);
 }
 
+fn copilot_clarify() -> StageAgents {
+    StageAgents {
+        clarify: "copilot".into(),
+        ..StageAgents::default()
+    }
+}
+
+fn clarify_model(model: &str) -> StageModels {
+    StageModels {
+        clarify: Some(model.to_owned()),
+        ..StageModels::default()
+    }
+}
+
+fn clarify_effort(level: &str) -> StageEfforts {
+    StageEfforts {
+        clarify: level.to_owned(),
+        ..StageEfforts::default()
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_session_keeps_its_model_and_effort_when_the_stage_agent_changes() {
+    // Job 47: a Claude session asked questions, the stage moved to Copilot with
+    // a Copilot model id, and the answer run passed that id to Claude, which
+    // refused it.
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_models("maestro", &clarify_model("sonnet"))
+        .unwrap();
+    store
+        .save_project_efforts("maestro", &clarify_effort("high"), &StageAgents::default())
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(2);
+    step(&scheduler).await;
+
+    store
+        .save_project_agents("maestro", &copilot_clarify())
+        .unwrap();
+    store
+        .save_project_models("maestro", &clarify_model("claude-sonnet-5.5"))
+        .unwrap();
+    store
+        .save_project_efforts("maestro", &clarify_effort("low"), &copilot_clarify())
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests[1].agent, Agent::Claude);
+    assert_eq!(model_of(&requests[1]), "sonnet");
+    assert_eq!(effort_of(&requests[1]), "high");
+    let notes: Vec<String> = store
+        .logs(id, 50)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .filter(|text| text.contains("stays on Claude"))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "This session started on Claude, so it stays on Claude with its earlier model. \
+          The clarify stage is now set to Copilot, which new sessions use."
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_session_with_no_recorded_settings_resumes_with_no_model_and_the_default_effort() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_agents("maestro", &copilot_clarify())
+        .unwrap();
+    store
+        .save_project_models("maestro", &clarify_model("claude-sonnet-5.5"))
+        .unwrap();
+    store
+        .save_project_efforts("maestro", &clarify_effort("high"), &copilot_clarify())
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    // A session row from before the columns existed records the agent only.
+    store
+        .session_uuid(id, factory_core::Session::Planning, Agent::Claude)
+        .unwrap();
+    executor.release(1);
+    step(&scheduler).await;
+
+    let request = &executor.requests()[0];
+    assert_eq!(request.agent, Agent::Claude);
+    assert_eq!(request.model, None);
+    assert_eq!(effort_of(request), Agent::Claude.default_effort());
+}
+
+#[tokio::test]
+async fn a_fresh_copilot_stage_runs_with_its_model() {
+    let (store, executor, scheduler) = setup(one_pass);
+    store
+        .save_project_agents("maestro", &copilot_clarify())
+        .unwrap();
+    store
+        .save_project_models("maestro", &clarify_model("claude-sonnet-5.5"))
+        .unwrap();
+    store.create("maestro", "alice", "Add a button").unwrap();
+    executor.release(1);
+    step(&scheduler).await;
+
+    let request = &executor.requests()[0];
+    assert_eq!(request.agent, Agent::Copilot);
+    assert_eq!(model_of(request), "claude-sonnet-5.5");
+}
+
 #[tokio::test]
 async fn a_codex_run_stores_its_thread_id_and_the_next_run_resumes_on_it() {
     // Codex names its own session, so the scheduler learns the thread id from the

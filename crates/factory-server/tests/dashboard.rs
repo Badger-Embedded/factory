@@ -5754,6 +5754,84 @@ async fn the_running_step_badge_shows_the_effort_and_stays_compact() {
     );
 }
 
+#[tokio::test]
+async fn the_running_step_badge_shows_the_settings_of_a_session_on_another_agent() {
+    // Job 47: the session runs on Claude while the stage names Copilot, so the
+    // badge shows what the run was given, not the stage's Copilot settings.
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .session_uuid(id, Session::Planning, Agent::Claude)
+        .unwrap();
+    dashboard
+        .store
+        .record_session_settings(id, Session::Planning, Some("sonnet"), "high")
+        .unwrap();
+    let copilot = agents("copilot", "claude", "claude", "claude", "claude");
+    dashboard
+        .store
+        .save_project_efforts(
+            "maestro",
+            &efforts("low", "medium", "medium", "medium", "medium"),
+            &copilot,
+        )
+        .unwrap();
+    dashboard
+        .store
+        .save_project_agents("maestro", &copilot)
+        .unwrap();
+    dashboard
+        .store
+        .save_project_models("maestro", &models(Some("claude-sonnet-5.5"), None))
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let badge = agent_badge(timeline_step(&page.body, "clarifying"));
+    assert_eq!(badge, "sonnet · high");
+}
+
+#[test]
+fn a_sessions_table_without_the_model_and_effort_columns_opens_and_reads_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                job_id INTEGER NOT NULL,
+                session TEXT NOT NULL,
+                uuid TEXT NOT NULL,
+                agent TEXT NOT NULL DEFAULT 'claude',
+                agent_session TEXT,
+                cost_usd REAL,
+                PRIMARY KEY (job_id, session)
+            );
+            INSERT INTO sessions (job_id, session, uuid)
+                VALUES (1, 'planning', 'fixed-uuid');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let old = store
+        .session_settings(1, Session::Planning)
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.agent, Agent::Claude);
+    assert_eq!(old.model, None);
+    assert_eq!(old.effort, None);
+    store
+        .record_session_settings(1, Session::Planning, Some("opus"), "low")
+        .unwrap();
+    let new = store
+        .session_settings(1, Session::Planning)
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.model.as_deref(), Some("opus"));
+    assert_eq!(new.effort.as_deref(), Some("low"));
+}
+
 #[test]
 fn project_auto_merge_defaults_off_and_a_saved_row_wins() {
     let dir = tempfile::tempdir().unwrap();

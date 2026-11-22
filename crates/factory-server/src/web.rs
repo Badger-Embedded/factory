@@ -10,7 +10,8 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use factory_core::{Event, Gates, Stage};
+use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage};
+use factory_runner::Expect;
 use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -864,6 +865,47 @@ struct JobData {
     auto_merge: bool,
 }
 
+/// Replaces the current step's model and effort with the session's recorded
+/// ones when the session runs on another agent than the stage now names. The
+/// scheduler gives such a run the session's settings, so the timeline badge
+/// shows those and not the stage's, which belong to the stage's new agent.
+fn keep_session_settings(
+    state: &AppState,
+    row: &JobRow,
+    models: &mut StageModels,
+    efforts: &mut StageEfforts,
+) -> Result<(), AppError> {
+    let Some(Command::RunAgent { session, task }) = row.job.next_command() else {
+        return Ok(());
+    };
+    let Some(expect) = Expect::for_task(row.job.stage(), &task) else {
+        return Ok(());
+    };
+    let Some(last) = state.store.session_settings(row.id, session)? else {
+        return Ok(());
+    };
+    let agents = state.store.project_agents(&row.project)?;
+    let (model, effort, stage_agent) = match expect {
+        Expect::Clarify => (&mut models.clarify, &mut efforts.clarify, &agents.clarify),
+        Expect::Spec => (&mut models.spec, &mut efforts.spec, &agents.spec),
+        Expect::Plan => (&mut models.plan, &mut efforts.plan, &agents.plan),
+        Expect::Commits | Expect::FixCi => (
+            &mut models.implement,
+            &mut efforts.implement,
+            &agents.implement,
+        ),
+        Expect::Review => (&mut models.review, &mut efforts.review, &agents.review),
+    };
+    if Agent::from_id(stage_agent).unwrap_or(DEFAULT_AGENT) == last.agent {
+        return Ok(());
+    }
+    *effort = last
+        .effort
+        .unwrap_or_else(|| last.agent.default_effort().to_owned());
+    *model = last.model;
+    Ok(())
+}
+
 fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
     let row = state.store.get(id)?;
     let project = state.projects.lookup(&row.project)?;
@@ -875,8 +917,9 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         .as_ref()
         .map(|project| project.models.clone())
         .unwrap_or_default();
-    let models = state.store.project_models(&row.project, &defaults)?;
-    let efforts = state.store.project_efforts(&row.project)?;
+    let mut models = state.store.project_models(&row.project, &defaults)?;
+    let mut efforts = state.store.project_efforts(&row.project)?;
+    keep_session_settings(state, &row, &mut models, &mut efforts)?;
     let default_auto_merge = project.as_ref().is_some_and(|p| p.auto_merge);
     let auto_merge = state
         .store
