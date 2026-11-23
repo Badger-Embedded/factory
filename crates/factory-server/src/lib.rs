@@ -45,7 +45,9 @@ pub use github::{
     check_repo,
 };
 pub use gitlab::GlabRepos;
-pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
+pub use mcp::{
+    McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
+};
 pub use podman::PodmanExecutor;
 pub use projects::{
     ImportError, Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels,

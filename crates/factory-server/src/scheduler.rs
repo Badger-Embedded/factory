@@ -1391,6 +1391,10 @@ impl<E: Executor> Scheduler<E> {
             if !(settings.enabled && in_stage) {
                 continue;
             }
+            // Runs do not carry stdio servers yet.
+            if server.as_stdio().is_some() {
+                continue;
+            }
             if self.mcp_secrets_usable(project, &server)? {
                 active.push(server.name);
             } else {
@@ -1410,7 +1414,9 @@ impl<E: Executor> Scheduler<E> {
     /// skips the server, so a broken credential never lands in a worker's
     /// config. A transient database error propagates and the run waits.
     fn mcp_secrets_usable(&self, project: &str, server: &McpServer) -> Result<bool, StoreError> {
-        let McpTransport::Remote { headers, .. } = &server.transport;
+        let McpTransport::Remote { headers, .. } = &server.transport else {
+            return Ok(true);
+        };
         for header in headers {
             let at = SecretRef {
                 project,

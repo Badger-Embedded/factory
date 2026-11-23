@@ -240,6 +240,105 @@ test('MCP servers: add, edit with header rows, and delete', async ({ page }) => 
   await expect(page.getByText('No servers yet.')).toBeVisible();
 });
 
+test('MCP servers: add a stdio server with argument rows, then edit it', async ({ page }) => {
+  await page.goto('/settings/mcp');
+  const url = page.getByLabel('URL', { exact: true });
+  const command = page.getByLabel('Command', { exact: true });
+  await expect(url).toBeVisible();
+  await expect(command).toBeHidden();
+
+  await page.getByLabel('stdio', { exact: true }).check();
+  await expect(url).toBeHidden();
+  await expect(page.getByLabel('Header name')).toBeHidden();
+  await expect(command).toBeVisible();
+
+  await page.getByLabel('Name', { exact: true }).fill('playwright');
+  await command.fill('npx');
+  const args = page.getByLabel('Argument');
+  await expect(args).toHaveCount(3);
+  await args.nth(0).fill('-y');
+  await args.nth(1).fill('--junk');
+  await args.nth(2).fill('@playwright/mcp@0.0.83');
+  await page.getByRole('button', { name: 'Remove' }).nth(1).click();
+  await expect(args).toHaveCount(2);
+  await page.getByRole('button', { name: 'Add argument' }).click();
+  await expect(args).toHaveCount(3);
+  await page.getByRole('button', { name: 'Add server' }).click();
+
+  await expect(page.getByText('Added.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'playwright', level: 1 })).toBeVisible();
+  await expect(page.getByText('Kind: stdio')).toBeVisible();
+  await expect(command).toHaveValue('npx');
+  await expect(args.nth(0)).toHaveValue('-y');
+  await expect(args.nth(1)).toHaveValue('@playwright/mcp@0.0.83');
+  await expect(page.getByLabel('Header name')).toHaveCount(0);
+
+  await args.nth(2).fill('--no-sandbox');
+  await expect(page.getByText('Unsaved changes.')).toBeVisible();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto('/settings/mcp');
+  await expect(page.getByText('stdio: npx -y @playwright/mcp@0.0.83 --no-sandbox')).toBeVisible();
+});
+
+test('MCP servers: a stale remote field cannot block a stdio add, and argument rows refill', async ({ page }) => {
+  await page.goto('/settings/mcp');
+  await page.getByLabel('URL', { exact: true }).fill('not a url');
+  await page.getByLabel('Header name').first().fill('bad header:');
+  await page.getByLabel('stdio', { exact: true }).check();
+  await page.getByLabel('Name', { exact: true }).fill('rows');
+  await page.getByLabel('Command', { exact: true }).fill('npx');
+  const args = page.getByLabel('Argument');
+  for (let i = 0; i < 3; i++) await page.getByRole('button', { name: 'Remove' }).last().click();
+  await expect(args).toHaveCount(0);
+  await page.getByRole('button', { name: 'Add argument' }).click();
+  await expect(args).toHaveCount(1);
+  await args.first().fill('-y');
+  await page.getByRole('button', { name: 'Add server' }).click();
+  await expect(page.getByText('Added.', { exact: true })).toBeVisible();
+  await expect(args.first()).toHaveValue('-y');
+});
+
+test.describe('without JavaScript', () => {
+  test.use({ javaScriptEnabled: false });
+
+  test('MCP servers: arguments with line breaks survive a command edit and can be edited or removed', async ({
+    page,
+  }) => {
+    const added = await page.request.post('/settings/mcp', {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      data: new URLSearchParams([
+        ['name', 'multi'],
+        ['kind', 'stdio'],
+        ['command', 'npx'],
+        ['arg', 'a\nb'],
+        ['arg', 'c\rd'],
+        ['arg', '--headless'],
+      ]).toString(),
+    });
+    expect(added.ok()).toBe(true);
+    const save = async () => {
+      await page.getByRole('button', { name: 'Save', exact: true }).click();
+      await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+    };
+
+    await page.goto('/settings/mcp/multi');
+    await page.getByLabel('Command', { exact: true }).fill('uvx');
+    await save();
+    await expect(page.getByLabel('Argument with a line break')).toHaveCount(2);
+    await expect(page.getByLabel('Argument with a line break').nth(0)).toHaveValue('a\\nb');
+    await expect(page.getByLabel('Argument with a line break').nth(1)).toHaveValue('c\\rd');
+
+    await page.getByLabel('Argument with a line break').nth(0).fill('x\\ny\\\\z');
+    await page.getByLabel('Argument with a line break').nth(1).fill('');
+    await save();
+    await expect(page.getByLabel('Argument with a line break')).toHaveCount(1);
+    await expect(page.getByLabel('Argument with a line break')).toHaveValue('x\\ny\\\\z');
+    await expect(page.getByLabel('Argument', { exact: true }).first()).toHaveValue('--headless');
+  });
+});
+
 test('a login that is not an admin is turned away from the factory-wide settings', async ({
   page,
 }) => {

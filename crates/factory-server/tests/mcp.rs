@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use factory_server::{
-    LocalSecrets, MASTER_KEY_LEN, McpError, McpProjectSettings, McpServer, McpStages, SecretRef,
-    SecretStore, Store,
+    LocalSecrets, MASTER_KEY_LEN, McpError, McpProjectSettings, McpServer, McpStages, McpTransport,
+    SecretRef, SecretStore, Store,
 };
 
 fn store() -> Arc<Store> {
@@ -503,4 +503,198 @@ fn has_secret_reports_a_stored_value_without_the_value() {
     assert!(store.has_secret(at).expect("present"));
     secrets.delete(at).expect("clear");
     assert!(!store.has_secret(at).expect("cleared"));
+}
+
+fn stdio(command: &str, args: &[&str]) -> McpTransport {
+    McpTransport::Stdio {
+        command: command.to_owned(),
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn a_stdio_server_is_created_listed_and_read_back() {
+    let store = store();
+    store
+        .create_mcp_server_with(
+            "playwright",
+            &stdio(" npx ", &["-y", "", "@playwright/mcp@0.0.83"]),
+        )
+        .expect("create stdio");
+    let expected = McpServer::stdio(
+        "playwright",
+        "npx",
+        vec!["-y".into(), "@playwright/mcp@0.0.83".into()],
+    );
+    assert_eq!(
+        store.mcp_server("playwright").unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(store.mcp_servers().unwrap(), vec![expected]);
+}
+
+#[test]
+fn an_invalid_stdio_server_writes_no_row() {
+    let store = store();
+    let too_many: Vec<&str> = vec!["a"; 65];
+    let long = "x".repeat(4097);
+    let bad: Vec<McpTransport> = vec![
+        stdio("", &[]),
+        stdio("  ", &[]),
+        stdio("np\nx", &[]),
+        stdio("np\rx", &[]),
+        stdio("np\0x", &[]),
+        stdio(&"c".repeat(257), &[]),
+        stdio("${HOME}/bin", &[]),
+        stdio("npx", &too_many),
+        stdio("npx", &[&long]),
+        stdio("npx", &["a\0b"]),
+        stdio("npx", &["${HOME}"]),
+    ];
+    for transport in &bad {
+        let result = store.create_mcp_server_with("playwright", transport);
+        assert!(
+            matches!(result, Err(McpError::BadCommand(_) | McpError::BadArgs(_))),
+            "{transport:?} should be rejected, got {result:?}",
+        );
+    }
+    assert_eq!(store.mcp_servers().unwrap(), Vec::new());
+    // 64 arguments and a lone `$` are fine.
+    let sixty_four: Vec<&str> = vec!["a"; 64];
+    store
+        .create_mcp_server_with("playwright", &stdio("npx", &sixty_four))
+        .expect("64 arguments");
+}
+
+#[test]
+fn a_stdio_name_clashes_with_a_remote_one() {
+    let store = store();
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    let again = store.create_mcp_server_with("context7", &stdio("npx", &[]));
+    assert!(matches!(again, Err(McpError::DuplicateName(name)) if name == "context7"));
+    assert!(
+        store
+            .mcp_server("context7")
+            .unwrap()
+            .unwrap()
+            .as_remote()
+            .is_some()
+    );
+}
+
+#[test]
+fn stdio_arguments_keep_spaces_quotes_and_a_lone_dollar() {
+    let store = store();
+    let args = [
+        "--title=a \"b\" 'c'",
+        " lead and trail ",
+        "$",
+        "cost $5",
+        "back\\slash",
+    ];
+    store
+        .create_mcp_server_with("playwright", &stdio("npx", &args))
+        .unwrap();
+    let server = store.mcp_server("playwright").unwrap().unwrap();
+    assert_eq!(server.as_stdio().unwrap().1, args);
+}
+
+#[test]
+fn editing_a_stdio_server_keeps_project_settings_and_cannot_change_its_kind() {
+    let store = store();
+    store
+        .create_mcp_server_with("playwright", &stdio("npx", &["-y", "a"]))
+        .unwrap();
+    let on = McpProjectSettings {
+        enabled: true,
+        stages: McpStages {
+            implement: true,
+            ..McpStages::default()
+        },
+    };
+    store
+        .save_project_mcp("maestro", "playwright", &on)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .mcp_edit_deletes("playwright", "https://x.test/mcp", &[])
+            .unwrap(),
+        Vec::<(String, String)>::new()
+    );
+    store
+        .edit_mcp_server_with("playwright", &stdio("uvx", &["b"]))
+        .unwrap();
+    let server = store.mcp_server("playwright").unwrap().unwrap();
+    assert_eq!(server.as_stdio().unwrap(), ("uvx", &["b".to_owned()][..]));
+    assert_eq!(store.project_mcp("maestro", "playwright").unwrap(), on);
+
+    let remote = store.edit_mcp_server("playwright", "https://x.test/mcp", &[]);
+    assert!(matches!(remote, Err(McpError::KindChange(_))));
+    let bad = store.edit_mcp_server_with("playwright", &stdio("", &[]));
+    assert!(matches!(bad, Err(McpError::BadCommand(_))));
+    assert_eq!(store.mcp_server("playwright").unwrap(), Some(server));
+
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    let to_stdio = store.edit_mcp_server_with("context7", &stdio("npx", &[]));
+    assert!(matches!(to_stdio, Err(McpError::KindChange(_))));
+}
+
+#[test]
+fn deleting_a_stdio_server_removes_its_project_rows() {
+    let store = store();
+    store
+        .create_mcp_server_with("playwright", &stdio("npx", &[]))
+        .unwrap();
+    let on = McpProjectSettings {
+        enabled: true,
+        stages: McpStages {
+            spec: true,
+            ..McpStages::default()
+        },
+    };
+    store
+        .save_project_mcp("maestro", "playwright", &on)
+        .unwrap();
+    store.delete_mcp_server("playwright").unwrap();
+    assert!(store.mcp_server("playwright").unwrap().is_none());
+    assert_eq!(
+        store.project_mcp("maestro", "playwright").unwrap(),
+        McpProjectSettings::default()
+    );
+}
+
+#[test]
+fn a_database_from_before_stdio_loads_every_server_as_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers (
+                 name TEXT PRIMARY KEY,
+                 url TEXT NOT NULL,
+                 headers TEXT NOT NULL
+             );
+             INSERT INTO mcp_servers (name, url, headers)
+             VALUES ('context7', 'https://mcp.context7.com/mcp', '[\"Authorization\"]');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.mcp_server("context7").unwrap(),
+        Some(McpServer::remote(
+            "context7",
+            "https://mcp.context7.com/mcp",
+            vec!["Authorization".into()]
+        )),
+    );
+    store
+        .create_mcp_server_with("playwright", &stdio("npx", &[]))
+        .unwrap();
 }

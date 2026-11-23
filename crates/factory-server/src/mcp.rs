@@ -1,8 +1,10 @@
-//! The MCP server registry: the remote servers an operator adds on the
-//! settings page, and the validation their fields must pass.
+//! The MCP server registry: the servers an operator adds on the settings page,
+//! and the validation their fields must pass.
 //!
-//! A server is a name, an `https` URL and a list of header names each project
-//! may fill with a value of its own. The name is the key in a run's MCP config
+//! A server is a name and a transport. A remote server is an `https` URL and a
+//! list of header names each project may fill with a value of its own. A stdio
+//! server is a command and base arguments the agent starts inside the worker.
+//! The name is the key in a run's MCP config
 //! and part of the proxy path, so it is a tight slug. The header names are the
 //! only headers a project may set, so the factory refuses the ones it sets
 //! itself or that the streamable-HTTP protocol owns. The [`Store`](crate::Store)
@@ -46,6 +48,26 @@ pub enum McpTransport {
         /// is a valid HTTP token and not reserved; no two differ only in case.
         headers: Vec<String>,
     },
+    /// A process the agent starts inside the worker and talks to over stdin
+    /// and stdout. It bypasses the proxy, so it has no stored values.
+    Stdio {
+        /// The program to run, found on the worker's `PATH`. Trimmed.
+        command: String,
+        /// The base arguments, in order, each one argv element. Kept as typed:
+        /// not trimmed, never split or expanded by a shell.
+        args: Vec<String>,
+    },
+}
+
+impl McpTransport {
+    /// The kind's name as the registry stores it and the pages show it.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            McpTransport::Remote { .. } => "remote",
+            McpTransport::Stdio { .. } => "stdio",
+        }
+    }
 }
 
 impl McpServer {
@@ -60,11 +82,32 @@ impl McpServer {
         }
     }
 
+    #[must_use]
+    pub fn stdio(name: impl Into<String>, command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args,
+            },
+        }
+    }
+
     /// The URL and header names when the server is remote.
     #[must_use]
     pub fn as_remote(&self) -> Option<(&str, &[String])> {
         match &self.transport {
             McpTransport::Remote { url, headers } => Some((url, headers)),
+            McpTransport::Stdio { .. } => None,
+        }
+    }
+
+    /// The command and base arguments when the server is stdio.
+    #[must_use]
+    pub fn as_stdio(&self) -> Option<(&str, &[String])> {
+        match &self.transport {
+            McpTransport::Stdio { command, args } => Some((command, args)),
+            McpTransport::Remote { .. } => None,
         }
     }
 }
@@ -144,6 +187,16 @@ pub enum McpError {
     ReservedHeader(String),
     /// A project enabled a server without picking a stage for it.
     NoStage(String),
+    /// A stdio server's command is empty, too long, or has a NUL, a newline or
+    /// `${`.
+    BadCommand(String),
+    /// An argument list has too many entries, or an entry that is too long or
+    /// has a NUL or `${`.
+    BadArgs(String),
+    /// A posted kind is neither `remote` nor `stdio`.
+    BadKind(String),
+    /// An edit would change a server's kind, which is fixed when it is added.
+    KindChange(String),
     Store(StoreError),
 }
 
@@ -156,7 +209,12 @@ impl fmt::Display for McpError {
             ),
             McpError::DuplicateName(name) => write!(f, "a server named {name:?} already exists"),
             McpError::NotFound(name) => write!(f, "no MCP server named {name:?}"),
-            McpError::BadUrl(reason) => write!(f, "{reason}"),
+            McpError::BadUrl(reason)
+            | McpError::BadCommand(reason)
+            | McpError::BadArgs(reason)
+            | McpError::BadKind(reason) => {
+                write!(f, "{reason}")
+            }
             McpError::BadHeader(header) => {
                 write!(f, "{header:?} is not a valid HTTP header name")
             }
@@ -167,6 +225,10 @@ impl fmt::Display for McpError {
             McpError::NoStage(server) => write!(
                 f,
                 "the server {server:?} is enabled but no stage is checked; pick at least one or turn it off"
+            ),
+            McpError::KindChange(name) => write!(
+                f,
+                "the server {name:?} cannot change kind; delete it and add it again"
             ),
             McpError::Store(err) => write!(f, "{err}"),
         }
@@ -235,6 +297,82 @@ pub(crate) fn validate_url(url: &str) -> Result<(), McpError> {
         return Err(McpError::BadUrl(format!("the URL {url:?} has no host")));
     }
     Ok(())
+}
+
+/// The longest stdio command, in bytes.
+const MAX_COMMAND_BYTES: usize = 256;
+/// The most arguments one list may hold.
+pub(crate) const MAX_ARGS: usize = 64;
+/// The longest single argument, in bytes.
+pub(crate) const MAX_ARG_BYTES: usize = 4096;
+
+/// Checks a stdio server's command and base arguments and returns them as the
+/// registry stores them: the command trimmed and the empty arguments dropped.
+///
+/// `${` is refused because Copilot expands `${NAME}` in the command and
+/// arguments of its MCP config and the other agents do not, so refusing it
+/// keeps one entry meaning the same on all three.
+///
+/// # Errors
+///
+/// Returns [`McpError::BadCommand`] or [`McpError::BadArgs`] naming the problem.
+pub(crate) fn validate_stdio(
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>), McpError> {
+    if command.contains(['\n', '\r']) {
+        return Err(McpError::BadCommand(
+            "the command has a line break".to_owned(),
+        ));
+    }
+    let command = command.trim();
+    let bad = |reason: &str| Err(McpError::BadCommand(format!("the command {reason}")));
+    if command.is_empty() {
+        return bad("is empty");
+    }
+    if command.len() > MAX_COMMAND_BYTES {
+        return bad(&format!("is longer than {MAX_COMMAND_BYTES} bytes"));
+    }
+    if command.contains('\0') {
+        return bad("has a NUL");
+    }
+    if command.contains("${") {
+        return bad("contains \"${\", which Copilot would expand");
+    }
+    Ok((command.to_owned(), validate_args(args)?))
+}
+
+/// Drops the empty arguments and checks the rest: at most 64, each at most
+/// 4096 bytes, with no NUL or `${`. A line break is allowed. Order is kept and no
+/// argument is trimmed, so spaces, quotes and a lone `$` arrive unchanged.
+///
+/// # Errors
+///
+/// Returns [`McpError::BadArgs`] naming the problem.
+pub(crate) fn validate_args(args: &[String]) -> Result<Vec<String>, McpError> {
+    let kept: Vec<String> = args.iter().filter(|arg| !arg.is_empty()).cloned().collect();
+    if kept.len() > MAX_ARGS {
+        return Err(McpError::BadArgs(format!(
+            "there are {} arguments; the most allowed is {MAX_ARGS}",
+            kept.len()
+        )));
+    }
+    for arg in &kept {
+        if arg.len() > MAX_ARG_BYTES {
+            return Err(McpError::BadArgs(format!(
+                "an argument is longer than {MAX_ARG_BYTES} bytes"
+            )));
+        }
+        if arg.contains('\0') {
+            return Err(McpError::BadArgs("an argument contains a NUL".to_owned()));
+        }
+        if arg.contains("${") {
+            return Err(McpError::BadArgs(format!(
+                "the argument {arg:?} contains \"${{\", which Copilot would expand"
+            )));
+        }
+    }
+    Ok(kept)
 }
 
 /// Validates each header name and drops a case-insensitive duplicate, keeping

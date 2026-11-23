@@ -25,13 +25,13 @@
 
   document.addEventListener("input", mark);
   document.addEventListener("change", mark);
-  // Adding or removing a header row changes the form without an input event.
-  // This listens in the capture phase, before the header-row script removes
-  // the clicked row from its form.
+  // Adding or removing a header or argument row changes the form without an
+  // input event. This listens in the capture phase, before the row script
+  // removes the clicked row from its form.
   document.addEventListener(
     "click",
     function (event) {
-      if (event.target.matches(".add-header, .remove-header")) mark(event);
+      if (event.target.matches(".add-header, .remove-header, .add-arg, .remove-arg")) mark(event);
     },
     true,
   );

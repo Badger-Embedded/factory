@@ -631,6 +631,23 @@ async fn store_upstreams_resolves_a_stored_header() {
     assert!(upstreams.resolve("maestro", "absent").is_none());
 }
 
+#[test]
+fn a_stdio_server_does_not_resolve_through_the_proxy() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_mcp_server_with(
+            "playwright",
+            &factory_server::McpTransport::Stdio {
+                command: "npx".to_owned(),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+    let secrets = Arc::new(LocalSecrets::new(&[3; MASTER_KEY_LEN], Arc::clone(&store)));
+    let upstreams = StoreUpstreams::new(store, secrets);
+    assert!(upstreams.resolve("maestro", "playwright").is_none());
+}
+
 /// The proxy in front of the fake at `path`, with `delete` turned off for the
 /// project. Returns the proxy base, a token for job 3 and the warnings.
 async fn proxy_with_delete_off(

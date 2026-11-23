@@ -176,7 +176,10 @@ CREATE TABLE IF NOT EXISTS secrets (
 CREATE TABLE IF NOT EXISTS mcp_servers (
     name TEXT PRIMARY KEY,
     url TEXT NOT NULL,
-    headers TEXT NOT NULL
+    headers TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'remote',
+    command TEXT NOT NULL DEFAULT '',
+    args TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS project_mcp (
     project TEXT NOT NULL,
@@ -599,6 +602,70 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
+/// An `mcp_servers` row's transport columns as stored.
+struct StoredTransport {
+    kind: String,
+    url: String,
+    headers: String,
+    command: String,
+    args: String,
+}
+
+impl StoredTransport {
+    /// Validates `transport` and renders it as the columns a row stores. A
+    /// stdio row keeps an empty URL and header list.
+    fn validated(transport: &McpTransport) -> Result<Self, McpError> {
+        Ok(match transport {
+            McpTransport::Remote { url, headers } => {
+                mcp::validate_url(url)?;
+                let headers = mcp::normalize_headers(headers)?;
+                StoredTransport {
+                    kind: "remote".to_owned(),
+                    url: url.clone(),
+                    headers: serde_json::to_string(&headers)?,
+                    command: String::new(),
+                    args: "[]".to_owned(),
+                }
+            }
+            McpTransport::Stdio { command, args } => {
+                let (command, args) = mcp::validate_stdio(command, args)?;
+                StoredTransport {
+                    kind: "stdio".to_owned(),
+                    url: String::new(),
+                    headers: "[]".to_owned(),
+                    command,
+                    args: serde_json::to_string(&args)?,
+                }
+            }
+        })
+    }
+
+    fn into_transport(self) -> Result<McpTransport, StoreError> {
+        Ok(if self.kind == "stdio" {
+            McpTransport::Stdio {
+                command: self.command,
+                args: serde_json::from_str(&self.args)?,
+            }
+        } else {
+            McpTransport::Remote {
+                url: self.url,
+                headers: serde_json::from_str(&self.headers)?,
+            }
+        })
+    }
+}
+
+/// Reads `kind, url, headers, command, args` from `row`, starting at `from`.
+fn mcp_row(row: &rusqlite::Row<'_>, from: usize) -> rusqlite::Result<StoredTransport> {
+    Ok(StoredTransport {
+        kind: row.get(from)?,
+        url: row.get(from + 1)?,
+        headers: row.get(from + 2)?,
+        command: row.get(from + 3)?,
+        args: row.get(from + 4)?,
+    })
+}
+
 impl Store {
     /// Opens or creates the database at `path`.
     ///
@@ -618,11 +685,29 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self, StoreError> {
-        conn.execute_batch(SCHEMA)?;
-        Self::migrate_project_forge(&conn)?;
-        Self::migrate_renovate_author(&conn)?;
-        Self::migrate_upstream_forge(&conn)?;
+    /// A stdio kind joined the registry after it shipped. Old rows are remote.
+    fn migrate_mcp_kind(conn: &Connection) -> Result<(), StoreError> {
+        for (column, definition) in [
+            ("kind", "kind TEXT NOT NULL DEFAULT 'remote'"),
+            ("command", "command TEXT NOT NULL DEFAULT ''"),
+            ("args", "args TEXT NOT NULL DEFAULT '[]'"),
+        ] {
+            let present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('mcp_servers') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                conn.execute(
+                    &format!("ALTER TABLE mcp_servers ADD COLUMN {definition}"),
+                    [],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_display_name(conn: &Connection) -> Result<(), StoreError> {
         let has_display_name: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'display_name'",
             [],
@@ -631,6 +716,15 @@ impl Store {
         if has_display_name == 0 {
             conn.execute("ALTER TABLE projects ADD COLUMN display_name TEXT", [])?;
         }
+        Ok(())
+    }
+
+    fn init(conn: Connection) -> Result<Self, StoreError> {
+        conn.execute_batch(SCHEMA)?;
+        Self::migrate_project_forge(&conn)?;
+        Self::migrate_renovate_author(&conn)?;
+        Self::migrate_upstream_forge(&conn)?;
+        Self::migrate_display_name(&conn)?;
         // `review` joined the model stages after the table shipped, so add it to
         // a `project_models` table that predates it. A fresh database already
         // has the column from SCHEMA, so this skips it.
@@ -642,6 +736,7 @@ impl Store {
         if has_review == 0 {
             conn.execute("ALTER TABLE project_models ADD COLUMN review TEXT", [])?;
         }
+        Self::migrate_mcp_kind(&conn)?;
         let has_use_my_account: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('project_collaborators') WHERE name = 'use_my_account'",
             [],
@@ -4004,25 +4099,20 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Fails on a database error or a stored header list that does not parse.
+    /// Fails on a database error or a stored list that does not parse.
     pub fn mcp_servers(&self) -> Result<Vec<McpServer>, StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT name, url, headers FROM mcp_servers ORDER BY name")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
+        let mut stmt = conn.prepare(
+            "SELECT name, kind, url, headers, command, args FROM mcp_servers ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, mcp_row(row, 1)?)))?;
         let mut servers = Vec::new();
         for row in rows {
-            let (name, url, headers) = row?;
-            servers.push(McpServer::remote(
+            let (name, stored) = row?;
+            servers.push(McpServer {
                 name,
-                url,
-                serde_json::from_str(&headers)?,
-            ));
+                transport: stored.into_transport()?,
+            });
         }
         Ok(servers)
     }
@@ -4031,44 +4121,63 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Fails on a database error or a stored header list that does not parse.
+    /// Fails on a database error or a stored list that does not parse.
     pub fn mcp_server(&self, name: &str) -> Result<Option<McpServer>, StoreError> {
         let row = self
             .conn()
             .query_row(
-                "SELECT url, headers FROM mcp_servers WHERE name = ?1",
+                "SELECT kind, url, headers, command, args FROM mcp_servers WHERE name = ?1",
                 [name],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| mcp_row(row, 0),
             )
             .optional()?;
-        let Some((url, headers)) = row else {
+        let Some(stored) = row else {
             return Ok(None);
         };
-        Ok(Some(McpServer::remote(
-            name,
-            url,
-            serde_json::from_str(&headers)?,
-        )))
+        Ok(Some(McpServer {
+            name: name.to_owned(),
+            transport: stored.into_transport()?,
+        }))
     }
 
-    /// Registers an MCP server. The name, URL and header names are validated,
-    /// and header names are deduplicated case-insensitively before storage.
+    /// Registers a remote MCP server. See [`Store::create_mcp_server_with`].
     ///
     /// # Errors
     ///
-    /// Returns [`McpError::BadName`], [`McpError::BadUrl`],
-    /// [`McpError::BadHeader`] or [`McpError::ReservedHeader`] for an invalid
-    /// field, and [`McpError::DuplicateName`] when `name` is taken. Nothing is
-    /// written when it fails.
+    /// As [`Store::create_mcp_server_with`].
     pub fn create_mcp_server(
         &self,
         name: &str,
         url: &str,
         headers: &[String],
     ) -> Result<(), McpError> {
+        self.create_mcp_server_with(
+            name,
+            &McpTransport::Remote {
+                url: url.to_owned(),
+                headers: headers.to_vec(),
+            },
+        )
+    }
+
+    /// Registers an MCP server. The name and the transport's fields are
+    /// validated; header names are deduplicated case-insensitively and a stdio
+    /// command is trimmed and its empty arguments dropped before storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::BadName`], [`McpError::BadUrl`],
+    /// [`McpError::BadHeader`], [`McpError::ReservedHeader`],
+    /// [`McpError::BadCommand`] or [`McpError::BadArgs`] for an invalid field,
+    /// and [`McpError::DuplicateName`] when `name` is taken, by either kind.
+    /// Nothing is written when it fails.
+    pub fn create_mcp_server_with(
+        &self,
+        name: &str,
+        transport: &McpTransport,
+    ) -> Result<(), McpError> {
         mcp::validate_name(name)?;
-        mcp::validate_url(url)?;
-        let headers = mcp::normalize_headers(headers)?;
+        let stored = StoredTransport::validated(transport)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let taken = tx
@@ -4081,71 +4190,115 @@ impl Store {
             return Err(McpError::DuplicateName(name.to_owned()));
         }
         tx.execute(
-            "INSERT INTO mcp_servers (name, url, headers) VALUES (?1, ?2, ?3)",
-            params![name, url, serde_json::to_string(&headers)?],
+            "INSERT INTO mcp_servers (name, kind, url, headers, command, args)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                name,
+                stored.kind,
+                stored.url,
+                stored.headers,
+                stored.command,
+                stored.args
+            ],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Edits the URL and header names of the server `name`. The name itself does
-    /// not change, because it keys the stored secrets and the proxy path.
-    ///
-    /// When the new URL's origin (scheme, host or port) differs from the old
-    /// one, every project's stored secret value for this server is deleted, so a
-    /// redirected server cannot collect another project's keys, and every stored
-    /// tool is marked as not offered until the next refresh. Each tool keeps its
-    /// on or off state. Otherwise, each
-    /// header name no longer declared has its stored values deleted. Both happen
-    /// in the same transaction as the update.
+    /// Edits a remote server. See [`Store::edit_mcp_server_with`].
     ///
     /// # Errors
     ///
-    /// Returns [`McpError::BadUrl`], [`McpError::BadHeader`] or
-    /// [`McpError::ReservedHeader`] for an invalid field, and
-    /// [`McpError::NotFound`] when no server is registered under `name`. Nothing
-    /// is written when it fails.
+    /// As [`Store::edit_mcp_server_with`].
     pub fn edit_mcp_server(
         &self,
         name: &str,
         url: &str,
         headers: &[String],
     ) -> Result<(), McpError> {
-        mcp::validate_url(url)?;
-        let headers = mcp::normalize_headers(headers)?;
+        self.edit_mcp_server_with(
+            name,
+            &McpTransport::Remote {
+                url: url.to_owned(),
+                headers: headers.to_vec(),
+            },
+        )
+    }
+
+    /// Edits the transport of the server `name`. The name itself does not
+    /// change, because it keys the stored secrets and the proxy path, and the
+    /// kind does not change either.
+    ///
+    /// For a remote server: when the new URL's origin (scheme, host or port)
+    /// differs from the old one, every project's stored secret value for this
+    /// server is deleted, so a redirected server cannot collect another
+    /// project's keys, and every stored tool is marked as not offered until the
+    /// next refresh. Each tool keeps its on or off state. Otherwise, each
+    /// header name no longer declared has its stored values deleted. Both happen
+    /// in the same transaction as the update.
+    ///
+    /// For a stdio server the command and base arguments are replaced and
+    /// every project's settings for it stay, because it has no stored values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::BadUrl`], [`McpError::BadHeader`],
+    /// [`McpError::ReservedHeader`], [`McpError::BadCommand`] or
+    /// [`McpError::BadArgs`] for an invalid field, [`McpError::KindChange`] when
+    /// `transport` is not the server's kind, and [`McpError::NotFound`] when no
+    /// server is registered under `name`. Nothing is written when it fails.
+    pub fn edit_mcp_server_with(
+        &self,
+        name: &str,
+        transport: &McpTransport,
+    ) -> Result<(), McpError> {
+        let stored = StoredTransport::validated(transport)?;
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let existing = tx
             .query_row(
-                "SELECT url, headers FROM mcp_servers WHERE name = ?1",
+                "SELECT kind, url, headers, command, args FROM mcp_servers WHERE name = ?1",
                 [name],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| mcp_row(row, 0),
             )
             .optional()?;
-        let Some((old_url, old_headers)) = existing else {
+        let Some(existing) = existing else {
             return Err(McpError::NotFound(name.to_owned()));
         };
-        if mcp::same_origin(&old_url, url) {
-            let old_headers: Vec<String> = serde_json::from_str(&old_headers)?;
-            for removed in old_headers
-                .iter()
-                .filter(|old| !headers.iter().any(|kept| kept.eq_ignore_ascii_case(old)))
-            {
+        if existing.kind != stored.kind {
+            return Err(McpError::KindChange(name.to_owned()));
+        }
+        if let McpTransport::Remote { url, .. } = transport {
+            let headers: Vec<String> = serde_json::from_str(&stored.headers)?;
+            if mcp::same_origin(&existing.url, url) {
+                let old_headers: Vec<String> = serde_json::from_str(&existing.headers)?;
+                for removed in old_headers
+                    .iter()
+                    .filter(|old| !headers.iter().any(|kept| kept.eq_ignore_ascii_case(old)))
+                {
+                    tx.execute(
+                        "DELETE FROM secrets WHERE server = ?1 AND header = ?2",
+                        params![name, removed],
+                    )?;
+                }
+            } else {
+                tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
                 tx.execute(
-                    "DELETE FROM secrets WHERE server = ?1 AND header = ?2",
-                    params![name, removed],
+                    "UPDATE project_mcp_tools SET offered = 0 WHERE server = ?1",
+                    [name],
                 )?;
             }
-        } else {
-            tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
-            tx.execute(
-                "UPDATE project_mcp_tools SET offered = 0 WHERE server = ?1",
-                [name],
-            )?;
         }
         tx.execute(
-            "UPDATE mcp_servers SET url = ?1, headers = ?2 WHERE name = ?3",
-            params![url, serde_json::to_string(&headers)?, name],
+            "UPDATE mcp_servers SET url = ?1, headers = ?2, command = ?3, args = ?4
+             WHERE name = ?5",
+            params![
+                stored.url,
+                stored.headers,
+                stored.command,
+                stored.args,
+                name
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -4174,7 +4327,8 @@ impl Store {
     /// # Errors
     ///
     /// Fails as [`Store::edit_mcp_server`] would, on an invalid URL or header
-    /// name, an unknown server or a database error.
+    /// name, an unknown server or a database error. A stdio server gives an
+    /// empty list.
     pub fn mcp_edit_deletes(
         &self,
         name: &str,
@@ -4186,8 +4340,11 @@ impl Store {
         let Some(server) = self.mcp_server(name)? else {
             return Err(McpError::NotFound(name.to_owned()));
         };
+        // A stdio server has no stored values, so an edit deletes none.
+        let Some((current, _)) = server.as_remote() else {
+            return Ok(Vec::new());
+        };
         let stored = self.mcp_secrets(name)?;
-        let McpTransport::Remote { url: current, .. } = &server.transport;
         if !mcp::same_origin(current, url) {
             return Ok(stored);
         }
