@@ -89,6 +89,10 @@ pub enum JobKind {
     /// `source_pr`, found by job `source_job`. It waits for approval at
     /// [`Stage::Proposed`], then runs like a request.
     Gap { source_job: i64, source_pr: u64 },
+    /// A change that a stopped Renovate pull request needs before CI can
+    /// pass, made in its own pull request. `source_job` is the Renovate job
+    /// and `source_pr` its pull request number. It runs like a request.
+    Fix { source_job: i64, source_pr: u64 },
 }
 
 /// How many times the factory reruns failed CI on one head commit of a
@@ -235,6 +239,48 @@ pub enum RenovateWait {
     Ready,
     /// The diff check found the update unsafe.
     Unsafe,
+    /// A fix job runs, or has merged and Renovate has not rebased yet. The
+    /// factory keeps watching and the user has no action. See [`FixLink`].
+    Fixing,
+    /// A fix job merged, but the factory could not ask Renovate to rebase.
+    /// The user rebases the pull request by hand.
+    RebaseFailed,
+}
+
+/// The fix job a Renovate job waits for, and how far it got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixLink {
+    pub job: i64,
+    pub state: FixState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixState {
+    /// The fix job has not ended.
+    Running,
+    /// The fix job merged while the pull request had head `head`.
+    Merged { head: String, rebase: RebaseState },
+}
+
+/// How the request to Renovate to rebase the pull request went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RebaseState {
+    /// The factory still owes the request.
+    Pending,
+    Requested,
+    Failed,
+}
+
+/// How a fix job ended, as the scheduler reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FixOutcome {
+    Merged,
+    Cancelled,
+    /// A pull request of the fix job closed without merging.
+    Closed,
+    /// The fix job failed and the user dismissed it.
+    Dismissed,
+    Deleted,
 }
 
 /// What the factory does for a Renovate job before it watches again.
@@ -253,6 +299,8 @@ enum Pending {
         gaps: Vec<Gap>,
         range: Option<(String, String)>,
     },
+    /// Ask Renovate to rebase, once the fix job merged.
+    Rebase,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +335,10 @@ pub struct RenovatePr {
     /// not run. An empty list means it found no gaps.
     #[serde(default)]
     pub gaps: Option<Vec<i64>>,
+    /// The fix job the Renovate job waits for. A job stored before fix jobs
+    /// existed loads with none.
+    #[serde(default)]
+    pub fix: Option<FixLink>,
     #[serde(default)]
     pending: Option<Pending>,
     #[serde(default)]
@@ -294,6 +346,155 @@ pub struct RenovatePr {
 }
 
 impl RenovatePr {
+    /// The request text of a fix job for this pull request. `reason` is why
+    /// triage stopped.
+    #[must_use]
+    pub fn fix_request(&self, reason: &str, instructions: Option<&str>) -> String {
+        let mut text = format!(
+            "Renovate pull request #{} ({}) cannot pass CI as it is: {}\n{}\n\n\
+             Make the change this repository needs so that CI can pass once the update is \
+             applied.\n",
+            self.number, self.title, self.url, reason
+        );
+        if let Some(instructions) = instructions.map(str::trim).filter(|i| !i.is_empty()) {
+            text.push_str("\nInstructions from the requester:\n");
+            text.push_str(instructions);
+            text.push('\n');
+        }
+        text.push_str(
+            "\nConstraints:\n\
+             - The change must not include the dependency update itself.\n\
+             - The change must pass CI on the base branch as it is today, and must let CI pass \
+             once the update is applied on top.",
+        );
+        text
+    }
+
+    /// What a Renovate job that waits on its fix job shows, from the fix
+    /// link. Without a link it is the stopped wait.
+    fn fix_ask(&self) -> Ask {
+        let (reason, state) = match &self.fix {
+            Some(FixLink {
+                job,
+                state: FixState::Running,
+            }) => (format!("Waiting for fix job #{job}"), RenovateWait::Fixing),
+            Some(FixLink {
+                job,
+                state:
+                    FixState::Merged {
+                        rebase: RebaseState::Failed,
+                        ..
+                    },
+            }) => (
+                format!(
+                    "Fix job #{job} merged, but the factory could not ask Renovate to rebase. \
+                     Rebase the pull request by hand."
+                ),
+                RenovateWait::RebaseFailed,
+            ),
+            Some(FixLink { job, .. }) => (
+                format!("Fix job #{job} merged. Waiting for Renovate to rebase the pull request."),
+                RenovateWait::Fixing,
+            ),
+            None => (
+                self.stopped.clone().unwrap_or_default(),
+                RenovateWait::Stopped,
+            ),
+        };
+        Ask::Renovate { reason, state }
+    }
+
+    /// Applies the end of fix job `job` while the job's turn is `turn`.
+    fn on_fix_ended(&mut self, turn: &Turn, job: i64, outcome: FixOutcome) -> Turn {
+        let running = matches!(
+            &self.fix,
+            Some(FixLink { job: linked, state: FixState::Running }) if *linked == job
+        );
+        let busy = self.pending.is_some() || matches!(turn, Turn::Agent(_) | Turn::RerunCi { .. });
+        if !running || busy {
+            return turn.clone();
+        }
+        if outcome == FixOutcome::Merged {
+            let head = self.head.clone().unwrap_or_default();
+            self.fix = Some(FixLink {
+                job,
+                state: FixState::Merged {
+                    head,
+                    rebase: RebaseState::Pending,
+                },
+            });
+            self.pending = Some(Pending::Rebase);
+            return Turn::Factory;
+        }
+        let line = match outcome {
+            FixOutcome::Cancelled => format!("Fix job #{job} was cancelled."),
+            FixOutcome::Closed => format!("Fix job #{job} was closed without merging."),
+            FixOutcome::Dismissed => format!("Fix job #{job} was dismissed after a failure."),
+            _ => format!("Fix job #{job} was deleted."),
+        };
+        let fixing = matches!(
+            turn,
+            Turn::User(Ask::Renovate {
+                state: RenovateWait::Fixing,
+                ..
+            })
+        );
+        self.fix = None;
+        if !fixing {
+            return turn.clone();
+        }
+        let earlier = self.stopped.clone().unwrap_or_default();
+        Turn::User(Ask::Renovate {
+            reason: if earlier.is_empty() {
+                line
+            } else {
+                format!("{earlier}\n{line}")
+            },
+            state: RenovateWait::Stopped,
+        })
+    }
+
+    /// Counts the rerun that ran and goes back to watching.
+    fn on_rerun(&mut self) -> Turn {
+        match self.rerun {
+            RerunKind::Auto => {
+                self.reruns += 1;
+                self.auto_reruns += 1;
+            }
+            RerunKind::Analysed => self.reruns += 1,
+            RerunKind::Retry => {}
+        }
+        Turn::Factory
+    }
+
+    fn fix_running(&self) -> bool {
+        matches!(
+            self.fix,
+            Some(FixLink {
+                state: FixState::Running,
+                ..
+            })
+        )
+    }
+
+    /// Records how the rebase request went. False when no merged fix waits
+    /// for one.
+    fn rebased(&mut self, to: RebaseState) -> bool {
+        if self.pending != Some(Pending::Rebase) {
+            return false;
+        }
+        let Some(FixLink {
+            state: FixState::Merged { rebase, .. },
+            ..
+        }) = &mut self.fix
+        else {
+            return false;
+        };
+        *rebase = to;
+        self.pending = None;
+        true
+    }
+
     fn commented(&self, kind: CommentKind) -> bool {
         self.head
             .as_ref()
@@ -308,16 +509,28 @@ impl RenovatePr {
         self.stopped = None;
         self.pending = None;
         self.rerun = RerunKind::Auto;
+        if !self.fix_running() {
+            self.fix = None;
+        }
     }
 
     fn stop(&mut self, kind: CommentKind, reason: String, body: String) -> Turn {
-        let state = if kind == CommentKind::Unsafe {
-            RenovateWait::Unsafe
+        let then = if kind == CommentKind::Unsafe {
+            Ask::Renovate {
+                reason,
+                state: RenovateWait::Unsafe,
+            }
         } else {
             self.stopped = Some(reason.clone());
-            RenovateWait::Stopped
+            if self.fix_running() {
+                self.fix_ask()
+            } else {
+                Ask::Renovate {
+                    reason,
+                    state: RenovateWait::Stopped,
+                }
+            }
         };
-        let then = Ask::Renovate { reason, state };
         if self.commented(kind) {
             return Turn::User(then);
         }
@@ -432,6 +645,22 @@ fn unsafe_texts(reason: &str) -> (String, String) {
              dependency or packaging version files.\n\n{reason}"
         ),
     )
+}
+
+impl Turn {
+    /// Whether the turn is a Renovate wait that only a new head ends.
+    fn waits_for_head(&self) -> bool {
+        matches!(
+            self,
+            Turn::User(Ask::Renovate {
+                state: RenovateWait::Stopped
+                    | RenovateWait::Unsafe
+                    | RenovateWait::Fixing
+                    | RenovateWait::RebaseFailed,
+                ..
+            })
+        )
+    }
 }
 
 /// Whether the reviewer has approved the current head of a pull request.
@@ -830,6 +1059,14 @@ pub enum Command {
         /// The upstream versions the analysis compared, for the request text.
         range: Option<(String, String)>,
     },
+    /// Tick the rebase checkbox in the description of the Renovate pull
+    /// request, unless its head is no longer `head`. Then report
+    /// [`Event::RebaseRequested`], [`Event::RebaseSkipped`] or
+    /// [`Event::RebaseFailed`].
+    RequestRebase {
+        number: u64,
+        head: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -959,6 +1196,25 @@ pub enum Event {
         jobs: Vec<i64>,
     },
     ClosedUnmerged,
+    /// The user started fix job `job` for a stopped Renovate job.
+    FixStarted {
+        job: i64,
+    },
+    /// The scheduler read that fix job `job` ended with `outcome`. It reports
+    /// this on every watch, so a repeat changes nothing.
+    FixEnded {
+        job: i64,
+        outcome: FixOutcome,
+    },
+    /// The factory ticked Renovate's rebase checkbox.
+    RebaseRequested,
+    /// The head of the pull request changed after the fix job merged, so
+    /// the factory asked for no rebase.
+    RebaseSkipped,
+    /// The pull request has no rebase checkbox, or writing it failed.
+    RebaseFailed {
+        reason: String,
+    },
     /// The pull request's branch has no commits after the base branch, so
     /// there is nothing to push. This happens when an earlier pull request
     /// already made the change. A pull request with no number is skipped and
@@ -1050,6 +1306,18 @@ impl Job {
         job
     }
 
+    /// A job that fixes what stopped Renovate pull request `source_pr` of job
+    /// `source_job`. It starts at [`Stage::Requested`] and runs like a request.
+    #[must_use]
+    pub fn fix(request: impl Into<String>, gates: Gates, source_job: i64, source_pr: u64) -> Self {
+        let mut job = Job::new(request, gates);
+        job.kind = JobKind::Fix {
+            source_job,
+            source_pr,
+        };
+        job
+    }
+
     /// A job that watches Renovate pull request `number`. Its request text is
     /// the pull request's title.
     #[must_use]
@@ -1069,6 +1337,7 @@ impl Job {
             comments: Vec::new(),
             runs: 0,
             gaps: None,
+            fix: None,
             pending: None,
             rerun: RerunKind::Auto,
         }));
@@ -1085,7 +1354,7 @@ impl Job {
     pub fn renovate_pr(&self) -> Option<&RenovatePr> {
         match &self.kind {
             JobKind::Renovate(pr) => Some(&**pr),
-            JobKind::Request | JobKind::Gap { .. } => None,
+            JobKind::Request | JobKind::Gap { .. } | JobKind::Fix { .. } => None,
         }
     }
 
@@ -1094,6 +1363,18 @@ impl Job {
     pub fn gap_source(&self) -> Option<(i64, u64)> {
         match &self.kind {
             JobKind::Gap {
+                source_job,
+                source_pr,
+            } => Some((*source_job, *source_pr)),
+            _ => None,
+        }
+    }
+
+    /// The Renovate job and pull request number a fix job is for.
+    #[must_use]
+    pub fn fix_source(&self) -> Option<(i64, u64)> {
+        match &self.kind {
+            JobKind::Fix {
                 source_job,
                 source_pr,
             } => Some((*source_job, *source_pr)),
@@ -1227,6 +1508,20 @@ impl Job {
                 Some(Pending::Merge) => Command::MergeRenovate {
                     number,
                     head: pr.head.clone()?,
+                },
+                Some(Pending::Rebase) => match &pr.fix {
+                    Some(FixLink {
+                        state: FixState::Merged { head, .. },
+                        ..
+                    }) => Command::RequestRebase {
+                        number,
+                        head: head.clone(),
+                    },
+                    _ => Command::WatchRenovate {
+                        number,
+                        verdict_head: None,
+                        watch_only: false,
+                    },
                 },
                 None | Some(Pending::Propose { .. }) => Command::WatchRenovate {
                     number,
@@ -1493,6 +1788,16 @@ impl Job {
     fn deliver_renovate(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
         use Event as E;
 
+        if matches!(
+            event,
+            E::FixStarted { .. }
+                | E::FixEnded { .. }
+                | E::RebaseRequested
+                | E::RebaseSkipped
+                | E::RebaseFailed { .. }
+        ) {
+            return self.deliver_fix(event);
+        }
         let turn = self.turn.clone();
         let Some(pr) = self.renovate_mut() else {
             return Err(self.unexpected(event));
@@ -1505,17 +1810,7 @@ impl Job {
             (Turn::Agent(Task::CheckDiff { .. }), E::Agent(AgentResult::DiffVerdict(found))) => {
                 pr.on_diff_verdict(*found)
             }
-            (Turn::RerunCi { .. }, E::CiRerun) => {
-                match pr.rerun {
-                    RerunKind::Auto => {
-                        pr.reruns += 1;
-                        pr.auto_reruns += 1;
-                    }
-                    RerunKind::Analysed => pr.reruns += 1,
-                    RerunKind::Retry => {}
-                }
-                Turn::Factory
-            }
+            (Turn::RerunCi { .. }, E::CiRerun) => pr.on_rerun(),
             (Turn::RerunCi { .. }, E::NothingToRerun) => pr.stop(
                 CommentKind::NothingToRerun,
                 "CI fails on a check that has no failed GitHub Actions run, so the factory cannot \
@@ -1549,7 +1844,7 @@ impl Job {
                     auto_merge,
                 },
             ) => {
-                if matches!(pr.pending, Some(Pending::Comment { .. })) {
+                if matches!(pr.pending, Some(Pending::Comment { .. } | Pending::Rebase)) {
                     return Err(self.unexpected(E::RenovateObserved {
                         head,
                         ci,
@@ -1557,13 +1852,7 @@ impl Job {
                         auto_merge,
                     }));
                 }
-                let waiting = matches!(
-                    turn,
-                    Turn::User(Ask::Renovate {
-                        state: RenovateWait::Stopped | RenovateWait::Unsafe,
-                        ..
-                    })
-                );
+                let waiting = turn.waits_for_head();
                 if pr.head.as_deref() != Some(head.as_str()) {
                     pr.reset(head);
                 } else if waiting {
@@ -1587,6 +1876,46 @@ impl Job {
                 return Ok((Stage::Packaging, Turn::Factory));
             }
             (_, E::ClosedUnmerged) => return Ok((Stage::Cancelled, Turn::Done)),
+            (_, event) => return Err(self.unexpected(event)),
+        };
+        Ok((Stage::Renovate, next))
+    }
+
+    /// Handles the events of a Renovate job's fix job and of the rebase
+    /// request that follows its merge.
+    fn deliver_fix(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
+        use Event as E;
+
+        let turn = self.turn.clone();
+        let Some(pr) = self.renovate_mut() else {
+            return Err(self.unexpected(event));
+        };
+        let next = match (&turn, event) {
+            (
+                Turn::User(Ask::Renovate {
+                    state: RenovateWait::Stopped,
+                    ..
+                }),
+                E::FixStarted { job },
+            ) if !pr.fix_running() => {
+                pr.fix = Some(FixLink {
+                    job,
+                    state: FixState::Running,
+                });
+                Turn::User(pr.fix_ask())
+            }
+            (_, E::FixEnded { job, outcome }) => pr.on_fix_ended(&turn, job, outcome),
+            (Turn::Factory, E::RebaseRequested) if pr.rebased(RebaseState::Requested) => {
+                Turn::User(pr.fix_ask())
+            }
+            (Turn::Factory, E::RebaseFailed { .. }) if pr.rebased(RebaseState::Failed) => {
+                Turn::User(pr.fix_ask())
+            }
+            (Turn::Factory, E::RebaseSkipped) if pr.pending == Some(Pending::Rebase) => {
+                pr.pending = None;
+                pr.fix = None;
+                Turn::Factory
+            }
             (_, event) => return Err(self.unexpected(event)),
         };
         Ok((Stage::Renovate, next))
@@ -1635,7 +1964,7 @@ impl Job {
     fn renovate_mut(&mut self) -> Option<&mut RenovatePr> {
         match &mut self.kind {
             JobKind::Renovate(pr) => Some(&mut **pr),
-            JobKind::Request | JobKind::Gap { .. } => None,
+            JobKind::Request | JobKind::Gap { .. } | JobKind::Fix { .. } => None,
         }
     }
 
