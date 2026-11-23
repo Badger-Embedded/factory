@@ -214,6 +214,35 @@ test('the log keeps its scroll position when a poll swaps it', async ({ page, fa
   await expect.poll(() => log.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(4);
 });
 
+test('a reviewed job shows its review pass', async ({ page, factory, project }) => {
+  const id = newJob(factory, project, 'reviewed');
+  await page.goto(`/jobs/${id}`);
+
+  const card = page.locator('#job-reviews');
+  await expect(card.getByRole('heading', { name: 'LLM review' })).toBeVisible();
+  await expect(card).toContainText('Pass 1');
+  await expect(card.locator('.badge')).toHaveText('approved');
+});
+
+test('an opened MCP server group stays open across a poll', async ({ page, factory, project }) => {
+  const id = newJob(factory, project, 'implementing');
+  factory.fixture('mcp', '--job', id, '--server', 'github', '--tool', 'get_issue');
+  factory.fixture('mcp', '--job', id, '--server', 'github', '--tool', 'list_issues');
+  await page.goto(`/jobs/${id}`);
+
+  const card = page.locator('#job-mcp-calls');
+  await expect(card.getByRole('heading', { name: 'MCP tool calls' })).toBeVisible();
+  await expect(card.locator('.log-count')).toContainText('2 calls');
+  const group = card.locator('details.mcp-call-group');
+  await group.locator('summary').click();
+  await expect(group).toHaveJSProperty('open', true);
+
+  factory.fixture('mcp', '--job', id, '--server', 'github', '--tool', 'create_issue');
+  await expect(group.locator('li.mcp-call')).toHaveCount(3);
+  await expect(card.locator('.log-count')).toContainText('3 calls');
+  await expect(group).toHaveJSProperty('open', true);
+});
+
 test.describe('in a time zone that is not UTC', () => {
   test.use({ timezoneId: 'Asia/Kolkata' });
 
