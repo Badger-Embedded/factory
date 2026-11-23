@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage};
+use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage, Wait};
 use factory_runner::{Access, Account, Expect, ForgeKind};
 use maud::{Markup, html};
 use serde::Deserialize;
@@ -394,9 +394,11 @@ impl IntoResponse for AppError {
             AppError::Store(err @ StoreError::Rejected(_)) => {
                 (StatusCode::CONFLICT, err.to_string())
             }
-            AppError::Store(err @ (StoreError::InvalidEffort(_) | StoreError::InvalidAgent(_))) => {
-                (StatusCode::BAD_REQUEST, err.to_string())
-            }
+            AppError::Store(
+                err @ (StoreError::InvalidEffort(_)
+                | StoreError::InvalidAgent(_)
+                | StoreError::InvalidPrerequisite(_)),
+            ) => (StatusCode::BAD_REQUEST, err.to_string()),
             AppError::Store(err) => {
                 tracing::error!("{err}");
                 (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -448,6 +450,7 @@ struct BoardData {
     selected: Option<String>,
     jobs: Vec<JobRow>,
     costs: HashMap<i64, f64>,
+    waits: HashMap<i64, Wait>,
     totals: ProjectTotals,
     auto_merge: bool,
     project: Option<Project>,
@@ -486,6 +489,7 @@ fn load_board(
     };
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
+    let waits = state.store.waits()?;
     let (totals, auto_merge, project) = match &selected {
         Some(name) => {
             let project = state.projects.lookup(name)?;
@@ -503,6 +507,7 @@ fn load_board(
         selected,
         jobs,
         costs,
+        waits,
         totals,
         auto_merge,
         project,
@@ -540,6 +545,7 @@ async fn index(
         data.selected.as_deref(),
         &data.jobs,
         &data.costs,
+        &data.waits,
         data.totals,
         plan_usage.as_ref(),
         data.auto_merge,
@@ -597,7 +603,11 @@ async fn notifications(
         .filter(|(row, _)| row.requested_by == login || row.requested_by == FACTORY_REQUESTER)
         .filter_map(|(row, event)| {
             let merge = *auto_merge.get(&row.project)?;
-            let kind = pages::attention(&row.job, merge)?;
+            let kind = pages::attention(
+                &row.job,
+                merge,
+                snapshot.waits.get(&row.id).unwrap_or(&Wait::Ready),
+            )?;
             Some(serde_json::json!({
                 "key": format!("{}:{event}", row.id),
                 "job": row.id,
@@ -692,6 +702,7 @@ async fn board_fragment(
         pages::board(
             &data.rows(),
             &data.costs,
+            &data.waits,
             data.auto_merge,
             project,
             data.project.as_ref(),
@@ -848,6 +859,7 @@ async fn create_job(
 ) -> Result<Redirect, AppError> {
     let mut project = None;
     let mut request = None;
+    let mut after = Vec::new();
     let mut attachments = Vec::new();
     while let Some(field) = form
         .next_field()
@@ -857,6 +869,13 @@ async fn create_job(
         match field.name() {
             Some("project") => project = Some(read_text(field).await?),
             Some("request") => request = Some(read_text(field).await?),
+            Some("after") => {
+                let value = read_text(field).await?;
+                let id = value.trim().parse::<i64>().map_err(|_| {
+                    AppError::BadRequest(format!("{value:?} is not a job number to wait for"))
+                })?;
+                after.push(id);
+            }
             Some("images") => read_attachment(field, &mut attachments).await?,
             _ => {}
         }
@@ -868,7 +887,9 @@ async fn create_job(
     if request.is_empty() {
         return Err(AppError::BadRequest("the request is empty".into()));
     }
-    let id = state.store.create(&project, &user(&headers), request)?;
+    let id = state
+        .store
+        .create_after(&project, &user(&headers), request, &after)?;
     if !attachments.is_empty()
         && let Err(err) = save_attachments(&state, id, &attachments)
     {

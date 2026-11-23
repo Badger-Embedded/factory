@@ -362,6 +362,20 @@ test.describe('without scripts', () => {
       await setWorkers(2);
     }
   });
+
+  test('a request filed with a Start after selection waits', async ({ page, factory, project }) => {
+    const first = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The first job');
+    await page.goto(`/?project=${project}`);
+    await page.locator('#request').fill('Builds on the first job');
+    await page.locator('fieldset.start-after').getByLabel(`#${first} The first job`).check();
+    await page.getByRole('button', { name: 'Request' }).click();
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+
+    await page.goto(`/?project=${project}`);
+    const row = page.locator('li.job', { hasText: 'Builds on the first job' });
+    await expect(row.locator('.badge')).toHaveText('waiting');
+    await expect(row).toContainText(`waits for #${first}`);
+  });
 });
 
 // Logins other than the admin can use the board of a project they collaborate on.
@@ -415,4 +429,53 @@ test('Renovate pull requests link through the forge and show a plain number on a
   await page.goto(`/?project=${odd}`);
   await expect(page.locator('.renovate-pr')).toHaveText('#8');
   await expect(page.locator('a.renovate-pr')).toHaveCount(0);
+});
+
+test('the Start after picker offers the unfinished jobs of the project', async ({ page, factory, project }) => {
+  await page.goto(`/?project=${project}`);
+  await expect(page.getByText('Start after')).toHaveCount(0);
+
+  const open = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'An open job');
+  const retryable = factory.fixture('job', '--project', project, '--stage', 'failed', '--request', 'A failed job');
+  factory.fixture('job', '--project', project, '--stage', 'merged', '--request', 'A merged job');
+  factory.fixture('job', '--project', project, '--stage', 'cancelled', '--request', 'A cancelled job');
+  await page.goto(`/?project=${project}`);
+
+  await page.locator('#request').fill('Needs the open job');
+  const picker = page.locator('fieldset.start-after');
+  await expect(picker.locator('legend')).toHaveText('Start after');
+  await expect(picker.locator('input[name="after"]')).toHaveCount(2);
+  await expect(picker.getByLabel(`#${open} An open job`)).toBeVisible();
+  await expect(picker.getByLabel(`#${retryable} A failed job`)).toBeVisible();
+
+  await picker.getByLabel(`#${open} An open job`).check();
+  await page.getByRole('button', { name: 'Request' }).click();
+  await expect(page).toHaveURL(/\/jobs\/\d+$/);
+});
+
+test('a request that waits shows as waiting, then blocked when its prerequisite is cancelled', async ({
+  page,
+  factory,
+  project,
+}) => {
+  const first = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The first job');
+  await page.goto(`/?project=${project}`);
+  await page.locator('#request').fill('Builds on the first job');
+  await page.locator('fieldset.start-after').getByLabel(`#${first} The first job`).check();
+  await page.getByRole('button', { name: 'Request' }).click();
+  await expect(page).toHaveURL(/\/jobs\/\d+$/);
+
+  await page.goto(`/?project=${project}`);
+  const row = page.locator('li.job', { hasText: 'Builds on the first job' });
+  await expect(row.locator('.badge')).toHaveText('waiting');
+  await expect(row.getByRole('link', { name: `#${first}` })).toHaveAttribute('href', `/jobs/${first}`);
+  await expect(row.getByRole('link', { name: `#${first}` })).not.toHaveAttribute('target', '_blank');
+  await expect(page.locator('section.inbox-running').locator('li.job', { hasText: 'Builds on' })).toHaveCount(1);
+
+  factory.fixture('apply', '--job', first, '--event', 'cancel');
+
+  const blocked = page.locator('section.inbox-you li.job', { hasText: 'Builds on the first job' });
+  await expect(blocked.locator('.badge')).toHaveText('blocked');
+  await expect(blocked).toContainText(`waits for #${first} (cancelled)`);
+  await expect(blocked.getByRole('link', { name: 'Open' })).toBeVisible();
 });

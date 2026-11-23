@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, DEFAULT_AGENT, Event, Gap, Gates, Job, Rejected, Session, Stage,
+    Agent, AgentResult, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, Gap, Gates, Job,
+    PrerequisiteState, Rejected, Session, Stage, Wait,
 };
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -39,6 +40,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     job TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS job_prerequisites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    prerequisite INTEGER NOT NULL,
+    gone TEXT CHECK (gone IN ('merged', 'unmerged')),
+    title TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS job_prerequisites_live
+    ON job_prerequisites (job_id, prerequisite) WHERE gone IS NULL;
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     settings TEXT NOT NULL
@@ -439,6 +449,9 @@ pub struct Snapshot {
     /// pair, also after a restart, and no clock is involved.
     pub order: (u64, u64),
     pub jobs: Vec<(JobRow, i64)>,
+    /// What each waiting job waits for, read in the same transaction as the
+    /// jobs.
+    pub waits: HashMap<i64, Wait>,
 }
 
 /// A gap job as the packaging analysis sees it.
@@ -479,6 +492,10 @@ pub enum StoreError {
     /// A request tried to remove the sole remaining collaborator of a project.
     /// The project would then be visible to nobody, so removal is refused.
     LastCollaborator,
+    /// A request named a prerequisite job that does not exist, belongs to
+    /// another project, or cannot be waited for. The message is the same for
+    /// each, so it leaks nothing about other projects.
+    InvalidPrerequisite(i64),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -513,6 +530,9 @@ impl fmt::Display for StoreError {
                 f,
                 "A project needs at least one collaborator. Remove the project instead."
             ),
+            StoreError::InvalidPrerequisite(id) => {
+                write!(f, "job #{id} is not a job this request can wait for")
+            }
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
             StoreError::Io(err) => write!(f, "file system: {err}"),
@@ -863,11 +883,49 @@ impl Store {
         requested_by: &str,
         request: &str,
     ) -> Result<i64, StoreError> {
+        self.create_after(project, requested_by, request, &[])
+    }
+
+    /// Creates a job that starts only after every job in `after` has merged.
+    /// The job and its `job_prerequisites` rows go in one transaction. A
+    /// repeated id counts once.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::InvalidPrerequisite`] when an id names no job
+    /// of `project`, or a Renovate job or gap proposal, and then creates
+    /// nothing. The state of a valid prerequisite does not matter. Fails on a
+    /// database error.
+    pub fn create_after(
+        &self,
+        project: &str,
+        requested_by: &str,
+        request: &str,
+        after: &[i64],
+    ) -> Result<i64, StoreError> {
         let gates = self.project_gates(project)?;
         let new = Job::new(request, gates);
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let mut ids = after.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        for &prerequisite in &ids {
+            match Self::load(&tx, prerequisite) {
+                Ok(row) if row.project == project && row.job.accepts_as_prerequisite() => {}
+                Ok(_) | Err(StoreError::NotFound(_)) => {
+                    return Err(StoreError::InvalidPrerequisite(prerequisite));
+                }
+                Err(err) => return Err(err),
+            }
+        }
         let id = Self::insert_job(&tx, project, requested_by, &new)?;
+        for prerequisite in ids {
+            tx.execute(
+                "INSERT INTO job_prerequisites (job_id, prerequisite) VALUES (?1, ?2)",
+                params![id, prerequisite],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }
@@ -1137,6 +1195,7 @@ impl Store {
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             rows.collect::<Result<_, _>>()?
         };
+        let waits = Self::waits_in(&tx, None)?;
         tx.commit()?;
         let jobs = jobs
             .into_iter()
@@ -1148,6 +1207,7 @@ impl Store {
         Ok(Snapshot {
             order: (self.epoch, self.reads.fetch_add(1, Ordering::SeqCst) + 1),
             jobs,
+            waits,
         })
     }
 
@@ -1174,7 +1234,7 @@ impl Store {
     /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on
     /// a file system or database error.
     pub fn delete_job(&self, id: i64, data_dir: &Path) -> Result<(), StoreError> {
-        Self::load(&self.conn(), id)?;
+        let row = Self::load(&self.conn(), id)?;
         match std::fs::remove_dir_all(data_dir.join("jobs").join(id.to_string())) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
                 return Err(StoreError::Io(err));
@@ -1195,6 +1255,22 @@ impl Store {
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
+        // SQLite reuses a deleted job's id, so a job that waited for this one
+        // keeps its own record of how it ended instead of the id.
+        tx.execute(
+            "UPDATE job_prerequisites SET gone = ?2, title = ?3
+             WHERE prerequisite = ?1 AND gone IS NULL",
+            params![
+                id,
+                if *row.job.stage() == Stage::Merged {
+                    "merged"
+                } else {
+                    "unmerged"
+                },
+                row.job.request().lines().next().unwrap_or_default()
+            ],
+        )?;
+        tx.execute("DELETE FROM job_prerequisites WHERE job_id = ?1", [id])?;
         tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
         Ok(tx.commit()?)
     }
@@ -1237,6 +1313,88 @@ impl Store {
         Self::apply_in(&tx, &mut row, event)?;
         tx.commit()?;
         Ok(row)
+    }
+
+    /// Applies [`Event::Start`] to requested job `id` when every job it waits
+    /// for has merged, and returns the started job. Returns `None` and changes
+    /// nothing while any prerequisite is unmet. The check and the start share
+    /// one transaction under the connection lock, so an edit of the job's
+    /// request cannot land between them.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Rejected`] when the job rejects the event.
+    pub fn start(&self, id: i64) -> Result<Option<JobRow>, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, id)?;
+        if Self::waits_in(&tx, Some(id))?.remove(&id).is_some() {
+            return Ok(None);
+        }
+        Self::apply_in(&tx, &mut row, Event::Start)?;
+        tx.commit()?;
+        Ok(Some(row))
+    }
+
+    /// What each job with unmet prerequisites waits for. A job whose
+    /// prerequisites have all merged, or that has none, is absent.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    pub fn waits(&self) -> Result<HashMap<i64, Wait>, StoreError> {
+        Self::waits_in(&self.conn(), None)
+    }
+
+    fn waits_in(conn: &Connection, only: Option<i64>) -> Result<HashMap<i64, Wait>, StoreError> {
+        let mut stmt = conn.prepare(
+            "SELECT p.job_id, p.prerequisite, p.gone, j.job
+             FROM job_prerequisites p
+             LEFT JOIN jobs j ON p.gone IS NULL AND j.id = p.prerequisite
+             WHERE ?1 IS NULL OR p.job_id = ?1
+             ORDER BY p.job_id, p.id",
+        )?;
+        let rows = stmt.query_map([only], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut grouped: Vec<(i64, Vec<PrerequisiteEntry>)> = Vec::new();
+        for row in rows {
+            let (job_id, prerequisite, gone, job) = row?;
+            let entry = match (gone.as_deref(), job) {
+                (Some("merged"), _) => (prerequisite, PrerequisiteState::Met, "merged".into()),
+                (Some(_), _) | (None, None) => (
+                    prerequisite,
+                    PrerequisiteState::Blocked,
+                    DELETED_PREREQUISITE.into(),
+                ),
+                (None, Some(json)) => {
+                    let job: Job = serde_json::from_str(&json)?;
+                    let label = match job.stage() {
+                        Stage::Failed { .. } => "failed",
+                        Stage::Cancelled => "cancelled",
+                        Stage::Dismissed => "dismissed",
+                        _ => "",
+                    };
+                    (prerequisite, job.prerequisite_state(), label.into())
+                }
+            };
+            match grouped.last_mut() {
+                Some((id, entries)) if *id == job_id => entries.push(entry),
+                _ => grouped.push((job_id, vec![entry])),
+            }
+        }
+        Ok(grouped
+            .into_iter()
+            .filter_map(|(id, entries)| match Wait::fold(entries) {
+                Wait::Ready => None,
+                wait => Some((id, wait)),
+            })
+            .collect())
     }
 
     /// Applies `event` to `row`, saves the job, adds the event to its history
@@ -3671,6 +3829,8 @@ impl Store {
         parse_row(raw)
     }
 }
+
+type PrerequisiteEntry = (i64, PrerequisiteState, String);
 
 /// Swaps a queued job's staged attachment directories into place while keeping
 /// the old set aside, so a failure before the store commits can restore it

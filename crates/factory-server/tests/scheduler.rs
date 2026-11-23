@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
     PackagingContext, PrDescription, Question, RenovateCi, RenovateWait, ReviewState, Stage, Turn,
+    Wait,
 };
 use factory_runner::{
     Account, Expect, ForgeKind, LogLine, McpUnavailable, Observation, RenovatePr, Rerun, RunReport,
@@ -552,6 +553,236 @@ async fn queued_jobs_wait_for_a_free_worker() {
     assert_eq!(scheduler.running(), [ids[2]]);
     executor.release(1);
     wait_idle(&scheduler).await;
+}
+
+fn apply_all(store: &Store, id: i64, events: impl IntoIterator<Item = Event>) {
+    for event in events {
+        store.apply(id, event).unwrap();
+    }
+}
+
+fn at_spec(store: &Store, id: i64) {
+    apply_all(
+        store,
+        id,
+        [
+            Event::Start,
+            Event::Agent(AgentResult::Clarified),
+            Event::Agent(AgentResult::Spec("s".into())),
+        ],
+    );
+}
+
+fn merge_from_spec(store: &Store, id: i64) {
+    apply_all(
+        store,
+        id,
+        [
+            Event::Approve,
+            Event::Agent(AgentResult::Plan(vec![planned_pr("a")])),
+            Event::Approve,
+            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::ChecksPassed,
+            Event::Published { number: 3 },
+            Event::Merged,
+        ],
+    );
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Merged);
+}
+
+#[tokio::test]
+async fn a_job_waits_for_its_prerequisite_to_merge_and_holds_no_slot() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let a = store.create("maestro", "alice", "first").unwrap();
+    at_spec(&store, a);
+    let b = store
+        .create_after("maestro", "alice", "second", &[a, a])
+        .unwrap();
+    let c = store.create("maestro", "alice", "third").unwrap();
+
+    scheduler.tick().await.unwrap();
+    assert_eq!(scheduler.running(), [c]);
+    assert_eq!(scheduler.slots().busy().len(), 1);
+    assert_eq!(store.get(b).unwrap().job.stage(), &Stage::Requested);
+    assert_eq!(store.waits().unwrap()[&b], Wait::Waiting(vec![a]));
+
+    merge_from_spec(&store, a);
+    assert!(store.waits().unwrap().is_empty());
+    scheduler.tick().await.unwrap();
+    assert_eq!(store.get(b).unwrap().job.stage(), &Stage::Clarifying);
+    let mut running = scheduler.running();
+    running.sort_unstable();
+    assert_eq!(running, [b, c]);
+    executor.release(2);
+    wait_idle(&scheduler).await;
+}
+
+#[tokio::test]
+async fn a_job_waits_for_every_prerequisite() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    let first = store.create("maestro", "alice", "first").unwrap();
+    let second = store.create("maestro", "alice", "second").unwrap();
+    at_spec(&store, first);
+    at_spec(&store, second);
+    let b = store
+        .create_after("maestro", "alice", "third", &[first, second])
+        .unwrap();
+
+    merge_from_spec(&store, first);
+    scheduler.tick().await.unwrap();
+    assert_eq!(store.get(b).unwrap().job.stage(), &Stage::Requested);
+    assert_eq!(store.waits().unwrap()[&b], Wait::Waiting(vec![second]));
+
+    merge_from_spec(&store, second);
+    scheduler.tick().await.unwrap();
+    assert_eq!(scheduler.running(), [b]);
+    executor.release(1);
+    wait_idle(&scheduler).await;
+}
+
+#[tokio::test]
+async fn a_prerequisite_that_ended_unmerged_keeps_the_job_waiting_until_it_merges() {
+    let (store, _executor, scheduler) = setup(|_| questions());
+    let a = store.create("maestro", "alice", "first").unwrap();
+    apply_all(
+        &store,
+        a,
+        [
+            Event::Start,
+            Event::AgentFailed {
+                reason: "usage limit".into(),
+            },
+        ],
+    );
+    let b = store
+        .create_after("maestro", "alice", "second", &[a])
+        .unwrap();
+    let cancelled = store.create("maestro", "alice", "third").unwrap();
+    store.apply(cancelled, Event::Cancel).unwrap();
+    let c = store
+        .create_after("maestro", "alice", "fourth", &[cancelled])
+        .unwrap();
+
+    scheduler.tick().await.unwrap();
+    assert_eq!(scheduler.running(), Vec::<i64>::new());
+    assert_eq!(store.get(b).unwrap().job.stage(), &Stage::Requested);
+    assert_eq!(store.get(c).unwrap().job.stage(), &Stage::Requested);
+    assert_eq!(
+        store.waits().unwrap()[&b],
+        Wait::Blocked(vec![(a, "failed".into())])
+    );
+    assert_eq!(
+        store.waits().unwrap()[&c],
+        Wait::Blocked(vec![(cancelled, "cancelled".into())])
+    );
+
+    apply_all(
+        &store,
+        a,
+        [
+            Event::Retry,
+            Event::Agent(AgentResult::Clarified),
+            Event::Agent(AgentResult::Spec("s".into())),
+        ],
+    );
+    merge_from_spec(&store, a);
+    scheduler.tick().await.unwrap();
+    assert_eq!(scheduler.running(), [b]);
+    assert_eq!(store.get(c).unwrap().job.stage(), &Stage::Requested);
+}
+
+#[tokio::test]
+async fn a_prerequisite_deleted_unmerged_blocks_the_job_and_its_id_is_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    let a = store.create("maestro", "alice", "first").unwrap();
+    let b = store
+        .create_after("maestro", "alice", "second", &[a])
+        .unwrap();
+    // A prerequisite with a higher id than the job, whose id SQLite then reuses.
+    let high = store.create("maestro", "alice", "third").unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO job_prerequisites (job_id, prerequisite) VALUES (?1, ?2)",
+        rusqlite::params![a, high],
+    )
+    .unwrap();
+    store.delete_job(high, dir.path()).unwrap();
+    let reused = store.create("maestro", "alice", "fourth").unwrap();
+    assert_eq!(reused, high);
+    at_spec(&store, reused);
+    merge_from_spec(&store, reused);
+    assert_eq!(
+        store.waits().unwrap()[&a],
+        Wait::Blocked(vec![(high, "deleted before it merged".into())])
+    );
+
+    store.delete_job(a, dir.path()).unwrap();
+    assert_eq!(
+        store.waits().unwrap()[&b],
+        Wait::Blocked(vec![(a, "deleted before it merged".into())])
+    );
+    assert!(!store.waits().unwrap().contains_key(&a));
+}
+
+#[tokio::test]
+async fn a_prerequisite_deleted_after_it_merged_counts_as_met() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("factory.db")).unwrap();
+    let a = store.create("maestro", "alice", "first").unwrap();
+    at_spec(&store, a);
+    let b = store
+        .create_after("maestro", "alice", "second", &[a])
+        .unwrap();
+    merge_from_spec(&store, a);
+    store.delete_job(a, dir.path()).unwrap();
+    assert!(store.waits().unwrap().is_empty());
+    assert!(store.start(b).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn prerequisites_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let (a, b) = {
+        let store = Store::open(&path).unwrap();
+        let a = store.create("maestro", "alice", "first").unwrap();
+        at_spec(&store, a);
+        let b = store
+            .create_after("maestro", "alice", "second", &[a])
+            .unwrap();
+        (a, b)
+    };
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.waits().unwrap()[&b], Wait::Waiting(vec![a]));
+    assert!(store.start(b).unwrap().is_none());
+    assert_eq!(store.get(b).unwrap().job.stage(), &Stage::Requested);
+    merge_from_spec(&store, a);
+    assert!(store.start(b).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_request_with_a_bad_prerequisite_creates_no_job() {
+    let store = Store::open_in_memory().unwrap();
+    let before = store.list().unwrap().len();
+    for after in [vec![99], vec![99, 98]] {
+        assert!(matches!(
+            store.create_after("maestro", "alice", "x", &after),
+            Err(factory_server::StoreError::InvalidPrerequisite(_))
+        ));
+    }
+    let renovate = store
+        .create_renovate_job("maestro", 5, "chore(deps): bump", "https://example.test/5")
+        .unwrap()
+        .unwrap();
+    let ok = store.create("maestro", "alice", "ok").unwrap();
+    assert!(
+        store
+            .create_after("maestro", "alice", "x", &[ok, renovate])
+            .is_err()
+    );
+    assert_eq!(store.list().unwrap().len(), before + 2);
 }
 
 #[tokio::test]

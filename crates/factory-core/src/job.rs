@@ -2352,10 +2352,104 @@ impl Job {
         )
     }
 
+    /// Whether the new-request form offers the job as a prerequisite: an
+    /// unfinished job, or a failed job that can be retried and is not
+    /// dismissed. False for a Renovate job and a gap proposal.
+    #[must_use]
+    pub fn can_be_prerequisite(&self) -> bool {
+        if !self.accepts_as_prerequisite() {
+            return false;
+        }
+        match self.stage {
+            Stage::Failed {
+                dismissed: false, ..
+            } => self.can_retry(),
+            _ => !self.is_finished(),
+        }
+    }
+
+    /// Whether the server accepts the job as a prerequisite. The state at
+    /// submit time does not matter, so a merged, cancelled or failed job is
+    /// accepted. False for a Renovate job and a gap proposal.
+    #[must_use]
+    pub fn accepts_as_prerequisite(&self) -> bool {
+        self.renovate_pr().is_none() && self.stage != Stage::Proposed
+    }
+
+    /// How the job counts as a prerequisite of another job.
+    #[must_use]
+    pub fn prerequisite_state(&self) -> PrerequisiteState {
+        match self.stage {
+            Stage::Merged => PrerequisiteState::Met,
+            Stage::Cancelled | Stage::Dismissed | Stage::Failed { .. } => {
+                PrerequisiteState::Blocked
+            }
+            _ => PrerequisiteState::Pending,
+        }
+    }
+
     fn unexpected(&self, event: Event) -> Rejected {
         Rejected::Unexpected {
             stage: self.stage.clone(),
             event,
+        }
+    }
+}
+
+/// Whether a prerequisite lets the waiting job start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrerequisiteState {
+    /// The prerequisite merged.
+    Met,
+    /// The prerequisite is still on its way to merging.
+    Pending,
+    /// The prerequisite cannot merge until someone acts on it.
+    Blocked,
+}
+
+/// The label of a prerequisite that was deleted before it merged.
+pub const DELETED_PREREQUISITE: &str = "deleted before it merged";
+
+/// What a job with prerequisites waits for. See [`Wait::fold`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wait {
+    /// No prerequisite is left, so the job may start.
+    Ready,
+    /// The ids of the prerequisites that have not merged, none of them
+    /// blocked.
+    Waiting(Vec<i64>),
+    /// The prerequisites that have not merged, each with what holds it:
+    /// a stage label, or [`DELETED_PREREQUISITE`]. At least one is blocked.
+    Blocked(Vec<(i64, String)>),
+}
+
+impl Wait {
+    /// Folds the prerequisites, each an id with its state and a label for
+    /// the state. A deleted prerequisite enters as met when it had merged and
+    /// as blocked otherwise.
+    #[must_use]
+    pub fn fold<I>(prerequisites: I) -> Self
+    where
+        I: IntoIterator<Item = (i64, PrerequisiteState, String)>,
+    {
+        let mut unmet = Vec::new();
+        let mut blocked = false;
+        for (id, state, label) in prerequisites {
+            match state {
+                PrerequisiteState::Met => {}
+                PrerequisiteState::Pending => unmet.push((id, label)),
+                PrerequisiteState::Blocked => {
+                    blocked = true;
+                    unmet.push((id, label));
+                }
+            }
+        }
+        if unmet.is_empty() {
+            Self::Ready
+        } else if blocked {
+            Self::Blocked(unmet)
+        } else {
+            Self::Waiting(unmet.into_iter().map(|(id, _)| id).collect())
         }
     }
 }

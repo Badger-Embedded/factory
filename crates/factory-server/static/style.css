@@ -272,6 +272,10 @@ a.worker-job:hover { color: var(--accent); }
    to the row, not to the body. Otherwise :focus-within stops matching and the
    row hides before the click lands. */
 .composer-more:focus { outline: none; }
+.start-after { border: 0; margin: var(--space-8) 0 0; padding: 0; }
+.start-after legend { padding: 0; font-weight: 600; }
+.start-after-job { display: flex; align-items: baseline; gap: var(--space-4); margin-top: var(--space-4); }
+.start-after-job .id { color: var(--muted); }
 .composer:focus-within .composer-more,
 .composer:has(textarea:not(:placeholder-shown)) .composer-more,
 .composer:has(.pasted-images li) .composer-more { display: block; }
