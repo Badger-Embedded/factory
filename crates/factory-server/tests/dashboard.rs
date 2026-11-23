@@ -14776,7 +14776,7 @@ async fn upstream_post(dashboard: &Dashboard, action: &str, form: &str) -> Reply
         .to_owned();
     dashboard
         .post(
-            &format!("{PROJECT_PAGE}/upstream-token{action}"),
+            &format!("{PROJECT_PAGE}/upstream-token{action}?forge=github"),
             &format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&{form}&csrf={csrf}"),
         )
         .await
@@ -14835,7 +14835,7 @@ async fn an_upstream_token_replaces_the_project_token_for_the_check_and_is_never
             &format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool"),
         )
         .await;
-    let rejected = upstream_post(&dashboard, "", "token=nope").await;
+    let rejected = upstream_post(&dashboard, "", "token_github=nope").await;
     assert!(
         rejected
             .body
@@ -14843,7 +14843,7 @@ async fn an_upstream_token_replaces_the_project_token_for_the_check_and_is_never
     );
     assert!(!rejected.body.contains("nope"));
 
-    let saved = upstream_post(&dashboard, "", "token=tok-reader").await;
+    let saved = upstream_post(&dashboard, "", "token_github=tok-reader").await;
     assert!(saved.body.contains("reader-bot"));
     assert!(!saved.body.contains("tok-reader"));
 
@@ -14981,11 +14981,11 @@ fn upstream_owner() -> ForgeTokenOwner<'static> {
 async fn an_upstream_token_saved_after_the_project_was_recreated_stores_nothing() {
     let dashboard = dashboard_with_project_token();
     let csrf = upstream_csrf(&dashboard).await;
-    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&token=tok-lag&csrf={csrf}");
+    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&token_github=tok-lag&csrf={csrf}");
 
     let reply = post_while(
         &dashboard,
-        &format!("{PROJECT_PAGE}/upstream-token"),
+        &format!("{PROJECT_PAGE}/upstream-token?forge=github"),
         &form,
         || {
             dashboard.store.remove_project("maestro").unwrap();
@@ -15019,11 +15019,11 @@ async fn an_upstream_token_saved_after_the_project_was_recreated_stores_nothing(
 async fn an_upstream_token_saved_by_a_login_removed_meanwhile_stores_nothing() {
     let dashboard = dashboard_with_project_token();
     let csrf = upstream_csrf(&dashboard).await;
-    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&token=tok-lag&csrf={csrf}");
+    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&token_github=tok-lag&csrf={csrf}");
 
     let reply = post_while(
         &dashboard,
-        &format!("{PROJECT_PAGE}/upstream-token"),
+        &format!("{PROJECT_PAGE}/upstream-token?forge=github"),
         &form,
         || {
             dashboard
@@ -15121,6 +15121,60 @@ async fn a_maintenance_save_refuses_a_result_checked_with_an_upstream_token_sinc
             .unwrap()
             .packaging
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_token_button_acts_on_the_forge_it_names_and_an_unknown_forge_is_refused() {
+    let dashboard = dashboard_with_project_token();
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .put_forge_token(
+            upstream_owner(),
+            "tok",
+            &ForgeAccount {
+                login: "reader-bot".into(),
+                id: 1,
+            },
+        )
+        .unwrap();
+    let csrf = upstream_csrf(&dashboard).await;
+    let salsa = ForgeTokenOwner::Upstream {
+        project: "maestro",
+        forge: ForgeKind::Salsa,
+    };
+
+    // The form still says GitHub, with packaging off, and names Salsa.
+    let cleared = dashboard
+        .post(
+            &format!("{PROJECT_PAGE}/upstream-token/clear?forge=salsa"),
+            &format!("upstream_forge=github&csrf={csrf}"),
+        )
+        .await;
+    assert!(cleared.body.contains("Cleared."));
+    assert!(dashboard.store.forge_account(salsa).unwrap().is_none());
+    assert!(
+        dashboard
+            .store
+            .forge_account(upstream_owner())
+            .unwrap()
+            .is_some()
+    );
+
+    for forge in ["gitlab", ""] {
+        let refused = dashboard
+            .post(
+                &format!("{PROJECT_PAGE}/upstream-token/clear?forge={forge}"),
+                &format!("csrf={csrf}"),
+            )
+            .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    }
+    assert!(
+        dashboard
+            .store
+            .forge_account(upstream_owner())
+            .unwrap()
+            .is_some()
     );
 }
 

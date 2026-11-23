@@ -16,7 +16,7 @@ use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::accounts::{Accounts, ResolveError, UpstreamCredential};
+use crate::accounts::{Accounts, ResolveError, TokenRow, UpstreamCredential};
 use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::copilot::validate_copilot_token;
 use crate::csrf::CsrfKey;
@@ -1957,13 +1957,6 @@ fn project_page_full(
     if let Some(maintenance) = maintenance {
         settings.maintenance = maintenance;
     }
-    settings.upstream.account = match &settings.maintenance.packaging {
-        Some(packaging) => state.store.forge_account(ForgeTokenOwner::Upstream {
-            project: name,
-            forge: packaging.upstream_forge,
-        })?,
-        None => None,
-    };
     settings.upstream.check = check;
     Ok(pages::settings_project(
         &user(headers),
@@ -2058,13 +2051,16 @@ fn project_settings(
         forge_problem: project.forge.problem(),
         forge_account,
         upstream: pages::UpstreamCard {
-            account: match state.store.project_maintenance(name)?.packaging {
-                Some(packaging) => state.store.forge_account(ForgeTokenOwner::Upstream {
-                    project: name,
-                    forge: packaging.upstream_forge,
-                })?,
-                None => None,
-            },
+            accounts: ForgeKind::ALL
+                .into_iter()
+                .map(|forge| {
+                    let owner = ForgeTokenOwner::Upstream {
+                        project: name,
+                        forge,
+                    };
+                    Ok((forge, state.store.forge_account(owner)?))
+                })
+                .collect::<Result<_, StoreError>>()?,
             secrets_available: state.secrets.available(),
             check: None,
         },
@@ -2629,44 +2625,9 @@ fn maintenance_from_form(
     (maintenance, refusal)
 }
 
-/// The sealed bytes of a token row when a check read it, or `None` for a row
-/// that was absent. The save writes only while the row still holds them.
-struct TokenSnapshot {
-    upstream: bool,
-    forge: ForgeKind,
-    sealed: Option<Vec<u8>>,
-}
-
-fn snapshot_token(
-    state: &AppState,
-    project: &str,
-    upstream: bool,
-    forge: ForgeKind,
-) -> Result<TokenSnapshot, StoreError> {
-    let owner = if upstream {
-        ForgeTokenOwner::Upstream { project, forge }
-    } else {
-        ForgeTokenOwner::Project { project, forge }
-    };
-    let (row, header) = owner.row();
-    let sealed = state
-        .store
-        .get_secret(SecretRef {
-            project: &row,
-            server: "",
-            header: &header,
-        })?
-        .map(|(_, sealed)| sealed);
-    Ok(TokenSnapshot {
-        upstream,
-        forge,
-        sealed,
-    })
-}
-
 struct SaveChecks {
     notice: String,
-    snapshots: Vec<TokenSnapshot>,
+    snapshots: Vec<TokenRow>,
     check: Option<pages::UpstreamCheckView>,
 }
 
@@ -2686,33 +2647,25 @@ async fn save_checks(
             RenovateCheck::Refused(problem) => return Ok(Err((problem, None))),
             RenovateCheck::Warned { warning, sealed } => {
                 notice = format!("{notice} {warning}");
-                snapshots.push(TokenSnapshot {
+                snapshots.push(TokenRow {
                     upstream: false,
                     forge: project_forge,
                     sealed: Some(sealed),
                 });
             }
-            RenovateCheck::Passed { sealed } => snapshots.push(TokenSnapshot {
+            RenovateCheck::Passed { sealed } => snapshots.push(TokenRow {
                 upstream: false,
                 forge: project_forge,
                 sealed: Some(sealed),
             }),
         }
     }
-    if let Some(packaging) = &maintenance.packaging {
-        let project_forge = project_forge_kind(record)?;
-        snapshots.push(snapshot_token(
-            state,
-            project,
-            true,
-            packaging.upstream_forge,
-        )?);
-        if packaging.upstream_forge == project_forge && !maintenance.renovate {
-            snapshots.push(snapshot_token(state, project, false, project_forge)?);
-        }
-    }
     let check = match &maintenance.packaging {
-        Some(packaging) => Some(check_upstream(state, project, record, packaging).await),
+        Some(packaging) => {
+            let (view, rows) = check_upstream(state, project, record, packaging).await;
+            snapshots.extend(rows);
+            Some(view)
+        }
         None => None,
     };
     if let Some(report) = &check {
@@ -2879,7 +2832,7 @@ async fn check_upstream(
     name: &str,
     project: &Project,
     packaging: &Packaging,
-) -> pages::UpstreamCheckView {
+) -> (pages::UpstreamCheckView, Vec<TokenRow>) {
     let forge = packaging.upstream_forge;
     let repo = &packaging.upstream_repo;
     let display = forge.display_name();
@@ -2891,10 +2844,16 @@ async fn check_upstream(
     let read = match accounts.upstream(name, project, forge) {
         Ok(read) => read,
         Err(ResolveError::Account(why)) => {
-            return unchecked_upstream(&format!("the credential could not be read: {why}"));
+            return (
+                unchecked_upstream(&format!("the credential could not be read: {why}")),
+                Vec::new(),
+            );
         }
         Err(ResolveError::Store(err)) => {
-            return unchecked_upstream(&format!("the stored tokens could not be read: {err}"));
+            return (
+                unchecked_upstream(&format!("the stored tokens could not be read: {err}")),
+                Vec::new(),
+            );
         }
     };
     let used = match &read.credential {
@@ -2923,9 +2882,14 @@ async fn check_upstream(
             Some(false),
             format!("Checked with {used}: {display} rejected the token. {advice}"),
         ),
-        Err(err) => return unchecked_upstream(&format!("the read with {used} failed: {err}")),
+        Err(err) => {
+            return (
+                unchecked_upstream(&format!("the read with {used} failed: {err}")),
+                read.rows,
+            );
+        }
     };
-    pages::UpstreamCheckView { readable, text }
+    (pages::UpstreamCheckView { readable, text }, read.rows)
 }
 
 fn unchecked_upstream(why: &str) -> pages::UpstreamCheckView {
@@ -2972,7 +2936,7 @@ async fn check_project_upstream(
             Some(maintenance),
         );
     }
-    let report = check_upstream(&state, &project, &record, &packaging).await;
+    let (report, _) = check_upstream(&state, &project, &record, &packaging).await;
     project_page_full(
         &state,
         &headers,
@@ -2985,32 +2949,19 @@ async fn check_project_upstream(
     )
 }
 
-/// The upstream forge a token form acts on: the one chosen on the card, else
-/// the saved one.
-fn token_form_forge(
-    state: &AppState,
-    name: &str,
-    project: &Project,
-    draft: &Maintenance,
-) -> Result<ForgeKind, AppError> {
-    match &draft.packaging {
-        Some(packaging) => Ok(packaging.upstream_forge),
-        None => upstream_forge_of(state, name, project),
-    }
-}
-
 async fn save_upstream_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<TokenForgeQuery>,
     Form(form): Form<UpstreamTokenForm>,
 ) -> Result<Markup, AppError> {
     let project = visible_project(&state, &headers, &name)?;
     let login = user(&headers);
     require_csrf(&state, &login, &form.csrf)?;
+    let kind = token_forge(&query)?;
     let part = pages::PipelinePart::parse(None);
     let (draft, _) = maintenance_from_form(&form.draft(), project.forge.kind());
-    let kind = token_form_forge(&state, &name, &project, &draft)?;
     let redraw = |notice: Option<&str>, problem: Option<&str>| {
         project_page_full(
             &state,
@@ -3029,7 +2980,7 @@ async fn save_upstream_token(
             Some("The master key is missing, so the token was not saved."),
         );
     }
-    let token = form.token.trim();
+    let token = form.token(kind).trim();
     if token.is_empty() {
         return redraw(Some("Saved."), None);
     }
@@ -3089,12 +3040,13 @@ async fn clear_upstream_token_route(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<TokenForgeQuery>,
     Form(form): Form<UpstreamTokenForm>,
 ) -> Result<Markup, AppError> {
     let project = visible_project(&state, &headers, &name)?;
     require_csrf(&state, &user(&headers), &form.csrf)?;
+    let kind = token_forge(&query)?;
     let (draft, _) = maintenance_from_form(&form.draft(), project.forge.kind());
-    let kind = token_form_forge(&state, &name, &project, &draft)?;
     clear_upstream_token(&state, &name, kind)?;
     project_page_full(
         &state,
@@ -3106,17 +3058,6 @@ async fn clear_upstream_token_route(
         Some(draft),
         None,
     )
-}
-
-fn upstream_forge_of(
-    state: &AppState,
-    name: &str,
-    project: &Project,
-) -> Result<ForgeKind, AppError> {
-    Ok(match state.store.project_maintenance(name)?.packaging {
-        Some(packaging) => packaging.upstream_forge,
-        None => project_forge_kind(project)?,
-    })
 }
 
 enum RenovateCheck {
@@ -4006,7 +3947,9 @@ struct ForgeTokenForm {
 #[derive(Deserialize)]
 struct UpstreamTokenForm {
     #[serde(default)]
-    token: String,
+    token_github: String,
+    #[serde(default)]
+    token_salsa: String,
     #[serde(default)]
     csrf: String,
     renovate: Option<String>,
@@ -4025,7 +3968,25 @@ struct UpstreamTokenForm {
     renovate_author: String,
 }
 
+/// The forge a token button names in its `formaction`.
+#[derive(Deserialize)]
+struct TokenForgeQuery {
+    forge: String,
+}
+
+fn token_forge(query: &TokenForgeQuery) -> Result<ForgeKind, AppError> {
+    ForgeKind::parse(&query.forge)
+        .ok_or_else(|| AppError::BadRequest(format!("{:?} is not a forge", query.forge)))
+}
+
 impl UpstreamTokenForm {
+    fn token(&self, forge: ForgeKind) -> &str {
+        match forge {
+            ForgeKind::GitHub => &self.token_github,
+            ForgeKind::Salsa => &self.token_salsa,
+        }
+    }
+
     fn draft(&self) -> MaintenanceForm {
         MaintenanceForm {
             renovate: self.renovate.clone(),

@@ -2826,6 +2826,20 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let ForgeTokenOwner::Upstream { project, forge } = owner {
+            // A project keeps one upstream token, so clearing one forge's
+            // leaves a token stored for the other forge alone.
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT forge FROM project_forge_accounts WHERE project = ?1 AND kind = 'upstream'",
+                    [project],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if stored.is_some_and(|stored| stored != forge.as_str()) {
+                return Ok(());
+            }
+        }
         tx.execute(
             "DELETE FROM secrets WHERE project = ?1 AND server = ?2 AND header = ?3",
             params![at.project, at.server, at.header],
@@ -4705,14 +4719,13 @@ fn read_forge_account(
             params![login, forge.as_str()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         ),
-        ForgeTokenOwner::Project { project, .. } | ForgeTokenOwner::Upstream { project, .. } => {
-            conn.query_row(
-                "SELECT account_login, account_id FROM project_forge_accounts
-                 WHERE project = ?1 AND kind = ?2",
-                params![project, project_token_kind(owner)],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-        }
+        ForgeTokenOwner::Project { project, forge }
+        | ForgeTokenOwner::Upstream { project, forge } => conn.query_row(
+            "SELECT account_login, account_id FROM project_forge_accounts
+                 WHERE project = ?1 AND kind = ?2 AND forge = ?3",
+            params![project, project_token_kind(owner), forge.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ),
     }
     .optional()?;
     Ok(found.map(|(login, id)| ForgeAccount {

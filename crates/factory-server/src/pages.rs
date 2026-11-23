@@ -624,8 +624,9 @@ pub struct UpstreamCheckView {
 
 /// What the packaging upstream's token card and connection check show.
 pub struct UpstreamCard {
-    /// The account the upstream token belongs to, or `None` with no token.
-    pub account: Option<ForgeAccount>,
+    /// The account the upstream token of each forge belongs to, or `None`
+    /// with no token.
+    pub accounts: Vec<(ForgeKind, Option<ForgeAccount>)>,
     pub secrets_available: bool,
     pub check: Option<UpstreamCheckView>,
 }
@@ -1867,44 +1868,56 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
                         p.hint.upstream-check-result.bad[check.readable != Some(true)] role="status" { (check.text) }
                     }
                 }
-                (upstream_token_field(project, packaging.upstream_forge))
+                @for (forge, account) in &project.upstream.accounts {
+                    (upstream_token_field(project, *forge, account.as_ref()))
+                }
             }
             (save_bar("Save maintenance"))
         }
     }
 }
 
-/// The optional token for the upstream on `forge`. It sits in the Maintenance
-/// form, so a save or a clear acts on the upstream forge chosen there, before
-/// the card itself is saved.
-fn upstream_token_field(project: &ProjectSettings, forge: ForgeKind) -> Markup {
+/// The optional token for an upstream on `forge`. Each forge has its own
+/// field, status and buttons, and the buttons name the forge in their
+/// `formaction`, so what a button acts on is what sits beside it however the
+/// upstream forge select is set. They sit in the Maintenance form, so the card
+/// can hold a token before it is saved.
+fn upstream_token_field(
+    project: &ProjectSettings,
+    forge: ForgeKind,
+    account: Option<&ForgeAccount>,
+) -> Markup {
     let base = format!(
         "/settings/projects/{}/upstream-token",
         crate::web::query_escape(&project.name)
     );
-    let card = &project.upstream;
-    let secrets = card.secrets_available;
+    let secrets = project.upstream.secrets_available;
+    let id = format!("upstream-token-{}", forge.as_str());
     html! {
-        div.field #upstream-token {
-            label for="upstream-token-field" { "Upstream token" }
-            input #upstream-token-field.wide type="password" name="token"
+        div.field.upstream-token id=(id) {
+            label for={ (id) "-field" } { (forge.display_name()) " upstream token" }
+            input id={ (id) "-field" } .wide type="password" name={ "token_" (forge.as_str()) }
                 autocomplete="off" spellcheck="false"
-                placeholder=(if card.account.is_some() { "set" } else { "not set" })
+                placeholder=(if account.is_some() { "set" } else { "not set" })
                 disabled[!secrets];
             p.hint {
-                @if let Some(account) = &card.account {
+                @if let Some(account) = account {
                     "A " (forge.display_name()) " token is stored. It belongs to the account " strong.forge-account { (account.login) } ". "
                 } @else {
                     "No " (forge.display_name()) " token is stored. "
                 }
-                "Optional. Most upstreams are public and are read with no token. Save a token whose account can read the upstream repository when it is private, or to lift the rate limit on unauthenticated reads. \
+                "Optional. It reads an upstream on " (forge.display_name()) ". A project keeps one upstream token, so saving one replaces a token stored for the other forge. Most upstreams are public and are read with no token. Save a token whose account can read the upstream repository when it is private, or to lift the rate limit on unauthenticated reads. \
                  Stored encrypted and never shown. An empty field keeps the stored token."
             }
             @if !secrets {
                 p.hint.bad { "The master key is missing, so a token cannot be saved here. Clear still works." }
             }
-            button type="submit" formnovalidate disabled[!secrets] formaction=(base) { "Save upstream token" }
-            button.danger type="submit" formnovalidate formaction={ (base) "/clear" } { "Clear upstream token" }
+            button type="submit" formnovalidate disabled[!secrets] formaction={ (base) "?forge=" (forge.as_str()) } {
+                "Save " (forge.display_name()) " upstream token"
+            }
+            button.danger type="submit" formnovalidate formaction={ (base) "/clear?forge=" (forge.as_str()) } {
+                "Clear " (forge.display_name()) " upstream token"
+            }
         }
     }
 }

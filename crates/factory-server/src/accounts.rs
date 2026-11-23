@@ -201,6 +201,18 @@ pub struct UpstreamRead {
     pub account: Account,
     pub owner: Owner,
     pub credential: UpstreamCredential,
+    /// The token rows this read consulted and what each held: the sealed
+    /// bytes it used, or `None` for a row it found absent. A write that
+    /// relies on the read stays valid only while the rows still match.
+    pub rows: Vec<TokenRow>,
+}
+
+/// A token row a read consulted and the sealed bytes it held.
+#[derive(Debug, Clone)]
+pub struct TokenRow {
+    pub upstream: bool,
+    pub forge: ForgeKind,
+    pub sealed: Option<Vec<u8>>,
 }
 
 /// Resolves the account of an operation when it starts, so a change to a
@@ -308,18 +320,26 @@ impl Accounts {
             project: project_name,
             forge: upstream,
         };
+        let mut rows = Vec::new();
+        let upstream_row = |sealed| TokenRow {
+            upstream: true,
+            forge: upstream,
+            sealed,
+        };
         if self.store.forge_account(own)?.is_some() {
             let whose = Owner::Upstream {
                 project: project_name.to_owned(),
             };
-            if let Some((token, found)) = self.read(own, &whose)? {
+            if let Some((token, found, sealed)) = self.read_sealed(own, &whose)? {
                 return Ok(UpstreamRead {
                     account: forge.account(token, &found),
                     owner: whose,
                     credential: UpstreamCredential::Upstream(found),
+                    rows: vec![upstream_row(Some(sealed))],
                 });
             }
         }
+        rows.push(upstream_row(None));
         let kind = project
             .forge
             .kind()
@@ -329,18 +349,26 @@ impl Accounts {
                 project: project_name,
                 forge: kind,
             };
+            let project_row = |sealed| TokenRow {
+                upstream: false,
+                forge: kind,
+                sealed,
+            };
             if self.store.forge_account(owner)?.is_some() {
                 let whose = Owner::Project {
                     project: project_name.to_owned(),
                 };
-                if let Some((token, found)) = self.read(owner, &whose)? {
+                if let Some((token, found, sealed)) = self.read_sealed(owner, &whose)? {
+                    rows.push(project_row(Some(sealed)));
                     return Ok(UpstreamRead {
                         account: forge.account(token, &found),
                         owner: whose,
                         credential: UpstreamCredential::Project(found),
+                        rows,
                     });
                 }
             }
+            rows.push(project_row(None));
         }
         Ok(UpstreamRead {
             account: Account {
@@ -353,6 +381,7 @@ impl Accounts {
                 project: project_name.to_owned(),
             },
             credential: UpstreamCredential::None,
+            rows,
         })
     }
 
@@ -425,7 +454,17 @@ impl Accounts {
         owner: ForgeTokenOwner<'_>,
         whose: &Owner,
     ) -> Result<Option<(String, factory_runner::ForgeAccount)>, ResolveError> {
-        match self.secrets.forge_token_with_account(owner) {
+        Ok(self
+            .read_sealed(owner, whose)?
+            .map(|(token, account, _)| (token, account)))
+    }
+
+    fn read_sealed(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        whose: &Owner,
+    ) -> Result<Option<(String, factory_runner::ForgeAccount, Vec<u8>)>, ResolveError> {
+        match self.secrets.forge_token_sealed(owner) {
             Ok(found) => Ok(found),
             Err(SecretError::Store(err)) => Err(ResolveError::Store(err)),
             Err(SecretError::Unavailable) => Err(ResolveError::Account(
