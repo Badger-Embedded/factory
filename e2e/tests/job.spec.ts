@@ -193,6 +193,72 @@ test('a state change on the server appears without a reload', async ({ page, fac
   expect(await page.evaluate(() => (window as unknown as { loadedOnce?: boolean }).loadedOnce)).toBe(true);
 });
 
+test('a waiting job lists its prerequisite and shows it cancelled without a reload', async ({
+  page,
+  factory,
+  project,
+}) => {
+  const first = newJob(factory, project, 'requested');
+  const id = factory.fixture(
+    'job',
+    '--project',
+    project,
+    '--stage',
+    'requested',
+    '--request',
+    'Waits',
+    '--after',
+    first,
+  );
+  await page.goto(`/jobs/${id}`);
+  await expect(status(page).locator('.badge')).toHaveText('waiting');
+  await expect(status(page).getByRole('link', { name: `#${first}` })).toHaveAttribute('href', `/jobs/${first}`);
+  await expect(status(page)).toContainText('A requested job');
+  await expect(status(page)).not.toContainText('Waiting for a free worker.');
+  await page.evaluate(() => {
+    (window as unknown as { loadedOnce: boolean }).loadedOnce = true;
+  });
+
+  factory.fixture('apply', '--job', first, '--event', 'cancel');
+
+  await expect(status(page).locator('.badge')).toHaveText('blocked');
+  await expect(status(page)).toContainText(`will not start until #${first} merges or is removed from the list`);
+  await expect(status(page)).toContainText('cancelled');
+  await expect(status(page).getByRole('link', { name: 'Edit the list' })).toHaveAttribute('href', `/jobs/${id}/edit`);
+  expect(await page.evaluate(() => (window as unknown as { loadedOnce?: boolean }).loadedOnce)).toBe(true);
+});
+
+test('the prerequisite links stay on the page when the waiting job starts', async ({ page, factory, project }) => {
+  const first = newJob(factory, project, 'requested');
+  const id = factory.fixture(
+    'job',
+    '--project',
+    project,
+    '--stage',
+    'requested',
+    '--request',
+    'Waits',
+    '--after',
+    first,
+  );
+  await page.goto(`/jobs/${id}`);
+  await expect(status(page).locator('.badge')).toHaveText('waiting');
+  await expect(page.locator('#job-queued-after')).toBeEmpty();
+  await page.evaluate(() => {
+    (window as unknown as { loadedOnce: boolean }).loadedOnce = true;
+  });
+
+  factory.fixture('apply', '--job', id, '--event', 'start');
+
+  await expect(status(page).locator('.badge')).toHaveText('agent working');
+  await expect(page.locator('#job-queued-after')).toContainText('Queued after');
+  await expect(page.locator('#job-queued-after').getByRole('link', { name: `#${first}` })).toHaveAttribute(
+    'href',
+    `/jobs/${first}`,
+  );
+  expect(await page.evaluate(() => (window as unknown as { loadedOnce?: boolean }).loadedOnce)).toBe(true);
+});
+
 test('a draft survives a state change while its field has focus', async ({ page, factory, project }) => {
   const id = newJob(factory, project, 'spec');
   await page.goto(`/jobs/${id}`);

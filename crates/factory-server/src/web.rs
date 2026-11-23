@@ -31,8 +31,8 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectGuard,
-    ProjectTotals, Store, StoreError,
+    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, PrerequisiteView,
+    ProjectGuard, ProjectTotals, Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -971,6 +971,7 @@ struct JobData {
     efforts: StageEfforts,
     auto_merge: bool,
     gap_links: Vec<i64>,
+    prerequisites: Vec<PrerequisiteView>,
 }
 
 fn keep_session_settings(
@@ -1032,6 +1033,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         .store
         .project_auto_merge(&row.project, default_auto_merge)?;
     let gap_links = gap_links(&state.store, &row)?;
+    let prerequisites = state.store.prerequisites(id)?;
     Ok(JobData {
         row,
         project,
@@ -1043,6 +1045,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         efforts,
         auto_merge,
         gap_links,
+        prerequisites,
     })
 }
 
@@ -1084,6 +1087,7 @@ async fn show_job(
         &data.efforts,
         data.auto_merge,
         &data.gap_links,
+        &data.prerequisites,
     ))
 }
 
@@ -1108,6 +1112,7 @@ async fn job_fragment(
         &data.efforts,
         data.auto_merge,
         &data.gap_links,
+        &data.prerequisites,
     ))
 }
 

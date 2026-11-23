@@ -1473,6 +1473,54 @@ impl Store {
         Self::waits_in(&self.conn(), None)
     }
 
+    /// The prerequisites of job `id` in the order they were chosen, each
+    /// with its current state.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    pub fn prerequisites(&self, id: i64) -> Result<Vec<PrerequisiteView>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT p.prerequisite, p.gone, p.title, j.job
+             FROM job_prerequisites p
+             LEFT JOIN jobs j ON p.gone IS NULL AND j.id = p.prerequisite
+             WHERE p.job_id = ?1
+             ORDER BY p.id",
+        )?;
+        let rows = stmt.query_map([id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut views = Vec::new();
+        for row in rows {
+            let (prerequisite, gone, title, job) = row?;
+            let job = job
+                .map(|json| serde_json::from_str::<Job>(&json))
+                .transpose()?;
+            let state = match (gone.as_deref(), &job) {
+                (Some("merged"), _) => PrerequisiteState::Met,
+                (_, Some(job)) => job.prerequisite_state(),
+                (_, None) => PrerequisiteState::Blocked,
+            };
+            let title = match &job {
+                Some(job) => job.request().lines().next().unwrap_or_default().to_owned(),
+                None => title.unwrap_or_default(),
+            };
+            views.push(PrerequisiteView {
+                id: prerequisite,
+                title,
+                state,
+                job,
+            });
+        }
+        Ok(views)
+    }
+
     fn waits_in(conn: &Connection, only: Option<i64>) -> Result<HashMap<i64, Wait>, StoreError> {
         let mut stmt = conn.prepare(
             "SELECT p.job_id, p.prerequisite, p.gone, j.job
@@ -3980,6 +4028,18 @@ impl Store {
             .ok_or(StoreError::NotFound(id))?;
         parse_row(raw)
     }
+}
+
+/// A prerequisite of a job as the job page shows it.
+#[derive(Debug, Clone)]
+pub struct PrerequisiteView {
+    pub id: i64,
+    /// The first line of the request, as stored when the job was deleted.
+    pub title: String,
+    pub state: PrerequisiteState,
+    /// The prerequisite job, or `None` when it was deleted. A deleted one is
+    /// met when it had merged and blocked otherwise.
+    pub job: Option<Job>,
 }
 
 type PrerequisiteEntry = (i64, PrerequisiteState, String);
