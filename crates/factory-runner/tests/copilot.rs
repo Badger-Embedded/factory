@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Agent, AgentResult, Event, PrDescription};
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, McpServerEntry, RunResult, SessionRun, WorkerConfig,
-    WorkerRun, backend, run,
+    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, McpUnavailable, RunResult,
+    SessionRun, WorkerConfig, WorkerRun, backend, run,
 };
 
 const SESSION: &str = "d3c2f38c-6c9e-4528-9666-a9c3d7aff405";
@@ -156,8 +156,10 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     let dir = tempfile::tempdir().unwrap();
     let mut run = copilot_run(dir.path(), SessionRun::Resume(SESSION.into()));
     run.mcp = Some(McpConfig {
-        proxy_url: "http://factory:8081".into(),
-        token: "d34db33f-run-token".into(),
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "d34db33f-run-token".into(),
+        }),
         servers: ["context7", "docs"]
             .map(|name| McpServerEntry::Remote { name: name.into() })
             .to_vec(),
@@ -193,14 +195,134 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     );
 }
 
+fn stdio_entry() -> McpServerEntry {
+    McpServerEntry::Stdio {
+        name: "pw".into(),
+        command: "playwright-mcp".into(),
+        args: ["--no-sandbox", "a $b"].map(String::from).to_vec(),
+    }
+}
+
+#[test]
+fn a_stdio_server_becomes_a_local_entry_with_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    let plain = copilot_args(&run);
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    let args = copilot_args(&run);
+
+    assert_eq!(
+        value_after(&args, "--additional-mcp-config"),
+        "@/copilot/factory-mcp.json"
+    );
+    let config = written_config(&run, dir.path());
+    assert_eq!(
+        config["mcpServers"],
+        serde_json::json!({ "pw": {
+            "type": "local",
+            "command": "playwright-mcp",
+            "args": ["--no-sandbox", "a $b"],
+            "tools": ["*"],
+        } })
+    );
+    assert!(!env_names(&args).contains(&"FACTORY_MCP_TOKEN"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg.contains("factory:8081")));
+    assert_eq!(env_names(&args), env_names(&plain));
+}
+
+fn written_config(run: &WorkerRun, dir: &Path) -> serde_json::Value {
+    backend(Agent::Copilot).unwrap().prepare(run).unwrap();
+    serde_json::from_str(&fs::read_to_string(dir.join("copilot/factory-mcp.json")).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn stdio_arguments_too_big_for_one_argv_element_go_through_the_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    let big: Vec<String> = (0..64).map(|i| format!("{i:x<4096}")).collect();
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![McpServerEntry::Stdio {
+            name: "pw".into(),
+            command: "playwright-mcp".into(),
+            args: big.clone(),
+        }],
+    });
+    // Linux rejects one argv element of 128 KiB or more.
+    assert!(copilot_args(&run).iter().all(|arg| arg.len() < 128 * 1024));
+    let config = written_config(&run, dir.path());
+    assert_eq!(config["mcpServers"]["pw"]["args"], serde_json::json!(big));
+}
+
+#[test]
+fn a_remote_and_a_stdio_server_share_a_copilot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    run.mcp = Some(McpConfig {
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "tok".into(),
+        }),
+        servers: vec![
+            McpServerEntry::Remote {
+                name: "context7".into(),
+            },
+            stdio_entry(),
+        ],
+    });
+    let args = copilot_args(&run);
+    let config = written_config(&run, dir.path());
+    assert_eq!(config["mcpServers"]["context7"]["type"], "http");
+    assert_eq!(config["mcpServers"]["pw"]["type"], "local");
+    assert!(env_names(&args).contains(&"FACTORY_MCP_TOKEN"));
+}
+
+#[test]
+fn a_stdio_tool_start_logs_the_namespaced_tool_name() {
+    let line = r#"{"type":"tool.execution_start","data":{"toolName":"pw-browser_navigate","mcpServerName":"pw","mcpToolName":"browser_navigate","arguments":{},"toolCallId":"t1"}}"#;
+    assert_eq!(
+        parse(Expect::Spec, line),
+        [AgentItem::Log(LogLine::Tool {
+            name: "mcp__pw__browser_navigate".into(),
+            summary: String::new()
+        })]
+    );
+}
+
+#[test]
+fn a_failed_server_status_is_reported_unavailable_even_though_it_is_ephemeral() {
+    let changed = r#"{"type":"session.mcp_server_status_changed","ephemeral":true,"data":{"serverName":"pw","status":"failed","error":"spawn ENOENT"}}"#;
+    let connected = r#"{"type":"session.mcp_server_status_changed","ephemeral":true,"data":{"serverName":"ok","status":"connected"}}"#;
+    let loaded = r#"{"type":"session.mcp_servers_loaded","ephemeral":true,"data":{"servers":[{"name":"ok","status":"connected"},{"name":"pw","status":"failed","error":"spawn ENOENT"}]}}"#;
+    let expected = AgentItem::Unavailable(McpUnavailable {
+        server: "pw".into(),
+        reason: "the agent reported it as failed".into(),
+    });
+    assert_eq!(
+        parse(Expect::Spec, changed),
+        std::slice::from_ref(&expected)
+    );
+    assert_eq!(parse(Expect::Spec, connected), []);
+    assert_eq!(parse(Expect::Spec, loaded), [expected]);
+}
+
 #[test]
 fn a_run_with_no_active_server_passes_no_mcp_config_or_token() {
     let dir = tempfile::tempdir().unwrap();
     for mcp in [None, Some(Vec::new())] {
         let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
         run.mcp = mcp.map(|servers| McpConfig {
-            proxy_url: "http://factory:8081".into(),
-            token: "unused".into(),
+            proxy: Some(McpProxy {
+                url: "http://factory:8081".into(),
+                token: "unused".into(),
+            }),
             servers,
         });
         let args = copilot_args(&run);
@@ -757,5 +879,28 @@ async fn a_checkpoint_is_logged_when_the_run_dies_before_its_result_line() {
                 .into()
         )),
         "{log:?}"
+    );
+}
+
+#[test]
+fn a_symlink_in_the_copilot_config_dir_is_replaced_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
+    let target = dir.path().join("outside");
+    fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("copilot/factory-mcp.json")).unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    backend(Agent::Copilot).unwrap().prepare(&run).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    let written = dir.path().join("copilot/factory-mcp.json");
+    assert!(!fs::symlink_metadata(&written).unwrap().is_symlink());
+    assert!(
+        fs::read_to_string(&written)
+            .unwrap()
+            .contains("playwright-mcp")
     );
 }

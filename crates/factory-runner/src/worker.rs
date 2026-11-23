@@ -54,23 +54,32 @@ impl Default for WorkerConfig {
     }
 }
 
-/// The MCP servers active for one run, and how the worker reaches them. The
-/// agent passes each as an `http` entry in its MCP config, pointed at the proxy
-/// with the per-run token, so a server credential never enters the worker: the
-/// proxy swaps the token for the project's stored headers. The scheduler builds
-/// this only when at least one server is active, so a run with none passes no
-/// MCP config.
+/// The MCP servers active for one run, and how the worker reaches them. A
+/// remote server is an `http` entry in the agent's MCP config, pointed at the
+/// proxy with the per-run token, so a server credential never enters the worker:
+/// the proxy swaps the token for the project's stored headers. A stdio server is
+/// a command the agent starts itself inside the worker, so it passes through no
+/// proxy and carries no token. The scheduler builds this only when at least one
+/// server is active, so a run with none passes no MCP config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfig {
+    /// How the worker reaches the proxy. Set only when a remote server is
+    /// active, so a run with only stdio servers has no token and no URL.
+    pub proxy: Option<McpProxy>,
+    /// The active servers. Each becomes one entry in the agent's MCP config.
+    /// Never empty when this is set.
+    pub servers: Vec<McpServerEntry>,
+}
+
+/// The proxy a run's remote servers go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpProxy {
     /// The proxy's base URL the worker reaches, such as `http://factory:8081`.
-    pub proxy_url: String,
+    pub url: String,
     /// The per-run bearer token the proxy checks. It is the entry's only
     /// header, scoped to this job and these servers, and revoked when the run
     /// ends.
     pub token: String,
-    /// The active servers. Each becomes one entry in the agent's MCP config.
-    /// Never empty when this is set.
-    pub servers: Vec<McpServerEntry>,
 }
 
 impl McpConfig {
@@ -79,14 +88,30 @@ impl McpConfig {
     pub fn names(&self) -> Vec<&str> {
         self.servers.iter().map(McpServerEntry::name).collect()
     }
+
+    /// Whether any active server is a stdio server.
+    #[must_use]
+    pub fn has_stdio(&self) -> bool {
+        self.servers
+            .iter()
+            .any(|server| matches!(server, McpServerEntry::Stdio { .. }))
+    }
 }
 
 /// One active MCP server in a run's config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerEntry {
     /// A remote server behind the proxy. It becomes one `http` entry keyed by
-    /// the name, pointing at `<proxy_url>/mcp/<name>`.
+    /// the name, pointing at `<proxy url>/mcp/<name>`.
     Remote { name: String },
+    /// A command the agent starts as a child process in the worker and talks to
+    /// over stdin and stdout. `args` is the registry's base arguments followed
+    /// by the project's extra arguments.
+    Stdio {
+        name: String,
+        command: String,
+        args: Vec<String>,
+    },
 }
 
 impl McpServerEntry {
@@ -94,10 +119,14 @@ impl McpServerEntry {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Remote { name } => name,
+            Self::Remote { name } | Self::Stdio { name, .. } => name,
         }
     }
 }
+
+/// How long the agent waits for a stdio server to start, in seconds. A first
+/// start of a package runner such as `npx` downloads the package.
+pub const STDIO_STARTUP_TIMEOUT_SECS: u64 = 120;
 
 /// Whether a run starts the session or continues it.
 #[derive(Debug, Clone, PartialEq, Eq)]

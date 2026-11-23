@@ -21,16 +21,19 @@ use std::path::Path;
 use factory_core::Agent;
 use serde_json::Value;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult};
+use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, write_replacing};
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
-use crate::worker::{AGENTS_DIR, McpConfig, McpServerEntry, SessionRun, WorkerConfig, WorkerRun};
+use crate::worker::{
+    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, SessionRun, WorkerConfig, WorkerRun,
+};
 
 /// The Copilot config directory inside the worker, mounted from the job's
 /// `copilot` directory on the host and passed to Copilot as `COPILOT_HOME`. It
 /// keeps `session-state/<id>/` for a resumed run, next to the login the device
 /// flow stores.
 const CONFIG_DIR: &str = "/copilot";
+const MCP_CONFIG_FILE: &str = "factory-mcp.json";
 
 /// The environment variable Copilot reads its GitHub token from. It is first in
 /// the CLI's lookup order, so the factory's stored login wins over any token in
@@ -94,6 +97,13 @@ impl AgentBackend for CopilotAgent {
         "copilot"
     }
 
+    fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
+        match run.mcp.as_ref().filter(|mcp| mcp.has_stdio()) {
+            Some(mcp) => write_replacing(&run.config_dir, MCP_CONFIG_FILE, &mcp_config(mcp)),
+            None => Ok(()),
+        }
+    }
+
     fn session_for(&self, host_config_dir: &Path, id: &str) -> SessionRun {
         if host_config_dir.join("session-state").join(id).is_dir() {
             SessionRun::Resume(id.to_owned())
@@ -103,8 +113,13 @@ impl AgentBackend for CopilotAgent {
     }
 
     fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
-        match run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
-            Some(mcp) => vec![(MCP_TOKEN_ENV, mcp.token.as_str())],
+        match run
+            .mcp
+            .as_ref()
+            .filter(|mcp| !mcp.servers.is_empty())
+            .and_then(|mcp| mcp.proxy.as_ref())
+        {
+            Some(proxy) => vec![(MCP_TOKEN_ENV, proxy.token.as_str())],
             None => Vec::new(),
         }
     }
@@ -146,7 +161,11 @@ impl AgentBackend for CopilotAgent {
         );
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             copilot.push("--additional-mcp-config".into());
-            copilot.push(mcp_config(mcp));
+            if mcp.has_stdio() {
+                copilot.push(format!("@{CONFIG_DIR}/{MCP_CONFIG_FILE}"));
+            } else {
+                copilot.push(mcp_config(mcp));
+            }
         }
         // The image bakes the review skills at `/factory-agents` whether or not
         // the factory mounts its own copy there, so the flag always resolves and
@@ -165,24 +184,42 @@ impl AgentBackend for CopilotAgent {
     }
 }
 
-/// The JSON for `copilot --additional-mcp-config`: one `http` entry per active
-/// server, each pointing at the proxy with `Authorization: Bearer ${FACTORY_MCP_TOKEN}`
-/// and `"tools": ["*"]`. No stored credential appears here; the CLI expands the
-/// variable and the proxy swaps the run token for the project's headers.
+/// The JSON for `copilot --additional-mcp-config`: one entry per active server,
+/// each with `"tools": ["*"]`. A remote server is an `http` entry pointing at the
+/// proxy with `Authorization: Bearer ${FACTORY_MCP_TOKEN}`. No stored credential
+/// appears here; the CLI expands the variable and the proxy swaps the run token
+/// for the project's headers. A stdio server is a `local` entry with its command
+/// and arguments. Copilot has no startup timeout setting, so it keeps its own.
 fn mcp_config(mcp: &McpConfig) -> String {
     let servers: serde_json::Map<String, Value> = mcp
         .servers
         .iter()
-        .map(|server| match server {
-            McpServerEntry::Remote { name } => (
+        .filter_map(|server| match server {
+            McpServerEntry::Remote { name } => {
+                let proxy = mcp.proxy.as_ref()?;
+                Some((
+                    name.clone(),
+                    serde_json::json!({
+                        "type": "http",
+                        "url": format!("{}/mcp/{name}", proxy.url),
+                        "headers": { "Authorization": format!("Bearer ${{{MCP_TOKEN_ENV}}}") },
+                        "tools": ["*"],
+                    }),
+                ))
+            }
+            McpServerEntry::Stdio {
+                name,
+                command,
+                args,
+            } => Some((
                 name.clone(),
                 serde_json::json!({
-                    "type": "http",
-                    "url": format!("{}/mcp/{name}", mcp.proxy_url),
-                    "headers": { "Authorization": format!("Bearer ${{{MCP_TOKEN_ENV}}}") },
+                    "type": "local",
+                    "command": command,
+                    "args": args,
                     "tools": ["*"],
                 }),
-            ),
+            )),
         })
         .collect();
     serde_json::json!({ "mcpServers": servers }).to_string()
@@ -199,10 +236,16 @@ fn parse_copilot(expect: Expect, line: &str) -> Vec<AgentItem> {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return vec![AgentItem::Log(LogLine::Other(line.to_owned()))];
     };
+    let data = value.get("data");
+    // These two are ephemeral, so they come before the ephemeral check.
+    match value.get("type").and_then(Value::as_str) {
+        Some("session.mcp_server_status_changed") => return mcp_status_changed(data),
+        Some("session.mcp_servers_loaded") => return mcp_servers_loaded(data),
+        _ => {}
+    }
     if value.get("ephemeral").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
     }
-    let data = value.get("data");
     match value.get("type").and_then(Value::as_str) {
         Some("session.start") => string_at(data, "sessionId")
             .map(|id| AgentItem::Session(id.to_owned()))
@@ -220,6 +263,36 @@ fn parse_copilot(expect: Expect, line: &str) -> Vec<AgentItem> {
         Some("result") => parse_result(expect, &value),
         _ => Vec::new(),
     }
+}
+
+/// A server the agent reports as failed, such as a stdio command that would not
+/// start. The reason names the status only, since the CLI's error text can quote
+/// the command's output.
+fn mcp_unavailable(server: &str, status: &str) -> AgentItem {
+    AgentItem::Unavailable(McpUnavailable {
+        server: server.to_owned(),
+        reason: format!("the agent reported it as {status}"),
+    })
+}
+
+fn mcp_status_changed(data: Option<&Value>) -> Vec<AgentItem> {
+    match (string_at(data, "serverName"), string_at(data, "status")) {
+        (Some(server), Some("failed")) => vec![mcp_unavailable(server, "failed")],
+        _ => Vec::new(),
+    }
+}
+
+fn mcp_servers_loaded(data: Option<&Value>) -> Vec<AgentItem> {
+    data.and_then(|data| data.get("servers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|server| {
+            let status = server.get("status").and_then(Value::as_str)?;
+            let name = server.get("name").and_then(Value::as_str)?;
+            (status == "failed").then(|| mcp_unavailable(name, status))
+        })
+        .collect()
 }
 
 fn parse_message(expect: Expect, data: Option<&Value>) -> Vec<AgentItem> {

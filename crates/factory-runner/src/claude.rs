@@ -12,16 +12,18 @@ use std::path::Path;
 
 use factory_core::Agent;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult};
+use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, write_replacing};
 use crate::outcome::{Expect, event_from_result};
 use crate::stream::{StreamItem, parse_line};
 use crate::worker::{
-    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, SessionRun, WorkerConfig, WorkerRun,
+    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, STDIO_STARTUP_TIMEOUT_SECS, SessionRun,
+    WorkerConfig, WorkerRun,
 };
 
 /// The Claude Code config directory inside the worker, mounted from the job's
 /// `claude` directory on the host. It keeps the session files `--resume` reads.
 const CONFIG_DIR: &str = "/claude";
+const MCP_CONFIG_FILE: &str = "factory-mcp.json";
 
 /// Settings for every Claude run. Claude Code adds a `Co-Authored-By` trailer
 /// to commits and a footer to pull request descriptions unless `attribution`
@@ -66,6 +68,13 @@ impl AgentBackend for ClaudeAgent {
         "claude"
     }
 
+    fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
+        match run.mcp.as_ref().filter(|mcp| mcp.has_stdio()) {
+            Some(mcp) => write_replacing(&run.config_dir, MCP_CONFIG_FILE, &mcp_config(mcp)),
+            None => Ok(()),
+        }
+    }
+
     fn session_for(&self, host_config_dir: &Path, id: &str) -> SessionRun {
         let transcript = format!("{id}.jsonl");
         if contains_file(&host_config_dir.join("projects"), &transcript) {
@@ -92,7 +101,7 @@ impl AgentBackend for ClaudeAgent {
             "--json-schema".into(),
             run.expect.schema().to_string(),
             "--settings".into(),
-            AGENT_SETTINGS.into(),
+            settings(run.mcp.as_ref()),
             session_flag.into(),
             session_id.clone(),
         ];
@@ -113,10 +122,15 @@ impl AgentBackend for ClaudeAgent {
         );
         // One `http` entry per active MCP server, pointed at the proxy with the
         // run token. A run with no active server adds nothing, so its arguments
-        // match a run from before MCP.
+        // match a run from before MCP. A run with a stdio server reads the config
+        // from a file, since its arguments can outgrow one argv element.
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             claude.push("--mcp-config".into());
-            claude.push(mcp_config(mcp));
+            if mcp.has_stdio() {
+                claude.push(format!("{CONFIG_DIR}/{MCP_CONFIG_FILE}"));
+            } else {
+                claude.push(mcp_config(mcp));
+            }
         }
         claude.into_iter().map(OsString::from).collect()
     }
@@ -150,22 +164,51 @@ impl AgentBackend for ClaudeAgent {
     }
 }
 
-/// The JSON for `claude --mcp-config`: one `http` entry per active server, each
-/// pointing at the proxy and carrying `Authorization: Bearer <token>` as its
-/// only header. No stored credential appears here; the proxy adds it.
+/// The JSON for `claude --settings`. A run with a stdio server raises Claude's
+/// MCP startup timeout, `MCP_TIMEOUT`, through the settings `env` key, because a
+/// first start of a package runner downloads the package and the default is 30
+/// seconds. Settings carry it, so the container gets no `--env` for it.
+fn settings(mcp: Option<&McpConfig>) -> String {
+    if mcp.is_some_and(McpConfig::has_stdio) {
+        serde_json::json!({
+            "attribution": { "commit": "", "pr": "", "sessionUrl": false },
+            "env": { "MCP_TIMEOUT": (STDIO_STARTUP_TIMEOUT_SECS * 1000).to_string() },
+        })
+        .to_string()
+    } else {
+        AGENT_SETTINGS.to_owned()
+    }
+}
+
+/// The JSON for `claude --mcp-config`: one entry per active server. A remote
+/// server is an `http` entry pointing at the proxy and carrying
+/// `Authorization: Bearer <token>` as its only header; no stored credential
+/// appears here, the proxy adds it. A stdio server is a `stdio` entry with its
+/// command and arguments.
 fn mcp_config(mcp: &McpConfig) -> String {
     let servers: serde_json::Map<String, serde_json::Value> = mcp
         .servers
         .iter()
-        .map(|server| match server {
-            McpServerEntry::Remote { name } => (
+        .filter_map(|server| match server {
+            McpServerEntry::Remote { name } => {
+                let proxy = mcp.proxy.as_ref()?;
+                Some((
+                    name.clone(),
+                    serde_json::json!({
+                        "type": "http",
+                        "url": format!("{}/mcp/{name}", proxy.url),
+                        "headers": { "Authorization": format!("Bearer {}", proxy.token) },
+                    }),
+                ))
+            }
+            McpServerEntry::Stdio {
+                name,
+                command,
+                args,
+            } => Some((
                 name.clone(),
-                serde_json::json!({
-                    "type": "http",
-                    "url": format!("{}/mcp/{name}", mcp.proxy_url),
-                    "headers": { "Authorization": format!("Bearer {}", mcp.token) },
-                }),
-            ),
+                serde_json::json!({ "type": "stdio", "command": command, "args": args }),
+            )),
         })
         .collect();
     serde_json::json!({ "mcpServers": servers }).to_string()

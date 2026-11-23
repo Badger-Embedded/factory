@@ -9,17 +9,17 @@ use factory_core::{
     ReviewState, Stage, Turn, Wait,
 };
 use factory_runner::{
-    Account, Expect, ForgeAccount, ForgeKind, Git, GitHub, HeadCommit, LogLine, McpUnavailable,
-    NOT_PERMITTED, Observation, RenovatePr, Rerun, RunReport, TokenUsage, WorkerConfig,
-    is_renovate_login,
+    Account, Expect, ForgeAccount, ForgeKind, Git, GitHub, HeadCommit, LogLine, McpServerEntry,
+    McpUnavailable, NOT_PERMITTED, Observation, RenovatePr, Rerun, RunReport, TokenUsage,
+    WorkerConfig, is_renovate_login,
 };
 use factory_server::{
     AccountSource, Accounts, AgentRegistry, AgentRequest, ChecksRequest, ClaudeToken, CodexLogin,
     CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GhRepos, JobFile,
-    LocalSecrets, LogSink, MASTER_KEY_LEN, McpProjectSettings, McpRuntime, McpStages, McpWarnings,
-    Owner, PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project, ProjectForge, Projects,
-    PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, RunTokens,
-    Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
+    LocalSecrets, LogSink, MASTER_KEY_LEN, McpProjectSettings, McpRuntime, McpStages, McpTransport,
+    McpWarnings, Owner, PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project, ProjectForge,
+    Projects, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest,
+    RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
     StageModels, Store, SummaryRequest, UnavailableSecrets, UpstreamCredential, WatchReport,
     WatchRequest, WorkerSlots, credential_failure, format_cost, ready_action, watch_only_event,
 };
@@ -46,6 +46,7 @@ struct FakeExecutor {
     token_usages: Mutex<VecDeque<TokenUsage>>,
     /// The MCP servers each run reports as not connected in its init line.
     unavailable: Mutex<VecDeque<Vec<McpUnavailable>>>,
+    tool_calls: Mutex<VecDeque<Vec<String>>>,
     /// The agent-reported session ids each run streams back, such as Codex's
     /// thread id, in run order. A run with none reports no id, as Claude does.
     sessions: Mutex<VecDeque<String>>,
@@ -116,6 +117,7 @@ impl FakeExecutor {
             costs: Mutex::new(VecDeque::new()),
             token_usages: Mutex::new(VecDeque::new()),
             unavailable: Mutex::new(VecDeque::new()),
+            tool_calls: Mutex::new(VecDeque::new()),
             sessions: Mutex::new(VecDeque::new()),
             stopped: Mutex::new(Vec::new()),
             stop_gate: Semaphore::new(Semaphore::MAX_PERMITS),
@@ -171,6 +173,15 @@ impl FakeExecutor {
         self.unavailable.lock().unwrap().push_back(servers);
     }
 
+    /// Makes the next run log a tool call for each of `names`, the way the
+    /// agent's output does.
+    fn report_tool_calls(&self, names: &[&str]) {
+        self.tool_calls
+            .lock()
+            .unwrap()
+            .push_back(names.iter().map(|name| (*name).to_owned()).collect());
+    }
+
     /// Makes the next run stream back `id` as the agent's own session id, the
     /// way a Codex run reports its thread id on `thread.started`.
     fn report_session(&self, id: &str) {
@@ -198,6 +209,13 @@ impl Executor for FakeExecutor {
             session(id);
         }
         log(LogLine::Text("Reading the repository.".into()));
+        let tools = self.tool_calls.lock().unwrap().pop_front();
+        for name in tools.into_iter().flatten() {
+            log(LogLine::Tool {
+                name,
+                summary: String::new(),
+            });
+        }
         // A run with queued token usage reports it and no dollar cost, the way a
         // Codex run does; otherwise it reports a dollar cost like Claude.
         let token_usage = self.token_usages.lock().unwrap().pop_front();
@@ -4529,6 +4547,294 @@ async fn a_server_whose_secret_cannot_be_decrypted_is_skipped_with_a_warning() {
     );
 }
 
+/// Like [`setup_mcp`] with a second project, `factory`.
+fn setup_two_projects(
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+) -> (Arc<Store>, Arc<FakeExecutor>, Arc<Scheduler<FakeExecutor>>) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(respond);
+    let project = |repo: &str| Project {
+        forge: ProjectForge::Known(ForgeKind::GitHub),
+        repo: repo.into(),
+        base: "main".into(),
+        checks: Some("just lint".into()),
+        models: factory_server::StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    };
+    let projects: Projects = [
+        ("maestro".to_owned(), project("Badger-Embedded/maestro")),
+        ("factory".to_owned(), project("Badger-Embedded/factory")),
+    ]
+    .into_iter()
+    .collect();
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        accounts(&store),
+    );
+    (store, executor, scheduler)
+}
+
+fn clarify_only() -> McpStages {
+    McpStages {
+        clarify: true,
+        ..Default::default()
+    }
+}
+
+fn stdio_entry(request: &AgentRequest, name: &str) -> Option<(String, Vec<String>)> {
+    request
+        .mcp
+        .iter()
+        .flat_map(|mcp| &mcp.servers)
+        .find_map(|entry| match entry {
+            McpServerEntry::Stdio {
+                name: n,
+                command,
+                args,
+            } if n == name => Some((command.clone(), args.clone())),
+            _ => None,
+        })
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn register_stdio(store: &Store, name: &str, command: &str, args: &[&str]) {
+    store
+        .create_mcp_server_with(
+            name,
+            &McpTransport::Stdio {
+                command: command.into(),
+                args: strings(args),
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_stdio_run_carries_the_base_arguments_then_the_projects_and_no_token() {
+    let (store, executor, scheduler, _tokens) = setup_mcp(|_| questions());
+    register_stdio(&store, "pw", "playwright-mcp", &["-y", "pkg"]);
+    store
+        .save_project_mcp("maestro", "pw", &enabled(clarify_only()))
+        .unwrap();
+    let id = store
+        .create("maestro", "alice", "Add a reboot button")
+        .unwrap();
+
+    // A project with no extra arguments gets the base arguments alone.
+    scheduler.tick().await.unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+    let first = executor.requests()[0].clone();
+    assert_eq!(
+        stdio_entry(&first, "pw"),
+        Some(("playwright-mcp".into(), strings(&["-y", "pkg"])))
+    );
+    assert!(
+        first.mcp.as_ref().unwrap().proxy.is_none(),
+        "stdio servers alone issue no run token"
+    );
+    assert!(
+        first
+            .prompt
+            .contains("This run has these MCP servers: `pw`.")
+    );
+
+    // The job's next run reads the changed list.
+    store
+        .save_project_mcp_args("maestro", "pw", &strings(&["--headless", "--x=1"]))
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    scheduler.tick().await.unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+    let second = executor.requests()[1].clone();
+    assert_eq!(
+        stdio_entry(&second, "pw").unwrap().1,
+        strings(&["-y", "pkg", "--headless", "--x=1"])
+    );
+}
+
+#[tokio::test]
+async fn a_stdio_server_enabled_for_implement_alone_reaches_only_the_implement_run() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewApproved,
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    register_stdio(&store, "pw", "playwright-mcp", &["--no-sandbox"]);
+    store
+        .save_project_mcp(
+            "maestro",
+            "pw",
+            &enabled(McpStages {
+                implement: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+    to_watching(&store, &executor, &scheduler).await;
+    let requests = executor.requests();
+    let implement = requests
+        .iter()
+        .find(|r| r.expect == Expect::Commits)
+        .expect("an implement run");
+    let entry = stdio_entry(implement, "pw").expect("the implement run carries it");
+    assert_eq!(entry.1, strings(&["--no-sandbox"]));
+    assert!(implement.mcp.as_ref().unwrap().proxy.is_none());
+    for request in requests.iter().filter(|r| r.expect != Expect::Commits) {
+        assert!(request.mcp.is_none(), "{:?}", request.expect);
+    }
+}
+
+#[tokio::test]
+async fn two_projects_get_their_own_extra_arguments_for_the_same_stdio_server() {
+    let (store, executor, scheduler) = setup_two_projects(|_| questions());
+    register_stdio(&store, "pw", "playwright-mcp", &["--no-sandbox"]);
+    for (project, arg) in [("maestro", "--headless"), ("factory", "--caps=vision")] {
+        store
+            .save_project_mcp(project, "pw", &enabled(clarify_only()))
+            .unwrap();
+        store
+            .save_project_mcp_args(project, "pw", &strings(&[arg]))
+            .unwrap();
+    }
+    store.create("maestro", "alice", "one").unwrap();
+    store.create("factory", "alice", "two").unwrap();
+
+    scheduler.tick().await.unwrap();
+    executor.release(2);
+    wait_idle(&scheduler).await;
+    let requests = executor.requests();
+    let args_of = |repo: &str| {
+        let request = requests.iter().find(|r| r.repo.ends_with(repo)).unwrap();
+        stdio_entry(request, "pw").unwrap().1
+    };
+    assert_eq!(args_of("maestro"), strings(&["--no-sandbox", "--headless"]));
+    assert_eq!(
+        args_of("factory"),
+        strings(&["--no-sandbox", "--caps=vision"])
+    );
+
+    // Saving one project's list leaves the other's alone.
+    store
+        .save_project_mcp_args("maestro", "pw", &strings(&["--changed"]))
+        .unwrap();
+    assert_eq!(
+        store.project_mcp_args("factory", "pw").unwrap(),
+        strings(&["--caps=vision"])
+    );
+}
+
+#[tokio::test]
+async fn a_project_that_leaves_a_stdio_server_off_gets_no_mcp_config() {
+    let (store, executor, scheduler) = setup_two_projects(|_| questions());
+    register_stdio(&store, "pw", "playwright-mcp", &[]);
+    store
+        .save_project_mcp("maestro", "pw", &enabled(clarify_only()))
+        .unwrap();
+    store.create("maestro", "alice", "one").unwrap();
+    store.create("factory", "alice", "two").unwrap();
+
+    scheduler.tick().await.unwrap();
+    executor.release(2);
+    wait_idle(&scheduler).await;
+    let requests = executor.requests();
+    let mcp_of = |repo: &str| {
+        requests
+            .iter()
+            .find(|r| r.repo.ends_with(repo))
+            .unwrap()
+            .mcp
+            .clone()
+    };
+    assert!(mcp_of("maestro").is_some());
+    assert!(mcp_of("factory").is_none());
+}
+
+#[tokio::test]
+async fn a_run_with_a_remote_and_a_stdio_server_carries_both_and_the_token() {
+    let (store, executor, scheduler, tokens) = setup_mcp(|_| questions());
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    register_stdio(&store, "pw", "playwright-mcp", &["--no-sandbox"]);
+    for name in ["context7", "pw"] {
+        store
+            .save_project_mcp("maestro", name, &enabled(clarify_only()))
+            .unwrap();
+    }
+    store.create("maestro", "alice", "one").unwrap();
+
+    scheduler.tick().await.unwrap();
+    wait_for_requests(&executor, 1).await;
+    let mcp = executor.requests()[0].mcp.clone().unwrap();
+    assert_eq!(
+        mcp.servers,
+        vec![
+            McpServerEntry::Remote {
+                name: "context7".into()
+            },
+            McpServerEntry::Stdio {
+                name: "pw".into(),
+                command: "playwright-mcp".into(),
+                args: strings(&["--no-sandbox"]),
+            },
+        ]
+    );
+    let proxy = mcp.proxy.expect("the remote server needs the proxy");
+    assert!(tokens.is_active(&proxy.token));
+    executor.release(1);
+    wait_idle(&scheduler).await;
+}
+
+#[tokio::test]
+async fn a_stdio_tool_call_in_the_agents_output_is_recorded_under_its_job() {
+    let (store, executor, scheduler) = setup_two_projects(|_| questions());
+    store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    register_stdio(&store, "pw", "playwright-mcp", &[]);
+    for name in ["context7", "pw"] {
+        store
+            .save_project_mcp("maestro", name, &enabled(clarify_only()))
+            .unwrap();
+    }
+    let id = store.create("maestro", "alice", "one").unwrap();
+    let other = store.create("factory", "alice", "two").unwrap();
+    executor.report_tool_calls(&[
+        "mcp__pw__browser_navigate",
+        "mcp__context7__query-docs",
+        "Bash",
+    ]);
+
+    scheduler.tick().await.unwrap();
+    executor.release(2);
+    wait_idle(&scheduler).await;
+
+    let calls = |job| -> Vec<String> {
+        store
+            .events(job)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event == "mcp-tool-call")
+            .filter_map(|event| event.detail)
+            .collect()
+    };
+    // A remote call is the proxy's to record, so only the stdio call is a row.
+    assert_eq!(calls(id), ["pw: browser_navigate"]);
+    assert_eq!(calls(other), Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn a_run_token_is_live_during_the_run_and_revoked_after() {
     let (store, executor, scheduler, tokens) = setup_mcp(|_| questions());
@@ -4556,15 +4862,16 @@ async fn a_run_token_is_live_during_the_run_and_revoked_after() {
         .clone()
         .expect("context7 is active for the clarify run");
     assert_eq!(mcp.names(), ["context7"]);
-    assert_eq!(mcp.proxy_url, "http://factory:8081");
-    assert!(mcp.token.len() >= 64, "a 256-bit token as hex");
+    let proxy = mcp.proxy.expect("a remote server comes with the proxy");
+    assert_eq!(proxy.url, "http://factory:8081");
+    assert!(proxy.token.len() >= 64, "a 256-bit token as hex");
     // The worker is still running, so the proxy honours its token.
-    assert!(tokens.is_active(&mcp.token));
+    assert!(tokens.is_active(&proxy.token));
 
     executor.release(1);
     wait_idle(&scheduler).await;
     // The worker exited, so the factory revoked the token.
-    assert!(!tokens.is_active(&mcp.token));
+    assert!(!tokens.is_active(&proxy.token));
 }
 
 #[tokio::test]

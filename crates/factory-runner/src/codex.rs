@@ -16,13 +16,19 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
+use std::fmt::Write as _;
+
 use factory_core::Agent;
 use serde_json::Value;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage};
+use crate::agent::{
+    AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage, write_replacing,
+};
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
-use crate::worker::{McpServerEntry, SessionRun, WorkerConfig, WorkerRun};
+use crate::worker::{
+    McpServerEntry, STDIO_STARTUP_TIMEOUT_SECS, SessionRun, WorkerConfig, WorkerRun,
+};
 
 /// The Codex config directory inside the worker, mounted from the job's `codex`
 /// directory on the host and passed to Codex as `CODEX_HOME`. It keeps the
@@ -100,7 +106,25 @@ impl AgentBackend for CodexAgent {
     }
 
     fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
-        fs::write(run.config_dir.join(CONFIG_FILE), CONFIG_TOML)?;
+        let mut config = CONFIG_TOML.to_owned();
+        for entry in run.mcp.iter().flat_map(|mcp| &mcp.servers) {
+            if let McpServerEntry::Stdio {
+                name,
+                command,
+                args,
+            } = entry
+            {
+                // Codex's startup timeout defaults to 10 seconds, too short for
+                // a first download.
+                let _ = write!(
+                    config,
+                    "\n[mcp_servers.{name}]\ncommand = {}\nargs = {}\nstartup_timeout_sec = {STDIO_STARTUP_TIMEOUT_SECS}\n",
+                    toml_string(command),
+                    toml_array(args)
+                );
+            }
+        }
+        write_replacing(&run.config_dir, CONFIG_FILE, &config)?;
         fs::write(
             run.config_dir.join(SCHEMA_FILE),
             run.expect.strict_schema().to_string(),
@@ -108,10 +132,16 @@ impl AgentBackend for CodexAgent {
     }
 
     fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
-        // The MCP run token, by name only, for a run with at least one active
-        // server. A run with none passes none, so it gets no token.
-        match run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
-            Some(mcp) => vec![(MCP_TOKEN_ENV, mcp.token.as_str())],
+        // The MCP run token, by name only, for a run with at least one remote
+        // server. A run with none, such as one with only stdio servers, passes
+        // none, so it gets no token.
+        match run
+            .mcp
+            .as_ref()
+            .filter(|mcp| !mcp.servers.is_empty())
+            .and_then(|mcp| mcp.proxy.as_ref())
+        {
+            Some(proxy) => vec![(MCP_TOKEN_ENV, proxy.token.as_str())],
             None => Vec::new(),
         }
     }
@@ -143,24 +173,30 @@ impl AgentBackend for CodexAgent {
                 .as_deref()
                 .unwrap_or_else(|| Agent::Codex.default_effort())
         ));
-        // One remote MCP server per active server, pointed at the proxy. The run
-        // token is passed by name, not value, so it stays out of the arguments;
-        // the proxy swaps it for the project's stored headers. A run with no
-        // active server adds nothing.
-        if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
+        // A remote MCP server is pointed at the proxy. The run token is passed
+        // by name, not value, so it stays out of the arguments; the proxy swaps
+        // it for the project's stored headers. A run with no active server adds
+        // nothing.
+        if let Some(mcp) = run.mcp.as_ref() {
             for entry in &mcp.servers {
                 match entry {
                     McpServerEntry::Remote { name: server } => {
+                        let Some(proxy) = mcp.proxy.as_ref() else {
+                            continue;
+                        };
                         codex.push("-c".into());
                         codex.push(format!(
                             "mcp_servers.{server}.url=\"{}/mcp/{server}\"",
-                            mcp.proxy_url
+                            proxy.url
                         ));
                         codex.push("-c".into());
                         codex.push(format!(
                             "mcp_servers.{server}.bearer_token_env_var=\"{MCP_TOKEN_ENV}\""
                         ));
                     }
+                    // Stdio entries live in config.toml, since their arguments
+                    // can outgrow one argv element.
+                    McpServerEntry::Stdio { .. } => {}
                 }
             }
         }
@@ -171,6 +207,34 @@ impl AgentBackend for CodexAgent {
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         parse_codex(expect, line)
     }
+}
+
+/// `value` as a TOML basic string, which `-c` parses as the override's value.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            ch if ch.is_control() => {
+                let _ = write!(out, "\\u{:04X}", u32::from(ch));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn toml_array(values: &[String]) -> String {
+    let items: Vec<String> = values.iter().map(|value| toml_string(value)).collect();
+    format!("[{}]", items.join(","))
 }
 
 /// Parses one line of `codex exec --json`. A line the factory does not keep,
