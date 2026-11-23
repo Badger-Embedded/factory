@@ -3588,14 +3588,20 @@ impl Store {
         }
         for (owner, sealed) in credentials {
             let (project, header) = owner.row();
-            let current: Option<Vec<u8>> = tx
-                .query_row(
+            // Account resolution reads a token only when its account row is
+            // recorded for this forge, so a ciphertext sealed for another
+            // forge counts as absent here too.
+            let current: Option<Vec<u8>> = if read_forge_account(&tx, *owner)?.is_some() {
+                tx.query_row(
                     "SELECT value FROM secrets
                      WHERE project = ?1 AND server = '' AND header = ?2",
                     params![project, header],
                     |row| row.get(0),
                 )
-                .optional()?;
+                .optional()?
+            } else {
+                None
+            };
             if current.as_deref() != *sealed {
                 return Ok(MaintenanceSave::TokenChanged);
             }

@@ -15125,6 +15125,42 @@ async fn a_maintenance_save_refuses_a_result_checked_with_an_upstream_token_sinc
 }
 
 #[tokio::test]
+async fn a_maintenance_save_ignores_an_upstream_token_stored_for_the_other_forge() {
+    let dashboard = dashboard_with_project_token();
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .put_forge_token(
+            ForgeTokenOwner::Upstream {
+                project: "maestro",
+                forge: ForgeKind::Salsa,
+            },
+            "tok-salsa",
+            &ForgeAccount {
+                login: "salsa-bot".into(),
+                id: 9,
+            },
+        )
+        .unwrap();
+
+    let csrf = upstream_csrf(&dashboard).await;
+    let reply = dashboard
+        .post(
+            &format!("{PROJECT_PAGE}/maintenance"),
+            &format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&csrf={csrf}"),
+        )
+        .await;
+
+    assert!(!reply.body.contains("A token changed"));
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn an_upstream_token_button_acts_on_the_forge_it_names_and_an_unknown_forge_is_refused() {
     let dashboard = dashboard_with_project_token();
     LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
