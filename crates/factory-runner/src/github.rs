@@ -133,6 +133,21 @@ pub struct PrInfo {
     pub files: Vec<String>,
 }
 
+/// The head commit of a pull request and what GitHub says about when it
+/// became the head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadCommit {
+    pub sha: String,
+    /// UTC, as `YYYY-MM-DD HH:MM:SS`, which compares with SQLite's
+    /// `CURRENT_TIMESTAMP` as text. When GitHub recorded the force push that
+    /// made the commit the head, or `None` when the timeline has no such
+    /// event, as after a plain push, which GitHub does not date.
+    pub pushed_at: Option<String>,
+    /// When the commit was made. The commit was not the head before this, but
+    /// may have become the head long after.
+    pub committed_at: Option<String>,
+}
+
 /// What an agent needs to judge a pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrDetails {
@@ -159,6 +174,11 @@ struct PullJson {
 #[derive(Deserialize)]
 struct HeadJson {
     sha: String,
+}
+
+/// GitHub's `2026-01-02T03:04:05Z` as `2026-01-02 03:04:05`.
+fn sql_time(github: &str) -> String {
+    github.trim_end_matches('Z').replace('T', " ")
 }
 
 #[derive(Deserialize)]
@@ -781,6 +801,137 @@ impl GitHub {
         })
     }
 
+    /// The head commit of a pull request, when it was made, and when GitHub
+    /// recorded the force push that made it the head, if it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails, its output does not parse, or
+    /// the timeline says nothing about the head.
+    async fn head_commit(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<HeadCommit, String> {
+        #[derive(Deserialize)]
+        struct Oid {
+            oid: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Commit {
+            oid: String,
+            committed_date: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "__typename")]
+        enum Node {
+            HeadRefForcePushedEvent {
+                #[serde(rename = "createdAt")]
+                created_at: String,
+                #[serde(rename = "afterCommit")]
+                after: Option<Oid>,
+            },
+            PullRequestCommit {
+                commit: Commit,
+            },
+        }
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<Node>,
+        }
+        #[derive(Deserialize)]
+        struct Pr {
+            #[serde(rename = "headRefOid")]
+            head: String,
+            #[serde(rename = "timelineItems")]
+            timeline: Nodes,
+        }
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| format!("{repo} is not owner/name"))?;
+        let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid timelineItems(last:100,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} ... on PullRequestCommit{commit{oid committedDate}}}}}}}";
+        let out = self
+            .run(
+                account,
+                &[
+                    "api",
+                    "graphql",
+                    "-f",
+                    &format!("query={query}"),
+                    "-f",
+                    &format!("owner={owner}"),
+                    "-f",
+                    &format!("name={name}"),
+                    "-F",
+                    &format!("number={number}"),
+                    "--jq",
+                    ".data.repository.pullRequest",
+                ],
+                None,
+            )
+            .await?;
+        let pr: Pr = serde_json::from_str(&out)
+            .map_err(|_| "gh api graphql returned unexpected output".to_owned())?;
+        let mut pushed_at = None;
+        let mut committed_at = None;
+        for node in &pr.timeline.nodes {
+            match node {
+                Node::HeadRefForcePushedEvent {
+                    created_at,
+                    after: Some(after),
+                } if after.oid == pr.head => pushed_at = Some(sql_time(created_at)),
+                Node::PullRequestCommit { commit } if commit.oid == pr.head => {
+                    committed_at = Some(sql_time(&commit.committed_date));
+                }
+                _ => {}
+            }
+        }
+        Ok(HeadCommit {
+            sha: pr.head,
+            pushed_at,
+            committed_at,
+        })
+    }
+
+    /// When the pull request merged, as `YYYY-MM-DD HH:MM:SS` in UTC, or
+    /// `None` when GitHub shows it unmerged.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails or its output does not parse.
+    async fn merged_at(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<String>, String> {
+        #[derive(Deserialize)]
+        struct View {
+            #[serde(rename = "mergedAt")]
+            merged_at: Option<String>,
+        }
+        let out = self
+            .run(
+                account,
+                &[
+                    "pr",
+                    "view",
+                    &number.to_string(),
+                    "--repo",
+                    repo,
+                    "--json",
+                    "mergedAt",
+                ],
+                None,
+            )
+            .await?;
+        let view: View = serde_json::from_str(&out)
+            .map_err(|_| "gh pr view returned unexpected output".to_owned())?;
+        Ok(view.merged_at.as_deref().map(sql_time))
+    }
+
     /// The title, description, head, changed files and diff of a pull
     /// request.
     ///
@@ -883,7 +1034,9 @@ impl GitHub {
         .map(|_| ())
     }
 
-    /// Ticks Renovate's rebase checkbox in the pull request description.
+    /// Ticks Renovate's rebase checkbox in the pull request description,
+    /// unless the head is no longer `head`. The head and the description come
+    /// from one read, so the write never builds on a newer head's body.
     ///
     /// # Errors
     ///
@@ -893,21 +1046,35 @@ impl GitHub {
         account: &Account,
         repo: &str,
         number: u64,
+        head: &str,
     ) -> Result<RebaseCheckbox, String> {
         #[derive(Deserialize)]
         struct Body {
             body: Option<String>,
+            #[serde(rename = "headRefOid")]
+            head: String,
         }
         let number_text = number.to_string();
         let out = self
             .run(
                 account,
-                &["pr", "view", &number_text, "--repo", repo, "--json", "body"],
+                &[
+                    "pr",
+                    "view",
+                    &number_text,
+                    "--repo",
+                    repo,
+                    "--json",
+                    "body,headRefOid",
+                ],
                 None,
             )
             .await?;
         let view: Body = serde_json::from_str(&out)
             .map_err(|_| "gh pr view returned unexpected output".to_owned())?;
+        if view.head != head {
+            return Ok(RebaseCheckbox::HeadMoved);
+        }
         let body = view.body.unwrap_or_default();
         let Some(ticked) = tick_rebase_checkbox(&body) else {
             return Ok(RebaseCheckbox::Missing);
@@ -1258,6 +1425,9 @@ pub enum RebaseCheckbox {
     Ticked,
     /// The description has no rebase checkbox.
     Missing,
+    /// The pull request has another head than the caller expected, so
+    /// nothing was written.
+    HeadMoved,
 }
 
 /// `body` with Renovate's rebase checkbox ticked: the first
@@ -1434,6 +1604,24 @@ impl Forge for GitHub {
         Box::pin(GitHub::pr_info(self, account, repo, number))
     }
 
+    fn head_commit<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<HeadCommit, String>> {
+        Box::pin(GitHub::head_commit(self, account, repo, number))
+    }
+
+    fn merged_at<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Option<String>, String>> {
+        Box::pin(GitHub::merged_at(self, account, repo, number))
+    }
+
     fn pr_details<'a>(
         &'a self,
         account: &'a Account,
@@ -1448,8 +1636,11 @@ impl Forge for GitHub {
         account: &'a Account,
         repo: &'a str,
         number: u64,
+        head: &'a str,
     ) -> BoxFuture<'a, Result<RebaseCheckbox, String>> {
-        Box::pin(GitHub::request_renovate_rebase(self, account, repo, number))
+        Box::pin(GitHub::request_renovate_rebase(
+            self, account, repo, number, head,
+        ))
     }
 
     fn comment<'a>(

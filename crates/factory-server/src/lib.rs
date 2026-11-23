@@ -53,7 +53,7 @@ pub use proxy::{
 pub use registry::{AgentEntry, AgentRegistry};
 pub use scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, McpRuntime,
-    PackagingRequest, PublishRequest, Published, RENOVATE_DISCOVERY, ReadyAction,
+    PackagingRequest, PublishRequest, Published, RENOVATE_DISCOVERY, ReadyAction, Rebase,
     RenovateWatchRequest, RerunRequest, Scheduler, SessionSink, SummaryRequest, WatchReport,
     WatchRequest, branch_name, ready_action, watch_only_event,
 };
@@ -64,8 +64,8 @@ pub use secrets::{
 };
 pub use settings::Settings;
 pub use store::{
-    CodexPrice, Collaborator, FACTORY_REQUESTER, GapJob, JobEvent, JobFile, JobRow, LogEntry,
-    Maintenance, Packaging, PackagingType, ProjectTotals, Snapshot, Store, StoreError,
+    Claim, CodexPrice, Collaborator, FACTORY_REQUESTER, GapJob, JobEvent, JobFile, JobRow,
+    LogEntry, Maintenance, Packaging, PackagingType, ProjectTotals, Snapshot, Store, StoreError,
 };
 pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;

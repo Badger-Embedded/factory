@@ -747,7 +747,7 @@ fn renovate_body() -> String {
 }
 
 fn view_json(body: &str) -> String {
-    serde_json::json!({ "body": body }).to_string()
+    serde_json::json!({ "body": body, "headRefOid": "h1" }).to_string()
 }
 
 fn rebase_github(dir: &Path, body: &str) -> (GitHub, PathBuf, PathBuf) {
@@ -812,13 +812,13 @@ async fn request_renovate_rebase_writes_the_ticked_description() {
     let body = renovate_body();
     let (github, calls, stdin) = rebase_github(dir.path(), &body);
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Ticked);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\napi --method PATCH repos/o/r/pulls/5 -F body=@-\n"
+        "pr view 5 --repo o/r --json body,headRefOid\napi --method PATCH repos/o/r/pulls/5 -F body=@-\n"
     );
     assert_eq!(
         fs::read_to_string(&stdin).unwrap(),
@@ -831,13 +831,13 @@ async fn request_renovate_rebase_without_a_checkbox_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls, _) = rebase_github(dir.path(), "Update dep.\n- [ ] other\n");
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Missing);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\n"
+        "pr view 5 --repo o/r --json body,headRefOid\n"
     );
 }
 
@@ -849,13 +849,13 @@ async fn request_renovate_rebase_ignores_a_marker_without_a_checkbox() {
         "Update dep.\n<!-- rebase-check -->\n- [ ] unrelated <!-- rebase-check -->\n",
     );
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Missing);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\n"
+        "pr view 5 --repo o/r --json body,headRefOid\n"
     );
 }
 
@@ -864,14 +864,105 @@ async fn request_renovate_rebase_skips_the_write_when_already_ticked() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls, _) = rebase_github(dir.path(), " - [x] <!-- rebase-check -->retry\n");
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Ticked);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\n"
+        "pr view 5 --repo o/r --json body,headRefOid\n"
     );
+}
+
+#[tokio::test]
+async fn request_renovate_rebase_writes_nothing_for_another_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls, _) = rebase_github(dir.path(), &renovate_body());
+    let result = github
+        .request_renovate_rebase(&account(), "o/r", 5, "h0")
+        .await
+        .unwrap();
+    assert_eq!(result, RebaseCheckbox::HeadMoved);
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr view 5 --repo o/r --json body,headRefOid\n"
+    );
+}
+
+#[tokio::test]
+async fn head_commit_dates_a_force_push_by_the_push_not_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h2","timelineItems":{"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"h1","committedDate":"2026-01-01T00:00:00Z"}},{"__typename":"PullRequestCommit","commit":{"oid":"h2","committedDate":"2026-01-01T01:00:00Z"}},{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-01-02T03:04:05Z","afterCommit":{"oid":"h2"}}]}}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.sha, "h2");
+    assert_eq!(head.pushed_at.as_deref(), Some("2026-01-02 03:04:05"));
+    assert_eq!(head.committed_at.as_deref(), Some("2026-01-01 01:00:00"));
+    assert!(
+        fs::read_to_string(&calls)
+            .unwrap()
+            .starts_with("api graphql")
+    );
+}
+
+#[tokio::test]
+async fn head_commit_has_no_push_time_without_a_force_push() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h1","timelineItems":{"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"h1","committedDate":"2026-01-01T00:00:00Z"}}]}}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.pushed_at, None);
+    assert_eq!(head.committed_at.as_deref(), Some("2026-01-01 00:00:00"));
+}
+
+#[tokio::test]
+async fn head_commit_uses_a_force_push_without_a_commit_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h2","timelineItems":{"nodes":[{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-01-02T03:04:05Z","afterCommit":{"oid":"h2"}}]}}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.pushed_at.as_deref(), Some("2026-01-02 03:04:05"));
+    assert_eq!(head.committed_at, None);
+}
+
+#[tokio::test]
+async fn head_commit_has_no_times_when_the_timeline_lacks_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h2","timelineItems":{"nodes":[]}}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.sha, "h2");
+    assert_eq!(head.pushed_at, None);
+    assert_eq!(head.committed_at, None);
+}
+
+#[tokio::test]
+async fn merged_at_reads_the_merge_time_and_none_for_an_open_pull_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) =
+        recording_github(dir.path(), r#"echo '{"mergedAt":"2026-01-02T03:04:05Z"}'"#);
+    assert_eq!(
+        github
+            .merged_at(&account(), "o/r", 5)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2026-01-02 03:04:05")
+    );
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr view 5 --repo o/r --json mergedAt\n"
+    );
+    let (github, _) = recording_github(dir.path(), r#"echo '{"mergedAt":null}'"#);
+    assert_eq!(github.merged_at(&account(), "o/r", 5).await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -879,7 +970,7 @@ async fn request_renovate_rebase_reports_the_gh_error() {
     let dir = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(dir.path(), "echo 'gh: HTTP 502' >&2; exit 1");
     let err = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap_err();
     assert!(err.contains("HTTP 502"), "{err}");

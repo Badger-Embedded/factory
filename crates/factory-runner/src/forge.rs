@@ -11,7 +11,9 @@ use std::pin::Pin;
 
 use factory_core::PrDescription;
 
-use crate::github::{FailedCheck, PrDetails, PrInfo, PrStatus, RebaseCheckbox, RenovatePr, Rerun};
+use crate::github::{
+    FailedCheck, HeadCommit, PrDetails, PrInfo, PrStatus, RebaseCheckbox, RenovatePr, Rerun,
+};
 
 /// A boxed future, so the trait stays object safe without a macro crate.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -217,6 +219,22 @@ pub trait Forge: Send + Sync {
         number: u64,
     ) -> BoxFuture<'a, Result<PrInfo, String>>;
 
+    /// The head commit of a pull request and when it became the head.
+    fn head_commit<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<HeadCommit, String>>;
+
+    /// When the pull request merged, or `None` while it is not merged.
+    fn merged_at<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Option<String>, String>>;
+
     /// As [`Forge::pr_info`], plus the diff.
     fn pr_details<'a>(
         &'a self,
@@ -226,12 +244,14 @@ pub trait Forge: Send + Sync {
     ) -> BoxFuture<'a, Result<PrDetails, String>>;
 
     /// Asks Renovate to rebase its pull request by ticking the rebase
-    /// checkbox in the description, or reports that there is none.
+    /// checkbox in the description, or reports that there is none or that the
+    /// head is no longer `head`.
     fn request_renovate_rebase<'a>(
         &'a self,
         account: &'a Account,
         repo: &'a str,
         number: u64,
+        head: &'a str,
     ) -> BoxFuture<'a, Result<RebaseCheckbox, String>>;
 
     /// Posts a comment on the pull request.

@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, Gap, Gates, Job,
-    PrerequisiteState, Rejected, Session, Stage, Wait,
+    Agent, AgentResult, Ask, Command, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink,
+    FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session, Stage, Turn,
+    Wait,
 };
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -147,6 +148,12 @@ CREATE TABLE IF NOT EXISTS codex_prices (
     output_usd_per_mtok REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS job_events_by_job ON job_events (job_id, id);
+CREATE TABLE IF NOT EXISTS renovate_heads (
+    job_id INTEGER NOT NULL,
+    head TEXT NOT NULL,
+    seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (job_id, head)
+);
 CREATE TABLE IF NOT EXISTS pr_watermarks (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     pr INTEGER NOT NULL,
@@ -218,6 +225,11 @@ CREATE TABLE IF NOT EXISTS renovate_prs (
     number INTEGER NOT NULL,
     job_id INTEGER NOT NULL,
     PRIMARY KEY (project, number)
+);
+CREATE TABLE IF NOT EXISTS rebase_claims (
+    job_id INTEGER NOT NULL,
+    fix_job INTEGER NOT NULL,
+    PRIMARY KEY (job_id, fix_job)
 );
 CREATE TABLE IF NOT EXISTS dismissed_gaps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -379,6 +391,17 @@ pub struct LogEntry {
     /// `text`, `tool`, `other` for agent output, or `factory`.
     pub kind: String,
     pub text: String,
+}
+
+/// Whether the factory may write a Renovate rebase request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// The caller may write the request.
+    Granted,
+    /// An earlier call claimed it and stored no result.
+    Taken,
+    /// The job no longer owes this request.
+    Stale,
 }
 
 /// One entry of a job's history: something that happened to the job, and
@@ -1033,6 +1056,108 @@ impl Store {
         Ok(row)
     }
 
+    /// Claims the one request to Renovate to rebase for fix job `fix_job` of
+    /// Renovate job `job_id`, in the transaction that checks the job still
+    /// owes that request for `head`. A claim that exists means an earlier call
+    /// may have written, so a restart between the write and its result never
+    /// writes twice.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn claim_rebase(&self, job_id: i64, fix_job: i64, head: &str) -> Result<Claim, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row = Self::load(&tx, job_id)?;
+        // The job's own next command says the request is still due, which a
+        // cancelled job's leftover fix link does not.
+        let owed = matches!(
+            row.job.renovate_pr().and_then(|pr| pr.fix.as_ref()),
+            Some(FixLink {
+                job,
+                state: FixState::Merged {
+                    head: owed,
+                    rebase: RebaseState::Pending,
+                },
+                ..
+            }) if *job == fix_job && owed == head
+        ) && matches!(
+            row.job.next_command(),
+            Some(Command::RequestRebase { head: due, .. }) if due == head
+        );
+        if !owed {
+            return Ok(Claim::Stale);
+        }
+        let claimed = tx.execute(
+            "INSERT OR IGNORE INTO rebase_claims (job_id, fix_job) VALUES (?1, ?2)",
+            params![job_id, fix_job],
+        )?;
+        tx.commit()?;
+        Ok(if claimed == 1 {
+            Claim::Granted
+        } else {
+            Claim::Taken
+        })
+    }
+
+    /// When the factory first saw `head` on Renovate job `job_id`'s pull
+    /// request, as SQLite's `CURRENT_TIMESTAMP` writes it. The head was the
+    /// head by then.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn head_first_seen(&self, job_id: i64, head: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT seen_at FROM renovate_heads WHERE job_id = ?1 AND head = ?2",
+                params![job_id, head],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Creates the fix job for the stopped Renovate job `renovate_id`, with
+    /// `login` as its requester, and links it to the Renovate job in one
+    /// transaction. A second call while the first fix job is unfinished is
+    /// rejected and creates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Rejected`] when the Renovate job is not at
+    /// Triage stopped or already waits for a fix job.
+    pub fn start_fix(
+        &self,
+        renovate_id: i64,
+        login: &str,
+        instructions: Option<&str>,
+    ) -> Result<i64, StoreError> {
+        let project = self.get(renovate_id)?.project;
+        let gates = self.project_gates(&project)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, renovate_id)?;
+        let mut check = row.job.clone();
+        check
+            .apply(Event::FixStarted { job: 0 })
+            .map_err(StoreError::Rejected)?;
+        let (Some(pr), Turn::User(Ask::Renovate { reason, .. })) =
+            (row.job.renovate_pr(), row.job.turn())
+        else {
+            return Err(StoreError::Rejected(Rejected::Unexpected {
+                stage: row.job.stage().clone(),
+                event: Event::FixStarted { job: 0 },
+            }));
+        };
+        let text = pr.fix_request(reason, instructions);
+        let new = Job::fix(text, gates, renovate_id, pr.number);
+        let id = Self::insert_job(&tx, &project, login, &new)?;
+        Self::apply_in(&tx, &mut row, Event::FixStarted { job: id })?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Approves the gap job `id` for `login`. The job moves to `requested`
     /// and `login` becomes its requester in one transaction, so the two never
     /// disagree.
@@ -1252,6 +1377,8 @@ impl Store {
             "logs",
             "sessions",
             "cost_closed_jobs",
+            "rebase_claims",
+            "renovate_heads",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
@@ -1411,9 +1538,33 @@ impl Store {
             Event::ChecksError { error } => Some(error.clone()),
             _ => None,
         };
-        let observed = matches!(event, Event::RenovateObserved { .. });
+        let observed = matches!(
+            event,
+            Event::RenovateObserved { .. } | Event::FixEnded { .. }
+        );
+        // A stored result or a new fix retires the claims, so one left behind
+        // never blocks the request of a later fix that reuses the id.
+        let retires_claims = matches!(
+            event,
+            Event::FixStarted { .. }
+                | Event::RebaseRequested
+                | Event::RebaseSkipped
+                | Event::RebaseFailed { .. }
+        );
         let before = observed.then(|| row.job.clone());
         row.job.apply(event).map_err(StoreError::Rejected)?;
+        if let (true, Some(head)) = (
+            observed,
+            row.job.renovate_pr().and_then(|pr| pr.head.as_deref()),
+        ) {
+            tx.execute(
+                "INSERT OR IGNORE INTO renovate_heads (job_id, head) VALUES (?1, ?2)",
+                params![row.id, head],
+            )?;
+        }
+        if retires_claims {
+            tx.execute("DELETE FROM rebase_claims WHERE job_id = ?1", [row.id])?;
+        }
         if before.is_some_and(|before| before == row.job) {
             return Ok(());
         }
