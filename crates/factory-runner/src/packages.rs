@@ -15,10 +15,10 @@ const SCRIPT: &str = r#"n=$1; shift
 pkgs=()
 for ((i = 0; i < n; i++)); do pkgs+=("nixpkgs#$1"); shift; done
 nix build --no-link "${pkgs[@]}" >&2 || exit 86
-f=$(mktemp)
-exec 9>"$f" 8<"$f"
-rm -f "$f"
-nix shell "${pkgs[@]}" --command bash -c 'echo >&9; exec "$@" 8<&- 9>&-' bash "$@"
+f=$(mktemp) || exit 86
+exec 9>"$f" 8<"$f" || exit 86
+rm -f "$f" || exit 86
+nix shell "${pkgs[@]}" --command bash -c 'echo >&9 || exit 86; exec "$@" 8<&- 9>&-' bash "$@"
 code=$?
 if ! IFS= read -r -u 8 _; then exit 86; fi
 if [ "$code" -eq 86 ]; then exit 1; fi

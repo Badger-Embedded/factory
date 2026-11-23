@@ -293,6 +293,17 @@ fn checks_with_packages_run_the_command_inside_nix_shell() {
 /// Runs the generated wrapper for `command` under a fake `nix` whose build
 /// and shell steps succeed or fail as given, and returns its exit code.
 fn wrapper_exit(build_ok: bool, shell_ok: bool, command: &str) -> Option<i32> {
+    wrapper_run(build_ok, shell_ok, command, true).0
+}
+
+/// Like [`wrapper_exit`], with a temporary directory that can be missing, and
+/// whether the command ran, which it does by creating `$RAN`.
+fn wrapper_run(
+    build_ok: bool,
+    shell_ok: bool,
+    command: &str,
+    tmp_exists: bool,
+) -> (Option<i32>, bool) {
     let dir = tempfile::tempdir().unwrap();
     let nix = format!(
         "case \"$1\" in\nbuild) {} ;;\nshell) {} ;;\nesac",
@@ -322,16 +333,30 @@ fn wrapper_exit(build_ok: bool, shell_ok: bool, command: &str) -> Option<i32> {
         std::env::var("PATH").unwrap()
     );
     let tmp = dir.path().join("tmp");
-    fs::create_dir(&tmp).unwrap();
+    if tmp_exists {
+        fs::create_dir(&tmp).unwrap();
+    }
+    let ran = dir.path().join("ran");
     let code = std::process::Command::new(&args[image + 1])
         .args(&args[image + 2..])
         .env("PATH", path)
         .env("TMPDIR", &tmp)
+        .env("RAN", &ran)
         .status()
         .unwrap()
         .code();
-    assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0, "left a marker");
-    code
+    if tmp_exists {
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0, "left a marker");
+    }
+    (code, ran.exists())
+}
+
+#[test]
+fn the_wrapper_does_not_run_the_command_when_its_start_signal_cannot_be_set_up() {
+    assert_eq!(
+        wrapper_run(true, true, "touch \"$RAN\"", false),
+        (Some(86), false)
+    );
 }
 
 #[test]
