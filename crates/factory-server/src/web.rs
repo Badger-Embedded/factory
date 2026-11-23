@@ -11,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage};
-use factory_runner::Expect;
+use factory_runner::{Expect, ForgeKind};
 use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -19,7 +19,8 @@ use tokio::sync::Notify;
 use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::copilot::validate_copilot_token;
 use crate::device_login::DeviceLogin;
-use crate::github::{RepoChecker, RepoReport};
+use crate::forges::Forges;
+use crate::github::RepoReport;
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, Projects, StageAgents, StageEfforts, StageModels};
@@ -58,7 +59,7 @@ struct AppState {
     wake: Arc<Notify>,
     data_dir: PathBuf,
     plan_usage: Arc<PlanUsageCache>,
-    github: Arc<dyn RepoChecker>,
+    forges: Forges,
     slots: Arc<WorkerSlots>,
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
@@ -73,12 +74,12 @@ struct AppState {
 /// job loop looks at the job right away. Uploaded images go under
 /// `<data_dir>/jobs/<id>/images/`. The index page reads `plan_usage` from the
 /// cache the worker runs fill.
-/// The onboarding wizard runs its repository checks through `github`. The
+/// The onboarding wizard runs its repository checks through `forges`. The
 /// board shows the worker slots the scheduler fills in `slots`. Per-project
 /// MCP header values are read and written through `secrets`, which reports
 /// itself unavailable when no master key is present. The per-project MCP
 /// connection check runs through `checker`, the way the onboarding checks run
-/// through `github`. The settings pages list the agents and link their account
+/// through `forges`. The settings pages list the agents and link their account
 /// pages through `registry`.
 #[allow(
     clippy::too_many_arguments,
@@ -90,7 +91,7 @@ pub fn app(
     wake: Arc<Notify>,
     data_dir: PathBuf,
     plan_usage: Arc<PlanUsageCache>,
-    github: Arc<dyn RepoChecker>,
+    forges: Forges,
     slots: Arc<WorkerSlots>,
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
@@ -105,7 +106,7 @@ pub fn app(
         wake,
         data_dir,
         plan_usage,
-        github,
+        forges,
         slots,
         secrets,
         checker,
@@ -3014,7 +3015,12 @@ async fn onboard_report(
     repo: &str,
     base: &str,
 ) -> Result<RepoReport, AppError> {
-    let mut report = match state.github.check(repo, base).await {
+    let mut report = match state
+        .forges
+        .checker(ForgeKind::GitHub)
+        .check(repo, base)
+        .await
+    {
         Ok(report) => report,
         Err(err) => RepoReport {
             errors: vec![format!("The repository checks could not run: {err}")],

@@ -13,12 +13,13 @@ use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
+use factory_runner::GitHub;
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin,
-    FACTORY_REQUESTER, GitHubRepos, LocalSecrets, LoginProcess, LoginSpawner, MASTER_KEY_LEN,
-    McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection, RepoChecker, RepoInfo,
-    RepoReport, SecretStore, Settings, StageAgents, StageEfforts, StageModels, Store, StoreError,
-    ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    FACTORY_REQUESTER, Forges, GitHubRepos, LocalSecrets, LoginProcess, LoginSpawner,
+    MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection,
+    RepoChecker, RepoInfo, RepoReport, SecretStore, Settings, StageAgents, StageEfforts,
+    StageModels, Store, StoreError, ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -256,7 +257,7 @@ fn dashboard_with_admins(
             Arc::new(Notify::new()),
             data.path().to_owned(),
             Arc::clone(&usage),
-            github,
+            Forges::new(Arc::new(GitHub::default()), github),
             Arc::clone(&slots),
             secrets,
             Arc::clone(&checker) as Arc<dyn McpChecker>,
@@ -2336,7 +2337,7 @@ async fn a_job_whose_project_is_gone_renders_without_links() {
         Arc::new(Notify::new()),
         dashboard.data.path().to_owned(),
         Arc::new(PlanUsageCache::new()),
-        Arc::new(FakeRepos::fit()),
+        Forges::new(Arc::new(GitHub::default()), Arc::new(FakeRepos::fit())),
         Arc::new(WorkerSlots::new()),
         Arc::new(UnavailableSecrets::new(dashboard.store.clone())),
         Arc::new(FakeChecker::default()) as Arc<dyn McpChecker>,

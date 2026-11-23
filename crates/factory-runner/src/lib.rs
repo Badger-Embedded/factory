@@ -11,6 +11,7 @@ mod claude;
 mod codex;
 mod copilot;
 mod files;
+mod forge;
 mod git;
 mod github;
 mod images;
@@ -23,7 +24,8 @@ pub use agent::{AgentBackend, AgentItem, Credential, RunResult, TokenUsage, back
 pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
 pub use files::{PlacedFile, place_files, show_files};
-pub use git::Git;
+pub use forge::{Account, BoxFuture, Forge, ForgeKind};
+pub use git::{Git, Remote};
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, Observation, PrDetails, PrInfo, PrState, PrStatus,
     RenovatePr, Rerun, actions_job_id, is_renovate_login, observe, parse_renovate_prs,

