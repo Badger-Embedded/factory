@@ -74,7 +74,7 @@ struct FakeExecutor {
     rebases: Mutex<VecDeque<Result<Rebase, String>>>,
     /// The head the fake reads from the pull request, `h1` when unset.
     current_head: Mutex<Option<String>>,
-    head_changed_at: Mutex<Option<String>>,
+    head_pushed_at: Mutex<Option<String>>,
     fix_merged_at: Mutex<Option<String>>,
     /// Each rebase request as `(number, head)`.
     rebase_calls: Mutex<Vec<(u64, String)>>,
@@ -127,7 +127,7 @@ impl FakeExecutor {
             approved: Mutex::new(Vec::new()),
             rebases: Mutex::new(VecDeque::new()),
             current_head: Mutex::new(None),
-            head_changed_at: Mutex::new(None),
+            head_pushed_at: Mutex::new(None),
             fix_merged_at: Mutex::new(None),
             rebase_calls: Mutex::new(Vec::new()),
             pr_files: Mutex::new(Vec::new()),
@@ -437,7 +437,7 @@ impl Executor for FakeExecutor {
                 .lock()
                 .unwrap()
                 .clone()
-                .unwrap_or_else(|| "2000-01-01 00:00:00".to_owned()),
+                .unwrap_or_else(|| "2100-01-01 00:00:00".to_owned()),
         ))
     }
 
@@ -456,12 +456,8 @@ impl Executor for FakeExecutor {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "h1".to_owned()),
-            changed_at: self
-                .head_changed_at
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(|| "1970-01-01 00:00:00".to_owned()),
+            pushed_at: self.head_pushed_at.lock().unwrap().clone(),
+            committed_at: "1970-01-01 00:00:00".to_owned(),
         })
     }
 
@@ -5796,6 +5792,7 @@ async fn the_rebase_names_the_head_read_when_the_fix_merged() {
     let (store, executor, scheduler, _id, fix) = fixing_setup().await;
     // Renovate pushed h2 and the watch has not seen it yet.
     *executor.current_head.lock().unwrap() = Some("h2".into());
+    *executor.head_pushed_at.lock().unwrap() = Some("2000-01-01 00:00:00".into());
     store.apply(fix, Event::Merged).unwrap();
     step_until(&scheduler, || {
         !executor.rebase_calls.lock().unwrap().is_empty()
@@ -5814,7 +5811,7 @@ async fn a_commit_pushed_after_the_merge_asks_for_no_rebase() {
     // h2 was made before the merge, but GitHub recorded its push after the
     // merge and before the first watch saw the merge.
     *executor.current_head.lock().unwrap() = Some("h2".into());
-    *executor.head_changed_at.lock().unwrap() = Some("2000-01-02 00:00:00".into());
+    *executor.head_pushed_at.lock().unwrap() = Some("2100-01-02 00:00:00".into());
     *executor.renovate_now.lock().unwrap() = failing("h2");
     step_until(&scheduler, || {
         pr_of(&store, id).head.as_deref() == Some("h2")
@@ -5823,6 +5820,40 @@ async fn a_commit_pushed_after_the_merge_asks_for_no_rebase() {
     assert!(executor.rebase_calls.lock().unwrap().is_empty());
     assert!(event_names(&store, id).contains(&"rebase-skipped".to_owned()));
     assert!(pr_of(&store, id).fix.is_none());
+}
+
+#[tokio::test]
+async fn a_fast_forward_after_the_merge_is_unknown_and_asks_the_user() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    store.apply(fix, Event::Merged).unwrap();
+    // h2 was committed before the merge and reached the branch by a plain
+    // push, which GitHub does not date. The factory never saw it before.
+    *executor.current_head.lock().unwrap() = Some("h2".into());
+    step_until(&scheduler, || {
+        needs_you(&store, id) == Some(RenovateWait::RebaseFailed)
+    })
+    .await;
+    assert!(executor.rebase_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_cancelled_job_with_a_pending_rebase_cannot_claim_it() {
+    let (store, _executor, _scheduler, id, fix) = fixing_setup().await;
+    store.apply(fix, Event::Merged).unwrap();
+    store
+        .apply(
+            id,
+            Event::FixEnded {
+                job: fix,
+                outcome: FixOutcome::Merged { head: "h1".into() },
+            },
+        )
+        .unwrap();
+    store.apply(id, Event::Cancel).unwrap();
+    assert_eq!(
+        store.claim_rebase(id, fix, "h1").unwrap(),
+        factory_server::Claim::Stale
+    );
 }
 
 #[tokio::test]

@@ -133,14 +133,19 @@ pub struct PrInfo {
     pub files: Vec<String>,
 }
 
-/// The head commit of a pull request and when it became the head.
+/// The head commit of a pull request and what GitHub says about when it
+/// became the head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadCommit {
     pub sha: String,
     /// UTC, as `YYYY-MM-DD HH:MM:SS`, which compares with SQLite's
-    /// `CURRENT_TIMESTAMP` as text. It is when GitHub recorded the force push
-    /// that made the commit the head, or else the commit's own date.
-    pub changed_at: String,
+    /// `CURRENT_TIMESTAMP` as text. When GitHub recorded the force push that
+    /// made the commit the head, or `None` when the timeline has no such
+    /// event, as after a plain push, which GitHub does not date.
+    pub pushed_at: Option<String>,
+    /// When the commit was made. The commit was not the head before this, but
+    /// may have become the head long after.
+    pub committed_at: String,
 }
 
 /// What an agent needs to judge a pull request.
@@ -796,9 +801,8 @@ impl GitHub {
         })
     }
 
-    /// The head commit of a pull request and when it became the head. A
-    /// force push counts from the time GitHub recorded it, so a commit made
-    /// earlier and pushed later is dated by its push.
+    /// The head commit of a pull request, when it was made, and when GitHub
+    /// recorded the force push that made it the head, if it did.
     ///
     /// # Errors
     ///
@@ -870,23 +874,26 @@ impl GitHub {
             .await?;
         let pr: Pr = serde_json::from_str(&out)
             .map_err(|_| "gh api graphql returned unexpected output".to_owned())?;
-        let mut at = None;
+        let mut pushed_at = None;
+        let mut committed_at = None;
         for node in &pr.timeline.nodes {
             match node {
                 Node::HeadRefForcePushedEvent {
                     created_at,
                     after: Some(after),
-                } if after.oid == pr.head => at = Some(created_at),
-                Node::PullRequestCommit { commit } if commit.oid == pr.head && at.is_none() => {
-                    at = Some(&commit.committed_date);
+                } if after.oid == pr.head => pushed_at = Some(sql_time(created_at)),
+                Node::PullRequestCommit { commit } if commit.oid == pr.head => {
+                    committed_at = Some(sql_time(&commit.committed_date));
                 }
                 _ => {}
             }
         }
-        let at = at.ok_or_else(|| format!("the timeline of #{number} does not show its head"))?;
+        let committed_at = committed_at
+            .ok_or_else(|| format!("the timeline of #{number} does not show its head"))?;
         Ok(HeadCommit {
             sha: pr.head,
-            changed_at: sql_time(at),
+            pushed_at,
+            committed_at,
         })
     }
 

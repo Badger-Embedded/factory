@@ -898,7 +898,8 @@ async fn head_commit_dates_a_force_push_by_the_push_not_the_commit() {
     );
     let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
     assert_eq!(head.sha, "h2");
-    assert_eq!(head.changed_at, "2026-01-02 03:04:05");
+    assert_eq!(head.pushed_at.as_deref(), Some("2026-01-02 03:04:05"));
+    assert_eq!(head.committed_at, "2026-01-01 01:00:00");
     assert!(
         fs::read_to_string(&calls)
             .unwrap()
@@ -907,14 +908,15 @@ async fn head_commit_dates_a_force_push_by_the_push_not_the_commit() {
 }
 
 #[tokio::test]
-async fn head_commit_falls_back_to_the_commit_date() {
+async fn head_commit_has_no_push_time_without_a_force_push() {
     let dir = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(
         dir.path(),
         r#"echo '{"headRefOid":"h1","timelineItems":{"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"h1","committedDate":"2026-01-01T00:00:00Z"}}]}}'"#,
     );
     let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
-    assert_eq!(head.changed_at, "2026-01-01 00:00:00");
+    assert_eq!(head.pushed_at, None);
+    assert_eq!(head.committed_at, "2026-01-01 00:00:00");
 }
 
 #[tokio::test]

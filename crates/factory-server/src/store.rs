@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, Ask, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink, FixState, Gap,
-    Gates, Job, PrerequisiteState, RebaseState, Rejected, Session, Stage, Turn, Wait,
+    Agent, AgentResult, Ask, Command, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink,
+    FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session, Stage, Turn,
+    Wait,
 };
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -147,6 +148,12 @@ CREATE TABLE IF NOT EXISTS codex_prices (
     output_usd_per_mtok REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS job_events_by_job ON job_events (job_id, id);
+CREATE TABLE IF NOT EXISTS renovate_heads (
+    job_id INTEGER NOT NULL,
+    head TEXT NOT NULL,
+    seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (job_id, head)
+);
 CREATE TABLE IF NOT EXISTS pr_watermarks (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
     pr INTEGER NOT NULL,
@@ -1062,6 +1069,8 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let row = Self::load(&tx, job_id)?;
+        // The job's own next command says the request is still due, which a
+        // cancelled job's leftover fix link does not.
         let owed = matches!(
             row.job.renovate_pr().and_then(|pr| pr.fix.as_ref()),
             Some(FixLink {
@@ -1072,6 +1081,9 @@ impl Store {
                 },
                 ..
             }) if *job == fix_job && owed == head
+        ) && matches!(
+            row.job.next_command(),
+            Some(Command::RequestRebase { head: due, .. }) if due == head
         );
         if !owed {
             return Ok(Claim::Stale);
@@ -1086,6 +1098,24 @@ impl Store {
         } else {
             Claim::Taken
         })
+    }
+
+    /// When the factory first saw `head` on Renovate job `job_id`'s pull
+    /// request, as SQLite's `CURRENT_TIMESTAMP` writes it. The head was the
+    /// head by then.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn head_first_seen(&self, job_id: i64, head: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT seen_at FROM renovate_heads WHERE job_id = ?1 AND head = ?2",
+                params![job_id, head],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Creates the fix job for the stopped Renovate job `renovate_id`, with
@@ -1348,6 +1378,7 @@ impl Store {
             "sessions",
             "cost_closed_jobs",
             "rebase_claims",
+            "renovate_heads",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
@@ -1522,6 +1553,15 @@ impl Store {
         );
         let before = observed.then(|| row.job.clone());
         row.job.apply(event).map_err(StoreError::Rejected)?;
+        if let (true, Some(head)) = (
+            observed,
+            row.job.renovate_pr().and_then(|pr| pr.head.as_deref()),
+        ) {
+            tx.execute(
+                "INSERT OR IGNORE INTO renovate_heads (job_id, head) VALUES (?1, ?2)",
+                params![row.id, head],
+            )?;
+        }
         if retires_claims {
             tx.execute("DELETE FROM rebase_claims WHERE job_id = ?1", [row.id])?;
         }
