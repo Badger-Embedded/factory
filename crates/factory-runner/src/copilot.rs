@@ -46,11 +46,16 @@ const MCP_TOKEN_ENV: &str = "FACTORY_MCP_TOKEN";
 
 /// The instruction appended to a Copilot prompt. The CLI has no output-schema
 /// flag, so the run must end with the JSON itself; [`prompt`](crate::prompt)
-/// writes this sentence and then the stage's schema.
+/// writes this text and then the stage's schema. It gives the reason for the
+/// rule and a place for the summary, since agents wrote one anyway.
 const SCHEMA_IN_PROMPT: &str = "This agent has no structured-output mode, so produce the \
      outcome yourself. End the run with one final message that holds only the JSON for your \
-     outcome and nothing else: no sentence before it and none after. A single ```json fenced \
-     block around the whole message is allowed. The JSON must match this schema:";
+     outcome and nothing else: no sentence before it and none after. The factory parses that \
+     message as JSON, and any text outside the JSON fails the run. Put a summary, an \
+     explanation or a note to the requester inside the JSON fields the schema offers, such as \
+     the pull request body, the spec or the review feedback, or leave it out. Only the final \
+     message is restricted; earlier messages may hold prose. A single ```json fenced block \
+     around the JSON is allowed. The JSON must match this schema:";
 
 /// The note [`start_log`](AgentBackend::start_log) writes at the start of each
 /// run. See Job cost in the design doc.

@@ -244,11 +244,27 @@ fn the_prompt_carries_the_stage_schema_so_the_agent_ends_with_its_json() {
         copilot.contains("\"outcome\""),
         "the Copilot prompt does not carry the schema"
     );
-    let claude = factory_runner::prompt(&Task::WriteSpec, Expect::Spec, Agent::Claude);
     assert!(
-        !claude.contains("only the JSON"),
-        "Claude's prompt must not carry the schema-in-prompt wording"
+        copilot.contains("any text outside the JSON fails the run"),
+        "the Copilot prompt does not give the reason: {copilot}"
     );
+    assert!(
+        copilot.contains("inside the JSON fields the schema offers"),
+        "the Copilot prompt does not say where a summary goes: {copilot}"
+    );
+    for agent in [Agent::Claude, Agent::Codex] {
+        let prompt = factory_runner::prompt(&Task::WriteSpec, Expect::Spec, agent);
+        for phrase in [
+            "only the JSON",
+            "any text outside the JSON fails the run",
+            "inside the JSON fields the schema offers",
+        ] {
+            assert!(
+                !prompt.contains(phrase),
+                "a non-Copilot prompt must not carry {phrase:?}"
+            );
+        }
+    }
 }
 
 #[test]
