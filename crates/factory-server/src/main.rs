@@ -3,7 +3,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_runner::{Account, Git, GitHub, WorkerConfig};
+use factory_runner::{Account, ForgeKind, Git, GitHub, WorkerConfig};
 use factory_server::{
     Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, HttpMcpChecker,
     LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor,
@@ -247,6 +247,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             token: gh_token(),
         }),
     );
+
+    if let Some(token) = gh_token() {
+        factory_server::forge_tokens::copy_gh_token(
+            &store,
+            secrets.as_ref(),
+            forges.forge(ForgeKind::GitHub).as_ref(),
+            &token,
+            factory_server::forge_tokens::LOOKUP_TIMEOUT,
+        )
+        .await;
+    }
 
     // Without podman workers no job takes a slot, so the board shows every
     // slot idle.

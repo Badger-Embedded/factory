@@ -237,6 +237,9 @@ CREATE TABLE IF NOT EXISTS project_forge_accounts (
     account_id INTEGER NOT NULL,
     PRIMARY KEY (project, kind)
 );
+CREATE TABLE IF NOT EXISTS gh_token_copies (
+    project TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS store_boots (
     id INTEGER PRIMARY KEY AUTOINCREMENT
 );
@@ -793,8 +796,39 @@ impl Store {
                  VALUES (?1, ?2, ?2)",
                 params![name, by],
             )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO gh_token_copies (project) VALUES (?1)",
+                [name],
+            )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether the one-time copy of `GH_TOKEN` is done for `project`, or does
+    /// not apply to it.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn gh_token_copy_done(&self, project: &str) -> Result<bool, StoreError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM gh_token_copies WHERE project = ?1)",
+            [project],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Records that `project` needs no more copies of `GH_TOKEN`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn record_gh_token_copy(&self, project: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO gh_token_copies (project) VALUES (?1)",
+            [project],
+        )?;
         Ok(())
     }
 
@@ -2076,6 +2110,7 @@ impl Store {
             params![at.project, at.server, at.header, backend, value],
         )?;
         write_forge_account(&tx, owner, account)?;
+        mark_project_token_handled(&tx, owner)?;
         tx.commit()?;
         Ok(())
     }
@@ -2151,6 +2186,7 @@ impl Store {
             params![at.project, at.server, at.header, backend, value],
         )?;
         write_forge_account(&tx, owner, account)?;
+        mark_project_token_handled(&tx, owner)?;
         tx.commit()?;
         Ok(true)
     }
@@ -2172,6 +2208,7 @@ impl Store {
             params![at.project, at.server, at.header],
         )?;
         erase_forge_account(&tx, owner)?;
+        mark_project_token_handled(&tx, owner)?;
         tx.commit()?;
         Ok(())
     }
@@ -2404,6 +2441,7 @@ impl Store {
             "renovate_prs",
             "dismissed_gaps",
             "project_forge_accounts",
+            "gh_token_copies",
             "project_instances",
             "secrets",
         ] {
@@ -3728,6 +3766,21 @@ fn project_token_kind(owner: ForgeTokenOwner<'_>) -> &'static str {
         ForgeTokenOwner::Upstream { .. } => "upstream",
         _ => "project",
     }
+}
+
+/// Saving or clearing a project token ends the startup copy of `GH_TOKEN` for
+/// that project, in the transaction that changes the token.
+fn mark_project_token_handled(
+    conn: &Connection,
+    owner: ForgeTokenOwner<'_>,
+) -> Result<(), StoreError> {
+    if let ForgeTokenOwner::Project { project, .. } = owner {
+        conn.execute(
+            "INSERT OR IGNORE INTO gh_token_copies (project) VALUES (?1)",
+            [project],
+        )?;
+    }
+    Ok(())
 }
 
 fn write_forge_account(

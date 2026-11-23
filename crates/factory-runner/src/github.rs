@@ -1190,7 +1190,8 @@ impl GitHub {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         if let Some(token) = &account.token {
             command.env("GH_TOKEN", token);
         }
