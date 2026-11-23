@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Self-test for install.sh: runs it against stub podman, systemctl, tailscale,
-# curl and gh commands, and checks that the installed Quadlet unit passes the
-# claude-token secret only when it exists.
+# Self-test for install.sh: runs it against stub podman, systemctl, tailscale
+# and curl commands, and checks that the installed Quadlet unit passes the
+# gh-token and claude-token secrets only when they exist.
 set -euo pipefail
 
 src=$(cd "$(dirname "$0")/.." && pwd)
@@ -36,12 +36,11 @@ case "$1 ${2:-}" in
 esac
 EOF
 
-for cmd in systemctl tailscale gh; do
+for cmd in systemctl tailscale; do
     cat >"$bin/$cmd" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   *"serve status"*) echo "https://example.ts.net 127.0.0.1:8080" ;;
-  *"auth token"*) echo "ghtok" ;;
 esac
 exit 0
 EOF
@@ -90,20 +89,45 @@ has() {
 }
 
 claude_line='Secret=claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN'
+gh_line='Secret=gh-token,type=env,target=GH_TOKEN'
+key_line='Secret=factory-master-key,type=env,target=FACTORY_MASTER_KEY'
 
-# Without the claude-token secret: install succeeds and the unit omits the line.
+# A new install has no gh-token or claude-token secret: install succeeds, the
+# unit names neither, and install.sh creates no gh-token.
 rm -f "$secrets"/*
 run
-check pass "install succeeds without the claude-token secret"
+check pass "install succeeds without the gh-token and claude-token secrets"
 has no "$claude_line" "unit has no claude-token Secret line"
-has yes "Secret=gh-token,type=env,target=GH_TOKEN" "unit still passes gh-token"
-has yes "Secret=factory-master-key,type=env,target=FACTORY_MASTER_KEY" "unit still passes the master key"
+has no "$gh_line" "unit has no gh-token Secret line"
+has yes "$key_line" "unit still passes the master key"
+if [[ -e $secrets/gh-token ]]; then
+    echo "FAIL  install.sh created a gh-token secret"
+    failures=$((failures + 1))
+else
+    echo "ok    install.sh creates no gh-token secret"
+fi
+
+# An install from before project tokens has a gh-token secret: the unit passes
+# it in, so the factory can copy it once, and its trailing newline is removed.
+printf 'ghtok\n' >"$secrets/gh-token"
+run
+check pass "install succeeds with the gh-token secret"
+has yes "$gh_line" "unit passes gh-token when the secret exists"
+has no "$claude_line" "unit has no claude-token Secret line without that secret"
+has yes "$key_line" "unit still passes the master key with gh-token"
+if [[ $(cat "$secrets/gh-token") == ghtok ]]; then
+    echo "ok    the gh-token secret lost its trailing newline"
+else
+    echo "FAIL  the gh-token secret kept its trailing newline"
+    failures=$((failures + 1))
+fi
 
 # With the claude-token secret present: the unit passes it in.
 printf 'claudetok' >"$secrets/claude-token"
 run
 check pass "install succeeds with the claude-token secret"
 has yes "$claude_line" "unit passes claude-token when the secret exists"
+has yes "$gh_line" "unit passes both secrets together"
 
 if [[ $failures -gt 0 ]]; then
     echo "$failures check(s) failed"

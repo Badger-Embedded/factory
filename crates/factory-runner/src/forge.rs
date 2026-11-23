@@ -76,6 +76,43 @@ impl ForgeKind {
     }
 }
 
+/// Starts the error of a forge or git command that failed because the forge
+/// refused the credentials. [`rejected_by_forge`] decides this from the
+/// command's own output, where the command runs.
+pub const REJECTED: &str = "the forge rejected the credentials: ";
+
+/// Whether the stderr of a forge CLI or git says the forge refused the token.
+#[must_use]
+pub fn rejected_by_forge(stderr: &str) -> bool {
+    [
+        "HTTP 401",
+        "Bad credentials",
+        "returned error: 401",
+        "Authentication failed",
+        "Invalid username or token",
+        "401 Unauthorized",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker))
+}
+
+/// The error text of a failed command: `stderr` with every secret removed,
+/// marked with [`REJECTED`] when the forge refused the credentials.
+pub(crate) fn command_error(what: &str, stderr: &str, secrets: &[String]) -> String {
+    let mut text = stderr.trim().to_owned();
+    let mut secrets: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for secret in secrets {
+        text = text.replace(secret.as_str(), "<redacted>");
+    }
+    let marker = if rejected_by_forge(&text) {
+        REJECTED
+    } else {
+        ""
+    };
+    format!("{marker}{what} failed: {text}")
+}
+
 /// The forge account an operation runs as: its token and the identity its
 /// commits carry.
 #[derive(Clone, PartialEq, Eq)]
@@ -86,17 +123,6 @@ pub struct Account {
     pub name: String,
     /// The commit author email.
     pub email: String,
-}
-
-impl Default for Account {
-    fn default() -> Self {
-        Account {
-            token: None,
-            login: "moonthebot".into(),
-            name: "moonthebot".into(),
-            email: "289833623+moonthebot@users.noreply.github.com".into(),
-        }
-    }
 }
 
 impl fmt::Debug for Account {
@@ -312,11 +338,13 @@ pub trait Forge: Send + Sync {
         ignore: &'a [String],
     ) -> BoxFuture<'a, Result<PrStatus, String>>;
 
-    /// The failed checks with the end of each failed job's log.
+    /// The failed checks with the end of each failed job's log. A log that
+    /// cannot be fetched is noted in the report, except when the forge
+    /// rejects the credentials, which is an error.
     fn failure_report<'a>(
         &'a self,
         account: &'a Account,
         repo: &'a str,
         checks: &'a [FailedCheck],
-    ) -> BoxFuture<'a, String>;
+    ) -> BoxFuture<'a, Result<String, String>>;
 }

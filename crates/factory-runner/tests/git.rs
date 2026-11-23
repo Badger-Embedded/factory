@@ -57,9 +57,15 @@ impl Fixture {
     /// The fixture's repository, reached through the GitHub forge's
     /// authentication header and a `file://` URL.
     fn remote(&self) -> factory_runner::Remote {
+        self.remote_as("moonthebot", 7)
+    }
+
+    fn remote_as(&self, login: &str, id: u64) -> factory_runner::Remote {
         let account = Account {
             token: Some("ghp_secret".into()),
-            ..Account::default()
+            login: login.into(),
+            name: login.into(),
+            email: format!("{id}+{login}@users.noreply.github.com"),
         };
         factory_runner::Remote {
             url: format!(
@@ -79,9 +85,16 @@ impl Fixture {
     }
 
     fn remote_log(&self, branch: &str) -> String {
+        let bare = self.root.path().join("remotes/owner/repo.git");
         git(
-            &self.root.path().join("remotes/owner/repo.git"),
-            &["log", "--format=%s", branch],
+            self.root.path(),
+            &[
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "log",
+                "--format=%s",
+                branch,
+            ],
         )
     }
 }
@@ -91,7 +104,7 @@ async fn planning_clones_the_base_branch_with_the_bot_identity() {
     let remote = Fixture::new();
     let work = remote.work();
     Git::default()
-        .prepare(&work, &remote.remote(), "main", None)
+        .prepare(&work, &|| Ok(remote.remote()), "main", None)
         .await
         .unwrap();
 
@@ -103,18 +116,38 @@ async fn planning_clones_the_base_branch_with_the_bot_identity() {
 }
 
 #[tokio::test]
+async fn a_new_account_takes_over_an_existing_checkout() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let git_ = Git::default();
+    git_.prepare(&work, &|| Ok(remote.remote_as("first", 1)), "main", None)
+        .await
+        .unwrap();
+    assert_eq!(git(&work, &["config", "user.name"]), "first");
+
+    git_.prepare(&work, &|| Ok(remote.remote_as("second", 2)), "main", None)
+        .await
+        .unwrap();
+    assert_eq!(git(&work, &["config", "user.name"]), "second");
+    assert_eq!(
+        git(&work, &["config", "user.email"]),
+        "2+second@users.noreply.github.com"
+    );
+}
+
+#[tokio::test]
 async fn a_second_planning_run_keeps_the_checkout() {
     let remote = Fixture::new();
     let work = remote.work();
     let git_ = Git::default();
-    git_.prepare(&work, &remote.remote(), "main", None)
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", None)
         .await
         .unwrap();
     fs::write(work.join("notes"), "agent scratch").unwrap();
     commit(&remote.upstream(), "later", "second");
     git(&remote.upstream(), &["push", "-q", "origin", "main"]);
 
-    git_.prepare(&work, &remote.remote(), "main", None)
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", None)
         .await
         .unwrap();
     assert!(work.join("notes").exists());
@@ -126,14 +159,14 @@ async fn a_pull_request_branch_starts_from_the_newest_base_and_keeps_its_commits
     let remote = Fixture::new();
     let work = remote.work();
     let git_ = Git::default();
-    git_.prepare(&work, &remote.remote(), "main", None)
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", None)
         .await
         .unwrap();
     commit(&remote.upstream(), "merged", "merged earlier");
     git(&remote.upstream(), &["push", "-q", "origin", "main"]);
 
     let branch = "factory/job-7-pr-1";
-    git_.prepare(&work, &remote.remote(), "main", Some(branch))
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
         .await
         .unwrap();
     assert_eq!(git(&work, &["branch", "--show-current"]), branch);
@@ -141,7 +174,7 @@ async fn a_pull_request_branch_starts_from_the_newest_base_and_keeps_its_commits
 
     commit(&work, "feature", "agent work");
     git(&work, &["checkout", "-q", "--detach"]);
-    git_.prepare(&work, &remote.remote(), "main", Some(branch))
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
         .await
         .unwrap();
     assert_eq!(git(&work, &["branch", "--show-current"]), branch);
@@ -154,7 +187,7 @@ async fn a_rebase_left_unfinished_is_aborted() {
     let work = remote.work();
     let git_ = Git::default();
     let branch = "factory/job-7-pr-1";
-    git_.prepare(&work, &remote.remote(), "main", Some(branch))
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
         .await
         .unwrap();
     commit(&work, "README", "agent edit");
@@ -169,7 +202,7 @@ async fn a_rebase_left_unfinished_is_aborted() {
         .unwrap();
     assert!(!conflict.status.success(), "the rebase should conflict");
 
-    git_.prepare(&work, &remote.remote(), "main", Some(branch))
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
         .await
         .unwrap();
     assert_eq!(git(&work, &["branch", "--show-current"]), branch);
@@ -183,19 +216,23 @@ async fn push_publishes_the_branch() {
     let work = remote.work();
     let git_ = Git::default();
     let branch = "factory/job-7-pr-1";
-    git_.prepare(&work, &remote.remote(), "main", Some(branch))
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
         .await
         .unwrap();
     commit(&work, "feature", "agent work");
 
-    git_.push(&work, &remote.remote(), branch).await.unwrap();
+    git_.push(&work, &|| Ok(remote.remote()), branch, &|| {})
+        .await
+        .unwrap();
     assert_eq!(remote.remote_log(branch), "agent work\nfirst");
 
     git(
         &work,
         &["commit", "-q", "--amend", "-m", "agent work, revised"],
     );
-    git_.push(&work, &remote.remote(), branch).await.unwrap();
+    git_.push(&work, &|| Ok(remote.remote()), branch, &|| {})
+        .await
+        .unwrap();
     assert_eq!(remote.remote_log(branch), "agent work, revised\nfirst");
 }
 
@@ -207,7 +244,7 @@ async fn a_half_finished_clone_is_replaced() {
     fs::write(work.join("partial"), "").unwrap();
 
     Git::default()
-        .prepare(&work, &remote.remote(), "main", None)
+        .prepare(&work, &|| Ok(remote.remote()), "main", None)
         .await
         .unwrap();
     assert!(!work.join("partial").exists());
@@ -220,9 +257,11 @@ async fn a_missing_repository_fails_with_gits_message() {
     let err = Git::default()
         .prepare(
             &remote.work(),
-            &factory_runner::Remote {
-                url: remote.remote().url.replace("owner/repo", "owner/missing"),
-                ..remote.remote()
+            &|| {
+                Ok(factory_runner::Remote {
+                    url: remote.remote().url.replace("owner/repo", "owner/missing"),
+                    ..remote.remote()
+                })
             },
             "main",
             None,
@@ -238,14 +277,14 @@ async fn every_pull_request_run_fetches_the_newest_base() {
     let work = remote.work();
     let git_ = Git::default();
     let branch = "factory/job-7-pr-1";
-    git_.prepare(&work, &remote.remote(), "main", Some(branch))
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
         .await
         .unwrap();
     commit(&work, "feature", "agent work");
 
     commit(&remote.upstream(), "other", "merged meanwhile");
     git(&remote.upstream(), &["push", "-q", "origin", "main"]);
-    git_.prepare(&work, &remote.remote(), "main", Some(branch))
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
         .await
         .unwrap();
 
@@ -261,9 +300,14 @@ async fn commits_that_credit_an_ai_tool_are_found() {
     let remote = Fixture::new();
     let work = remote.work();
     let git_ = Git::default();
-    git_.prepare(&work, &remote.remote(), "main", Some("factory/job-7-pr-1"))
-        .await
-        .unwrap();
+    git_.prepare(
+        &work,
+        &|| Ok(remote.remote()),
+        "main",
+        Some("factory/job-7-pr-1"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         git_.attributed_commits(&work, "main").await.unwrap(),
         Vec::<String>::new()
@@ -299,9 +343,14 @@ async fn a_branch_summary_lists_the_commits_and_the_diff_stat() {
     let remote = Fixture::new();
     let work = remote.work();
     let git_ = Git::default();
-    git_.prepare(&work, &remote.remote(), "main", Some("factory/job-7-pr-1"))
-        .await
-        .unwrap();
+    git_.prepare(
+        &work,
+        &|| Ok(remote.remote()),
+        "main",
+        Some("factory/job-7-pr-1"),
+    )
+    .await
+    .unwrap();
     commit(&work, "a", "add a");
     commit(&work, "b", "add b");
     // The base moves on after the branch was cut. Its change is not ours.
@@ -346,11 +395,248 @@ async fn a_branch_with_no_commits_ahead_has_an_empty_summary() {
     let remote = Fixture::new();
     let work = remote.work();
     let git_ = Git::default();
-    git_.prepare(&work, &remote.remote(), "main", Some("factory/job-7-pr-1"))
-        .await
-        .unwrap();
+    git_.prepare(
+        &work,
+        &|| Ok(remote.remote()),
+        "main",
+        Some("factory/job-7-pr-1"),
+    )
+    .await
+    .unwrap();
 
     let summary = git_.summarize_branch(&work, "main").await.unwrap();
     assert_eq!(summary.commits, Vec::<String>::new());
     assert_eq!(summary.diff_stat, "");
+}
+
+#[cfg(unix)]
+fn fake_git(dir: &Path, body: &str) -> Git {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-git");
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    // A concurrent test's fork can hold the script's write handle briefly, so exec fails with ETXTBSY.
+    while let Err(e) = std::process::Command::new(&path).output() {
+        assert_eq!(e.raw_os_error(), Some(26), "{e}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Git { git: path }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failure_that_echoes_the_credentials_does_not_carry_them() {
+    let remote = Fixture::new();
+    let tools = tempfile::tempdir().unwrap();
+    let git_ = fake_git(
+        tools.path(),
+        "echo \"fatal: $GIT_CONFIG_VALUE_0 token ghp_secret\" >&2; exit 128",
+    );
+    let err = git_
+        .prepare(&remote.work(), &|| Ok(remote.remote()), "main", None)
+        .await
+        .unwrap_err();
+    assert!(err.starts_with("git clone failed:"), "{err}");
+    assert!(!err.contains("ghp_secret"), "{err}");
+    assert!(!err.contains("Basic"), "{err}");
+    assert!(!err.starts_with(factory_runner::REJECTED), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_token_is_marked_where_git_ran() {
+    let remote = Fixture::new();
+    let tools = tempfile::tempdir().unwrap();
+    let git_ = fake_git(
+        tools.path(),
+        "echo \"fatal: Authentication failed for $GIT_CONFIG_VALUE_0\" >&2; exit 128",
+    );
+    let err = git_
+        .prepare(&remote.work(), &|| Ok(remote.remote()), "main", None)
+        .await
+        .unwrap_err();
+    assert!(err.starts_with(factory_runner::REJECTED), "{err}");
+    assert!(!err.contains("ghp_secret"), "{err}");
+}
+
+#[tokio::test]
+async fn authenticated_commands_ignore_the_checkouts_origin_and_hooks() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let git_ = Git::default();
+    let branch = "factory/job-7-pr-1";
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
+        .await
+        .unwrap();
+    commit(&work, "feature", "agent work");
+
+    let marker = remote.root.path().join("hook-ran");
+    let hooks = work.join("evil-hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-push");
+    fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    git(
+        &work,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    git(&work, &["remote", "set-url", "origin", "file:///nowhere"]);
+
+    git_.push(&work, &|| Ok(remote.remote()), branch, &|| {})
+        .await
+        .unwrap();
+    assert_eq!(remote.remote_log(branch), "agent work\nfirst");
+    assert!(!marker.exists(), "a checkout hook ran with the credentials");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn updating_the_base_runs_no_checkout_hooks() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let git_ = Git::default();
+    let branch = "factory/job-7-pr-1";
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
+        .await
+        .unwrap();
+
+    let marker = remote.root.path().join("hook-ran");
+    let hook = work.join(".git/hooks/reference-transaction");
+    fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    git(&work, &["config", "core.fsmonitor", "touch-never-runs"]);
+
+    let upstream = remote.root.path().join("upstream");
+    commit(&upstream, "newer", "newer base");
+    git(&upstream, &["push", "-q", "origin", "HEAD:main"]);
+    let before = git(&work, &["rev-parse", "origin/main"]);
+
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
+        .await
+        .unwrap();
+    assert_ne!(git(&work, &["rev-parse", "origin/main"]), before);
+    assert!(!marker.exists(), "a checkout hook ran during the fetch");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_push_resolves_its_remote_after_the_copy_into_the_transfer_repository() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let branch = "factory/job-7-pr-1";
+    Git::default()
+        .prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
+        .await
+        .unwrap();
+    commit(&work, "feature", "agent work");
+
+    let tools = tempfile::tempdir().unwrap();
+    let log = tools.path().join("calls");
+    let git_ = fake_git(
+        tools.path(),
+        &format!("echo \"$@\" >> {}\nexec git \"$@\"", log.display()),
+    );
+    let seen = std::sync::Mutex::new(String::new());
+    git_.push(
+        &work,
+        &|| {
+            *seen.lock().unwrap() = fs::read_to_string(&log).unwrap();
+            Ok(remote.remote())
+        },
+        branch,
+        &|| {},
+    )
+    .await
+    .unwrap();
+    let seen = seen.into_inner().unwrap();
+    assert!(seen.contains(" fetch "), "{seen}");
+    assert!(!seen.contains(" push "), "{seen}");
+}
+
+#[tokio::test]
+async fn transport_settings_in_the_checkout_are_not_loaded_with_the_credentials() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let git_ = Git::default();
+    let branch = "factory/job-7-pr-1";
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
+        .await
+        .unwrap();
+    commit(&work, "feature", "agent work");
+    for (key, value) in [
+        ("url.https://evil.invalid/.insteadOf", "file://"),
+        ("protocol.file.allow", "never"),
+        ("http.proxy", "http://evil.invalid:3128"),
+        ("http.sslVerify", "false"),
+        ("include.path", "/nonexistent"),
+    ] {
+        git(&work, &["config", key, value]);
+    }
+
+    git_.push(&work, &|| Ok(remote.remote()), branch, &|| {})
+        .await
+        .unwrap();
+    assert_eq!(remote.remote_log(branch), "agent work\nfirst");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_credential_goes_to_a_repository_the_factory_made() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let tools = tempfile::tempdir().unwrap();
+    let seen = tools.path().join("seen");
+    let git_ = fake_git(
+        tools.path(),
+        &format!(
+            "case \"$GIT_CONFIG_VALUE_0\" in *Authorization*) echo \"$PWD $*\" >> {} ;; esac\n\
+             exec git \"$@\"",
+            seen.display()
+        ),
+    );
+    let branch = "factory/job-7-pr-1";
+    git_.prepare(&work, &|| Ok(remote.remote()), "main", Some(branch))
+        .await
+        .unwrap();
+    commit(&work, "feature", "agent work");
+    git_.push(&work, &|| Ok(remote.remote()), branch, &|| {})
+        .await
+        .unwrap();
+
+    let seen = fs::read_to_string(&seen).unwrap();
+    assert!(
+        !seen
+            .lines()
+            .any(|line| line.starts_with(work.to_str().unwrap())),
+        "{seen}"
+    );
+    assert!(
+        seen.lines()
+            .all(|line| line.contains("--git-dir=") || line.contains(" clone ")),
+        "{seen}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_remote_is_resolved_before_each_authenticated_command() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let git_ = Git::default();
+    git_.prepare(
+        &work,
+        &|| {
+            let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(remote.remote_as(&format!("bot{n}"), n as u64))
+        },
+        "main",
+        Some("factory/job-7-pr-1"),
+    )
+    .await
+    .unwrap();
+
+    // One for the clone and one for the fetch, which sets the identity.
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(git(&work, &["config", "user.name"]), "bot2");
 }

@@ -27,7 +27,10 @@ mod warnings;
 mod web;
 mod workers;
 
-pub use accounts::{Accounts, Resolved};
+pub use accounts::{
+    AccountSource, Accounts, Operation, Owner, ResolveError, Resolved, blame, credential_failure,
+    credential_reason,
+};
 pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT, ToolList};
 pub use codex::{CodexLogin, CodexRun};
 pub use copilot::{CopilotTokenError, validate_copilot_token};
@@ -53,7 +56,7 @@ pub use proxy::{
 pub use registry::{AgentEntry, AgentRegistry};
 pub use scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, FINISHED_JOB_DAYS, LogSink, McpRuntime,
-    PackagingRequest, PublishRequest, Published, RENOVATE_DISCOVERY, ReadyAction, Rebase,
+    PackagingRequest, PublishRequest, Published, PushLog, RENOVATE_DISCOVERY, ReadyAction, Rebase,
     RenovateWatchRequest, RerunRequest, Scheduler, SessionSink, SummaryRequest, WatchReport,
     WatchRequest, branch_name, ready_action, watch_only_event,
 };

@@ -2,17 +2,18 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
 use factory_runner::{
-    Account, BranchSummary, Ci, Credential, ForgeKind, Git, HeadCommit, Observation, PrState,
+    BranchSummary, Ci, Credential, ForgeKind, Git, HeadCommit, Observation, PrState,
     RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
     backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
     show_images,
 };
 
+use crate::accounts::{AccountSource, blame, credential_reason};
 use crate::forges::Forges;
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
@@ -202,6 +203,38 @@ fn job_images(job_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+impl PodmanExecutor {
+    async fn prepare_checkout(
+        &self,
+        request: &AgentRequest,
+        workspace: &Path,
+    ) -> Result<(), String> {
+        let forge = self.forges.forge(request.forge);
+        let owner = Mutex::new(None);
+        let remote = || {
+            let operation = request.account.resolve()?;
+            let remote = Remote::new(&*forge, &operation.account, &request.repo);
+            *owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(operation.owner);
+            Ok(remote)
+        };
+        let result = self
+            .git
+            .prepare(workspace, &remote, &request.base, request.branch.as_deref())
+            .await;
+        let owner = owner.into_inner().unwrap_or_else(PoisonError::into_inner);
+        let result = match &owner {
+            Some(owner) => blame(owner, result),
+            None => result,
+        };
+        result.map_err(|err| {
+            credential_reason(&err).map_or_else(
+                || format!("could not prepare the checkout: {err}"),
+                str::to_owned,
+            )
+        })
+    }
+}
+
 impl Executor for PodmanExecutor {
     async fn run_agent(
         &self,
@@ -235,18 +268,8 @@ impl Executor for PodmanExecutor {
         if let Err(err) = fs::create_dir_all(&config_dir) {
             return failed(format!("could not create {}: {err}", config_dir.display()));
         }
-        let forge = self.forges.forge(request.forge);
-        if let Err(err) = self
-            .git
-            .prepare(
-                &workspace,
-                &Remote::new(&*forge, &request.account, &request.repo),
-                &request.base,
-                request.branch.as_deref(),
-            )
-            .await
-        {
-            return failed(format!("could not prepare the checkout: {err}"));
+        if let Err(reason) = self.prepare_checkout(&request, &workspace).await {
+            return failed(reason);
         }
 
         let name = Self::container(request.job_id);
@@ -355,10 +378,13 @@ impl Executor for PodmanExecutor {
 
     async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
         let forge = self.forges.forge(request.forge);
-        if let Some(number) = forge
-            .merged_pr(&request.account, &request.repo, &request.branch)
-            .await?
-        {
+        let lookup = request.account.resolve()?;
+        if let Some(number) = blame(
+            &lookup.owner,
+            forge
+                .merged_pr(&lookup.account, &request.repo, &request.branch)
+                .await,
+        )? {
             return Ok(Published::AlreadyMerged(number));
         }
         let workspace = self.job_dir(request.job_id).join("work");
@@ -366,35 +392,64 @@ impl Executor for PodmanExecutor {
         if summary.commits.is_empty() {
             return Ok(Published::Empty);
         }
-        self.git
-            .push(
-                &workspace,
-                &Remote::new(&*forge, &request.account, &request.repo),
-                &request.branch,
-            )
-            .await?;
-        forge
-            .open_pr(
-                &request.account,
-                &request.repo,
-                &request.base,
-                &request.branch,
-                &request.description,
-            )
-            .await
-            .map(Published::Open)
+        let pusher = Mutex::new(None);
+        let remote = || {
+            let operation = request.account.resolve()?;
+            let remote = Remote::new(&*forge, &operation.account, &request.repo);
+            *pusher.lock().unwrap_or_else(PoisonError::into_inner) = Some(operation);
+            Ok(remote)
+        };
+        let record = || {
+            if let Some(operation) = &*pusher.lock().unwrap_or_else(PoisonError::into_inner) {
+                request.pushed.record(&format!(
+                    "{} ({})",
+                    operation.account.login,
+                    operation.owner.label()
+                ));
+            }
+        };
+        let result = self
+            .git
+            .push(&workspace, &remote, &request.branch, &record)
+            .await;
+        let owner = pusher
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|operation| operation.owner);
+        match &owner {
+            Some(owner) => blame(owner, result)?,
+            None => result?,
+        }
+        let opener = request.account.resolve()?;
+        blame(
+            &opener.owner,
+            forge
+                .open_pr(
+                    &opener.account,
+                    &request.repo,
+                    &request.base,
+                    &request.branch,
+                    &request.description,
+                )
+                .await,
+        )
+        .map(Published::Open)
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
         let forge = self.forges.forge(request.forge);
-        let status = forge
-            .status(
-                &request.account,
-                &request.repo,
-                request.number,
-                &request.ignore,
-            )
-            .await?;
+        let reader = request.account.resolve()?;
+        let status = blame(
+            &reader.owner,
+            forge
+                .status(
+                    &reader.account,
+                    &request.repo,
+                    request.number,
+                    &reader.ignore,
+                )
+                .await,
+        )?;
         let observation = observe(&status, request.seen_until.as_deref());
         // The review stopped and waits for the user. Report only a merge or
         // close by someone else; take no other action and leave the watermark
@@ -421,9 +476,13 @@ impl Executor for PodmanExecutor {
                     None,
                 ),
                 ReadyAction::Merge => {
-                    forge
-                        .merge(&request.account, &request.repo, request.number)
-                        .await?;
+                    let merger = request.account.resolve()?;
+                    blame(
+                        &merger.owner,
+                        forge
+                            .merge(&merger.account, &request.repo, request.number)
+                            .await,
+                    )?;
                     merged_by_factory = true;
                     (Some(Event::Merged), None)
                 }
@@ -438,9 +497,13 @@ impl Executor for PodmanExecutor {
                 None,
             ),
             Observation::CiFailed(checks) => {
-                let log = forge
-                    .failure_report(&request.account, &request.repo, &checks)
-                    .await;
+                let reporter = request.account.resolve()?;
+                let log = blame(
+                    &reporter.owner,
+                    forge
+                        .failure_report(&reporter.account, &request.repo, &checks)
+                        .await,
+                )?;
                 (Some(Event::CiFailed { log }), None)
             }
             Observation::Comments { text, seen_until } => (
@@ -457,35 +520,47 @@ impl Executor for PodmanExecutor {
     }
 
     async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
-        self.forges
-            .forge(request.forge)
-            .rerun_failed(&request.account, &request.repo, request.number)
-            .await
+        let operation = request.account.resolve()?;
+        blame(
+            &operation.owner,
+            self.forges
+                .forge(request.forge)
+                .rerun_failed(&operation.account, &request.repo, request.number)
+                .await,
+        )
     }
 
     async fn renovate_prs(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         base: &str,
     ) -> Result<Vec<RenovatePr>, String> {
-        self.forges
-            .forge(forge)
-            .renovate_prs(account, repo, base)
-            .await
+        let operation = account.resolve()?;
+        blame(
+            &operation.owner,
+            self.forges
+                .forge(forge)
+                .renovate_prs(&operation.account, repo, base)
+                .await,
+        )
     }
 
     async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
         let forge = self.forges.forge(request.forge);
-        let status = forge
-            .status(
-                &request.account,
-                &request.repo,
-                request.number,
-                &request.ignore,
-            )
-            .await?;
+        let reader = request.account.resolve()?;
+        let status = blame(
+            &reader.owner,
+            forge
+                .status(
+                    &reader.account,
+                    &request.repo,
+                    request.number,
+                    &reader.ignore,
+                )
+                .await,
+        )?;
         let ci = match status.state {
             PrState::Merged => {
                 let event = self
@@ -508,18 +583,28 @@ impl Executor for PodmanExecutor {
         let ci = match ci {
             Ci::NoChecks => RenovateCi::NoChecks,
             Ci::Pending => RenovateCi::Pending,
-            Ci::Failed(checks) => RenovateCi::Failed {
-                log: forge
-                    .failure_report(&request.account, &request.repo, &checks)
-                    .await,
-            },
+            Ci::Failed(checks) => {
+                let reporter = request.account.resolve()?;
+                RenovateCi::Failed {
+                    log: blame(
+                        &reporter.owner,
+                        forge
+                            .failure_report(&reporter.account, &request.repo, &checks)
+                            .await,
+                    )?,
+                }
+            }
             Ci::Passed => {
                 let details = if request.verdict_head.as_deref() == Some(status.head.as_str()) {
                     None
                 } else {
-                    let details = forge
-                        .pr_details(&request.account, &request.repo, request.number)
-                        .await?;
+                    let reader = request.account.resolve()?;
+                    let details = blame(
+                        &reader.owner,
+                        forge
+                            .pr_details(&reader.account, &request.repo, request.number)
+                            .await,
+                    )?;
                     Some(Box::new(PrDiff {
                         diff: details.diff,
                         body: details.body,
@@ -539,45 +624,61 @@ impl Executor for PodmanExecutor {
     async fn comment(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         body: &str,
     ) -> Result<(), String> {
-        self.forges
-            .forge(forge)
-            .comment(account, repo, number, body)
-            .await
+        let operation = account.resolve()?;
+        blame(
+            &operation.owner,
+            self.forges
+                .forge(forge)
+                .comment(&operation.account, repo, number, body)
+                .await,
+        )
     }
 
     async fn merge_renovate(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         head: &str,
     ) -> Result<(), String> {
         let forge = self.forges.forge(forge);
-        forge.approve(account, repo, number, head, APPROVAL).await?;
-        forge.merge_head(account, repo, number, head).await
+        let approver = account.resolve()?;
+        blame(
+            &approver.owner,
+            forge
+                .approve(&approver.account, repo, number, head, APPROVAL)
+                .await,
+        )?;
+        let merger = account.resolve()?;
+        blame(
+            &merger.owner,
+            forge.merge_head(&merger.account, repo, number, head).await,
+        )
     }
 
     async fn request_rebase(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         head: &str,
     ) -> Result<Rebase, String> {
+        let operation = account.resolve()?;
         Ok(
-            match self
-                .forges
-                .forge(forge)
-                .request_renovate_rebase(account, repo, number, head)
-                .await?
-            {
+            match blame(
+                &operation.owner,
+                self.forges
+                    .forge(forge)
+                    .request_renovate_rebase(&operation.account, repo, number, head)
+                    .await,
+            )? {
                 RebaseCheckbox::Ticked => Rebase::Requested,
                 RebaseCheckbox::Missing => Rebase::NoCheckbox,
                 RebaseCheckbox::HeadMoved => Rebase::HeadMoved,
@@ -588,33 +689,41 @@ impl Executor for PodmanExecutor {
     async fn merged_at(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
     ) -> Result<Option<String>, String> {
-        self.forges
-            .forge(forge)
-            .merged_at(account, repo, number)
-            .await
+        let operation = account.resolve()?;
+        blame(
+            &operation.owner,
+            self.forges
+                .forge(forge)
+                .merged_at(&operation.account, repo, number)
+                .await,
+        )
     }
 
     async fn renovate_head(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
     ) -> Result<HeadCommit, String> {
-        self.forges
-            .forge(forge)
-            .head_commit(account, repo, number)
-            .await
+        let operation = account.resolve()?;
+        blame(
+            &operation.owner,
+            self.forges
+                .forge(forge)
+                .head_commit(&operation.account, repo, number)
+                .await,
+        )
     }
 
     async fn renovate_merged(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         manifest_files: Option<&[String]>,
@@ -625,11 +734,14 @@ impl Executor for PodmanExecutor {
                 manifest_changed: false,
             });
         };
-        let info = self
-            .forges
-            .forge(forge)
-            .pr_info(account, repo, number)
-            .await?;
+        let operation = account.resolve()?;
+        let info = blame(
+            &operation.owner,
+            self.forges
+                .forge(forge)
+                .pr_info(&operation.account, repo, number)
+                .await,
+        )?;
         Ok(Event::RenovateMerged {
             packaging: true,
             manifest_changed: info.files.iter().any(|file| manifest_files.contains(file)),
@@ -641,14 +753,22 @@ impl Executor for PodmanExecutor {
         request: PackagingRequest,
     ) -> Result<PackagingContext, String> {
         let forge = self.forges.forge(request.forge);
-        let details = forge
-            .pr_details(&request.account, &request.repo, request.number)
-            .await?;
+        let reader = request.account.resolve()?;
+        let details = blame(
+            &reader.owner,
+            forge
+                .pr_details(&reader.account, &request.repo, request.number)
+                .await,
+        )?;
         let mut manifests = Vec::new();
         for path in &request.manifest_files {
-            let text = forge
-                .file_at(&request.account, &request.repo, path, &request.base)
-                .await?;
+            let reader = request.account.resolve()?;
+            let text = blame(
+                &reader.owner,
+                forge
+                    .file_at(&reader.account, &request.repo, path, &request.base)
+                    .await,
+            )?;
             manifests.push(FileText {
                 path: path.clone(),
                 text,
@@ -670,9 +790,13 @@ impl Executor for PodmanExecutor {
         let mut upstream = Vec::new();
         if let Some((from, to)) = &range {
             for path in &request.build_config_files {
-                let text = forge
-                    .compare_patch(&request.account, &request.upstream, from, to, path)
-                    .await?;
+                let reader = request.account.resolve()?;
+                let text = blame(
+                    &reader.owner,
+                    forge
+                        .compare_patch(&reader.account, &request.upstream, from, to, path)
+                        .await,
+                )?;
                 upstream.push(FileText {
                     path: path.clone(),
                     text,

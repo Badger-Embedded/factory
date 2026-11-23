@@ -11,13 +11,15 @@ use factory_core::{
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Account, Expect, ForgeKind, HeadCommit, LogLine, McpConfig, Observation, RenovatePr, Rerun,
-    RunReport, job_prompt,
+    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport,
+    job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::accounts::{Accounts, Resolved};
+use crate::accounts::{
+    AccountSource, Accounts, ResolveError, Resolved, credential_failure, credential_reason,
+};
 use crate::cost::{codex_cost, format_cost};
 use crate::mcp::McpServer;
 use crate::projects::{Project, Projects, StageAgents};
@@ -85,8 +87,9 @@ fn stage_name(expect: Expect) -> &'static str {
 pub struct AgentRequest {
     pub job_id: i64,
     pub forge: ForgeKind,
-    /// The account the operation runs as. Its token never reaches a worker.
-    pub account: Account,
+    /// Gives the account for each forge or git operation of the step when it
+    /// starts. The token never reaches a worker.
+    pub account: AccountSource,
     /// The repository as `owner/name`.
     pub repo: String,
     /// The branch pull requests target.
@@ -142,18 +145,50 @@ pub struct SummaryRequest {
 pub struct PublishRequest {
     pub job_id: i64,
     pub forge: ForgeKind,
-    /// The account the operation runs as. Its token never reaches a worker.
-    pub account: Account,
+    /// Gives the account for each forge or git operation of the step when it
+    /// starts. The token never reaches a worker.
+    pub account: AccountSource,
     pub repo: String,
     pub base: String,
     pub branch: String,
     pub description: PrDescription,
+    /// Told the account of each push right after it succeeds, before the pull
+    /// request is opened.
+    pub pushed: PushLog,
 }
 
+/// Records which account a push used.
+#[derive(Clone)]
+pub struct PushLog(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl PushLog {
+    pub fn new(log: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        PushLog(Arc::new(log))
+    }
+
+    pub fn record(&self, pushed_as: &str) {
+        (self.0)(pushed_as);
+    }
+}
+
+impl std::fmt::Debug for PushLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PushLog")
+    }
+}
+
+impl PartialEq for PushLog {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PushLog {}
+
 /// What a publish found on GitHub.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Published {
-    /// The branch was pushed and this open pull request has its description.
+    /// This open pull request has the description.
     Open(u64),
     /// This pull request for the branch was merged before the push, so the
     /// factory pushed nothing.
@@ -171,10 +206,9 @@ pub enum Published {
 pub struct WatchRequest {
     pub job_id: i64,
     pub forge: ForgeKind,
-    /// The account the operation runs as. Its token never reaches a worker.
-    pub account: Account,
-    /// The logins whose comments are not review feedback.
-    pub ignore: Vec<String>,
+    /// Gives the account for each forge or git operation of the step when it
+    /// starts. The token never reaches a worker.
+    pub account: AccountSource,
     pub repo: String,
     /// The branch the pull request targets.
     pub base: String,
@@ -287,10 +321,9 @@ const FIX_PR_CLOSED: &str = "the pull request was closed without merging";
 pub struct RenovateWatchRequest {
     pub job_id: i64,
     pub forge: ForgeKind,
-    /// The account the operation runs as. Its token never reaches a worker.
-    pub account: Account,
-    /// The logins whose comments are not review feedback.
-    pub ignore: Vec<String>,
+    /// Gives the account for each forge or git operation of the step when it
+    /// starts. The token never reaches a worker.
+    pub account: AccountSource,
     pub repo: String,
     pub number: u64,
     /// The head the job has a diff verdict for. The executor fetches the diff
@@ -315,8 +348,9 @@ pub struct RenovateWatchRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackagingRequest {
     pub forge: ForgeKind,
-    /// The account the operation runs as. Its token never reaches a worker.
-    pub account: Account,
+    /// Gives the account for each forge or git operation of the step when it
+    /// starts. The token never reaches a worker.
+    pub account: AccountSource,
     /// The maintained repository as `owner/name`.
     pub repo: String,
     /// The upstream repository as `owner/name`.
@@ -338,8 +372,9 @@ pub struct PackagingRequest {
 pub struct RerunRequest {
     pub job_id: i64,
     pub forge: ForgeKind,
-    /// The account the operation runs as. Its token never reaches a worker.
-    pub account: Account,
+    /// Gives the account for each forge or git operation of the step when it
+    /// starts. The token never reaches a worker.
+    pub account: AccountSource,
     pub repo: String,
     pub number: u64,
 }
@@ -418,7 +453,7 @@ pub trait Executor: Send + Sync + 'static {
     fn renovate_prs(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         base: &str,
     ) -> impl Future<Output = Result<Vec<RenovatePr>, String>> + Send;
@@ -434,7 +469,7 @@ pub trait Executor: Send + Sync + 'static {
     fn comment(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         body: &str,
@@ -445,7 +480,7 @@ pub trait Executor: Send + Sync + 'static {
     fn merge_renovate(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         head: &str,
@@ -455,7 +490,7 @@ pub trait Executor: Send + Sync + 'static {
     fn renovate_head(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
     ) -> impl Future<Output = Result<HeadCommit, String>> + Send;
@@ -464,7 +499,7 @@ pub trait Executor: Send + Sync + 'static {
     fn merged_at(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
     ) -> impl Future<Output = Result<Option<String>, String>> + Send;
@@ -475,7 +510,7 @@ pub trait Executor: Send + Sync + 'static {
     fn request_rebase(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         head: &str,
@@ -487,7 +522,7 @@ pub trait Executor: Send + Sync + 'static {
     fn renovate_merged(
         &self,
         forge: ForgeKind,
-        account: &Account,
+        account: &AccountSource,
         repo: &str,
         number: u64,
         manifest_files: Option<&[String]>,
@@ -696,7 +731,9 @@ impl<E: Executor> Scheduler<E> {
                     let Some(expect) = Expect::for_task(job.stage(), &task) else {
                         continue;
                     };
-                    let resolved = self.resolve(&row, &project)?;
+                    let Some(resolved) = self.resolve(&row, &project, &settings, true)? else {
+                        continue;
+                    };
                     let (request, skipped) = self
                         .agent_request(&row, &job, &project, &resolved, session, &task, expect)?;
                     let scheduler = Arc::clone(self);
@@ -712,19 +749,25 @@ impl<E: Executor> Scheduler<E> {
                     self.summarize(row.id, &project, &settings);
                 }
                 Command::Publish { pr } if self.due(row.id) => {
-                    let resolved = self.resolve(&row, &project)?;
+                    let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
+                        continue;
+                    };
                     self.publish(row.id, pr, &job, &project, &resolved, &settings)?;
                 }
                 watch @ Command::WatchPr { .. } if self.due(row.id) => {
-                    let resolved = self.resolve(&row, &project)?;
+                    let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
+                        continue;
+                    };
                     self.watch_pr(&row, &job, &project, &resolved, &settings, &watch)?;
                 }
                 Command::RerunCi { number, reason, .. } if self.due(row.id) => {
-                    let resolved = self.resolve(&row, &project)?;
+                    let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
+                        continue;
+                    };
                     let request = RerunRequest {
                         job_id: row.id,
                         forge: resolved.forge,
-                        account: resolved.account,
+                        account: resolved.source.clone(),
                         repo: project.repo.clone(),
                         number,
                     };
@@ -763,13 +806,15 @@ impl<E: Executor> Scheduler<E> {
         command: Command,
     ) -> Result<(), StoreError> {
         let id = row.id;
-        let resolved = self.resolve(row, project)?;
+        let Some(resolved) = self.resolve(row, project, settings, false)? else {
+            return Ok(());
+        };
         match command {
             Command::RerunRenovate { number, reason } => {
                 let request = RerunRequest {
                     job_id: id,
                     forge: resolved.forge,
-                    account: resolved.account,
+                    account: resolved.source.clone(),
                     repo: project.repo.clone(),
                     number,
                 };
@@ -787,8 +832,7 @@ impl<E: Executor> Scheduler<E> {
                 let request = RenovateWatchRequest {
                     job_id: id,
                     forge: resolved.forge,
-                    account: resolved.account,
-                    ignore: resolved.ignore,
+                    account: resolved.source.clone(),
                     repo: project.repo.clone(),
                     number,
                     verdict_head,
@@ -878,7 +922,7 @@ impl<E: Executor> Scheduler<E> {
         let verdict = job.renovate_pr().and_then(|pr| pr.verdict.as_ref());
         let request = PackagingRequest {
             forge: resolved.forge,
-            account: resolved.account.clone(),
+            account: resolved.source.clone(),
             repo: project.repo.clone(),
             upstream: packaging.upstream_repo,
             base: project.base.clone(),
@@ -909,9 +953,33 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    fn resolve(&self, row: &JobRow, project: &Project) -> Result<Resolved, StoreError> {
-        self.accounts
+    /// The account the next operation of a job runs as, resolved now so a
+    /// token or switch changed since the last operation applies. When the job
+    /// has no account, an agent run fails and any other step tries again
+    /// later, so Retry or the next pass works once a token is saved. The
+    /// result is `None` then.
+    fn resolve(
+        &self,
+        row: &JobRow,
+        project: &Project,
+        settings: &Settings,
+        agent: bool,
+    ) -> Result<Option<Resolved>, StoreError> {
+        match self
+            .accounts
             .resolve(&row.project, project, &row.requested_by)
+        {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(ResolveError::Store(err)) => Err(err),
+            Err(ResolveError::Account(reason)) => {
+                if agent {
+                    self.store.apply(row.id, Event::AgentFailed { reason })?;
+                } else {
+                    self.retry_later(settings, row.id, &credential_failure(&reason));
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn manifest_files(&self, project: &str) -> Result<Option<Vec<String>>, StoreError> {
@@ -980,7 +1048,15 @@ impl<E: Executor> Scheduler<E> {
             }
             let resolved = match self.accounts.resolve(&name, &project, FACTORY_REQUESTER) {
                 Ok(resolved) => resolved,
-                Err(err) => {
+                Err(ResolveError::Account(reason)) => {
+                    tracing::warn!("skipping the Renovate discovery of {name}: {reason}");
+                    self.discovered
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(name.clone(), Instant::now());
+                    continue;
+                }
+                Err(ResolveError::Store(err)) => {
                     tracing::error!("skipping the Renovate discovery of {name}: {err}");
                     continue;
                 }
@@ -989,7 +1065,7 @@ impl<E: Executor> Scheduler<E> {
                 .executor
                 .renovate_prs(
                     resolved.forge,
-                    &resolved.account,
+                    &resolved.source,
                     &project.repo,
                     &project.base,
                 )
@@ -1211,7 +1287,7 @@ impl<E: Executor> Scheduler<E> {
         let request = AgentRequest {
             job_id: row.id,
             forge: resolved.forge,
-            account: resolved.account.clone(),
+            account: resolved.source.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
             branch: match session {
@@ -1428,19 +1504,25 @@ impl<E: Executor> Scheduler<E> {
         let request = PublishRequest {
             job_id,
             forge: resolved.forge,
-            account: resolved.account.clone(),
+            account: resolved.source.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
             branch: branch_name(job_id, pr),
             description,
+            pushed: PushLog::new({
+                let scheduler = Arc::clone(self);
+                let (branch, repo) = (branch_name(job_id, pr), project.repo.clone());
+                move |pushed_as| {
+                    scheduler.note(
+                        job_id,
+                        &format!("Pushed {branch} to {repo} as {pushed_as}."),
+                    );
+                }
+            }),
         };
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
         self.spawn(job_id, Kind::Factory, async move {
-            scheduler.note(
-                job_id,
-                &format!("Pushing {} to {}.", request.branch, request.repo),
-            );
             let (branch, base) = (request.branch.clone(), request.base.clone());
             match scheduler.executor.publish(request).await {
                 Ok(Published::Open(number)) => {
@@ -1496,8 +1578,7 @@ impl<E: Executor> Scheduler<E> {
         let request = WatchRequest {
             job_id: row.id,
             forge: resolved.forge,
-            account: resolved.account.clone(),
-            ignore: resolved.ignore.clone(),
+            account: resolved.source.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
             number,
@@ -1880,7 +1961,7 @@ impl<E: Executor> Scheduler<E> {
         }
         let event = match self
             .executor
-            .request_rebase(resolved.forge, &resolved.account, repo, number, head)
+            .request_rebase(resolved.forge, &resolved.source, repo, number, head)
             .await
         {
             Ok(Rebase::Requested) => {
@@ -1916,7 +1997,7 @@ impl<E: Executor> Scheduler<E> {
     ) {
         match self
             .executor
-            .comment(resolved.forge, &resolved.account, repo, number, body)
+            .comment(resolved.forge, &resolved.source, repo, number, body)
             .await
         {
             Ok(()) => {
@@ -1943,7 +2024,7 @@ impl<E: Executor> Scheduler<E> {
     ) {
         match self
             .executor
-            .merge_renovate(resolved.forge, &resolved.account, repo, number, head)
+            .merge_renovate(resolved.forge, &resolved.source, repo, number, head)
             .await
         {
             Ok(()) => {
@@ -1955,12 +2036,14 @@ impl<E: Executor> Scheduler<E> {
                 );
                 // The merge is done. When the factory cannot read the pull
                 // request now, the job goes back to watching, which finds it
-                // merged.
+                // merged. The merge is recorded first, so a credential failure
+                // that stops the job leaves Retry resuming the watch and not
+                // the merge.
                 match self
                     .executor
                     .renovate_merged(
                         resolved.forge,
-                        &resolved.account,
+                        &resolved.source,
                         repo,
                         number,
                         manifest_files.as_deref(),
@@ -1969,14 +2052,20 @@ impl<E: Executor> Scheduler<E> {
                 {
                     Ok(event) => self.apply(job_id, event),
                     Err(err) => {
-                        self.retry_later(settings, job_id, &err);
                         self.apply(job_id, Event::MergeFailed);
+                        self.retry_later(settings, job_id, &err);
                     }
                 }
             }
             Err(err) => {
+                // A credential failure stops the job with the merge pending,
+                // so Retry merges again. The merge event only applies to a job
+                // that is still running.
+                let credentials = credential_reason(&err).is_some();
                 self.retry_later(settings, job_id, &err);
-                self.apply(job_id, Event::MergeFailed);
+                if !credentials {
+                    self.apply(job_id, Event::MergeFailed);
+                }
             }
         }
     }
@@ -2041,7 +2130,20 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
+    /// Handles a failed forge or git step. A failure of the credentials fails
+    /// the job with the reason, so the job shows Retry and the step resumes
+    /// once a token is saved. Any other failure is tried again after the poll
+    /// interval.
     fn retry_later(&self, settings: &Settings, job_id: i64, err: &str) {
+        if let Some(reason) = credential_reason(err) {
+            self.apply(
+                job_id,
+                Event::FactoryFailed {
+                    reason: reason.to_owned(),
+                },
+            );
+            return;
+        }
         self.wait(settings, job_id);
         self.note(
             job_id,

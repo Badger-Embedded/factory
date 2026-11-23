@@ -3,7 +3,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_runner::{Account, ForgeKind, Git, GitHub, WorkerConfig};
+use factory_runner::{ForgeKind, Git, GitHub, WorkerConfig};
 use factory_server::{
     Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, HttpMcpChecker,
     LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor,
@@ -87,18 +87,6 @@ async fn start_mcp_proxy(
         }
     });
     Ok(run_tokens)
-}
-
-/// The factory-wide account, from `GH_TOKEN` and the commit identity
-/// variables.
-fn factory_account() -> Account {
-    let default = Account::default();
-    Account {
-        token: gh_token(),
-        name: env::var("FACTORY_GIT_NAME").unwrap_or(default.name.clone()),
-        email: env::var("FACTORY_GIT_EMAIL").unwrap_or(default.email.clone()),
-        ..default
-    }
 }
 
 /// The Codex device login the settings page drives. It runs
@@ -284,7 +272,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 proxy_url: proxy_url.clone(),
                 warnings: Arc::clone(&mcp_warnings),
             },
-            Accounts::new(factory_account()),
+            Accounts::new(Arc::clone(&store), Arc::clone(&secrets), forges.clone()),
         );
         slots = scheduler.slots();
         tokio::spawn(scheduler.run());

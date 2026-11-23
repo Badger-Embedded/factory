@@ -228,7 +228,8 @@ async fn the_failure_report_has_each_failed_jobs_log() {
                 },
             ],
         )
-        .await;
+        .await
+        .unwrap();
     assert!(report.contains("Check \"Lint and test\" failed."));
     assert!(report.contains("FAILED (job 135)"));
     assert!(report.contains("Details: https://ci.example/1"));
@@ -1173,7 +1174,12 @@ async fn approve_names_the_checked_commit_so_a_later_head_is_not_approved() {
 }
 
 fn account() -> Account {
-    Account::default()
+    Account {
+        token: None,
+        login: "factory-bot".into(),
+        name: "factory-bot".into(),
+        email: "1+factory-bot@users.noreply.github.com".into(),
+    }
 }
 
 #[tokio::test]
@@ -1250,4 +1256,71 @@ fi"#,
     assert_eq!(account.token.as_deref(), Some("tok-good"));
     assert_eq!(account.name, "octobot");
     assert_eq!(account.email, "42+octobot@users.noreply.github.com");
+}
+
+#[tokio::test]
+async fn a_failure_that_echoes_the_token_does_not_carry_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = script(
+        dir.path(),
+        "gh",
+        "echo \"boom: token $GH_TOKEN\" >&2; exit 1",
+    );
+    let github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+    let mut who = account();
+    who.token = Some("ghp_secret".into());
+    let err = github.merge(&who, "o/r", 15).await.unwrap_err();
+    assert!(err.starts_with("gh pr merge failed:"), "{err}");
+    assert!(!err.contains("ghp_secret"), "{err}");
+}
+
+#[tokio::test]
+async fn a_refused_token_is_marked_where_gh_ran() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = script(
+        dir.path(),
+        "gh",
+        "echo \"gh: Bad credentials (HTTP 401)\" >&2; exit 1",
+    );
+    let github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+    let err = github.merge(&account(), "o/r", 15).await.unwrap_err();
+    assert!(err.starts_with(factory_runner::REJECTED), "{err}");
+}
+
+#[tokio::test]
+async fn a_refused_token_fetching_a_log_is_an_error_and_another_failure_is_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let checks = [FailedCheck {
+        name: "Lint".into(),
+        url: Some("https://github.com/o/r/actions/runs/44/job/135".into()),
+    }];
+    let refused = GitHub {
+        gh: script(
+            dir.path(),
+            "gh",
+            "echo 'HTTP 401: Bad credentials' >&2; exit 1",
+        ),
+        ..GitHub::default()
+    };
+    let err = refused
+        .failure_report(&account(), "o/r", &checks)
+        .await
+        .unwrap_err();
+    assert!(err.starts_with(factory_runner::REJECTED), "{err}");
+
+    let down = GitHub {
+        gh: script(dir.path(), "gh", "echo 'network is down' >&2; exit 1"),
+        ..GitHub::default()
+    };
+    let report = down
+        .failure_report(&account(), "o/r", &checks)
+        .await
+        .unwrap();
+    assert!(report.contains("Could not fetch its log"), "{report}");
 }

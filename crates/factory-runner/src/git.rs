@@ -2,10 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use factory_core::BranchSummary;
 use tokio::process::Command;
 
-use crate::forge::{Account, Forge};
+use crate::forge::{Account, Forge, command_error};
+
+/// Gives the remote for one command that sends a credential, resolved when
+/// the command starts.
+pub type RemoteSource<'a> = dyn Fn() -> Result<Remote, String> + Send + Sync + 'a;
 
 /// Runs git for the factory.
 #[derive(Debug, Clone)]
@@ -58,7 +64,11 @@ impl Remote {
 }
 
 impl Git {
-    /// Makes `work` a checkout of `repo` ready for an agent run.
+    /// Makes `work` a checkout of `repo` ready for an agent run, with the
+    /// commit identity of the remote's account. The identity is set on every
+    /// call, so a checkout made under another account takes the new one.
+    /// `remote` is called before each command that sends a credential, so a
+    /// token saved between the clone and the fetch reaches the fetch.
     ///
     /// Without a branch, a missing checkout is cloned at `base` and an
     /// existing one is left as it is, so planning runs keep reading the same
@@ -74,22 +84,19 @@ impl Git {
     pub async fn prepare(
         &self,
         work: &Path,
-        remote: &Remote,
+        remote: &RemoteSource<'_>,
         base: &str,
         branch: Option<&str>,
     ) -> Result<(), String> {
         if !work.join(".git").exists() {
-            self.clone_into(work, remote, base).await?;
+            self.clone_into(work, &remote()?, base).await?;
         }
         let Some(branch) = branch else {
-            return Ok(());
+            return self.set_identity(work, &remote()?).await;
         };
-        self.run(
-            work,
-            &["fetch", "origin", base],
-            remote.auth_header.as_deref(),
-        )
-        .await?;
+        let remote = remote()?;
+        self.set_identity(work, &remote).await?;
+        self.fetch_base(work, &remote, base).await?;
         if ["rebase-merge", "rebase-apply"]
             .iter()
             .any(|dir| work.join(".git").join(dir).exists())
@@ -111,22 +118,58 @@ impl Git {
         Ok(())
     }
 
-    /// Pushes `branch` to `origin`. The branch belongs to the factory, so a
-    /// rewritten branch replaces the old one, unless someone else pushed to
-    /// it since the last fetch.
+    /// Pushes `branch` to the remote's URL. The branch belongs to the
+    /// factory, so a rewritten branch replaces the old one, unless someone
+    /// else pushed to it since the last fetch.
+    ///
+    /// The worker writes the checkout's configuration, so the token never
+    /// reaches a command that reads it. The branch is copied into a
+    /// repository the factory made, without a credential, and pushed from
+    /// there to the URL the forge gave. `remote` is called after the copy,
+    /// right before the push, and `pushed` runs once the push succeeds.
     ///
     /// # Errors
     ///
     /// Returns git's message when the push fails.
-    pub async fn push(&self, work: &Path, remote: &Remote, branch: &str) -> Result<(), String> {
-        let refspec = format!("{branch}:{branch}");
+    pub async fn push(
+        &self,
+        work: &Path,
+        remote: &RemoteSource<'_>,
+        branch: &str,
+        pushed: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), String> {
+        let tracking = format!("refs/remotes/origin/{branch}");
+        let seen = self
+            .run(work, &["rev-parse", "--verify", "--quiet", &tracking], None)
+            .await
+            .map(|out| out.trim().to_owned())
+            .unwrap_or_default();
+        let transfer = tempfile::tempdir()
+            .map_err(|err| format!("could not create a transfer repository: {err}"))?;
+        let git_dir = self.init_transfer(transfer.path()).await?;
+        let local = format!("refs/heads/{branch}");
+        let refspec = format!("+{local}:{local}");
+        let from_checkout = work.to_string_lossy();
         self.run(
-            work,
-            &["push", "--force-with-lease", "origin", &refspec],
-            remote.auth_header.as_deref(),
+            transfer.path(),
+            &[&git_dir, "fetch", "--no-tags", &from_checkout, &refspec],
+            None,
         )
-        .await
-        .map(|_| ())
+        .await?;
+        let lease = format!("--force-with-lease={local}:{seen}");
+        let refspec = format!("{local}:{local}");
+        let remote = remote()?;
+        self.run(
+            transfer.path(),
+            &[&git_dir, "push", &lease, &remote.url, &refspec],
+            Some(&remote),
+        )
+        .await?;
+        pushed();
+        let tip = self.run(work, &["rev-parse", &local], None).await?;
+        self.run(work, &["update-ref", &tracking, tip.trim()], None)
+            .await
+            .map(|_| ())
     }
 
     /// The commits on the checked-out branch, after `origin/<base>`, whose
@@ -183,9 +226,13 @@ impl Git {
         self.run(
             parent,
             &["clone", "--branch", base, "--", url, &target],
-            remote.auth_header.as_deref(),
+            Some(remote),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn set_identity(&self, work: &Path, remote: &Remote) -> Result<(), String> {
         self.run(work, &["config", "user.name", &remote.user_name], None)
             .await?;
         self.run(work, &["config", "user.email", &remote.user_email], None)
@@ -193,18 +240,79 @@ impl Git {
         Ok(())
     }
 
-    async fn run(&self, dir: &Path, args: &[&str], auth: Option<&str>) -> Result<String, String> {
+    /// Fetches `base` into the checkout's `origin/<base>`. The credential
+    /// goes to a repository the factory made, and the checkout then fetches
+    /// from that repository without one.
+    async fn fetch_base(&self, work: &Path, remote: &Remote, base: &str) -> Result<(), String> {
+        let transfer = tempfile::tempdir()
+            .map_err(|err| format!("could not create a transfer repository: {err}"))?;
+        let git_dir = self.init_transfer(transfer.path()).await?;
+        let local = format!("refs/heads/{base}");
+        self.run(
+            transfer.path(),
+            &[
+                &git_dir,
+                "fetch",
+                "--no-tags",
+                &remote.url,
+                &format!("+{local}:{local}"),
+            ],
+            Some(remote),
+        )
+        .await?;
+        let tracking = format!("+{local}:refs/remotes/origin/{base}");
+        let source = transfer.path().to_string_lossy();
+        self.run(work, &["fetch", "--no-tags", &source, &tracking], None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Makes a bare repository in `dir`, with no hooks or configuration of
+    /// the worker's, and returns the `--git-dir` argument that selects it.
+    async fn init_transfer(&self, dir: &Path) -> Result<String, String> {
+        let target = dir.to_string_lossy();
+        self.run(dir, &["init", "--bare", "--quiet", &target], None)
+            .await?;
+        Ok(format!("--git-dir={target}"))
+    }
+
+    async fn run(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        authenticate: Option<&Remote>,
+    ) -> Result<String, String> {
         let mut command = Command::new(&self.git);
+        command.args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
+        if authenticate.is_some() {
+            command.args([
+                "-c",
+                "credential.helper=",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+            ]);
+        }
         command
             .args(args)
             .current_dir(dir)
             .stdin(Stdio::null())
             .env("GIT_TERMINAL_PROMPT", "0");
-        if let Some(header) = auth {
+        let mut secrets = Vec::new();
+        if let Some(remote) = authenticate
+            && let Some(header) = &remote.auth_header
+        {
             command
                 .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+                .env("GIT_CONFIG_KEY_0", header_key(&remote.url))
                 .env("GIT_CONFIG_VALUE_0", header);
+            secrets = header_secrets(header);
         }
         let output = command
             .output()
@@ -213,13 +321,46 @@ impl Git {
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
-            Err(format!(
-                "git {} failed: {}",
-                args.first().unwrap_or(&""),
-                String::from_utf8_lossy(&output.stderr).trim()
+            Err(command_error(
+                &format!(
+                    "git {}",
+                    args.iter()
+                        .find(|arg| !arg.starts_with("--"))
+                        .unwrap_or(&"")
+                ),
+                &String::from_utf8_lossy(&output.stderr),
+                &secrets,
             ))
         }
     }
+}
+
+fn header_key(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) if scheme.starts_with("http") => {
+            let host = rest.split('/').next().unwrap_or(rest);
+            format!("http.{scheme}://{host}/.extraHeader")
+        }
+        _ => "http.extraHeader".to_owned(),
+    }
+}
+
+/// Every form of the credential in a header, for removing it from output: the
+/// header, its value, and the value decoded from base64 with its token part.
+fn header_secrets(header: &str) -> Vec<String> {
+    let mut secrets = vec![header.to_owned()];
+    if let Some(value) = header.split_whitespace().last() {
+        secrets.push(value.to_owned());
+        if let Ok(bytes) = STANDARD.decode(value)
+            && let Ok(decoded) = String::from_utf8(bytes)
+        {
+            if let Some((_, token)) = decoded.split_once(':') {
+                secrets.push(token.to_owned());
+            }
+            secrets.push(decoded);
+        }
+    }
+    secrets
 }
 
 /// Whether a commit message line credits an AI tool: a co-author trailer
