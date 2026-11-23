@@ -51,38 +51,3 @@ fn is_attribute_path(entry: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-'))
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::validate;
-
-    #[test]
-    fn keeps_order_trims_and_collapses_duplicates() {
-        let packages = validate([
-            " playwright-mcp ",
-            "",
-            "python3Packages.requests",
-            "playwright-mcp",
-        ]);
-        assert_eq!(
-            packages.unwrap(),
-            ["playwright-mcp", "python3Packages.requests"]
-        );
-    }
-
-    #[test]
-    fn rejects_shell_text_flake_references_and_bad_dots() {
-        for bad in ["foo;rm -rf /", "nixpkgs#foo", "a..b", ".a", "a.", "a b"] {
-            let err = validate([bad]).unwrap_err();
-            assert!(err.contains(bad), "{err}");
-        }
-    }
-
-    #[test]
-    fn limits_count_and_length() {
-        let many: Vec<String> = (0..33).map(|n| format!("p{n}")).collect();
-        assert!(validate(many.iter().map(String::as_str)).is_err());
-        assert!(validate(["a".repeat(129).as_str()]).is_err());
-        assert!(validate(["a".repeat(128).as_str()]).is_ok());
-    }
-}

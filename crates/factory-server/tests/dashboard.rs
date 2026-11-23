@@ -15016,6 +15016,24 @@ async fn the_worker_packages_card_saves_validates_and_shows_the_list() {
 }
 
 #[tokio::test]
+async fn worker_packages_collapse_duplicates_and_have_count_and_length_limits() {
+    let dashboard = dashboard();
+    let reply = packages_post(&dashboard, USER, "jq%0A%0A+jq+%0Ayq").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard.store.project_packages("maestro").unwrap(),
+        ["jq", "yq"]
+    );
+    let many: Vec<String> = (0..33).map(|n| format!("p{n}")).collect();
+    for bad in [many.join("%0A"), "a".repeat(129)] {
+        let reply = packages_post(&dashboard, USER, &bad).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+    let ok = packages_post(&dashboard, USER, &"a".repeat(128)).await;
+    assert_eq!(ok.status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn a_collaborator_of_another_project_cannot_save_worker_packages() {
     let dashboard = two_projects();
     dashboard
