@@ -145,6 +145,7 @@ fn events_named(name: &str) -> Result<Vec<Event>> {
                 },
                 limits: RetryLimits { auto: 0, total: 0 },
                 auto_merge: false,
+                access: Box::default(),
             },
             Event::Commented,
         ],

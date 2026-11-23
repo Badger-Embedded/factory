@@ -181,6 +181,16 @@ pub trait Forge: Send + Sync {
         repo: &'a str,
     ) -> BoxFuture<'a, Result<Access, String>>;
 
+    /// Whether `account` may merge pull request `number`. `access` is what
+    /// the account may do in `repo`, read just before.
+    fn may_merge<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        access: Access,
+    ) -> BoxFuture<'a, Result<bool, String>>;
+
     /// The account that runs as `token`, whose commits carry `found`'s
     /// login and noreply address.
     fn account(&self, token: String, found: &ForgeAccount) -> Account;

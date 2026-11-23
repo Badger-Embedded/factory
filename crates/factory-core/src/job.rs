@@ -112,6 +112,39 @@ pub struct RetryLimits {
     pub total: u32,
 }
 
+/// What the project account may do on a Renovate pull request's repository,
+/// read on every watch. A job stored before this existed loads with full
+/// access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenovateAccess {
+    /// The account may rerun failed CI, which takes Write.
+    pub can_rerun: bool,
+    /// The account may approve and merge the pull request.
+    pub can_merge: bool,
+    /// The account's login, named in what the job page and the comments say.
+    pub account: String,
+}
+
+impl Default for RenovateAccess {
+    fn default() -> Self {
+        Self {
+            can_rerun: true,
+            can_merge: true,
+            account: String::new(),
+        }
+    }
+}
+
+impl RenovateAccess {
+    fn who(&self) -> String {
+        if self.account.is_empty() {
+            "the project account".to_owned()
+        } else {
+            format!("the project account {}", self.account)
+        }
+    }
+}
+
 /// The comments the factory posts on a Renovate pull request, each at most
 /// once per head commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +157,8 @@ pub enum CommentKind {
     NothingToRerun,
     /// CI still fails after the total reruns.
     Stopped,
+    /// The failure looks transient, but the project account cannot rerun CI.
+    TransientNoWrite,
 }
 
 /// The diff check's verdict on one head commit.
@@ -362,6 +397,8 @@ pub struct RenovatePr {
     pending: Option<Pending>,
     #[serde(default)]
     rerun: RerunKind,
+    #[serde(default)]
+    access: RenovateAccess,
 }
 
 impl RenovatePr {
@@ -576,6 +613,19 @@ impl RenovatePr {
     }
 
     fn on_failure_verdict(&mut self, transient: bool, reason: &str) -> Turn {
+        if transient && !self.access.can_rerun {
+            let who = self.access.who();
+            let body = format!(
+                "CI fails, and the failure looks transient: {reason}\n\nThe {who} cannot rerun CI \
+                 without Write access to the repository, so the factory stops here. Rerun the \
+                 failed jobs, or give the account Write access."
+            );
+            let reason = format!(
+                "CI fails and the failure looks transient, but {who} cannot rerun CI without Write \
+                 access: {reason}"
+            );
+            return self.stop(CommentKind::TransientNoWrite, reason, body);
+        }
         if transient {
             self.rerun = RerunKind::Analysed;
             return Turn::RerunCi {
@@ -632,7 +682,7 @@ impl RenovatePr {
                              rerunning it and leaves this pull request to a person."
                         ),
                     )
-                } else if self.auto_reruns < limits.auto {
+                } else if self.access.can_rerun && self.auto_reruns < limits.auto {
                     self.rerun = RerunKind::Auto;
                     Turn::RerunCi {
                         reason: format!(
@@ -651,10 +701,19 @@ impl RenovatePr {
                     let (reason, body) = unsafe_texts(&verdict.reason);
                     self.stop(CommentKind::Unsafe, reason, body)
                 }
-                (Some(_), _) if auto_merge => {
+                (Some(_), _) if auto_merge && self.access.can_merge => {
                     self.pending = Some(Pending::Merge);
                     Turn::Factory
                 }
+                (Some(_), _) if auto_merge => Turn::User(Ask::Renovate {
+                    reason: format!(
+                        "Every check passed and the diff check found the update safe. The {} may not \
+                         merge it: it needs Write access, and merge rights on the base branch. \
+                         Merge it on the forge, or give the account the access.",
+                        self.access.who()
+                    ),
+                    state: RenovateWait::Ready,
+                }),
                 (Some(_), _) => Turn::User(Ask::Renovate {
                     reason: "Every check passed and the diff check found the update safe. \
                              Merge it on GitHub, or turn on auto-merge for the project."
@@ -1219,6 +1278,9 @@ pub enum Event {
         ci: RenovateCi,
         limits: RetryLimits,
         auto_merge: bool,
+        /// What the project account may do in the repository now.
+        #[serde(default)]
+        access: Box<RenovateAccess>,
     },
     /// The factory posted the comment of [`Command::PostComment`].
     Commented,
@@ -1280,7 +1342,7 @@ pub enum Rejected {
     /// duplicate or late event ends here.
     Unexpected {
         stage: Stage,
-        event: Event,
+        event: Box<Event>,
     },
     AnswerCount {
         expected: usize,
@@ -1382,6 +1444,7 @@ impl Job {
             fix: None,
             pending: None,
             rerun: RerunKind::Auto,
+            access: RenovateAccess::default(),
         }));
         job
     }
@@ -1905,6 +1968,7 @@ impl Job {
                     ci,
                     limits,
                     auto_merge,
+                    access,
                 },
             ) => {
                 if matches!(pr.pending, Some(Pending::Comment { .. } | Pending::Rebase)) {
@@ -1913,8 +1977,10 @@ impl Job {
                         ci,
                         limits,
                         auto_merge,
+                        access,
                     }));
                 }
+                pr.access = *access;
                 let waiting = turn.waits_for_head();
                 if pr.head.as_deref() != Some(head.as_str()) {
                     pr.reset(head);
@@ -2460,7 +2526,7 @@ impl Job {
     fn unexpected(&self, event: Event) -> Rejected {
         Rejected::Unexpected {
             stage: self.stage.clone(),
-            event,
+            event: Box::new(event),
         }
     }
 }

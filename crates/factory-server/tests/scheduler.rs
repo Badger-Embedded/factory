@@ -336,6 +336,7 @@ impl Executor for FakeExecutor {
                     ci,
                     limits: request.limits,
                     auto_merge: request.auto_merge,
+                    access: Box::default(),
                 })
             }
         })
@@ -4721,6 +4722,7 @@ fn observed(head: &str, ci: factory_core::RenovateCi) -> Event {
         ci,
         limits: factory_core::RetryLimits { auto: 0, total: 7 },
         auto_merge: false,
+        access: Box::default(),
     }
 }
 

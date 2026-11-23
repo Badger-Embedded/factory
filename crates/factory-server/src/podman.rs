@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
-use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
+use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateAccess, RenovateCi};
 use factory_runner::{
-    BranchSummary, Ci, Credential, ForgeKind, Git, HeadCommit, Observation, PrState,
+    Access, BranchSummary, Ci, Credential, ForgeKind, Git, HeadCommit, Observation, PrState,
     RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
     backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
     show_images,
@@ -580,6 +580,24 @@ impl Executor for PodmanExecutor {
         if request.watch_only && request.known_head.as_deref() == Some(status.head.as_str()) {
             return Ok(None);
         }
+        let access = {
+            let reader = request.account.resolve()?;
+            let level = blame(
+                &reader.owner,
+                forge.access(&reader.account, &request.repo).await,
+            )?;
+            let may_merge = blame(
+                &reader.owner,
+                forge
+                    .may_merge(&reader.account, &request.repo, request.number, level)
+                    .await,
+            )?;
+            Box::new(RenovateAccess {
+                can_rerun: matches!(level, Access::Write | Access::Admin),
+                can_merge: may_merge,
+                account: reader.account.login.clone(),
+            })
+        };
         let ci = match ci {
             Ci::NoChecks => RenovateCi::NoChecks,
             Ci::Pending => RenovateCi::Pending,
@@ -618,6 +636,7 @@ impl Executor for PodmanExecutor {
             ci,
             limits: request.limits,
             auto_merge: request.auto_merge,
+            access,
         }))
     }
 
