@@ -46,8 +46,7 @@ const MCP_TOKEN_ENV: &str = "FACTORY_MCP_TOKEN";
 
 /// The instruction appended to a Copilot prompt. The CLI has no output-schema
 /// flag, so the run must end with the JSON itself; [`prompt`](crate::prompt)
-/// writes this text and then the stage's schema. It gives the reason for the
-/// rule and a place for the summary, since agents wrote one anyway.
+/// writes this text and then the stage's schema.
 const SCHEMA_IN_PROMPT: &str = "This agent has no structured-output mode, so produce the \
      outcome yourself. End the run with one final message that holds only the JSON for your \
      outcome and nothing else: no sentence before it and none after. The factory parses that \
