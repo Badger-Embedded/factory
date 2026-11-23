@@ -845,7 +845,12 @@ label.check input { width: auto; }
   .topbar-end { gap: var(--space-8); flex: 1 1 100%; }
   .project-picker { position: static; flex: 0 1 auto; }
   .topbar-inner { position: relative; }
-  .picker-panel { left: var(--space-16); width: auto; right: var(--space-16); }
+  .picker-panel {
+    left: var(--space-16);
+    width: auto;
+    right: var(--space-16);
+    max-height: calc(100vh - 2 * var(--topbar-height) - var(--space-16));
+  }
   .user { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 

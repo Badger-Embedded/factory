@@ -1,27 +1,3 @@
-// Project picker in the board's top bar, by test name. Each test gives its
-// login its own projects, so the rows it sees are the ones it seeds.
-//
-// - The native select is gone; a button named Project opens a panel with one
-//   row per project, and a row opens that project's board and is remembered:
-//   "the picker is a button that opens a panel of project links"
-// - A row's counts equal the board's section counts, and a dismissed failed
-//   job adds to neither: "the row counts equal the board section counts"
-// - A running-only project shows a dot and an idle one its name only:
-//   "a running project shows a dot and an idle one shows its name only"
-// - Rows read Needs you, Failed, Running, then the rest:
-//   "the rows read needs you, failed, running, then idle"
-// - With 50 projects the panel stays in the viewport, rows stay on one line
-//   and the list scrolls: "50 projects keep the panel inside the viewport at $width px"
-// - Clicking outside or pressing Esc closes the panel, and Esc returns focus
-//   to the button: "a click outside and Esc close the panel"
-// - A job entering Needs you in another project updates its row without a
-//   reload, and the panel stays open: "a row updates without a reload while the panel is open"
-// - A project the login does not collaborate on has no row, and its fragment is 404:
-//   "a project the login does not collaborate on has no row"
-// - Without JavaScript the panel opens and a row switches the board:
-//   "without JavaScript the panel opens and a row switches the board"
-// - A display name shows in the button and the row, and the link carries the
-//   identifier: "a display name shows in the button and the row"
 import type { Page } from '@playwright/test';
 import { ADMIN, COLLABORATOR, SHARED_PROJECT, expect, test, type Factory } from '../fixtures';
 
@@ -39,7 +15,7 @@ function job(factory: Factory, project: string, stage: string) {
   return Number(factory.fixture('job', '--project', project, '--stage', stage, '--request', `A ${stage} job`).trim());
 }
 
-const button = (page: Page) => page.getByLabel('Project', { exact: true });
+const button = (page: Page) => page.getByRole('button', { name: 'Project', exact: true });
 const row = (page: Page, project: string) => page.locator(`#picker-list li[data-id="${project}"]`);
 
 test.describe('as a login of its own', () => {
@@ -205,6 +181,66 @@ test.describe('as a login of its own', () => {
     const link = page.locator('#picker-list a[aria-current="page"]');
     await expect(link.locator('.picker-name')).toHaveText('Pretty Name');
     await expect(link).toHaveAttribute('href', `/?project=${name}`);
+  });
+
+  test('removing the selected project in another tab moves this board to a remaining project', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    projectFor(factory, login, `gone${tag}`);
+    projectFor(factory, login, `stay${tag}`);
+
+    await page.goto(`/?project=gone${tag}`);
+    await expect(row(page, `stay${tag}`)).toHaveCount(1);
+
+    const other = await page.context().newPage();
+    await other.goto(`/settings/projects/gone${tag}`);
+    await other.getByLabel('Project name').fill(`gone${tag}`);
+    await other.getByRole('button', { name: `Remove gone${tag}` }).click();
+    await expect(other.getByText(`Removed project gone${tag}.`)).toBeVisible();
+
+    await expect(page).toHaveURL(/\/$/, { timeout: 15_000 });
+    await expect(button(page)).toContainText(`stay${tag}`);
+    await expect(page.locator('#picker-list li')).toHaveCount(1);
+  });
+
+  test('a rename updates the button and keeps focus on the same row while the panel is open', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    projectFor(factory, login, `ren${tag}`);
+    projectFor(factory, login, `other${tag}`);
+
+    await page.goto(`/?project=ren${tag}`);
+    await button(page).click();
+    const link = page.locator(`#picker-list a[href="/?project=other${tag}"]`);
+    await link.focus();
+    await expect(link).toBeFocused();
+
+    const second = await page.context().newPage();
+    await second.goto(`/settings/projects/ren${tag}`);
+    const card = second.locator('form.settings-form').filter({ hasText: 'Project name' });
+    await card.getByLabel('Name', { exact: true }).fill('Renamed');
+    await card.getByRole('button', { name: 'Save name' }).click();
+    await expect(second.getByText('Saved.', { exact: true })).toBeVisible();
+
+    await expect(button(page)).toHaveText('Renamed', { timeout: 15_000 });
+    await expect(page.locator('.picker-panel')).toBeVisible();
+    await expect(page.locator(`#picker-list a[href="/?project=other${tag}"]`)).toBeFocused();
+  });
+
+  test('the button is a named button and the panel fits a short narrow viewport', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.setViewportSize({ width: 390, height: 400 });
+    for (let i = 0; i < 30; i++) projectFor(factory, login, `s${String(i).padStart(2, '0')}${tag}`);
+
+    await page.goto(`/?project=s00${tag}`);
+    await expect(page.getByRole('button', { name: 'Project', exact: true })).toHaveCount(1);
+    await button(page).click();
+    const panel = await page.locator('.picker-panel').boundingBox();
+    expect(panel!.y + panel!.height).toBeLessThanOrEqual(400);
   });
 });
 

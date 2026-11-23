@@ -641,7 +641,7 @@ fn project_selector(
 ) -> Markup {
     html! {
         details.project-picker #project-picker {
-            summary aria-label="Project" aria-expanded="false" {
+            summary role="button" aria-label="Project" aria-expanded="false" {
                 span.picker-current { (shown_name(labels, selected)) }
                 span.picker-chevron aria-hidden="true" {}
             }

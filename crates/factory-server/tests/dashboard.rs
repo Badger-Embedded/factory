@@ -4257,7 +4257,9 @@ async fn the_picker_is_in_the_topbar_and_the_form_has_no_project_select() {
     let (topbar, rest) = page.body.split_at(main);
     assert!(!page.body.contains("<select"));
     assert!(topbar.contains("<details class=\"project-picker\" id=\"project-picker\">"));
-    assert!(topbar.contains("<summary aria-label=\"Project\" aria-expanded=\"false\">"));
+    assert!(
+        topbar.contains("<summary role=\"button\" aria-label=\"Project\" aria-expanded=\"false\">")
+    );
     assert!(topbar.contains("<span class=\"picker-current\">tool</span>"));
     assert!(topbar.contains("<a href=\"/?project=maestro\">"));
     assert_current_project(&page.body, "tool", "tool");
@@ -4390,7 +4392,6 @@ async fn picker_counts_equal_the_board_section_counts() {
     dashboard.apply(review, Event::Published { number: 3 });
     let failed = dashboard.new_job().await;
     fail_job(&dashboard, failed);
-    // The publish gate setup turns the spec and plan gates off, so it goes last.
     let publish = at_publish_gate(&dashboard).await;
     dashboard.apply(publish, Event::Summarized(branch_summary()));
     let dismissed = dashboard.new_job().await;
@@ -4401,7 +4402,6 @@ async fn picker_counts_equal_the_board_section_counts() {
     assert_eq!(picker_counts(&body, "maestro"), (5, 1));
     assert_eq!(board_counts(&body), (5, 1));
 
-    // A review with auto-merge on leaves Needs you.
     dashboard
         .store
         .save_project_auto_merge("maestro", true)
@@ -4449,7 +4449,6 @@ async fn the_picker_orders_needs_you_then_failed_then_running_then_the_rest() {
     assert_eq!(order, ["c-you", "b-failed", "d-running", "a-idle"]);
     let groups: Vec<_> = rows.iter().map(|(_, group, _)| group.as_str()).collect();
     assert_eq!(groups, ["you", "failed", "running", "idle"]);
-    // An idle row shows its name only, and a running row a dot without a number.
     assert_eq!(rows[3].2, Vec::<String>::new());
     assert_eq!(rows[2].2, ["running"]);
 }
