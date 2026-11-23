@@ -675,3 +675,64 @@ mcpTest('a login that is not a collaborator gets the 404 page for a project MCP 
   expect(response?.status()).toBe(404);
   await expect(page.getByText(`no project ${mcpProject}`)).toBeVisible();
 });
+
+test('a stdio MCP server takes extra arguments, keeps them when off and shows in the pipeline', async ({
+  page,
+  project,
+}) => {
+  const server = `pw-${Math.random().toString(36).slice(2, 8)}`;
+  const added = await page.request.post('/settings/mcp', {
+    form: { name: server, kind: 'stdio', command: 'playwright-mcp', arg: '--no-sandbox' },
+    maxRedirects: 0,
+  });
+  expect(added.status()).toBeLessThan(400);
+  const path = `/settings/projects/${project}/mcp/${server}`;
+  const enable = page.getByLabel(`Run this server for ${project}`);
+  const args = page.getByLabel('Argument');
+  const line = page.locator('.mcp-command-line');
+
+  await page.goto(settingsPath(project));
+  await expect(page.locator('.server-row').filter({ hasText: server })).toContainText('Off');
+  await page.getByRole('link', { name: 'Configure' }).click();
+  await expect(page).toHaveURL(path);
+  await expect(page.getByRole('button', { name: 'Refresh connection' })).toHaveCount(0);
+  await expect(page.locator('.mcp-tool')).toHaveCount(0);
+  await expect(page.getByText('so the factory cannot check its connection')).toBeVisible();
+  await expect(line).toHaveText('playwright-mcp --no-sandbox');
+
+  await enable.check();
+  await page.getByRole('checkbox', { name: 'implement', exact: true }).check();
+  await args.nth(0).fill('--headless');
+  await page.getByRole('button', { name: 'Add argument' }).click();
+  await args.last().fill('--viewport-size=1280x720');
+  await args.nth(1).fill('--junk');
+  await page.getByRole('button', { name: 'Remove' }).nth(1).click();
+  await page.getByRole('button', { name: 'Add argument' }).click();
+  await args.last().fill('a  b');
+  await expect(page.getByText('Unsaved changes.')).toBeVisible();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto(path);
+  await expect(args.nth(0)).toHaveValue('--headless');
+  await expect(args.nth(1)).toHaveValue('--viewport-size=1280x720');
+  await expect(line).toHaveText("playwright-mcp --no-sandbox --headless --viewport-size=1280x720 'a  b'");
+  expect(await line.evaluate((el) => getComputedStyle(el).whiteSpace)).toBe('pre-wrap');
+
+  await enable.uncheck();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await enable.check();
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await expect(args.nth(1)).toHaveValue('--viewport-size=1280x720');
+
+  await page.goto(settingsPath(project, '?stage=spec'));
+  const specBox = panel(page, 'spec').getByRole('checkbox', { name: server });
+  await specBox.check();
+  await page.getByRole('button', { name: `Save ${project}` }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await page.goto(path);
+  await expect(page.getByRole('checkbox', { name: 'spec', exact: true })).toBeChecked();
+  await expect(args.nth(1)).toHaveValue('--viewport-size=1280x720');
+});

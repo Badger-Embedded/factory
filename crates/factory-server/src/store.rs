@@ -208,6 +208,12 @@ CREATE TABLE IF NOT EXISTS project_mcp_tool_refreshes (
     latest INTEGER NOT NULL,
     PRIMARY KEY (project, server)
 );
+CREATE TABLE IF NOT EXISTS project_mcp_args (
+    project TEXT NOT NULL,
+    server TEXT NOT NULL,
+    args TEXT NOT NULL,
+    PRIMARY KEY (project, server)
+);
 CREATE TABLE IF NOT EXISTS cost_closed_jobs (
     job_id INTEGER PRIMARY KEY REFERENCES jobs (id)
 );
@@ -3213,7 +3219,7 @@ impl Store {
     /// The deleted configuration is the project's rows in `projects`,
     /// `project_models`, `project_settings`, `project_gates`, `project_efforts`,
     /// `project_agents`, `project_mcp`, `project_mcp_tools`,
-    /// `project_mcp_tool_refreshes`, `project_totals` and
+    /// `project_mcp_tool_refreshes`, `project_mcp_args`, `project_totals` and
     /// `project_collaborators`, `project_maintenance`, `renovate_prs`, its MCP header values in `secrets`, its
     /// `job_costs` rows, and the `cost` rows in `job_events` for its jobs. With
     /// no collaborator rows left, the project and its surviving jobs are visible
@@ -3260,6 +3266,7 @@ impl Store {
             "project_mcp",
             "project_mcp_tools",
             "project_mcp_tool_refreshes",
+            "project_mcp_args",
             "project_totals",
             "project_collaborators",
             "project_maintenance",
@@ -4366,6 +4373,7 @@ impl Store {
         tx.execute("DELETE FROM secrets WHERE server = ?1", [name])?;
         tx.execute("DELETE FROM project_mcp WHERE server = ?1", [name])?;
         tx.execute("DELETE FROM project_mcp_tools WHERE server = ?1", [name])?;
+        tx.execute("DELETE FROM project_mcp_args WHERE server = ?1", [name])?;
         tx.execute(
             "DELETE FROM project_mcp_tool_refreshes WHERE server = ?1",
             [name],
@@ -4445,6 +4453,48 @@ impl Store {
                 stages.implement,
                 stages.review
             ],
+        )?;
+        Ok(())
+    }
+
+    /// The extra arguments `project` appends after the base arguments of the
+    /// stdio server `server`, in order. Empty when no row is stored.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or when the stored list is not valid JSON.
+    pub fn project_mcp_args(&self, project: &str, server: &str) -> Result<Vec<String>, StoreError> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT args FROM project_mcp_args WHERE project = ?1 AND server = ?2",
+                params![project, server],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Saves `project`'s extra arguments for `server`, writing only this row.
+    /// The caller has validated them with [`crate::mcp::validate_args`].
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_mcp_args(
+        &self,
+        project: &str,
+        server: &str,
+        args: &[String],
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(args)?;
+        self.conn().execute(
+            "INSERT INTO project_mcp_args (project, server, args) VALUES (?1, ?2, ?3)
+             ON CONFLICT (project, server) DO UPDATE SET args = excluded.args",
+            params![project, server, json],
         )?;
         Ok(())
     }

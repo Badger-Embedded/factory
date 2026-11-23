@@ -849,6 +849,17 @@ pub struct ServerSettings {
     pub headers: Vec<HeaderState>,
     /// The tools the last refresh stored, each with its on or off state.
     pub tools: Vec<McpToolState>,
+    /// The command line parts when the server is stdio, `None` when it is remote.
+    pub stdio: Option<StdioSettings>,
+}
+
+/// A stdio server as a project's page shows it.
+pub struct StdioSettings {
+    pub command: String,
+    /// The registry's base arguments.
+    pub args: Vec<String>,
+    /// The arguments this project appends after the base ones.
+    pub extra_args: Vec<String>,
 }
 
 /// One declared header in a project's server block. `set` is whether a value is
@@ -2237,6 +2248,9 @@ fn project_servers_card(project: &ProjectSettings, admin: bool) -> Markup {
                     span.server-name { (server.name) }
                     span.hint.server-url {
                         (usage_line(server.enabled, server.stages))
+                        @if server.stdio.is_some() {
+                            " · stdio"
+                        }
                         @if !server.tools.is_empty() {
                             " · " (on) " of " (server.tools.len()) " tools on"
                         }
@@ -2273,22 +2287,93 @@ pub fn settings_project_mcp(
             h1 { (server.name) " for " (project.shown) }
             p.meta {
                 @if nav.admin {
-                    "The server's URL and header names are on "
+                    @if server.stdio.is_some() {
+                        "The server's command and base arguments are on "
+                    } @else {
+                        "The server's URL and header names are on "
+                    }
                     a href={ "/settings/mcp/" (crate::web::query_escape(&server.name)) } { "its own page" }
                     ". "
                 }
                 "The values here are this project's alone."
             }
-            @if !secrets_available {
+            @if !secrets_available && server.stdio.is_none() {
                 p.hint.bad { "The master key is missing, so header values cannot be saved. The enabled switch, stages and tools still save." }
             }
             form.card.settings-form method="post" action=(project_mcp_href(&project.id, &server.name)) {
                 (project_server_block(project, server, secrets_available))
                 (save_bar("Save"))
             }
-            script { (PreEscaped(MCP_TOOLS)) }
+            @if server.stdio.is_some() {
+                script { (PreEscaped(MCP_ROWS)) }
+            } @else {
+                script { (PreEscaped(MCP_TOOLS)) }
+            }
         },
     )
+}
+
+fn stdio_block(stdio: &StdioSettings) -> Markup {
+    let line = std::iter::once(&stdio.command)
+        .chain(&stdio.args)
+        .chain(&stdio.extra_args)
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    html! {
+        div.field {
+            span.label { "Command" }
+            p { code { (stdio.command) } }
+            @if !stdio.args.is_empty() {
+                span.label { "Base arguments" }
+                p { @for arg in &stdio.args { code.mcp-arg { (arg) } " " } }
+            }
+            p.hint { "Set by an admin on the server's own page. They run inside the worker of every project that turns the server on." }
+        }
+        div.field {
+            span.label { "Extra arguments" }
+            div.mcp-args {
+                @for arg in &stdio.extra_args {
+                    @if arg.contains(['\r', '\n']) {
+                        (escaped_arg_row(arg))
+                    } @else {
+                        (arg_row(arg))
+                    }
+                }
+                @for _ in 0..3 {
+                    (arg_row(""))
+                }
+            }
+            template { (arg_row("")) }
+            button.add-arg type="button" { "Add argument" }
+            p.hint { "Appended after the server's own arguments, in this order, for this project's runs only. The agent can read them, so no secret belongs here. An argument is passed as one value, with no shell splitting, and may not contain ${. Runs do not start stdio servers yet, so a saved list takes effect once worker support lands." }
+        }
+        div.field {
+            span.label { "Command line a run starts" }
+            p { code.mcp-command-line { (line) } }
+        }
+        p.hint { "This server runs inside the worker, so the factory cannot check its connection or turn off single tools." }
+    }
+}
+
+fn shell_quote(part: &str) -> String {
+    if part.contains(['\r', '\n']) {
+        let escaped = part
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\r', "\\r")
+            .replace('\n', "\\n");
+        return format!("$'{escaped}'");
+    }
+    let plain = !part.is_empty()
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_=./:@%+,".contains(&b));
+    if plain {
+        part.to_owned()
+    } else {
+        format!("'{}'", part.replace('\'', "'\\''"))
+    }
 }
 
 /// The header-name rows a server form shares: one text box per stored name, each
@@ -2940,7 +3025,11 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bo
                         @if server.headers.iter().any(|header| !header.set) {
                             span.bad { "Key missing. " }
                         }
-                        a href=(project_mcp_href(name, &server.name)) { "Key and tools for " (server.name) }
+                        @if server.stdio.is_some() {
+                            a href=(project_mcp_href(name, &server.name)) { "Arguments for " (server.name) }
+                        } @else {
+                            a href=(project_mcp_href(name, &server.name)) { "Key and tools for " (server.name) }
+                        }
                     }
                 }
             }
@@ -2985,50 +3074,54 @@ fn project_server_block(
     let base = format!("mcp.{}", server.name);
     let stages = server.stages;
     html! {
-        div.mcp-project {
-            div.field {
-                label.check {
-                    input type="checkbox" name={ (base) ".enabled" } value="on"
-                        checked[server.enabled];
-                    " Run this server for " (project.shown)
-                }
-            }
-            div.field {
-                p.hint { "The stages it runs in. An enabled server needs at least one." }
-                @for (stage, on) in [
-                    ("clarify", stages.clarify),
-                    ("spec", stages.spec),
-                    ("plan", stages.plan),
-                    ("implement", stages.implement),
-                    ("review", stages.review),
-                ] {
-                    label.check {
-                        input type="checkbox" name={ (base) ".stage." (stage) } value="on"
-                            checked[on];
-                        " " (stage)
-                    }
-                }
-            }
-            @for header in &server.headers {
-                div.field {
-                    label for={ (base) "-header-" (header.name) } { (header.name) }
-                    input id={ (base) "-header-" (header.name) }.wide type="password"
-                        name={ (base) ".header." (header.name) }
-                        autocomplete="off" placeholder=(if header.set { "set" } else { "not set" })
-                        disabled[!secrets_available];
-                    label.check {
-                        input type="checkbox" name={ (base) ".clear." (header.name) } value="on";
-                        " Clear the stored value"
-                    }
-                    p.hint {
-                        @if header.set { "A value is stored. " } @else { "No value is stored. " }
-                        "Type a new value to replace it. An empty field keeps it."
-                    }
-                }
-            }
-            (mcp_refresh(&project.id, &server.name, &server.tools, None))
-        }
-    }
+           div.mcp-project {
+               div.field {
+                   label.check {
+                       input type="checkbox" name={ (base) ".enabled" } value="on"
+                           checked[server.enabled];
+                       " Run this server for " (project.shown)
+                   }
+               }
+               div.field {
+                   p.hint { "The stages it runs in. An enabled server needs at least one." }
+                   @for (stage, on) in [
+                       ("clarify", stages.clarify),
+                       ("spec", stages.spec),
+                       ("plan", stages.plan),
+                       ("implement", stages.implement),
+                       ("review", stages.review),
+                   ] {
+                       label.check {
+                           input type="checkbox" name={ (base) ".stage." (stage) } value="on"
+                               checked[on];
+                           " " (stage)
+                       }
+                   }
+               }
+    @if let Some(stdio) = &server.stdio {
+                   (stdio_block(stdio))
+               } @else {
+               @for header in &server.headers {
+                   div.field {
+                       label for={ (base) "-header-" (header.name) } { (header.name) }
+                       input id={ (base) "-header-" (header.name) }.wide type="password"
+                           name={ (base) ".header." (header.name) }
+                           autocomplete="off" placeholder=(if header.set { "set" } else { "not set" })
+                           disabled[!secrets_available];
+                       label.check {
+                           input type="checkbox" name={ (base) ".clear." (header.name) } value="on";
+                           " Clear the stored value"
+                       }
+                       p.hint {
+                           @if header.set { "A value is stored. " } @else { "No value is stored. " }
+                           "Type a new value to replace it. An empty field keeps it."
+                       }
+                   }
+               }
+               (mcp_refresh(&project.id, &server.name, &server.tools, None))
+               }
+           }
+       }
 }
 
 /// The "Refresh connection" button, its result area and the server's tool list
