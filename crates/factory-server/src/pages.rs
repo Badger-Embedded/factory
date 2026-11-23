@@ -129,7 +129,7 @@ fn page(user: &str, title: &str, nav: &Markup, body: &Markup) -> Markup {
                         div.topbar-end {
                             a.nav href="/onboard" { "Onboard" }
                             a.nav href="/settings" { "Settings" }
-                            @if !user.is_empty() { span.user { (user) } }
+                            @if !user.is_empty() { span.user title=(user) { (user) } }
                         }
                     }
                 }
