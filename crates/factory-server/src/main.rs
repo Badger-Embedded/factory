@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use factory_runner::{ForgeKind, Git, GitHub, GitLab, WorkerConfig};
 use factory_server::{
-    Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, HttpMcpChecker,
-    LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor,
-    PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler, SecretStore, Store,
-    StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
-    master_key_from_env, parse_admins, proxy_app_with_roots,
+    Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, GlabRepos,
+    HttpMcpChecker, LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache,
+    PodmanExecutor, PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler,
+    SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app,
+    import_tomls, master_key_from_env, parse_admins, proxy_app_with_roots,
 };
 use tokio::sync::Notify;
 
@@ -225,6 +225,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
+    let salsa = GitLab {
+        glab: path_var("FACTORY_GLAB", "glab"),
+        host: ForgeKind::Salsa.host().into(),
+        ..GitLab::default()
+    };
     let forges = Forges::new(
         Arc::new(GitHub {
             gh: path_var("FACTORY_GH", "gh"),
@@ -234,11 +239,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             gh: path_var("FACTORY_GH", "gh"),
         }),
     )
-    .with_salsa(Arc::new(GitLab {
-        glab: path_var("FACTORY_GLAB", "glab"),
-        host: ForgeKind::Salsa.host().into(),
-        ..GitLab::default()
-    }));
+    .with_salsa(Arc::new(salsa.clone()))
+    .with_salsa_checker(Arc::new(GlabRepos { gitlab: salsa }));
 
     if let Some(token) = gh_token() {
         factory_server::forge_tokens::copy_gh_token(

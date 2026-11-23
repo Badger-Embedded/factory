@@ -13,6 +13,36 @@ if [ "$1" = api ] && [ "$GITLAB_HOST" = salsa.debian.org ]; then
         echo "glab: 401 Unauthorized (HTTP 401)" >&2
         exit 1
       fi
+      case "$4" in
+        projects/e2e%2Fsub%2Fgood)
+          echo '{"squash_option":"default_on","permissions":{"project_access":{"access_level":30},"group_access":null}}'
+          exit 0
+          ;;
+        projects/e2e%2Fsub%2Freporter)
+          echo '{"squash_option":"default_on","permissions":{"project_access":{"access_level":20},"group_access":null}}'
+          exit 0
+          ;;
+        projects/e2e%2Fsub%2Fgood/repository/branches/main | projects/e2e%2Fsub%2Freporter/repository/branches/main)
+          echo '{"protected":true,"commit":{"id":"abc123"}}'
+          exit 0
+          ;;
+        projects/e2e%2Fsub%2Fgood/protected_branches?per_page=100\&page=1)
+          echo '[{"name":"main","merge_access_levels":[{"access_level":30}]}]'
+          exit 0
+          ;;
+        projects/e2e%2Fsub%2Fgood/pipelines?ref=main\&sha=abc123\&per_page=1 | projects/e2e%2Fsub%2Freporter/pipelines?ref=main\&sha=abc123\&per_page=1)
+          echo '[{"id":1}]'
+          exit 0
+          ;;
+        projects/e2e%2Fsub%2Fgood/protected_branches?per_page=100\&page=2)
+          echo '[]'
+          exit 0
+          ;;
+        projects/*)
+          echo "glab: 404 Not Found (HTTP 404)" >&2
+          exit 1
+          ;;
+      esac
       ;;
   esac
 fi

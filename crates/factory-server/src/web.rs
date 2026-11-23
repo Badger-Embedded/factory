@@ -3642,6 +3642,9 @@ const DEFAULT_BASE: &str = "main";
 
 #[derive(Deserialize)]
 struct OnboardForm {
+    /// The forge's stored name. Empty means GitHub.
+    #[serde(default)]
+    forge: String,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -3671,6 +3674,7 @@ struct OnboardForm {
 
 async fn show_onboard(headers: HeaderMap, Query(query): Query<NoticeQuery>) -> Markup {
     let view = pages::OnboardView {
+        forge: ForgeKind::GitHub,
         name: "",
         repo: "",
         base: DEFAULT_BASE,
@@ -3692,6 +3696,13 @@ async fn submit_onboard(
     headers: HeaderMap,
     Form(form): Form<OnboardForm>,
 ) -> Result<Response, AppError> {
+    let forge_field = form.forge.trim();
+    let parsed_forge = if forge_field.is_empty() {
+        Some(ForgeKind::GitHub)
+    } else {
+        ForgeKind::parse(forge_field)
+    };
+    let forge = parsed_forge.unwrap_or(ForgeKind::GitHub);
     let name = form.name.trim();
     let repo = form.repo.trim();
     let base_field = form.base.trim();
@@ -3713,30 +3724,39 @@ async fn submit_onboard(
     let auto_merge = form.auto_merge.is_some();
     let llm_review = form.llm_review.is_some();
 
-    let _one_onboarding_at_a_time = state.onboarding.lock().await;
-    let (mut report, token_page) =
-        onboard_report(&state, &headers, effective_name, repo, base).await?;
-
-    if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
-        let _pass = state.slots.lock_pass().await;
-        let leftover = state.store.job_ids_for(effective_name)?;
-        if leftover.iter().any(|id| state.slots.has_task(*id)) {
-            report.errors.push(
-                "This name's removed project still has a job finishing. Try again in a minute."
-                    .to_owned(),
-            );
-        } else {
-            for id in &leftover {
-                state.store.delete_job(*id, &state.data_dir)?;
-            }
-        }
+    if parsed_forge.is_none() {
+        let report = RepoReport {
+            errors: vec![format!(
+                "The forge {forge_field:?} is not one the factory supports."
+            )],
+            warnings: Vec::new(),
+        };
+        let view = pages::OnboardView {
+            forge,
+            name,
+            repo,
+            base: base_field,
+            checks,
+            models: &models,
+            auto_merge,
+            llm_review,
+            token_page: None,
+        };
+        return Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response());
     }
 
+    let _one_onboarding_at_a_time = state.onboarding.lock().await;
+    let (mut report, token_page) =
+        onboard_report(&state, &headers, effective_name, forge, repo, base).await?;
+
+    if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
+        clear_leftover_jobs(&state, effective_name, &mut report).await?;
+    }
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         let checks = (!checks.is_empty()).then_some(checks);
         match state.store.create_project_as(
             effective_name,
-            ForgeKind::GitHub,
+            forge,
             repo,
             base,
             checks,
@@ -3745,16 +3765,7 @@ async fn submit_onboard(
         ) {
             Ok(()) => {
                 if form.action == "create" {
-                    if models != StageModels::default() {
-                        state.store.save_project_models(effective_name, &models)?;
-                    }
-                    if auto_merge || llm_review {
-                        state.store.save_project_settings(
-                            effective_name,
-                            auto_merge,
-                            llm_review,
-                        )?;
-                    }
+                    save_onboard_options(&state, effective_name, &models, auto_merge, llm_review)?;
                 }
                 state.wake.notify_one();
                 return Ok(
@@ -3773,6 +3784,7 @@ async fn submit_onboard(
     }
 
     let view = pages::OnboardView {
+        forge,
         name,
         repo,
         base: base_field,
@@ -3783,6 +3795,46 @@ async fn submit_onboard(
         token_page: token_page.as_deref(),
     };
     Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response())
+}
+
+fn save_onboard_options(
+    state: &AppState,
+    name: &str,
+    models: &StageModels,
+    auto_merge: bool,
+    llm_review: bool,
+) -> Result<(), AppError> {
+    if *models != StageModels::default() {
+        state.store.save_project_models(name, models)?;
+    }
+    if auto_merge || llm_review {
+        state
+            .store
+            .save_project_settings(name, auto_merge, llm_review)?;
+    }
+    Ok(())
+}
+
+/// Deletes the jobs a removed project of this name left behind, or adds a
+/// blocking error when one still has a task.
+async fn clear_leftover_jobs(
+    state: &AppState,
+    name: &str,
+    report: &mut RepoReport,
+) -> Result<(), AppError> {
+    let _pass = state.slots.lock_pass().await;
+    let leftover = state.store.job_ids_for(name)?;
+    if leftover.iter().any(|id| state.slots.has_task(*id)) {
+        report.errors.push(
+            "This name's removed project still has a job finishing. Try again in a minute."
+                .to_owned(),
+        );
+    } else {
+        for id in &leftover {
+            state.store.delete_job(*id, &state.data_dir)?;
+        }
+    }
+    Ok(())
 }
 
 /// The name a project is created under: the typed name, or the repository name
@@ -3834,17 +3886,17 @@ fn onboarder_account(
     }
 }
 
-/// The repository checks plus the name and repo uniqueness rules. A GitHub call
+/// The repository checks on `forge` plus the name and repo uniqueness rules. A forge call
 /// that could not run becomes a blocking error, so the operator sees it and can
 /// retry rather than the page returning a 500.
 async fn onboard_report(
     state: &AppState,
     headers: &HeaderMap,
     name: &str,
+    forge: ForgeKind,
     repo: &str,
     base: &str,
 ) -> Result<(RepoReport, Option<String>), AppError> {
-    let forge = ForgeKind::GitHub;
     let mut token_page = None;
     let mut report = match onboarder_account(state, headers, forge)? {
         Onboarder::Account(account) => match state

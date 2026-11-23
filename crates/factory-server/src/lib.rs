@@ -10,6 +10,7 @@ mod device_login;
 pub mod forge_tokens;
 mod forges;
 mod github;
+mod gitlab;
 mod localtime;
 mod mcp;
 mod pages;
@@ -43,6 +44,7 @@ pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
     check_repo,
 };
+pub use gitlab::GlabRepos;
 pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
 pub use podman::PodmanExecutor;
 pub use projects::{
