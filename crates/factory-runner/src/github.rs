@@ -1150,17 +1150,23 @@ impl GitHub {
         let mut child = command
             .spawn()
             .map_err(|err| format!("could not start {}: {err}", self.gh.display()))?;
-        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            pipe.write_all(text.as_bytes())
-                .await
-                .map_err(|err| format!("writing to gh: {err}"))?;
-        }
+        let written = match (stdin, child.stdin.take()) {
+            (Some(text), Some(mut pipe)) => pipe.write_all(text.as_bytes()).await,
+            _ => Ok(()),
+        };
         let output = child
             .wait_with_output()
             .await
             .map_err(|err| format!("waiting for gh: {err}"))?;
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            // gh may exit without reading its stdin, so a broken pipe on a
+            // successful exit is not an error.
+            match written {
+                Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => {
+                    Err(format!("writing to gh: {err}"))
+                }
+                _ => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+            }
         } else {
             Err(format!(
                 "gh {} failed: {}",
