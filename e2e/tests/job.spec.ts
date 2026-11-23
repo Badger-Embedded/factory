@@ -129,6 +129,26 @@ test('retrying a failed job resumes it', async ({ page, factory, project }) => {
   await expect(page.getByText('The job failed')).toHaveCount(0);
 });
 
+test('a job whose checks could not run links to the project settings', async ({ page, factory, project }) => {
+  const id = newJob(factory, project, 'checks-error');
+  await page.goto(`/jobs/${id}`);
+
+  await expect(page.getByText('The job failed')).toBeVisible();
+  const reason = status(page).locator('.failure-reason');
+  await expect(reason).toContainText('could not run');
+  await expect(reason).toContainText('command not found');
+  await expect(status(page)).toContainText("Revise the project's local checks command, then retry");
+  const link = status(page).getByRole('link', { name: `Local checks for ${project}` });
+  await expect(link).toHaveAttribute('href', `/settings/projects/${project}`);
+  await expect(link).not.toHaveAttribute('target', /.*/);
+  await expect(page.getByRole('button', { name: 'Dismiss' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Retry' }).click();
+
+  await expect(status(page)).toContainText("The factory is running the project's checks.");
+  await expect(page.getByText('The job failed')).toHaveCount(0);
+});
+
 test('dismissing a failed job takes it off the Failed section', async ({ page, factory, project }) => {
   const id = newJob(factory, project, 'failed');
   await page.goto(`/?project=${project}`);

@@ -112,6 +112,16 @@ fn events_for(stage: &str) -> Result<Vec<Event>> {
                 reason: "the worker ran out of memory".into(),
             },
         ],
+        "checks-error" => [
+            to_implementing,
+            vec![Event::Agent(AgentResult::CommitsReady(ready()))],
+            (0..5)
+                .map(|_| Event::ChecksError {
+                    error: "bash: just: command not found".into(),
+                })
+                .collect(),
+        ]
+        .concat(),
         "cancelled" => vec![Event::Start, Event::Cancel],
         other => return Err(format!("unknown stage {other}").into()),
     })

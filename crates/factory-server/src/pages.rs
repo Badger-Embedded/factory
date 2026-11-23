@@ -3225,7 +3225,7 @@ pub fn job(
             }
             div.job-layout {
                 div.job-now {
-                    (status_region(false, id, job, settings, auto_merge, gap_links))
+                    (status_region(false, id, &row.project, job, settings, auto_merge, gap_links))
                     p.meta { "Approval gates: " (gates_line(job.gates())) }
                 }
                 aside.job-side { (timeline_region(false, job, events, models, efforts)) }
@@ -3279,7 +3279,7 @@ pub fn job_fragment(
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd, any_estimated(events)))
         (timeline_region(true, job, events, models, efforts))
-        (status_region(true, row.id, job, settings, auto_merge, gap_links))
+        (status_region(true, row.id, &row.project, job, settings, auto_merge, gap_links))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
         (reviews_region(true, job))
@@ -3350,6 +3350,7 @@ fn timeline_region(
 fn status_region(
     oob: bool,
     id: i64,
+    project: &str,
     job: &Job,
     settings: &Settings,
     auto_merge: bool,
@@ -3357,7 +3358,7 @@ fn status_region(
 ) -> Markup {
     html! {
         div #job-status hx-swap-oob=[oob.then_some("true")] {
-            (status_card(id, job, settings, auto_merge, gap_links))
+            (status_card(id, project, job, settings, auto_merge, gap_links))
         }
     }
 }
@@ -3974,6 +3975,7 @@ fn proposal_card(id: i64, job: &Job) -> Markup {
 
 fn status_card(
     id: i64,
+    project: &str,
     job: &Job,
     settings: &Settings,
     auto_merge: bool,
@@ -4070,7 +4072,7 @@ fn status_card(
                 reason, dismissed, ..
             },
             _,
-        ) => failed_card(id, job, reason, *dismissed),
+        ) => failed_card(id, project, job, reason, *dismissed),
         _ => html! {
             div.card.status {
                 (turn_badge(job, auto_merge, &Wait::Ready))
@@ -4080,7 +4082,7 @@ fn status_card(
     }
 }
 
-fn failed_card(id: i64, job: &Job, reason: &str, dismissed: bool) -> Markup {
+fn failed_card(id: i64, project: &str, job: &Job, reason: &str, dismissed: bool) -> Markup {
     html! {
         div.card.failed {
             div.card-head {
@@ -4093,6 +4095,14 @@ fn failed_card(id: i64, job: &Job, reason: &str, dismissed: bool) -> Markup {
                 }
             }
             p.failure-reason { (reason) }
+            @if job.checks_could_not_run() {
+                p.hint {
+                    "Revise the project's local checks command, then retry, or retry to run the checks again. "
+                    a href={ "/settings/projects/" (crate::web::query_escape(project)) } {
+                        "Local checks for " (project)
+                    }
+                }
+            }
             @if job.can_retry() || !dismissed {
                 div.row.actions {
                     @if job.can_retry() {

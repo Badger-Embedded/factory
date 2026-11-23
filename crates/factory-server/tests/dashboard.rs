@@ -7429,6 +7429,60 @@ async fn a_retry_reruns_a_failed_agent_run() {
     );
 }
 
+const CHECKS_HINT: &str = "Revise the project's local checks command, then retry";
+
+#[tokio::test]
+async fn a_job_whose_checks_could_not_run_links_to_the_project_settings() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    for _ in 0..5 {
+        dashboard.apply(
+            id,
+            Event::ChecksError {
+                error: "bash: just: command not found".into(),
+            },
+        );
+    }
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The job failed"));
+    assert!(page.body.contains(CHECKS_HINT));
+    assert!(page.body.contains("href=\"/settings/projects/maestro\""));
+    assert!(page.body.contains(&format!("/jobs/{id}/retry")));
+}
+
+#[tokio::test]
+async fn a_job_that_failed_another_way_shows_no_checks_hint() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_spec_approval(&dashboard, id);
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
+    );
+    dashboard.apply(id, Event::Approve);
+    dashboard.apply(
+        id,
+        Event::AgentFailed {
+            reason: "usage limit".into(),
+        },
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("The job failed"));
+    assert!(!page.body.contains(CHECKS_HINT));
+    assert!(!page.body.contains("/settings/projects/"));
+}
+
 #[tokio::test]
 async fn a_closed_unmerged_job_offers_no_retry_button_and_rejects_retry() {
     let dashboard = dashboard();
