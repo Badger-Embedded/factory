@@ -28,6 +28,8 @@ pub struct GlabRepos {
 struct ProjectJson {
     #[serde(default)]
     squash_option: Option<String>,
+    #[serde(default)]
+    builds_access_level: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -241,8 +243,13 @@ impl GlabRepos {
         }
         // A pipeline of the same commit on another ref, such as a feature
         // branch or a tag, is not CI of the base branch.
-        let mut has_pipeline = false;
-        if let Some(commit) = &branch.commit {
+        let ci_disabled = info.builds_access_level.as_deref() == Some("disabled");
+        let mut has_pipeline = ci_disabled;
+        if ci_disabled {
+            report.warnings.push(format!(
+                "CI/CD is disabled in {repo}, so the factory has no CI to wait for."
+            ));
+        } else if let Some(commit) = &branch.commit {
             let endpoint = format!(
                 "{project}/pipelines?ref={}&sha={}&per_page=1",
                 gitlab_encode(base),
@@ -255,9 +262,13 @@ impl GlabRepos {
                 Ok(pipelines) => {
                     has_pipeline = pipelines.is_some_and(|pipelines| !pipelines.is_empty());
                 }
-                // GitLab refuses the listing when CI/CD is disabled or the
-                // account cannot read builds, so there is no CI to wait for.
-                Err(err) if err.contains("HTTP 403") => {}
+                Err(err) if err.contains("HTTP 403") => {
+                    has_pipeline = true;
+                    report.warnings.push(format!(
+                        "CI could not be checked in {repo}: {} may not list its pipelines.",
+                        account.login
+                    ));
+                }
                 Err(err) => return Err(err),
             }
         }

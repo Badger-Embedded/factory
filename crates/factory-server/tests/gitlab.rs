@@ -24,10 +24,9 @@ struct Salsa {
     /// The protected branch rules, as the JSON array GitLab lists. Level 0
     /// is GitLab's "No one".
     rules: &'static str,
-    /// The second page of rules.
     rules_page2: &'static str,
-    /// Whether the pipeline listing answers HTTP 403, as with CI/CD disabled.
     pipelines_forbidden: bool,
+    builds: &'static str,
     /// The ref a pipeline of the base branch's head commit ran on, if any.
     pipeline_ref: Option<&'static str>,
 }
@@ -42,6 +41,7 @@ impl Salsa {
             rules: r#"[{"name":"main","merge_access_levels":[{"access_level":30}]}]"#,
             rules_page2: "[]",
             pipelines_forbidden: false,
+            builds: "enabled",
             pipeline_ref: Some("main"),
         }
     }
@@ -66,7 +66,7 @@ impl Salsa {
             r#"#!/bin/sh
 echo "$GITLAB_HOST $GITLAB_TOKEN $*" >> "{log}"
 case "$4" in
-  projects/team%2Fsub%2Fpkg) echo '{{"squash_option":"{squash}","permissions":{{"project_access":{{"access_level":{level}}},"group_access":null}}}}' ;;
+  projects/team%2Fsub%2Fpkg) echo '{{"squash_option":"{squash}","builds_access_level":"{builds}","permissions":{{"project_access":{{"access_level":{level}}},"group_access":null}}}}' ;;
   projects/team%2Fsub%2Fpkg/repository/branches/main) {branch} ;;
   'projects/team%2Fsub%2Fpkg/protected_branches?per_page=100&page=1') echo '{rules}' ;;
   'projects/team%2Fsub%2Fpkg/protected_branches?per_page=100&page=2') echo '{rules_page2}' ;;
@@ -77,6 +77,7 @@ esac
 "#,
             log = dir.join("calls.log").display(),
             squash = self.squash,
+            builds = self.builds,
             level = self.level,
             rules = self.rules,
             rules_page2 = self.rules_page2,
@@ -314,12 +315,30 @@ async fn a_grant_on_the_second_page_of_rules_lets_a_developer_merge() {
         rules_page2: r#"[{"name":"*","merge_access_levels":[{"access_level":30}]}]"#,
         ..with_rules(r#"[{"name":"main","merge_access_levels":[{"access_level":40}]}]"#)
     };
-    let (report, _) = check(&salsa, "team/sub/pkg").await;
+    let (report, log) = check(&salsa, "team/sub/pkg").await;
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(
+        log.contains("protected_branches?per_page=100&page=2"),
+        "{log}"
+    );
 }
 
 #[tokio::test]
-async fn disabled_ci_is_a_warning_and_not_an_error() {
+async fn disabled_ci_is_a_warning_and_the_listing_is_not_read() {
+    let salsa = Salsa {
+        builds: "disabled",
+        pipelines_forbidden: true,
+        ..Salsa::fit()
+    };
+    let (report, log) = check(&salsa, "team/sub/pkg").await;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("CI/CD is disabled"));
+    assert!(!log.contains("/pipelines"), "{log}");
+}
+
+#[tokio::test]
+async fn a_forbidden_pipeline_listing_on_an_enabled_project_is_not_an_absence() {
     let salsa = Salsa {
         pipelines_forbidden: true,
         ..Salsa::fit()
@@ -327,5 +346,6 @@ async fn disabled_ci_is_a_warning_and_not_an_error() {
     let (report, _) = check(&salsa, "team/sub/pkg").await;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
-    assert!(report.warnings[0].contains("no pipeline"));
+    assert!(report.warnings[0].contains("could not be checked"));
+    assert!(!report.warnings[0].contains("no pipeline"));
 }
