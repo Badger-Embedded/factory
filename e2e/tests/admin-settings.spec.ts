@@ -70,13 +70,13 @@ test('Default gates saves and keeps its values', async ({ page }) => {
   await expect(gate(page, 'Approve before pushing')).toBeChecked({ checked: !before[2] });
 });
 
-test('GitHub saves and keeps its value', async ({ page }) => {
-  await page.goto('/settings/github');
+test('Pull request polling saves and keeps its value', async ({ page }) => {
+  await page.goto('/settings/polling');
   await page.getByLabel('Seconds between looks at a pull request').fill('77');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
 
-  await page.goto('/settings/github');
+  await page.goto('/settings/polling');
   await expect(page.getByLabel('Seconds between looks at a pull request')).toHaveValue('77');
 });
 
@@ -233,7 +233,7 @@ test('a login that is not an admin is turned away from the factory-wide settings
   for (const path of [
     '/settings/workers',
     '/settings/gates',
-    '/settings/github',
+    '/settings/polling',
     '/settings/renovate',
     '/settings/agents/claude',
     '/settings/agents/codex',

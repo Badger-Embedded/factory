@@ -339,7 +339,7 @@ impl Dashboard {
         let mut uris: Vec<String> = [
             "/settings/workers",
             "/settings/gates",
-            "/settings/github",
+            "/settings/polling",
             "/settings/agents/claude",
             "/settings/agents/codex",
             "/settings/mcp",
@@ -1900,7 +1900,7 @@ async fn the_settings_page_shows_and_saves_the_stored_settings() {
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.body.contains("Saved."));
-    let reply = dashboard.post("/settings/github", "poll_seconds=30").await;
+    let reply = dashboard.post("/settings/polling", "poll_seconds=30").await;
     assert_eq!(reply.status, StatusCode::OK);
     assert!(reply.body.contains("Saved."));
     assert_eq!(
@@ -2045,7 +2045,7 @@ async fn bad_settings_are_rejected_and_not_saved() {
     let dashboard = dashboard();
     let before = dashboard.store.settings().unwrap();
     for (uri, form) in [
-        ("/settings/github", "poll_seconds=5"),
+        ("/settings/polling", "poll_seconds=5"),
         (
             "/settings/workers",
             "max_workers=2&worker_image=+&worker_memory=3g&worker_cpus=4",
@@ -9348,11 +9348,11 @@ async fn the_notifications_page_opens_for_a_non_admin_with_only_the_you_and_proj
 async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
     let dashboard = two_projects();
     add_context7(&dashboard).await;
-    let body = dashboard.get("/settings/github").await.body;
+    let body = dashboard.get("/settings/polling").await.body;
     for href in [
         "/settings/workers",
         "/settings/gates",
-        "/settings/github",
+        "/settings/polling",
         "/settings/agents/claude",
         "/settings/mcp",
         "/settings/projects/maestro",
@@ -9361,7 +9361,7 @@ async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
     ] {
         assert!(body.contains(&format!("href=\"{href}\"")), "{href}");
     }
-    assert!(body.contains(r#"href="/settings/github" aria-current="page""#));
+    assert!(body.contains(r#"href="/settings/polling" aria-current="page""#));
     assert_eq!(body.matches(r#"aria-current="page""#).count(), 1);
 
     // A server's page marks the MCP servers entry.
@@ -9372,7 +9372,7 @@ async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
 #[tokio::test]
 async fn the_sidebar_groups_agents_and_links_each_one() {
     let dashboard = dashboard();
-    let body = dashboard.get("/settings/github").await.body;
+    let body = dashboard.get("/settings/polling").await.body;
 
     // The sidebar has an Agents group between Factory and Integrations.
     assert!(body.contains("Agents"));
@@ -9408,13 +9408,26 @@ async fn the_old_claude_url_redirects_to_the_agent_page() {
 }
 
 #[tokio::test]
+async fn the_old_github_url_redirects_to_the_polling_page() {
+    let dashboard = dashboard();
+    for reply in [
+        dashboard.get("/settings/github").await,
+        dashboard.post("/settings/github", "poll_seconds=30").await,
+    ] {
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        assert_eq!(reply.location.as_deref(), Some("/settings/polling"));
+    }
+    assert_ne!(dashboard.store.settings().unwrap().poll_seconds, 30);
+}
+
+#[tokio::test]
 async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     let dashboard = dashboard();
     add_context7(&dashboard).await;
     for uri in [
         "/settings/workers",
         "/settings/gates",
-        "/settings/github",
+        "/settings/polling",
         "/settings/agents/claude",
         "/settings/mcp/context7",
         "/settings/projects/maestro",
@@ -9452,7 +9465,7 @@ async fn save_comes_before_delete_and_clear_so_enter_saves() {
 async fn each_factory_page_saves_only_its_own_fields() {
     let dashboard = dashboard();
     dashboard.post("/settings/gates", "gate_publish=on").await;
-    dashboard.post("/settings/github", "poll_seconds=90").await;
+    dashboard.post("/settings/polling", "poll_seconds=90").await;
     dashboard
         .post(
             "/settings/workers",
@@ -10385,7 +10398,7 @@ async fn concurrent_onboarding_of_one_name_cannot_delete_the_new_projects_jobs()
 const ADMIN_ROUTES: &[&str] = &[
     "/settings/workers",
     "/settings/gates",
-    "/settings/github",
+    "/settings/polling",
     "/settings/renovate",
     "/settings/claude",
     "/settings/agents/claude",
@@ -10441,7 +10454,7 @@ async fn an_admin_opens_the_factory_settings_pages_and_sees_their_groups() {
     for uri in [
         "/settings/workers",
         "/settings/gates",
-        "/settings/github",
+        "/settings/polling",
         "/settings/renovate",
         "/settings/agents/codex",
         "/settings/mcp",
