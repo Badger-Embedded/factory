@@ -238,7 +238,7 @@ fn requested_tools(data: Option<&Value>) -> bool {
 }
 
 fn message_result(expect: Expect, text: &str) -> RunResult {
-    let event = match serde_json::from_str::<Value>(unfence(text)) {
+    let event = match serde_json::from_str::<Value>(json_slice(text)) {
         Ok(value) => event_from_output(expect, Some(value)),
         Err(err) => failed_event(
             expect,
@@ -252,20 +252,35 @@ fn message_result(expect: Expect, text: &str) -> RunResult {
     }
 }
 
-/// The JSON inside a single fenced code block, or the trimmed text when there is
-/// no fence. The prompt allows one fence around the whole message, so a leading
-/// triple-backtick with an optional language on its line and a trailing
-/// triple-backtick are stripped; anything else is left for the JSON parser to
-/// reject.
-fn unfence(text: &str) -> &str {
+/// The JSON to parse from the final message: the content of the fenced block
+/// that ends the message, whatever text precedes it, or the whole trimmed text
+/// when the message does not end with a closing fence. A fence line starts with
+/// at least three backticks after optional indentation. A block closes on a
+/// bare fence at least as long as its opening fence. Backticks inside a valid
+/// JSON string cannot start a raw line.
+fn json_slice(text: &str) -> &str {
     let text = text.trim();
-    let Some(rest) = text.strip_prefix("```") else {
-        return text;
-    };
-    let Some(inner) = rest.strip_suffix("```") else {
-        return text;
-    };
-    inner.split_once('\n').map_or("", |(_, body)| body).trim()
+    let mut open: Option<(usize, usize)> = None;
+    let mut body = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+        match open {
+            None if ticks >= 3 => {
+                open = Some((ticks, offset + line.len()));
+                body = None;
+            }
+            None => body = None,
+            Some((len, start)) if ticks >= len && ticks == trimmed.len() => {
+                body = Some(text[start..offset].trim());
+                open = None;
+            }
+            Some(_) => {}
+        }
+        offset += line.len();
+    }
+    body.filter(|_| open.is_none()).unwrap_or(text)
 }
 
 fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {
