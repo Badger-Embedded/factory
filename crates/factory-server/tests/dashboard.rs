@@ -12333,9 +12333,16 @@ async fn maintain_while(dashboard: &Dashboard, login: &str, meanwhile: impl FnOn
         "renovate=on",
     );
     let driver = async {
-        while !started.exists() {
+        for _ in 0..500 {
+            if started.exists() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert!(
+            started.exists(),
+            "the access check did not start within 5 s, so the Renovate save never reached the forge"
+        );
         meanwhile();
         std::fs::write(&go, "").unwrap();
     };
@@ -12432,6 +12439,52 @@ async fn a_renovate_save_after_the_project_token_was_cleared_or_replaced_stores_
             .unwrap()
             .renovate
     );
+}
+
+#[tokio::test]
+async fn a_renovate_save_after_the_token_was_replaced_by_one_of_the_same_account_stores_nothing() {
+    let dashboard = slow_project_dashboard();
+    let reply = maintain_while(&dashboard, USER, || {
+        seed_project_token(&dashboard, "tok-reader", "slow-bot", 77);
+    })
+    .await;
+    assert!(reply.body.contains("project token changed"));
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .renovate
+    );
+}
+
+#[tokio::test]
+async fn turning_renovate_off_needs_no_forge_and_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO projects (name, forge, repo, base) VALUES ('odd', 'elsewhere', 'o/odd', 'main')",
+            [],
+        )
+        .unwrap();
+    let dashboard = dashboard_with(store);
+    let maintenance = factory_server::Maintenance {
+        renovate: true,
+        packaging: None,
+    };
+    dashboard
+        .store
+        .save_project_maintenance("odd", &maintenance)
+        .unwrap();
+    let reply = dashboard
+        .post("/settings/projects/odd/maintenance", "")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    assert!(!dashboard.store.project_maintenance("odd").unwrap().renovate);
 }
 
 #[tokio::test]

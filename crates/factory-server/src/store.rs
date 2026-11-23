@@ -3357,8 +3357,9 @@ impl Store {
 
     /// As [`Store::save_project_maintenance`], and writes only while the
     /// project instance and collaborator in `guard` still exist and, when
-    /// `credential` is given, while the project token of that account is
-    /// still stored.
+    /// `credential` is given, while the sealed token stored for its owner is
+    /// still those bytes. A token saved again is sealed anew, so it differs
+    /// even when it is the same string.
     ///
     /// # Errors
     ///
@@ -3367,7 +3368,7 @@ impl Store {
         &self,
         guard: &ProjectGuard<'_>,
         maintenance: &Maintenance,
-        credential: Option<(ForgeTokenOwner<'_>, &ForgeAccount)>,
+        credential: Option<(ForgeTokenOwner<'_>, &[u8])>,
     ) -> Result<MaintenanceSave, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -3383,17 +3384,17 @@ impl Store {
         if !present {
             return Ok(MaintenanceSave::Gone);
         }
-        if let Some((owner, account)) = credential {
+        if let Some((owner, sealed)) = credential {
             let (project, header) = owner.row();
-            let stored: bool = tx.query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM secrets
-                     WHERE project = ?1 AND server = '' AND header = ?2
-                 )",
-                params![project, header],
-                |row| row.get(0),
-            )?;
-            if !stored || read_forge_account(&tx, owner)?.as_ref() != Some(account) {
+            let current: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM secrets
+                     WHERE project = ?1 AND server = '' AND header = ?2",
+                    params![project, header],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current.as_deref() != Some(sealed) {
                 return Ok(MaintenanceSave::TokenChanged);
             }
         }
