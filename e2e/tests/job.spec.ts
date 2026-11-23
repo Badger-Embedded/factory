@@ -722,6 +722,58 @@ test('a job page links its Renovate pull request through the forge', async ({ pa
   await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
 });
 
+test('a stopped Renovate job starts a fix job and links to it', async ({ page, factory, project }) => {
+  const id = factory.fixture(
+    'renovate',
+    '--project',
+    project,
+    '--number',
+    '7',
+    '--url',
+    'https://stored.example/pull/7',
+  );
+  factory.fixture('apply', '--job', id, '--event', 'renovate-stopped');
+  await page.goto(`/jobs/${id}`);
+
+  await expect(page.getByText('Triage stopped')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+  await page.locator('textarea[name=instructions]').fill('Update the smoke test');
+  await page.getByRole('button', { name: 'Fix in a separate pull request' }).click();
+
+  const waiting = page.locator('.status-detail');
+  await expect(waiting).toContainText('Waiting for fix job #');
+  await expect(page.getByRole('button', { name: 'Retry' })).toHaveCount(0);
+  await expect(page.locator('textarea[name=instructions]')).toHaveCount(0);
+
+  const fix = (await waiting.getByRole('link').getAttribute('href'))!.split('/').pop()!;
+  await waiting.getByRole('link').click();
+  await expect(page).toHaveURL(/\/jobs\/\d+$/);
+  await expect(page.getByText('Update the smoke test').first()).toBeVisible();
+  const back = page.locator(`p.meta a[href="/jobs/${id}"]`);
+  await expect(back).toBeVisible();
+  await expect(back).not.toHaveAttribute('target', '_blank');
+  await back.click();
+  await expect(page).toHaveURL(new RegExp(`/jobs/${id}$`));
+
+  factory.fixture('apply', '--job', id, '--fix', fix);
+  await page.goto(`/jobs/${id}`);
+  const stopped = page.locator('.status-detail');
+  const rows = await stopped.evaluate((el) => {
+    const range = document.createRange();
+    const tops = new Set<number>();
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      range.selectNodeContents(n);
+      for (const rect of Array.from(range.getClientRects())) tops.add(Math.round(rect.top));
+    }
+    return tops.size;
+  });
+  expect(rows).toBeGreaterThan(1);
+  await expect(stopped).toContainText(`Fix job #${fix} was cancelled.`);
+  await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+  await expect(page.locator('textarea[name=instructions]')).toBeVisible();
+});
+
 test('a job page on an unknown forge shows the notice and a plain Renovate number', async ({
   page,
   factory,

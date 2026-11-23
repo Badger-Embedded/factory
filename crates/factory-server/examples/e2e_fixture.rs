@@ -23,7 +23,9 @@ use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question};
+use factory_core::{
+    AgentResult, Event, FixOutcome, PlannedPr, PrDescription, Question, RenovateCi, RetryLimits,
+};
 use factory_runner::ForgeKind;
 use factory_server::Store;
 
@@ -127,14 +129,25 @@ fn events_for(stage: &str) -> Result<Vec<Event>> {
     })
 }
 
-fn event_named(name: &str) -> Result<Event> {
+fn events_named(name: &str) -> Result<Vec<Event>> {
     Ok(match name {
-        "start" => Event::Start,
-        "approve" => Event::Approve,
-        "cancel" => Event::Cancel,
-        "questions" => Event::Agent(AgentResult::Questions(vec![Question {
+        "start" => vec![Event::Start],
+        "approve" => vec![Event::Approve],
+        "cancel" => vec![Event::Cancel],
+        "questions" => vec![Event::Agent(AgentResult::Questions(vec![Question {
             text: "Which hub model should the first version support?".into(),
-        }])),
+        }]))],
+        "renovate-stopped" => vec![
+            Event::RenovateObserved {
+                head: "abc1234".into(),
+                ci: RenovateCi::Failed {
+                    log: "smoke test failed".into(),
+                },
+                limits: RetryLimits { auto: 0, total: 0 },
+                auto_merge: false,
+            },
+            Event::Commented,
+        ],
         other => return Err(format!("unknown event {other}").into()),
     })
 }
@@ -214,6 +227,32 @@ fn write_tls(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn end_fix(store: &Store, job: i64, fix: i64) -> Result<()> {
+    store.apply(fix, Event::Cancel)?;
+    store.apply(
+        job,
+        Event::FixEnded {
+            job: fix,
+            outcome: FixOutcome::Cancelled,
+        },
+    )?;
+    Ok(())
+}
+
+fn apply(store: &Store, flags: &HashMap<String, Vec<String>>) -> Result<()> {
+    let one = |name: &str| -> Result<&str> {
+        Ok(flags.get(name).ok_or(format!("--{name} is required"))?[0].as_str())
+    };
+    let job: i64 = one("job")?.parse()?;
+    if flags.contains_key("fix") {
+        return end_fix(store, job, one("fix")?.parse()?);
+    }
+    for event in events_named(one("event")?)? {
+        store.apply(job, event)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing subcommand")?;
@@ -283,9 +322,7 @@ fn main() -> Result<()> {
                 .ok_or("the pull request already has a job")?;
             println!("{id}");
         }
-        "apply" => {
-            store.apply(one("job")?.parse()?, event_named(one("event")?)?)?;
-        }
+        "apply" => apply(&store, &flags)?,
         "log" => {
             let job = one("job")?.parse()?;
             let text = one("text")?;

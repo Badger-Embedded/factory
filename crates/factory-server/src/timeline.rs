@@ -58,6 +58,7 @@ struct Step {
 
 struct Timeline {
     steps: Vec<Step>,
+    fix_notes: Vec<Note>,
     /// The step the job is in, or for a failed or cancelled job the step it
     /// was in when that happened. `None` when the history does not say.
     current: Option<usize>,
@@ -95,7 +96,14 @@ fn build(job: &Job, events: &[JobEvent]) -> Timeline {
     let mut steps: Vec<Step> = (0..=merged_order(prs)).map(|_| Step::default()).collect();
     let mut current = None;
     let mut active: Option<usize> = None;
+    let mut fix_notes = Vec::new();
     for event in events {
+        if let Some(text) = fix_note(event) {
+            fix_notes.push(Note {
+                at: event.at.clone(),
+                text,
+            });
+        }
         if let Some(step) = current.and_then(|i: usize| steps.get_mut(i)) {
             note(step, event);
         }
@@ -121,7 +129,31 @@ fn build(job: &Job, events: &[JobEvent]) -> Timeline {
     if !matches!(job.stage(), Stage::Failed { .. } | Stage::Cancelled) {
         current = stage_order(job.stage().name(), job.stage().pr(), prs);
     }
-    Timeline { steps, current }
+    Timeline {
+        steps,
+        fix_notes,
+        current,
+    }
+}
+
+fn fix_note(event: &JobEvent) -> Option<String> {
+    let detail = event.detail.as_deref();
+    match event.event.as_str() {
+        "fix-started" => Some(format!("Started fix job #{}", detail?)),
+        "fix-ended" => Some(match detail?.split_once(": ") {
+            Some((job, outcome)) => format!("Fix job #{job} {outcome}"),
+            None => "The fix job ended".to_owned(),
+        }),
+        "rebase-requested" => Some("Asked Renovate to rebase the pull request".to_owned()),
+        "rebase-skipped" => {
+            Some("Skipped the rebase request, because the head had changed".to_owned())
+        }
+        "rebase-failed" => Some(match detail {
+            Some(reason) => format!("Could not ask Renovate to rebase: {reason}"),
+            None => "Could not ask Renovate to rebase".to_owned(),
+        }),
+        _ => None,
+    }
 }
 
 /// Adds to `step` what `event` says happened in it.
@@ -302,6 +334,13 @@ pub(crate) fn timeline(
             }
             @for pr in 0..prs { (pr_group(job, &timeline, models, efforts, pr)) }
             ol.tl { (step(job, &timeline, models, efforts, merged)) }
+            @if !timeline.fix_notes.is_empty() {
+                ul.rounds.fix-notes {
+                    @for note in &timeline.fix_notes {
+                        li { span { (note.text) } span.when { (localtime::time(&note.at)) } }
+                    }
+                }
+            }
             @if timeline.current.is_none() {
                 @if let Stage::Failed { reason, .. } = job.stage() {
                     p.tl-end.failed { "Failed: " (reason) }

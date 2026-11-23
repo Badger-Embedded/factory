@@ -24,7 +24,7 @@ use crate::forge_tokens::{self, SaveError};
 use crate::forges::Forges;
 use crate::github::RepoReport;
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
-use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
+use crate::pages::{self, HeaderState, JobLinks, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
@@ -147,6 +147,7 @@ pub fn app(
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/retry", post(retry))
+        .route("/jobs/{id}/fix", post(start_fix))
         .route("/jobs/{id}/dismiss", post(dismiss))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -973,7 +974,7 @@ struct JobData {
     models: StageModels,
     efforts: StageEfforts,
     auto_merge: bool,
-    gap_links: Vec<i64>,
+    links: JobLinks,
     prerequisites: Vec<PrerequisiteView>,
 }
 
@@ -1017,7 +1018,7 @@ fn keep_session_settings(
     Ok(())
 }
 
-fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
+fn load_job(state: &AppState, login: &str, id: i64) -> Result<JobData, AppError> {
     let row = state.store.get(id)?;
     let project = state.projects.lookup(&row.project)?;
     let settings = state.store.settings()?;
@@ -1035,7 +1036,7 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
     let auto_merge = state
         .store
         .project_auto_merge(&row.project, default_auto_merge)?;
-    let gap_links = gap_links(&state.store, &row)?;
+    let links = job_links(state, &row, login)?;
     let prerequisites = state.store.prerequisites(id)?;
     Ok(JobData {
         row,
@@ -1047,22 +1048,54 @@ fn load_job(state: &AppState, id: i64) -> Result<JobData, AppError> {
         models,
         efforts,
         auto_merge,
-        gap_links,
+        links,
         prerequisites,
     })
 }
 
-fn gap_links(store: &Store, row: &JobRow) -> Result<Vec<i64>, StoreError> {
-    let Some(pr) = row.job.renovate_pr() else {
-        return Ok(Vec::new());
+fn job_links(state: &AppState, row: &JobRow, login: &str) -> Result<JobLinks, StoreError> {
+    let store = &state.store;
+    let mut links = JobLinks {
+        csrf: state.csrf.issue(login),
+        ..JobLinks::default()
     };
-    let mut links = Vec::new();
-    for &gap in pr.gaps.iter().flatten() {
-        match store.get(gap) {
-            Ok(found) if found.job.gap_source() == Some((row.id, pr.number)) => links.push(gap),
-            Ok(_) | Err(StoreError::NotFound(_)) => {}
-            Err(err) => return Err(err),
+    if let Some(pr) = row.job.renovate_pr() {
+        for &gap in pr.gaps.iter().flatten() {
+            match store.get(gap) {
+                Ok(found) if found.job.gap_source() == Some((row.id, pr.number)) => {
+                    links.gaps.push(gap);
+                }
+                Ok(_) | Err(StoreError::NotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
         }
+        if let Some(fix) = &pr.fix {
+            links.fix = match store.get(fix.job) {
+                Ok(found)
+                    if found.project == row.project
+                        && found.job.fix_source() == Some((row.id, pr.number)) =>
+                {
+                    Some(fix.job)
+                }
+                Ok(_) | Err(StoreError::NotFound(_)) => None,
+                Err(err) => return Err(err),
+            };
+        }
+    }
+    if let Some((source, number)) = row.job.fix_source() {
+        links.source = match store.get(source) {
+            Ok(found)
+                if found.project == row.project
+                    && found
+                        .job
+                        .renovate_pr()
+                        .is_some_and(|pr| pr.number == number) =>
+            {
+                Some(source)
+            }
+            Ok(_) | Err(StoreError::NotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
     }
     Ok(links)
 }
@@ -1073,7 +1106,7 @@ async fn show_job(
     Path(id): Path<i64>,
 ) -> Result<Markup, AppError> {
     visible_job(&state, &headers, id)?;
-    let data = load_job(&state, id)?;
+    let data = load_job(&state, &user(&headers), id)?;
     let images = state.store.images(id)?;
     let files = state.store.files(id)?;
     Ok(pages::job(
@@ -1089,7 +1122,7 @@ async fn show_job(
         &data.models,
         &data.efforts,
         data.auto_merge,
-        &data.gap_links,
+        &data.links,
         &data.prerequisites,
     ))
 }
@@ -1103,7 +1136,7 @@ async fn job_fragment(
     Path(id): Path<i64>,
 ) -> Result<Markup, AppError> {
     visible_job(&state, &headers, id)?;
-    let data = load_job(&state, id)?;
+    let data = load_job(&state, &user(&headers), id)?;
     Ok(pages::job_fragment(
         &data.row,
         data.project.as_ref(),
@@ -1114,7 +1147,7 @@ async fn job_fragment(
         &data.models,
         &data.efforts,
         data.auto_merge,
-        &data.gap_links,
+        &data.links,
         &data.prerequisites,
     ))
 }
@@ -1443,6 +1476,36 @@ async fn retry(
         .store
         .append_factory_log(id, "Retried the job from the dashboard.")?;
     board_redirect(&state, form.project, redirect)
+}
+
+#[derive(Deserialize)]
+struct FixForm {
+    project: Option<String>,
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    instructions: String,
+}
+
+async fn start_fix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<FixForm>,
+) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let instructions = form.instructions.trim();
+    let fix = state.store.start_fix(
+        id,
+        &user(&headers),
+        (!instructions.is_empty()).then_some(instructions),
+    )?;
+    state.wake.notify_one();
+    state
+        .store
+        .append_factory_log(id, &format!("Started fix job #{fix} from the dashboard."))?;
+    board_redirect(&state, form.project, job_redirect(id))
 }
 
 async fn dismiss(
