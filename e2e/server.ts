@@ -11,6 +11,7 @@ const target = path.join(repoRoot, 'target', 'debug');
 export const ADMIN = 'admin@e2e.test';
 export const COLLABORATOR = 'alice@e2e.test';
 export const OUTSIDER = 'nobody@e2e.test';
+export const PHONE_USER = 'talhahavadar.phone@e2e.test';
 export const SHARED_PROJECT = 'maestro';
 
 export interface Factory {

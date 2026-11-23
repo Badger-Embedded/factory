@@ -3131,6 +3131,14 @@ async fn the_picker_sits_after_the_brand_and_before_the_nav() {
     assert!(picker < onboard, "the picker comes before the Onboard link");
 }
 
+#[tokio::test]
+async fn the_login_pill_carries_the_full_login_in_title() {
+    let page = two_projects().get("/?project=tool").await;
+    let pill = page.body.find("<span class=\"user\"").unwrap();
+    let tag = &page.body[pill..pill + page.body[pill..].find('>').unwrap()];
+    assert!(tag.contains("title=\""), "the pill has a title: {tag}");
+}
+
 fn saved_images(dashboard: &Dashboard, id: i64) -> Vec<String> {
     let dir = dashboard
         .data

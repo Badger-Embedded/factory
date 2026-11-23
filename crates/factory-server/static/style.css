@@ -671,6 +671,9 @@ button:hover { filter: brightness(0.96); }
 .nav { color: var(--muted); text-decoration: none; font-size: var(--font-size-md); }
 .nav:hover { color: var(--text); }
 input.wide { width: 100%; }
+@media (max-width: 480px) {
+  form input[type="text"] { box-sizing: border-box; max-width: 100%; }
+}
 input[type="number"] { width: 8rem; }
 .hint { color: var(--muted); font-size: var(--font-size-sm); margin: var(--space-4) 0 0; }
 .hint.bad { color: var(--bad); }
@@ -722,10 +725,19 @@ label.check input { width: auto; }
 .project-picker select:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
 
 @media (max-width: 480px) {
-  .topbar-inner { gap: var(--space-8); }
-  .topbar-start { gap: var(--space-8); }
-  .topbar-end { gap: var(--space-8); }
-  .project-picker select { max-width: 9rem; }
+  .topbar-inner {
+    flex-wrap: wrap;
+    gap: var(--space-4) var(--space-8);
+    height: auto;
+    min-height: var(--topbar-height);
+    padding-top: var(--space-8);
+    padding-bottom: var(--space-8);
+  }
+  .topbar-start { gap: var(--space-8); flex: 1 1 100%; }
+  .topbar-end { gap: var(--space-8); flex: 1 1 100%; }
+  .project-picker { flex: 0 1 auto; }
+  .project-picker select { max-width: 100%; }
+  .user { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 
 .pasted-images, .request-images, .request-files { list-style: none; display: flex; flex-wrap: wrap; gap: var(--space-10); margin: var(--space-8) 0 0; padding: 0; }
