@@ -27,6 +27,9 @@ pub struct GitHub {
     /// it waits for GitHub to stop reporting the old failure.
     pub settle_polls: u32,
     pub settle_interval: Duration,
+    /// Where a call with no token goes, because `gh` refuses to run without
+    /// one. Tests point it at a local server.
+    pub api_base: String,
 }
 
 impl Default for GitHub {
@@ -35,6 +38,7 @@ impl Default for GitHub {
             gh: PathBuf::from("gh"),
             settle_polls: 10,
             settle_interval: Duration::from_secs(3),
+            api_base: "https://api.github.com".to_owned(),
         }
     }
 }
@@ -1232,11 +1236,7 @@ impl GitHub {
         path: &str,
     ) -> Result<Option<String>, String> {
         let out = match self
-            .run(
-                account,
-                &["api", &format!("repos/{repo}/compare/{from}...{to}")],
-                None,
-            )
+            .api_get(account, &format!("repos/{repo}/compare/{from}...{to}"), &[])
             .await
         {
             Ok(out) => out,
@@ -1339,6 +1339,46 @@ impl GitHub {
             report.push('\n');
         }
         Ok(report)
+    }
+
+    /// A GET of the API path `path` as `account`. With no token it is a plain
+    /// request to the public API, which reads a public repository but is rate
+    /// limited. Failures read like `gh`'s, so `HTTP 404` marks a missing path.
+    async fn api_get(
+        &self,
+        account: &Account,
+        path: &str,
+        args: &[&str],
+    ) -> Result<String, String> {
+        if account.token.is_some() {
+            let mut full = vec!["api", path];
+            full.extend_from_slice(args);
+            return self.run(account, &full, None).await;
+        }
+        let url = format!("{}/{path}", self.api_base.trim_end_matches('/'));
+        let response = reqwest::Client::new()
+            .get(&url)
+            .header("User-Agent", "factory")
+            .header("Accept", "application/vnd.github+json")
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|err| format!("GET {path} without a token failed: {err}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| format!("GET {path} without a token failed: {err}"))?;
+        if status.is_success() {
+            Ok(body)
+        } else {
+            let detail: String = body.chars().take(200).collect();
+            Err(format!(
+                "GET {path} without a token failed: HTTP {}: {}",
+                status.as_u16(),
+                detail.trim()
+            ))
+        }
     }
 
     async fn run(
@@ -1464,9 +1504,14 @@ impl Forge for GitHub {
         repo: &'a str,
     ) -> BoxFuture<'a, Result<Access, String>> {
         Box::pin(async move {
-            let path = format!("repos/{repo}");
-            let args = ["api", path.as_str(), "--hostname", "github.com"];
-            let out = match self.run(account, &args, None).await {
+            let out = match self
+                .api_get(
+                    account,
+                    &format!("repos/{repo}"),
+                    &["--hostname", "github.com"],
+                )
+                .await
+            {
                 Ok(out) => out,
                 Err(err) if err.contains("HTTP 404") => return Ok(Access::NotVisible),
                 Err(err) => return Err(err),

@@ -222,7 +222,8 @@ CREATE TABLE IF NOT EXISTS project_maintenance (
     manifest_files TEXT NOT NULL DEFAULT '[]',
     build_config_files TEXT NOT NULL DEFAULT '[]',
     upstream_repo TEXT,
-    renovate_author TEXT
+    renovate_author TEXT,
+    upstream_forge TEXT
 );
 CREATE TABLE IF NOT EXISTS renovate_prs (
     project TEXT NOT NULL,
@@ -318,8 +319,11 @@ pub struct Packaging {
     pub manifest_files: Vec<String>,
     /// Paths in the upstream repository whose changes the analysis reads.
     pub build_config_files: Vec<String>,
-    /// The upstream repository, `owner/name`.
+    /// The upstream repository, in the form `upstream_forge` names.
     pub upstream_repo: String,
+    /// The forge the upstream lives on. A project that never chose one reads
+    /// as its own forge.
+    pub upstream_forge: ForgeKind,
 }
 
 /// A project's maintenance settings. Both switches are off by default.
@@ -351,8 +355,17 @@ impl Maintenance {
         if packaging.manifest_files.is_empty() {
             return Err("Give at least one manifest file.".to_owned());
         }
-        if !crate::github::well_formed(&packaging.upstream_repo) {
-            return Err("The upstream repository must look like owner/name.".to_owned());
+        if !packaging
+            .upstream_forge
+            .valid_repo(&packaging.upstream_repo)
+        {
+            return Err(match packaging.upstream_forge {
+                ForgeKind::GitHub => "The upstream repository must look like owner/name.",
+                ForgeKind::Salsa => {
+                    "The upstream repository must be a Salsa project path such as group/name."
+                }
+            }
+            .to_owned());
         }
         Ok(())
     }
@@ -607,6 +620,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         Self::migrate_project_forge(&conn)?;
         Self::migrate_renovate_author(&conn)?;
+        Self::migrate_upstream_forge(&conn)?;
         let has_display_name: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'display_name'",
             [],
@@ -727,6 +741,23 @@ impl Store {
             epoch,
             reads: AtomicU64::new(0),
         })
+    }
+
+    /// `upstream_forge` joined `project_maintenance` later. A NULL reads as the
+    /// project's own forge, so no row needs a value.
+    fn migrate_upstream_forge(conn: &Connection) -> Result<(), StoreError> {
+        let has: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('project_maintenance') WHERE name = 'upstream_forge'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has == 0 {
+            conn.execute(
+                "ALTER TABLE project_maintenance ADD COLUMN upstream_forge TEXT",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     fn migrate_renovate_author(conn: &Connection) -> Result<(), StoreError> {
@@ -3442,7 +3473,9 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT renovate, packaging, packaging_type, manifest_files,
-                        build_config_files, upstream_repo, renovate_author
+                        build_config_files, upstream_repo, renovate_author,
+                        COALESCE(upstream_forge,
+                                 (SELECT forge FROM projects WHERE name = ?1))
                  FROM project_maintenance WHERE project = ?1",
                 [project],
                 |row| {
@@ -3454,11 +3487,21 @@ impl Store {
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((renovate, packaging, kind, manifest, build, upstream, renovate_author)) = row
+        let Some((
+            renovate,
+            packaging,
+            kind,
+            manifest,
+            build,
+            upstream,
+            renovate_author,
+            upstream_forge,
+        )) = row
         else {
             return Ok(Maintenance::default());
         };
@@ -3471,6 +3514,10 @@ impl Store {
                 manifest_files: serde_json::from_str(&manifest)?,
                 build_config_files: serde_json::from_str(&build)?,
                 upstream_repo: upstream.unwrap_or_default(),
+                upstream_forge: upstream_forge
+                    .as_deref()
+                    .and_then(ForgeKind::parse)
+                    .unwrap_or(ForgeKind::GitHub),
             })
         } else {
             None
@@ -4622,15 +4669,16 @@ fn write_maintenance(
     conn.execute(
         "INSERT INTO project_maintenance
             (project, renovate, packaging, packaging_type, manifest_files,
-             build_config_files, upstream_repo, renovate_author)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             build_config_files, upstream_repo, renovate_author, upstream_forge)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (project) DO UPDATE SET renovate = excluded.renovate,
             packaging = excluded.packaging,
             packaging_type = excluded.packaging_type,
             manifest_files = excluded.manifest_files,
             build_config_files = excluded.build_config_files,
             upstream_repo = excluded.upstream_repo,
-            renovate_author = excluded.renovate_author",
+            renovate_author = excluded.renovate_author,
+            upstream_forge = excluded.upstream_forge",
         params![
             project,
             maintenance.renovate,
@@ -4640,6 +4688,7 @@ fn write_maintenance(
             serde_json::to_string(&packaging.map_or(&[][..], |p| &p.build_config_files[..]))?,
             packaging.map(|p| p.upstream_repo.as_str()),
             maintenance.renovate_author,
+            packaging.map(|p| p.upstream_forge.as_str()),
         ],
     )?;
     Ok(())

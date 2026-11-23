@@ -603,6 +603,8 @@ pub struct ProjectSettings {
     pub forge_problem: Option<String>,
     /// The Forge account card. `None` when the project's forge is unknown.
     pub forge_account: Option<ForgeAccountCard>,
+    /// The packaging upstream's token and the last connection check.
+    pub upstream: UpstreamCard,
     /// The project's local checks command, or `None` when it has none.
     pub checks: Option<String>,
     /// The form token the Local checks card posts.
@@ -611,6 +613,22 @@ pub struct ProjectSettings {
 
 const CHECKS_LABEL: &str = "Local checks command (optional)";
 const CHECKS_HINT: &str = "The factory runs this with bash in the worker, in the job's checkout, before it pushes, such as nix develop -c just lint && nix develop -c just test. It is separate from GitHub's CI on the pull request. Leave it empty to push without local checks.";
+
+/// The result of reading the packaging upstream the way a job would.
+pub struct UpstreamCheckView {
+    /// Whether the repository was readable, or `None` when the check could
+    /// not run.
+    pub readable: Option<bool>,
+    pub text: String,
+}
+
+/// What the packaging upstream's token card and connection check show.
+pub struct UpstreamCard {
+    /// The account the upstream token belongs to, or `None` with no token.
+    pub account: Option<ForgeAccount>,
+    pub secrets_available: bool,
+    pub check: Option<UpstreamCheckView>,
+}
 
 /// What the Forge account card shows: the project token state and the
 /// current login's own switch.
@@ -1701,6 +1719,7 @@ pub fn settings_project(
             }
             (project_checks_card(project))
             (project_maintenance_card(project))
+            (project_upstream_token_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
                 div.card.failed { (problem) }
@@ -1825,11 +1844,82 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
                 div.field {
                     label for="upstream_repo" { "Upstream repository" }
                     input #upstream_repo type="text" name="upstream_repo" autocomplete="off"
-                        autocapitalize="none" spellcheck="false" placeholder="owner/name"
+                        autocapitalize="none" spellcheck="false"
+                        placeholder=(if packaging.upstream_forge == ForgeKind::Salsa { "group/name" } else { "owner/name" })
                         value=(packaging.upstream_repo);
+                }
+                div.field {
+                    label for="upstream_forge" { "Upstream forge" }
+                    select #upstream_forge name="upstream_forge" {
+                        @for kind in ForgeKind::ALL {
+                            option value=(kind.as_str()) selected[kind == packaging.upstream_forge] { (kind.display_name()) }
+                        }
+                    }
+                    p.hint { "Where the upstream repository lives. It defaults to the project's own forge." }
+                }
+                div.field.upstream-check {
+                    button type="submit" formnovalidate
+                        formaction={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/maintenance/check" } {
+                        "Check connection"
+                    }
+                    p.hint { "Reads the upstream repository the way a job would and stores nothing." }
+                    @if let Some(check) = &project.upstream.check {
+                        p.hint.upstream-check-result.bad[check.readable != Some(true)] role="status" { (check.text) }
+                    }
                 }
             }
             (save_bar("Save maintenance"))
+        }
+    }
+}
+
+fn project_upstream_token_card(project: &ProjectSettings) -> Markup {
+    let Some(packaging) = project.maintenance.packaging.as_ref() else {
+        return html! {};
+    };
+    let base = format!(
+        "/settings/projects/{}/upstream-token",
+        crate::web::query_escape(&project.name)
+    );
+    let name = packaging.upstream_forge.display_name();
+    let card = &project.upstream;
+    let secrets = card.secrets_available;
+    html! {
+        div.card #upstream-token {
+            h2 { "Upstream token" }
+            p.hint {
+                "Optional. Most upstreams are public and are read with no token. Save a " (name)
+                " token whose account can read the upstream repository when it is private, or to lift the rate limit on unauthenticated reads. \
+                 Stored encrypted and never shown."
+            }
+            form.settings-form method="post" action=(base) {
+                input type="hidden" name="csrf" value=(project.checks_csrf);
+                @if !secrets {
+                    p.hint.bad { "The master key is missing, so a token cannot be saved here. Clear still works." }
+                }
+                div.field {
+                    label for="upstream-token-field" { "Upstream token" }
+                    input #upstream-token-field.wide type="password" name="token"
+                        autocomplete="off" spellcheck="false"
+                        placeholder=(if card.account.is_some() { "set" } else { "not set" })
+                        disabled[!secrets];
+                    p.hint {
+                        @if let Some(account) = &card.account {
+                            "A token is stored. It belongs to the account " strong.forge-account { (account.login) } ". "
+                        } @else {
+                            "No token is stored. "
+                        }
+                        "Paste a new one to replace it. An empty field keeps it."
+                    }
+                }
+                div.save-bar {
+                    span.save-bar-note { "No unsaved changes." }
+                    button.primary disabled[!secrets] { "Save upstream token" }
+                }
+                div.danger-zone {
+                    button.danger formaction={ (base) "/clear" } formnovalidate { "Clear upstream token" }
+                }
+            }
         }
     }
 }

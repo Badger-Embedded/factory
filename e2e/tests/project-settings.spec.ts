@@ -273,6 +273,35 @@ test('the maintenance settings save', async ({ page, project }) => {
   await expect(card.getByLabel('Upstream repository')).toHaveValue('e2e/upstream');
 });
 
+test('the upstream forge is checked and an unreadable upstream is refused', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project));
+  await saveProjectToken(page, 'tok-e2e-alice');
+  const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
+  await card.getByLabel('Renovate pull requests').check();
+  await card.getByLabel('Packaging project').check();
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await card.getByLabel('Type').selectOption('deb');
+  await card.getByLabel('Manifest files').fill('debian/control');
+  await expect(card.getByLabel('Upstream forge')).toHaveValue('github');
+
+  await card.getByLabel('Upstream repository').fill('e2e/missing');
+  await card.getByRole('button', { name: 'Check connection' }).click();
+  await expect(page.getByText('e2e/missing could not be read on GitHub')).toBeVisible();
+  // The check redraws the form as unchanged, and Save waits for an edit.
+  await card.getByLabel('Manifest files').fill('debian/control\ndebian/rules');
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await expect(page.getByText('Nothing was saved.')).toBeVisible();
+
+  await card.getByLabel('Upstream repository').fill('e2e/upstream');
+  await card.getByRole('button', { name: 'Check connection' }).click();
+  await expect(
+    page.getByText('Checked with the project token of alice-bot: e2e/upstream is readable on GitHub.'),
+  ).toBeVisible();
+});
+
 test('turning Renovate on checks the project account', async ({ page, project }) => {
   await page.goto(settingsPath(project));
   const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });

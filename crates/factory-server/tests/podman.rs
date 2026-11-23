@@ -306,7 +306,7 @@ fn gh_executor(
     std::fs::write(
         &gh,
         format!(
-            "#!/bin/bash\necho \"$@\" >> '{}'\ncase \"$1 $2\" in\n\
+            "#!/bin/bash\necho \"[$GH_TOKEN] $@\" >> '{}'\ncase \"$1 $2\" in\n\
              \"pr view\") cat '{}';;\n\
              \"pr diff\") if [ -f '{diff}' ]; then cat '{diff}'; else head -c {diff_bytes} /dev/zero | tr '\\0' x; fi;;\n\
              \"api --method\") echo '{{\"content\":\"bmFtZQ==\",\"type\":\"file\",\"encoding\":\"base64\"}}';;\n\
@@ -354,6 +354,8 @@ fn packaging_request(
         account: AccountSource::fixed(test_account()),
         repo: "o/r".into(),
         upstream: "up/app".into(),
+        upstream_forge: ForgeKind::GitHub,
+        upstream_account: AccountSource::fixed(test_account()),
         base: "main".into(),
         number: 5,
         manifest_files: vec!["snap/snapcraft.yaml".into()],
@@ -362,6 +364,33 @@ fn packaging_request(
         from: range.map(|(from, _)| from.to_owned()),
         to: range.map(|(_, to)| to.to_owned()),
     }
+}
+
+#[tokio::test]
+async fn the_upstream_is_read_with_the_upstream_account_and_the_pull_request_with_the_project_account()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("h1", COMPARE_BODY, &[]), 10);
+    let mut request = packaging_request(None, None);
+    request.account = AccountSource::fixed(Account {
+        token: Some("ghp_project".into()),
+        ..test_account()
+    });
+    request.upstream_account = AccountSource::fixed(Account {
+        token: Some("ghp_upstream".into()),
+        ..test_account()
+    });
+
+    podman.gather_packaging(request).await.unwrap();
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("[ghp_project] pr view"), "{calls}");
+    assert!(calls.contains("[ghp_project] api --method"), "{calls}");
+    assert!(
+        calls.contains("[ghp_upstream] api repos/up/app/compare/v1...v2"),
+        "{calls}"
+    );
+    assert!(!calls.contains("[ghp_project] api repos/up/app"), "{calls}");
 }
 
 const COMPARE_BODY: &str = "Bumps app. [Compare Source](https://github.com/up/app/compare/v1...v2)";

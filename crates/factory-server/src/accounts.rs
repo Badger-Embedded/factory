@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use factory_runner::{Account, ForgeKind};
+use factory_runner::{Account, ForgeAccount, ForgeKind};
 
 use crate::forges::Forges;
 use crate::projects::Project;
@@ -16,6 +16,8 @@ pub enum Owner {
     Project { project: String },
     /// The personal token of the job's requester.
     Requester { login: String, forge: ForgeKind },
+    /// The optional token that reads the packaging upstream.
+    Upstream { project: String },
 }
 
 impl Owner {
@@ -25,6 +27,7 @@ impl Owner {
         match self {
             Owner::Project { .. } => "project account",
             Owner::Requester { .. } => "requester's account",
+            Owner::Upstream { .. } => "upstream account",
         }
     }
 
@@ -33,6 +36,10 @@ impl Owner {
         match self {
             Owner::Project { project } => (
                 format!("the project token of {project}"),
+                format!("/settings/projects/{project}"),
+            ),
+            Owner::Upstream { project } => (
+                format!("the upstream token of {project}"),
                 format!("/settings/projects/{project}"),
             ),
             Owner::Requester { login, forge } => (
@@ -177,6 +184,25 @@ impl From<StoreError> for ResolveError {
     }
 }
 
+/// Which credential reads a packaging upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamCredential {
+    /// The upstream token the project stores, with the account it belongs to.
+    Upstream(ForgeAccount),
+    /// The project token, for an upstream on the project's own forge.
+    Project(ForgeAccount),
+    /// No token: the read is unauthenticated.
+    None,
+}
+
+/// The account that reads a packaging upstream and which credential it is.
+#[derive(Debug, Clone)]
+pub struct UpstreamRead {
+    pub account: Account,
+    pub owner: Owner,
+    pub credential: UpstreamCredential,
+}
+
 /// Resolves the account of an operation when it starts, so a change to a
 /// token or to the "Use my account" switch applies from the next operation.
 #[derive(Clone)]
@@ -238,6 +264,96 @@ impl Accounts {
             requested_by.to_owned(),
         );
         AccountSource::new(move || accounts.operation(&name, &project, &requested_by))
+    }
+
+    /// A source that picks the credential for reading the upstream of
+    /// `project_name` on `upstream` each time it is asked.
+    #[must_use]
+    pub fn upstream_source(
+        &self,
+        project_name: &str,
+        project: &Project,
+        upstream: ForgeKind,
+    ) -> AccountSource {
+        let accounts = self.clone();
+        let (name, project) = (project_name.to_owned(), project.clone());
+        AccountSource::new(move || {
+            let read = accounts.upstream(&name, &project, upstream)?;
+            Ok(Operation {
+                forge: upstream,
+                account: read.account,
+                owner: read.owner,
+                ignore: Vec::new(),
+            })
+        })
+    }
+
+    /// The credential that reads the upstream on `upstream`: the upstream
+    /// token when one is stored, the project token when the upstream is on the
+    /// project's own forge, and no token otherwise, because most upstreams are
+    /// public. A token is read from the secret store only when its account is
+    /// recorded, so a public read works with the store unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`ResolveError::Account`] when a stored token cannot be read.
+    pub fn upstream(
+        &self,
+        project_name: &str,
+        project: &Project,
+        upstream: ForgeKind,
+    ) -> Result<UpstreamRead, ResolveError> {
+        let forge = self.forges.forge(upstream);
+        let own = ForgeTokenOwner::Upstream {
+            project: project_name,
+            forge: upstream,
+        };
+        if self.store.forge_account(own)?.is_some() {
+            let whose = Owner::Upstream {
+                project: project_name.to_owned(),
+            };
+            if let Some((token, found)) = self.read(own, &whose)? {
+                return Ok(UpstreamRead {
+                    account: forge.account(token, &found),
+                    owner: whose,
+                    credential: UpstreamCredential::Upstream(found),
+                });
+            }
+        }
+        let kind = project
+            .forge
+            .kind()
+            .ok_or_else(|| StoreError::UnknownForge(project_name.to_owned()))?;
+        if kind == upstream {
+            let owner = ForgeTokenOwner::Project {
+                project: project_name,
+                forge: kind,
+            };
+            if self.store.forge_account(owner)?.is_some() {
+                let whose = Owner::Project {
+                    project: project_name.to_owned(),
+                };
+                if let Some((token, found)) = self.read(owner, &whose)? {
+                    return Ok(UpstreamRead {
+                        account: forge.account(token, &found),
+                        owner: whose,
+                        credential: UpstreamCredential::Project(found),
+                    });
+                }
+            }
+        }
+        Ok(UpstreamRead {
+            account: Account {
+                token: None,
+                login: String::new(),
+                name: String::new(),
+                email: String::new(),
+            },
+            owner: Owner::Upstream {
+                project: project_name.to_owned(),
+            },
+            credential: UpstreamCredential::None,
+        })
     }
 
     fn operation(

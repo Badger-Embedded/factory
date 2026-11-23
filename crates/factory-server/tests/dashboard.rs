@@ -13077,6 +13077,7 @@ fn maintenance_settings_round_trip_through_the_store() {
         manifest_files: vec!["a.yaml".into(), "b dir/c.yaml".into()],
         build_config_files: vec!["CMakeLists.txt".into()],
         upstream_repo: "o/tool".into(),
+        upstream_forge: ForgeKind::GitHub,
     };
     let maintenance = factory_server::Maintenance {
         renovate: true,
@@ -13407,6 +13408,12 @@ async fn a_reused_gap_job_id_is_not_linked_from_an_older_result() {
 /// A dashboard whose `gh` answers `api user` by the `GH_TOKEN` it gets: the
 /// token `tok-alice` is the account `alice-bot` and `tok-bob` is `bob-bot`.
 fn forge_token_dashboard(secrets_available: bool) -> Dashboard {
+    // A closed port, so a read with no token never reaches the real API.
+    forge_token_dashboard_at(secrets_available, "http://127.0.0.1:9".to_owned())
+}
+
+/// As [`forge_token_dashboard`], with the API a read with no token goes to.
+fn forge_token_dashboard_at(secrets_available: bool, api_base: String) -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
         .create_project(
@@ -13435,6 +13442,16 @@ if [ "$1 $2 $3 $4" = "api user --hostname github.com" ]; then
     *) echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
   esac
 fi
+if [ "$1 $2 $3 $4" = "api repos/o/tool --hostname github.com" ]; then
+  echo '{"permissions":{"admin":false,"maintain":false,"push":false}}'; exit 0
+fi
+if [ "$1 $2 $3 $4" = "api repos/o/secret --hostname github.com" ]; then
+  case "$GH_TOKEN" in
+    tok-reader) echo '{"permissions":{"admin":false,"maintain":false,"push":false}}'; exit 0 ;;
+    tok-bob) echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
+    *) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  esac
+fi
 if [ "$1 $2 $3 $4" = "api repos/Badger-Embedded/maestro --hostname github.com" ]; then
   case "$GH_TOKEN" in
     tok-alice|tok-bob) echo '{"permissions":{"admin":false,"maintain":false,"push":true}}'; exit 0 ;;
@@ -13455,6 +13472,7 @@ exit 1
         );
         GitHub {
             gh,
+            api_base,
             ..GitHub::default()
         }
     };
@@ -14700,4 +14718,194 @@ async fn a_display_name_save_waits_for_a_running_onboarding() {
     assert_eq!(onboarded.status, StatusCode::SEE_OTHER);
     assert!(saved.body.contains("already exists"));
     assert_eq!(store.project_shown_name("maestro").unwrap(), "maestro");
+}
+
+const UPSTREAM_FORM: &str = "renovate=on&packaging=on&packaging_type=deb&manifest_files=debian%2Fcontrol\
+    &build_config_files=&upstream_forge=github";
+
+async fn upstream_post(dashboard: &Dashboard, action: &str, form: &str) -> Reply {
+    let page = dashboard.get(PROJECT_PAGE).await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let csrf = doc
+        .select(&scraper::Selector::parse("#upstream-token input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the upstream token card carries a csrf token")
+        .to_owned();
+    dashboard
+        .post(
+            &format!("{PROJECT_PAGE}/upstream-token{action}"),
+            &format!("{form}&csrf={csrf}"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn check_connection_names_the_credential_and_stores_nothing() {
+    let dashboard = dashboard_with_project_token();
+    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool");
+    let before = dashboard.store.project_maintenance("maestro").unwrap();
+
+    let reply = dashboard
+        .post(&format!("{PROJECT_PAGE}/maintenance/check"), &form)
+        .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply
+            .body
+            .contains("Checked with the project token of alice-bot: o/tool is readable on GitHub.")
+    );
+    assert!(!reply.body.contains("tok-alice"));
+    assert_eq!(
+        dashboard.store.project_maintenance("maestro").unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_token_replaces_the_project_token_for_the_check_and_is_never_shown() {
+    let dashboard = dashboard_with_project_token();
+    let secret = format!("{UPSTREAM_FORM}&upstream_repo=o%2Fsecret");
+
+    let refused = dashboard
+        .post(&format!("{PROJECT_PAGE}/maintenance"), &secret)
+        .await;
+    assert!(
+        refused
+            .body
+            .contains("o/secret could not be read on GitHub")
+    );
+    assert!(refused.body.contains("Save an upstream token"));
+    assert!(refused.body.contains("Nothing was saved."));
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+
+    dashboard
+        .post(
+            &format!("{PROJECT_PAGE}/maintenance"),
+            &format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool"),
+        )
+        .await;
+    let rejected = upstream_post(&dashboard, "", "token=nope").await;
+    assert!(
+        rejected
+            .body
+            .contains("GitHub rejected the token. Nothing was saved.")
+    );
+    assert!(!rejected.body.contains("nope"));
+
+    let saved = upstream_post(&dashboard, "", "token=tok-reader").await;
+    assert!(saved.body.contains("reader-bot"));
+    assert!(!saved.body.contains("tok-reader"));
+
+    let checked = dashboard
+        .post(&format!("{PROJECT_PAGE}/maintenance/check"), &secret)
+        .await;
+    assert!(checked.body.contains(
+        "Checked with the upstream token of reader-bot: o/secret is readable on GitHub."
+    ));
+    let saved = dashboard
+        .post(&format!("{PROJECT_PAGE}/maintenance"), &secret)
+        .await;
+    assert!(saved.body.contains("Saved."));
+    assert_eq!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .unwrap()
+            .upstream_repo,
+        "o/secret"
+    );
+
+    let cleared = upstream_post(&dashboard, "/clear", "").await;
+    assert!(cleared.body.contains("Cleared."));
+}
+
+#[tokio::test]
+async fn a_read_with_no_token_is_checked_and_a_failed_check_does_not_stop_the_save() {
+    let (api, _hits) = stub_api().await;
+    let dashboard = forge_token_dashboard_at(true, api);
+    seed_project_token(&dashboard, "tok-alice", "alice-bot", 11);
+    // The upstream is on Salsa, so the GitHub project token does not apply.
+    // The fake host has no glab, so the read fails or finds nothing.
+    let on_salsa = format!("{UPSTREAM_FORM}&upstream_repo=team%2Ftool").replace("github", "salsa");
+    let reply = dashboard
+        .post(&format!("{PROJECT_PAGE}/maintenance/check"), &on_salsa)
+        .await;
+    assert!(reply.body.contains("Checked with no token: team/tool"));
+
+    let none = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool");
+    let reply = dashboard
+        .post(&format!("{PROJECT_PAGE}/maintenance/check"), &none)
+        .await;
+    assert!(
+        reply
+            .body
+            .contains("Checked with the project token of alice-bot")
+    );
+
+    // With no project token the read is unauthenticated and rate limited.
+    dashboard
+        .store
+        .clear_forge_account(project_owner())
+        .unwrap();
+    let reply = dashboard
+        .post(&format!("{PROJECT_PAGE}/maintenance/check"), &none)
+        .await;
+    assert!(reply.body.contains(
+        "Checked with no token: o/tool is readable on GitHub. GitHub rate limits reads with no token"
+    ));
+}
+
+#[tokio::test]
+async fn saving_packaging_when_the_upstream_check_cannot_run_still_saves() {
+    let dashboard = dashboard_with_project_token();
+    let reply = dashboard
+        .post(
+            &format!("{PROJECT_PAGE}/maintenance"),
+            &format!("{UPSTREAM_FORM}&upstream_repo=o%2Fboom"),
+        )
+        .await;
+    assert!(reply.body.contains("Saved."));
+    assert!(reply.body.contains("The upstream was not checked"));
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .is_some()
+    );
+}
+
+/// Answers every request with an empty repository as a public API would.
+async fn stub_api() -> (String, ()) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = vec![0; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = "{}";
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (base, ())
 }

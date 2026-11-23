@@ -811,7 +811,11 @@ impl Executor for PodmanExecutor {
             .then(|| request.from.clone().zip(request.to.clone()))
             .flatten();
         let range = recorded
-            .or_else(|| forge.compare_range(&details.body, &request.upstream))
+            .or_else(|| {
+                self.forges
+                    .forge(request.upstream_forge)
+                    .compare_range(&details.body, &request.upstream)
+            })
             .or_else(|| manifest_range(&details.diff, &request.manifest_files));
         if range.is_none() && !request.build_config_files.is_empty() {
             return Err(format!(
@@ -823,10 +827,11 @@ impl Executor for PodmanExecutor {
         let mut upstream = Vec::new();
         if let Some((from, to)) = &range {
             for path in &request.build_config_files {
-                let reader = request.account.resolve()?;
+                let reader = request.upstream_account.resolve()?;
                 let text = blame(
                     &reader.owner,
-                    forge
+                    self.forges
+                        .forge(request.upstream_forge)
                         .compare_patch(&reader.account, &request.upstream, from, to, path)
                         .await,
                 )?;

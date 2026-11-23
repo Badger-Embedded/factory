@@ -452,6 +452,7 @@ fn quick(gh: PathBuf) -> GitHub {
         gh,
         settle_polls: 3,
         settle_interval: std::time::Duration::ZERO,
+        ..GitHub::default()
     }
 }
 
@@ -1175,7 +1176,7 @@ async fn approve_names_the_checked_commit_so_a_later_head_is_not_approved() {
 
 fn account() -> Account {
     Account {
-        token: None,
+        token: Some("ghp_test".into()),
         login: "factory-bot".into(),
         name: "factory-bot".into(),
         email: "1+factory-bot@users.noreply.github.com".into(),
@@ -1323,4 +1324,93 @@ async fn a_refused_token_fetching_a_log_is_an_error_and_another_failure_is_noted
         .await
         .unwrap();
     assert!(report.contains("Could not fetch its log"), "{report}");
+}
+
+/// Serves `routes` (request path, status, body) over HTTP on a local port and
+/// records the request lines it gets. Returns the base URL.
+async fn stub_api(
+    routes: &'static [(&'static str, u16, &'static str)],
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let log = std::sync::Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut buf = vec![0; 8192];
+                let n = socket.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                log.lock().unwrap().push(head.clone());
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(route, _, _)| *route == path)
+                    .map_or((404, "{}"), |(_, status, body)| (*status, *body));
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (base, seen)
+}
+
+fn unauthenticated(api_base: String) -> (GitHub, Account) {
+    let github = GitHub {
+        gh: PathBuf::from("/nonexistent/gh"),
+        api_base,
+        ..GitHub::default()
+    };
+    let account = Account {
+        token: None,
+        ..account()
+    };
+    (github, account)
+}
+
+#[tokio::test]
+async fn an_account_with_no_token_reads_a_public_repository_over_https_and_never_runs_gh() {
+    let (base, seen) = stub_api(&[
+        ("/repos/up/app", 200, r#"{"full_name":"up/app"}"#),
+        ("/repos/up/private", 404, r#"{"message":"Not Found"}"#),
+        (
+            "/repos/up/limited",
+            403,
+            r#"{"message":"API rate limit exceeded"}"#,
+        ),
+        (
+            "/repos/up/app/compare/v1...v2",
+            200,
+            r#"{"files":[{"filename":"CMakeLists.txt","patch":"@@ cmake"}]}"#,
+        ),
+    ])
+    .await;
+    let (github, account) = unauthenticated(base);
+
+    assert_eq!(github.access(&account, "up/app").await, Ok(Access::Read));
+    assert_eq!(
+        github.access(&account, "up/private").await,
+        Ok(Access::NotVisible)
+    );
+    let limited = github.access(&account, "up/limited").await.unwrap_err();
+    assert!(limited.contains("HTTP 403"), "{limited}");
+    assert_eq!(
+        github
+            .compare_patch(&account, "up/app", "v1", "v2", "CMakeLists.txt")
+            .await
+            .unwrap(),
+        Some("@@ cmake".into())
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .all(|head| !head.to_ascii_lowercase().contains("authorization"))
+    );
 }

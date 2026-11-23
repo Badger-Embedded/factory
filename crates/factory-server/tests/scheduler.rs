@@ -20,8 +20,8 @@ use factory_server::{
     Owner, PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project, ProjectForge, Projects,
     PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, RunTokens,
     Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
-    StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots,
-    credential_failure, format_cost, ready_action, watch_only_event,
+    StageModels, Store, SummaryRequest, UnavailableSecrets, UpstreamCredential, WatchReport,
+    WatchRequest, WorkerSlots, credential_failure, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -5666,6 +5666,7 @@ fn packaging_project(store: &Store) {
                     manifest_files: vec!["snap/snapcraft.yaml".into()],
                     build_config_files: vec!["CMakeLists.txt".into()],
                     upstream_repo: "upstream/app".into(),
+                    upstream_forge: ForgeKind::GitHub,
                 }),
             },
         )
@@ -6916,4 +6917,81 @@ async fn read_access_triages_without_writes_through_retry_and_merges_a_new_head_
     let log = std::fs::read_to_string(&calls).unwrap();
     assert!(log.contains("--match-head-commit h2"), "{log}");
     assert!(executor.rerun_requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_upstream_credential_is_the_upstream_token_then_the_project_token_then_none() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    let forges = Forges::new(Arc::new(GitHub::default()), Arc::new(GhRepos::default()));
+    let accounts = Accounts::new(
+        Arc::clone(&store),
+        Arc::clone(&secrets) as Arc<dyn SecretStore>,
+        forges,
+    );
+    let salsa_project = Project {
+        forge: ProjectForge::Known(ForgeKind::Salsa),
+        repo: "team/pkg".into(),
+        base: "main".into(),
+        checks: None,
+        models: StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    };
+    let found = |login: &str| ForgeAccount {
+        login: login.into(),
+        id: 1,
+    };
+    secrets
+        .put_forge_token(
+            ForgeTokenOwner::Project {
+                project: "pkg",
+                forge: ForgeKind::Salsa,
+            },
+            "salsa-project-token",
+            &found("pkg-bot"),
+        )
+        .unwrap();
+
+    // A GitHub upstream of a Salsa project: the project token does not work there.
+    let read = accounts
+        .upstream("pkg", &salsa_project, ForgeKind::GitHub)
+        .unwrap();
+    assert_eq!(read.account.token, None);
+    assert_eq!(read.credential, UpstreamCredential::None);
+
+    let read = accounts
+        .upstream("pkg", &salsa_project, ForgeKind::Salsa)
+        .unwrap();
+    assert_eq!(read.account.token.as_deref(), Some("salsa-project-token"));
+    assert_eq!(
+        read.credential,
+        UpstreamCredential::Project(found("pkg-bot"))
+    );
+
+    secrets
+        .put_forge_token(
+            ForgeTokenOwner::Upstream {
+                project: "pkg",
+                forge: ForgeKind::GitHub,
+            },
+            "ghp_upstream",
+            &found("reader"),
+        )
+        .unwrap();
+    let read = accounts
+        .upstream("pkg", &salsa_project, ForgeKind::GitHub)
+        .unwrap();
+    assert_eq!(read.account.token.as_deref(), Some("ghp_upstream"));
+    assert_eq!(read.account.login, "reader");
+    assert_eq!(
+        read.credential,
+        UpstreamCredential::Upstream(found("reader"))
+    );
+    assert_eq!(
+        read.owner,
+        Owner::Upstream {
+            project: "pkg".into()
+        }
+    );
 }

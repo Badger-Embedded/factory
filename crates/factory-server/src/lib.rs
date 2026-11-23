@@ -29,8 +29,8 @@ mod web;
 mod workers;
 
 pub use accounts::{
-    AccountSource, Accounts, Operation, Owner, ResolveError, Resolved, blame, credential_failure,
-    credential_reason,
+    AccountSource, Accounts, Operation, Owner, ResolveError, Resolved, UpstreamCredential,
+    UpstreamRead, blame, credential_failure, credential_reason,
 };
 pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT, ToolList};
 pub use codex::{CodexLogin, CodexRun};
