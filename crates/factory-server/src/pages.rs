@@ -3610,6 +3610,13 @@ fn job_header(
         @if job.renovate_pr().is_some() {
             p.meta { (renovate_link(job, repo_url)) }
         }
+        @if let Some((source, number)) = job.fix_source() {
+            p.meta {
+                "Fixes Renovate pull request #" (number) ", in "
+                a href={ "/jobs/" (source) } { "job " (source) }
+                "."
+            }
+        }
         p.meta {
             @if let Some(links) = repo_url {
                 (external_link(&links.repo_url(), &row.project, None, None))
@@ -3651,6 +3658,9 @@ fn renovate_details(pr: &RenovatePr, settings: &Settings, gap_links: &[i64]) -> 
                     ". " (verdict.reason)
                 }
                 li { "Summary: " (verdict.summary) }
+            }
+            @if let Some(fix) = &pr.fix {
+                li { "Fix job: " a href={ "/jobs/" (fix.job) } { "job " (fix.job) } }
             }
             @match &pr.gaps {
                 Some(jobs) if jobs.is_empty() => li { "No gaps found" },
@@ -3954,6 +3964,17 @@ fn renovate_wait_card(
         RenovateWait::Fixing => "Waiting for a fix job",
         RenovateWait::RebaseFailed => "Rebase the pull request",
     };
+    if state == RenovateWait::Fixing {
+        return html! {
+            div.card.status {
+                span.badge.factory { "waiting for fix" }
+                span.status-detail { (fix_reason(job, reason)) }
+                @if let Some(pr) = job.renovate_pr() {
+                    (renovate_details(pr, settings, gap_links))
+                }
+            }
+        };
+    }
     html! {
         div.card.needs-you {
             div.card-head {
@@ -3971,6 +3992,39 @@ fn renovate_wait_card(
                     }
                 }
             }
+            @if state == RenovateWait::Stopped {
+                form.fix-form method="post" action={ "/jobs/" (id) "/fix" } {
+                    label for="fix-instructions" { "Fix it in a separate pull request" }
+                    textarea #fix-instructions name="instructions" rows="3"
+                        placeholder="What should the fix change? Optional." {}
+                    p.hint {
+                        "The factory starts a job that changes the repository, not the update. "
+                        "When it merges, the factory asks Renovate to rebase the pull request."
+                    }
+                    button.primary { "Fix in a separate pull request" }
+                }
+            }
+        }
+    }
+}
+
+/// The wait reason with the fix job's `#N` as a link to that job.
+fn fix_reason(job: &Job, reason: &str) -> Markup {
+    let target = job
+        .renovate_pr()
+        .and_then(|pr| pr.fix.as_ref())
+        .map(|fix| fix.job);
+    let found = target.and_then(|job| {
+        let mark = format!("#{job}");
+        reason.find(&mark).map(|at| (job, at, mark.len()))
+    });
+    html! {
+        @if let Some((fix, at, len)) = found {
+            (&reason[..at])
+            a href={ "/jobs/" (fix) } { "#" (fix) }
+            (&reason[at + len..])
+        } @else {
+            (reason)
         }
     }
 }
@@ -4279,6 +4333,13 @@ fn status(job: &Job, auto_merge: bool, wait: &Wait) -> Status {
             Wait::Waiting(_) => (Lane::Factory, "factory", "waiting"),
             Wait::Blocked(_) => (Lane::You, "you", "blocked"),
         },
+        (
+            _,
+            Turn::User(Ask::Renovate {
+                state: RenovateWait::Fixing,
+                ..
+            }),
+        ) => (Lane::Factory, "factory", "waiting for fix"),
         (_, Turn::User(_)) if !collecting(job) => (Lane::You, "you", "needs you"),
         _ if in_review(job) && auto_merge => (Lane::Factory, "factory", "merges when green"),
         _ if in_review(job) => (Lane::You, "you", "in review"),

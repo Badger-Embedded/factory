@@ -2741,6 +2741,188 @@ async fn a_renovate_job_shows_on_the_board_and_its_page_and_retries_from_it() {
     assert!(matches!(dashboard.turn(id), Turn::RerunCi { .. }));
 }
 
+fn stopped_renovate_job(dashboard: &Dashboard) -> i64 {
+    let id = dashboard
+        .store
+        .create_renovate_job(
+            "maestro",
+            7,
+            "Update dependency serde",
+            "https://github.com/Badger-Embedded/maestro/pull/7",
+        )
+        .unwrap()
+        .unwrap();
+    dashboard.apply(
+        id,
+        Event::RenovateObserved {
+            head: "abc1234".into(),
+            ci: factory_core::RenovateCi::Failed { log: "boom".into() },
+            limits: factory_core::RetryLimits { auto: 0, total: 0 },
+            auto_merge: false,
+        },
+    );
+    dashboard.apply(id, Event::Commented);
+    id
+}
+
+#[tokio::test]
+async fn the_fix_form_shows_only_on_a_stopped_renovate_job() {
+    let dashboard = dashboard();
+    let stopped = stopped_renovate_job(&dashboard);
+    let page = dashboard.get(&format!("/jobs/{stopped}")).await.body;
+    assert!(page.contains(&format!("action=\"/jobs/{stopped}/fix\"")));
+    assert!(page.contains("name=\"instructions\""));
+    assert!(page.contains("Fix in a separate pull request"));
+    assert!(page.contains(&format!("action=\"/jobs/{stopped}/retry\"")));
+
+    let ready = dashboard
+        .store
+        .create_renovate_job("maestro", 8, "Update tokio", "https://example/pull/8")
+        .unwrap()
+        .unwrap();
+    renovate_to_ready(&dashboard, ready, "h1");
+    let page = dashboard.get(&format!("/jobs/{ready}")).await.body;
+    assert!(page.contains("Ready to merge"));
+    assert!(!page.contains("/fix\""));
+
+    let unsafe_job = dashboard
+        .store
+        .create_renovate_job("maestro", 9, "Update axum", "https://example/pull/9")
+        .unwrap()
+        .unwrap();
+    observe_renovate(&dashboard, unsafe_job, "h1", passed_with_details());
+    dashboard.apply(
+        unsafe_job,
+        Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe: false,
+                reason: "drops a feature".into(),
+                summary: "Drops a feature".into(),
+                from: None,
+                to: None,
+            },
+        ))),
+    );
+    dashboard.apply(unsafe_job, Event::Commented);
+    let page = dashboard.get(&format!("/jobs/{unsafe_job}")).await.body;
+    assert!(page.contains("The update is not safe to merge"));
+    assert!(!page.contains("/fix\""));
+}
+
+#[tokio::test]
+async fn starting_a_fix_creates_one_linked_job_and_leaves_needs_you() {
+    let dashboard = dashboard();
+    let id = stopped_renovate_job(&dashboard);
+
+    let stranger = dashboard
+        .post_as(STRANGER, &format!("/jobs/{id}/fix"), "instructions=x")
+        .await;
+    assert_eq!(stranger.status, StatusCode::NOT_FOUND);
+    assert!(dashboard.store.get(id + 1).is_err());
+
+    let reply = dashboard
+        .post(
+            &format!("/jobs/{id}/fix"),
+            "instructions=update+the+smoke+test",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let fix = dashboard.store.get(id + 1).unwrap();
+    assert_eq!(fix.requested_by, USER);
+    assert_eq!(*fix.job.stage(), Stage::Requested);
+    assert_eq!(fix.job.fix_source(), Some((id, 7)));
+    for part in [
+        "#7",
+        "https://github.com/Badger-Embedded/maestro/pull/7",
+        "update the smoke test",
+    ] {
+        assert!(fix.job.request().contains(part), "{part}");
+    }
+
+    let again = dashboard.post(&format!("/jobs/{id}/fix"), "").await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+    assert!(dashboard.store.get(id + 2).is_err());
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains(&format!(
+        "Waiting for fix job <a href=\"/jobs/{}\">#{}</a>",
+        fix.id, fix.id
+    )));
+    assert!(!page.contains("/retry\""));
+    assert!(!page.contains("/fix\" "));
+    assert!(page.contains("Started fix job #"));
+
+    let fix_page = dashboard.get(&format!("/jobs/{}", fix.id)).await.body;
+    assert!(fix_page.contains(&format!("href=\"/jobs/{id}\"")));
+
+    let board = dashboard.get("/").await.body;
+    assert!(board.contains("Running <span class=\"count\">"));
+    let you = board.split("inbox inbox-you").nth(1).unwrap_or_default();
+    assert!(
+        !you.split("</section>")
+            .next()
+            .unwrap_or_default()
+            .contains("Update dependency serde")
+    );
+    let notes = notifications_as(&dashboard, USER).await;
+    assert!(
+        notes["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["job"] != id)
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_fix_job_brings_back_the_fix_form() {
+    let dashboard = dashboard();
+    let id = stopped_renovate_job(&dashboard);
+    dashboard.post(&format!("/jobs/{id}/fix"), "").await;
+    dashboard.apply(
+        id,
+        Event::FixEnded {
+            job: id + 1,
+            outcome: factory_core::FixOutcome::Cancelled,
+        },
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains("Triage stopped"));
+    assert!(page.contains(&format!("Fix job #{}", id + 1)));
+    assert!(page.contains(&format!("action=\"/jobs/{id}/retry\"")));
+    assert!(page.contains(&format!("action=\"/jobs/{id}/fix\"")));
+    assert!(page.contains("was cancelled"));
+}
+
+#[tokio::test]
+async fn a_failed_rebase_request_shows_under_needs_you() {
+    let dashboard = dashboard();
+    let id = stopped_renovate_job(&dashboard);
+    dashboard.post(&format!("/jobs/{id}/fix"), "").await;
+    dashboard.apply(
+        id,
+        Event::FixEnded {
+            job: id + 1,
+            outcome: factory_core::FixOutcome::Merged {
+                head: "abc1234".into(),
+            },
+        },
+    );
+    dashboard.apply(
+        id,
+        Event::RebaseFailed {
+            reason: "no checkbox".into(),
+        },
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains("could not ask Renovate to rebase. Rebase the pull request by hand."));
+    assert!(!page.contains("/fix\" "));
+    let board = dashboard.get("/").await.body;
+    assert!(board.contains("Needs you <span class=\"count\">1</span>"));
+}
+
 #[tokio::test]
 async fn a_merged_renovate_job_page_keeps_the_verdict_and_summary() {
     let dashboard = dashboard();

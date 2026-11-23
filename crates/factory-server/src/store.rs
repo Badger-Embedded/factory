@@ -6,8 +6,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
     Agent, AgentResult, Ask, Command, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink,
-    FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session, Stage, Turn,
-    Wait,
+    FixOutcome, FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session,
+    Stage, Turn, Wait,
 };
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -1594,8 +1594,20 @@ impl Store {
         let detail = match &event {
             Event::AgentFailed { reason }
             | Event::ReviewFailed { reason }
+            | Event::RebaseFailed { reason }
             | Event::Agent(AgentResult::RerunCi { reason }) => Some(reason.clone()),
             Event::ChecksError { error } => Some(error.clone()),
+            Event::FixStarted { job } => Some(job.to_string()),
+            Event::FixEnded { job, outcome } => Some(format!(
+                "{job}: {}",
+                match outcome {
+                    FixOutcome::Merged { .. } | FixOutcome::MergedUnordered { .. } => "merged",
+                    FixOutcome::Cancelled => "was cancelled",
+                    FixOutcome::Closed => "was closed without merging",
+                    FixOutcome::Dismissed => "failed and was dismissed",
+                    FixOutcome::Deleted => "was deleted",
+                }
+            )),
             _ => None,
         };
         let observed = matches!(

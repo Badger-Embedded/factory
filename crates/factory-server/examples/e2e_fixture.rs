@@ -23,7 +23,9 @@ use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question};
+use factory_core::{
+    AgentResult, Event, PlannedPr, PrDescription, Question, RenovateCi, RetryLimits,
+};
 use factory_runner::ForgeKind;
 use factory_server::Store;
 
@@ -127,14 +129,26 @@ fn events_for(stage: &str) -> Result<Vec<Event>> {
     })
 }
 
-fn event_named(name: &str) -> Result<Event> {
+fn events_named(name: &str) -> Result<Vec<Event>> {
     Ok(match name {
-        "start" => Event::Start,
-        "approve" => Event::Approve,
-        "cancel" => Event::Cancel,
-        "questions" => Event::Agent(AgentResult::Questions(vec![Question {
+        "start" => vec![Event::Start],
+        "approve" => vec![Event::Approve],
+        "cancel" => vec![Event::Cancel],
+        "questions" => vec![Event::Agent(AgentResult::Questions(vec![Question {
             text: "Which hub model should the first version support?".into(),
-        }])),
+        }]))],
+        // CI failed with no rerun left, so triage stops and comments.
+        "renovate-stopped" => vec![
+            Event::RenovateObserved {
+                head: "abc1234".into(),
+                ci: RenovateCi::Failed {
+                    log: "smoke test failed".into(),
+                },
+                limits: RetryLimits { auto: 0, total: 0 },
+                auto_merge: false,
+            },
+            Event::Commented,
+        ],
         other => return Err(format!("unknown event {other}").into()),
     })
 }
@@ -284,7 +298,9 @@ fn main() -> Result<()> {
             println!("{id}");
         }
         "apply" => {
-            store.apply(one("job")?.parse()?, event_named(one("event")?)?)?;
+            for event in events_named(one("event")?)? {
+                store.apply(one("job")?.parse()?, event)?;
+            }
         }
         "log" => {
             let job = one("job")?.parse()?;

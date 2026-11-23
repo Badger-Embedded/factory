@@ -147,6 +147,7 @@ pub fn app(
         .route("/jobs/{id}/answers", post(answer))
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/retry", post(retry))
+        .route("/jobs/{id}/fix", post(start_fix))
         .route("/jobs/{id}/dismiss", post(dismiss))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -1411,6 +1412,33 @@ async fn retry(
         .store
         .append_factory_log(id, "Retried the job from the dashboard.")?;
     board_redirect(&state, form.project, redirect)
+}
+
+#[derive(Deserialize)]
+struct FixForm {
+    project: Option<String>,
+    #[serde(default)]
+    instructions: String,
+}
+
+async fn start_fix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<FixForm>,
+) -> Result<Redirect, AppError> {
+    visible_job(&state, &headers, id)?;
+    let instructions = form.instructions.trim();
+    let fix = state.store.start_fix(
+        id,
+        &user(&headers),
+        (!instructions.is_empty()).then_some(instructions),
+    )?;
+    state.wake.notify_one();
+    state
+        .store
+        .append_factory_log(id, &format!("Started fix job #{fix} from the dashboard."))?;
+    board_redirect(&state, form.project, job_redirect(id))
 }
 
 async fn dismiss(
