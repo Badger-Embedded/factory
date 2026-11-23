@@ -2832,6 +2832,24 @@ impl Store {
         Ok(())
     }
 
+    /// Sets the local checks command of `project`. `None` means no checks. It
+    /// does not trim; the caller does.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_checks(
+        &self,
+        project: &str,
+        checks: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE projects SET checks = ?2 WHERE name = ?1",
+            params![project, checks],
+        )?;
+        Ok(())
+    }
+
     /// Saves a project's auto-merge and LLM-review flags together, so the one
     /// settings form writes the whole row. A saved row replaces the project
     /// file defaults as a whole.

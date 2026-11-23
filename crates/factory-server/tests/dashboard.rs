@@ -17,10 +17,10 @@ use factory_runner::{ForgeAccount, ForgeKind, GitHub};
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin,
     FACTORY_REQUESTER, ForgeTokenOwner, Forges, GitHubRepos, LocalSecrets, LoginProcess,
-    LoginSpawner, MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, ProjectForge,
-    Projects, Protection, RepoChecker, RepoInfo, RepoReport, SecretStore, Settings, StageAgents,
-    StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER, UnavailableSecrets,
-    WorkerSlots, app,
+    LoginSpawner, MASTER_KEY_LEN, McpChecker, McpProjectSettings, McpTool, Permission,
+    PlanUsageCache, ProjectForge, Projects, Protection, RepoChecker, RepoInfo, RepoReport,
+    SecretStore, Settings, StageAgents, StageEfforts, StageModels, Store, StoreError, ToolList,
+    USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -9448,7 +9448,7 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     ] {
         let body = dashboard.get(uri).await.body;
         let bars = if uri == "/settings/projects/maestro" {
-            4
+            5
         } else {
             1
         };
@@ -12177,4 +12177,310 @@ async fn an_unknown_forge_is_a_404() {
         .post("/settings/forges/other/token", "token=x")
         .await;
     assert_eq!(post.status, StatusCode::NOT_FOUND);
+}
+
+async fn checks_post(dashboard: &Dashboard, login: &str, checks: &str) -> Reply {
+    let page = dashboard.get_as(login, PROJECT_PAGE).await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let csrf = doc
+        .select(&scraper::Selector::parse("form[action$='/checks'] input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the Local checks card carries a csrf token")
+        .to_owned();
+    dashboard
+        .post_as(
+            login,
+            &format!("{PROJECT_PAGE}/checks"),
+            &format!("checks={checks}&csrf={csrf}"),
+        )
+        .await
+}
+
+fn checks_field(body: &str) -> Option<String> {
+    let doc = scraper::Html::parse_document(body);
+    let form = scraper::Selector::parse("form[action$='/checks'] input[name=checks]").unwrap();
+    let input = doc.select(&form).next()?;
+    Some(input.value().attr("value").unwrap_or("").to_owned())
+}
+
+fn stored_checks(dashboard: &Dashboard, project: &str) -> Option<String> {
+    dashboard.store.project(project).unwrap().unwrap().checks
+}
+
+#[tokio::test]
+async fn the_checks_card_shows_the_stored_command_or_an_empty_field() {
+    let dashboard = dashboard();
+    let page = dashboard.get(PROJECT_PAGE).await.body;
+    assert!(page.contains("<h2>Local checks</h2>"));
+    assert_eq!(checks_field(&page).as_deref(), Some(""));
+
+    dashboard
+        .store
+        .save_project_checks("maestro", Some("just lint"))
+        .unwrap();
+    let page = dashboard.get(PROJECT_PAGE).await.body;
+    assert_eq!(checks_field(&page).as_deref(), Some("just lint"));
+}
+
+#[tokio::test]
+async fn the_checks_field_has_the_onboarding_label_and_hint() {
+    let dashboard = dashboard();
+    let onboard = dashboard.get("/onboard").await.body;
+    let settings = dashboard.get(PROJECT_PAGE).await.body;
+    let label = "Local checks command (optional)";
+    let hint = "before it pushes, such as nix develop -c just lint &amp;&amp; nix develop -c just test. It is separate from GitHub";
+    let end = "CI on the pull request. Leave it empty to push without local checks.";
+    for body in [&onboard, &settings] {
+        assert!(body.contains(label));
+        assert!(body.contains(hint), "{hint}");
+        assert!(body.contains(end), "{end}");
+    }
+}
+
+#[tokio::test]
+async fn saving_the_checks_card_stores_a_trimmed_command_and_redraws_the_page() {
+    let dashboard = dashboard();
+    let reply = checks_post(&dashboard, USER, "++just+lint+%26%26+just+test++").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("Saved."));
+    assert_eq!(
+        stored_checks(&dashboard, "maestro").as_deref(),
+        Some("just lint && just test")
+    );
+    assert_eq!(
+        checks_field(&reply.body).as_deref(),
+        Some("just lint && just test")
+    );
+}
+
+#[tokio::test]
+async fn an_empty_or_blank_checks_save_stores_no_command() {
+    let dashboard = dashboard();
+    for blank in ["", "+++"] {
+        dashboard
+            .store
+            .save_project_checks("maestro", Some("just lint"))
+            .unwrap();
+        let reply = checks_post(&dashboard, USER, blank).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(stored_checks(&dashboard, "maestro"), None, "{blank:?}");
+        assert_eq!(checks_field(&reply.body).as_deref(), Some(""));
+    }
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_save_the_checks_command() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_checks("maestro", Some("just lint"))
+        .unwrap();
+    let reply = dashboard
+        .post_as(STRANGER, "/settings/projects/maestro/checks", "checks=evil")
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    let unknown = dashboard
+        .post_as(STRANGER, "/settings/projects/nope/checks", "checks=evil")
+        .await;
+    assert_eq!(unknown.status, reply.status);
+    assert_eq!(
+        stored_checks(&dashboard, "maestro").as_deref(),
+        Some("just lint")
+    );
+}
+
+#[tokio::test]
+async fn checks_requests_without_a_valid_form_token_change_nothing() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_checks("maestro", Some("just lint"))
+        .unwrap();
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    let other = dashboard.get_as(DAVE, PROJECT_PAGE).await.body;
+    let other_token = scraper::Html::parse_document(&other)
+        .select(&scraper::Selector::parse("form[action$='/checks'] input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .unwrap()
+        .to_owned();
+    for bad in [
+        "",
+        "&csrf=",
+        "&csrf=forged",
+        &format!("&csrf={other_token}"),
+    ] {
+        let reply = dashboard
+            .post(
+                "/settings/projects/maestro/checks",
+                &format!("checks=evil{bad}"),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{bad}");
+        assert_eq!(
+            stored_checks(&dashboard, "maestro").as_deref(),
+            Some("just lint")
+        );
+    }
+}
+
+fn seed_non_default_settings(dashboard: &Dashboard) {
+    let store = &dashboard.store;
+    store
+        .save_project_checks("maestro", Some("just lint"))
+        .unwrap();
+    store
+        .create_project(
+            "other",
+            ForgeKind::GitHub,
+            "o/other",
+            "main",
+            Some("make"),
+            Some("alice"),
+        )
+        .unwrap();
+    store.add_collaborator("maestro", DAVE, "test").unwrap();
+    store
+        .save_project_models("maestro", &models(Some("opus"), Some("sonnet")))
+        .unwrap();
+    store.save_project_settings("maestro", true, true).unwrap();
+    store
+        .save_project_gates(
+            "maestro",
+            Gates {
+                spec: false,
+                plan: false,
+                publish: true,
+            },
+        )
+        .unwrap();
+    let maintenance = factory_server::Maintenance {
+        renovate: true,
+        packaging: None,
+    };
+    store
+        .save_project_maintenance("maestro", &maintenance)
+        .unwrap();
+    let project_token = ForgeTokenOwner::Project {
+        project: "maestro",
+        forge: ForgeKind::GitHub,
+    };
+    store
+        .set_forge_account(
+            project_token,
+            &ForgeAccount {
+                login: "bot".into(),
+                id: 7,
+            },
+        )
+        .unwrap();
+    store.set_use_my_account("maestro", DAVE, true).unwrap();
+    let mcp = McpProjectSettings {
+        enabled: true,
+        stages: factory_server::McpStages {
+            plan: true,
+            ..Default::default()
+        },
+    };
+    store.save_project_mcp("maestro", "context7", &mcp).unwrap();
+}
+
+#[tokio::test]
+async fn the_checks_card_and_the_other_settings_forms_leave_each_other_alone() {
+    let dashboard = dashboard();
+    seed_non_default_settings(&dashboard);
+    let store = &dashboard.store;
+    let project_token = ForgeTokenOwner::Project {
+        project: "maestro",
+        forge: ForgeKind::GitHub,
+    };
+
+    let snapshot = || {
+        (
+            store
+                .project_models("maestro", &StageModels::default())
+                .unwrap(),
+            store.project_auto_merge("maestro", false).unwrap(),
+            store.project_llm_review("maestro", false).unwrap(),
+            store.project_gates("maestro").unwrap(),
+            store.collaborators("maestro").unwrap(),
+            store.project_maintenance("maestro").unwrap(),
+            store.forge_account(project_token).unwrap(),
+            store.use_my_account("maestro", DAVE).unwrap(),
+            store.project_mcp("maestro", "context7").unwrap(),
+        )
+    };
+    let before = snapshot();
+    assert!(before.1 && before.2 && before.7 && before.8.enabled);
+
+    let reply = checks_post(&dashboard, DAVE, "just+test").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        stored_checks(&dashboard, "maestro").as_deref(),
+        Some("just test")
+    );
+    assert_eq!(stored_checks(&dashboard, "other").as_deref(), Some("make"));
+    assert_eq!(snapshot(), before);
+
+    let reply = dashboard
+        .post("/settings/projects/maestro/maintenance", "")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(!store.project_maintenance("maestro").unwrap().renovate);
+    assert_eq!(
+        stored_checks(&dashboard, "maestro").as_deref(),
+        Some("just test")
+    );
+
+    let form = "clarify=haiku&spec=&plan=&implement=&review=&\
+        clarify_effort=medium&spec_effort=medium&plan_effort=medium&\
+        implement_effort=medium&review_effort=medium&\
+        clarify_agent=claude&spec_agent=claude&plan_agent=claude&\
+        implement_agent=claude&review_agent=claude";
+    let reply = dashboard.post("/settings/projects/maestro", form).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        store
+            .project_models("maestro", &StageModels::default())
+            .unwrap()
+            .clarify
+            .as_deref(),
+        Some("haiku")
+    );
+    assert_eq!(
+        stored_checks(&dashboard, "maestro").as_deref(),
+        Some("just test")
+    );
+}
+
+#[test]
+fn the_checks_command_round_trips_through_the_store() {
+    let store = Store::open_in_memory().unwrap();
+    for name in ["a", "b"] {
+        store
+            .create_project(
+                name,
+                ForgeKind::GitHub,
+                &format!("o/{name}"),
+                "main",
+                Some("make"),
+                None,
+            )
+            .unwrap();
+    }
+    store.save_project_checks("a", Some("just lint")).unwrap();
+    assert_eq!(
+        store.project("a").unwrap().unwrap().checks.as_deref(),
+        Some("just lint")
+    );
+    assert_eq!(
+        store.project("b").unwrap().unwrap().checks.as_deref(),
+        Some("make")
+    );
+    store.save_project_checks("a", None).unwrap();
+    assert_eq!(store.project("a").unwrap().unwrap().checks, None);
 }
