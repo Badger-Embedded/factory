@@ -12021,22 +12021,29 @@ const PACKAGING_FORM: &str = "renovate=on&packaging=on&packaging_type=deb\
     &manifest_files=%20debian/control%20%0D%0A%0D%0Asnap/snapcraft.yaml\
     &build_config_files=&upstream_repo=o%2Ftool";
 
-/// Records a project token account for `maestro`, which Renovate needs. The
-/// token itself is not stored, so the access check cannot run.
-fn record_project_account(dashboard: &Dashboard) {
-    dashboard
-        .store
-        .set_forge_account(
+/// Seals `token` as the project token of `maestro` for `login`.
+fn seed_project_token(dashboard: &Dashboard, token: &str, login: &str, id: u64) {
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .put_forge_token(
             ForgeTokenOwner::Project {
                 project: "maestro",
                 forge: ForgeKind::GitHub,
             },
+            token,
             &ForgeAccount {
-                login: "bot".into(),
-                id: 7,
+                login: login.into(),
+                id,
             },
         )
         .unwrap();
+}
+
+/// A dashboard with the fake `gh` and the Write token `tok-alice` stored as
+/// the project token, which Renovate needs.
+fn dashboard_with_project_token() -> Dashboard {
+    let dashboard = forge_token_dashboard(true);
+    seed_project_token(&dashboard, "tok-alice", "alice-bot", 11);
+    dashboard
 }
 
 #[tokio::test]
@@ -12108,8 +12115,7 @@ async fn ticking_packaging_without_a_manifest_redraws_the_fields_and_stores_noth
 
 #[tokio::test]
 async fn a_packaging_save_saves_and_renders_the_stored_values() {
-    let dashboard = dashboard();
-    record_project_account(&dashboard);
+    let dashboard = dashboard_with_project_token();
     let reply = dashboard
         .post("/settings/projects/maestro/maintenance", PACKAGING_FORM)
         .await;
@@ -12136,8 +12142,7 @@ async fn a_packaging_save_saves_and_renders_the_stored_values() {
 
 #[tokio::test]
 async fn each_refused_maintenance_save_leaves_the_stored_row_unchanged() {
-    let dashboard = dashboard();
-    record_project_account(&dashboard);
+    let dashboard = dashboard_with_project_token();
     dashboard
         .post("/settings/projects/maestro/maintenance", PACKAGING_FORM)
         .await;
@@ -12179,8 +12184,7 @@ async fn each_refused_maintenance_save_leaves_the_stored_row_unchanged() {
 
 #[tokio::test]
 async fn turning_packaging_off_hides_its_fields_again() {
-    let dashboard = dashboard();
-    record_project_account(&dashboard);
+    let dashboard = dashboard_with_project_token();
     dashboard
         .post("/settings/projects/maestro/maintenance", PACKAGING_FORM)
         .await;
@@ -12273,28 +12277,7 @@ async fn renovate_on_reads_the_project_accounts_access() {
 #[tokio::test]
 async fn a_project_account_that_lost_sight_of_the_repository_refuses_renovate() {
     let dashboard = forge_token_dashboard(true);
-    project_post(&dashboard, USER, "forge-token", "token=tok-alice").await;
-    dashboard
-        .store
-        .set_forge_account(
-            project_owner(),
-            &ForgeAccount {
-                login: "ghost-bot".into(),
-                id: 55,
-            },
-        )
-        .unwrap();
-    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
-    secrets
-        .put_forge_token(
-            project_owner(),
-            "tok-ghost",
-            &ForgeAccount {
-                login: "ghost-bot".into(),
-                id: 55,
-            },
-        )
-        .unwrap();
+    seed_project_token(&dashboard, "tok-ghost", "ghost-bot", 55);
     let reply = dashboard
         .post("/settings/projects/maestro/maintenance", "renovate=on")
         .await;
@@ -12303,6 +12286,145 @@ async fn a_project_account_that_lost_sight_of_the_repository_refuses_renovate() 
             .body
             .contains("ghost-bot cannot see Badger-Embedded/maestro")
     );
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .renovate
+    );
+}
+
+#[tokio::test]
+async fn account_metadata_without_a_sealed_token_does_not_turn_renovate_on() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .set_forge_account(
+            project_owner(),
+            &ForgeAccount {
+                login: "bot".into(),
+                id: 7,
+            },
+        )
+        .unwrap();
+    let reply = dashboard
+        .post("/settings/projects/maestro/maintenance", "renovate=on")
+        .await;
+    assert!(reply.body.contains("need a project token"));
+    assert!(!reply.body.contains("was not checked"));
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .renovate
+    );
+}
+
+/// Posts the Maintenance card as `login` with Renovate on, and runs
+/// `meanwhile` while the access check of the `tok-slow` project token waits.
+async fn maintain_while(dashboard: &Dashboard, login: &str, meanwhile: impl FnOnce()) -> Reply {
+    let started = dashboard.data.path().join("started");
+    let go = dashboard.data.path().join("go");
+    let save = dashboard.post_as(
+        login,
+        "/settings/projects/maestro/maintenance",
+        "renovate=on",
+    );
+    let driver = async {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        meanwhile();
+        std::fs::write(&go, "").unwrap();
+    };
+    tokio::join!(save, driver).0
+}
+
+fn slow_project_dashboard() -> Dashboard {
+    let dashboard = forge_token_dashboard(true);
+    seed_project_token(&dashboard, "tok-slow", "slow-bot", 77);
+    dashboard
+}
+
+#[tokio::test]
+async fn a_renovate_save_that_finishes_after_the_project_was_recreated_stores_nothing() {
+    let dashboard = slow_project_dashboard();
+    let reply = maintain_while(&dashboard, USER, || {
+        dashboard.store.remove_project("maestro").unwrap();
+        dashboard
+            .store
+            .create_project(
+                "maestro",
+                ForgeKind::GitHub,
+                "Badger-Embedded/maestro",
+                "main",
+                None,
+                Some(USER),
+            )
+            .unwrap();
+        dashboard.store.project_with_instance("maestro").unwrap();
+    })
+    .await;
+    assert!(reply.body.contains("Nothing was saved"));
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .renovate
+    );
+}
+
+#[tokio::test]
+async fn a_renovate_save_by_a_login_removed_meanwhile_stores_nothing() {
+    let dashboard = slow_project_dashboard();
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    let reply = maintain_while(&dashboard, DAVE, || {
+        dashboard
+            .store
+            .remove_collaborator("maestro", DAVE)
+            .unwrap();
+    })
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .renovate
+    );
+}
+
+#[tokio::test]
+async fn a_renovate_save_after_the_project_token_was_cleared_or_replaced_stores_nothing() {
+    let dashboard = slow_project_dashboard();
+    let reply = maintain_while(&dashboard, USER, || {
+        LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+            .delete_forge_token(project_owner())
+            .unwrap();
+    })
+    .await;
+    assert!(reply.body.contains("project token changed"));
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .renovate
+    );
+
+    let dashboard = slow_project_dashboard();
+    let reply = maintain_while(&dashboard, USER, || {
+        seed_project_token(&dashboard, "tok-bob", "bob-bot", 22);
+    })
+    .await;
+    assert!(reply.body.contains("project token changed"));
     assert!(
         !dashboard
             .store
