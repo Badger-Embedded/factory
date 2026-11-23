@@ -16,13 +16,12 @@
 //! the stream, so the parser keys a failure off a non-zero `result.exitCode`.
 
 use std::ffi::OsString;
-use std::fs;
 use std::path::Path;
 
 use factory_core::Agent;
 use serde_json::Value;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult};
+use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, write_replacing};
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
 use crate::worker::{
@@ -100,7 +99,7 @@ impl AgentBackend for CopilotAgent {
 
     fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
         match run.mcp.as_ref().filter(|mcp| mcp.has_stdio()) {
-            Some(mcp) => fs::write(run.config_dir.join(MCP_CONFIG_FILE), mcp_config(mcp)),
+            Some(mcp) => write_replacing(&run.config_dir, MCP_CONFIG_FILE, &mcp_config(mcp)),
             None => Ok(()),
         }
     }

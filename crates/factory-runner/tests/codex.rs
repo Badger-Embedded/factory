@@ -711,3 +711,26 @@ async fn a_run_reports_the_thread_id_usage_and_reads_the_refreshed_login_back() 
     .unwrap();
     assert_eq!(schema, Expect::Spec.strict_schema());
 }
+
+#[test]
+fn a_symlink_in_the_codex_config_dir_is_replaced_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("codex")).unwrap();
+    let target = dir.path().join("outside");
+    fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("codex/config.toml")).unwrap();
+    let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    backend(Agent::Codex).unwrap().prepare(&run).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    let written = dir.path().join("codex/config.toml");
+    assert!(!fs::symlink_metadata(&written).unwrap().is_symlink());
+    assert!(
+        fs::read_to_string(&written)
+            .unwrap()
+            .contains("playwright-mcp")
+    );
+}

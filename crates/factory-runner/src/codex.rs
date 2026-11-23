@@ -21,7 +21,9 @@ use std::fmt::Write as _;
 use factory_core::Agent;
 use serde_json::Value;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage};
+use crate::agent::{
+    AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage, write_replacing,
+};
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
 use crate::worker::{
@@ -122,7 +124,7 @@ impl AgentBackend for CodexAgent {
                 );
             }
         }
-        fs::write(run.config_dir.join(CONFIG_FILE), config)?;
+        write_replacing(&run.config_dir, CONFIG_FILE, &config)?;
         fs::write(
             run.config_dir.join(SCHEMA_FILE),
             run.expect.strict_schema().to_string(),

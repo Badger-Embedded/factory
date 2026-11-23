@@ -2063,3 +2063,26 @@ fn the_gap_prompt_carries_the_input_and_the_rules_of_its_type() {
     assert!(text.contains("Build-Depends") && text.contains("debian/patches"));
     assert!(text.contains("unavailable"));
 }
+
+#[test]
+fn a_symlink_in_the_claude_config_dir_is_replaced_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("claude")).unwrap();
+    let target = dir.path().join("outside");
+    fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("claude/factory-mcp.json")).unwrap();
+    let mut run = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    backend(Agent::Claude).unwrap().prepare(&run).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    let written = dir.path().join("claude/factory-mcp.json");
+    assert!(!fs::symlink_metadata(&written).unwrap().is_symlink());
+    assert!(
+        fs::read_to_string(&written)
+            .unwrap()
+            .contains("playwright-mcp")
+    );
+}

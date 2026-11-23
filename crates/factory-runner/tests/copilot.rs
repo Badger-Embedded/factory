@@ -881,3 +881,26 @@ async fn a_checkpoint_is_logged_when_the_run_dies_before_its_result_line() {
         "{log:?}"
     );
 }
+
+#[test]
+fn a_symlink_in_the_copilot_config_dir_is_replaced_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
+    let target = dir.path().join("outside");
+    fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("copilot/factory-mcp.json")).unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    backend(Agent::Copilot).unwrap().prepare(&run).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    let written = dir.path().join("copilot/factory-mcp.json");
+    assert!(!fs::symlink_metadata(&written).unwrap().is_symlink());
+    assert!(
+        fs::read_to_string(&written)
+            .unwrap()
+            .contains("playwright-mcp")
+    );
+}

@@ -200,3 +200,14 @@ pub fn backend(agent: Agent) -> Option<&'static dyn AgentBackend> {
         Agent::Copilot => Some(&CopilotAgent),
     }
 }
+
+/// Writes `contents` to `dir/name` through a fresh temporary file in `dir` and a
+/// rename. A previous worker can leave a symlink at `name`, and a rename replaces
+/// the link itself, where an in-place write would follow it out of `dir`.
+pub(crate) fn write_replacing(dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(contents.as_bytes())?;
+    file.persist(dir.join(name)).map_err(|err| err.error)?;
+    Ok(())
+}
