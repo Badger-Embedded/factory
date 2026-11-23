@@ -33,6 +33,7 @@ fn codex_run(dir: &Path, session: SessionRun) -> WorkerRun {
         model: None,
         effort: None,
         mcp: None,
+        packages: Vec::new(),
     }
 }
 
@@ -343,6 +344,7 @@ fn a_claude_run_is_unchanged_by_the_codex_backend() {
                 name: "context7".into(),
             }],
         }),
+        packages: Vec::new(),
     };
     let args = strings(&factory_runner::podman_args(&WorkerConfig::default(), &run));
 

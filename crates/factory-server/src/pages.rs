@@ -784,7 +784,9 @@ pub struct ProjectSettings {
     pub upstream: UpstreamCard,
     /// The project's local checks command, or `None` when it has none.
     pub checks: Option<String>,
-    /// The form token the Local checks card posts.
+    /// The project's worker packages.
+    pub packages: Vec<String>,
+    /// The form token the Local checks and Worker packages cards post.
     pub checks_csrf: String,
 }
 
@@ -1918,6 +1920,7 @@ pub fn settings_project(
                 (project_forge_account_card(&project.name, card))
             }
             (project_checks_card(project))
+            (project_packages_card(project))
             (project_maintenance_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
@@ -1981,6 +1984,31 @@ fn project_checks_card(project: &ProjectSettings) -> Markup {
             }
             input type="hidden" name="csrf" value=(project.checks_csrf);
             (save_bar("Save checks"))
+        }
+    }
+}
+
+fn project_packages_card(project: &ProjectSettings) -> Markup {
+    html! {
+        form.card.settings-form method="post"
+            action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/packages" } {
+            h2 { "Worker packages" }
+            div.field {
+                label for="packages" { "nixpkgs packages" }
+                textarea #packages.wide name="packages" rows="4"
+                    autocapitalize="none" spellcheck="false" placeholder="playwright-mcp" {
+                    (project.packages.join("\n"))
+                }
+                p.hint {
+                    "One nixpkgs package per line, such as playwright-mcp or python3Packages.requests. "
+                    "The factory puts them on PATH in every agent and checks run of this project, "
+                    "which is how a stdio MCP server gets the tools it needs. The first run with a new "
+                    "package takes longer while nix downloads it."
+                }
+                p.hint { "A change applies at the next run. A run already in the worker keeps the packages it started with." }
+            }
+            input type="hidden" name="csrf" value=(project.checks_csrf);
+            (save_bar("Save packages"))
         }
     }
 }

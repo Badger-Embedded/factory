@@ -5,20 +5,26 @@ use std::process::Stdio;
 use factory_core::Event;
 use tokio::process::Command;
 
+use crate::packages;
 use crate::worker::{WORK_DIR, WorkerConfig};
 
 const MAX_REPORT: usize = 30_000;
+const MAX_PACKAGE_ERROR: usize = 4_000;
 /// Exit codes podman uses for its own errors, as opposed to the command's.
 const PODMAN_ERRORS: [i32; 3] = [125, 126, 127];
 
 /// The arguments after `podman` to run `command` with bash in the job's
 /// checkout. The container gets no Claude token and no GitHub credentials.
+/// With `packages`, the command runs in a `nix shell` with them on `PATH`, and
+/// bash is not a login shell, because the image's `/etc/profile` resets `PATH`
+/// and would drop them.
 #[must_use]
 pub fn checks_args(
     config: &WorkerConfig,
     name: &str,
     workspace: &Path,
     command: &str,
+    packages: &[String],
 ) -> Vec<OsString> {
     let mut volume = OsString::from(workspace.as_os_str());
     volume.push(format!(":{WORK_DIR}"));
@@ -45,9 +51,15 @@ pub fn checks_args(
         args.push("--volume".into());
         args.push(volume.into());
     }
-    for arg in [config.image.as_str(), "bash", "-lc", command] {
-        args.push(arg.into());
-    }
+    args.push(config.image.as_str().into());
+    let flag = if packages.is_empty() { "-lc" } else { "-c" };
+    args.extend(packages::wrap(
+        packages,
+        ["bash", flag, command]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+    ));
     args
 }
 
@@ -63,9 +75,10 @@ pub async fn run_checks(
     name: &str,
     workspace: &Path,
     command: &str,
+    packages: &[String],
 ) -> Result<Event, String> {
     let output = Command::new(&config.podman)
-        .args(checks_args(config, name, workspace, command))
+        .args(checks_args(config, name, workspace, command, packages))
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output()
@@ -76,6 +89,12 @@ pub async fn run_checks(
     }
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !packages.is_empty() && output.status.code() == Some(packages::FAILED_CODE) {
+        return Err(packages::failure(
+            packages,
+            &format!(": {}", tail(text.trim(), MAX_PACKAGE_ERROR)),
+        ));
+    }
     if output
         .status
         .code()
@@ -87,15 +106,19 @@ pub async fn run_checks(
             text.trim()
         ));
     }
-    let mut start = text.len().saturating_sub(MAX_REPORT);
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
     Ok(Event::ChecksFailed {
         report: format!(
             "`{command}` failed ({}):\n\n{}",
             output.status,
-            &text[start..]
+            tail(&text, MAX_REPORT)
         ),
     })
+}
+
+fn tail(text: &str, max: usize) -> &str {
+    let mut start = text.len().saturating_sub(max);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }

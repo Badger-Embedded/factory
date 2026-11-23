@@ -56,6 +56,7 @@ fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
         model: None,
         effort: None,
         mcp: None,
+        packages: Vec::new(),
     }
 }
 
@@ -483,6 +484,54 @@ fn podman_args_give_the_worker_its_token_limits_and_mounts() {
             .any(|arg| arg.contains("GH_TOKEN") || arg.contains("GITHUB_TOKEN")),
         "workers get no GitHub credentials"
     );
+}
+
+#[test]
+fn packages_wrap_the_agent_command_in_nix_shell_and_no_packages_change_nothing() {
+    let config = WorkerConfig::default();
+    let plain = strings(&podman_args(
+        &config,
+        &worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into())),
+    ));
+    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+    run.packages = vec!["a".into(), "b".into()];
+    let wrapped = strings(&podman_args(&config, &run));
+
+    let image = plain.iter().position(|arg| *arg == config.image).unwrap();
+    assert_eq!(plain[..=image], wrapped[..=image]);
+    assert_eq!(wrapped[image + 1..image + 3], ["bash", "-c"]);
+    assert!(wrapped[image + 3].contains("nix shell"));
+    assert_eq!(
+        wrapped[image + 4..image + 8],
+        ["factory-worker-packages", "a", "b", "--"]
+    );
+    assert_eq!(wrapped[image + 8..], plain[image + 1..]);
+}
+
+#[tokio::test]
+async fn a_package_failure_fails_the_run_with_the_packages_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    fs::write(&empty, "").unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &empty, "error: attribute nope missing", 86),
+        ..WorkerConfig::default()
+    };
+    let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
+    worker.packages = vec!["nope".into(), "also".into()];
+
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+    let reason = failure_reason(report.event);
+    assert!(
+        reason.contains("worker packages (nope, also) could not be installed"),
+        "{reason}"
+    );
+    assert!(reason.contains("attribute nope missing"), "{reason}");
+
+    // Without packages the same exit code is an ordinary failed run.
+    worker.packages = Vec::new();
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+    assert!(!failure_reason(report.event).contains("worker packages"));
 }
 
 #[test]

@@ -9,6 +9,7 @@ use tokio::process::Command;
 
 use crate::agent::{AgentItem, Credential, RunResult, TokenUsage, backend};
 use crate::outcome::{Expect, failed_event};
+use crate::packages;
 use crate::stream::LogLine;
 
 /// Where the job's checkout appears inside the worker.
@@ -192,6 +193,9 @@ pub struct WorkerRun {
     /// The MCP servers active for this run, or `None` when none is. `None`
     /// passes no MCP config, so the arguments are unchanged.
     pub mcp: Option<McpConfig>,
+    /// The project's nixpkgs packages. A non-empty list runs the agent inside
+    /// `nix shell` with them on `PATH`; an empty one changes nothing.
+    pub packages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -298,7 +302,7 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     }
 
     args.push(config.image.clone().into());
-    args.extend(backend.command(config, run));
+    args.extend(packages::wrap(&run.packages, backend.command(config, run)));
     args
 }
 
@@ -399,6 +403,14 @@ pub async fn run(
         Credential::File(name) => fs::read_to_string(run.config_dir.join(name)).ok(),
         Credential::Env(_) => None,
     };
+    if !run.packages.is_empty()
+        && collected.result.is_none()
+        && status
+            .as_ref()
+            .is_ok_and(|status| status.code() == Some(packages::FAILED_CODE))
+    {
+        return failed(packages::failure(&run.packages, &tail(&stderr)));
+    }
     collected.into_report(run.expect, credential, status, &stderr)
 }
 

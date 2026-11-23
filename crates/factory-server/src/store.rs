@@ -214,6 +214,10 @@ CREATE TABLE IF NOT EXISTS project_mcp_args (
     args TEXT NOT NULL,
     PRIMARY KEY (project, server)
 );
+CREATE TABLE IF NOT EXISTS project_packages (
+    project TEXT PRIMARY KEY,
+    packages TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cost_closed_jobs (
     job_id INTEGER PRIMARY KEY REFERENCES jobs (id)
 );
@@ -3219,7 +3223,7 @@ impl Store {
     /// The deleted configuration is the project's rows in `projects`,
     /// `project_models`, `project_settings`, `project_gates`, `project_efforts`,
     /// `project_agents`, `project_mcp`, `project_mcp_tools`,
-    /// `project_mcp_tool_refreshes`, `project_mcp_args`, `project_totals` and
+    /// `project_mcp_tool_refreshes`, `project_mcp_args`, `project_packages`, `project_totals` and
     /// `project_collaborators`, `project_maintenance`, `renovate_prs`, its MCP header values in `secrets`, its
     /// `job_costs` rows, and the `cost` rows in `job_events` for its jobs. With
     /// no collaborator rows left, the project and its surviving jobs are visible
@@ -3267,6 +3271,7 @@ impl Store {
             "project_mcp_tools",
             "project_mcp_tool_refreshes",
             "project_mcp_args",
+            "project_packages",
             "project_totals",
             "project_collaborators",
             "project_maintenance",
@@ -3752,6 +3757,46 @@ impl Store {
         self.conn().execute(
             "UPDATE projects SET checks = ?2 WHERE name = ?1",
             params![project, checks],
+        )?;
+        Ok(())
+    }
+
+    /// The nixpkgs packages `project` puts on `PATH` in its workers, in the
+    /// order saved. Empty when none is saved.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or when the stored list is not valid JSON.
+    pub fn project_packages(&self, project: &str) -> Result<Vec<String>, StoreError> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT packages FROM project_packages WHERE project = ?1",
+                [project],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Saves `project`'s worker packages, writing only this row. The caller has
+    /// validated them with [`crate::packages::validate`].
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_packages(
+        &self,
+        project: &str,
+        packages: &[String],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO project_packages (project, packages) VALUES (?1, ?2)
+             ON CONFLICT (project) DO UPDATE SET packages = excluded.packages",
+            params![project, serde_json::to_string(packages)?],
         )?;
         Ok(())
     }

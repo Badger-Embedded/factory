@@ -35,6 +35,7 @@ fn copilot_run(dir: &Path, session: SessionRun) -> WorkerRun {
         model: None,
         effort: None,
         mcp: None,
+        packages: Vec::new(),
     }
 }
 

@@ -82,6 +82,7 @@ fn request() -> AgentRequest {
         model: None,
         effort: None,
         mcp: None,
+        packages: Vec::new(),
     }
 }
 

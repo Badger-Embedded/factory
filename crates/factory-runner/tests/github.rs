@@ -246,6 +246,7 @@ fn checks_run_with_bash_in_the_checkout_without_tokens() {
         "factory-job-7",
         Path::new("/jobs/7/work"),
         "just lint",
+        &[],
     )
     .iter()
     .map(|arg| arg.to_string_lossy().into_owned())
@@ -254,6 +255,65 @@ fn checks_run_with_bash_in_the_checkout_without_tokens() {
     assert!(args.iter().any(|arg| arg == "factory-nix:/nix"));
     assert_eq!(args[args.len() - 3..], ["bash", "-lc", "just lint"]);
     assert!(!args.iter().any(|arg| arg.contains("secret")));
+}
+
+#[test]
+fn checks_with_packages_run_the_command_inside_nix_shell() {
+    let config = WorkerConfig::default();
+    let packages = ["a".to_owned(), "b".to_owned()];
+    let args: Vec<String> = checks_args(
+        &config,
+        "factory-job-7",
+        Path::new("/jobs/7/work"),
+        "just lint; echo $HOME",
+        &packages,
+    )
+    .iter()
+    .map(|arg| arg.to_string_lossy().into_owned())
+    .collect();
+    let image = args.iter().position(|arg| *arg == config.image).unwrap();
+    assert_eq!(args[image + 1], "bash");
+    assert_eq!(args[image + 2], "-c");
+    assert!(args[image + 3].contains("nix shell"));
+    assert!(!args[image + 3].contains("just lint"));
+    assert_eq!(
+        args[image + 4..],
+        [
+            "factory-worker-packages",
+            "a",
+            "b",
+            "--",
+            "bash",
+            "-c",
+            "just lint; echo $HOME"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn packages_that_cannot_be_installed_are_a_checks_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let podman = script(
+        dir.path(),
+        "podman",
+        "echo 'error: attribute nope missing' >&2\nexit 86",
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let packages = ["nope".to_owned()];
+    let err = run_checks(
+        &config,
+        "factory-job-7",
+        Path::new("/jobs/7/work"),
+        "just lint",
+        &packages,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("worker packages (nope)"), "{err}");
+    assert!(err.contains("attribute nope missing"), "{err}");
 }
 
 #[tokio::test]
@@ -275,6 +335,7 @@ async fn check_results_become_events_and_podman_errors_are_retried() {
                 "factory-job-7",
                 Path::new("/jobs/7/work"),
                 "just lint",
+                &[],
             )
             .await
         }

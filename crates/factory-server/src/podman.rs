@@ -322,6 +322,7 @@ impl Executor for PodmanExecutor {
             model: request.model,
             effort: request.effort,
             mcp: request.mcp,
+            packages: request.packages,
         };
         let report = run(
             &config,
@@ -368,7 +369,14 @@ impl Executor for PodmanExecutor {
                 ),
             });
         }
-        run_checks(&config, &name, &workspace, &request.command).await
+        run_checks(
+            &config,
+            &name,
+            &workspace,
+            &request.command,
+            &request.packages,
+        )
+        .await
     }
 
     async fn summarize(&self, request: SummaryRequest) -> Result<BranchSummary, String> {

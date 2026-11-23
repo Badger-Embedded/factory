@@ -211,6 +211,32 @@ test('the local checks command saves and clears', async ({ page, project }) => {
   await expect(field).toHaveValue('');
 });
 
+test('the worker packages save, show the unsaved bar and refuse a bad name', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project));
+  const card = page.locator('form.settings-form').filter({ hasText: 'Worker packages' });
+  const field = card.getByLabel('nixpkgs packages');
+  const note = card.locator('.save-bar-note');
+  await expect(field).toHaveValue('');
+  await expect(note).toHaveText('No unsaved changes.');
+  await field.fill('playwright-mcp\npython3Packages.requests');
+  await expect(note).toHaveText('Unsaved changes.');
+  await card.getByRole('button', { name: 'Save packages' }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto(settingsPath(project));
+  await expect(field).toHaveValue('playwright-mcp\npython3Packages.requests');
+
+  await field.fill('nixpkgs#foo');
+  await card.getByRole('button', { name: 'Save packages' }).click();
+  await expect(page.getByText('"nixpkgs#foo" is not a nixpkgs package name')).toBeVisible();
+
+  await page.goto(settingsPath(project));
+  await expect(field).toHaveValue('playwright-mcp\npython3Packages.requests');
+});
+
 test('a display name shows in the picker, the sidebar and the heading', async ({
   page,
   project,
