@@ -7,11 +7,12 @@ use std::time::SystemTime;
 
 use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
 use factory_runner::{
-    Account, BranchSummary, Ci, Credential, Forge, Git, Observation, PrState, Remote, RenovatePr,
-    Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend, observe, place_files,
-    place_images, remove_container, run, run_checks, show_files, show_images,
+    Account, BranchSummary, Ci, Credential, ForgeKind, Git, Observation, PrState, Remote,
+    RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend, observe,
+    place_files, place_images, remove_container, run, run_checks, show_files, show_images,
 };
 
+use crate::forges::Forges;
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PackagingRequest, PublishRequest,
@@ -33,11 +34,9 @@ pub struct PodmanExecutor {
     pub base: WorkerConfig,
     /// Prepares each job's checkout.
     pub git: Git,
-    /// Opens pull requests and reads their state.
-    pub forge: Arc<dyn Forge>,
-    /// The account every operation runs as. Its token never reaches the
-    /// worker.
-    pub factory_account: Account,
+    /// The forge of each request, which opens pull requests and reads their
+    /// state as the account the request names.
+    pub forges: Forges,
     pub data_dir: PathBuf,
     /// Resolves each run's agent to its credential, worker image and host config
     /// directory. The run reads the credential when it starts, so a token saved
@@ -235,11 +234,12 @@ impl Executor for PodmanExecutor {
         if let Err(err) = fs::create_dir_all(&config_dir) {
             return failed(format!("could not create {}: {err}", config_dir.display()));
         }
+        let forge = self.forges.forge(request.forge);
         if let Err(err) = self
             .git
             .prepare(
                 &workspace,
-                &Remote::new(&*self.forge, &self.factory_account, &request.repo),
+                &Remote::new(&*forge, &request.account, &request.repo),
                 &request.base,
                 request.branch.as_deref(),
             )
@@ -353,9 +353,9 @@ impl Executor for PodmanExecutor {
     }
 
     async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
-        if let Some(number) = self
-            .forge
-            .merged_pr(&self.factory_account, &request.repo, &request.branch)
+        let forge = self.forges.forge(request.forge);
+        if let Some(number) = forge
+            .merged_pr(&request.account, &request.repo, &request.branch)
             .await?
         {
             return Ok(Published::AlreadyMerged(number));
@@ -368,13 +368,13 @@ impl Executor for PodmanExecutor {
         self.git
             .push(
                 &workspace,
-                &Remote::new(&*self.forge, &self.factory_account, &request.repo),
+                &Remote::new(&*forge, &request.account, &request.repo),
                 &request.branch,
             )
             .await?;
-        self.forge
+        forge
             .open_pr(
-                &self.factory_account,
+                &request.account,
                 &request.repo,
                 &request.base,
                 &request.branch,
@@ -385,9 +385,14 @@ impl Executor for PodmanExecutor {
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
-        let status = self
-            .forge
-            .status(&self.factory_account, &request.repo, request.number)
+        let forge = self.forges.forge(request.forge);
+        let status = forge
+            .status(
+                &request.account,
+                &request.repo,
+                request.number,
+                &request.ignore,
+            )
             .await?;
         let observation = observe(&status, request.seen_until.as_deref());
         // The review stopped and waits for the user. Report only a merge or
@@ -415,8 +420,8 @@ impl Executor for PodmanExecutor {
                     None,
                 ),
                 ReadyAction::Merge => {
-                    self.forge
-                        .merge(&self.factory_account, &request.repo, request.number)
+                    forge
+                        .merge(&request.account, &request.repo, request.number)
                         .await?;
                     merged_by_factory = true;
                     (Some(Event::Merged), None)
@@ -432,9 +437,8 @@ impl Executor for PodmanExecutor {
                 None,
             ),
             Observation::CiFailed(checks) => {
-                let log = self
-                    .forge
-                    .failure_report(&self.factory_account, &request.repo, &checks)
+                let log = forge
+                    .failure_report(&request.account, &request.repo, &checks)
                     .await;
                 (Some(Event::CiFailed { log }), None)
             }
@@ -452,26 +456,41 @@ impl Executor for PodmanExecutor {
     }
 
     async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
-        self.forge
-            .rerun_failed(&self.factory_account, &request.repo, request.number)
+        self.forges
+            .forge(request.forge)
+            .rerun_failed(&request.account, &request.repo, request.number)
             .await
     }
 
-    async fn renovate_prs(&self, repo: &str, base: &str) -> Result<Vec<RenovatePr>, String> {
-        self.forge
-            .renovate_prs(&self.factory_account, repo, base)
+    async fn renovate_prs(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        base: &str,
+    ) -> Result<Vec<RenovatePr>, String> {
+        self.forges
+            .forge(forge)
+            .renovate_prs(account, repo, base)
             .await
     }
 
     async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
-        let status = self
-            .forge
-            .status(&self.factory_account, &request.repo, request.number)
+        let forge = self.forges.forge(request.forge);
+        let status = forge
+            .status(
+                &request.account,
+                &request.repo,
+                request.number,
+                &request.ignore,
+            )
             .await?;
         let ci = match status.state {
             PrState::Merged => {
                 let event = self
                     .renovate_merged(
+                        request.forge,
+                        &request.account,
                         &request.repo,
                         request.number,
                         request.manifest_files.as_deref(),
@@ -489,18 +508,16 @@ impl Executor for PodmanExecutor {
             Ci::NoChecks => RenovateCi::NoChecks,
             Ci::Pending => RenovateCi::Pending,
             Ci::Failed(checks) => RenovateCi::Failed {
-                log: self
-                    .forge
-                    .failure_report(&self.factory_account, &request.repo, &checks)
+                log: forge
+                    .failure_report(&request.account, &request.repo, &checks)
                     .await,
             },
             Ci::Passed => {
                 let details = if request.verdict_head.as_deref() == Some(status.head.as_str()) {
                     None
                 } else {
-                    let details = self
-                        .forge
-                        .pr_details(&self.factory_account, &request.repo, request.number)
+                    let details = forge
+                        .pr_details(&request.account, &request.repo, request.number)
                         .await?;
                     Some(Box::new(PrDiff {
                         diff: details.diff,
@@ -518,23 +535,37 @@ impl Executor for PodmanExecutor {
         }))
     }
 
-    async fn comment(&self, repo: &str, number: u64, body: &str) -> Result<(), String> {
-        self.forge
-            .comment(&self.factory_account, repo, number, body)
+    async fn comment(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), String> {
+        self.forges
+            .forge(forge)
+            .comment(account, repo, number, body)
             .await
     }
 
-    async fn merge_renovate(&self, repo: &str, number: u64, head: &str) -> Result<(), String> {
-        self.forge
-            .approve(&self.factory_account, repo, number, head, APPROVAL)
-            .await?;
-        self.forge
-            .merge_head(&self.factory_account, repo, number, head)
-            .await
+    async fn merge_renovate(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) -> Result<(), String> {
+        let forge = self.forges.forge(forge);
+        forge.approve(account, repo, number, head, APPROVAL).await?;
+        forge.merge_head(account, repo, number, head).await
     }
 
     async fn renovate_merged(
         &self,
+        forge: ForgeKind,
+        account: &Account,
         repo: &str,
         number: u64,
         manifest_files: Option<&[String]>,
@@ -546,8 +577,9 @@ impl Executor for PodmanExecutor {
             });
         };
         let info = self
-            .forge
-            .pr_info(&self.factory_account, repo, number)
+            .forges
+            .forge(forge)
+            .pr_info(account, repo, number)
             .await?;
         Ok(Event::RenovateMerged {
             packaging: true,
@@ -559,15 +591,14 @@ impl Executor for PodmanExecutor {
         &self,
         request: PackagingRequest,
     ) -> Result<PackagingContext, String> {
-        let details = self
-            .forge
-            .pr_details(&self.factory_account, &request.repo, request.number)
+        let forge = self.forges.forge(request.forge);
+        let details = forge
+            .pr_details(&request.account, &request.repo, request.number)
             .await?;
         let mut manifests = Vec::new();
         for path in &request.manifest_files {
-            let text = self
-                .forge
-                .file_at(&self.factory_account, &request.repo, path, &request.base)
+            let text = forge
+                .file_at(&request.account, &request.repo, path, &request.base)
                 .await?;
             manifests.push(FileText {
                 path: path.clone(),
@@ -578,7 +609,7 @@ impl Executor for PodmanExecutor {
             .then(|| request.from.clone().zip(request.to.clone()))
             .flatten();
         let range = recorded
-            .or_else(|| self.forge.compare_range(&details.body, &request.upstream))
+            .or_else(|| forge.compare_range(&details.body, &request.upstream))
             .or_else(|| manifest_range(&details.diff, &request.manifest_files));
         if range.is_none() && !request.build_config_files.is_empty() {
             return Err(format!(
@@ -590,9 +621,8 @@ impl Executor for PodmanExecutor {
         let mut upstream = Vec::new();
         if let Some((from, to)) = &range {
             for path in &request.build_config_files {
-                let text = self
-                    .forge
-                    .compare_patch(&self.factory_account, &request.upstream, from, to, path)
+                let text = forge
+                    .compare_patch(&request.account, &request.upstream, from, to, path)
                     .await?;
                 upstream.push(FileText {
                     path: path.clone(),
