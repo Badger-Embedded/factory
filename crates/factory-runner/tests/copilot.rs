@@ -424,6 +424,21 @@ fn a_stray_closing_fence_after_an_earlier_block_fails_the_run() {
 }
 
 #[test]
+fn a_longer_fence_in_the_summary_is_not_closed_by_a_shorter_one() {
+    let json = commits_outcome("Why.");
+    let summary = "Summary.\n\n````markdown\n```sh\njust lint\n```\n````";
+    let text = format!("{summary}\n\n```json\n{json}\n```");
+    let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
+    assert_eq!(result.event, commits_event("Why."));
+
+    let text = format!("{summary}\n\n{json}\n```");
+    match last_result(&parse(Expect::Commits, &assistant_message(&text))).event {
+        Event::AgentFailed { reason } => assert!(reason.contains("not valid JSON"), "{reason}"),
+        other => panic!("expected AgentFailed, got {other:?}"),
+    }
+}
+
+#[test]
 fn text_after_the_fence_or_a_non_json_block_fails_the_run() {
     let json = commits_outcome("Why.");
     for text in [

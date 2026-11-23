@@ -255,26 +255,28 @@ fn message_result(expect: Expect, text: &str) -> RunResult {
 /// The JSON to parse from the final message: the content of the fenced block
 /// that ends the message, whatever text precedes it, or the whole trimmed text
 /// when the message does not end with a closing fence. A fence line starts with
-/// triple backticks after optional indentation. Backticks inside a valid JSON
-/// string cannot start a raw line.
+/// at least three backticks after optional indentation. A block closes on a
+/// bare fence at least as long as its opening fence. Backticks inside a valid
+/// JSON string cannot start a raw line.
 fn json_slice(text: &str) -> &str {
     let text = text.trim();
-    let mut open: Option<usize> = None;
-    let mut body: Option<&str> = None;
+    let mut open: Option<(usize, usize)> = None;
+    let mut body = None;
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with("```") {
-            match open.take() {
-                None => open = Some(offset + line.len()),
-                Some(start) => {
-                    body = Some(text[start..offset].trim());
-                    if offset + line.len() < text.len() || line.trim() != "```" {
-                        body = None;
-                    }
-                }
+        let trimmed = line.trim();
+        let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+        match open {
+            None if ticks >= 3 => {
+                open = Some((ticks, offset + line.len()));
+                body = None;
             }
-        } else if body.is_some() {
-            body = None;
+            None => body = None,
+            Some((len, start)) if ticks >= len && ticks == trimmed.len() => {
+                body = Some(text[start..offset].trim());
+                open = None;
+            }
+            Some(_) => {}
         }
         offset += line.len();
     }
