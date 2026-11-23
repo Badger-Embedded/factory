@@ -106,7 +106,7 @@
   picker.addEventListener("toggle", function () {
     summary.setAttribute("aria-expanded", picker.open ? "true" : "false");
     if (picker.open) {
-      applyFilter(false);
+      applyFilter(true);
       search.focus();
     } else {
       search.value = "";

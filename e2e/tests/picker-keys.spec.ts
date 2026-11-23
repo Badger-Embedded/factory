@@ -1,16 +1,3 @@
-// Keyboard shortcuts of the project picker and the key caps that show them.
-//
-// - p opens the picker with the search box focused and Esc closes it:
-//   "p opens the panel with the search box focused and Esc returns focus to the button"
-// - n and Shift+N load the next and previous project that needs attention, wrapping:
-//   "n and Shift+N jump between projects that need attention and wrap around"
-// - Typing p or n in the request box only types the letter:
-//   "typing p or n in the request box does nothing else"
-// - The caps are <kbd> elements, the button keeps its name, and the N hints dim
-//   when no other project needs attention:
-//   "the button and the panel footer show key caps", "the N hints dim with no other project that needs attention"
-// - A touch device and a page without JavaScript show no caps:
-//   "a touch device shows no key caps", "without JavaScript no key cap is visible"
 import type { Page } from '@playwright/test';
 import { expect, test, type Factory } from '../fixtures';
 
@@ -124,9 +111,28 @@ test.describe('with a desktop pointer', () => {
     await expect(page.locator('.picker-hint-n.dimmed')).toHaveCount(2);
     await expect(page.locator('.picker-hint:not(.picker-hint-n).dimmed')).toHaveCount(0);
 
-    // The dimming follows the five-second refresh.
     factory.fixture('job', '--project', ids.c, '--stage', 'spec', '--request', 'Another spec job');
     await expect(page.locator('.picker-hint-n.dimmed')).toHaveCount(0, { timeout: 15_000 });
+  });
+});
+
+test.describe('at an intermediate width', () => {
+  test.use({ viewport: { width: 600, height: 800 } });
+
+  test('the open panel stays inside the viewport', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: 'spec' });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    await button(page).click();
+    await expect
+      .poll(async () => {
+        const box = await page.locator('.picker-panel').boundingBox();
+        return box!.x + box!.width;
+      })
+      .toBeLessThanOrEqual(600);
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth))
+      .toBeLessThanOrEqual(0);
   });
 });
 
