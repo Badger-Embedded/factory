@@ -31,7 +31,7 @@ const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const ONBOARD_FORGE: &str = include_str!("../static/onboard-forge.js");
 const SOURCE_LINK: &str = include_str!("../static/source-link.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
-const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
+const MCP_ROWS: &str = include_str!("../static/mcp-rows.js");
 const NOTIFICATIONS: &str = include_str!("../static/notifications.js");
 const PERMISSION_BAR: &str = include_str!("../static/permission-bar.js");
 const NOTIFICATION_PERMISSION: &str = include_str!("../static/notification-permission.js");
@@ -1669,7 +1669,7 @@ pub fn settings_mcp(
         &html! {
             h1 { "MCP servers" }
             (mcp_servers(servers, secrets_available))
-            script { (PreEscaped(MCP_HEADER_ROWS)) }
+            script { (PreEscaped(MCP_ROWS)) }
         },
     )
 }
@@ -1725,19 +1725,28 @@ pub fn settings_mcp_server(
         &html! {
             p.crumbs { a href="/settings/mcp" { "MCP servers" } " › " (server.name) }
             h1 { (server.name) }
-            p.meta { "Shared by every project. Each project stores its own header values on its own page." }
+            p.meta { "Kind: " span.server-kind { (server.transport.kind()) } }
+            @if server.as_stdio().is_some() {
+                p.meta { "Shared by every project. The command and base arguments run inside the worker of every project that turns the server on." }
+            } @else {
+                p.meta { "Shared by every project. Each project stores its own header values on its own page." }
+            }
             @if let Some(problem) = page.problem {
                 div.card.failed { (problem) }
             }
             (mcp_server_form(server, page.pending))
-            (server_usage_card(&server.name, page.usage))
+            (server_usage_card(&server.name, page.usage, server.as_stdio().is_some()))
             form.card.danger-card method="post" action={ "/settings/mcp/" (crate::web::query_escape(&server.name)) "/delete" } {
                 h2 { "Delete " (server.name) }
-                p.hint {
-                    "Removes the server from every project and deletes the "
-                    (stored) " stored "
-                    (if stored == 1 { "value" } else { "values" })
-                    " for it. Type the server's name to confirm."
+                @if server.as_stdio().is_some() {
+                    p.hint { "Removes the server from every project. Type the server's name to confirm." }
+                } @else {
+                    p.hint {
+                        "Removes the server from every project and deletes the "
+                        (stored) " stored "
+                        (if stored == 1 { "value" } else { "values" })
+                        " for it. Type the server's name to confirm."
+                    }
                 }
                 div.row {
                     input.grow type="text" name="confirm_name" aria-label="Server name"
@@ -1746,7 +1755,7 @@ pub fn settings_mcp_server(
                     button.danger { "Delete " (server.name) }
                 }
             }
-            script { (PreEscaped(MCP_HEADER_ROWS)) }
+            script { (PreEscaped(MCP_ROWS)) }
         },
     )
 }
@@ -1754,7 +1763,7 @@ pub fn settings_mcp_server(
 /// The "Used by" card: each project with whether it runs the server, in how
 /// many stages, and which of its header values are stored, with a link to the
 /// project's page for the server.
-fn server_usage_card(server: &str, usage: &[ServerUsage]) -> Markup {
+fn server_usage_card(server: &str, usage: &[ServerUsage], stdio: bool) -> Markup {
     html! {
         div.card {
             h2 { "Used by" }
@@ -1766,7 +1775,9 @@ fn server_usage_card(server: &str, usage: &[ServerUsage]) -> Markup {
                     span.server-name { (entry.project.shown) }
                     span.hint.server-url { (usage_line(entry.enabled, entry.stages)) }
                     (header_badges(&entry.headers))
-                    a.link-button href=(project_mcp_href(&entry.project.id, server)) { "Open" }
+                    @if !stdio {
+                        a.link-button href=(project_mcp_href(&entry.project.id, server)) { "Open" }
+                    }
                 }
             }
         }
@@ -2285,19 +2296,20 @@ pub fn settings_project_mcp(
 /// button and the given `hint`. The names post as a repeated `header` field. The
 /// box's `pattern` refuses anything but an HTTP header name in the browser, so a
 /// pasted `Authorization: x` is caught before the form posts; the server
-/// validates again. "Add header" and "Remove" run `MCP_HEADER_ROWS`. Without
+/// validates again. "Add header" and "Remove" run `MCP_ROWS`. Without
 /// JavaScript the form still works: you add one name per save and remove a name
 /// by clearing its box.
-fn header_rows(names: &[String], hint: &Markup) -> Markup {
+fn header_rows(names: &[String], hint: &Markup, validate: bool) -> Markup {
     html! {
         div.field {
             span.label { "Header names" }
             div.mcp-headers {
                 @for name in names {
-                    (header_row(name))
+                    (header_row(name, validate))
                 }
-                (header_row(""))
+                (header_row("", validate))
             }
+            template { (header_row("", validate)) }
             button.add-header type="button" { "Add header" }
             (hint)
         }
@@ -2305,11 +2317,11 @@ fn header_rows(names: &[String], hint: &Markup) -> Markup {
 }
 
 /// One header-name row: a text box named `header` and a Remove button.
-fn header_row(value: &str) -> Markup {
+fn header_row(value: &str, validate: bool) -> Markup {
     html! {
         div.mcp-header-row {
             input.grow type="text" name="header" placeholder="Authorization"
-                pattern=(HEADER_NAME_PATTERN) aria-label="Header name"
+                pattern=[validate.then_some(HEADER_NAME_PATTERN)] aria-label="Header name"
                 title="Only the header name, with no colon or value."
                 value=(value);
             button.remove-header type="button" { "Remove" }
@@ -2361,7 +2373,7 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
     html! {
         div.card {
             h2 { "MCP servers" }
-            p.hint { "Remote MCP servers over HTTPS, offered to agent runs. A project turns one on and picks its stages on its own page. Header values are entered per project." }
+            p.hint { "Remote MCP servers over HTTPS, and stdio servers the agent starts inside the worker. A project turns one on and picks its stages on its own page. Header values of a remote server are entered per project." }
             @if !secrets_available {
                 p.hint.bad { "The master key is missing, so header values cannot be saved. The factory still runs, and a project's enabled servers and stages still save." }
             }
@@ -2371,7 +2383,7 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
             @for server in servers {
                 div.server-row {
                     span.server-name { (server.name) }
-                    span.hint.server-url { (remote_url(server)) }
+                    span.hint.server-url { (server.transport.kind()) ": " (server_summary(server)) }
                     a.link-button href={ "/settings/mcp/" (crate::web::query_escape(&server.name)) } { "Open" }
                 }
             }
@@ -2391,23 +2403,110 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
                     autocapitalize="none" autocomplete="off" spellcheck="false";
                 p.hint { "1 to 32 characters of a-z, 0-9 and -. It is the key in a run's MCP config and part of the proxy path." }
             }
-            div.field {
-                label for="mcp-new-url" { "URL" }
-                input #mcp-new-url.wide type="url" name="url" required
-                    placeholder="https://mcp.context7.com/mcp";
-                p.hint { "An https URL to the server's streamable-HTTP endpoint." }
+            fieldset.kind-choice {
+                legend { "Kind" }
+                label { input type="radio" name="kind" value="remote" checked; " remote" }
+                label { input type="radio" name="kind" value="stdio"; " stdio" }
+                p.hint { "A kind cannot change after the server is added." }
             }
-            (header_rows(&[], &html! {
-                p.hint { "Only the header name, such as " code { "Authorization" } ", with no colon or value. Each project enters its own value on its own page, stored encrypted. A keyless server needs none." }
-            }))
+            div.kind-remote {
+                div.field {
+                    label for="mcp-new-url" { "URL" }
+                    // No browser validation on the add form's remote fields: a
+                    // hidden field that fails it would block a stdio submit, and
+                    // without JavaScript it cannot be disabled. The server validates.
+                    input #mcp-new-url.wide type="text" inputmode="url" name="url"
+                        placeholder="https://mcp.context7.com/mcp";
+                    p.hint { "An https URL to the server's streamable-HTTP endpoint." }
+                }
+                (header_rows(&[], &html! {
+                    p.hint { "Only the header name, such as " code { "Authorization" } ", with no colon or value. Each project enters its own value on its own page, stored encrypted. A keyless server needs none." }
+                }, false))
+            }
+            div.kind-stdio {
+                div.field {
+                    label for="mcp-new-command" { "Command" }
+                    input #mcp-new-command.wide type="text" name="command"
+                        placeholder="npx" maxlength="256"
+                        autocapitalize="none" autocomplete="off" spellcheck="false";
+                }
+                (arg_rows(&[], &html! { (STDIO_HINT) }))
+            }
             button.primary { "Add server" }
         }
     }
 }
 
-fn remote_url(server: &McpServer) -> &str {
-    let McpTransport::Remote { url, .. } = &server.transport;
-    url
+/// What the server list shows after the kind: a remote server's URL or a stdio
+/// server's command line.
+fn server_summary(server: &McpServer) -> String {
+    match &server.transport {
+        McpTransport::Remote { url, .. } => url.clone(),
+        McpTransport::Stdio { command, args } => std::iter::once(command.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+const STDIO_HINT: &str = "The command and base arguments run inside the worker of every project that turns the server on, and each project can append arguments of its own. The agent can read every argument, so no secret belongs here. Each project supplies the command's dependencies through its worker packages. An argument is passed as one value, with no shell splitting, and may not contain ${.";
+
+/// The argument rows a stdio form shares: one text box per stored argument,
+/// each with a Remove button, then three empty boxes for new ones so the form
+/// works without JavaScript, then an "Add argument" button and the given
+/// `hint`. The arguments post as a repeated `arg` field, and the server drops
+/// the empty ones.
+fn arg_rows(args: &[String], hint: &Markup) -> Markup {
+    html! {
+        div.field {
+            span.label { "Base arguments" }
+            div.mcp-args {
+                @for arg in args {
+                    @if arg.contains(['\r', '\n']) {
+                        (escaped_arg_row(arg))
+                    } @else {
+                        (arg_row(arg))
+                    }
+                }
+                @for _ in 0..3 {
+                    (arg_row(""))
+                }
+            }
+            template { (arg_row("")) }
+            button.add-arg type="button" { "Add argument" }
+            (hint)
+        }
+    }
+}
+
+/// A stored argument with a line break, which a one-line input would strip. The
+/// input shows it with `\`, line feed and carriage return escaped and posts it
+/// as `arg_escaped`, so the value survives a save and an admin can edit it or
+/// clear the box to remove it.
+fn escaped_arg_row(value: &str) -> Markup {
+    let shown = value
+        .replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    html! {
+        div.mcp-arg-row {
+            input.grow type="text" name="arg_escaped" aria-label="Argument with a line break"
+                autocapitalize="none" autocomplete="off" spellcheck="false"
+                value=(shown);
+            button.remove-arg type="button" { "Remove" }
+        }
+    }
+}
+
+fn arg_row(value: &str) -> Markup {
+    html! {
+        div.mcp-arg-row {
+            input.grow type="text" name="arg" aria-label="Argument"
+                autocapitalize="none" autocomplete="off" spellcheck="false"
+                value=(value);
+            button.remove-arg type="button" { "Remove" }
+        }
+    }
 }
 
 /// One server's edit form on its own page: its URL and header names, a Delete
@@ -2415,10 +2514,26 @@ fn remote_url(server: &McpServer) -> &str {
 /// because it keys the stored secrets and the proxy path.
 fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup {
     let action = format!("/settings/mcp/{}", server.name);
-    let McpTransport::Remote {
-        url: stored_url,
-        headers: stored_headers,
-    } = &server.transport;
+    let (stored_url, stored_headers) = match &server.transport {
+        McpTransport::Remote { url, headers } => (url, headers),
+        McpTransport::Stdio { command, args } => {
+            return html! {
+                form.card.settings-form method="post" action=(action) {
+                    div.field {
+                        label for={ "mcp-" (server.name) "-command" } { "Command" }
+                        input id={ "mcp-" (server.name) "-command" }.wide type="text" name="command"
+                            required maxlength="256" value=(command)
+                            autocapitalize="none" autocomplete="off" spellcheck="false";
+                    }
+                    (arg_rows(args, &html! {
+                        p.hint { (STDIO_HINT) }
+                        p.hint { "An edit keeps every project's settings for the server and applies at each job's next run." }
+                    }))
+                    (save_bar("Save"))
+                }
+            };
+        }
+    };
     let url = pending.map_or(stored_url.as_str(), |pending| pending.url.as_str());
     let headers = pending.map_or(stored_headers.as_slice(), |pending| {
         pending.headers.as_slice()
@@ -2457,7 +2572,7 @@ fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup 
             (header_rows(headers, &html! {
                 p.hint { "Only the header name, with no colon or value. Each project enters its own value on its own page, stored encrypted." }
                 p.hint { "Removing or renaming a header deletes every project's stored value for it, and changing the URL's host or port deletes all of them. The page asks before it saves such a change. Changing only the path keeps them." }
-            }))
+            }, true))
             @if pending.is_some() {
                 div.save-bar.dirty {
                     span.save-bar-note { "Unsaved changes." }

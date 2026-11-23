@@ -418,9 +418,14 @@ select:focus, textarea:focus, button:focus-visible { outline: var(--focus-ring);
 .field { margin-bottom: var(--space-14); }
 
 .field > .label { display: block; font-weight: var(--weight-semibold); margin: 0 0 var(--space-6); }
-.mcp-header-row { display: flex; gap: var(--space-8); align-items: center; margin-bottom: var(--space-8); }
-.mcp-header-row > .grow { flex: 1 1 auto; }
-.mcp-headers + .add-header { margin-bottom: var(--space-6); }
+.mcp-header-row, .mcp-arg-row { display: flex; gap: var(--space-8); align-items: center; margin-bottom: var(--space-8); }
+.mcp-header-row > .grow, .mcp-arg-row > .grow { flex: 1 1 auto; }
+.mcp-headers + .add-header, .mcp-args + .add-arg { margin-bottom: var(--space-6); }
+.kind-choice { border: 0; padding: 0; margin: 0 0 var(--space-14); }
+.kind-choice label { margin-right: var(--space-14); }
+/* Without JavaScript both groups exist; the checked kind decides which shows. */
+form:has(input[name=kind][value=stdio]:checked) .kind-remote,
+form:not(:has(input[name=kind][value=stdio]:checked)) .kind-stdio { display: none; }
 
 .codex-prices { display: flex; flex-direction: column; gap: var(--space-12); margin-bottom: var(--space-16); }
 .price-row, .price-add { display: flex; flex-wrap: wrap; gap: var(--space-12); align-items: flex-end; }

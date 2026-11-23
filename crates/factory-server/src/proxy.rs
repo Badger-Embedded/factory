@@ -230,7 +230,10 @@ impl Upstreams for StoreUpstreams {
         let McpTransport::Remote {
             url,
             headers: declared,
-        } = registered.transport;
+        } = registered.transport
+        else {
+            return None;
+        };
         let mut headers = Vec::new();
         for header in &declared {
             let at = SecretRef {

@@ -2028,6 +2028,8 @@ fn project_settings(
         .store
         .mcp_servers()?
         .into_iter()
+        // Runs do not carry a stdio server yet, so a project has no switch for it.
+        .filter(|server| server.as_remote().is_some())
         .map(|server| server_settings(state, name, server))
         .collect::<Result<Vec<_>, StoreError>>()?;
     let agents = state
@@ -2253,6 +2255,9 @@ fn save_posted_gates(store: &Store, project: &str, form: &ProjectForm) -> Result
 /// own page. A server that is off and stays off is not written.
 fn save_pipeline_mcp(state: &AppState, project: &str, form: &ProjectForm) -> Result<(), AppError> {
     for server in state.store.mcp_servers()? {
+        if server.as_remote().is_none() {
+            continue;
+        }
         let base = format!("mcp.{}", server.name);
         if !form.ticked(&format!("{base}.pipeline")) {
             continue;
@@ -3298,8 +3303,8 @@ fn server_settings(
     server: McpServer,
 ) -> Result<ServerSettings, StoreError> {
     let saved = state.store.project_mcp(project, &server.name)?;
-    let McpTransport::Remote { headers, .. } = &server.transport;
-    let headers = headers
+    let declared = server.as_remote().map_or(&[][..], |(_, headers)| headers);
+    let headers = declared
         .iter()
         .map(|header: &String| {
             let at = SecretRef {
@@ -3334,6 +3339,7 @@ fn project_and_server(
     state
         .store
         .mcp_server(server)?
+        .filter(|server| server.as_remote().is_some())
         .ok_or_else(|| AppError::NotFound(format!("no MCP server named {server:?}")))
 }
 
@@ -3393,10 +3399,9 @@ async fn save_project_mcp(
         form.get(&format!("{base}.header.{header}"))
             .filter(|value| !value.is_empty())
     };
-    let McpTransport::Remote {
-        headers: registered_headers,
-        ..
-    } = &registered.transport;
+    let registered_headers = registered
+        .as_remote()
+        .map_or(&[][..], |(_, headers)| headers);
     if !state.secrets.available()
         && registered_headers
             .iter()
@@ -3441,34 +3446,82 @@ async fn save_project_mcp(
     project_mcp_page(&state, &headers, &project, &server, Some("Saved."))
 }
 
-/// An MCP server form: its `url` and one `header` field per header-name row. The
-/// rows post as a repeated `header` field, so the form parses as a list of pairs
-/// rather than a struct. The Add form also posts a `name`; the edit route takes
-/// the name from its path and ignores any posted one.
+/// An MCP server form: a `kind`, the remote fields `url` and one `header` field
+/// per header-name row, and the stdio fields `command` and one `arg` field per
+/// argument row. Rows post as repeated fields, so the form parses as a list of
+/// pairs rather than a struct. The Add form also posts a `name`; the edit route
+/// takes the name from its path and ignores any posted one.
 struct McpServerForm {
     name: String,
+    /// Whether the posted kind is `stdio`, when one was posted. The edit route
+    /// only checks it against the stored kind, because the kind is fixed.
+    stdio: Option<bool>,
     url: String,
     headers: Vec<String>,
+    command: String,
+    args: Vec<String>,
     /// Set when the operator confirmed an edit that deletes stored values.
     confirm: bool,
 }
 
+/// Reads an argument the edit form escaped so that a one-line input can carry
+/// it: `\\` is a backslash, `\n` a line feed and `\r` a carriage return.
+fn unescape_arg(value: &str) -> Result<String, McpError> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            _ => {
+                return Err(McpError::BadArgs(
+                    "an escaped argument has a backslash that is not \\\\, \\n or \\r".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl McpServerForm {
-    /// Reads `name`, `url` and the repeated `header` field out of the posted
-    /// pairs. Each header name is trimmed and an empty one, from a blank row, is
-    /// dropped. The store validates and deduplicates the names.
-    fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+    /// Reads the posted pairs. Each header name is trimmed and an empty one,
+    /// from a blank row, is dropped. An argument is kept as typed, because a
+    /// space in it is part of it; the store drops an empty one. The store
+    /// validates both lists.
+    fn from_pairs(pairs: Vec<(String, String)>) -> Result<Self, McpError> {
         let mut form = McpServerForm {
             name: String::new(),
+            stdio: None,
             url: String::new(),
             headers: Vec::new(),
+            command: String::new(),
+            args: Vec::new(),
             confirm: false,
         };
         for (key, value) in pairs {
             match key.as_str() {
                 "name" => form.name = value,
+                "kind" => {
+                    form.stdio = Some(match value.as_str() {
+                        "stdio" => true,
+                        "remote" => false,
+                        _ => {
+                            return Err(McpError::BadKind(format!(
+                                "the kind {value:?} is not remote or stdio"
+                            )));
+                        }
+                    });
+                }
                 "url" => form.url = value,
+                "command" => form.command = value,
                 "confirm" => form.confirm = true,
+                "arg" => form.args.push(value),
+                "arg_escaped" => form.args.push(unescape_arg(&value)?),
                 "header" => {
                     let name = value.trim();
                     if !name.is_empty() {
@@ -3478,7 +3531,22 @@ impl McpServerForm {
                 _ => {}
             }
         }
-        form
+        Ok(form)
+    }
+
+    /// The transport the posted fields describe, ignoring the other kind's.
+    fn transport(&self, stdio: bool) -> McpTransport {
+        if stdio {
+            McpTransport::Stdio {
+                command: self.command.clone(),
+                args: self.args.clone(),
+            }
+        } else {
+            McpTransport::Remote {
+                url: self.url.trim().to_owned(),
+                headers: self.headers.clone(),
+            }
+        }
     }
 }
 
@@ -3487,10 +3555,11 @@ async fn add_mcp_server(
     headers: HeaderMap,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
-    let form = McpServerForm::from_pairs(pairs);
+    let form = McpServerForm::from_pairs(pairs)?;
+    let transport = form.transport(form.stdio == Some(true));
     state
         .store
-        .create_mcp_server(form.name.trim(), form.url.trim(), &form.headers)?;
+        .create_mcp_server_with(form.name.trim(), &transport)?;
     mcp_server_page(&state, &headers, form.name.trim(), Some("Added."))
 }
 
@@ -3500,29 +3569,43 @@ async fn edit_mcp_server(
     Path(name): Path<String>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
-    let form = McpServerForm::from_pairs(pairs);
-    let url = form.url.trim();
-    // An edit that deletes stored values waits for the operator to confirm it.
-    let deletes = state.store.mcp_edit_deletes(&name, url, &form.headers)?;
-    if !deletes.is_empty() && !form.confirm {
-        let total = deletes.len();
-        let visible = project_labels(&state, &user(&headers))?;
-        let shown = deletes
-            .into_iter()
-            .filter_map(|(project, header)| {
-                let label = visible.iter().find(|label| label.id == project)?;
-                Some((label.clone(), header))
-            })
-            .collect();
-        let pending = pages::PendingEdit {
-            url: url.to_owned(),
-            headers: form.headers,
-            deletes: shown,
-            total,
-        };
-        return mcp_server_page_with(&state, &headers, &name, None, Some(&pending), None);
+    let form = McpServerForm::from_pairs(pairs)?;
+    let Some(registered) = state.store.mcp_server(&name)? else {
+        return Err(McpError::NotFound(name).into());
+    };
+    let stdio = registered.as_stdio().is_some();
+    if form.stdio.is_some_and(|posted| posted != stdio) {
+        return Err(McpError::KindChange(name).into());
     }
-    state.store.edit_mcp_server(&name, url, &form.headers)?;
+    let transport = form.transport(stdio);
+    // An edit that deletes stored values waits for the operator to confirm it.
+    // A stdio server has none, so it saves at once.
+    if let McpTransport::Remote {
+        url,
+        headers: names,
+    } = &transport
+    {
+        let deletes = state.store.mcp_edit_deletes(&name, url, names)?;
+        if !deletes.is_empty() && !form.confirm {
+            let total = deletes.len();
+            let visible = project_labels(&state, &user(&headers))?;
+            let shown = deletes
+                .into_iter()
+                .filter_map(|(project, header)| {
+                    let label = visible.iter().find(|label| label.id == project)?;
+                    Some((label.clone(), header))
+                })
+                .collect();
+            let pending = pages::PendingEdit {
+                url: url.clone(),
+                headers: names.clone(),
+                deletes: shown,
+                total,
+            };
+            return mcp_server_page_with(&state, &headers, &name, None, Some(&pending), None);
+        }
+    }
+    state.store.edit_mcp_server_with(&name, &transport)?;
     mcp_server_page(&state, &headers, &name, Some("Saved."))
 }
 
@@ -3567,6 +3650,12 @@ async fn check_mcp_server(
             "no MCP server named {server:?}"
         )));
     };
+    // A stdio server runs inside the worker, so the factory cannot reach it.
+    if registered.as_stdio().is_some() {
+        return Err(AppError::BadRequest(format!(
+            "the server {server:?} runs inside the worker, so its connection cannot be checked"
+        )));
+    }
     // Resolve the saved URL and values the way the proxy does, so the check and
     // a run send the same headers. `resolve` returns `None` only for a server
     // that is not registered, which the lookup above has ruled out.
@@ -3577,10 +3666,9 @@ async fn check_mcp_server(
     // A declared header with no resolved value has none stored, or one that
     // would not decrypt. The result names these, and the check runs without
     // them.
-    let McpTransport::Remote {
-        headers: registered_headers,
-        ..
-    } = &registered.transport;
+    let registered_headers = registered
+        .as_remote()
+        .map_or(&[][..], |(_, headers)| headers);
     let missing: Vec<String> = registered_headers
         .iter()
         .filter(|name| !headers.iter().any(|(have, _)| have == *name))

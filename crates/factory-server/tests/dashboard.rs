@@ -10278,6 +10278,180 @@ async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
 }
 
 #[tokio::test]
+async fn a_stdio_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
+    let dashboard = dashboard();
+    let added = dashboard
+        .post(
+            "/settings/mcp",
+            "name=playwright&kind=stdio&command=npx&arg=-y&arg=&arg=%40playwright%2Fmcp%400.0.83\
+             &url=https%3A%2F%2Fignored.test%2Fmcp&header=Authorization",
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    assert!(added.body.contains("stdio"));
+    assert!(added.body.contains("@playwright/mcp@0.0.83"));
+    let server = dashboard.store.mcp_server("playwright").unwrap().unwrap();
+    assert_eq!(
+        server.as_stdio().unwrap(),
+        (
+            "npx",
+            &["-y".to_owned(), "@playwright/mcp@0.0.83".to_owned()][..]
+        ),
+    );
+
+    let list = dashboard.get("/settings/mcp").await;
+    assert!(list.body.contains("stdio: npx -y @playwright/mcp@0.0.83"));
+
+    let edited = dashboard
+        .post(
+            "/settings/mcp/playwright",
+            "command=uvx&arg=pkg&arg=--flag%3Da+b",
+        )
+        .await;
+    assert_eq!(edited.status, StatusCode::OK);
+    let server = dashboard.store.mcp_server("playwright").unwrap().unwrap();
+    assert_eq!(
+        server.as_stdio().unwrap(),
+        ("uvx", &["pkg".to_owned(), "--flag=a b".to_owned()][..]),
+    );
+
+    let deleted = dashboard
+        .post("/settings/mcp/playwright/delete", "confirm_name=playwright")
+        .await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert!(dashboard.store.mcp_server("playwright").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_stdio_mcp_server_is_not_checked_and_has_no_project_page_yet() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .create_mcp_server_with(
+            "playwright",
+            &factory_server::McpTransport::Stdio {
+                command: "npx".to_owned(),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+    let check = dashboard
+        .post("/settings/projects/maestro/mcp/playwright/check", "")
+        .await;
+    assert_eq!(check.status, StatusCode::BAD_REQUEST);
+    assert_eq!(dashboard.checker.calls(), 0);
+    let project = dashboard.get("/settings/projects/maestro").await;
+    assert!(!project.body.contains("playwright"));
+}
+
+#[tokio::test]
+async fn an_invalid_stdio_mcp_server_is_a_bad_request() {
+    let dashboard = dashboard();
+    for form in [
+        "name=p&kind=stdio&command=",
+        "name=p&kind=stdio&command=a%0Ab",
+        "name=p&kind=stdio&command=%0Anpx",
+        "name=p&kind=stdio&command=npx%0D",
+        "name=p&kind=stido&command=npx",
+        "name=p&kind=stido&url=https%3A%2F%2Fmcp.context7.com%2Fmcp",
+        "name=p&kind=stdio&command=npx&arg=%24%7BHOME%7D",
+    ] {
+        let reply = dashboard.post("/settings/mcp", form).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{form}");
+    }
+    let many = "&arg=a".repeat(65);
+    let reply = dashboard
+        .post(
+            "/settings/mcp",
+            &format!("name=p&kind=stdio&command=npx{many}"),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(dashboard.store.mcp_servers().unwrap(), Vec::new());
+
+    // An edit cannot change the kind: a remote server ignores stdio fields.
+    dashboard
+        .store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
+    let reply = dashboard
+        .post(
+            "/settings/mcp/context7",
+            "kind=stdio&url=https%3A%2F%2Fmcp.context7.com%2Fmcp&command=npx",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    let kept = dashboard.store.mcp_server("context7").unwrap().unwrap();
+    assert_eq!(kept.as_remote().unwrap().0, "https://mcp.context7.com/mcp");
+    // A stdio server refuses an explicit remote kind too.
+    dashboard
+        .store
+        .create_mcp_server_with(
+            "pw",
+            &factory_server::McpTransport::Stdio {
+                command: "npx".to_owned(),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+    let reply = dashboard
+        .post("/settings/mcp/pw", "kind=remote&command=uvx")
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        dashboard
+            .store
+            .mcp_server("pw")
+            .unwrap()
+            .unwrap()
+            .as_stdio()
+            .unwrap()
+            .0,
+        "npx"
+    );
+}
+
+#[tokio::test]
+async fn a_stdio_edit_keeps_arguments_with_line_breaks() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/mcp",
+            "name=pw&kind=stdio&command=npx&arg=a%0Ab&arg=c%0Dd&arg=--headless",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let stored = |dashboard: &Dashboard| {
+        let server = dashboard.store.mcp_server("pw").unwrap().unwrap();
+        let (command, args) = server.as_stdio().unwrap();
+        (command.to_owned(), args.to_vec())
+    };
+    let args = vec![
+        "a\nb".to_owned(),
+        "c\rd".to_owned(),
+        "--headless".to_owned(),
+    ];
+    assert_eq!(stored(&dashboard), ("npx".to_owned(), args.clone()));
+    let page = dashboard.get("/settings/mcp/pw").await;
+    assert_eq!(page.body.matches(r#"name="arg_escaped""#).count(), 2);
+    assert!(page.body.contains(r#"value="a\nb""#));
+    assert!(page.body.contains(r#"value="c\rd""#));
+    let reply = dashboard
+        .post(
+            "/settings/mcp/pw",
+            "command=uvx&arg_escaped=a%5Cnb&arg_escaped=c%5Crd&arg=--headless",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(stored(&dashboard), ("uvx".to_owned(), args));
+    let reply = dashboard
+        .post("/settings/mcp/pw", "command=uvx&arg_escaped=a%5Cqb")
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(stored(&dashboard).0, "uvx");
+}
+
+#[tokio::test]
 async fn an_invalid_mcp_server_is_a_bad_request() {
     let dashboard = dashboard();
     // A non-https URL.
@@ -10303,13 +10477,17 @@ async fn an_invalid_mcp_server_is_a_bad_request() {
 #[tokio::test]
 async fn the_add_server_form_has_header_name_rows_not_a_textarea() {
     let dashboard = dashboard();
+    dashboard
+        .store
+        .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
+        .unwrap();
     let page = dashboard.settings_pages().await;
     // The header names live in text boxes posting a repeated `header` field,
     // with an "Add header" button, and no textarea or `headers` field remains.
     assert!(page.contains(r#"name="header""#));
     assert!(page.contains("Add header"));
-    // The header-name pattern escapes `|` and the trailing `-`, as the `v` flag
-    // a browser compiles it with requires.
+    // The edit form's header-name pattern escapes `|` and the trailing `-`, as
+    // the `v` flag a browser compiles it with requires.
     assert!(page.contains(r"\|~\-]+"));
     assert!(!page.contains(r#"name="headers""#));
     assert!(!page.contains("<textarea id=\"mcp-new-headers\""));
