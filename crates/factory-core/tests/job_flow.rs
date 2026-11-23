@@ -1,8 +1,8 @@
 use factory_core::{
     AgentResult, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event, FixOutcome, Gates,
     Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, PrDiff, Question,
-    Rejected, RenovateCi, RenovateWait, RetryLimits, RetryTarget, ReviewPass, ReviewState,
-    ReviewStop, Session, Stage, Task, Turn, Verdict,
+    Rejected, RenovateAccess, RenovateCi, RenovateWait, RetryLimits, RetryTarget, ReviewPass,
+    ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -2310,6 +2310,28 @@ fn observe(job: &mut Job, head: &str, ci: RenovateCi, limits: RetryLimits, auto_
             ci,
             limits,
             auto_merge,
+            access: Box::default(),
+        },
+    );
+}
+
+fn read_only() -> RenovateAccess {
+    RenovateAccess {
+        can_rerun: false,
+        can_merge: false,
+        account: "project-bot".into(),
+    }
+}
+
+fn observe_as(job: &mut Job, head: &str, ci: RenovateCi, auto_merge: bool, access: RenovateAccess) {
+    apply(
+        job,
+        Event::RenovateObserved {
+            head: head.into(),
+            ci,
+            limits: LIMITS,
+            auto_merge,
+            access: Box::new(access),
         },
     );
 }
@@ -2483,6 +2505,112 @@ fn a_transient_verdict_reruns_and_counts_toward_the_total_only() {
     apply(&mut job, Event::CiRerun);
     assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (4, 3));
     assert_eq!(job.turn(), &Turn::Factory);
+}
+
+#[test]
+fn read_access_sends_failed_ci_to_the_failure_analysis_with_no_rerun() {
+    let mut job = renovate_job();
+    observe_as(&mut job, "h1", failed("the log"), false, read_only());
+    assert_runs(
+        &job,
+        Session::Renovate(1),
+        Task::AnalyzeFailure {
+            log: "the log".into(),
+        },
+    );
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (0, 0));
+}
+
+#[test]
+fn retry_after_a_read_only_stop_watches_afresh_and_reruns_nothing() {
+    let mut job = renovate_job();
+    observe_as(&mut job, "h1", failed("log"), false, read_only());
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "registry timeout".into(),
+        }),
+    );
+    post_comment(&mut job);
+    waits(&job, RenovateWait::Stopped);
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.turn(), &Turn::Factory);
+
+    observe_as(&mut job, "h1", failed("log"), false, read_only());
+    assert_runs(
+        &job,
+        Session::Renovate(2),
+        Task::AnalyzeFailure { log: "log".into() },
+    );
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (0, 0));
+}
+
+#[test]
+fn a_transient_verdict_on_read_access_comments_and_stops_until_a_new_head() {
+    let mut job = renovate_job();
+    observe_as(&mut job, "h1", failed("log"), false, read_only());
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "registry timeout".into(),
+        }),
+    );
+    let body = post_comment(&mut job);
+    assert!(body.contains("looks transient"), "{body}");
+    assert!(body.contains("project-bot"), "{body}");
+    assert!(body.contains("Write"), "{body}");
+    waits(&job, RenovateWait::Stopped);
+    assert!(!matches!(job.turn(), Turn::RerunCi { .. }));
+
+    observe_as(&mut job, "h1", failed("log"), false, read_only());
+    waits(&job, RenovateWait::Stopped);
+    observe_as(
+        &mut job,
+        "h2",
+        failed("log"),
+        false,
+        RenovateAccess::default(),
+    );
+    assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+}
+
+#[test]
+fn read_access_with_auto_merge_waits_as_ready_and_names_the_account() {
+    let mut job = with_safe_verdict(true);
+    observe_as(
+        &mut job,
+        "h1",
+        RenovateCi::Passed { details: None },
+        true,
+        read_only(),
+    );
+    waits(&job, RenovateWait::Ready);
+    let Turn::User(Ask::Renovate { reason, .. }) = job.turn() else {
+        panic!("{:?}", job.turn());
+    };
+    assert!(
+        reason.contains("project-bot") && reason.contains("Write"),
+        "{reason}"
+    );
+    assert!(!matches!(
+        job.next_command(),
+        Some(Command::MergeRenovate { .. })
+    ));
+
+    observe_as(
+        &mut job,
+        "h1",
+        RenovateCi::Passed { details: None },
+        true,
+        RenovateAccess::default(),
+    );
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::MergeRenovate { .. })
+    ));
 }
 
 #[test]
@@ -2917,6 +3045,7 @@ fn a_renovate_job_rejects_events_that_do_not_fit() {
             ci: RenovateCi::Pending,
             limits: LIMITS,
             auto_merge: false,
+            access: Box::default(),
         })
         .is_err()
     );
@@ -3453,6 +3582,7 @@ fn rebase_events_need_a_pending_request_and_an_observation_waits_for_it() {
         ci: RenovateCi::Pending,
         limits: LIMITS,
         auto_merge: false,
+        access: Box::default(),
     };
     assert!(job.apply(observed).is_err());
 }

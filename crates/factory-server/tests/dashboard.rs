@@ -2743,6 +2743,7 @@ async fn a_renovate_job_shows_on_the_board_and_its_page_and_retries_from_it() {
             ci: factory_core::RenovateCi::Failed { log: "boom".into() },
             limits: factory_core::RetryLimits { auto: 0, total: 0 },
             auto_merge: false,
+            access: Box::default(),
         },
     );
     dashboard.apply(id, Event::Commented);
@@ -2782,6 +2783,7 @@ fn stopped_renovate_job(dashboard: &Dashboard) -> i64 {
             ci: factory_core::RenovateCi::Failed { log: "boom".into() },
             limits: factory_core::RetryLimits { auto: 0, total: 0 },
             auto_merge: false,
+            access: Box::default(),
         },
     );
     dashboard.apply(id, Event::Commented);
@@ -3103,6 +3105,7 @@ async fn a_merged_renovate_job_page_keeps_the_verdict_and_summary() {
             },
             limits: factory_core::RetryLimits { auto: 3, total: 7 },
             auto_merge: false,
+            access: Box::default(),
         },
     );
     dashboard.apply(
@@ -12038,6 +12041,7 @@ fn observe_renovate(dashboard: &Dashboard, id: i64, head: &str, ci: factory_core
             ci,
             limits: factory_core::RetryLimits { auto: 0, total: 7 },
             auto_merge: false,
+            access: Box::default(),
         },
     );
 }

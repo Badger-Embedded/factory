@@ -53,6 +53,8 @@ The access each account needs on the repository:
 | Renovate triage: list pull requests, read status, logs and diffs, comment | Read |
 | Renovate triage: rerun failed CI, approve and merge | Write |
 
+With only Read, Renovate triage still works: it skips the reruns and goes straight to the failure analysis, comments, and leaves a safe pull request as ready to merge even with auto-merge on. Granting Write takes effect on the next head commit, with no restart.
+
 ## Deploy to moon
 
 ```sh

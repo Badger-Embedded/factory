@@ -246,8 +246,13 @@ async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_move
     std::fs::write(
         &gh,
         format!(
-            "#!/bin/bash\necho \"$@\" >> '{}'\necho '{{\"headRefOid\":\"unchecked2\"}}'\n",
-            calls.display()
+            "#!/bin/bash\necho \"$@\" >> '{}'\n\
+             case \"$*\" in\n\
+             \"api repos/o/r --hostname github.com\") echo '{}';;\n\
+             *) echo '{{\"headRefOid\":\"unchecked2\"}}';;\n\
+             esac\n",
+            calls.display(),
+            WRITE_ACCESS
         ),
     )
     .unwrap();
@@ -279,7 +284,7 @@ async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_move
         .unwrap();
 
     let calls = std::fs::read_to_string(&calls).unwrap();
-    assert_eq!(calls.lines().count(), 2, "{calls}");
+    assert_eq!(calls.lines().count(), 4, "{calls}");
     assert!(calls.contains("commit_id=checked1"), "{calls}");
     assert!(calls.contains("--match-head-commit checked1"), "{calls}");
     assert!(!calls.contains("unchecked2"), "{calls}");
@@ -977,4 +982,173 @@ async fn a_refused_token_names_its_owner_where_the_command_ran() {
         )
     );
     assert!(!err.contains("ghp_token"), "{err}");
+}
+
+const READ_ACCESS: &str =
+    r#"{"permissions":{"admin":false,"maintain":false,"push":false,"pull":true}}"#;
+const WRITE_ACCESS: &str =
+    r#"{"permissions":{"admin":false,"maintain":false,"push":true,"pull":true}}"#;
+
+fn renovate_watch(auto_merge: bool) -> factory_server::RenovateWatchRequest {
+    factory_server::RenovateWatchRequest {
+        job_id: 1,
+        forge: ForgeKind::GitHub,
+        account: AccountSource::fixed(test_account()),
+        repo: "o/r".into(),
+        number: 5,
+        verdict_head: Some("h1".into()),
+        known_head: None,
+        watch_only: false,
+        limits: factory_core::RetryLimits { auto: 3, total: 7 },
+        auto_merge,
+        manifest_files: None,
+    }
+}
+
+/// A gh whose pull request is open on `head` with failed CI, and whose
+/// repository permissions come from the `access.json` it reads on each call.
+fn access_executor(dir: &std::path::Path, head: &str) -> (PodmanExecutor, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let calls = dir.join("calls");
+    std::fs::write(dir.join("access.json"), READ_ACCESS).unwrap();
+    std::fs::write(
+        dir.join("view.json"),
+        serde_json::json!({
+            "state": "OPEN",
+            "headRefOid": head,
+            "statusCheckRollup": [{"name": "build", "status": "COMPLETED", "conclusion": "FAILURE"}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let gh = dir.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/bash\necho \"$@\" >> '{calls}'\ncase \"$*\" in\n\
+             \"pr view\"*) cat '{view}';;\n\
+             \"api --paginate\"*) ;;\n\
+             \"api repos/o/r --hostname github.com\") cat '{access}';;\n\
+             esac\n",
+            calls = calls.display(),
+            view = dir.join("view.json").display(),
+            access = dir.join("access.json").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(LocalSecrets::new(
+        &[7; MASTER_KEY_LEN],
+        Arc::new(Store::open_in_memory().unwrap()),
+    ));
+    let mut podman = executor(
+        registry(&secrets),
+        dir.to_owned(),
+        Arc::new(Store::open_in_memory().unwrap()),
+    );
+    podman.forges = forges(GitHub {
+        gh,
+        ..GitHub::default()
+    });
+    (podman, calls)
+}
+
+fn observed_access(event: Option<Event>) -> factory_core::RenovateAccess {
+    let Some(Event::RenovateObserved { access, .. }) = event else {
+        panic!("expected an observation, got {event:?}");
+    };
+    *access
+}
+
+#[tokio::test]
+async fn a_watch_reports_read_access_and_a_later_watch_reports_the_granted_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = access_executor(dir.path(), "h1");
+
+    let access = observed_access(podman.watch_renovate(renovate_watch(true)).await.unwrap());
+    assert!(!access.can_rerun && !access.can_merge, "{access:?}");
+    assert_eq!(access.account, "factory-bot");
+
+    std::fs::write(dir.path().join("access.json"), WRITE_ACCESS).unwrap();
+    let access = observed_access(podman.watch_renovate(renovate_watch(true)).await.unwrap());
+    assert!(access.can_rerun && access.can_merge, "{access:?}");
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    for forbidden in ["run rerun", "--approve", "pr merge", "/reviews"] {
+        assert!(
+            !calls.lines().any(|call| call.contains(forbidden)),
+            "{calls}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_watch_fails_when_the_access_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, _) = access_executor(dir.path(), "h1");
+    std::fs::write(dir.path().join("access.json"), "not json").unwrap();
+
+    assert!(podman.watch_renovate(renovate_watch(false)).await.is_err());
+}
+
+fn wrote(calls: &str) -> bool {
+    calls.lines().any(|call| {
+        ["run rerun", "--approve", "pr merge", "/reviews"]
+            .iter()
+            .any(|write| call.contains(write))
+    })
+}
+
+#[tokio::test]
+async fn a_rerun_and_a_merge_check_the_access_of_the_account_they_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = access_executor(dir.path(), "h1");
+    let account = AccountSource::fixed(test_account());
+
+    let rerun = podman
+        .rerun(factory_server::RerunRequest {
+            job_id: 1,
+            forge: ForgeKind::GitHub,
+            account: account.clone(),
+            repo: "o/r".into(),
+            number: 5,
+            renovate: true,
+        })
+        .await;
+    assert!(
+        rerun
+            .unwrap_err()
+            .starts_with(factory_runner::NOT_PERMITTED)
+    );
+    let merge = podman
+        .merge_renovate(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .await;
+    assert!(
+        merge
+            .unwrap_err()
+            .starts_with(factory_runner::NOT_PERMITTED)
+    );
+    assert!(!wrote(&std::fs::read_to_string(&calls).unwrap()));
+
+    std::fs::write(dir.path().join("access.json"), WRITE_ACCESS).unwrap();
+    let rerun = podman
+        .rerun(factory_server::RerunRequest {
+            job_id: 1,
+            forge: ForgeKind::GitHub,
+            account: account.clone(),
+            repo: "o/r".into(),
+            number: 5,
+            renovate: true,
+        })
+        .await;
+    if let Err(err) = rerun {
+        assert!(!err.starts_with(factory_runner::NOT_PERMITTED), "{err}");
+    }
+    let merge = podman
+        .merge_renovate(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .await;
+    if let Err(err) = merge {
+        assert!(!err.starts_with(factory_runner::NOT_PERMITTED), "{err}");
+    }
 }

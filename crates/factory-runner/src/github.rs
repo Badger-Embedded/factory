@@ -1484,6 +1484,16 @@ impl Forge for GitHub {
         })
     }
 
+    fn may_merge<'a>(
+        &'a self,
+        _account: &'a Account,
+        _repo: &'a str,
+        _number: u64,
+        access: Access,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move { Ok(matches!(access, Access::Write | Access::Admin)) })
+    }
+
     fn lookup_account<'a>(
         &'a self,
         token: &'a str,

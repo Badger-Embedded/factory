@@ -12,8 +12,8 @@ use factory_core::{
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport,
-    job_prompt,
+    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, NOT_PERMITTED, Observation, RenovatePr,
+    Rerun, RunReport, job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -378,6 +378,9 @@ pub struct RerunRequest {
     pub account: AccountSource,
     pub repo: String,
     pub number: u64,
+    /// Whether the rerun is a Renovate triage step, which checks the account's
+    /// access before it writes.
+    pub renovate: bool,
 }
 
 /// What a look at a pull request found.
@@ -640,6 +643,23 @@ pub struct Scheduler<E> {
     discovered: Mutex<HashMap<String, Instant>>,
 }
 
+fn rerun_request(
+    job_id: i64,
+    resolved: &Resolved,
+    project: &Project,
+    number: u64,
+    renovate: bool,
+) -> RerunRequest {
+    RerunRequest {
+        job_id,
+        forge: resolved.forge,
+        account: resolved.source.clone(),
+        repo: project.repo.clone(),
+        number,
+        renovate,
+    }
+}
+
 impl<E: Executor> Scheduler<E> {
     pub fn new(
         store: Arc<Store>,
@@ -765,13 +785,7 @@ impl<E: Executor> Scheduler<E> {
                     let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
                         continue;
                     };
-                    let request = RerunRequest {
-                        job_id: row.id,
-                        forge: resolved.forge,
-                        account: resolved.source.clone(),
-                        repo: project.repo.clone(),
-                        number,
-                    };
+                    let request = rerun_request(row.id, &resolved, &project, number, false);
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
                     self.spawn(row.id, Kind::Factory, async move {
@@ -812,13 +826,7 @@ impl<E: Executor> Scheduler<E> {
         };
         match command {
             Command::RerunRenovate { number, reason } => {
-                let request = RerunRequest {
-                    job_id: id,
-                    forge: resolved.forge,
-                    account: resolved.source.clone(),
-                    repo: project.repo.clone(),
-                    number,
-                };
+                let request = rerun_request(id, &resolved, project, number, true);
                 let scheduler = Arc::clone(self);
                 let settings = settings.clone();
                 self.spawn(id, Kind::Factory, async move {
@@ -2079,6 +2087,10 @@ impl<E: Executor> Scheduler<E> {
                     }
                 }
             }
+            Err(err) if err.starts_with(NOT_PERMITTED) => {
+                self.note(job_id, &format!("Did not merge #{number}: {err}"));
+                self.apply(job_id, Event::MergeFailed);
+            }
             Err(err) => {
                 // A credential failure stops the job with the merge pending,
                 // so Retry merges again. The merge event only applies to a job
@@ -2129,6 +2141,10 @@ impl<E: Executor> Scheduler<E> {
                     Event::CiRerun
                 };
                 self.apply(job_id, event);
+            }
+            Err(err) if renovate && err.starts_with(NOT_PERMITTED) => {
+                self.note(job_id, &format!("Did not rerun CI on #{number}: {err}"));
+                self.apply(job_id, Event::RerunDenied);
             }
             Err(err) => self.retry_later(settings, job_id, &err),
         }

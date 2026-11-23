@@ -9,17 +9,19 @@ use factory_core::{
     ReviewState, Stage, Turn, Wait,
 };
 use factory_runner::{
-    Account, Expect, ForgeAccount, ForgeKind, GitHub, HeadCommit, LogLine, McpUnavailable,
-    Observation, RenovatePr, Rerun, RunReport, TokenUsage, is_renovate_login,
+    Account, Expect, ForgeAccount, ForgeKind, Git, GitHub, HeadCommit, LogLine, McpUnavailable,
+    NOT_PERMITTED, Observation, RenovatePr, Rerun, RunReport, TokenUsage, WorkerConfig,
+    is_renovate_login,
 };
 use factory_server::{
-    AccountSource, Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, FACTORY_REQUESTER,
-    ForgeTokenOwner, Forges, GhRepos, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN,
-    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Owner, PrerequisiteEdit, Project,
-    ProjectForge, Projects, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest,
-    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
-    StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport,
-    WatchRequest, WorkerSlots, credential_failure, format_cost, ready_action, watch_only_event,
+    AccountSource, Accounts, AgentRegistry, AgentRequest, ChecksRequest, ClaudeToken, CodexLogin,
+    CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GhRepos, JobFile,
+    LocalSecrets, LogSink, MASTER_KEY_LEN, McpProjectSettings, McpRuntime, McpStages, McpWarnings,
+    Owner, PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project, ProjectForge, Projects,
+    PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, RunTokens,
+    Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
+    StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots,
+    credential_failure, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -90,6 +92,9 @@ struct FakeExecutor {
     /// The range the fake resolves from the merged pull request when the
     /// request has none.
     resolved_range: Mutex<Option<(String, String)>>,
+    /// A podman executor over a fake gh. When set, the Renovate watch, rerun
+    /// and merge go through it, so the real access checks run.
+    cli: Mutex<Option<Arc<PodmanExecutor>>>,
 }
 
 /// The state the fake reports for the Renovate pull request.
@@ -142,6 +147,7 @@ impl FakeExecutor {
             pr_files: Mutex::new(Vec::new()),
             gathered: Mutex::new(Vec::new()),
             resolved_range: Mutex::new(None),
+            cli: Mutex::new(None),
         })
     }
 
@@ -271,7 +277,11 @@ impl Executor for FakeExecutor {
 
     async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
         tokio::task::yield_now().await;
-        self.rerun_requests.lock().unwrap().push(request);
+        self.rerun_requests.lock().unwrap().push(request.clone());
+        let cli = self.cli.lock().unwrap().clone();
+        if let Some(cli) = cli {
+            return cli.rerun(request).await;
+        }
         self.reruns
             .lock()
             .unwrap()
@@ -305,6 +315,10 @@ impl Executor for FakeExecutor {
         tokio::task::yield_now().await;
         let now = self.renovate_now.lock().unwrap().clone();
         self.renovate_watched.lock().unwrap().push(request.clone());
+        let cli = self.cli.lock().unwrap().clone();
+        if let Some(cli) = cli {
+            return cli.watch_renovate(request).await;
+        }
         Ok(match now {
             RenovateNow::Nothing => None,
             RenovateNow::Merged => Some(
@@ -336,6 +350,7 @@ impl Executor for FakeExecutor {
                     ci,
                     limits: request.limits,
                     auto_merge: request.auto_merge,
+                    access: Box::default(),
                 })
             }
         })
@@ -425,13 +440,17 @@ impl Executor for FakeExecutor {
 
     async fn merge_renovate(
         &self,
-        _forge: ForgeKind,
-        _account: &AccountSource,
-        _repo: &str,
+        forge: ForgeKind,
+        account: &AccountSource,
+        repo: &str,
         number: u64,
         head: &str,
     ) -> Result<(), String> {
         tokio::task::yield_now().await;
+        let cli = self.cli.lock().unwrap().clone();
+        if let Some(cli) = cli {
+            return cli.merge_renovate(forge, account, repo, number, head).await;
+        }
         self.approved
             .lock()
             .unwrap()
@@ -4721,6 +4740,7 @@ fn observed(head: &str, ci: factory_core::RenovateCi) -> Event {
         ci,
         limits: factory_core::RetryLimits { auto: 0, total: 7 },
         auto_merge: false,
+        access: Box::default(),
     }
 }
 
@@ -5304,6 +5324,42 @@ async fn a_refused_token_before_a_merge_fails_the_job_and_retry_merges() {
     .await;
     assert_eq!(executor.approved.lock().unwrap().len(), 2);
     assert_eq!(*executor.merged.lock().unwrap(), [(7, "h1".to_owned())]);
+}
+
+#[tokio::test]
+async fn a_merge_the_account_may_no_longer_make_goes_back_to_watching_without_a_stop() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    executor
+        .merge_errors
+        .lock()
+        .unwrap()
+        .push_back(format!("{NOT_PERMITTED}bot may not merge #7."));
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert_eq!(executor.approved.lock().unwrap().len(), 2);
+    assert!(!is_failed(&store, id));
+}
+
+#[tokio::test]
+async fn a_rerun_the_account_may_no_longer_make_goes_back_to_watching_and_counts_nothing() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    executor
+        .reruns
+        .lock()
+        .unwrap()
+        .push_back(Err(format!("{NOT_PERMITTED}bot needs Write access.")));
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || {
+        executor.rerun_requests.lock().unwrap().len() >= 2
+    })
+    .await;
+    assert!(!is_failed(&store, id));
+    assert_eq!(needs_you(&store, id), None);
+    assert_eq!(pr_of(&store, id).reruns, 1);
 }
 
 #[tokio::test]
@@ -6558,4 +6614,131 @@ async fn a_refused_token_asking_for_a_rebase_fails_the_job_and_retry_asks_again(
     })
     .await;
     assert_eq!(executor.rebase_calls.lock().unwrap().len(), 2);
+}
+
+fn fake_gh(dir: &std::path::Path) -> (Arc<PodmanExecutor>, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let gh = dir.join("gh");
+    let calls = dir.join("calls");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/bash\necho \"$@\" >> '{calls}'\ncase \"$*\" in\n\
+             \"pr view\"*) cat '{view}';;\n\
+             \"pr diff\"*) echo '+serde = 1.0.2';;\n\
+             \"api repos/\"*\" --hostname github.com\") cat '{access}';;\n\
+             esac\n",
+            calls = calls.display(),
+            view = dir.join("view.json").display(),
+            access = dir.join("access.json").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    let podman = PodmanExecutor {
+        base: WorkerConfig::default(),
+        git: Git {
+            git: PathBuf::from("/nonexistent/git"),
+        },
+        forges: Forges::new(
+            Arc::new(GitHub {
+                gh,
+                ..GitHub::default()
+            }),
+            Arc::new(GhRepos {
+                gh: PathBuf::from("gh"),
+            }),
+        ),
+        data_dir: dir.to_owned(),
+        registry: Arc::new(AgentRegistry::new(
+            Arc::new(ClaudeToken::new(Arc::clone(&secrets), None)),
+            Arc::new(CodexLogin::new(Arc::clone(&secrets))),
+            Arc::clone(&secrets),
+        )),
+        store,
+        plan_usage: Arc::new(PlanUsageCache::new()),
+    };
+    (Arc::new(podman), calls)
+}
+
+fn set_pr(dir: &std::path::Path, head: &str, conclusion: &str, access: &str) {
+    std::fs::write(
+        dir.join("view.json"),
+        serde_json::json!({
+            "state": "OPEN",
+            "title": "Update serde",
+            "body": "Bumps serde",
+            "headRefOid": head,
+            "files": [],
+            "statusCheckRollup": [{"name": "build", "status": "COMPLETED", "conclusion": conclusion}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("access.json"), access).unwrap();
+}
+
+fn wrote(calls: &std::path::Path) -> bool {
+    std::fs::read_to_string(calls).is_ok_and(|log| {
+        ["run rerun", "--method POST", "pr merge"]
+            .iter()
+            .any(|write| log.contains(write))
+    })
+}
+
+const READ: &str = r#"{"permissions":{"admin":false,"maintain":false,"push":false,"pull":true}}"#;
+const WRITE: &str = r#"{"permissions":{"admin":false,"maintain":false,"push":true,"pull":true}}"#;
+
+#[tokio::test]
+async fn read_access_triages_without_writes_through_retry_and_merges_a_new_head_once_write_is_granted()
+ {
+    let (store, executor, scheduler, id) = renovate_setup(|request| match request.expect {
+        Expect::FailureAnalysis => Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "the runner lost its network".into(),
+        }),
+        _ => Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe: true,
+                reason: "only a version bump".into(),
+                summary: "Bumps serde".into(),
+                from: None,
+                to: None,
+            },
+        ))),
+    });
+    store.save_project_auto_merge("maestro", true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (cli, calls) = fake_gh(dir.path());
+    *executor.cli.lock().unwrap() = Some(cli);
+    set_pr(dir.path(), "h1", "FAILURE", READ);
+
+    step_until(&scheduler, || {
+        needs_you(&store, id) == Some(RenovateWait::Stopped)
+    })
+    .await;
+    assert_eq!(executor.requests().len(), 1);
+    assert!(!wrote(&calls));
+
+    store.apply(id, Event::Retry).unwrap();
+    step_until(&scheduler, || executor.requests().len() == 2).await;
+    step_until(&scheduler, || {
+        needs_you(&store, id) == Some(RenovateWait::Stopped)
+    })
+    .await;
+    assert!(!wrote(&calls));
+    assert!(executor.rerun_requests.lock().unwrap().is_empty());
+
+    set_pr(dir.path(), "h2", "SUCCESS", WRITE);
+    step_until(&scheduler, || {
+        std::fs::read_to_string(&calls).is_ok_and(|log| log.contains("pr merge"))
+    })
+    .await;
+    let log = std::fs::read_to_string(&calls).unwrap();
+    assert!(log.contains("--match-head-commit h2"), "{log}");
+    assert!(executor.rerun_requests.lock().unwrap().is_empty());
 }

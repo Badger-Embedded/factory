@@ -1042,7 +1042,7 @@ impl Store {
         let number = row.job.renovate_pr().map(|pr| pr.number).ok_or_else(|| {
             StoreError::Rejected(Rejected::Unexpected {
                 stage: row.job.stage().clone(),
-                event: Event::GapsProposed { jobs: Vec::new() },
+                event: Box::new(Event::GapsProposed { jobs: Vec::new() }),
             })
         })?;
         let mut jobs = Vec::new();
@@ -1159,7 +1159,7 @@ impl Store {
         else {
             return Err(StoreError::Rejected(Rejected::Unexpected {
                 stage: row.job.stage().clone(),
-                event: Event::FixStarted { job: 0 },
+                event: Box::new(Event::FixStarted { job: 0 }),
             }));
         };
         let text = pr.fix_request(reason, instructions);
@@ -1185,7 +1185,7 @@ impl Store {
         if *row.job.stage() != Stage::Proposed {
             return Err(StoreError::Rejected(Rejected::Unexpected {
                 stage: row.job.stage().clone(),
-                event: Event::Approve,
+                event: Box::new(Event::Approve),
             }));
         }
         Self::apply_in(&tx, &mut row, Event::Approve)?;
@@ -1749,7 +1749,7 @@ impl Store {
         if *row.job.stage() != Stage::Requested {
             return Err(StoreError::Rejected(Rejected::Unexpected {
                 stage: row.job.stage().clone(),
-                event,
+                event: Box::new(event),
             }));
         }
         let change = Self::plan_prerequisites(&tx, id, &row.project, prerequisites)?;

@@ -25,8 +25,8 @@ pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
 pub use files::{PlacedFile, place_files, show_files};
 pub use forge::{
-    Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, REJECTED,
-    rejected_by_forge,
+    Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, NOT_PERMITTED,
+    REJECTED, rejected_by_forge,
 };
 pub use git::{Git, Remote, RemoteSource};
 pub use github::{

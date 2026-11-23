@@ -76,6 +76,11 @@ impl ForgeKind {
     }
 }
 
+/// Starts the error of a write the account may no longer make, read just
+/// before the write. The factory returns the job to watching instead of
+/// retrying the write.
+pub const NOT_PERMITTED: &str = "the account may not make this change: ";
+
 /// Starts the error of a forge or git command that failed because the forge
 /// refused the credentials. [`rejected_by_forge`] decides this from the
 /// command's own output, where the command runs.
@@ -180,6 +185,16 @@ pub trait Forge: Send + Sync {
         account: &'a Account,
         repo: &'a str,
     ) -> BoxFuture<'a, Result<Access, String>>;
+
+    /// Whether `account` may merge pull request `number`. `access` is what
+    /// the account may do in `repo`, read just before.
+    fn may_merge<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        access: Access,
+    ) -> BoxFuture<'a, Result<bool, String>>;
 
     /// The account that runs as `token`, whose commits carry `found`'s
     /// login and noreply address.
