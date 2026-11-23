@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Agent, AgentResult, Event, PrDescription};
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, McpServerEntry, RunResult, SessionRun, WorkerConfig,
-    WorkerRun, backend, run,
+    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, McpUnavailable, RunResult,
+    SessionRun, WorkerConfig, WorkerRun, backend, run,
 };
 
 const SESSION: &str = "d3c2f38c-6c9e-4528-9666-a9c3d7aff405";
@@ -156,8 +156,10 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     let dir = tempfile::tempdir().unwrap();
     let mut run = copilot_run(dir.path(), SessionRun::Resume(SESSION.into()));
     run.mcp = Some(McpConfig {
-        proxy_url: "http://factory:8081".into(),
-        token: "d34db33f-run-token".into(),
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "d34db33f-run-token".into(),
+        }),
         servers: ["context7", "docs"]
             .map(|name| McpServerEntry::Remote { name: name.into() })
             .to_vec(),
@@ -193,14 +195,104 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     );
 }
 
+fn stdio_entry() -> McpServerEntry {
+    McpServerEntry::Stdio {
+        name: "pw".into(),
+        command: "playwright-mcp".into(),
+        args: ["--no-sandbox", "a $b"].map(String::from).to_vec(),
+    }
+}
+
+#[test]
+fn a_stdio_server_becomes_a_local_entry_with_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    let plain = copilot_args(&run);
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    let args = copilot_args(&run);
+
+    let config: serde_json::Value =
+        serde_json::from_str(value_after(&args, "--additional-mcp-config")).unwrap();
+    assert_eq!(
+        config["mcpServers"],
+        serde_json::json!({ "pw": {
+            "type": "local",
+            "command": "playwright-mcp",
+            "args": ["--no-sandbox", "a $b"],
+            "tools": ["*"],
+        } })
+    );
+    assert!(!env_names(&args).contains(&"FACTORY_MCP_TOKEN"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg.contains("factory:8081")));
+    assert_eq!(env_names(&args), env_names(&plain));
+}
+
+#[test]
+fn a_remote_and_a_stdio_server_share_a_copilot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    run.mcp = Some(McpConfig {
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "tok".into(),
+        }),
+        servers: vec![
+            McpServerEntry::Remote {
+                name: "context7".into(),
+            },
+            stdio_entry(),
+        ],
+    });
+    let args = copilot_args(&run);
+    let config: serde_json::Value =
+        serde_json::from_str(value_after(&args, "--additional-mcp-config")).unwrap();
+    assert_eq!(config["mcpServers"]["context7"]["type"], "http");
+    assert_eq!(config["mcpServers"]["pw"]["type"], "local");
+    assert!(env_names(&args).contains(&"FACTORY_MCP_TOKEN"));
+}
+
+#[test]
+fn a_stdio_tool_start_logs_the_namespaced_tool_name() {
+    let line = r#"{"type":"tool.execution_start","data":{"toolName":"pw-browser_navigate","mcpServerName":"pw","mcpToolName":"browser_navigate","arguments":{},"toolCallId":"t1"}}"#;
+    assert_eq!(
+        parse(Expect::Spec, line),
+        [AgentItem::Log(LogLine::Tool {
+            name: "mcp__pw__browser_navigate".into(),
+            summary: String::new()
+        })]
+    );
+}
+
+#[test]
+fn a_failed_server_status_is_reported_unavailable_even_though_it_is_ephemeral() {
+    let changed = r#"{"type":"session.mcp_server_status_changed","ephemeral":true,"data":{"serverName":"pw","status":"failed","error":"spawn ENOENT"}}"#;
+    let connected = r#"{"type":"session.mcp_server_status_changed","ephemeral":true,"data":{"serverName":"ok","status":"connected"}}"#;
+    let loaded = r#"{"type":"session.mcp_servers_loaded","ephemeral":true,"data":{"servers":[{"name":"ok","status":"connected"},{"name":"pw","status":"failed","error":"spawn ENOENT"}]}}"#;
+    let expected = AgentItem::Unavailable(McpUnavailable {
+        server: "pw".into(),
+        reason: "the agent reported it as failed".into(),
+    });
+    assert_eq!(
+        parse(Expect::Spec, changed),
+        std::slice::from_ref(&expected)
+    );
+    assert_eq!(parse(Expect::Spec, connected), []);
+    assert_eq!(parse(Expect::Spec, loaded), [expected]);
+}
+
 #[test]
 fn a_run_with_no_active_server_passes_no_mcp_config_or_token() {
     let dir = tempfile::tempdir().unwrap();
     for mcp in [None, Some(Vec::new())] {
         let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
         run.mcp = mcp.map(|servers| McpConfig {
-            proxy_url: "http://factory:8081".into(),
-            token: "unused".into(),
+            proxy: Some(McpProxy {
+                url: "http://factory:8081".into(),
+                token: "unused".into(),
+            }),
             servers,
         });
         let args = copilot_args(&run);

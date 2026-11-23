@@ -13,9 +13,11 @@
 //! `job_events`, neither of which changes the job's stage or turn.
 //!
 //! A refused tool call comes only from the proxy. It writes a factory line to
-//! the job log and an `mcp-tool-blocked` row to `job_events`. A forwarded call
-//! comes only from the proxy too and writes an `mcp-tool-call` row, with no log
-//! line and no dedup, so every call the agent makes is one row.
+//! the job log and an `mcp-tool-blocked` row to `job_events`. A call to a remote
+//! server comes from the proxy and writes an `mcp-tool-call` row, with no log
+//! line and no dedup. A call to a stdio server never reaches the proxy, so the
+//! scheduler writes the same row from the agent's output. Every call the agent
+//! makes is one row.
 //!
 //! The dedup is keyed by job. A job runs one agent run at a time, so
 //! [`McpWarnings::begin`] clears the servers warned in the job's previous run

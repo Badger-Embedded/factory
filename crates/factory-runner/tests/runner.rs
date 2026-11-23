@@ -8,10 +8,10 @@ use factory_core::{
     PrDescription, Question, Stage, Task, UsageWindow,
 };
 use factory_runner::{
-    Expect, LogLine, McpConfig, McpServerEntry, McpServerStatus, PlacedFile, ResultMessage,
-    SessionRun, StreamItem, WorkerConfig, WorkerRun, backend, event_from_result, job_prompt,
-    parse_line, place_files, place_images, podman_args, prompt, remove_container, run, show_files,
-    show_images,
+    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, McpServerStatus,
+    McpUnavailable, PlacedFile, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
+    backend, event_from_result, job_prompt, parse_line, place_files, place_images, podman_args,
+    prompt, remove_container, run, show_files, show_images,
 };
 use serde_json::{Value, json};
 
@@ -951,8 +951,10 @@ fn podman_args_pass_no_mcp_config_without_an_active_server() {
     for mcp in [None, Some(Vec::new())] {
         let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
         run.mcp = mcp.map(|servers| McpConfig {
-            proxy_url: "http://factory:8081".into(),
-            token: "unused".into(),
+            proxy: Some(McpProxy {
+                url: "http://factory:8081".into(),
+                token: "unused".into(),
+            }),
             servers,
         });
         let args = strings(&podman_args(&WorkerConfig::default(), &run));
@@ -964,8 +966,10 @@ fn podman_args_pass_no_mcp_config_without_an_active_server() {
 fn podman_args_give_each_active_server_a_proxy_entry_with_the_run_token() {
     let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Resume(SESSION.into()));
     run.mcp = Some(McpConfig {
-        proxy_url: "http://factory:8081".into(),
-        token: "d34db33f".into(),
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "d34db33f".into(),
+        }),
         servers: ["context7", "docs"]
             .map(|name| McpServerEntry::Remote { name: name.into() })
             .to_vec(),
@@ -989,6 +993,113 @@ fn podman_args_give_each_active_server_a_proxy_entry_with_the_run_token() {
             "the run token is the entry's only header"
         );
     }
+}
+
+fn stdio_entry() -> McpServerEntry {
+    McpServerEntry::Stdio {
+        name: "pw".into(),
+        command: "playwright-mcp".into(),
+        args: ["--no-sandbox", "--headless", "a b\"c$"]
+            .map(String::from)
+            .to_vec(),
+    }
+}
+
+#[test]
+fn podman_args_give_a_stdio_server_a_command_entry_and_no_token_or_proxy() {
+    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Resume(SESSION.into()));
+    let plain = strings(&podman_args(&WorkerConfig::default(), &run));
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    let args = strings(&podman_args(&WorkerConfig::default(), &run));
+
+    let config: Value = serde_json::from_str(value_after(&args, "--mcp-config")).unwrap();
+    assert_eq!(
+        config["mcpServers"],
+        json!({ "pw": {
+            "type": "stdio",
+            "command": "playwright-mcp",
+            "args": ["--no-sandbox", "--headless", "a b\"c$"],
+        } })
+    );
+    assert!(!args.iter().any(|arg| arg.contains("FACTORY_MCP_TOKEN")));
+    assert!(!args.iter().any(|arg| arg.contains("factory:8081")));
+
+    // The startup timeout rides in the settings, not a container flag.
+    let settings: Value = serde_json::from_str(value_after(&args, "--settings")).unwrap();
+    assert_eq!(settings["env"]["MCP_TIMEOUT"], "120000");
+    assert_eq!(settings["attribution"]["sessionUrl"], false);
+
+    // The stdio server adds no container flag: every podman flag before the
+    // image is the same as without it.
+    let image = |args: &[String]| args.iter().position(|arg| arg == "claude").unwrap();
+    assert_eq!(args[..image(&args)], plain[..image(&plain)]);
+}
+
+#[test]
+fn podman_args_carry_a_remote_and_a_stdio_server_together() {
+    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+    run.mcp = Some(McpConfig {
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "d34db33f".into(),
+        }),
+        servers: vec![
+            McpServerEntry::Remote {
+                name: "context7".into(),
+            },
+            stdio_entry(),
+        ],
+    });
+    let args = strings(&podman_args(&WorkerConfig::default(), &run));
+    let config: Value = serde_json::from_str(value_after(&args, "--mcp-config")).unwrap();
+    assert_eq!(
+        config["mcpServers"]["context7"],
+        json!({
+            "type": "http",
+            "url": "http://factory:8081/mcp/context7",
+            "headers": { "Authorization": "Bearer d34db33f" },
+        })
+    );
+    assert_eq!(config["mcpServers"]["pw"]["type"], "stdio");
+}
+
+#[test]
+fn a_run_without_a_stdio_server_keeps_the_settings_it_had() {
+    let run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+    let args = strings(&podman_args(&WorkerConfig::default(), &run));
+    assert_eq!(
+        value_after(&args, "--settings"),
+        r#"{"attribution":{"commit":"","pr":"","sessionUrl":false}}"#
+    );
+}
+
+#[test]
+fn a_failed_stdio_server_in_the_init_line_is_reported_unavailable() {
+    let line = r#"{"type":"system","subtype":"init","session_id":"s","mcp_servers":[{"name":"pw","status":"failed","source":"dynamic"}]}"#;
+    let items = backend(Agent::Claude).unwrap().parse(Expect::Spec, line);
+    assert_eq!(
+        items,
+        vec![AgentItem::Unavailable(McpUnavailable {
+            server: "pw".into(),
+            reason: "the agent reported it as failed".into(),
+        })]
+    );
+}
+
+#[test]
+fn a_stdio_tool_use_logs_the_namespaced_tool_name() {
+    let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__pw__browser_navigate","input":{"url":"http://localhost:3000"}}]}}"#;
+    let items = backend(Agent::Claude).unwrap().parse(Expect::Spec, line);
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            AgentItem::Log(LogLine::Tool { name, .. }) if name == "mcp__pw__browser_navigate"
+        )),
+        "{items:?}"
+    );
 }
 
 #[test]

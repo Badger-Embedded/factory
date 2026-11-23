@@ -44,6 +44,6 @@ pub use outcome::{Expect, event_from_output, event_from_result, failed_event};
 pub use prompt::{job_prompt, prompt};
 pub use stream::{LogLine, McpServerStatus, ResultMessage, StreamItem, parse_line};
 pub use worker::{
-    McpConfig, McpServerEntry, McpUnavailable, RunReport, SessionRun, WorkerConfig, WorkerRun,
-    podman_args, remove_container, run,
+    McpConfig, McpProxy, McpServerEntry, McpUnavailable, RunReport, STDIO_STARTUP_TIMEOUT_SECS,
+    SessionRun, WorkerConfig, WorkerRun, podman_args, remove_container, run,
 };

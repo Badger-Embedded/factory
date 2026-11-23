@@ -12,8 +12,8 @@ use factory_core::{
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, McpServerEntry, NOT_PERMITTED, Observation,
-    RenovatePr, Rerun, RunReport, job_prompt,
+    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, McpProxy, McpServerEntry, NOT_PERMITTED,
+    Observation, RenovatePr, Rerun, RunReport, job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -585,10 +585,29 @@ struct McpSelection {
     skipped: Vec<SkippedServer>,
 }
 
+/// One server active for a run, with what the run's config needs from the
+/// registry and the project.
+enum ActiveServer {
+    Remote(String),
+    Stdio {
+        name: String,
+        command: String,
+        args: Vec<String>,
+    },
+}
+
+impl ActiveServer {
+    fn name(&self) -> &str {
+        match self {
+            Self::Remote(name) | Self::Stdio { name, .. } => name,
+        }
+    }
+}
+
 /// The servers active for a run and the servers skipped for an undecryptable
 /// secret, as [`Scheduler::active_mcp_servers`] sorts them.
 struct ActiveServers {
-    active: Vec<String>,
+    active: Vec<ActiveServer>,
     skipped: Vec<SkippedServer>,
 }
 
@@ -605,6 +624,14 @@ impl Drop for TokenGuard {
     fn drop(&mut self) {
         self.tokens.revoke(&self.token);
     }
+}
+
+/// The server and tool of an agent's `mcp__<server>__<tool>` tool name when the
+/// server is one of the run's stdio servers. Server names hold no underscore, so
+/// the first `__` after the prefix ends the server.
+fn stdio_tool_call<'a>(name: &'a str, stdio: &[String]) -> Option<(&'a str, &'a str)> {
+    let (server, tool) = name.strip_prefix("mcp__")?.split_once("__")?;
+    stdio.iter().any(|s| s == server).then_some((server, tool))
 }
 
 /// Clears a run's MCP warning dedup state when the run ends, by success,
@@ -1350,16 +1377,34 @@ impl<E: Executor> Scheduler<E> {
         expect: Expect,
     ) -> Result<McpSelection, StoreError> {
         let ActiveServers { active, skipped } = self.active_mcp_servers(project, expect)?;
-        let config = (!active.is_empty()).then(|| {
-            let token = self.mcp.tokens.issue(job_id, project, &active);
-            McpConfig {
-                proxy_url: self.mcp.proxy_url.clone(),
-                token,
-                servers: active
-                    .into_iter()
-                    .map(|name| McpServerEntry::Remote { name })
-                    .collect(),
-            }
+        let remote: Vec<String> = active
+            .iter()
+            .filter(|server| matches!(server, ActiveServer::Remote(_)))
+            .map(|server| server.name().to_owned())
+            .collect();
+        // Only a remote server goes through the proxy, so a run with stdio
+        // servers alone gets no token.
+        let proxy = (!remote.is_empty()).then(|| McpProxy {
+            url: self.mcp.proxy_url.clone(),
+            token: self.mcp.tokens.issue(job_id, project, &remote),
+        });
+        let config = (!active.is_empty()).then(|| McpConfig {
+            proxy,
+            servers: active
+                .into_iter()
+                .map(|server| match server {
+                    ActiveServer::Remote(name) => McpServerEntry::Remote { name },
+                    ActiveServer::Stdio {
+                        name,
+                        command,
+                        args,
+                    } => McpServerEntry::Stdio {
+                        name,
+                        command,
+                        args,
+                    },
+                })
+                .collect(),
         });
         Ok(McpSelection { config, skipped })
     }
@@ -1391,12 +1436,18 @@ impl<E: Executor> Scheduler<E> {
             if !(settings.enabled && in_stage) {
                 continue;
             }
-            // Runs do not carry stdio servers yet.
-            if server.as_stdio().is_some() {
-                continue;
-            }
-            if self.mcp_secrets_usable(project, &server)? {
-                active.push(server.name);
+            if let Some((command, base)) = server.as_stdio() {
+                // The project's extra arguments follow the base arguments, read
+                // on every run so a change reaches the job's next run.
+                let mut args = base.to_vec();
+                args.extend(self.store.project_mcp_args(project, &server.name)?);
+                active.push(ActiveServer::Stdio {
+                    command: command.to_owned(),
+                    args,
+                    name: server.name,
+                });
+            } else if self.mcp_secrets_usable(project, &server)? {
+                active.push(ActiveServer::Remote(server.name));
             } else {
                 skipped.push((
                     server.name,
@@ -1651,10 +1702,14 @@ impl<E: Executor> Scheduler<E> {
         let job_id = request.job_id;
         // The run's proxy token is revoked when this guard drops: at the end of
         // the run, or when a cancel aborts and drops this future.
-        let _token = request.mcp.as_ref().map(|mcp| TokenGuard {
-            tokens: Arc::clone(&self.mcp.tokens),
-            token: mcp.token.clone(),
-        });
+        let _token = request
+            .mcp
+            .as_ref()
+            .and_then(|mcp| mcp.proxy.as_ref())
+            .map(|proxy| TokenGuard {
+                tokens: Arc::clone(&self.mcp.tokens),
+                token: proxy.token.clone(),
+            });
         // Forget the servers warned about in this job's previous run before this
         // one reports any, and clear this run's set when the guard drops, so a
         // server is warned about at most once per run. Begun before the worker
@@ -1681,7 +1736,24 @@ impl<E: Executor> Scheduler<E> {
             &format!("Agent run started in session {session_label}."),
         );
         let sink_store = Arc::clone(&self.store);
+        // The proxy records a call to a remote server. A call to a stdio server
+        // never reaches it, so the run's own output is the record.
+        let stdio_servers: Vec<String> = request
+            .mcp
+            .iter()
+            .flat_map(|mcp| &mcp.servers)
+            .filter_map(|entry| match entry {
+                McpServerEntry::Stdio { name, .. } => Some(name.clone()),
+                McpServerEntry::Remote { .. } => None,
+            })
+            .collect();
+        let call_warnings = Arc::clone(&self.mcp.warnings);
         let sink: LogSink = Box::new(move |line| {
+            if let LogLine::Tool { name, .. } = &line
+                && let Some((server, tool)) = stdio_tool_call(name, &stdio_servers)
+            {
+                call_warnings.record_tool_called(job_id, server, tool);
+            }
             if let Err(err) = sink_store.append_log(job_id, &line) {
                 tracing::error!("job {job_id}: {err}");
             }

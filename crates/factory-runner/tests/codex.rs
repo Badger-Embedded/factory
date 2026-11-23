@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Agent, AgentResult, Event};
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, McpServerEntry, RunResult, SessionRun, TokenUsage,
-    WorkerConfig, WorkerRun, backend, run,
+    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, RunResult, SessionRun,
+    TokenUsage, WorkerConfig, WorkerRun, backend, run,
 };
 use serde_json::Value;
 
@@ -146,8 +146,10 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     let dir = tempfile::tempdir().unwrap();
     let mut run = codex_run(dir.path(), SessionRun::Resume(THREAD.into()));
     run.mcp = Some(McpConfig {
-        proxy_url: "http://factory:8081".into(),
-        token: "d34db33f-run-token".into(),
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "d34db33f-run-token".into(),
+        }),
         servers: ["context7", "docs"]
             .map(|name| McpServerEntry::Remote { name: name.into() })
             .to_vec(),
@@ -188,14 +190,105 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     );
 }
 
+fn stdio_entry() -> McpServerEntry {
+    McpServerEntry::Stdio {
+        name: "pw".into(),
+        command: "playwright-mcp".into(),
+        args: ["--no-sandbox", "a \"b\\c\" d"].map(String::from).to_vec(),
+    }
+}
+
+#[test]
+fn a_stdio_server_becomes_toml_overrides_with_a_startup_timeout_and_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+    let plain = codex_args(&run);
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![stdio_entry()],
+    });
+    let args = codex_args(&run);
+
+    let overrides: Vec<&String> = args
+        .iter()
+        .filter(|arg| arg.starts_with("mcp_servers."))
+        .collect();
+    // The quote, backslash and space in the second argument are escaped, so
+    // TOML reads them back unchanged.
+    assert_eq!(
+        overrides,
+        [
+            r#"mcp_servers.pw.command="playwright-mcp""#,
+            r#"mcp_servers.pw.args=["--no-sandbox","a \"b\\c\" d"]"#,
+            "mcp_servers.pw.startup_timeout_sec=120",
+        ]
+    );
+    let value: toml::Value = toml::from_str(&format!(
+        "args = {}",
+        overrides[1].strip_prefix("mcp_servers.pw.args=").unwrap()
+    ))
+    .unwrap();
+    assert_eq!(value["args"][1].as_str(), Some("a \"b\\c\" d"));
+
+    assert!(!env_names(&args).contains(&"FACTORY_MCP_TOKEN"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg.contains("factory:8081")));
+    // No container flag is added: only the config overrides differ.
+    let flags = |args: &[String]| args.iter().filter(|a| a.starts_with("--")).count();
+    assert_eq!(flags(&args), flags(&plain));
+    assert_eq!(env_names(&args), env_names(&plain));
+}
+
+#[test]
+fn a_remote_and_a_stdio_server_share_a_codex_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+    run.mcp = Some(McpConfig {
+        proxy: Some(McpProxy {
+            url: "http://factory:8081".into(),
+            token: "tok".into(),
+        }),
+        servers: vec![
+            McpServerEntry::Remote {
+                name: "context7".into(),
+            },
+            stdio_entry(),
+        ],
+    });
+    let args = codex_args(&run);
+    assert!(
+        args.iter()
+            .any(|arg| { arg == "mcp_servers.context7.url=\"http://factory:8081/mcp/context7\"" })
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg.starts_with("mcp_servers.pw.command="))
+    );
+    assert!(env_names(&args).contains(&"FACTORY_MCP_TOKEN"));
+}
+
+#[test]
+fn a_stdio_tool_call_logs_the_namespaced_tool_name() {
+    let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"pw","tool":"browser_navigate","status":"completed"}}"#;
+    let items = backend(Agent::Codex).unwrap().parse(Expect::Spec, line);
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            AgentItem::Log(LogLine::Tool { name, .. }) if name == "mcp__pw__browser_navigate"
+        )),
+        "{items:?}"
+    );
+}
+
 #[test]
 fn a_run_with_no_active_server_passes_no_mcp_flags_or_token() {
     let dir = tempfile::tempdir().unwrap();
     for mcp in [None, Some(Vec::new())] {
         let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
         run.mcp = mcp.map(|servers| McpConfig {
-            proxy_url: "http://factory:8081".into(),
-            token: "unused".into(),
+            proxy: Some(McpProxy {
+                url: "http://factory:8081".into(),
+                token: "unused".into(),
+            }),
             servers,
         });
         let args = codex_args(&run);
@@ -224,8 +317,10 @@ fn a_claude_run_is_unchanged_by_the_codex_backend() {
         model: None,
         effort: None,
         mcp: Some(McpConfig {
-            proxy_url: "http://factory:8081".into(),
-            token: "run-token".into(),
+            proxy: Some(McpProxy {
+                url: "http://factory:8081".into(),
+                token: "run-token".into(),
+            }),
             servers: vec![McpServerEntry::Remote {
                 name: "context7".into(),
             }],
