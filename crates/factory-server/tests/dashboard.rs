@@ -11581,13 +11581,7 @@ async fn a_non_admin_saves_and_clears_their_forge_token_and_the_page_never_shows
     assert!(page.body.contains(">Forges<"));
     assert!(page.body.contains("href=\"/settings/forges/github\""));
 
-    let saved = dashboard
-        .post_as(
-            "carol@example.com",
-            &format!("{FORGE_PAGE}/token"),
-            "token=tok-alice",
-        )
-        .await;
+    let saved = forge_post(&dashboard, "carol@example.com", "token", "token=tok-alice").await;
     assert_eq!(saved.status, StatusCode::OK);
     assert!(saved.body.contains("alice-bot"));
     assert!(!saved.body.contains("tok-alice"));
@@ -11596,26 +11590,14 @@ async fn a_non_admin_saves_and_clears_their_forge_token_and_the_page_never_shows
     assert!(!page.body.contains("tok-alice"));
 
     // An empty save keeps the token.
-    dashboard
-        .post_as(
-            "carol@example.com",
-            &format!("{FORGE_PAGE}/token"),
-            "token=",
-        )
-        .await;
+    forge_post(&dashboard, "carol@example.com", "token", "token=").await;
     let owner = ForgeTokenOwner::User {
         login: "carol@example.com",
         forge: ForgeKind::GitHub,
     };
     assert!(dashboard.store.forge_account(owner).unwrap().is_some());
 
-    let cleared = dashboard
-        .post_as(
-            "carol@example.com",
-            &format!("{FORGE_PAGE}/token/clear"),
-            "",
-        )
-        .await;
+    let cleared = forge_post(&dashboard, "carol@example.com", "token/clear", "").await;
     assert!(cleared.body.contains("Cleared."));
     assert!(cleared.body.contains("No token is stored."));
     assert!(dashboard.store.forge_account(owner).unwrap().is_none());
@@ -11626,13 +11608,7 @@ async fn a_non_admin_saves_and_clears_their_forge_token_and_the_page_never_shows
 #[tokio::test]
 async fn a_forge_token_the_forge_rejects_is_not_stored_and_not_echoed() {
     let dashboard = forge_token_dashboard(true);
-    let rejected = dashboard
-        .post_as(
-            USER,
-            &format!("{FORGE_PAGE}/token"),
-            "token=tok-wrong-secret",
-        )
-        .await;
+    let rejected = forge_post(&dashboard, USER, "token", "token=tok-wrong-secret").await;
     assert_eq!(rejected.status, StatusCode::OK);
     assert!(rejected.body.contains("rejected the token"));
     assert!(!rejected.body.contains("tok-wrong-secret"));
@@ -11648,26 +11624,15 @@ async fn a_forge_token_the_forge_rejects_is_not_stored_and_not_echoed() {
 #[tokio::test]
 async fn two_logins_see_only_their_own_forge_token() {
     let dashboard = forge_token_dashboard(true);
-    let save = format!("{FORGE_PAGE}/token");
-    dashboard
-        .post_as("carol@example.com", &save, "token=tok-alice")
-        .await;
-    dashboard
-        .post_as("dave@example.com", &save, "token=tok-bob")
-        .await;
+    forge_post(&dashboard, "carol@example.com", "token", "token=tok-alice").await;
+    forge_post(&dashboard, "dave@example.com", "token", "token=tok-bob").await;
 
     let carol = dashboard.get_as("carol@example.com", FORGE_PAGE).await.body;
     let dave = dashboard.get_as("dave@example.com", FORGE_PAGE).await.body;
     assert!(carol.contains("alice-bot") && !carol.contains("bob-bot"));
     assert!(dave.contains("bob-bot") && !dave.contains("alice-bot"));
 
-    dashboard
-        .post_as(
-            "carol@example.com",
-            &format!("{FORGE_PAGE}/token/clear"),
-            "",
-        )
-        .await;
+    forge_post(&dashboard, "carol@example.com", "token/clear", "").await;
     let dave = dashboard.get_as("dave@example.com", FORGE_PAGE).await.body;
     assert!(dave.contains("bob-bot"));
 }
@@ -11679,22 +11644,10 @@ async fn without_a_master_key_the_forge_page_disables_the_field_and_still_clears
     assert!(page.contains("master key is missing"));
     assert!(page.contains("disabled"));
 
-    let refused = dashboard
-        .post_as(
-            "carol@example.com",
-            &format!("{FORGE_PAGE}/token"),
-            "token=tok-alice",
-        )
-        .await;
+    let refused = forge_post(&dashboard, "carol@example.com", "token", "token=tok-alice").await;
     assert!(!refused.body.contains("tok-alice"));
     assert!(refused.body.contains("was not saved"));
-    let empty = dashboard
-        .post_as(
-            "carol@example.com",
-            &format!("{FORGE_PAGE}/token"),
-            "token=",
-        )
-        .await;
+    let empty = forge_post(&dashboard, "carol@example.com", "token", "token=").await;
     assert!(empty.body.contains("was not saved"));
     assert!(!empty.body.contains("Saved."));
     let owner = ForgeTokenOwner::User {
@@ -11713,65 +11666,79 @@ async fn without_a_master_key_the_forge_page_disables_the_field_and_still_clears
             },
         )
         .unwrap();
-    let cleared = dashboard
-        .post_as(
-            "carol@example.com",
-            &format!("{FORGE_PAGE}/token/clear"),
-            "",
-        )
-        .await;
+    let cleared = forge_post(&dashboard, "carol@example.com", "token/clear", "").await;
     assert_eq!(cleared.status, StatusCode::OK);
     assert!(dashboard.store.forge_account(owner).unwrap().is_none());
 }
 
+/// Loads the page as `login`, then posts `form` with the token its form
+/// carries, the way the browser does.
+async fn forge_post(dashboard: &Dashboard, login: &str, action: &str, form: &str) -> Reply {
+    let page = dashboard.get_as(login, FORGE_PAGE).await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let csrf = doc
+        .select(&scraper::Selector::parse("input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the form carries a csrf token")
+        .to_owned();
+    dashboard
+        .post_as(
+            login,
+            &format!("{FORGE_PAGE}/{action}"),
+            &format!("{form}&csrf={csrf}"),
+        )
+        .await
+}
+
 #[tokio::test]
-async fn cross_site_forge_token_requests_change_nothing() {
+async fn forge_token_requests_without_a_valid_form_token_change_nothing() {
     let dashboard = forge_token_dashboard(true);
     let owner = ForgeTokenOwner::User {
         login: "carol@example.com",
         forge: ForgeKind::GitHub,
     };
     let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
-    let send = |path: &str, form: &str, extra: (&str, &str)| {
-        let request = Request::post(format!("{FORGE_PAGE}/{path}"))
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header(USER_HEADER, "carol@example.com")
-            .header(header::HOST, "factory.test")
-            .header(extra.0, extra.1)
-            .body(Body::from(form.to_owned()))
-            .unwrap();
-        dashboard.send(request)
-    };
+    let other = dashboard.get_as("dave@example.com", FORGE_PAGE).await.body;
+    let other_token = other
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_owned();
 
-    let foreign = [
-        ("origin", "https://evil.example"),
-        ("origin", "null"),
-        ("sec-fetch-site", "cross-site"),
-        ("sec-fetch-site", "same-site"),
-    ];
-    for extra in foreign {
-        let saved = send("token", "token=tok-alice", extra).await;
-        assert_eq!(saved.status, StatusCode::FORBIDDEN, "{extra:?}");
+    for bad in [
+        "",
+        "&csrf=",
+        "&csrf=forged",
+        &format!("&csrf={other_token}"),
+    ] {
+        let saved = dashboard
+            .post_as(
+                "carol@example.com",
+                &format!("{FORGE_PAGE}/token"),
+                &format!("token=tok-alice{bad}"),
+            )
+            .await;
+        assert_eq!(saved.status, StatusCode::FORBIDDEN, "{bad}");
         assert!(dashboard.store.forge_account(owner).unwrap().is_none());
         assert!(secrets.forge_token(owner).unwrap().is_none());
     }
 
-    let saved = send(
-        "token",
-        "token=tok-alice",
-        ("origin", "http://factory.test"),
-    )
-    .await;
-    assert_eq!(saved.status, StatusCode::OK);
-    assert!(secrets.forge_token(owner).unwrap().is_some());
-    for extra in foreign {
-        let cleared = send("token/clear", "", extra).await;
-        assert_eq!(cleared.status, StatusCode::FORBIDDEN, "{extra:?}");
+    forge_post(&dashboard, "carol@example.com", "token", "token=tok-alice").await;
+    for bad in ["", "csrf=forged", &format!("csrf={other_token}")] {
+        let cleared = dashboard
+            .post_as(
+                "carol@example.com",
+                &format!("{FORGE_PAGE}/token/clear"),
+                bad,
+            )
+            .await;
+        assert_eq!(cleared.status, StatusCode::FORBIDDEN, "{bad}");
         assert!(dashboard.store.forge_account(owner).unwrap().is_some());
         assert!(secrets.forge_token(owner).unwrap().is_some());
     }
-    let cleared = send("token/clear", "", ("sec-fetch-site", "same-origin")).await;
-    assert_eq!(cleared.status, StatusCode::OK);
+    forge_post(&dashboard, "carol@example.com", "token/clear", "").await;
     assert!(secrets.forge_token(owner).unwrap().is_none());
 }
 

@@ -1301,6 +1301,7 @@ pub fn settings_forge(
     kind: ForgeKind,
     account: Option<&ForgeAccount>,
     secrets_available: bool,
+    csrf: &str,
     notice: Option<&str>,
 ) -> Markup {
     let base = format!("/settings/forges/{}", kind.as_str());
@@ -1314,6 +1315,7 @@ pub fn settings_forge(
         &html! {
             h1 { (name) }
             form.card.settings-form method="post" action=(format!("{base}/token")) {
+                input type="hidden" name="csrf" value=(csrf);
                 h2 { "Your " (name) " token" }
                 p.hint {
                     "The factory uses this token for the onboarding checks and for jobs in \

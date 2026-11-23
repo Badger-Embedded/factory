@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 
 use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::copilot::validate_copilot_token;
+use crate::csrf::CsrfKey;
 use crate::device_login::DeviceLogin;
 use crate::forge_tokens::{self, SaveError};
 use crate::forges::Forges;
@@ -69,6 +70,7 @@ struct AppState {
     onboarding: Arc<tokio::sync::Mutex<()>>,
     copilot_login: Arc<DeviceLogin>,
     admins: Arc<Vec<String>>,
+    csrf: Arc<CsrfKey>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -116,6 +118,7 @@ pub fn app(
         onboarding: Arc::new(tokio::sync::Mutex::new(())),
         copilot_login,
         admins: Arc::new(admins),
+        csrf: Arc::new(CsrfKey::generate()),
     };
     Router::new()
         .route("/", get(index))
@@ -2758,23 +2761,14 @@ async fn cancel_codex_login(
     codex_page(&state, &headers, None).await
 }
 
-/// Refuses a request a browser marks as cross-site, or whose `Origin` names
-/// another host than the one requested. The login comes from the proxy, so
-/// browser cookie rules do not protect these forms. A request with neither
-/// header is not from a browser form.
-fn require_same_origin(headers: &HeaderMap) -> Result<(), AppError> {
-    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let cross_site = text("sec-fetch-site").is_some_and(|site| site != "same-origin");
-    let other_origin = text("origin").is_some_and(|origin| {
-        let host = origin.split_once("://").map_or(origin, |(_, rest)| rest);
-        origin == "null" || Some(host) != text("host")
-    });
-    if cross_site || other_origin {
-        return Err(AppError::Forbidden(
-            "cross-site requests are not allowed here".into(),
-        ));
+fn require_csrf(state: &AppState, login: &str, token: &str) -> Result<(), AppError> {
+    if state.csrf.accepts(login, token) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "the form is missing its token or it is stale, reload the page".into(),
+        ))
     }
-    Ok(())
 }
 
 fn forge_kind(name: &str) -> Result<ForgeKind, AppError> {
@@ -2798,6 +2792,7 @@ fn forge_page(
         kind,
         account.as_ref(),
         state.secrets.available(),
+        &state.csrf.issue(&login),
         notice,
     ))
 }
@@ -2814,10 +2809,10 @@ async fn save_forge_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(forge): Path<String>,
-    Form(form): Form<CopilotTokenForm>,
+    Form(form): Form<ForgeTokenForm>,
 ) -> Result<Markup, AppError> {
     let kind = forge_kind(&forge)?;
-    require_same_origin(&headers)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
     if !state.secrets.available() {
         return forge_page(
             &state,
@@ -2862,9 +2857,10 @@ async fn clear_forge_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(forge): Path<String>,
+    Form(form): Form<ForgeClearForm>,
 ) -> Result<Markup, AppError> {
     let kind = forge_kind(&forge)?;
-    require_same_origin(&headers)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
     let login = user(&headers);
     let cleared = forge_tokens::clear(
         state.secrets.as_ref(),
@@ -2886,6 +2882,20 @@ async fn show_copilot(
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
     copilot_page(&state, &headers, None).await
+}
+
+#[derive(Deserialize)]
+struct ForgeTokenForm {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    csrf: String,
+}
+
+#[derive(Deserialize)]
+struct ForgeClearForm {
+    #[serde(default)]
+    csrf: String,
 }
 
 #[derive(Deserialize)]

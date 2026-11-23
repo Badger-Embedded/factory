@@ -83,3 +83,32 @@ test('the sidebar lists the forges and an unknown forge is a 404', async ({ page
   const response = await page.goto('/settings/forges/other');
   expect(response?.status()).toBe(404);
 });
+
+test('forms posted from another origin change nothing', async ({ page, own }) => {
+  await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': COLLABORATOR });
+  await page.goto(PAGE);
+  await page.getByLabel('Token').fill('tok-e2e-alice');
+  await page.getByRole('button', { name: 'Save token' }).click();
+  await expect(page.getByText('Saved. The token belongs to alice-bot.')).toBeVisible();
+
+  const evil = 'http://evil.example';
+  await page.route(`${evil}/**`, (route) =>
+    route.fulfill({
+      contentType: 'text/html',
+      body: `<form method="post" action="${own.url}${PAGE}/token">
+        <input name="token" value="tok-e2e-bob"><button id="save">save</button></form>
+        <form method="post" action="${own.url}${PAGE}/token/clear"><button id="clear">clear</button></form>`,
+    }),
+  );
+  for (const button of ['#save', '#clear']) {
+    await page.goto(`${evil}/`);
+    const [response] = await Promise.all([
+      page.waitForResponse((r) => r.url().startsWith(own.url) && r.request().method() === 'POST'),
+      page.click(button),
+    ]);
+    expect(response.status()).toBe(403);
+  }
+
+  await page.goto(PAGE);
+  await expect(page.locator('.forge-account')).toHaveText('alice-bot');
+});

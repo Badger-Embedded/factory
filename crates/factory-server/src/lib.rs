@@ -5,6 +5,7 @@ mod check;
 mod codex;
 mod copilot;
 mod cost;
+pub mod csrf;
 mod device_login;
 pub mod forge_tokens;
 mod forges;
