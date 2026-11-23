@@ -259,6 +259,19 @@ fn dashboard_with_gh(
     admins: Vec<String>,
     gh: impl FnOnce(&Path) -> GitHub,
 ) -> Dashboard {
+    dashboard_build(store, github, None, secrets, admins, gh)
+}
+
+/// As [`dashboard_with_gh`], with the Salsa onboarding checks answered by
+/// `salsa` when given.
+fn dashboard_build(
+    store: Arc<Store>,
+    github: Arc<dyn RepoChecker>,
+    salsa: Option<Arc<dyn RepoChecker>>,
+    secrets: Arc<dyn SecretStore>,
+    admins: Vec<String>,
+    gh: impl FnOnce(&Path) -> GitHub,
+) -> Dashboard {
     for (name, _) in store.list_projects().unwrap() {
         store.add_collaborator(&name, USER, "test").unwrap();
     }
@@ -290,7 +303,13 @@ fn dashboard_with_gh(
             Arc::new(Notify::new()),
             data.path().to_owned(),
             Arc::clone(&usage),
-            Forges::new(Arc::new(gh(data.path())), github),
+            {
+                let forges = Forges::new(Arc::new(gh(data.path())), github);
+                match salsa {
+                    Some(salsa) => forges.with_salsa_checker(salsa),
+                    None => forges,
+                }
+            },
             Arc::clone(&slots),
             secrets,
             Arc::clone(&checker) as Arc<dyn McpChecker>,
@@ -9215,13 +9234,14 @@ fn empty_dashboard(github: Arc<dyn RepoChecker>) -> (Arc<Store>, Dashboard) {
 /// Stores a GitHub token for `login`, sealed with the key the test
 /// dashboards use, so the onboarding checks have an account to run as.
 fn seed_user_token(store: &Arc<Store>, login: &str) {
+    seed_forge_user_token(store, login, ForgeKind::GitHub);
+}
+
+fn seed_forge_user_token(store: &Arc<Store>, login: &str, forge: ForgeKind) {
     let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(store));
     secrets
         .put_forge_token(
-            ForgeTokenOwner::User {
-                login,
-                forge: ForgeKind::GitHub,
-            },
+            ForgeTokenOwner::User { login, forge },
             &format!("token-of-{login}"),
             &ForgeAccount {
                 login: format!("account-of-{login}"),
@@ -9359,6 +9379,165 @@ async fn onboarding_without_a_token_is_blocked_and_calls_no_forge() {
     assert!(reply.body.contains("href=\"/settings/forges/github\""));
     assert!(seen.lock().unwrap().is_empty());
     assert!(store.project("widgets").unwrap().is_none());
+}
+
+/// A fake Salsa checker that reports the same findings for any path and
+/// records the token of each call.
+#[derive(Default)]
+struct FakeSalsa {
+    errors: Vec<String>,
+    seen: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl RepoChecker for FakeSalsa {
+    fn check<'a>(
+        &'a self,
+        account: &'a Account,
+        _repo: &'a str,
+        _base: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
+        self.seen.lock().unwrap().push(account.token.clone());
+        let report = RepoReport {
+            errors: self.errors.clone(),
+            warnings: Vec::new(),
+        };
+        Box::pin(std::future::ready(Ok(report)))
+    }
+}
+
+/// A dashboard whose GitHub and Salsa checks are answered by separate fakes.
+fn salsa_dashboard(github: Arc<FakeRepos>, salsa: Arc<FakeSalsa>) -> (Arc<Store>, Dashboard) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    seed_user_token(&store, USER);
+    seed_forge_user_token(&store, USER, ForgeKind::Salsa);
+    let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    let admins = [USER, STRANGER, MAESTRO_ONLY].map(str::to_owned).to_vec();
+    let dashboard = dashboard_build(
+        Arc::clone(&store),
+        github,
+        Some(salsa),
+        secrets,
+        admins,
+        |_| GitHub::default(),
+    );
+    (store, dashboard)
+}
+
+#[tokio::test]
+async fn a_salsa_project_is_checked_by_the_salsa_checker_and_stores_its_forge() {
+    let github = Arc::new(FakeRepos::fit());
+    let salsa = Arc::new(FakeSalsa::default());
+    let github_seen = Arc::clone(&github.seen);
+    let salsa_seen = Arc::clone(&salsa.seen);
+    let (store, dashboard) = salsa_dashboard(github, salsa);
+
+    let reply = dashboard
+        .post("/onboard", "forge=salsa&repo=team%2Fsub%2Fpkg&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(github_seen.lock().unwrap().is_empty());
+    assert_eq!(
+        *salsa_seen.lock().unwrap(),
+        vec![Some(format!("token-of-{USER}"))]
+    );
+    let project = store.project("pkg").unwrap().unwrap();
+    assert_eq!(project.forge, ProjectForge::Known(ForgeKind::Salsa));
+    assert_eq!(project.repo, "team/sub/pkg");
+}
+
+#[tokio::test]
+async fn the_wizard_keeps_the_selected_forge_on_a_redraw() {
+    let (_store, dashboard) = salsa_dashboard(
+        Arc::new(FakeRepos::fit()),
+        Arc::new(FakeSalsa {
+            errors: vec!["no such project".into()],
+            ..FakeSalsa::default()
+        }),
+    );
+    let reply = dashboard
+        .post("/onboard", "forge=salsa&repo=team%2Fpkg&action=check")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply
+            .body
+            .contains("data-placeholder=\"group/subgroup/project\" checked")
+    );
+}
+
+#[tokio::test]
+async fn a_salsa_project_without_a_salsa_token_links_the_salsa_page() {
+    let github = Arc::new(FakeRepos::fit());
+    let salsa = Arc::new(FakeSalsa::default());
+    let seen = Arc::clone(&salsa.seen);
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    seed_user_token(&store, USER);
+    let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    let admins = vec![USER.to_owned()];
+    let dashboard = dashboard_build(
+        Arc::clone(&store),
+        github,
+        Some(salsa),
+        secrets,
+        admins,
+        |_| GitHub::default(),
+    );
+
+    let reply = dashboard
+        .post("/onboard", "forge=salsa&repo=team%2Fpkg&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("You have no Salsa token stored"));
+    assert!(reply.body.contains("href=\"/settings/forges/salsa\""));
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(store.project("pkg").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_same_path_onboards_once_per_forge() {
+    let (store, dashboard) =
+        salsa_dashboard(Arc::new(FakeRepos::fit()), Arc::new(FakeSalsa::default()));
+    let github = dashboard
+        .post("/onboard", "repo=team%2Fpkg&name=on-github&action=skip")
+        .await;
+    assert_eq!(github.status, StatusCode::SEE_OTHER);
+    let salsa = dashboard
+        .post(
+            "/onboard",
+            "forge=salsa&repo=team%2Fpkg&name=on-salsa&action=skip",
+        )
+        .await;
+    assert_eq!(salsa.status, StatusCode::SEE_OTHER);
+    let again = dashboard
+        .post(
+            "/onboard",
+            "forge=salsa&repo=team%2Fpkg&name=again&action=skip",
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert!(
+        again
+            .body
+            .contains("The Salsa repository team/pkg is already onboarded.")
+    );
+    assert!(store.project("again").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_unknown_forge_is_refused_before_any_forge_call() {
+    let github = Arc::new(FakeRepos::fit());
+    let github_seen = Arc::clone(&github.seen);
+    let salsa = Arc::new(FakeSalsa::default());
+    let salsa_seen = Arc::clone(&salsa.seen);
+    let (store, dashboard) = salsa_dashboard(github, salsa);
+    let reply = dashboard
+        .post("/onboard", "forge=gitlab&repo=acme%2Fwidgets&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("is not one the factory supports"));
+    assert!(store.project("widgets").unwrap().is_none());
+    assert!(github_seen.lock().unwrap().is_empty());
+    assert!(salsa_seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

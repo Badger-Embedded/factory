@@ -28,6 +28,7 @@ pub const STYLESHEET: &str = include_str!("../static/style.css");
 /// tailnet host it runs on cannot reach one.
 pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
+const ONBOARD_FORGE: &str = include_str!("../static/onboard-forge.js");
 const SOURCE_LINK: &str = include_str!("../static/source-link.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_HEADER_ROWS: &str = include_str!("../static/mcp-header-rows.js");
@@ -2814,6 +2815,7 @@ fn check_outcome_line(outcome: &CheckOutcome) -> Markup {
 /// The values the onboarding form holds on a redraw, so a failed submit keeps
 /// what the operator typed.
 pub struct OnboardView<'a> {
+    pub forge: ForgeKind,
     /// The project name as typed. Empty means the repository name is used.
     pub name: &'a str,
     pub repo: &'a str,
@@ -2846,14 +2848,27 @@ pub fn onboard(
             @if let Some(notice) = notice {
                 div.card.saved { (notice) }
             }
-            p.meta { "The factory checks the repository as your own GitHub account before it creates anything. It creates no project while a required check fails." }
+            p.meta { "The factory checks the repository as your own account on the selected forge before it creates anything. It creates no project while a required check fails." }
             form.card method="post" action="/onboard" {
                 h2 { "Project" }
                 div.field {
+                    label { "Forge" }
+                    @for kind in ForgeKind::ALL {
+                        label.check {
+                            input type="radio" name="forge" value=(kind.as_str())
+                                data-placeholder=(repo_placeholder(kind))
+                                checked[kind == view.forge];
+                            " " (kind.display_name())
+                        }
+                    }
+                    p.hint { "Where the repository lives. The checks run as your own token for this forge." }
+                }
+                div.field {
                     label for="repo" { "Repository" }
                     input #repo.wide type="text" name="repo" required
-                        placeholder="owner/name" value=(view.repo);
-                    p.hint { "The GitHub repository as owner/name, such as Badger-Embedded/maestro." }
+                        placeholder=(repo_placeholder(view.forge)) value=(view.repo);
+                    p.hint data-forge="github" { "On GitHub, owner/name, such as Badger-Embedded/maestro." }
+                    p.hint data-forge="salsa" { "On Salsa, the full project path, such as python-team/packages/foo." }
                 }
                 div.field {
                     label for="name" { "Name" }
@@ -2913,8 +2928,16 @@ pub fn onboard(
                     }
                 }
             }
+            script { (PreEscaped(ONBOARD_FORGE)) }
         },
     )
+}
+
+fn repo_placeholder(forge: ForgeKind) -> &'static str {
+    match forge {
+        ForgeKind::GitHub => "owner/name",
+        ForgeKind::Salsa => "group/subgroup/project",
+    }
 }
 
 /// The checks panel under step 1: the required checks that failed, or a line

@@ -264,7 +264,8 @@ fn sql_time(gitlab: &str) -> String {
 
 /// `value` as one URL path segment, so a project path or a file path with
 /// slashes names one resource.
-fn encode(value: &str) -> String {
+#[must_use]
+pub fn encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -276,11 +277,13 @@ fn encode(value: &str) -> String {
     out
 }
 
-fn project(repo: &str) -> String {
+#[must_use]
+pub fn project(repo: &str) -> String {
     format!("projects/{}", encode(repo))
 }
 
-fn is_not_found(err: &str) -> bool {
+#[must_use]
+pub fn is_not_found(err: &str) -> bool {
     err.contains("HTTP 404")
 }
 
@@ -440,6 +443,17 @@ impl GitLab {
                 account.token.as_slice(),
             ))
         }
+    }
+
+    /// A GET of `endpoint` on the host's API as `account`, for reads that
+    /// have no [`Forge`] operation, such as the onboarding checks. A missing
+    /// resource is an error that [`is_not_found`] recognizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the redacted error of a failed `glab` call.
+    pub async fn api_get(&self, account: &Account, endpoint: &str) -> Result<String, String> {
+        self.get(account, endpoint, &[]).await
     }
 
     async fn get(
