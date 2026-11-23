@@ -252,6 +252,10 @@ pub enum RenovateWait {
 pub struct FixLink {
     pub job: i64,
     pub state: FixState,
+    /// The reason the job showed when the fix started, restored when the fix
+    /// ends without merging and no newer stop reason exists.
+    #[serde(default)]
+    pub earlier: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,13 +374,12 @@ impl RenovatePr {
         text
     }
 
-    /// What a Renovate job that waits on its fix job shows, from the fix
-    /// link. Without a link it is the stopped wait.
     fn fix_ask(&self) -> Ask {
         let (reason, state) = match &self.fix {
             Some(FixLink {
                 job,
                 state: FixState::Running,
+                ..
             }) => (format!("Waiting for fix job #{job}"), RenovateWait::Fixing),
             Some(FixLink {
                 job,
@@ -385,6 +388,7 @@ impl RenovatePr {
                         rebase: RebaseState::Failed,
                         ..
                     },
+                ..
             }) => (
                 format!(
                     "Fix job #{job} merged, but the factory could not ask Renovate to rebase. \
@@ -404,24 +408,36 @@ impl RenovatePr {
         Ask::Renovate { reason, state }
     }
 
-    /// Applies the end of fix job `job` while the job's turn is `turn`.
-    fn on_fix_ended(&mut self, turn: &Turn, job: i64, outcome: FixOutcome) -> Turn {
-        let running = matches!(
-            &self.fix,
-            Some(FixLink { job: linked, state: FixState::Running }) if *linked == job
-        );
+    fn on_fix_ended(
+        &mut self,
+        turn: &Turn,
+        job: i64,
+        outcome: FixOutcome,
+        merged_head: Option<String>,
+    ) -> Turn {
+        let earlier = match &self.fix {
+            Some(FixLink {
+                job: linked,
+                state: FixState::Running,
+                earlier,
+            }) if *linked == job => earlier.clone(),
+            _ => return turn.clone(),
+        };
         let busy = self.pending.is_some() || matches!(turn, Turn::Agent(_) | Turn::RerunCi { .. });
-        if !running || busy {
+        if busy {
             return turn.clone();
         }
         if outcome == FixOutcome::Merged {
-            let head = self.head.clone().unwrap_or_default();
+            let head = merged_head
+                .or_else(|| self.head.clone())
+                .unwrap_or_default();
             self.fix = Some(FixLink {
                 job,
                 state: FixState::Merged {
                     head,
                     rebase: RebaseState::Pending,
                 },
+                earlier,
             });
             self.pending = Some(Pending::Rebase);
             return Turn::Factory;
@@ -432,18 +448,19 @@ impl RenovatePr {
             FixOutcome::Dismissed => format!("Fix job #{job} was dismissed after a failure."),
             _ => format!("Fix job #{job} was deleted."),
         };
-        let fixing = matches!(
+        let restores = matches!(
             turn,
-            Turn::User(Ask::Renovate {
-                state: RenovateWait::Fixing,
-                ..
-            })
+            Turn::Factory
+                | Turn::User(Ask::Renovate {
+                    state: RenovateWait::Fixing,
+                    ..
+                })
         );
         self.fix = None;
-        if !fixing {
+        if !restores {
             return turn.clone();
         }
-        let earlier = self.stopped.clone().unwrap_or_default();
+        let earlier = self.stopped.clone().unwrap_or(earlier);
         Turn::User(Ask::Renovate {
             reason: if earlier.is_empty() {
                 line
@@ -454,7 +471,6 @@ impl RenovatePr {
         })
     }
 
-    /// Counts the rerun that ran and goes back to watching.
     fn on_rerun(&mut self) -> Turn {
         match self.rerun {
             RerunKind::Auto => {
@@ -477,8 +493,6 @@ impl RenovatePr {
         )
     }
 
-    /// Records how the rebase request went. False when no merged fix waits
-    /// for one.
     fn rebased(&mut self, to: RebaseState) -> bool {
         if self.pending != Some(Pending::Rebase) {
             return false;
@@ -648,7 +662,6 @@ fn unsafe_texts(reason: &str) -> (String, String) {
 }
 
 impl Turn {
-    /// Whether the turn is a Renovate wait that only a new head ends.
     fn waits_for_head(&self) -> bool {
         matches!(
             self,
@@ -1205,6 +1218,10 @@ pub enum Event {
     FixEnded {
         job: i64,
         outcome: FixOutcome,
+        /// For a merge, the head of the Renovate pull request when the fix
+        /// merged. It can differ from the last head the job observed, which
+        /// may be older or newer. `None` uses the last observed head.
+        head: Option<String>,
     },
     /// The factory ticked Renovate's rebase checkbox.
     RebaseRequested,
@@ -1881,8 +1898,6 @@ impl Job {
         Ok((Stage::Renovate, next))
     }
 
-    /// Handles the events of a Renovate job's fix job and of the rebase
-    /// request that follows its merge.
     fn deliver_fix(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
         use Event as E;
 
@@ -1894,17 +1909,18 @@ impl Job {
             (
                 Turn::User(Ask::Renovate {
                     state: RenovateWait::Stopped,
-                    ..
+                    reason,
                 }),
                 E::FixStarted { job },
             ) if !pr.fix_running() => {
                 pr.fix = Some(FixLink {
                     job,
                     state: FixState::Running,
+                    earlier: reason.clone(),
                 });
                 Turn::User(pr.fix_ask())
             }
-            (_, E::FixEnded { job, outcome }) => pr.on_fix_ended(&turn, job, outcome),
+            (_, E::FixEnded { job, outcome, head }) => pr.on_fix_ended(&turn, job, outcome, head),
             (Turn::Factory, E::RebaseRequested) if pr.rebased(RebaseState::Requested) => {
                 Turn::User(pr.fix_ask())
             }

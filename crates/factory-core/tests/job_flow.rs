@@ -3138,7 +3138,6 @@ fn a_failed_analysis_run_can_be_retried() {
 
 const STOPPED_AT_ONCE: RetryLimits = RetryLimits { auto: 0, total: 0 };
 
-/// A Renovate job that stopped triage on head `h1`.
 fn stopped_job() -> Job {
     let mut job = renovate_job();
     observe(&mut job, "h1", failed("log"), STOPPED_AT_ONCE, false);
@@ -3155,7 +3154,25 @@ fn fixing_job() -> Job {
 }
 
 fn fix_ended(job: &mut Job, outcome: FixOutcome) {
-    apply(job, Event::FixEnded { job: 7, outcome });
+    apply(
+        job,
+        Event::FixEnded {
+            job: 7,
+            outcome,
+            head: None,
+        },
+    );
+}
+
+fn fix_merged_on(job: &mut Job, head: &str) {
+    apply(
+        job,
+        Event::FixEnded {
+            job: 7,
+            outcome: FixOutcome::Merged,
+            head: Some(head.into()),
+        },
+    );
 }
 
 fn reason_of(job: &Job) -> &str {
@@ -3227,7 +3244,6 @@ fn a_merged_fix_queues_one_rebase_request() {
     assert_eq!(job.turn(), &Turn::Factory);
     assert_eq!(rebase_head(&job).as_deref(), Some("h1"));
 
-    // The same report before the request ran changes nothing.
     let before = job.clone();
     fix_ended(&mut job, FixOutcome::Merged);
     assert_eq!(job, before);
@@ -3254,6 +3270,7 @@ fn another_fix_job_ending_changes_nothing() {
         Event::FixEnded {
             job: 8,
             outcome: FixOutcome::Merged,
+            head: None,
         },
     );
     assert_eq!(job, before);
@@ -3280,7 +3297,6 @@ fn a_cancelled_or_dismissed_fix_returns_to_stopped_with_the_earlier_reason() {
         assert!(job.can_retry());
         assert_eq!(pr_of(&job).fix, None);
 
-        // The form shows again, so a second fix job may start.
         apply(&mut job, Event::FixStarted { job: 9 });
         waits(&job, RenovateWait::Fixing);
     }
@@ -3315,12 +3331,32 @@ fn a_new_head_keeps_a_running_fix() {
 }
 
 #[test]
-fn a_fix_that_ends_during_triage_on_a_new_head_leaves_the_turn() {
+fn a_fix_that_ends_on_a_new_head_restores_the_stopped_card() {
     let mut job = fixing_job();
     observe(&mut job, "h2", RenovateCi::Pending, LIMITS, false);
     fix_ended(&mut job, FixOutcome::Cancelled);
-    assert_eq!(job.turn(), &Turn::Factory);
+    waits(&job, RenovateWait::Stopped);
+    assert_eq!(
+        reason_of(&job),
+        "CI still fails after 0 reruns on this head commit.\nFix job #7 was cancelled."
+    );
+    assert!(job.can_retry());
     assert_eq!(pr_of(&job).fix, None);
+}
+
+#[test]
+fn a_fix_merged_on_an_older_head_asks_for_that_head() {
+    let mut job = fixing_job();
+    observe(&mut job, "h2", RenovateCi::Pending, LIMITS, false);
+    fix_merged_on(&mut job, "h1");
+    assert_eq!(rebase_head(&job).as_deref(), Some("h1"));
+}
+
+#[test]
+fn a_fix_merged_on_a_head_not_yet_observed_asks_for_that_head() {
+    let mut job = fixing_job();
+    fix_merged_on(&mut job, "h2");
+    assert_eq!(rebase_head(&job).as_deref(), Some("h2"));
 }
 
 #[test]
