@@ -211,6 +211,34 @@ test('the local checks command saves and clears', async ({ page, project }) => {
   await expect(field).toHaveValue('');
 });
 
+test('a display name shows in the picker, the sidebar and the heading', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project));
+  const card = page.locator('form.settings-form').filter({ hasText: 'Project name' });
+  const field = card.getByLabel('Name', { exact: true });
+  await expect(field).toHaveValue(project);
+  await field.fill('  My Project  ');
+  await card.getByRole('button', { name: 'Save name' }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`${settingsPath(project)}\\?notice=Saved\\.$`));
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('My Project');
+  await expect(
+    page.locator('.settings-nav').getByRole('link', { name: 'My Project' }),
+  ).toHaveAttribute('href', settingsPath(project));
+
+  await page.goto('/');
+  const picker = page.getByLabel('Project', { exact: true });
+  await expect(picker).toHaveValue(project);
+  await expect(picker.locator('option:checked')).toHaveText('My Project');
+
+  await page.goto(settingsPath(project));
+  await field.fill('');
+  await card.getByRole('button', { name: 'Save name' }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText(project);
+});
+
 const saveProjectToken = async (page: Page, token: string) => {
   const card = page.locator('#forge-account');
   await card.getByLabel('Project token').fill(token);

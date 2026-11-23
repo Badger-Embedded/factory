@@ -563,7 +563,7 @@ fn project_selector(labels: &[ProjectLabel], selected: &str) -> Markup {
             label.visually-hidden for="project" { "Project" }
             select #project name="project" {
                 @for label in labels {
-                    option value=[(label.shown != label.id).then_some(&label.id)] selected[label.id == selected] { (label.shown) }
+                    option value=(label.id) selected[label.id == selected] { (label.shown) }
                 }
             }
             noscript { button { "Go" } }
@@ -1691,6 +1691,7 @@ pub fn settings_project(
             @if let Some(problem) = &project.forge_problem {
                 div.card.failed { (problem) }
             }
+            (project_name_card(project))
             @if let Some(card) = &project.forge_account {
                 @if card.project_account.is_none() {
                     (missing_project_token_notice(&project.name))
@@ -1727,6 +1728,22 @@ fn remove_project_card(project: &ProjectSettings) -> Markup {
                     placeholder=(project.shown);
                 button.danger { "Remove " (project.shown) }
             }
+        }
+    }
+}
+
+fn project_name_card(project: &ProjectSettings) -> Markup {
+    html! {
+        form.card.settings-form method="post"
+            action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/name" } {
+            h2 { "Project name" }
+            div.field {
+                label for="display_name" { "Name" }
+                input #display_name.wide type="text" name="display_name" value=(project.shown);
+                p.hint { "The name the factory's pages show for this project. Empty it to show the original name again." }
+            }
+            input type="hidden" name="csrf" value=(project.checks_csrf);
+            (save_bar("Save name"))
         }
     }
 }

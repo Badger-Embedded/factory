@@ -1026,7 +1026,10 @@ fn apply_all(store: &Store, id: i64, events: impl IntoIterator<Item = Event>) {
 async fn the_index_lists_jobs_and_flags_those_waiting_for_the_user() {
     let dashboard = dashboard();
     let page = dashboard.get("/").await;
-    assert!(page.body.contains("<option selected>maestro</option>"));
+    assert!(
+        page.body
+            .contains("<option value=\"maestro\" selected>maestro</option>")
+    );
     assert!(page.body.contains("name=\"project\" value=\"maestro\""));
 
     let id = dashboard.new_job().await;
@@ -3510,7 +3513,10 @@ async fn the_index_defaults_to_the_first_project() {
     dashboard.new_job().await;
     dashboard.post_job("tool", "Tool change", &[]).await;
     let page = dashboard.get("/").await;
-    assert!(page.body.contains("<option selected>maestro</option>"));
+    assert!(
+        page.body
+            .contains("<option value=\"maestro\" selected>maestro</option>")
+    );
     assert!(page.body.contains("Add a reboot button</a>"));
     assert!(!page.body.contains("Tool change"));
 }
@@ -3524,7 +3530,10 @@ async fn the_board_shows_only_the_selected_project() {
 
     let page = dashboard.get("/?project=tool").await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(page.body.contains("<option selected>tool</option>"));
+    assert!(
+        page.body
+            .contains("<option value=\"tool\" selected>tool</option>")
+    );
     assert!(page.body.contains("Tool change"));
     assert!(!page.body.contains("Add a reboot button</a>"));
     assert!(!page.body.contains("class=\"inbox inbox-you\""));
@@ -3584,7 +3593,10 @@ async fn the_cookie_picks_the_project_after_a_visit_elsewhere() {
     assert!(project_cookie(&settings).is_none());
 
     let page = dashboard.get_with_cookie(USER, "/", &cookie).await;
-    assert!(page.body.contains("<option selected>tool</option>"));
+    assert!(
+        page.body
+            .contains("<option value=\"tool\" selected>tool</option>")
+    );
     assert!(page.body.contains("Tool change"));
     assert!(project_cookie(&page).is_none());
 }
@@ -3595,7 +3607,10 @@ async fn an_explicit_project_beats_the_cookie() {
     let page = dashboard
         .get_with_cookie(USER, "/?project=maestro", "factory_project=tool")
         .await;
-    assert!(page.body.contains("<option selected>maestro</option>"));
+    assert!(
+        page.body
+            .contains("<option value=\"maestro\" selected>maestro</option>")
+    );
     assert_eq!(
         project_cookie(&page).as_deref(),
         Some("factory_project=maestro")
@@ -3626,7 +3641,8 @@ async fn a_stale_or_foreign_cookie_falls_back_to_the_first_project() {
         let page = dashboard.get_with_cookie(USER, "/", cookie).await;
         assert_eq!(page.status, StatusCode::OK, "{cookie}");
         assert!(
-            page.body.contains("<option selected>maestro</option>"),
+            page.body
+                .contains("<option value=\"maestro\" selected>maestro</option>"),
             "{cookie}"
         );
         assert!(project_cookie(&page).is_none());
@@ -3694,7 +3710,10 @@ async fn an_unusual_project_name_round_trips_through_the_cookie() {
     let uri = "/?project=my%20proj%3B%20%C3%A9%2Cx";
     let cookie = project_cookie(&dashboard.get(uri).await).unwrap();
     let page = dashboard.get_with_cookie(USER, "/", &cookie).await;
-    assert!(page.body.contains("<option selected>my proj; é,x</option>"));
+    assert!(
+        page.body
+            .contains("<option value=\"my proj; é,x\" selected>my proj; é,x</option>")
+    );
 }
 
 const STRANGER: &str = "mallory@example.com";
@@ -4235,8 +4254,8 @@ async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
     let main = page.body.find("<main>").unwrap();
     let (topbar, rest) = page.body.split_at(main);
     assert!(topbar.contains("<select id=\"project\" name=\"project\">"));
-    assert!(topbar.contains("<option>maestro</option>"));
-    assert!(topbar.contains("<option selected>tool</option>"));
+    assert!(topbar.contains("<option value=\"maestro\">maestro</option>"));
+    assert!(topbar.contains("<option value=\"tool\" selected>tool</option>"));
     assert!(topbar.contains("<label class=\"visually-hidden\" for=\"project\">Project</label>"));
     assert!(topbar.contains("<noscript><button>Go</button></noscript>"));
     assert!(!rest.contains("<select"));
@@ -10771,7 +10790,7 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     ] {
         let body = dashboard.get(uri).await.body;
         let bars = if uri == "/settings/projects/maestro" {
-            5
+            6
         } else {
             1
         };
@@ -14126,4 +14145,337 @@ fn the_checks_command_round_trips_through_the_store() {
     );
     store.save_project_checks("a", None).unwrap();
     assert_eq!(store.project("a").unwrap().unwrap().checks, None);
+}
+
+async fn name_post(dashboard: &Dashboard, login: &str, value: &str) -> Reply {
+    let page = dashboard.get_as(login, PROJECT_PAGE).await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let csrf = doc
+        .select(&scraper::Selector::parse("form[action$='/name'] input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the Project name card carries a csrf token")
+        .to_owned();
+    dashboard
+        .post_as(
+            login,
+            &format!("{PROJECT_PAGE}/name"),
+            &format!("display_name={value}&csrf={csrf}"),
+        )
+        .await
+}
+
+#[test]
+fn the_store_reads_and_writes_a_display_name() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project("b", ForgeKind::GitHub, "o/b", "main", None, Some("alice"))
+        .unwrap();
+    store
+        .create_project("a", ForgeKind::GitHub, "o/a", "main", None, Some("alice"))
+        .unwrap();
+    assert_eq!(store.project_shown_name("b").unwrap(), "b");
+    store.save_project_display_name("b", Some("Alpha")).unwrap();
+    assert_eq!(store.project_shown_name("b").unwrap(), "Alpha");
+    let labels = store.project_labels_for("alice").unwrap();
+    let pairs: Vec<_> = labels
+        .iter()
+        .map(|l| (l.id.as_str(), l.shown.as_str()))
+        .collect();
+    assert_eq!(pairs, [("b", "Alpha"), ("a", "a")]);
+    assert!(store.project("b").unwrap().is_some());
+    assert!(matches!(
+        store.save_project_display_name("a", Some("Alpha")),
+        Err(StoreError::DuplicateName(_))
+    ));
+    assert!(matches!(
+        store.save_project_display_name("a", Some("b")),
+        Err(StoreError::DuplicateName(_))
+    ));
+    store.save_project_display_name("b", None).unwrap();
+    assert_eq!(store.project_shown_name("b").unwrap(), "b");
+}
+
+#[tokio::test]
+async fn saving_a_display_name_shows_it_and_keeps_the_identifier() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let reply = name_post(&dashboard, USER, "++My+Project++").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        reply.location.as_deref(),
+        Some("/settings/projects/maestro?notice=Saved.")
+    );
+    let page = dashboard.get(PROJECT_PAGE).await.body;
+    assert!(page.contains("<h1>My Project</h1>"));
+    assert!(page.contains("Remove My Project"));
+    assert!(page.contains(r#"value="My Project""#));
+    let board = dashboard.get("/").await;
+    assert!(
+        board
+            .body
+            .contains("<option value=\"maestro\" selected>My Project</option>")
+    );
+    assert!(board.body.contains("Describe a change for My Project…"));
+    let job = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(job.contains("My Project"));
+    assert!(dashboard.store.project("maestro").unwrap().is_some());
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Requested
+    );
+}
+
+#[tokio::test]
+async fn an_empty_value_or_the_identifier_clears_the_display_name() {
+    let dashboard = dashboard();
+    for clear in ["", "maestro", "+maestro+"] {
+        dashboard
+            .store
+            .save_project_display_name("maestro", Some("Shown"))
+            .unwrap();
+        let reply = name_post(&dashboard, USER, clear).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{clear:?}");
+        assert_eq!(
+            dashboard.store.project_shown_name("maestro").unwrap(),
+            "maestro"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bad_display_name_is_refused_and_changes_nothing() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .create_project(
+            "tool",
+            ForgeKind::GitHub,
+            "o/tool",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    dashboard
+        .store
+        .save_project_display_name("tool", Some("Other Tool"))
+        .unwrap();
+    dashboard
+        .store
+        .save_project_display_name("maestro", Some("Keep"))
+        .unwrap();
+    let long = "x".repeat(65);
+    for (value, needle) in [
+        (long.as_str(), "at most 64"),
+        ("a%07b", "control characters"),
+        ("tool", "already exists."),
+        ("Other+Tool", "already exists."),
+    ] {
+        let reply = name_post(&dashboard, USER, value).await;
+        assert_eq!(reply.status, StatusCode::OK, "{value}");
+        assert!(reply.body.contains(needle), "{value}");
+        assert_eq!(
+            dashboard.store.project_shown_name("maestro").unwrap(),
+            "Keep"
+        );
+    }
+    let sixty_four = "é".repeat(64);
+    assert_eq!(
+        name_post(&dashboard, USER, &sixty_four).await.status,
+        StatusCode::SEE_OTHER
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_save_a_display_name() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post_as(
+            STRANGER,
+            "/settings/projects/maestro/name",
+            "display_name=evil",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    let unknown = dashboard
+        .post_as(
+            STRANGER,
+            "/settings/projects/nope/name",
+            "display_name=evil",
+        )
+        .await;
+    assert_eq!(unknown.status, reply.status);
+    let forged = dashboard
+        .post(
+            "/settings/projects/maestro/name",
+            "display_name=evil&csrf=forged",
+        )
+        .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        dashboard.store.project_shown_name("maestro").unwrap(),
+        "maestro"
+    );
+}
+
+#[tokio::test]
+async fn onboarding_refuses_an_identifier_equal_to_a_display_name() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project(
+            "widgets",
+            ForgeKind::GitHub,
+            "acme/old",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    store
+        .save_project_display_name("widgets", Some("shiny"))
+        .unwrap();
+    rejected(
+        Arc::new(FakeRepos::fit()),
+        store,
+        "repo=acme%2Fnew&name=shiny&action=create",
+        "already exists",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn removal_asks_for_the_shown_name_and_a_reonboarded_project_has_none() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_display_name("maestro", Some("My Project"))
+        .unwrap();
+    let page = dashboard.get(PROJECT_PAGE).await.body;
+    assert!(page.contains("placeholder=\"My Project\""));
+    assert!(page.contains("Remove My Project"));
+    let refused = dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    assert!(refused.body.contains("Nothing was removed."));
+    assert!(dashboard.store.project("maestro").unwrap().is_some());
+    dashboard
+        .post("/settings/projects/maestro/remove", "confirm=My+Project")
+        .await;
+    assert!(dashboard.store.project("maestro").unwrap().is_none());
+    dashboard
+        .store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/new",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    assert_eq!(
+        dashboard.store.project_shown_name("maestro").unwrap(),
+        "maestro"
+    );
+}
+
+#[tokio::test]
+async fn the_sidebar_orders_projects_by_shown_name_and_mcp_pages_show_it() {
+    let dashboard = two_projects();
+    add_context7(&dashboard).await;
+    dashboard
+        .store
+        .save_project_display_name("maestro", Some("zed"))
+        .unwrap();
+    let page = dashboard.get(PROJECT_PAGE).await.body;
+    let nav = &page[page.find("<nav class=\"settings-nav\"").unwrap()..];
+    assert!(
+        nav.find("href=\"/settings/projects/tool\"").unwrap()
+            < nav.find("href=\"/settings/projects/maestro\"").unwrap()
+    );
+    let mcp = dashboard
+        .get("/settings/projects/maestro/mcp/context7")
+        .await
+        .body;
+    assert!(mcp.contains("zed"));
+    let server = dashboard.get("/settings/mcp/context7").await.body;
+    let used = &server[server.find("Used by").unwrap()..];
+    assert!(used.contains("zed"));
+    assert!(used.contains(r#"href="/settings/projects/maestro/mcp/context7""#));
+}
+
+#[tokio::test]
+async fn a_refused_onboarding_keeps_the_retained_jobs_of_the_name() {
+    let dashboard = dashboard();
+    seed_user_token(&dashboard.store, "bob@example.com");
+    let id = dashboard.new_job().await;
+    dashboard
+        .post("/settings/projects/maestro/remove", "confirm=maestro")
+        .await;
+    dashboard
+        .store
+        .create_project(
+            "widgets",
+            ForgeKind::GitHub,
+            "acme/widgets",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    dashboard
+        .store
+        .save_project_display_name("widgets", Some("maestro"))
+        .unwrap();
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fmaestro&name=maestro&action=skip",
+        )
+        .await;
+    assert!(reply.body.contains("already exists"));
+    assert!(dashboard.store.get(id).is_ok());
+}
+#[tokio::test]
+async fn a_display_name_save_waits_for_a_running_onboarding() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "acme/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    seed_user_token(&store, "bob@example.com");
+    let dashboard = dashboard_with(Arc::clone(&store));
+    let pass = dashboard.slots.lock_pass().await;
+    let onboard = dashboard.post_as(
+        "bob@example.com",
+        "/onboard",
+        "repo=acme%2Ffresh&name=fresh&action=skip",
+    );
+    let save = name_post(&dashboard, USER, "fresh");
+    tokio::pin!(onboard, save);
+    // Onboarding stops at the held pass lock, after its name check.
+    for _ in 0..20 {
+        let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(onboard.as_mut().poll(cx)));
+        assert!(polled.await.is_pending());
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..20 {
+        let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(save.as_mut().poll(cx)));
+        assert!(polled.await.is_pending(), "the save ran during onboarding");
+        tokio::task::yield_now().await;
+    }
+    assert!(store.project("fresh").unwrap().is_none());
+    drop(pass);
+    let (onboarded, saved) = tokio::join!(onboard, save);
+    assert_eq!(onboarded.status, StatusCode::SEE_OTHER);
+    assert!(saved.body.contains("already exists"));
+    assert_eq!(store.project_shown_name("maestro").unwrap(), "maestro");
 }
