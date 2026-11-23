@@ -129,8 +129,14 @@ fn event_named(name: &str) -> Result<Event> {
     })
 }
 
-fn create_job(store: &Store, project: &str, stage: &str, request: &str) -> Result<i64> {
-    let id = store.create(project, ADMIN, request)?;
+fn create_job(
+    store: &Store,
+    project: &str,
+    stage: &str,
+    request: &str,
+    after: &[i64],
+) -> Result<i64> {
+    let id = store.create_after(project, ADMIN, request, after)?;
     for event in events_for(stage)? {
         store.apply(id, event)?;
     }
@@ -158,7 +164,7 @@ fn seed(store: &Store) -> Result<()> {
         ("failed", "Retry flashing when the SD mux is busy"),
     ];
     for (stage, request) in live {
-        create_job(store, SHARED_PROJECT, stage, request)?;
+        create_job(store, SHARED_PROJECT, stage, request, &[])?;
     }
     // One more than the Done section lists, so the board has "Show 1 older".
     for number in 1..=5 {
@@ -167,6 +173,7 @@ fn seed(store: &Store) -> Result<()> {
             SHARED_PROJECT,
             "merged",
             &format!("Merged change {number}"),
+            &[],
         )?;
     }
     create_job(
@@ -174,6 +181,7 @@ fn seed(store: &Store) -> Result<()> {
         SHARED_PROJECT,
         "cancelled",
         "Rename the hardware crate",
+        &[],
     )?;
     Ok(())
 }
@@ -248,7 +256,10 @@ fn main() -> Result<()> {
         }
         "job" => {
             let request = one("request").map_or("A request from the fixture", |text| text.as_str());
-            let id = create_job(&store, one("project")?, one("stage")?, request)?;
+            let after = flags.get("after").map_or(Ok(Vec::new()), |ids| {
+                ids.iter().map(|id| id.parse()).collect()
+            })?;
+            let id = create_job(&store, one("project")?, one("stage")?, request, &after)?;
             println!("{id}");
         }
         "renovate" => {

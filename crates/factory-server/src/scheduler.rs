@@ -609,9 +609,9 @@ impl<E: Executor> Scheduler<E> {
                 if !workers_free {
                     continue;
                 }
-                job = match self.store.apply(row.id, Event::Start) {
-                    Ok(started) => started.job,
-                    Err(StoreError::Rejected(_) | StoreError::NotFound(_)) => continue,
+                job = match self.store.start(row.id) {
+                    Ok(Some(started)) => started.job,
+                    Ok(None) | Err(StoreError::Rejected(_) | StoreError::NotFound(_)) => continue,
                     Err(err) => return Err(err),
                 };
             }

@@ -1,5 +1,6 @@
 mod support;
 
+use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -12,6 +13,7 @@ use axum::http::{Request, StatusCode, header};
 use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
+    Wait,
 };
 use factory_runner::{Account, ForgeAccount, ForgeKind, GitHub};
 use factory_server::{
@@ -452,6 +454,34 @@ impl Dashboard {
         .await
     }
 
+    /// Posts a request that waits for the jobs in `after`, one repeated `after`
+    /// part each, as the board's checkboxes post them.
+    async fn post_job_after(&self, project: &str, request: &str, after: &[&str]) -> Reply {
+        let mut body = String::new();
+        for (name, value) in [("project", project), ("request", request)]
+            .into_iter()
+            .chain(after.iter().map(|id| ("after", *id)))
+        {
+            write!(
+                body,
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .unwrap();
+        }
+        write!(body, "--{BOUNDARY}--\r\n").unwrap();
+        self.send(
+            Request::post("/jobs")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .header(USER_HEADER, USER)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
     /// Posts an edit to `/jobs/{id}/edit` as multipart: the new request text,
     /// one `remove` part per stored name to drop, and one `images` part per new
     /// upload, the way the edit form posts.
@@ -573,6 +603,258 @@ async fn bad_requests_create_no_job() {
     let empty = dashboard.post_job("maestro", "  ", &[]).await;
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     assert_eq!(dashboard.store.list().unwrap().len(), 0);
+}
+
+fn job_id_of(reply: &Reply) -> i64 {
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    reply
+        .location
+        .as_deref()
+        .unwrap()
+        .strip_prefix("/jobs/")
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_request_waits_for_the_jobs_it_is_posted_after() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    let reply = dashboard
+        .post_job_after(
+            "maestro",
+            "Needs both",
+            &[&first.to_string(), &second.to_string(), &first.to_string()],
+        )
+        .await;
+    let id = job_id_of(&reply);
+
+    assert_eq!(
+        dashboard.store.get(id).unwrap().job.stage(),
+        &Stage::Requested
+    );
+    assert_eq!(
+        dashboard.store.waits().unwrap()[&id],
+        Wait::Waiting(vec![first, second])
+    );
+    let board = dashboard.get("/fragments/board?project=maestro").await.body;
+    let row = board
+        .split("<li ")
+        .find(|row| row.contains("Needs both"))
+        .unwrap();
+    assert!(
+        row.contains("<span class=\"badge factory\">waiting</span>"),
+        "{row}"
+    );
+    assert!(
+        row.contains(&format!(
+            "waits for <a href=\"/jobs/{first}\">#{first}</a>, <a href=\"/jobs/{second}\">#{second}</a>"
+        )),
+        "{row}"
+    );
+    assert_eq!(lanes_of(&board, id), ["inbox-running"]);
+}
+
+#[tokio::test]
+async fn a_deleted_prerequisite_is_plain_text_on_the_board_and_a_reused_id_is_not_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let dashboard = dashboard_with(Arc::clone(&store));
+    let waiting = dashboard.new_job().await;
+    let gone = dashboard.new_job().await;
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "INSERT INTO job_prerequisites (job_id, prerequisite) VALUES (?1, ?2)",
+        rusqlite::params![waiting, gone],
+    )
+    .unwrap();
+    store.delete_job(gone, Path::new("/nonexistent")).unwrap();
+    let reused = store.create("maestro", "alice", "reuses the id").unwrap();
+    assert_eq!(reused, gone, "SQLite reuses the highest id");
+
+    let board = dashboard.get("/fragments/board?project=maestro").await.body;
+    let row = board
+        .split("<li ")
+        .find(|row| row.contains(&format!("href=\"/jobs/{waiting}\"")))
+        .unwrap();
+    assert!(
+        row.contains(&format!("waits for #{gone} (deleted before it merged)")),
+        "{row}"
+    );
+    assert!(!row.contains(&format!("href=\"/jobs/{gone}\"")), "{row}");
+}
+
+#[tokio::test]
+async fn a_request_with_a_prerequisite_that_cannot_be_waited_for_is_refused() {
+    let dashboard = dashboard();
+    let store = &dashboard.store;
+    let ok = dashboard.new_job().await;
+    let other = store.create("elsewhere", "bob", "other").unwrap();
+    let renovate = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    let proposed = store
+        .create_gap_job("maestro", renovate, 7, "Add a flag")
+        .unwrap();
+    let before = store.list().unwrap().len();
+
+    let unknown = dashboard.post_job_after("maestro", "x", &["999"]).await;
+    let foreign = dashboard
+        .post_job_after("maestro", "x", &[&other.to_string()])
+        .await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+    assert_eq!(foreign.status, StatusCode::BAD_REQUEST);
+    assert!(
+        unknown
+            .body
+            .contains("<p>job #999 is not a job this request can wait for</p>")
+    );
+    assert!(foreign.body.contains(&format!(
+        "<p>job #{other} is not a job this request can wait for</p>"
+    )));
+    for refused in [
+        renovate.to_string(),
+        proposed.to_string(),
+        "soon".to_owned(),
+    ] {
+        let reply = dashboard
+            .post_job_after("maestro", "x", &[&ok.to_string(), &refused])
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{refused}");
+    }
+    assert_eq!(store.list().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn a_merged_prerequisite_does_not_hold_the_request() {
+    let dashboard = dashboard();
+    let done = merged(&dashboard).await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "After a merge", &[&done.to_string()])
+            .await,
+    );
+    assert!(dashboard.store.waits().unwrap().is_empty());
+    let board = dashboard.get("/fragments/board?project=maestro").await.body;
+    let row = board
+        .split("<li ")
+        .find(|row| row.contains("After a merge"))
+        .unwrap();
+    assert!(row.contains(">queued</span>"), "{row}");
+    assert!(!row.contains("waits for"), "{row}");
+    assert!(dashboard.store.start(id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_request_blocked_by_its_prerequisite_needs_you() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Blocked one", &[&first.to_string()])
+            .await,
+    );
+    dashboard.apply(first, Event::Cancel);
+
+    let board = dashboard.get("/fragments/board?project=maestro").await.body;
+    assert_eq!(lanes_of(&board, id), ["inbox-you"]);
+    let row = board
+        .split("<li ")
+        .find(|row| row.contains("Blocked one"))
+        .unwrap();
+    assert!(
+        row.contains("<span class=\"badge you\">blocked</span>"),
+        "{row}"
+    );
+    assert!(
+        row.contains(&format!(
+            "waits for <a href=\"/jobs/{first}\">#{first}</a> (cancelled)"
+        )),
+        "{row}"
+    );
+    assert!(
+        row.contains(&format!(
+            "<a class=\"link-button\" href=\"/jobs/{id}\">Open</a>"
+        )),
+        "{row}"
+    );
+
+    let notes = notifications_as(&dashboard, USER).await;
+    let kinds: Vec<_> = notes["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["job"] == id)
+        .map(|item| item["kind"].clone())
+        .collect();
+    assert_eq!(kinds, ["needs-you"]);
+}
+
+#[tokio::test]
+async fn the_composer_offers_the_projects_unfinished_jobs_to_start_after() {
+    let dashboard = dashboard();
+    let store = &dashboard.store;
+    let none = dashboard.get("/").await.body;
+    assert!(!none.contains("Start after"));
+
+    let open = dashboard.new_job().await;
+    let done = merged(&dashboard).await;
+    let cancelled = dashboard.new_job().await;
+    dashboard.apply(cancelled, Event::Cancel);
+    let stuck = dashboard.new_job().await;
+    apply_all(
+        store,
+        stuck,
+        [
+            Event::Start,
+            Event::AgentFailed {
+                reason: "usage limit".into(),
+            },
+        ],
+    );
+    let dead = dashboard.new_job().await;
+    dashboard.apply(dead, Event::Cancel);
+    store.create("elsewhere", "bob", "other").unwrap();
+    let renovate = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    let proposed = store
+        .create_gap_job("maestro", renovate, 7, "Add a flag")
+        .unwrap();
+
+    let page = dashboard.get("/").await.body;
+    assert!(page.contains("<legend>Start after</legend>"));
+    let offered = |id: i64| {
+        page.contains(&format!(
+            "<input type=\"checkbox\" name=\"after\" value=\"{id}\">"
+        ))
+    };
+    assert!(offered(open));
+    assert!(offered(stuck));
+    for hidden in [done, cancelled, dead, renovate, proposed] {
+        assert!(!offered(hidden), "job {hidden}");
+    }
+}
+
+fn apply_all(store: &Store, id: i64, events: impl IntoIterator<Item = Event>) {
+    for event in events {
+        store.apply(id, event).unwrap();
+    }
 }
 
 #[tokio::test]

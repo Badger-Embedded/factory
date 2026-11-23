@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, Gates, Job, PlanUsageSnapshot, RenovatePr, RenovateWait, Stage,
-    Task, Turn, UsageWindow, Verdict,
+    Ask, BranchSummary, Command, DELETED_PREREQUISITE, Gates, Job, PlanUsageSnapshot, RenovatePr,
+    RenovateWait, Stage, Task, Turn, UsageWindow, Verdict, Wait,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -168,6 +168,7 @@ pub fn index(
     selected: Option<&str>,
     jobs: &[JobRow],
     costs: &HashMap<i64, f64>,
+    waits: &HashMap<i64, Wait>,
     totals: ProjectTotals,
     plan_usage: Option<&UsageTile>,
     auto_merge: bool,
@@ -211,8 +212,8 @@ pub fn index(
                 @if project_token_missing {
                     (missing_project_token_notice(selected))
                 }
-                (composer(selected))
-                (board(&all, costs, auto_merge, selected, project))
+                (composer(selected, &all))
+                (board(&all, costs, waits, auto_merge, selected, project))
                 (stats(totals, selected))
             } @else {
                 div.card {
@@ -322,7 +323,11 @@ fn held_for(seconds: i64) -> String {
 /// The new-request form as a one-line bar. It grows, and shows the file
 /// picker, once it has focus or text, so it takes little room on a board
 /// that is opened more often to check on jobs than to file one.
-fn composer(project: &str) -> Markup {
+fn composer(project: &str, rows: &[&JobRow]) -> Markup {
+    let eligible: Vec<&&JobRow> = rows
+        .iter()
+        .filter(|row| row.job.can_be_prerequisite())
+        .collect();
     html! {
         form.composer method="post" action="/jobs" enctype="multipart/form-data" {
             input type="hidden" name="project" value=(project);
@@ -342,6 +347,19 @@ fn composer(project: &str) -> Markup {
                     }
                 }
                 ul #pasted-images.pasted-images {}
+                @if !eligible.is_empty() {
+                    fieldset.start-after {
+                        legend { "Start after" }
+                        span.hint { "The request waits until these jobs are merged." }
+                        @for row in eligible {
+                            label.start-after-job {
+                                input type="checkbox" name="after" value=(row.id);
+                                span.id { "#" (row.id) }
+                                " " (first_line(row.job.request()))
+                            }
+                        }
+                    }
+                }
             }
             script { (PreEscaped(PASTE_IMAGES)) }
         }
@@ -2930,6 +2948,7 @@ const DONE_SHOWN: usize = 5;
 pub fn board(
     rows: &[&JobRow],
     costs: &HashMap<i64, f64>,
+    waits: &HashMap<i64, Wait>,
     auto_merge: bool,
     project: &str,
     repo: Option<&Project>,
@@ -2938,7 +2957,9 @@ pub fn board(
     let in_section = |section: Section| -> Vec<&JobRow> {
         rows.iter()
             .copied()
-            .filter(|row| Section::of(status(&row.job, auto_merge).lane) == section)
+            .filter(|row| {
+                Section::of(status(&row.job, auto_merge, wait_of(waits, row.id)).lane) == section
+            })
             .collect()
     };
     let live = rows.iter().any(|row| !row.job.is_finished());
@@ -2952,13 +2973,13 @@ pub fn board(
                 section class={ "inbox inbox-" (section.name()) } {
                     h2 { (section.title()) " " span.count { (jobs.len()) } }
                     @if section == Section::Done && jobs.len() > DONE_SHOWN {
-                        (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge, links))
+                        (job_rows(&jobs[..DONE_SHOWN], costs, waits, auto_merge, links))
                         details.older data-key=(section.name()) {
                             summary { "Show " (jobs.len() - DONE_SHOWN) " older" }
-                            (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge, links))
+                            (job_rows(&jobs[DONE_SHOWN..], costs, waits, auto_merge, links))
                         }
                     } @else {
-                        (job_rows(&jobs, costs, auto_merge, links))
+                        (job_rows(&jobs, costs, waits, auto_merge, links))
                     }
                 }
             }
@@ -2977,13 +2998,15 @@ pub fn board(
 fn job_rows(
     rows: &[&JobRow],
     costs: &HashMap<i64, f64>,
+    waits: &HashMap<i64, Wait>,
     auto_merge: bool,
     links: Option<Links<'_>>,
 ) -> Markup {
     html! {
         ul.jobs {
             @for row in rows {
-                @let lane = status(&row.job, auto_merge).lane;
+                @let wait = wait_of(waits, row.id);
+                @let lane = status(&row.job, auto_merge, wait).lane;
                 li class={ "job job-" (Section::of(lane).name()) } {
                     span.id { "#" (row.id) }
                     a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
@@ -2991,9 +3014,11 @@ fn job_rows(
                     }
                     div.job-sub {
                         (renovate_link(&row.job, links))
-                        (turn_badge(&row.job, auto_merge))
+                        (turn_badge(&row.job, auto_merge, wait))
                         @if !row.job.is_finished() { (flow_steps(&row.job)) }
-                        @if let Some(detail) = row_detail(&row.job) {
+                        @if let (Stage::Requested, Some(waits_for)) = (row.job.stage(), waits_for(wait)) {
+                            span.stage { (waits_for) }
+                        } @else if let Some(detail) = row_detail(&row.job) {
                             span.stage { (detail) }
                         }
                         span.requester title=(row.requested_by) { (row.requested_by) }
@@ -3004,6 +3029,29 @@ fn job_rows(
             }
         }
     }
+}
+
+fn waits_for(wait: &Wait) -> Option<Markup> {
+    let entries: Vec<(i64, &str)> = match wait {
+        Wait::Ready => return None,
+        Wait::Waiting(ids) => ids.iter().map(|id| (*id, "")).collect(),
+        Wait::Blocked(entries) => entries
+            .iter()
+            .map(|(id, label)| (*id, label.as_str()))
+            .collect(),
+    };
+    Some(html! {
+        "waits for "
+        @for (index, (id, label)) in entries.into_iter().enumerate() {
+            @if index > 0 { ", " }
+            @if label == DELETED_PREREQUISITE {
+                "#" (id)
+            } @else {
+                a href={ "/jobs/" (id) } { "#" (id) }
+            }
+            @if !label.is_empty() { " (" (label) ")" }
+        }
+    })
 }
 
 /// The stage of a live job, or why a failed one failed. A merged or
@@ -3994,7 +4042,7 @@ fn status_card(
             _,
         ) => html! {
             div.card.status {
-                (turn_badge(job, auto_merge))
+                (turn_badge(job, auto_merge, &Wait::Ready))
                 span.status-detail { (turn_detail(job, settings, auto_merge)) }
                 @if let Some(pr) = job.renovate_pr() {
                     (renovate_details(pr, settings, gap_links))
@@ -4025,7 +4073,7 @@ fn status_card(
         ) => failed_card(id, job, reason, *dismissed),
         _ => html! {
             div.card.status {
-                (turn_badge(job, auto_merge))
+                (turn_badge(job, auto_merge, &Wait::Ready))
                 span.status-detail { (turn_detail(job, settings, auto_merge)) }
             }
         },
@@ -4073,6 +4121,12 @@ fn in_review(job: &Job) -> bool {
     matches!(job.next_command(), Some(Command::WatchPr { .. }))
 }
 
+static NO_WAIT: Wait = Wait::Ready;
+
+fn wait_of(waits: &HashMap<i64, Wait>, id: i64) -> &Wait {
+    waits.get(&id).unwrap_or(&NO_WAIT)
+}
+
 struct Status {
     lane: Lane,
     class: &'static str,
@@ -4080,7 +4134,7 @@ struct Status {
 }
 
 /// One match decides the lane and the badge, so they cannot disagree.
-fn status(job: &Job, auto_merge: bool) -> Status {
+fn status(job: &Job, auto_merge: bool, wait: &Wait) -> Status {
     let (lane, class, text) = match (job.stage(), job.turn()) {
         (Stage::Merged, _) => (Lane::Done, "ok", "merged"),
         (
@@ -4093,7 +4147,11 @@ fn status(job: &Job, auto_merge: bool) -> Status {
         (Stage::Failed { .. }, _) => (Lane::Failed, "bad", "failed"),
         (Stage::Cancelled, _) => (Lane::Done, "factory", "cancelled"),
         (Stage::Proposed, _) => (Lane::You, "you", "proposal"),
-        (Stage::Requested, _) => (Lane::Factory, "factory", "queued"),
+        (Stage::Requested, _) => match wait {
+            Wait::Ready => (Lane::Factory, "factory", "queued"),
+            Wait::Waiting(_) => (Lane::Factory, "factory", "waiting"),
+            Wait::Blocked(_) => (Lane::You, "you", "blocked"),
+        },
         (_, Turn::User(_)) if !collecting(job) => (Lane::You, "you", "needs you"),
         _ if in_review(job) && auto_merge => (Lane::Factory, "factory", "merges when green"),
         _ if in_review(job) => (Lane::You, "you", "in review"),
@@ -4105,8 +4163,8 @@ fn status(job: &Job, auto_merge: bool) -> Status {
     Status { lane, class, text }
 }
 
-pub fn attention(job: &Job, auto_merge: bool) -> Option<&'static str> {
-    match status(job, auto_merge).lane {
+pub fn attention(job: &Job, auto_merge: bool, wait: &Wait) -> Option<&'static str> {
+    match status(job, auto_merge, wait).lane {
         Lane::You => Some("needs-you"),
         Lane::Failed => Some("failed"),
         Lane::Agent | Lane::Factory | Lane::Done => None,
@@ -4117,8 +4175,8 @@ pub fn job_title(job: &Job) -> String {
     first_line(job.request())
 }
 
-fn turn_badge(job: &Job, auto_merge: bool) -> Markup {
-    let Status { class, text, .. } = status(job, auto_merge);
+fn turn_badge(job: &Job, auto_merge: bool, wait: &Wait) -> Markup {
+    let Status { class, text, .. } = status(job, auto_merge, wait);
     html! { span class={ "badge " (class) } { (text) } }
 }
 
