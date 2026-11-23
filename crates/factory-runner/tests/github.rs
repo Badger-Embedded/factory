@@ -890,6 +890,22 @@ async fn request_renovate_rebase_writes_nothing_for_another_head() {
 }
 
 #[tokio::test]
+async fn head_commit_reads_the_last_commit_time_as_utc_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h2","commits":[{"committedDate":"2026-01-01T00:00:00Z"},{"committedDate":"2026-01-02T03:04:05Z"}]}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.sha, "h2");
+    assert_eq!(head.committed_at, "2026-01-02 03:04:05");
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr view 5 --repo o/r --json headRefOid,commits\n"
+    );
+}
+
+#[tokio::test]
 async fn request_renovate_rebase_reports_the_gh_error() {
     let dir = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(dir.path(), "echo 'gh: HTTP 502' >&2; exit 1");

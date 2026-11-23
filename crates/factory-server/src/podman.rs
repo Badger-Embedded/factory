@@ -7,9 +7,10 @@ use std::time::SystemTime;
 
 use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
 use factory_runner::{
-    Account, BranchSummary, Ci, Credential, ForgeKind, Git, Observation, PrState, RebaseCheckbox,
-    Remote, RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend, observe,
-    place_files, place_images, remove_container, run, run_checks, show_files, show_images,
+    Account, BranchSummary, Ci, Credential, ForgeKind, Git, HeadCommit, Observation, PrState,
+    RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
+    backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
+    show_images,
 };
 
 use crate::forges::Forges;
@@ -590,13 +591,11 @@ impl Executor for PodmanExecutor {
         account: &Account,
         repo: &str,
         number: u64,
-    ) -> Result<String, String> {
-        Ok(self
-            .forges
+    ) -> Result<HeadCommit, String> {
+        self.forges
             .forge(forge)
-            .pr_info(account, repo, number)
-            .await?
-            .head)
+            .head_commit(account, repo, number)
+            .await
     }
 
     async fn renovate_merged(

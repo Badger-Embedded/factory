@@ -133,6 +133,15 @@ pub struct PrInfo {
     pub files: Vec<String>,
 }
 
+/// The head commit of a pull request and when it was committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadCommit {
+    pub sha: String,
+    /// UTC, as `YYYY-MM-DD HH:MM:SS`, which compares with SQLite's
+    /// `CURRENT_TIMESTAMP` as text.
+    pub committed_at: String,
+}
+
 /// What an agent needs to judge a pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrDetails {
@@ -778,6 +787,58 @@ impl GitHub {
             body: view.body,
             head: view.head_ref_oid,
             files: view.files.into_iter().map(|file| file.path).collect(),
+        })
+    }
+
+    /// The head commit of a pull request and its commit time.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails or its output does not parse.
+    async fn head_commit(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<HeadCommit, String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Commit {
+            committed_date: String,
+        }
+        #[derive(Deserialize)]
+        struct View {
+            #[serde(rename = "headRefOid")]
+            head: String,
+            commits: Vec<Commit>,
+        }
+        let out = self
+            .run(
+                account,
+                &[
+                    "pr",
+                    "view",
+                    &number.to_string(),
+                    "--repo",
+                    repo,
+                    "--json",
+                    "headRefOid,commits",
+                ],
+                None,
+            )
+            .await?;
+        let view: View = serde_json::from_str(&out)
+            .map_err(|_| "gh pr view returned unexpected output".to_owned())?;
+        let committed = view
+            .commits
+            .last()
+            .ok_or_else(|| "the pull request has no commits".to_owned())?;
+        Ok(HeadCommit {
+            sha: view.head,
+            committed_at: committed
+                .committed_date
+                .trim_end_matches('Z')
+                .replace('T', " "),
         })
     }
 
@@ -1451,6 +1512,15 @@ impl Forge for GitHub {
         number: u64,
     ) -> BoxFuture<'a, Result<PrInfo, String>> {
         Box::pin(GitHub::pr_info(self, account, repo, number))
+    }
+
+    fn head_commit<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<HeadCommit, String>> {
+        Box::pin(GitHub::head_commit(self, account, repo, number))
     }
 
     fn pr_details<'a>(

@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use factory_core::{
-    Agent, AgentResult, Ask, BranchSummary, Event, Gates, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS,
-    PackagingContext, PrDescription, Question, RenovateCi, RenovateWait, ReviewState, Stage, Turn,
-    Wait,
+    Agent, AgentResult, Ask, BranchSummary, Event, FixOutcome, Gates, MAX_FAILED_ROUNDS,
+    MAX_REVIEW_ROUNDS, PackagingContext, PrDescription, Question, RenovateCi, RenovateWait,
+    ReviewState, Stage, Turn, Wait,
 };
 use factory_runner::{
-    Account, Expect, ForgeKind, LogLine, McpUnavailable, Observation, RenovatePr, Rerun, RunReport,
-    TokenUsage, is_renovate_login,
+    Account, Expect, ForgeKind, HeadCommit, LogLine, McpUnavailable, Observation, RenovatePr,
+    Rerun, RunReport, TokenUsage, is_renovate_login,
 };
 use factory_server::{
     Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink,
@@ -74,6 +74,7 @@ struct FakeExecutor {
     rebases: Mutex<VecDeque<Result<Rebase, String>>>,
     /// The head the fake reads from the pull request, `h1` when unset.
     current_head: Mutex<Option<String>>,
+    head_committed_at: Mutex<Option<String>>,
     /// Each rebase request as `(number, head)`.
     rebase_calls: Mutex<Vec<(u64, String)>>,
     /// The files the merged pull request changed.
@@ -125,6 +126,7 @@ impl FakeExecutor {
             approved: Mutex::new(Vec::new()),
             rebases: Mutex::new(VecDeque::new()),
             current_head: Mutex::new(None),
+            head_committed_at: Mutex::new(None),
             rebase_calls: Mutex::new(Vec::new()),
             pr_files: Mutex::new(Vec::new()),
             gathered: Mutex::new(Vec::new()),
@@ -427,13 +429,21 @@ impl Executor for FakeExecutor {
         _account: &Account,
         _repo: &str,
         _number: u64,
-    ) -> Result<String, String> {
-        Ok(self
-            .current_head
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| "h1".to_owned()))
+    ) -> Result<HeadCommit, String> {
+        Ok(HeadCommit {
+            sha: self
+                .current_head
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "h1".to_owned()),
+            committed_at: self
+                .head_committed_at
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "1970-01-01 00:00:00".to_owned()),
+        })
     }
 
     async fn request_rebase(
@@ -5737,6 +5747,23 @@ async fn the_rebase_names_the_head_read_when_the_fix_merged() {
 }
 
 #[tokio::test]
+async fn a_head_committed_after_the_merge_asks_for_no_rebase() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    store.apply(fix, Event::Merged).unwrap();
+    // Renovate pushed h2 after the merge, before the first watch saw the merge.
+    *executor.current_head.lock().unwrap() = Some("h2".into());
+    *executor.head_committed_at.lock().unwrap() = Some("9999-01-01 00:00:00".into());
+    *executor.renovate_now.lock().unwrap() = failing("h2");
+    step_until(&scheduler, || {
+        pr_of(&store, id).head.as_deref() == Some("h2")
+    })
+    .await;
+    assert!(executor.rebase_calls.lock().unwrap().is_empty());
+    assert!(event_names(&store, id).contains(&"rebase-skipped".to_owned()));
+    assert!(pr_of(&store, id).fix.is_none());
+}
+
+#[tokio::test]
 async fn a_head_seen_after_the_merge_is_a_new_head_and_adds_no_second_request() {
     let (store, executor, scheduler, id, fix) = fixing_setup().await;
     store.apply(fix, Event::Merged).unwrap();
@@ -5777,12 +5804,60 @@ async fn a_fix_pull_request_closed_unmerged_returns_the_job_to_stopped() {
 #[tokio::test]
 async fn a_restart_after_the_rebase_write_asks_the_user_and_writes_nothing_again() {
     let (store, executor, scheduler, id, fix) = fixing_setup().await;
-    // The earlier run claimed the request and died before it stored the result.
-    assert!(store.claim_rebase(id, fix).unwrap());
+    // The state a restart finds: the merge is stored as pending and the earlier
+    // run claimed the request and died before it stored the result.
     store.apply(fix, Event::Merged).unwrap();
+    store
+        .apply(
+            id,
+            Event::FixEnded {
+                job: fix,
+                outcome: FixOutcome::Merged { head: "h1".into() },
+            },
+        )
+        .unwrap();
+    assert!(store.claim_rebase(id, fix).unwrap());
     step_until(&scheduler, || {
         needs_you(&store, id) == Some(RenovateWait::RebaseFailed)
     })
     .await;
+    step(&scheduler).await;
     assert!(executor.rebase_calls.lock().unwrap().is_empty());
+    let failed = event_names(&store, id)
+        .iter()
+        .filter(|name| *name == "rebase-failed")
+        .count();
+    assert_eq!(failed, 1);
+}
+
+#[tokio::test]
+async fn a_claim_left_by_an_earlier_fix_does_not_block_a_later_one() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    // An earlier fix with this id left a claim that no stored result retired.
+    assert!(store.claim_rebase(id, fix).unwrap());
+    store.apply(fix, Event::Cancel).unwrap();
+    step_until(&scheduler, || {
+        needs_you(&store, id) == Some(RenovateWait::Stopped)
+    })
+    .await;
+    let again = store.start_fix(id, "alice", None).unwrap();
+    for event in [
+        Event::Start,
+        Event::Agent(AgentResult::Clarified),
+        Event::Agent(AgentResult::Spec("s".into())),
+        Event::Approve,
+        Event::Agent(AgentResult::Plan(vec![planned_pr("a")])),
+        Event::Approve,
+        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::ChecksPassed,
+        Event::Published { number: 31 },
+        Event::Merged,
+    ] {
+        store.apply(again, event).unwrap();
+    }
+    step_until(&scheduler, || {
+        !executor.rebase_calls.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
 }

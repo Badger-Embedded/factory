@@ -1476,8 +1476,20 @@ impl Store {
             event,
             Event::RenovateObserved { .. } | Event::FixEnded { .. }
         );
+        // A stored result or a new fix retires the claims, so one left behind
+        // never blocks the request of a later fix that reuses the id.
+        let retires_claims = matches!(
+            event,
+            Event::FixStarted { .. }
+                | Event::RebaseRequested
+                | Event::RebaseSkipped
+                | Event::RebaseFailed { .. }
+        );
         let before = observed.then(|| row.job.clone());
         row.job.apply(event).map_err(StoreError::Rejected)?;
+        if retires_claims {
+            tx.execute("DELETE FROM rebase_claims WHERE job_id = ?1", [row.id])?;
+        }
         if before.is_some_and(|before| before == row.job) {
             return Ok(());
         }

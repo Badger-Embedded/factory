@@ -11,8 +11,8 @@ use factory_core::{
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Account, Expect, ForgeKind, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport,
-    job_prompt,
+    Account, Expect, ForgeKind, HeadCommit, LogLine, McpConfig, Observation, RenovatePr, Rerun,
+    RunReport, job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -451,14 +451,14 @@ pub trait Executor: Send + Sync + 'static {
         head: &str,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
-    /// Reads the head commit of the pull request.
+    /// Reads the head commit of the pull request and when it was committed.
     fn renovate_head(
         &self,
         forge: ForgeKind,
         account: &Account,
         repo: &str,
         number: u64,
-    ) -> impl Future<Output = Result<String, String>> + Send;
+    ) -> impl Future<Output = Result<HeadCommit, String>> + Send;
 
     /// Asks Renovate to rebase the pull request, unless its head is no longer
     /// `head`. The check and the description the write builds on come from
@@ -1747,19 +1747,7 @@ impl<E: Executor> Scheduler<E> {
             }
         };
         if matches!(outcome, FixOutcome::Merged { .. }) {
-            // The head now, not the last one polled: a newer head the watch
-            // has not seen yet still needs the rebase, and one that arrives
-            // after this read is handled as a new head.
-            match self
-                .executor
-                .renovate_head(
-                    request.forge,
-                    &request.account,
-                    &request.repo,
-                    request.number,
-                )
-                .await
-            {
+            match self.merge_head(request, fix_id).await {
                 Ok(head) => outcome = FixOutcome::Merged { head },
                 Err(err) => {
                     tracing::warn!("reading the head of #{}: {err}", request.number);
@@ -1776,6 +1764,38 @@ impl<E: Executor> Scheduler<E> {
         );
     }
 
+    /// The head Renovate's pull request had when fix job `fix_id` merged. A
+    /// head committed after the merge is not that head, so it gets the empty
+    /// head, which no pull request has and which asks for no rebase. Neither
+    /// the last polled head nor the time of this read says which side of the
+    /// merge a new head came on.
+    async fn merge_head(
+        &self,
+        request: &RenovateWatchRequest,
+        fix_id: i64,
+    ) -> Result<String, String> {
+        let head = self
+            .executor
+            .renovate_head(
+                request.forge,
+                &request.account,
+                &request.repo,
+                request.number,
+            )
+            .await?;
+        let merged_at = self
+            .store
+            .events(fix_id)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .find(|event| event.stage == Stage::Merged.name())
+            .map(|event| event.at);
+        Ok(match merged_at {
+            Some(merged_at) if head.committed_at > merged_at => String::new(),
+            _ => head.sha,
+        })
+    }
+
     async fn request_rebase(
         &self,
         job_id: i64,
@@ -1784,29 +1804,45 @@ impl<E: Executor> Scheduler<E> {
         number: u64,
         head: &str,
     ) {
-        let fix = self.store.get(job_id).ok().and_then(|row| {
-            let link = row.job.renovate_pr()?.fix.as_ref()?;
-            Some(link.job)
-        });
-        // The claim comes before the write. A claim left by a run that died
-        // before it stored the result means the write may have happened, so
-        // the factory asks the user instead of writing again.
-        if let Some(fix) = fix {
-            match self.store.claim_rebase(job_id, fix) {
-                Ok(true) => {}
-                Ok(false) => {
-                    let reason = "the factory restarted while asking Renovate to rebase".to_owned();
-                    self.note(
-                        job_id,
-                        &format!("Could not ask Renovate to rebase: {reason}"),
-                    );
-                    self.apply(job_id, Event::RebaseFailed { reason });
-                    return;
-                }
-                Err(err) => {
-                    tracing::error!("claiming the rebase of job #{job_id}: {err}");
-                    return;
-                }
+        if head.is_empty() {
+            self.apply(job_id, Event::RebaseSkipped);
+            return;
+        }
+        // The claim comes before the write, and the write needs a pending fix
+        // and a stored claim. A claim left by a run that died before it stored
+        // the result means the write may have happened, so the factory asks
+        // the user instead of writing again.
+        let fix = match self.store.get(job_id) {
+            Ok(row) => row.job.renovate_pr().and_then(|pr| match &pr.fix {
+                Some(FixLink {
+                    job,
+                    state: FixState::Merged { .. },
+                    ..
+                }) => Some(*job),
+                _ => None,
+            }),
+            Err(err) => {
+                tracing::error!("reading job #{job_id}: {err}");
+                return;
+            }
+        };
+        let Some(fix) = fix else {
+            return;
+        };
+        match self.store.claim_rebase(job_id, fix) {
+            Ok(true) => {}
+            Ok(false) => {
+                let reason = "the factory restarted while asking Renovate to rebase".to_owned();
+                self.note(
+                    job_id,
+                    &format!("Could not ask Renovate to rebase: {reason}"),
+                );
+                self.apply(job_id, Event::RebaseFailed { reason });
+                return;
+            }
+            Err(err) => {
+                tracing::error!("claiming the rebase of job #{job_id}: {err}");
+                return;
             }
         }
         let event = match self

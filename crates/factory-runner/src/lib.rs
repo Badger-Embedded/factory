@@ -27,8 +27,8 @@ pub use files::{PlacedFile, place_files, show_files};
 pub use forge::{Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError};
 pub use git::{Git, Remote};
 pub use github::{
-    Ci, Comment, FailedCheck, GitHub, Observation, PrDetails, PrInfo, PrState, PrStatus,
-    RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login, observe,
+    Ci, Comment, FailedCheck, GitHub, HeadCommit, Observation, PrDetails, PrInfo, PrState,
+    PrStatus, RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login, observe,
     parse_renovate_prs, parse_status, tick_rebase_checkbox,
 };
 pub use images::{place_images, show_images};

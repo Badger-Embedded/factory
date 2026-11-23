@@ -11,7 +11,9 @@ use std::pin::Pin;
 
 use factory_core::PrDescription;
 
-use crate::github::{FailedCheck, PrDetails, PrInfo, PrStatus, RebaseCheckbox, RenovatePr, Rerun};
+use crate::github::{
+    FailedCheck, HeadCommit, PrDetails, PrInfo, PrStatus, RebaseCheckbox, RenovatePr, Rerun,
+};
 
 /// A boxed future, so the trait stays object safe without a macro crate.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -216,6 +218,14 @@ pub trait Forge: Send + Sync {
         repo: &'a str,
         number: u64,
     ) -> BoxFuture<'a, Result<PrInfo, String>>;
+
+    /// The head commit of a pull request and when it was committed.
+    fn head_commit<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<HeadCommit, String>>;
 
     /// As [`Forge::pr_info`], plus the diff.
     fn pr_details<'a>(
