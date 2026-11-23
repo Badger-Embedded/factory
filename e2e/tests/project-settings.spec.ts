@@ -295,6 +295,43 @@ test('turning Renovate on checks the project account', async ({ page, project })
   await expect(page.getByText('Read access')).toHaveCount(0);
 });
 
+test('a Salsa project asks for its Renovate account and a GitHub project does not', async ({
+  page,
+  project,
+}, testInfo) => {
+  await page.goto(settingsPath(project));
+  const github = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
+  await expect(github.getByLabel('Renovate pull requests')).toBeVisible();
+  await expect(github.getByLabel('Renovate account')).toHaveCount(0);
+
+  const login = `renovate-owner-${testInfo.workerIndex}-${Date.now()}`;
+  const name = `salsa-renovate-${testInfo.workerIndex}-${Date.now()}`;
+  await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+  await page.goto('/settings/forges/salsa');
+  await page.getByLabel('Token').fill('tok-e2e-deb');
+  await page.getByRole('button', { name: 'Save token' }).click();
+  await expect(page.getByText('Saved. The token belongs to deb-bot.')).toBeVisible();
+  await page.goto('/onboard');
+  await page.getByLabel('Salsa').check();
+  await page.getByLabel('Repository').fill('e2e/sub/good');
+  await page.getByLabel('Name', { exact: true }).fill(name);
+  await page.getByRole('button', { name: 'Run checks' }).click();
+  await page.getByRole('button', { name: 'Skip extras and create' }).click();
+
+  await page.goto(settingsPath(name));
+  await saveProjectToken(page, 'tok-e2e-deb');
+  const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
+  await card.getByLabel('Renovate pull requests').check();
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await expect(page.getByText('Give the Renovate account')).toBeVisible();
+
+  await card.getByLabel('Renovate account').fill('renovate-bot');
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await page.goto(settingsPath(name));
+  await expect(card.getByLabel('Renovate account')).toHaveValue('renovate-bot');
+});
+
 test('the Forge account card saves a project token by its access and keeps the switch per login', async ({
   page,
   project,

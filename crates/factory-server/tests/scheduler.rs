@@ -64,6 +64,7 @@ struct FakeExecutor {
     /// Open pull requests as `(author, base, pull request)`.
     renovate_open: Mutex<Vec<(String, String, RenovatePr)>>,
     renovate_listed: Mutex<Vec<(String, String)>>,
+    renovate_authors: Mutex<Vec<Option<String>>>,
     /// What the next look at a Renovate pull request finds.
     renovate_now: Mutex<RenovateNow>,
     renovate_watched: Mutex<Vec<RenovateWatchRequest>>,
@@ -130,6 +131,7 @@ impl FakeExecutor {
             rerun_requests: Mutex::new(Vec::new()),
             renovate_open: Mutex::new(Vec::new()),
             renovate_listed: Mutex::new(Vec::new()),
+            renovate_authors: Mutex::new(Vec::new()),
             renovate_now: Mutex::new(RenovateNow::Nothing),
             renovate_watched: Mutex::new(Vec::new()),
             comments: Mutex::new(Vec::new()),
@@ -296,7 +298,12 @@ impl Executor for FakeExecutor {
         _account: &AccountSource,
         repo: &str,
         base: &str,
+        author: Option<&str>,
     ) -> Result<Vec<RenovatePr>, String> {
+        self.renovate_authors
+            .lock()
+            .unwrap()
+            .push(author.map(str::to_owned));
         self.renovate_listed
             .lock()
             .unwrap()
@@ -306,7 +313,9 @@ impl Executor for FakeExecutor {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(author, pr_base, _)| is_renovate_login(author) && pr_base == base)
+            .filter(|(login, pr_base, _)| {
+                pr_base == base && author.map_or_else(|| is_renovate_login(login), |a| a == login)
+            })
             .map(|(_, _, pr)| pr.clone())
             .collect())
     }
@@ -4886,6 +4895,7 @@ fn enable_renovate(store: &Store) {
             "maestro",
             &factory_server::Maintenance {
                 renovate: true,
+                renovate_author: None,
                 packaging: None,
             },
         )
@@ -5059,6 +5069,105 @@ async fn discovery_makes_one_job_per_renovate_pull_request() {
     step(&scheduler).await;
     assert_eq!(executor.renovate_listed.lock().unwrap().len(), 2);
     assert_eq!(reopened.list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn salsa_discovery_lists_by_the_renovate_account_and_github_by_none() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(|_| questions());
+    let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    secrets
+        .put_forge_token(
+            ForgeTokenOwner::Project {
+                project: "pkg",
+                forge: ForgeKind::Salsa,
+            },
+            "project-token",
+            &ForgeAccount {
+                login: "factory-bot".into(),
+                id: 1,
+            },
+        )
+        .unwrap();
+    store
+        .save_project_maintenance(
+            "pkg",
+            &factory_server::Maintenance {
+                renovate: true,
+                renovate_author: Some("renovate-bot".into()),
+                packaging: None,
+            },
+        )
+        .unwrap();
+    enable_renovate(&store);
+    {
+        let mut open = executor.renovate_open.lock().unwrap();
+        open.push(("renovate-bot".into(), "main".into(), renovate_pr(7)));
+        open.push(("renovate[bot]".into(), "main".into(), renovate_pr(8)));
+    }
+    let project = |forge, repo: &str| Project {
+        forge: ProjectForge::Known(forge),
+        repo: repo.into(),
+        base: "main".into(),
+        checks: None,
+        models: StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    };
+    let projects: Projects = [
+        ("pkg".to_owned(), project(ForgeKind::Salsa, "team/sub/pkg")),
+        (
+            "maestro".to_owned(),
+            project(ForgeKind::GitHub, "Badger-Embedded/maestro"),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let forges = Forges::new(Arc::new(GitHub::default()), Arc::new(GhRepos::default()));
+    let accounts = Accounts::new(
+        Arc::clone(&store),
+        Arc::clone(&secrets) as Arc<dyn SecretStore>,
+        forges,
+    );
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        accounts,
+    );
+    secrets
+        .put_forge_token(
+            ForgeTokenOwner::Project {
+                project: "maestro",
+                forge: ForgeKind::GitHub,
+            },
+            "project-token",
+            &ForgeAccount {
+                login: "factory-bot".into(),
+                id: 1,
+            },
+        )
+        .unwrap();
+
+    step(&scheduler).await;
+
+    let mut authors = executor.renovate_authors.lock().unwrap().clone();
+    authors.sort();
+    assert_eq!(authors, vec![None, Some("renovate-bot".to_owned())]);
+    let mut numbers: Vec<_> = store
+        .list()
+        .unwrap()
+        .iter()
+        .map(|row| (row.project.clone(), row.job.renovate_pr().unwrap().number))
+        .collect();
+    numbers.sort();
+    assert_eq!(
+        numbers,
+        vec![("maestro".to_owned(), 8), ("pkg".to_owned(), 7)]
+    );
 }
 
 #[tokio::test]
@@ -5486,6 +5595,7 @@ fn packaging_project(store: &Store) {
             "maestro",
             &factory_server::Maintenance {
                 renovate: true,
+                renovate_author: None,
                 packaging: Some(factory_server::Packaging {
                     kind: factory_server::PackagingType::Snap,
                     manifest_files: vec!["snap/snapcraft.yaml".into()],

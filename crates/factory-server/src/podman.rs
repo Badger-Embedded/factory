@@ -544,13 +544,14 @@ impl Executor for PodmanExecutor {
         account: &AccountSource,
         repo: &str,
         base: &str,
+        author: Option<&str>,
     ) -> Result<Vec<RenovatePr>, String> {
         let operation = account.resolve()?;
         blame(
             &operation.owner,
             self.forges
                 .forge(forge)
-                .renovate_prs(&operation.account, repo, base, None)
+                .renovate_prs(&operation.account, repo, base, author)
                 .await,
         )
     }
