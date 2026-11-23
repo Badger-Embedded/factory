@@ -764,6 +764,28 @@ impl Store {
         checks: Option<&str>,
         by: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.create_project_as(name, forge, repo, base, checks, by, false)
+    }
+
+    /// As [`Store::create_project`], with `use_my_account` as the first
+    /// collaborator's "Use my account" switch. Onboarding turns it on, because
+    /// its checks just showed that login's account can push. It has no effect
+    /// when `by` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::create_project`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_project_as(
+        &self,
+        name: &str,
+        forge: ForgeKind,
+        repo: &str,
+        base: &str,
+        checks: Option<&str>,
+        by: Option<&str>,
+        use_my_account: bool,
+    ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let name_taken = tx
@@ -792,9 +814,9 @@ impl Store {
         Self::insert_project_gates(&tx, name, gates)?;
         if let Some(by) = by {
             tx.execute(
-                "INSERT INTO project_collaborators (project, login, added_by)
-                 VALUES (?1, ?2, ?2)",
-                params![name, by],
+                "INSERT INTO project_collaborators (project, login, added_by, use_my_account)
+                 VALUES (?1, ?2, ?2, ?3)",
+                params![name, by, use_my_account],
             )?;
             tx.execute(
                 "INSERT OR IGNORE INTO gh_token_copies (project) VALUES (?1)",
@@ -2039,27 +2061,35 @@ impl Store {
         &self,
         owner: ForgeTokenOwner<'_>,
     ) -> Result<Option<ForgeAccount>, StoreError> {
-        let conn = self.conn();
-        let found = match owner {
-            ForgeTokenOwner::User { login, forge } => conn.query_row(
-                "SELECT account_login, account_id FROM user_forge_accounts
-                 WHERE login = ?1 AND forge = ?2",
-                params![login, forge.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            ),
-            ForgeTokenOwner::Project { project, .. }
-            | ForgeTokenOwner::Upstream { project, .. } => conn.query_row(
-                "SELECT account_login, account_id FROM project_forge_accounts
-                     WHERE project = ?1 AND kind = ?2",
-                params![project, project_token_kind(owner)],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            ),
-        }
-        .optional()?;
-        Ok(found.map(|(login, id)| ForgeAccount {
-            login,
-            id: id.cast_unsigned(),
-        }))
+        read_forge_account(&self.conn(), owner)
+    }
+
+    /// The sealed forge token at `at` and the account recorded for `owner`,
+    /// read in one transaction, so a concurrent save cannot pair a token with
+    /// another token's account. `None` when either is missing.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn forge_token_snapshot(
+        &self,
+        at: SecretRef<'_>,
+        owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<(String, Vec<u8>, ForgeAccount)>, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let sealed = tx
+            .query_row(
+                "SELECT backend, value FROM secrets
+                 WHERE project = ?1 AND server = ?2 AND header = ?3",
+                params![at.project, at.server, at.header],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let account = read_forge_account(&tx, owner)?;
+        Ok(sealed
+            .zip(account)
+            .map(|((backend, value), account)| (backend, value, account)))
     }
 
     /// Records the account the forge token of `owner` belongs to, replacing
@@ -3855,4 +3885,31 @@ fn erase_forge_account(conn: &Connection, owner: ForgeTokenOwner<'_>) -> Result<
         }
     };
     Ok(())
+}
+
+fn read_forge_account(
+    conn: &Connection,
+    owner: ForgeTokenOwner<'_>,
+) -> Result<Option<ForgeAccount>, StoreError> {
+    let found = match owner {
+        ForgeTokenOwner::User { login, forge } => conn.query_row(
+            "SELECT account_login, account_id FROM user_forge_accounts
+             WHERE login = ?1 AND forge = ?2",
+            params![login, forge.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ),
+        ForgeTokenOwner::Project { project, .. } | ForgeTokenOwner::Upstream { project, .. } => {
+            conn.query_row(
+                "SELECT account_login, account_id FROM project_forge_accounts
+                 WHERE project = ?1 AND kind = ?2",
+                params![project, project_token_kind(owner)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+        }
+    }
+    .optional()?;
+    Ok(found.map(|(login, id)| ForgeAccount {
+        login,
+        id: id.cast_unsigned(),
+    }))
 }

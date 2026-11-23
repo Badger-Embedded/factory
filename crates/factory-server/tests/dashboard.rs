@@ -13,7 +13,7 @@ use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
-use factory_runner::{ForgeAccount, ForgeKind, GitHub};
+use factory_runner::{Account, ForgeAccount, ForgeKind, GitHub};
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin,
     FACTORY_REQUESTER, ForgeTokenOwner, Forges, GitHubRepos, LocalSecrets, LoginProcess,
@@ -53,6 +53,8 @@ struct FakeRepos {
     repo: Option<RepoInfo>,
     branch: Option<BranchInfo>,
     ci: bool,
+    /// The token each forge call received, in order.
+    seen: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl FakeRepos {
@@ -68,24 +70,35 @@ impl FakeRepos {
                 protection: Protection::Protected,
             }),
             ci: true,
+            seen: Arc::default(),
         }
     }
 }
 
 impl GitHubRepos for FakeRepos {
-    fn repo(&self, _repo: &str) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send {
+    fn repo(
+        &self,
+        account: &Account,
+        _repo: &str,
+    ) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send {
+        self.seen.lock().unwrap().push(account.token.clone());
         std::future::ready(Ok(self.repo.clone()))
     }
 
     fn branch(
         &self,
+        _account: &Account,
         _repo: &str,
         _branch: &str,
     ) -> impl Future<Output = Result<Option<BranchInfo>, String>> + Send {
         std::future::ready(Ok(self.branch.clone()))
     }
 
-    fn has_ci(&self, _repo: &str) -> impl Future<Output = Result<bool, String>> + Send {
+    fn has_ci(
+        &self,
+        _account: &Account,
+        _repo: &str,
+    ) -> impl Future<Output = Result<bool, String>> + Send {
         std::future::ready(Ok(self.ci))
     }
 }
@@ -7972,8 +7985,28 @@ async fn a_plan_usage_poll_with_the_current_version_is_a_204() {
 /// A dashboard with no projects yet, its onboarding checks answered by `github`.
 fn empty_dashboard(github: Arc<dyn RepoChecker>) -> (Arc<Store>, Dashboard) {
     let store = Arc::new(Store::open_in_memory().unwrap());
+    seed_user_token(&store, USER);
     let dashboard = dashboard_with_github(Arc::clone(&store), github);
     (store, dashboard)
+}
+
+/// Stores a GitHub token for `login`, sealed with the key the test
+/// dashboards use, so the onboarding checks have an account to run as.
+fn seed_user_token(store: &Arc<Store>, login: &str) {
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(store));
+    secrets
+        .put_forge_token(
+            ForgeTokenOwner::User {
+                login,
+                forge: ForgeKind::GitHub,
+            },
+            &format!("token-of-{login}"),
+            &ForgeAccount {
+                login: format!("account-of-{login}"),
+                id: 9,
+            },
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -8046,6 +8079,85 @@ async fn onboarding_makes_the_requester_the_only_collaborator() {
 }
 
 #[tokio::test]
+async fn the_checks_run_as_the_onboarders_own_account() {
+    let github = Arc::new(FakeRepos::fit());
+    let seen = Arc::clone(&github.seen);
+    let (store, dashboard) = empty_dashboard(github);
+    seed_user_token(&store, "bob@example.com");
+
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fwidgets&action=check",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some("token-of-bob@example.com".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn onboarding_with_the_secret_store_unavailable_stays_in_the_wizard() {
+    let github = Arc::new(FakeRepos::fit());
+    let seen = Arc::clone(&github.seen);
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let dashboard = dashboard_with_secrets(
+        Arc::clone(&store),
+        github,
+        Arc::new(UnavailableSecrets::new(Arc::clone(&store))),
+    );
+
+    let reply = dashboard
+        .post("/onboard", "repo=acme%2Fwidgets&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("secret store is unavailable"));
+    assert!(reply.body.contains("href=\"/settings/forges/github\""));
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(store.project("widgets").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn onboarding_without_a_token_is_blocked_and_calls_no_forge() {
+    let github = Arc::new(FakeRepos::fit());
+    let seen = Arc::clone(&github.seen);
+    let (store, dashboard) = empty_dashboard(github);
+
+    let reply = dashboard
+        .post_as(
+            "bob@example.com",
+            "/onboard",
+            "repo=acme%2Fwidgets&action=skip",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.contains("href=\"/settings/forges/github\""));
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(store.project("widgets").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_onboarded_project_turns_the_switch_on_and_has_no_project_token() {
+    let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
+    let reply = dashboard
+        .post("/onboard", "repo=acme%2Fwidgets&action=skip")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+
+    assert!(store.use_my_account("widgets", USER).unwrap());
+    let project = ForgeTokenOwner::Project {
+        project: "widgets",
+        forge: ForgeKind::GitHub,
+    };
+    assert!(store.forge_account(project).unwrap().is_none());
+    let board = dashboard.get("/?project=widgets").await;
+    assert!(board.body.contains("missing-project-token"));
+}
+
+#[tokio::test]
 async fn step_two_values_are_stored_and_shown_on_the_settings_page() {
     let (store, dashboard) = empty_dashboard(Arc::new(FakeRepos::fit()));
     let reply = dashboard
@@ -8102,6 +8214,7 @@ async fn warnings_do_not_block_creation() {
             protection: Protection::Unprotected,
         }),
         ci: false,
+        seen: Arc::default(),
     });
     let (store, dashboard) = empty_dashboard(github);
 
@@ -8126,6 +8239,7 @@ async fn warnings_do_not_block_creation() {
 /// `needle` and no row was written.
 async fn rejected(github: Arc<dyn RepoChecker>, store: Arc<Store>, form: &str, needle: &str) {
     let before = store.list_projects().unwrap().len();
+    seed_user_token(&store, USER);
     let dashboard = dashboard_with_github(Arc::clone(&store), github);
     let reply = dashboard.post("/onboard", form).await;
     assert_eq!(reply.status, StatusCode::OK, "{needle}: expected a redraw");
@@ -8276,18 +8390,24 @@ async fn a_github_call_that_cannot_run_blocks_with_a_message() {
     impl GitHubRepos for Broken {
         fn repo(
             &self,
+            _account: &Account,
             _repo: &str,
         ) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send {
             std::future::ready(Err("gh api repos/acme/widgets failed: HTTP 500".into()))
         }
         fn branch(
             &self,
+            _account: &Account,
             _repo: &str,
             _branch: &str,
         ) -> impl Future<Output = Result<Option<BranchInfo>, String>> + Send {
             std::future::ready(Err("unreachable".into()))
         }
-        fn has_ci(&self, _repo: &str) -> impl Future<Output = Result<bool, String>> + Send {
+        fn has_ci(
+            &self,
+            _account: &Account,
+            _repo: &str,
+        ) -> impl Future<Output = Result<bool, String>> + Send {
             std::future::ready(Err("unreachable".into()))
         }
     }
@@ -10286,6 +10406,7 @@ async fn the_removal_notice_shows_on_the_page_settings_lands_on() {
 #[tokio::test]
 async fn onboarding_a_removed_name_again_starts_with_an_empty_board() {
     let (dashboard, _dir, _path) = file_dashboard();
+    seed_user_token(&dashboard.store, "bob@example.com");
     let id = dashboard.new_job().await;
     let job_dir = dashboard.data.path().join("jobs").join(id.to_string());
     fs::create_dir_all(&job_dir).unwrap();
@@ -10322,6 +10443,7 @@ async fn onboarding_a_removed_name_again_starts_with_an_empty_board() {
 #[tokio::test]
 async fn onboarding_is_refused_while_a_leftover_job_has_a_task() {
     let (dashboard, _dir, _path) = file_dashboard();
+    seed_user_token(&dashboard.store, "bob@example.com");
     let id = dashboard.new_job().await;
     dashboard
         .post("/settings/projects/maestro/remove", "confirm=maestro")
@@ -10362,6 +10484,7 @@ struct GatedChecker {
 impl RepoChecker for GatedChecker {
     fn check<'a>(
         &'a self,
+        _account: &'a Account,
         _repo: &'a str,
         _base: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
@@ -10397,6 +10520,9 @@ async fn concurrent_onboarding_of_one_name_cannot_delete_the_new_projects_jobs()
         calls: std::sync::atomic::AtomicUsize::new(0),
         gate: tokio::sync::Semaphore::new(0),
     });
+    for login in ["bob@example.com", "carol@example.com"] {
+        seed_user_token(&store, login);
+    }
     let dashboard = Arc::new(dashboard_with_github(
         Arc::clone(&store),
         Arc::clone(&checker) as Arc<dyn RepoChecker>,

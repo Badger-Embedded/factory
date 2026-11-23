@@ -11,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage};
-use factory_runner::{Access, Expect, ForgeKind};
+use factory_runner::{Access, Account, Expect, ForgeKind};
 use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -3327,6 +3327,7 @@ async fn show_onboard(headers: HeaderMap, Query(query): Query<NoticeQuery>) -> M
         models: &StageModels::default(),
         auto_merge: false,
         llm_review: false,
+        token_page: None,
     };
     pages::onboard(&user(&headers), &view, None, query.notice.as_deref())
 }
@@ -3362,7 +3363,8 @@ async fn submit_onboard(
     let llm_review = form.llm_review.is_some();
 
     let _one_onboarding_at_a_time = state.onboarding.lock().await;
-    let mut report = onboard_report(&state, effective_name, repo, base).await?;
+    let (mut report, token_page) =
+        onboard_report(&state, &headers, effective_name, repo, base).await?;
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         let _pass = state.slots.lock_pass().await;
@@ -3381,13 +3383,14 @@ async fn submit_onboard(
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         let checks = (!checks.is_empty()).then_some(checks);
-        match state.store.create_project(
+        match state.store.create_project_as(
             effective_name,
             ForgeKind::GitHub,
             repo,
             base,
             checks,
             Some(&user(&headers)),
+            true,
         ) {
             Ok(()) => {
                 if form.action == "create" {
@@ -3426,6 +3429,7 @@ async fn submit_onboard(
         models: &models,
         auto_merge,
         llm_review,
+        token_page: token_page.as_deref(),
     };
     Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response())
 }
@@ -3449,22 +3453,68 @@ fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
+enum Onboarder {
+    Account(Account),
+    Blocked(String),
+}
+
+fn onboarder_account(
+    state: &AppState,
+    headers: &HeaderMap,
+    forge: ForgeKind,
+) -> Result<Onboarder, AppError> {
+    let login = user(headers);
+    let owner = ForgeTokenOwner::User {
+        login: &login,
+        forge,
+    };
+    let name = forge.display_name();
+    match state.secrets.forge_token_with_account(owner) {
+        Ok(Some((token, found))) => Ok(Onboarder::Account(
+            state.forges.forge(forge).account(token, &found),
+        )),
+        Ok(None) => Ok(Onboarder::Blocked(format!(
+            "You have no {name} token stored, and the repository checks run as your account."
+        ))),
+        Err(SecretError::Unavailable) => Ok(Onboarder::Blocked(format!(
+            "The secret store is unavailable, so your {name} token cannot be read and the repository checks cannot run as your account."
+        ))),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// The repository checks plus the name and repo uniqueness rules. A GitHub call
 /// that could not run becomes a blocking error, so the operator sees it and can
 /// retry rather than the page returning a 500.
 async fn onboard_report(
     state: &AppState,
+    headers: &HeaderMap,
     name: &str,
     repo: &str,
     base: &str,
-) -> Result<RepoReport, AppError> {
+) -> Result<(RepoReport, Option<String>), AppError> {
     let forge = ForgeKind::GitHub;
-    let mut report = match state.forges.checker(forge).check(repo, base).await {
-        Ok(report) => report,
-        Err(err) => RepoReport {
-            errors: vec![format!("The repository checks could not run: {err}")],
-            warnings: Vec::new(),
+    let mut token_page = None;
+    let mut report = match onboarder_account(state, headers, forge)? {
+        Onboarder::Account(account) => match state
+            .forges
+            .checker(forge)
+            .check(&account, repo, base)
+            .await
+        {
+            Ok(report) => report,
+            Err(err) => RepoReport {
+                errors: vec![format!("The repository checks could not run: {err}")],
+                warnings: Vec::new(),
+            },
         },
+        Onboarder::Blocked(message) => {
+            token_page = Some(format!("/settings/forges/{}", forge.as_str()));
+            RepoReport {
+                errors: vec![message],
+                warnings: Vec::new(),
+            }
+        }
     };
     if !valid_name(name) {
         report.errors.insert(
@@ -3489,7 +3539,7 @@ async fn onboard_report(
             forge.display_name()
         ));
     }
-    Ok(report)
+    Ok((report, token_page))
 }
 
 async fn cancel(

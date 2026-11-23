@@ -1,13 +1,13 @@
 //! Repository checks the onboarding wizard runs before it creates a project.
 //!
-//! The checks ask GitHub, as the bot, whether a repository is fit for the
-//! factory: that it exists and is visible, that its base branch exists, that
-//! the bot can push, and that squash merges are allowed. They also report
+//! The checks ask GitHub, as the account they are given, whether a repository
+//! is fit for the factory: that it exists and is visible, that its base branch exists, that
+//! the account can push, and that squash merges are allowed. They also report
 //! warnings that do not block onboarding. See `docs/design.md`, "GitHub
-//! identity", for why the bot holds Write and not Admin.
+//! identity", for why the account holds Write and not Admin.
 //!
-//! The GitHub calls sit behind [`GitHubRepos`]. [`GhRepos`] runs `gh api` with
-//! the factory's token; tests pass a fake, so they need no network. The
+//! The GitHub calls sit behind [`GitHubRepos`]. [`GhRepos`] runs `gh api` as the
+//! account's token; tests pass a fake, so they need no network. The
 //! onboarding wizard holds a [`RepoChecker`], so it runs [`check_repo`] without
 //! naming the concrete GitHub type.
 
@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 
+use factory_runner::Account;
 use serde::Deserialize;
 use tokio::process::Command;
 
@@ -24,23 +25,32 @@ use tokio::process::Command;
 /// GitHub being unreachable, and is distinct from a repository that fails a
 /// check.
 pub trait GitHubRepos {
-    /// The repository `owner/name` as the bot sees it, or `None` when GitHub
-    /// returns 404 because the repository is missing or not visible to the bot.
-    fn repo(&self, repo: &str) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send;
+    /// The repository `owner/name` as the account sees it, or `None` when GitHub
+    /// returns 404 because the repository is missing or not visible to the account.
+    fn repo(
+        &self,
+        account: &Account,
+        repo: &str,
+    ) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send;
 
-    /// The base branch as the bot sees it, or `None` when it does not exist.
+    /// The base branch as the account sees it, or `None` when it does not exist.
     fn branch(
         &self,
+        account: &Account,
         repo: &str,
         branch: &str,
     ) -> impl Future<Output = Result<Option<BranchInfo>, String>> + Send;
 
     /// Whether the repository has any GitHub Actions workflow, the factory's
     /// proxy for "CI is set up".
-    fn has_ci(&self, repo: &str) -> impl Future<Output = Result<bool, String>> + Send;
+    fn has_ci(
+        &self,
+        account: &Account,
+        repo: &str,
+    ) -> impl Future<Output = Result<bool, String>> + Send;
 }
 
-/// The bot's access to a repository, from the `permissions` of
+/// The account's access to a repository, from the `permissions` of
 /// `gh api repos/{owner}/{name}`. The levels nest: Admin can push, Write can
 /// push, the others cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,19 +59,19 @@ pub enum Permission {
     Read,
     /// Push (Write) access, the level the design asks for.
     Write,
-    /// Admin access. A ruleset's Admin bypass would exempt the bot from it.
+    /// Admin access. A ruleset's Admin bypass would exempt the account from it.
     Admin,
 }
 
 impl Permission {
-    /// Whether the bot can push to the repository.
+    /// Whether the account can push to the repository.
     #[must_use]
     pub fn can_push(self) -> bool {
         matches!(self, Permission::Write | Permission::Admin)
     }
 }
 
-/// What the bot can do with a repository and how it merges, from
+/// What the account can do with a repository and how it merges, from
 /// `gh api repos/{owner}/{name}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoInfo {
@@ -103,8 +113,8 @@ pub struct RepoReport {
 ///
 /// The errors each block the project: a malformed `owner/name`, a repository
 /// that is missing or not visible to the bot, a base branch that does not
-/// exist, no push access for the bot, and squash merges turned off. The
-/// warnings do not: the bot holds Admin, the base branch has no protection or
+/// exist, no push access for the account, and squash merges turned off. The
+/// warnings do not: the account holds Admin, the base branch has no protection or
 /// ruleset, the repository has no CI, and merged branches are not deleted.
 ///
 /// A malformed repository short-circuits, because its name cannot be sent to
@@ -118,6 +128,7 @@ pub struct RepoReport {
 /// check".
 pub async fn check_repo(
     gh: &impl GitHubRepos,
+    account: &Account,
     repo: &str,
     base: &str,
 ) -> Result<RepoReport, String> {
@@ -128,23 +139,24 @@ pub async fn check_repo(
         ));
         return Ok(report);
     }
-    let Some(info) = gh.repo(repo).await? else {
+    let Some(info) = gh.repo(account, repo).await? else {
         report.errors.push(format!(
-            "The repository {repo} does not exist or is not visible to the bot."
+            "The repository {repo} does not exist or is not visible to {}.",
+            account.login
         ));
         return Ok(report);
     };
     if !info.permission.can_push() {
         report
             .errors
-            .push(format!("The bot has no push access to {repo}."));
+            .push(format!("{} has no push access to {repo}.", account.login));
     }
     if !info.allow_squash_merge {
         report.errors.push(format!(
             "{repo} does not allow squash merges, which the factory relies on."
         ));
     }
-    let base_branch = gh.branch(repo, base).await?;
+    let base_branch = gh.branch(account, repo, base).await?;
     if base_branch.is_none() {
         report.errors.push(format!(
             "The base branch \"{base}\" does not exist in {repo}."
@@ -153,7 +165,7 @@ pub async fn check_repo(
 
     if info.permission == Permission::Admin {
         report.warnings.push(format!(
-            "The bot has Admin access to {repo}. The design asks for Write, so a ruleset's Admin bypass does not apply to it."
+            "{} has Admin access to {repo}. The design asks for Write, so a ruleset's Admin bypass does not apply to it.", account.login
         ));
     }
     match base_branch.map(|branch| branch.protection) {
@@ -165,7 +177,7 @@ pub async fn check_repo(
         )),
         Some(Protection::Protected) | None => {}
     }
-    if !gh.has_ci(repo).await? {
+    if !gh.has_ci(account, repo).await? {
         report.warnings.push(format!("{repo} has no CI workflow."));
     }
     if !info.delete_branch_on_merge {
@@ -185,6 +197,7 @@ pub trait RepoChecker: Send + Sync {
     /// As [`check_repo`].
     fn check<'a>(
         &'a self,
+        account: &'a Account,
         repo: &'a str,
         base: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>>;
@@ -193,10 +206,11 @@ pub trait RepoChecker: Send + Sync {
 impl<T: GitHubRepos + Send + Sync> RepoChecker for T {
     fn check<'a>(
         &'a self,
+        account: &'a Account,
         repo: &'a str,
         base: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
-        Box::pin(check_repo(self, repo, base))
+        Box::pin(check_repo(self, account, repo, base))
     }
 }
 
@@ -214,19 +228,16 @@ pub(crate) fn well_formed(repo: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
 }
 
-/// Runs the onboarding checks with the `gh` CLI and the factory's token, as
-/// the bot.
+/// Runs the onboarding checks with the `gh` CLI, as the account each call names.
 #[derive(Debug, Clone)]
 pub struct GhRepos {
     pub gh: PathBuf,
-    pub token: Option<String>,
 }
 
 impl Default for GhRepos {
     fn default() -> Self {
         GhRepos {
             gh: PathBuf::from("gh"),
-            token: None,
         }
     }
 }
@@ -270,8 +281,8 @@ enum ApiOutcome {
 }
 
 impl GitHubRepos for GhRepos {
-    async fn repo(&self, repo: &str) -> Result<Option<RepoInfo>, String> {
-        let body = match self.api(&format!("repos/{repo}")).await? {
+    async fn repo(&self, account: &Account, repo: &str) -> Result<Option<RepoInfo>, String> {
+        let body = match self.api(account, &format!("repos/{repo}")).await? {
             ApiOutcome::Found(body) => body,
             ApiOutcome::NotFound => return Ok(None),
             ApiOutcome::Forbidden(message) => {
@@ -294,8 +305,16 @@ impl GitHubRepos for GhRepos {
         }))
     }
 
-    async fn branch(&self, repo: &str, branch: &str) -> Result<Option<BranchInfo>, String> {
-        let body = match self.api(&format!("repos/{repo}/branches/{branch}")).await? {
+    async fn branch(
+        &self,
+        account: &Account,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<BranchInfo>, String> {
+        let body = match self
+            .api(account, &format!("repos/{repo}/branches/{branch}"))
+            .await?
+        {
             ApiOutcome::Found(body) => body,
             ApiOutcome::NotFound => return Ok(None),
             ApiOutcome::Forbidden(message) => {
@@ -313,7 +332,7 @@ impl GitHubRepos for GhRepos {
         }
         // A ruleset protects a branch without setting `protected`.
         let protection = match self
-            .api(&format!("repos/{repo}/rules/branches/{branch}"))
+            .api(account, &format!("repos/{repo}/rules/branches/{branch}"))
             .await?
         {
             ApiOutcome::Found(body) if !body.trim().trim_start_matches('[').trim().is_empty() => {
@@ -325,8 +344,11 @@ impl GitHubRepos for GhRepos {
         Ok(Some(BranchInfo { protection }))
     }
 
-    async fn has_ci(&self, repo: &str) -> Result<bool, String> {
-        let body = match self.api(&format!("repos/{repo}/actions/workflows")).await? {
+    async fn has_ci(&self, account: &Account, repo: &str) -> Result<bool, String> {
+        let body = match self
+            .api(account, &format!("repos/{repo}/actions/workflows"))
+            .await?
+        {
             ApiOutcome::Found(body) => body,
             ApiOutcome::NotFound => return Ok(false),
             ApiOutcome::Forbidden(message) => {
@@ -347,16 +369,16 @@ impl GhRepos {
     /// [`ApiOutcome::Forbidden`], so a check that GitHub withholds on the
     /// repository's plan can become a warning. Any other non-zero exit is an
     /// error with gh's stderr.
-    async fn api(&self, path: &str) -> Result<ApiOutcome, String> {
+    async fn api(&self, account: &Account, path: &str) -> Result<ApiOutcome, String> {
         let mut command = Command::new(&self.gh);
         command
-            .args(["api", path])
+            .args(["api", path, "--hostname", "github.com"])
             .env("GH_PROMPT_DISABLED", "1")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(token) = &self.token {
+        if let Some(token) = &account.token {
             command.env("GH_TOKEN", token);
         }
         let output = command
@@ -368,7 +390,10 @@ impl GhRepos {
                 String::from_utf8_lossy(&output.stdout).into_owned(),
             ));
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = redact_token(
+            &String::from_utf8_lossy(&output.stderr),
+            account.token.as_deref(),
+        );
         if stderr.contains("HTTP 404") {
             Ok(ApiOutcome::NotFound)
         } else if stderr.contains("HTTP 403") {
@@ -379,5 +404,12 @@ impl GhRepos {
         } else {
             Err(format!("gh api {path} failed: {}", stderr.trim()))
         }
+    }
+}
+
+fn redact_token(text: &str, token: Option<&str>) -> String {
+    match token {
+        Some(token) if !token.is_empty() => text.replace(token, "<redacted>"),
+        _ => text.to_owned(),
     }
 }

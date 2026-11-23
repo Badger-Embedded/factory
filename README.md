@@ -24,7 +24,7 @@ Run the browser tests with `nix develop -c just e2e`. They start their own serve
 | `FACTORY_PODMAN` | `podman` | The podman binary. Set `CONTAINER_HOST` to use a remote podman service. |
 | `FACTORY_AGENTS_DIR` | unset | The factory's bundled agent material, mounted read-only into workers |
 | `FACTORY_WORKER_VOLUMES` | unset | Space-separated `--volume` values for every worker, such as `factory-nix:/nix` |
-| `GH_TOKEN` | unset | GitHub token the factory clones, pushes and opens pull requests with until jobs move to project tokens. At startup it also seeds the project token of each existing GitHub project once, when the secret store is available. Workers never get it. |
+| `GH_TOKEN` | unset | GitHub token the factory clones, pushes and opens pull requests with until jobs move to project tokens. Onboarding checks no longer use it: they run as the onboarding login's own token. At startup it also seeds the project token of each existing GitHub project once, when the secret store is available. Workers never get it. |
 | `FACTORY_GH` | `gh` | The GitHub CLI |
 | `FACTORY_MCP_CA_FILE` | unset | PEM file of extra root certificates that the MCP connection check and the MCP proxy trust next to the built-in roots, for a server whose certificate is not from a public CA. The factory stops at startup if the file cannot be read. |
 | `FACTORY_GIT_NAME`, `FACTORY_GIT_EMAIL` | `moonthebot` and its noreply address | Identity on the agent's commits |

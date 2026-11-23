@@ -304,6 +304,17 @@ pub trait SecretStore: Send + Sync {
     /// decrypt, or on a storage error.
     fn forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<Option<String>, SecretError>;
 
+    /// The forge token of `owner` with the account recorded for it, read in
+    /// one store snapshot. `None` when either is missing.
+    ///
+    /// # Errors
+    ///
+    /// As [`SecretStore::forge_token`].
+    fn forge_token_with_account(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<(String, ForgeAccount)>, SecretError>;
+
     /// Deletes the forge token of `owner` and its recorded account in one
     /// transaction. Clearing a token that is not there
     /// is fine, and it works with the store unavailable.
@@ -540,6 +551,22 @@ impl SecretStore for LocalSecrets {
         Ok(Some(self.open(&backend, &stored, &owner.aad())?))
     }
 
+    fn forge_token_with_account(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<(String, ForgeAccount)>, SecretError> {
+        let (project, header) = owner.row();
+        let at = SecretRef {
+            project: &project,
+            server: "",
+            header: &header,
+        };
+        let Some((backend, stored, account)) = self.store.forge_token_snapshot(at, owner)? else {
+            return Ok(None);
+        };
+        Ok(Some((self.open(&backend, &stored, &owner.aad())?, account)))
+    }
+
     fn delete_forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<(), SecretError> {
         delete_forge_row(&self.store, owner)
     }
@@ -653,6 +680,13 @@ impl SecretStore for UnavailableSecrets {
     }
 
     fn forge_token(&self, _owner: ForgeTokenOwner<'_>) -> Result<Option<String>, SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn forge_token_with_account(
+        &self,
+        _owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<(String, ForgeAccount)>, SecretError> {
         Err(SecretError::Unavailable)
     }
 
