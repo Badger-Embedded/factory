@@ -14438,49 +14438,6 @@ async fn a_refused_onboarding_keeps_the_retained_jobs_of_the_name() {
     assert!(reply.body.contains("already exists"));
     assert!(dashboard.store.get(id).is_ok());
 }
-
-/// Passes every check as [`FakeRepos::fit`], but holds the repository lookup
-/// until the test releases it.
-struct GatedRepos {
-    inner: FakeRepos,
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-impl GitHubRepos for GatedRepos {
-    fn repo(
-        &self,
-        account: &Account,
-        repo: &str,
-    ) -> impl Future<Output = Result<Option<RepoInfo>, String>> + Send {
-        let entered = Arc::clone(&self.entered);
-        let release = Arc::clone(&self.release);
-        let found = self.inner.repo(account, repo);
-        async move {
-            entered.notify_one();
-            release.notified().await;
-            found.await
-        }
-    }
-
-    fn branch(
-        &self,
-        account: &Account,
-        repo: &str,
-        branch: &str,
-    ) -> impl Future<Output = Result<Option<BranchInfo>, String>> + Send {
-        self.inner.branch(account, repo, branch)
-    }
-
-    fn has_ci(
-        &self,
-        account: &Account,
-        repo: &str,
-    ) -> impl Future<Output = Result<bool, String>> + Send {
-        self.inner.has_ci(account, repo)
-    }
-}
-
 #[tokio::test]
 async fn a_display_name_save_waits_for_a_running_onboarding() {
     let store = Arc::new(Store::open_in_memory().unwrap());
@@ -14495,33 +14452,26 @@ async fn a_display_name_save_waits_for_a_running_onboarding() {
         )
         .unwrap();
     seed_user_token(&store, "bob@example.com");
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let github = GatedRepos {
-        inner: FakeRepos::fit(),
-        entered: Arc::clone(&entered),
-        release: Arc::clone(&release),
-    };
-    let dashboard = dashboard_with_github(Arc::clone(&store), Arc::new(github));
+    let dashboard = dashboard_with(Arc::clone(&store));
+    let pass = dashboard.slots.lock_pass().await;
+    let wait = |ms| tokio::time::sleep(std::time::Duration::from_millis(ms));
     let onboard = dashboard.post_as(
         "bob@example.com",
         "/onboard",
         "repo=acme%2Ffresh&name=fresh&action=skip",
     );
     let save = async {
-        entered.notified().await;
-        let held = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            name_post(&dashboard, USER, "fresh"),
-        )
-        .await;
-        assert!(held.is_err(), "the save ran during onboarding");
-        assert_eq!(store.project_shown_name("maestro").unwrap(), "maestro");
-        release.notify_one();
+        wait(100).await;
+        name_post(&dashboard, USER, "fresh").await
     };
-    let (onboarded, ()) = tokio::join!(onboard, save);
+    let release = async {
+        wait(400).await;
+        assert_eq!(store.project_shown_name("maestro").unwrap(), "maestro");
+        assert!(store.project("fresh").unwrap().is_none());
+        drop(pass);
+    };
+    let (onboarded, saved, ()) = tokio::join!(onboard, save, release);
     assert_eq!(onboarded.status, StatusCode::SEE_OTHER);
-    assert!(store.project("fresh").unwrap().is_some());
-    let refused = name_post(&dashboard, USER, "fresh").await;
-    assert!(refused.body.contains("already exists"));
+    assert!(saved.body.contains("already exists"));
+    assert_eq!(store.project_shown_name("maestro").unwrap(), "maestro");
 }
