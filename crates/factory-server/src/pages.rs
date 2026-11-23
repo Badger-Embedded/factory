@@ -13,7 +13,7 @@ use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages, McpToolState};
 use factory_runner::{ForgeAccount, ForgeKind};
 
-use crate::projects::Project;
+use crate::projects::{Project, ProjectLabel};
 use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{
@@ -164,7 +164,7 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
 )]
 pub fn index(
     user: &str,
-    project_names: &[String],
+    project_names: &[ProjectLabel],
     selected: Option<&str>,
     jobs: &[JobRow],
     costs: &HashMap<i64, f64>,
@@ -212,7 +212,7 @@ pub fn index(
                 @if project_token_missing {
                     (missing_project_token_notice(selected))
                 }
-                (composer(selected, &all))
+                (composer(selected, shown_name(project_names, selected), &all))
                 (board(&all, costs, waits, auto_merge, selected, project))
                 (stats(totals, selected))
             } @else {
@@ -254,7 +254,12 @@ pub struct Workers {
 /// time, so the count stays right without leaking the job's id, project,
 /// stage or request. A job waiting for you holds no slot, so a full row of
 /// busy tiles is why a new job has not started.
-pub fn workers(workers: &Workers, jobs: &[JobRow], visible: &[String], project: &str) -> Region {
+pub fn workers(
+    workers: &Workers,
+    jobs: &[JobRow],
+    visible: &[ProjectLabel],
+    project: &str,
+) -> Region {
     let count = workers.limit.max(
         workers
             .busy
@@ -270,14 +275,15 @@ pub fn workers(workers: &Workers, jobs: &[JobRow], visible: &[String], project: 
                     @let slot = workers.busy.iter().find(|slot| slot.number == number);
                     @let row = slot
                         .and_then(|slot| jobs.iter().find(|row| row.id == slot.job_id))
-                        .filter(|row| visible.iter().any(|name| name == &row.project));
+                        .filter(|row| visible.iter().any(|label| label.id == row.project));
                     @match (slot, row) {
                         (Some(slot), Some(row)) => {
+                            @let shown = shown_name(visible, &row.project);
                             li.worker.busy {
                                 span.worker-name { "Worker " (number) }
                                 a.worker-job href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
                                     "#" (row.id)
-                                    @if row.project != project { " " (row.project) }
+                                    @if row.project != project { " " (shown) }
                                     " · " (stage_label(&row.job))
                                 }
                                 span.worker-time { (held_for(workers.now - slot.since)) }
@@ -371,7 +377,7 @@ fn start_after(options: &[StartAfterOption]) -> Markup {
 /// The new-request form as a one-line bar. It grows, and shows the file
 /// picker, once it has focus or text, so it takes little room on a board
 /// that is opened more often to check on jobs than to file one.
-fn composer(project: &str, rows: &[&JobRow]) -> Markup {
+fn composer(project: &str, shown: &str, rows: &[&JobRow]) -> Markup {
     let options: Vec<StartAfterOption> = rows
         .iter()
         .filter(|row| row.job.can_be_prerequisite())
@@ -380,10 +386,10 @@ fn composer(project: &str, rows: &[&JobRow]) -> Markup {
     html! {
         form.composer method="post" action="/jobs" enctype="multipart/form-data" {
             input type="hidden" name="project" value=(project);
-            label.visually-hidden for="request" { "New request for " (project) }
+            label.visually-hidden for="request" { "New request for " (shown) }
             div.composer-line {
                 textarea #request name="request" required rows="1"
-                    placeholder={ "Describe a change for " (project) "…" } {}
+                    placeholder={ "Describe a change for " (shown) "…" } {}
                 button.primary { "Request" }
             }
             div.composer-more tabindex="-1" {
@@ -542,13 +548,22 @@ fn count_or_dash(count: i64) -> String {
     }
 }
 
-fn project_selector(names: &[String], selected: &str) -> Markup {
+/// The name to show for the project `id`, which is the identifier itself when
+/// `labels` does not list it.
+fn shown_name<'a>(labels: &'a [ProjectLabel], id: &'a str) -> &'a str {
+    labels
+        .iter()
+        .find(|label| label.id == id)
+        .map_or(id, |label| label.shown.as_str())
+}
+
+fn project_selector(labels: &[ProjectLabel], selected: &str) -> Markup {
     html! {
         form.project-picker method="get" action="/" {
             label.visually-hidden for="project" { "Project" }
             select #project name="project" {
-                @for name in names {
-                    option selected[name.as_str() == selected] { (name) }
+                @for label in labels {
+                    option value=[(label.shown != label.id).then_some(&label.id)] selected[label.id == selected] { (label.shown) }
                 }
             }
             noscript { button { "Go" } }
@@ -560,7 +575,10 @@ fn project_selector(names: &[String], selected: &str) -> Markup {
 /// A project's block on the settings page: its models, efforts and flags, and
 /// its per-server MCP settings.
 pub struct ProjectSettings {
+    /// The identifier, which every form action and link uses.
     pub name: String,
+    /// The name the page shows.
+    pub shown: String,
     pub models: StageModels,
     pub efforts: StageEfforts,
     /// Every registered agent, in the registry's order, for the stage panel's
@@ -676,7 +694,7 @@ pub struct SettingsNav {
     /// Whether the login is a factory admin, who sees the factory-wide groups.
     pub admin: bool,
     /// Onboarded project names, in name order.
-    pub projects: Vec<String>,
+    pub projects: Vec<ProjectLabel>,
     /// Registered MCP server names, in the registry's order.
     pub servers: Vec<String>,
     /// The registered agents, in the registry's order.
@@ -755,11 +773,11 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
                 }
             }
             p.settings-group { "Projects" }
-            @for project in &nav.projects {
+            @for label in &nav.projects {
                 (entry(
-                    format!("/settings/projects/{}", crate::web::query_escape(project)),
-                    project,
-                    &SettingsPage::Project(project.clone()),
+                    format!("/settings/projects/{}", crate::web::query_escape(&label.id)),
+                    &label.shown,
+                    &SettingsPage::Project(label.id.clone()),
                 ))
             }
             a.settings-link.settings-add href="/onboard" { "Onboard a project" }
@@ -1461,7 +1479,7 @@ pub fn settings_mcp(
 
 /// One project's use of a server, for the "Used by" list on the server's page.
 pub struct ServerUsage {
-    pub project: String,
+    pub project: ProjectLabel,
     pub enabled: bool,
     pub stages: McpStages,
     pub headers: Vec<HeaderState>,
@@ -1476,7 +1494,7 @@ pub struct ServerUsage {
 pub struct PendingEdit {
     pub url: String,
     pub headers: Vec<String>,
-    pub deletes: Vec<(String, String)>,
+    pub deletes: Vec<(ProjectLabel, String)>,
     pub total: usize,
 }
 
@@ -1548,10 +1566,10 @@ fn server_usage_card(server: &str, usage: &[ServerUsage]) -> Markup {
             }
             @for entry in usage {
                 div.server-row {
-                    span.server-name { (entry.project) }
+                    span.server-name { (entry.project.shown) }
                     span.hint.server-url { (usage_line(entry.enabled, entry.stages)) }
                     (header_badges(&entry.headers))
-                    a.link-button href=(project_mcp_href(&entry.project, server)) { "Open" }
+                    a.link-button href=(project_mcp_href(&entry.project.id, server)) { "Open" }
                 }
             }
         }
@@ -1664,10 +1682,10 @@ pub fn settings_project(
         user,
         nav,
         &SettingsPage::Project(project.name.clone()),
-        &project.name,
+        &project.shown,
         notice,
         &html! {
-            h1 { (project.name) }
+            h1 { (project.shown) }
             p.meta { "The path a job takes. Select a stage to set its model, effort and MCP servers, or a ✋ to change that approval gate. " (RUNS_KEEP_VALUES) }
             (project_form(project, selected, nav.admin))
             @if let Some(problem) = &project.forge_problem {
@@ -1706,8 +1724,8 @@ fn remove_project_card(project: &ProjectSettings) -> Markup {
             div.row {
                 input.grow type="text" name="confirm" aria-label="Project name"
                     autocomplete="off" autocapitalize="none" spellcheck="false"
-                    placeholder=(project.name);
-                button.danger { "Remove " (project.name) }
+                    placeholder=(project.shown);
+                button.danger { "Remove " (project.shown) }
             }
         }
     }
@@ -1933,7 +1951,7 @@ fn project_servers_card(project: &ProjectSettings, admin: bool) -> Markup {
 pub fn settings_project_mcp(
     user: &str,
     nav: &SettingsNav,
-    project: &str,
+    project: &ProjectLabel,
     server: &ServerSettings,
     secrets_available: bool,
     notice: Option<&str>,
@@ -1941,15 +1959,15 @@ pub fn settings_project_mcp(
     settings_page(
         user,
         nav,
-        &SettingsPage::Project(project.to_owned()),
-        &format!("{} for {project}", server.name),
+        &SettingsPage::Project(project.id.clone()),
+        &format!("{} for {}", server.name, project.shown),
         notice,
         &html! {
             p.crumbs {
-                a href={ "/settings/projects/" (crate::web::query_escape(project)) } { (project) }
+                a href={ "/settings/projects/" (crate::web::query_escape(&project.id)) } { (project.shown) }
                 " › MCP › " (server.name)
             }
-            h1 { (server.name) " for " (project) }
+            h1 { (server.name) " for " (project.shown) }
             p.meta {
                 @if nav.admin {
                     "The server's URL and header names are on "
@@ -1961,7 +1979,7 @@ pub fn settings_project_mcp(
             @if !secrets_available {
                 p.hint.bad { "The master key is missing, so header values cannot be saved. The enabled switch, stages and tools still save." }
             }
-            form.card.settings-form method="post" action=(project_mcp_href(project, &server.name)) {
+            form.card.settings-form method="post" action=(project_mcp_href(&project.id, &server.name)) {
                 (project_server_block(project, server, secrets_available))
                 (save_bar("Save"))
             }
@@ -2119,7 +2137,7 @@ fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup 
                     p { strong { "Not saved yet." } " Saving this change deletes these stored values, and each project must enter them again:" }
                     ul {
                         @for (project, header) in &pending.deletes {
-                            li { (project) ": " code { (header) } }
+                            li { (project.shown) ": " code { (header) } }
                         }
                         @if hidden == 1 {
                             li { "1 value in a project you cannot see" }
@@ -2373,7 +2391,7 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) 
                     p.hint { "The factory squash-merges once every check passed and no review comment waits for the agent. Off, you merge on GitHub." }
                 }
             }
-            (save_bar(&format!("Save {name}")))
+            (save_bar(&format!("Save {}", project.shown)))
         }
     }
 }
@@ -2529,7 +2547,7 @@ fn gate_panel(project: &ProjectSettings, gate: &str, selected: bool) -> Markup {
                 p.hint { (gate_help(gate)) }
                 p.hint {
                     "Factory default: " strong { (if default { "on" } else { "off" }) } ". "
-                    span.gate-changed hidden[on == default] { "Changed for " (project.name) ". " }
+                    span.gate-changed hidden[on == default] { "Changed for " (project.shown) ". " }
                     button.link-like type="button" data-gate-reset=(gate) { "Use the default" }
                 }
                 p.hint { "Applies to jobs created after you save. A job keeps the gates it started with." }
@@ -2543,7 +2561,11 @@ fn gate_panel(project: &ProjectSettings, gate: &str, selected: bool) -> Markup {
 /// field shows only whether a value is stored, never the value, and its field
 /// is disabled when the secret store is unavailable. The field names carry the
 /// server as `mcp.<server>.…`, which the save handler splits back out.
-fn project_server_block(project: &str, server: &ServerSettings, secrets_available: bool) -> Markup {
+fn project_server_block(
+    project: &ProjectLabel,
+    server: &ServerSettings,
+    secrets_available: bool,
+) -> Markup {
     let base = format!("mcp.{}", server.name);
     let stages = server.stages;
     html! {
@@ -2552,7 +2574,7 @@ fn project_server_block(project: &str, server: &ServerSettings, secrets_availabl
                 label.check {
                     input type="checkbox" name={ (base) ".enabled" } value="on"
                         checked[server.enabled];
-                    " Run this server for " (project)
+                    " Run this server for " (project.shown)
                 }
             }
             div.field {
@@ -2588,7 +2610,7 @@ fn project_server_block(project: &str, server: &ServerSettings, secrets_availabl
                     }
                 }
             }
-            (mcp_refresh(project, &server.name, &server.tools, None))
+            (mcp_refresh(&project.id, &server.name, &server.tools, None))
         }
     }
 }
@@ -3234,6 +3256,7 @@ fn any_estimated(events: &[JobEvent]) -> bool {
 pub fn job(
     user: &str,
     row: &JobRow,
+    label: &ProjectLabel,
     project: Option<&Project>,
     settings: &Settings,
     logs: &[LogEntry],
@@ -3257,13 +3280,13 @@ pub fn job(
         &html! {},
         &html! {
             (job_poll(false, id, job))
-            (job_header(id, row, links, repo_url, cost_usd, estimated))
+            (job_header(id, row, label, links, repo_url, cost_usd, estimated))
             @if let Some(problem) = project.and_then(|project| project.forge.problem()) {
                 div.card.failed { (problem) }
             }
             div.job-layout {
                 div.job-now {
-                    (status_region(false, id, &row.project, job, settings, auto_merge, links, prerequisites))
+                    (status_region(false, id, label, job, settings, auto_merge, links, prerequisites))
                     (queued_after_region(false, job, prerequisites))
                     p.meta { "Approval gates: " (gates_line(job.gates())) }
                 }
@@ -3302,6 +3325,7 @@ pub fn job(
 )]
 pub fn job_fragment(
     row: &JobRow,
+    label: &ProjectLabel,
     project: Option<&Project>,
     settings: &Settings,
     logs: &[LogEntry],
@@ -3319,7 +3343,7 @@ pub fn job_fragment(
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd, any_estimated(events)))
         (timeline_region(true, job, events, models, efforts))
-        (status_region(true, row.id, &row.project, job, settings, auto_merge, links, prerequisites))
+        (status_region(true, row.id, label, job, settings, auto_merge, links, prerequisites))
         (queued_after_region(true, job, prerequisites))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
@@ -3395,7 +3419,7 @@ fn timeline_region(
 fn status_region(
     oob: bool,
     id: i64,
-    project: &str,
+    project: &ProjectLabel,
     job: &Job,
     settings: &Settings,
     auto_merge: bool,
@@ -3634,6 +3658,7 @@ fn log_region(oob: bool, logs: &[LogEntry]) -> Markup {
 fn job_header(
     id: i64,
     row: &JobRow,
+    label: &ProjectLabel,
     links: &JobLinks,
     repo_url: Option<Links<'_>>,
     cost_usd: f64,
@@ -3661,9 +3686,9 @@ fn job_header(
         }
         p.meta {
             @if let Some(links) = repo_url {
-                (external_link(&links.repo_url(), &row.project, None, None))
+                (external_link(&links.repo_url(), &label.shown, None, None))
             } @else {
-                (row.project)
+                (label.shown)
             }
             " · requested by " (row.requested_by) " · " (crate::localtime::date_time(&row.created_at))
         }
@@ -4164,7 +4189,7 @@ fn proposal_card(id: i64, job: &Job) -> Markup {
 
 fn status_card(
     id: i64,
-    project: &str,
+    project: &ProjectLabel,
     job: &Job,
     settings: &Settings,
     auto_merge: bool,
@@ -4358,7 +4383,13 @@ fn waiting_card(id: i64, job: &Job, wait: &Wait, prerequisites: &[PrerequisiteVi
     }
 }
 
-fn failed_card(id: i64, project: &str, job: &Job, reason: &str, dismissed: bool) -> Markup {
+fn failed_card(
+    id: i64,
+    project: &ProjectLabel,
+    job: &Job,
+    reason: &str,
+    dismissed: bool,
+) -> Markup {
     html! {
         div.card.failed {
             div.card-head {
@@ -4374,8 +4405,8 @@ fn failed_card(id: i64, project: &str, job: &Job, reason: &str, dismissed: bool)
             @if job.checks_could_not_run() {
                 p.hint {
                     "Revise the project's local checks command, then retry, or retry to run the checks again. "
-                    a href={ "/settings/projects/" (crate::web::query_escape(project)) } {
-                        "Local checks for " (project)
+                    a href={ "/settings/projects/" (crate::web::query_escape(&project.id)) } {
+                        "Local checks for " (project.shown)
                     }
                 }
             }
