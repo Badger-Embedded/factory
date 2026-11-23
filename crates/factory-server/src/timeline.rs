@@ -337,7 +337,7 @@ pub(crate) fn timeline(
             @if !timeline.fix_notes.is_empty() {
                 ul.rounds.fix-notes {
                     @for note in &timeline.fix_notes {
-                        li { span { (note.text) } span.when { (localtime::time(&note.at)) } }
+                        li { span { (note.text) } " " span.when { (localtime::time(&note.at)) } }
                     }
                 }
             }

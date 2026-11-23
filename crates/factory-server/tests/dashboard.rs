@@ -2944,6 +2944,16 @@ async fn starting_a_fix_creates_one_linked_job_and_leaves_needs_you() {
     assert!(!page.contains("/retry\""));
     assert!(!page.contains("/fix\" "));
     assert!(timeline_text(&page).contains(&format!("Started fix job #{}", fix.id)));
+    let note: String = scraper::Html::parse_document(&page)
+        .select(&scraper::Selector::parse("div.timeline ul.fix-notes li").unwrap())
+        .next()
+        .expect("the timeline has a fix note")
+        .text()
+        .collect();
+    assert!(
+        note.starts_with(&format!("Started fix job #{} ", fix.id)),
+        "{note}"
+    );
 
     let fix_page = dashboard.get(&format!("/jobs/{}", fix.id)).await.body;
     assert!(fix_page.contains(&format!("<a href=\"/jobs/{id}\">job {id}</a>")));
