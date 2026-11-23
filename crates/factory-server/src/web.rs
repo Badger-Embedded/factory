@@ -2434,7 +2434,6 @@ fn path_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The settings a Maintenance form posts and the refusal of its own fields.
 fn maintenance_from_form(form: &MaintenanceForm) -> (Maintenance, Option<String>) {
     let kind = if form.packaging_type.is_empty() {
         Some(PackagingType::default())
