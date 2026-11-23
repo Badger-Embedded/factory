@@ -124,6 +124,8 @@ pub struct AgentRequest {
     /// proxy token, or `None` when none is active. The runner passes it to
     /// `claude --mcp-config`.
     pub mcp: Option<McpConfig>,
+    /// The project's worker packages, read on every run.
+    pub packages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +135,8 @@ pub struct ChecksRequest {
     pub base: String,
     /// The project's `checks` command.
     pub command: String,
+    /// The project's worker packages, read on every run.
+    pub packages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,7 +802,7 @@ impl<E: Executor> Scheduler<E> {
                     });
                 }
                 Command::RunChecks { .. } => {
-                    self.checks(row.id, &project, &settings, workers_free)?;
+                    self.checks(row.id, &row.project, &project, &settings, workers_free)?;
                 }
                 Command::Summarize { .. } if self.due(row.id) => {
                     self.summarize(row.id, &project, &settings);
@@ -1366,6 +1370,7 @@ impl<E: Executor> Scheduler<E> {
             model,
             effort: Some(effort),
             mcp: selection.config,
+            packages: self.store.project_packages(&row.project)?,
         };
         Ok((request, selection.skipped))
     }
@@ -1492,6 +1497,7 @@ impl<E: Executor> Scheduler<E> {
     fn checks(
         self: &Arc<Self>,
         job_id: i64,
+        project_name: &str,
         project: &Project,
         settings: &Settings,
         workers_free: bool,
@@ -1511,6 +1517,7 @@ impl<E: Executor> Scheduler<E> {
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
         let base = project.base.clone();
+        let packages = self.store.project_packages(project_name)?;
         self.spawn(job_id, Kind::Worker, async move {
             scheduler.note(job_id, &format!("Running the checks: {command}"));
             let result = scheduler
@@ -1521,6 +1528,7 @@ impl<E: Executor> Scheduler<E> {
                         job_id,
                         base,
                         command,
+                        packages,
                     },
                 )
                 .await;

@@ -7302,3 +7302,82 @@ fn the_upstream_credential_is_the_upstream_token_then_the_project_token_then_non
         }
     );
 }
+
+fn to_verifying(store: &Store, project: &str, text: &str) -> i64 {
+    let id = store.create(project, "alice", text).unwrap();
+    for event in [
+        Event::Start,
+        Event::Agent(AgentResult::Clarified),
+        Event::Agent(AgentResult::Spec("s".into())),
+        Event::Approve,
+        Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+            title: "t".into(),
+            summary: "s".into(),
+            number: None,
+            description: None,
+            notes: None,
+        }])),
+        Event::Approve,
+        Event::Agent(AgentResult::CommitsReady(ready())),
+    ] {
+        store.apply(id, event).unwrap();
+    }
+    id
+}
+
+#[tokio::test]
+async fn worker_packages_reach_only_their_projects_agent_and_checks_runs() {
+    let (store, executor, scheduler) = setup_two_projects(|_| questions());
+    store
+        .save_project_packages("maestro", &strings(&["playwright-mcp", "jq"]))
+        .unwrap();
+    store.create("maestro", "alice", "one").unwrap();
+    store.create("factory", "alice", "two").unwrap();
+
+    scheduler.tick().await.unwrap();
+    executor.release(2);
+    wait_idle(&scheduler).await;
+    let requests = executor.requests();
+    let packages_of = |repo: &str| {
+        requests
+            .iter()
+            .find(|r| r.repo.ends_with(repo))
+            .unwrap()
+            .packages
+            .clone()
+    };
+    assert_eq!(packages_of("maestro"), strings(&["playwright-mcp", "jq"]));
+    assert_eq!(packages_of("factory"), Vec::<String>::new());
+
+    to_verifying(&store, "maestro", "three");
+    to_verifying(&store, "factory", "four");
+    step(&scheduler).await;
+    let checks = executor.checks_run.lock().unwrap().clone();
+    assert_eq!(checks.len(), 2);
+    let with_packages: Vec<_> = checks.iter().filter(|c| !c.packages.is_empty()).collect();
+    assert_eq!(with_packages.len(), 1);
+    assert_eq!(
+        with_packages[0].packages,
+        strings(&["playwright-mcp", "jq"])
+    );
+}
+
+#[tokio::test]
+async fn a_change_to_the_worker_packages_reaches_the_next_run() {
+    let (store, executor, scheduler) = setup_two_projects(|_| questions());
+    store.create("maestro", "alice", "one").unwrap();
+    scheduler.tick().await.unwrap();
+    executor.release(1);
+    wait_idle(&scheduler).await;
+    assert_eq!(executor.requests()[0].packages, Vec::<String>::new());
+
+    store
+        .save_project_packages("maestro", &strings(&["jq"]))
+        .unwrap();
+    to_verifying(&store, "maestro", "two");
+    step(&scheduler).await;
+    assert_eq!(
+        executor.checks_run.lock().unwrap()[0].packages,
+        strings(&["jq"])
+    );
+}

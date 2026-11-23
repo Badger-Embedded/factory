@@ -11740,7 +11740,7 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     ] {
         let body = dashboard.get(uri).await.body;
         let bars = if uri == "/settings/projects/maestro" {
-            6
+            7
         } else {
             1
         };
@@ -14966,6 +14966,91 @@ async fn a_non_collaborator_cannot_save_the_checks_command() {
     assert_eq!(
         stored_checks(&dashboard, "maestro").as_deref(),
         Some("just lint")
+    );
+}
+
+async fn packages_post(dashboard: &Dashboard, login: &str, packages: &str) -> Reply {
+    let page = dashboard.get_as(login, PROJECT_PAGE).await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let csrf = doc
+        .select(&scraper::Selector::parse("form[action$='/packages'] input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the Worker packages card carries a csrf token")
+        .to_owned();
+    dashboard
+        .post_as(
+            login,
+            &format!("{PROJECT_PAGE}/packages"),
+            &format!("packages={packages}&csrf={csrf}"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn the_worker_packages_card_saves_validates_and_shows_the_list() {
+    let dashboard = dashboard();
+    let page = dashboard.get(PROJECT_PAGE).await.body;
+    assert!(page.contains("<h2>Worker packages</h2>"));
+
+    let reply = packages_post(
+        &dashboard,
+        USER,
+        "playwright-mcp%0D%0Apython3Packages.requests%0A",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let stored = vec![
+        "playwright-mcp".to_owned(),
+        "python3Packages.requests".to_owned(),
+    ];
+    assert_eq!(dashboard.store.project_packages("maestro").unwrap(), stored);
+    let page = dashboard.get(PROJECT_PAGE).await.body;
+    assert!(page.contains("playwright-mcp\npython3Packages.requests"));
+
+    for bad in ["foo%3Brm+-rf+%2F", "nixpkgs%23foo"] {
+        let reply = packages_post(&dashboard, USER, bad).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(dashboard.store.project_packages("maestro").unwrap(), stored);
+    }
+}
+
+#[tokio::test]
+async fn worker_packages_collapse_duplicates_and_have_count_and_length_limits() {
+    let dashboard = dashboard();
+    let reply = packages_post(&dashboard, USER, "jq%0A%0A+jq+%0Ayq").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard.store.project_packages("maestro").unwrap(),
+        ["jq", "yq"]
+    );
+    let many: Vec<String> = (0..33).map(|n| format!("p{n}")).collect();
+    for bad in [many.join("%0A"), "a".repeat(129)] {
+        let reply = packages_post(&dashboard, USER, &bad).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+    let ok = packages_post(&dashboard, USER, &"a".repeat(128)).await;
+    assert_eq!(ok.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_collaborator_of_another_project_cannot_save_worker_packages() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .add_collaborator("tool", DAVE, "test")
+        .unwrap();
+    let reply = dashboard
+        .post_as(
+            DAVE,
+            "/settings/projects/maestro/packages",
+            "packages=evil&csrf=x",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        dashboard.store.project_packages("maestro").unwrap(),
+        Vec::<String>::new()
     );
 }
 

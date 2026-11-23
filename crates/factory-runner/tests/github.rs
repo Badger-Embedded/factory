@@ -246,6 +246,7 @@ fn checks_run_with_bash_in_the_checkout_without_tokens() {
         "factory-job-7",
         Path::new("/jobs/7/work"),
         "just lint",
+        &[],
     )
     .iter()
     .map(|arg| arg.to_string_lossy().into_owned())
@@ -254,6 +255,147 @@ fn checks_run_with_bash_in_the_checkout_without_tokens() {
     assert!(args.iter().any(|arg| arg == "factory-nix:/nix"));
     assert_eq!(args[args.len() - 3..], ["bash", "-lc", "just lint"]);
     assert!(!args.iter().any(|arg| arg.contains("secret")));
+}
+
+#[test]
+fn checks_with_packages_run_the_command_inside_nix_shell() {
+    let config = WorkerConfig::default();
+    let packages = ["a".to_owned(), "b".to_owned()];
+    let args: Vec<String> = checks_args(
+        &config,
+        "factory-job-7",
+        Path::new("/jobs/7/work"),
+        "just lint; echo $HOME",
+        &packages,
+    )
+    .iter()
+    .map(|arg| arg.to_string_lossy().into_owned())
+    .collect();
+    let image = args.iter().position(|arg| *arg == config.image).unwrap();
+    assert_eq!(args[image + 1], "bash");
+    assert_eq!(args[image + 2], "-c");
+    assert!(args[image + 3].contains("nix shell"));
+    assert!(!args[image + 3].contains("just lint"));
+    assert_eq!(
+        args[image + 4..],
+        [
+            "factory-worker-packages",
+            "2",
+            "a",
+            "b",
+            "bash",
+            "-c",
+            "just lint; echo $HOME"
+        ]
+    );
+}
+
+/// Runs the generated wrapper for `command` under a fake `nix` whose build
+/// and shell steps succeed or fail as given, and returns its exit code.
+fn wrapper_exit(build_ok: bool, shell_ok: bool, command: &str) -> Option<i32> {
+    wrapper_run(build_ok, shell_ok, command, true).0
+}
+
+/// Like [`wrapper_exit`], with a temporary directory that can be missing, and
+/// whether the command ran, which it does by creating `$RAN`.
+fn wrapper_run(
+    build_ok: bool,
+    shell_ok: bool,
+    command: &str,
+    tmp_exists: bool,
+) -> (Option<i32>, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let nix = format!(
+        "case \"$1\" in\nbuild) {} ;;\nshell) {} ;;\nesac",
+        if build_ok { "exit 0" } else { "exit 1" },
+        if shell_ok {
+            "while [ \"$1\" != --command ]; do shift; done; shift; exec \"$@\""
+        } else {
+            "exit 1"
+        },
+    );
+    script(dir.path(), "nix", &nix);
+    let config = WorkerConfig::default();
+    let args: Vec<String> = checks_args(
+        &config,
+        "factory-job-7",
+        Path::new("/jobs/7/work"),
+        command,
+        &["--".to_owned(), "b".to_owned()],
+    )
+    .iter()
+    .map(|arg| arg.to_string_lossy().into_owned())
+    .collect();
+    let image = args.iter().position(|arg| *arg == config.image).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let tmp = dir.path().join("tmp");
+    if tmp_exists {
+        fs::create_dir(&tmp).unwrap();
+    }
+    let ran = dir.path().join("ran");
+    let code = std::process::Command::new(&args[image + 1])
+        .args(&args[image + 2..])
+        .env("PATH", path)
+        .env("TMPDIR", &tmp)
+        .env("RAN", &ran)
+        .status()
+        .unwrap()
+        .code();
+    if tmp_exists {
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0, "left a marker");
+    }
+    (code, ran.exists())
+}
+
+#[test]
+fn the_wrapper_does_not_run_the_command_when_its_start_signal_cannot_be_set_up() {
+    assert_eq!(
+        wrapper_run(true, true, "touch \"$RAN\"", false),
+        (Some(86), false)
+    );
+}
+
+#[test]
+fn the_wrapper_tells_setup_failures_from_command_failures() {
+    assert_eq!(wrapper_exit(true, true, "exit 0"), Some(0));
+    assert_eq!(wrapper_exit(true, true, "exit 3"), Some(3));
+    assert_eq!(wrapper_exit(false, true, "exit 0"), Some(86));
+    assert_eq!(wrapper_exit(true, false, "exit 0"), Some(86));
+    assert_eq!(wrapper_exit(true, true, "exit 86"), Some(1));
+    assert_eq!(
+        wrapper_exit(true, true, "rm -f \"$TMPDIR\"/tmp.*; exit 3"),
+        Some(3)
+    );
+}
+
+#[tokio::test]
+async fn packages_that_cannot_be_installed_are_a_checks_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let podman = script(
+        dir.path(),
+        "podman",
+        "echo 'error: attribute nope missing' >&2\nexit 86",
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let packages = ["nope".to_owned()];
+    let err = run_checks(
+        &config,
+        "factory-job-7",
+        Path::new("/jobs/7/work"),
+        "just lint",
+        &packages,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("worker packages (nope)"), "{err}");
+    assert!(err.contains("attribute nope missing"), "{err}");
 }
 
 #[tokio::test]
@@ -275,6 +417,7 @@ async fn check_results_become_events_and_podman_errors_are_retried() {
                 "factory-job-7",
                 Path::new("/jobs/7/work"),
                 "just lint",
+                &[],
             )
             .await
         }

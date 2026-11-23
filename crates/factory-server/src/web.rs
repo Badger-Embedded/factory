@@ -289,6 +289,10 @@ fn project_card_routes() -> Router<AppState> {
             "/settings/projects/{project}/checks",
             post(save_project_checks),
         )
+        .route(
+            "/settings/projects/{project}/packages",
+            post(save_project_packages),
+        )
         .route("/settings/projects/{project}/name", post(save_project_name))
         .route(
             "/settings/projects/{project}/maintenance/check",
@@ -2099,6 +2103,7 @@ fn project_settings(
             check: None,
         },
         checks: project.checks.clone(),
+        packages: state.store.project_packages(name)?,
         checks_csrf: state.csrf.issue(login),
     })
 }
@@ -3184,6 +3189,35 @@ async fn save_project_checks(
     state
         .store
         .save_project_checks(&project, (!checks.is_empty()).then_some(checks))?;
+    project_page(
+        &state,
+        &headers,
+        &project,
+        pages::PipelinePart::parse(None),
+        Some("Saved."),
+        None,
+    )
+}
+
+#[derive(Deserialize)]
+struct PackagesForm {
+    #[serde(default)]
+    packages: String,
+    #[serde(default)]
+    csrf: String,
+}
+
+async fn save_project_packages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<PackagesForm>,
+) -> Result<Markup, AppError> {
+    visible_project(&state, &headers, &project)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let packages =
+        crate::packages::validate(form.packages.lines()).map_err(AppError::BadRequest)?;
+    state.store.save_project_packages(&project, &packages)?;
     project_page(
         &state,
         &headers,

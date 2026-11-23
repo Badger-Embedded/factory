@@ -13,6 +13,7 @@ mod github;
 mod gitlab;
 mod localtime;
 mod mcp;
+mod packages;
 mod pages;
 mod podman;
 mod projects;

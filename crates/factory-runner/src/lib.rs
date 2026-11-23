@@ -17,6 +17,7 @@ mod github;
 mod gitlab;
 mod images;
 mod outcome;
+mod packages;
 mod prompt;
 mod stream;
 mod worker;
