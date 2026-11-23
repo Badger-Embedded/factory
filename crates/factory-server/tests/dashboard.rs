@@ -12044,6 +12044,7 @@ async fn a_save_that_finishes_after_the_project_was_removed_stores_nothing() {
                 Some(USER),
             )
             .unwrap();
+        dashboard.store.project_with_instance("maestro").unwrap();
     })
     .await;
     assert!(reply.body.contains("Nothing was saved"));

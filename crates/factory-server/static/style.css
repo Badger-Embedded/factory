@@ -873,7 +873,7 @@ form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
 .save-bar-note { margin-right: auto; color: var(--muted); font-size: var(--font-size-sm); }
 .save-bar.dirty { background: var(--you-bg); border-top-color: var(--you); }
 .save-bar.dirty .save-bar-note { color: var(--you); font-weight: var(--weight-semibold); }
-/* Two forms share the Forge account card, so each save bar stays in the flow of its form. */
+/* The sticky bar of the first form intercepted clicks on the second form's switch. */
 #forge-account .save-bar { position: static; }
 .danger-zone { margin-top: var(--space-24); padding-top: var(--space-16); border-top: var(--border-width) solid var(--border); }
 
