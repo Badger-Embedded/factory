@@ -15,11 +15,11 @@ use factory_runner::{
 use factory_server::{
     AccountSource, Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, FACTORY_REQUESTER,
     ForgeTokenOwner, Forges, GhRepos, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN,
-    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Owner, Project, ProjectForge, Projects,
-    PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, RunTokens,
-    Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
-    StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots,
-    credential_failure, format_cost, ready_action, watch_only_event,
+    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Owner, PrerequisiteEdit, Project,
+    ProjectForge, Projects, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest,
+    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
+    StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport,
+    WatchRequest, WorkerSlots, credential_failure, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -4612,6 +4612,7 @@ async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
                 name: "file-1.txt".into(),
                 original_name: "notes.txt".into(),
             }],
+            &PrerequisiteEdit::default(),
         )
         .unwrap();
     let _ = fs::remove_dir_all(&staging);
@@ -4644,6 +4645,64 @@ async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
     assert_eq!(request.expect, Expect::Clarify);
     assert!(request.prompt.contains("Add a shutdown button"));
     assert!(!request.prompt.contains("Add a reboot button"));
+}
+
+#[test]
+fn an_edit_of_the_prerequisites_either_lands_before_the_start_or_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    for round in 0..50 {
+        let first = store.create("maestro", "alice", "first").unwrap();
+        let id = store.create("maestro", "alice", "second").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (started, edited) = std::thread::scope(|scope| {
+            let start = scope.spawn(|| {
+                barrier.wait();
+                store.start(id)
+            });
+            let edit = scope.spawn(|| {
+                barrier.wait();
+                store.edit_request(
+                    id,
+                    "second".into(),
+                    data.path(),
+                    &[],
+                    &[],
+                    &PrerequisiteEdit {
+                        after: &[first],
+                        keep: &[],
+                    },
+                )
+            });
+            (start.join().unwrap(), edit.join().unwrap())
+        });
+        let waits: Vec<i64> = store
+            .prerequisites(id)
+            .unwrap()
+            .iter()
+            .map(|prerequisite| prerequisite.id)
+            .collect();
+        match (started.unwrap(), edited) {
+            (Some(_), Err(factory_server::StoreError::Rejected(_))) => {
+                assert!(waits.is_empty(), "round {round}");
+            }
+            (None, Ok(())) => {
+                assert_eq!(waits, [first], "round {round}");
+                assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Requested);
+            }
+            (started, edited) => panic!("round {round}: {started:?} {edited:?}"),
+        }
+    }
 }
 
 /// A [`Event::StartReview`] on a head no earlier pass read, so the reviewer

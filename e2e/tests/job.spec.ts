@@ -179,6 +179,89 @@ test("editing a queued job's request saves the new text", async ({ page, factory
   await expect(page.locator('pre.doc').first()).toHaveText('A reworded request');
 });
 
+function waitingJob(
+  factory: { fixture(...args: string[]): string },
+  project: string,
+  first: string,
+): string {
+  return factory.fixture(
+    'job',
+    '--project',
+    project,
+    '--stage',
+    'requested',
+    '--request',
+    'Waits',
+    '--after',
+    first,
+  );
+}
+
+test('the edit page ticks the jobs a queued request waits for', async ({ page, factory, project }) => {
+  const first = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The first job');
+  const second = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The second job');
+  const id = waitingJob(factory, project, first);
+  await page.goto(`/jobs/${id}/edit`);
+
+  const picker = page.locator('fieldset.start-after');
+  await expect(picker.locator('legend')).toHaveText('Start after');
+  await expect(picker.getByLabel(`#${first} The first job`)).toBeChecked();
+  await expect(picker.getByLabel(`#${second} The second job`)).not.toBeChecked();
+  await expect(picker.getByLabel(`#${id}`)).toHaveCount(0);
+});
+
+test('saving with the prerequisite unticked lets the job start', async ({ page, factory, project }) => {
+  const first = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The first job');
+  const id = waitingJob(factory, project, first);
+  await page.goto(`/jobs/${id}/edit`);
+  await page.locator('fieldset.start-after').getByLabel(`#${first} The first job`).uncheck();
+  await page.getByRole('button', { name: 'Save' }).click();
+
+  await expect(page).toHaveURL(new RegExp(`/jobs/${id}$`));
+  await expect(status(page).locator('.badge')).toHaveText('queued');
+  await expect(status(page)).toContainText('Waiting for a free worker.');
+  await expect(page.locator('#job-timeline')).toContainText('You changed the jobs this waits for: none');
+  await page.goto(`/?project=${project}`);
+  await expect(page.locator('li.job', { hasText: 'Waits' }).locator('.badge')).toHaveText('queued');
+});
+
+test('saving with another job selected makes the job wait for it', async ({ page, factory, project }) => {
+  const first = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The first job');
+  const second = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The second job');
+  const id = waitingJob(factory, project, first);
+  await page.goto(`/jobs/${id}/edit`);
+  const picker = page.locator('fieldset.start-after');
+  await picker.getByLabel(`#${first} The first job`).uncheck();
+  await picker.getByLabel(`#${second} The second job`).check();
+  await page.getByRole('button', { name: 'Save' }).click();
+
+  await expect(page).toHaveURL(new RegExp(`/jobs/${id}$`));
+  await expect(status(page).locator('.badge')).toHaveText('waiting');
+  await expect(status(page).getByRole('link', { name: `#${second}` })).toHaveAttribute('href', `/jobs/${second}`);
+  await expect(status(page).getByRole('link', { name: `#${first}` })).toHaveCount(0);
+  await page.goto(`/?project=${project}`);
+  await expect(page.locator('li.job', { hasText: 'Waits' })).toContainText(`waits for #${second}`);
+});
+
+test.describe('without scripts', () => {
+  test.use({ javaScriptEnabled: false });
+
+  test('the edit form changes the jobs a queued request waits for', async ({ page, factory, project }) => {
+    const first = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The first job');
+    const second = factory.fixture('job', '--project', project, '--stage', 'questions', '--request', 'The second job');
+    const id = waitingJob(factory, project, first);
+    await page.goto(`/jobs/${id}/edit`);
+    const picker = page.locator('fieldset.start-after');
+    await expect(picker.getByLabel(`#${first} The first job`)).toBeChecked();
+    await picker.getByLabel(`#${first} The first job`).uncheck();
+    await picker.getByLabel(`#${second} The second job`).check();
+    await page.getByRole('button', { name: 'Save' }).click();
+
+    await expect(page).toHaveURL(new RegExp(`/jobs/${id}$`));
+    await expect(status(page).getByRole('link', { name: `#${second}` })).toBeVisible();
+  });
+});
+
 test('a state change on the server appears without a reload', async ({ page, factory, project }) => {
   const id = newJob(factory, project, 'requested');
   await page.goto(`/jobs/${id}`);
