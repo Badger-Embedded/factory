@@ -75,6 +75,22 @@ test.describe('phone, 390 px', () => {
     await topbarInViewport(page);
   });
 
+  test('the other-projects badge fits row one', async ({ page, factory }, testInfo) => {
+    const project = phoneProject(factory, testInfo);
+    const other = phoneProject(factory, testInfo);
+    factory.fixture('job', '--project', other, '--stage', 'spec');
+    factory.fixture('job', '--project', other, '--stage', 'failed');
+    await page.goto(`/?project=${project}`);
+
+    const badge = page.locator('#picker-badge');
+    await expect(badge).toBeVisible();
+    await noSidewaysScroll(page);
+    await inViewport(badge, page);
+    const row = await page.getByRole('link', { name: 'factory' }).boundingBox();
+    const box = await badge.boundingBox();
+    expect(box!.y).toBeLessThan(row!.y + row!.height);
+  });
+
   test('the login is inside the viewport and keeps its full value in title', async ({ page, factory }, testInfo) => {
     const project = phoneProject(factory, testInfo);
     await page.goto(`/?project=${project}`);

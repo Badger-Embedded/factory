@@ -646,16 +646,52 @@ fn project_selector(
                 span.picker-chevron aria-hidden="true" {}
             }
             div.picker-panel {
-                (picker(attention, selected))
+                (picker(attention, selected, false))
             }
             script { (PreEscaped(PROJECT_PICKER)) }
+        }
+        (picker_badge(attention, selected, false))
+    }
+}
+
+fn other_projects(count: usize, what: &str, projects: usize) -> String {
+    let s = if projects == 1 { "" } else { "s" };
+    format!("{count} {what} in {projects} other project{s}")
+}
+
+/// With nothing to show the badge stays an empty, hidden span, so the poll's
+/// out-of-band swap has a target.
+fn picker_badge(attention: &[ProjectAttention], selected: &str, oob: bool) -> Markup {
+    let others = || attention.iter().filter(|entry| entry.label.id != selected);
+    let you = others().map(|entry| entry.needs_you).sum::<usize>();
+    let you_projects = others().filter(|entry| entry.needs_you > 0).count();
+    let failed = others().map(|entry| entry.failed).sum::<usize>();
+    let failed_projects = others().filter(|entry| entry.failed > 0).count();
+    let mut parts = Vec::new();
+    if you > 0 {
+        parts.push(other_projects(you, "need you", you_projects));
+    }
+    if failed > 0 {
+        parts.push(other_projects(failed, "failed", failed_projects));
+    }
+    let oob = oob.then_some("true");
+    if parts.is_empty() {
+        return html! { span #picker-badge hidden hx-swap-oob=[oob] {} };
+    }
+    let label = parts.join(", ");
+    html! {
+        span #picker-badge role="img" aria-label=(label) title=(label) hx-swap-oob=[oob] {
+            @if you > 0 { span.badge.you { (you) } }
+            @if failed > 0 { span.badge.bad { (failed) } }
         }
     }
 }
 
-/// The picker's project list. Only this list polls, so the `<details>` around
-/// it keeps its open state.
-pub fn picker(attention: &[ProjectAttention], selected: &str) -> Region {
+/// The picker's project list. A poll's copy (`poll`) carries the top bar badge
+/// as an out-of-band swap, and the page's copy leaves it to the top bar. An
+/// empty `selected` is a recovery poll: it marks no row and counts every project.
+/// Only the list polls, so the `<details>` around it keeps its open state.
+pub fn picker(attention: &[ProjectAttention], selected: &str, poll: bool) -> Region {
     let inner = html! {
         @for entry in attention {
             @let label = &entry.label;
@@ -682,11 +718,19 @@ pub fn picker(attention: &[ProjectAttention], selected: &str) -> Region {
             }
         }
     };
-    let version = version_of(&inner);
+    let version = version_of(&html! { (inner) (picker_badge(attention, selected, false)) });
+    let url = if selected.is_empty() {
+        format!("/fragments/picker?v={version}")
+    } else {
+        fragment_url("picker", selected, &version)
+    };
     let markup = html! {
-        ul #picker-list hx-get=(fragment_url("picker", selected, &version))
+        ul #picker-list hx-get=(url)
             hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
             (inner)
+        }
+        @if poll {
+            (picker_badge(attention, selected, true))
         }
     };
     Region { version, markup }
