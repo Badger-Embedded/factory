@@ -288,6 +288,12 @@ pub enum FixOutcome {
     Merged {
         head: String,
     },
+    /// The fix merged, but the forge does not show whether the Renovate pull
+    /// request got its head `head` before or after, so the factory cannot
+    /// tell whether a rebase is due.
+    MergedUnordered {
+        head: String,
+    },
     Cancelled,
     /// A pull request of the fix job closed without merging.
     Closed,
@@ -442,11 +448,25 @@ impl RenovatePr {
             self.pending = Some(Pending::Rebase);
             return Turn::Factory;
         }
+        if let FixOutcome::MergedUnordered { head } = outcome {
+            self.head = Some(head.clone());
+            self.fix = Some(FixLink {
+                job,
+                state: FixState::Merged {
+                    head,
+                    rebase: RebaseState::Failed,
+                },
+                earlier,
+            });
+            return Turn::User(self.fix_ask());
+        }
         let line = match outcome {
             FixOutcome::Cancelled => format!("Fix job #{job} was cancelled."),
             FixOutcome::Closed => format!("Fix job #{job} was closed without merging."),
             FixOutcome::Dismissed => format!("Fix job #{job} was dismissed after a failure."),
-            FixOutcome::Deleted | FixOutcome::Merged { .. } => {
+            FixOutcome::Deleted
+            | FixOutcome::Merged { .. }
+            | FixOutcome::MergedUnordered { .. } => {
                 format!("Fix job #{job} was deleted.")
             }
         };

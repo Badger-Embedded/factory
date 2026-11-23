@@ -457,7 +457,7 @@ impl Executor for FakeExecutor {
                 .clone()
                 .unwrap_or_else(|| "h1".to_owned()),
             pushed_at: self.head_pushed_at.lock().unwrap().clone(),
-            committed_at: "1970-01-01 00:00:00".to_owned(),
+            committed_at: Some("1970-01-01 00:00:00".to_owned()),
         })
     }
 
@@ -5829,11 +5829,31 @@ async fn a_fast_forward_after_the_merge_is_unknown_and_asks_the_user() {
     // h2 was committed before the merge and reached the branch by a plain
     // push, which GitHub does not date. The factory never saw it before.
     *executor.current_head.lock().unwrap() = Some("h2".into());
+    *executor.renovate_now.lock().unwrap() = failing("h2");
     step_until(&scheduler, || {
         needs_you(&store, id) == Some(RenovateWait::RebaseFailed)
     })
     .await;
     assert!(executor.rebase_calls.lock().unwrap().is_empty());
+    assert_eq!(pr_of(&store, id).head.as_deref(), Some("h2"));
+
+    // The same head again changes nothing.
+    let rows = store.events(id).unwrap().len();
+    let reruns = executor.rerun_requests.lock().unwrap().len();
+    for _ in 0..5 {
+        step(&scheduler).await;
+    }
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::RebaseFailed));
+    assert_eq!(store.events(id).unwrap().len(), rows);
+    assert_eq!(executor.rerun_requests.lock().unwrap().len(), reruns);
+
+    // Only a later head restarts triage.
+    *executor.renovate_now.lock().unwrap() = failing("h3");
+    step_until(&scheduler, || {
+        pr_of(&store, id).head.as_deref() == Some("h3")
+    })
+    .await;
+    assert!(pr_of(&store, id).fix.is_none());
 }
 
 #[tokio::test]

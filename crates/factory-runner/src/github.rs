@@ -145,7 +145,7 @@ pub struct HeadCommit {
     pub pushed_at: Option<String>,
     /// When the commit was made. The commit was not the head before this, but
     /// may have become the head long after.
-    pub committed_at: String,
+    pub committed_at: Option<String>,
 }
 
 /// What an agent needs to judge a pull request.
@@ -888,8 +888,6 @@ impl GitHub {
                 _ => {}
             }
         }
-        let committed_at = committed_at
-            .ok_or_else(|| format!("the timeline of #{number} does not show its head"))?;
         Ok(HeadCommit {
             sha: pr.head,
             pushed_at,

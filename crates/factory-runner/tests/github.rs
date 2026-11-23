@@ -899,7 +899,7 @@ async fn head_commit_dates_a_force_push_by_the_push_not_the_commit() {
     let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
     assert_eq!(head.sha, "h2");
     assert_eq!(head.pushed_at.as_deref(), Some("2026-01-02 03:04:05"));
-    assert_eq!(head.committed_at, "2026-01-01 01:00:00");
+    assert_eq!(head.committed_at.as_deref(), Some("2026-01-01 01:00:00"));
     assert!(
         fs::read_to_string(&calls)
             .unwrap()
@@ -916,7 +916,32 @@ async fn head_commit_has_no_push_time_without_a_force_push() {
     );
     let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
     assert_eq!(head.pushed_at, None);
-    assert_eq!(head.committed_at, "2026-01-01 00:00:00");
+    assert_eq!(head.committed_at.as_deref(), Some("2026-01-01 00:00:00"));
+}
+
+#[tokio::test]
+async fn head_commit_uses_a_force_push_without_a_commit_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h2","timelineItems":{"nodes":[{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-01-02T03:04:05Z","afterCommit":{"oid":"h2"}}]}}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.pushed_at.as_deref(), Some("2026-01-02 03:04:05"));
+    assert_eq!(head.committed_at, None);
+}
+
+#[tokio::test]
+async fn head_commit_has_no_times_when_the_timeline_lacks_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h2","timelineItems":{"nodes":[]}}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.sha, "h2");
+    assert_eq!(head.pushed_at, None);
+    assert_eq!(head.committed_at, None);
 }
 
 #[tokio::test]

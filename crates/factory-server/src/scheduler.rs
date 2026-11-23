@@ -279,10 +279,6 @@ fn fix_outcome(fix: &Job) -> Option<FixOutcome> {
     }
 }
 
-/// The merge head when the forge and the factory cannot say whether the
-/// Renovate head came before or after the fix merged. No commit has it.
-const UNKNOWN_HEAD: &str = "unknown";
-
 /// The reason core gives a job whose pull request closed without merging.
 const FIX_PR_CLOSED: &str = "the pull request was closed without merging";
 
@@ -1761,7 +1757,7 @@ impl<E: Executor> Scheduler<E> {
         };
         if matches!(outcome, FixOutcome::Merged { .. }) {
             match self.merge_head(request, fix_id).await {
-                Ok(head) => outcome = FixOutcome::Merged { head },
+                Ok(merged) => outcome = merged,
                 Err(err) => {
                     tracing::warn!("reading the head of #{}: {err}", request.number);
                     return;
@@ -1777,10 +1773,10 @@ impl<E: Executor> Scheduler<E> {
         );
     }
 
-    /// The head Renovate's pull request had when fix job `fix_id` merged.
-    /// The empty head means the head became the head after the merge, so no
-    /// rebase is due, and [`UNKNOWN_HEAD`] means the evidence does not say.
-    /// The evidence, in order:
+    /// How fix job `fix_id` merged relative to Renovate's pull request head.
+    /// `Merged` with the empty head means the head became the head after the
+    /// merge, so no rebase is due. `MergedUnordered` carries the current head
+    /// and means the evidence does not say. The evidence, in order:
     ///
     /// 1. The force push GitHub dated: it decides.
     /// 2. A commit made after the merge: it became the head after it.
@@ -1792,7 +1788,7 @@ impl<E: Executor> Scheduler<E> {
         &self,
         request: &RenovateWatchRequest,
         fix_id: i64,
-    ) -> Result<String, String> {
+    ) -> Result<FixOutcome, String> {
         let fix = self.store.get(fix_id).map_err(|err| err.to_string())?;
         let mut merged_at: Option<String> = None;
         for number in fix.job.plan().iter().filter_map(|pr| pr.number) {
@@ -1813,22 +1809,26 @@ impl<E: Executor> Scheduler<E> {
             )
             .await?;
         if let Some(pushed_at) = &head.pushed_at {
-            return Ok(if *pushed_at > merged_at {
-                String::new()
-            } else {
-                head.sha
+            return Ok(FixOutcome::Merged {
+                head: if *pushed_at > merged_at {
+                    String::new()
+                } else {
+                    head.sha
+                },
             });
         }
-        if head.committed_at > merged_at {
-            return Ok(String::new());
+        if head.committed_at.as_ref().is_some_and(|at| *at > merged_at) {
+            return Ok(FixOutcome::Merged {
+                head: String::new(),
+            });
         }
         let seen = self
             .store
             .head_first_seen(request.job_id, &head.sha)
             .map_err(|err| err.to_string())?;
         Ok(match seen {
-            Some(seen) if seen <= merged_at => head.sha,
-            _ => UNKNOWN_HEAD.to_owned(),
+            Some(seen) if seen <= merged_at => FixOutcome::Merged { head: head.sha },
+            _ => FixOutcome::MergedUnordered { head: head.sha },
         })
     }
 
@@ -1842,16 +1842,6 @@ impl<E: Executor> Scheduler<E> {
     ) {
         if head.is_empty() {
             self.apply(job_id, Event::RebaseSkipped);
-            return;
-        }
-        if head == UNKNOWN_HEAD {
-            let reason =
-                "it could not tell whether Renovate pushed after the fix job merged".to_owned();
-            self.note(
-                job_id,
-                &format!("Could not ask Renovate to rebase: {reason}"),
-            );
-            self.apply(job_id, Event::RebaseFailed { reason });
             return;
         }
         // The claim comes before the write, and the write needs a pending fix
