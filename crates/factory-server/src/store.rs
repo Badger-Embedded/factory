@@ -729,8 +729,6 @@ impl Store {
         })
     }
 
-    /// `renovate_author` joined `project_maintenance` after the table shipped.
-    /// A fresh database already has the column from SCHEMA, so this skips it.
     fn migrate_renovate_author(conn: &Connection) -> Result<(), StoreError> {
         let has: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('project_maintenance') WHERE name = 'renovate_author'",
