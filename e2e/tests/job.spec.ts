@@ -672,7 +672,7 @@ test('a stopped Renovate job starts a fix job and links to it', async ({ page, f
   await back.click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${id}$`));
 
-  factory.fixture('end-fix', '--job', id, '--fix', fix);
+  factory.fixture('apply', '--job', id, '--fix', fix);
   await page.goto(`/jobs/${id}`);
   const stopped = page.locator('.status-detail');
   const rows = await stopped.evaluate((el) => {

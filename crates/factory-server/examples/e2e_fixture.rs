@@ -239,6 +239,20 @@ fn end_fix(store: &Store, job: i64, fix: i64) -> Result<()> {
     Ok(())
 }
 
+fn apply(store: &Store, flags: &HashMap<String, Vec<String>>) -> Result<()> {
+    let one = |name: &str| -> Result<&str> {
+        Ok(flags.get(name).ok_or(format!("--{name} is required"))?[0].as_str())
+    };
+    let job: i64 = one("job")?.parse()?;
+    if flags.contains_key("fix") {
+        return end_fix(store, job, one("fix")?.parse()?);
+    }
+    for event in events_named(one("event")?)? {
+        store.apply(job, event)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing subcommand")?;
@@ -308,12 +322,7 @@ fn main() -> Result<()> {
                 .ok_or("the pull request already has a job")?;
             println!("{id}");
         }
-        "apply" => {
-            for event in events_named(one("event")?)? {
-                store.apply(one("job")?.parse()?, event)?;
-            }
-        }
-        "end-fix" => end_fix(&store, one("job")?.parse()?, one("fix")?.parse()?)?,
+        "apply" => apply(&store, &flags)?,
         "log" => {
             let job = one("job")?.parse()?;
             let text = one("text")?;
