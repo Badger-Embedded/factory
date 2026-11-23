@@ -4,6 +4,12 @@
 //   the worker tiles: "lists the seeded jobs in their sections with totals and workers"
 // - The project picker switches the board through its row links:
 //   "the project picker switches the board"
+// - The picker's search box has focus on open, filters rows by name or identifier
+//   in any case, moves a highlight with the arrow keys and opens it with Enter, and
+//   says when nothing matches: "the picker search filters and opens the match",
+//   "opening the picker focuses the search and closing clears it"
+// - A poll updates the picker rows while the panel stays open with the typed
+//   filter and focus: "a poll keeps the picker search text, focus and filter"
 // - A login on no project sees the empty state and the onboarding link:
 //   "a login on no project is sent to onboarding"
 // - Submitting the New request form creates a job that shows on the board:
@@ -95,6 +101,73 @@ test('the badge follows a job in another project', async ({ page, factory }, tes
   const badge = page.locator('#picker-badge');
   await expect(badge.locator('.badge.you')).toHaveText('1', { timeout: 10_000 });
   await expect(badge).toHaveAttribute('aria-label', '1 need you in 1 other project');
+});
+
+test('the picker search filters and opens the match', async ({ page, factory }, testInfo) => {
+  const id = `s${testInfo.workerIndex}-${Date.now()}`;
+  const [alpha, alphabet, beta] = [`${id}-alpha`, `${id}-alphabet`, `${id}-beta`];
+  await badgeLogin(page, factory, [alpha, alphabet, beta]);
+  await page.goto(`/?project=${beta}`);
+  const rows = page.locator('#picker-list li:not([hidden])');
+  const search = page.getByLabel('Find a project');
+
+  await page.getByLabel('Project', { exact: true }).click();
+  await search.fill(`${id}-ALPH`.toUpperCase());
+  await expect(rows).toHaveCount(2);
+  await expect(rows.first()).toHaveClass(/active/);
+  await search.press('Enter');
+  await expect(page).toHaveURL(new RegExp(`[?&]project=${alpha}$`));
+
+  await page.getByLabel('Project', { exact: true }).click();
+  await page.getByLabel('Find a project').fill('ALPH');
+  await page.getByLabel('Find a project').press('ArrowDown');
+  await page.getByLabel('Find a project').press('Enter');
+  await expect(page).toHaveURL(new RegExp(`[?&]project=${alphabet}$`));
+
+  await page.getByLabel('Project', { exact: true }).click();
+  await page.getByLabel('Find a project').fill('no-such-project');
+  await expect(rows).toHaveCount(0);
+  await expect(page.getByText('No project matches.')).toBeVisible();
+});
+
+test('opening the picker focuses the search and closing clears it', async ({ page, factory }, testInfo) => {
+  const id = `c${testInfo.workerIndex}-${Date.now()}`;
+  const [home, other] = [`${id}-h`, `${id}-o`];
+  await badgeLogin(page, factory, [home, other]);
+  await page.goto(`/?project=${home}`);
+  const button = page.getByLabel('Project', { exact: true });
+  const search = page.getByLabel('Find a project');
+
+  await button.click();
+  await expect(search).toBeFocused();
+  await search.fill('-o');
+  await expect(page.locator('#picker-list li:not([hidden])')).toHaveCount(1);
+  await search.press('Escape');
+  await expect(button).toBeFocused();
+
+  await button.click();
+  await expect(search).toHaveValue('');
+  await expect(page.locator('#picker-list li:not([hidden])')).toHaveCount(2);
+});
+
+test('a poll keeps the picker search text, focus and filter', async ({ page, factory }, testInfo) => {
+  const id = `k${testInfo.workerIndex}-${Date.now()}`;
+  const [home, other, third] = [`${id}-h`, `${id}-o`, `${id}-t`];
+  await badgeLogin(page, factory, [home, other, third]);
+  await page.goto(`/?project=${home}`);
+  const search = page.getByLabel('Find a project');
+  await page.getByLabel('Project', { exact: true }).click();
+  await search.fill('-o');
+  const row = page.locator(`#picker-list li[data-id="${other}"]`);
+  await expect(row).toHaveAttribute('data-attention', 'idle');
+
+  factory.fixture('job', '--project', other, '--stage', 'spec');
+  await expect(row).toHaveAttribute('data-attention', 'you', { timeout: 10_000 });
+  await expect(page.locator('#project-picker')).toHaveJSProperty('open', true);
+  await expect(search).toHaveValue('-o');
+  await expect(search).toBeFocused();
+  await expect(row).toBeVisible();
+  await expect(page.locator(`#picker-list li[data-id="${third}"]`)).toBeHidden();
 });
 
 test.describe('without a project', () => {

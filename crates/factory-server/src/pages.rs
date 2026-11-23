@@ -646,7 +646,12 @@ fn project_selector(
                 span.picker-chevron aria-hidden="true" {}
             }
             div.picker-panel {
+                input.picker-search #picker-search type="search" hidden
+                    role="combobox" aria-label="Find a project" aria-controls="picker-list"
+                    aria-expanded="true" aria-autocomplete="list" autocomplete="off"
+                    spellcheck="false" placeholder="Find a project…";
                 (picker(attention, selected, false))
+                p.picker-empty hidden { "No project matches." }
             }
             script { (PreEscaped(PROJECT_PICKER)) }
         }
@@ -695,7 +700,7 @@ pub fn picker(attention: &[ProjectAttention], selected: &str, poll: bool) -> Reg
     let inner = html! {
         @for entry in attention {
             @let label = &entry.label;
-            li data-attention=(entry.kind()) data-id=(label.id) data-name=(label.shown) {
+            li id={ "picker-opt-" (label.id) } data-attention=(entry.kind()) data-id=(label.id) data-name=(label.shown) {
                 a href={ "/?project=" (crate::web::query_escape(&label.id)) }
                     aria-current=[(label.id == selected).then_some("page")] {
                     span.picker-name title=(label.shown) { (label.shown) }

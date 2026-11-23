@@ -4267,6 +4267,29 @@ async fn the_picker_is_in_the_topbar_and_the_form_has_no_project_select() {
 }
 
 #[tokio::test]
+async fn the_picker_has_a_search_box_and_a_hidden_empty_message() {
+    let page = two_projects().get("/?project=tool").await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let one = |css: &str| doc.select(&scraper::Selector::parse(css).unwrap()).next();
+    let search = one("#project-picker .picker-panel > input#picker-search").unwrap();
+    assert_eq!(search.value().attr("type"), Some("search"));
+    assert_eq!(search.value().attr("aria-label"), Some("Find a project"));
+    assert_eq!(search.value().attr("aria-controls"), Some("picker-list"));
+    let empty = one("#project-picker .picker-panel > p.picker-empty").unwrap();
+    assert!(empty.value().attr("hidden").is_some());
+    assert_eq!(empty.text().collect::<String>(), "No project matches.");
+    let rows = doc
+        .select(&scraper::Selector::parse("#picker-list > li").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert!(row.value().attr("data-id").is_some());
+        assert!(row.value().attr("data-name").is_some());
+        assert!(row.value().attr("id").unwrap().starts_with("picker-opt-"));
+    }
+}
+
+#[tokio::test]
 async fn the_picker_sits_after_the_brand_and_before_the_nav() {
     let page = two_projects().get("/?project=tool").await;
     let brand = page.body.find("class=\"brand\"").unwrap();
