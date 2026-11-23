@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Event, PrDescription};
 use factory_runner::{
-    Account, Ci, FailedCheck, Forge, ForgeAccount, GitHub, LookupError, Observation, PrState,
-    RenovatePr, Rerun, WorkerConfig, actions_job_id, checks_args, is_renovate_login, observe,
-    parse_renovate_prs, parse_status, run_checks,
+    Access, Account, Ci, FailedCheck, Forge, ForgeAccount, GitHub, LookupError, Observation,
+    PrState, RenovatePr, Rerun, WorkerConfig, actions_job_id, checks_args, is_renovate_login,
+    observe, parse_renovate_prs, parse_status, run_checks,
 };
 
 const VIEW: &str = r#"{
@@ -936,6 +936,40 @@ async fn approve_names_the_checked_commit_so_a_later_head_is_not_approved() {
 
 fn account() -> Account {
     Account::default()
+}
+
+#[tokio::test]
+async fn access_reads_the_permissions_of_the_account_on_the_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = script(
+        dir.path(),
+        "gh",
+        r#"case "$2" in
+  repos/o/admin) echo '{"permissions":{"admin":true,"maintain":true,"push":true}}' ;;
+  repos/o/maintain) echo '{"permissions":{"admin":false,"maintain":true,"push":false}}' ;;
+  repos/o/push) echo '{"permissions":{"admin":false,"maintain":false,"push":true}}' ;;
+  repos/o/read) echo '{"permissions":{"admin":false,"maintain":false,"push":false}}' ;;
+  repos/o/hidden) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  *) echo "gh: boom" >&2; exit 1 ;;
+esac"#,
+    );
+    let github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+    let account = account();
+
+    let access = |repo: &'static str| {
+        let github = &github;
+        let account = &account;
+        async move { github.access(account, repo).await }
+    };
+    assert_eq!(access("o/admin").await, Ok(Access::Admin));
+    assert_eq!(access("o/maintain").await, Ok(Access::Write));
+    assert_eq!(access("o/push").await, Ok(Access::Write));
+    assert_eq!(access("o/read").await, Ok(Access::Read));
+    assert_eq!(access("o/hidden").await, Ok(Access::NotVisible));
+    assert!(access("o/other").await.is_err());
 }
 
 #[tokio::test]

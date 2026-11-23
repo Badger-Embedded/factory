@@ -124,6 +124,16 @@ pub enum LookupError {
     Failed(String),
 }
 
+/// What an account may do in a repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// The repository does not exist or the account cannot see it.
+    NotVisible,
+    Read,
+    Write,
+    Admin,
+}
+
 /// What the factory asks of a forge. Errors are the forge CLI's message.
 pub trait Forge: Send + Sync {
     /// Where `repo` (`owner/name`) is cloned from.
@@ -135,6 +145,13 @@ pub trait Forge: Send + Sync {
         &'a self,
         token: &'a str,
     ) -> BoxFuture<'a, Result<ForgeAccount, LookupError>>;
+
+    /// What `account` may do in `repo`.
+    fn access<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+    ) -> BoxFuture<'a, Result<Access, String>>;
 
     /// The account that runs as `token`, whose commits carry `found`'s
     /// login and noreply address.

@@ -383,6 +383,7 @@ a.worker-job:hover { color: var(--accent); }
 
 .card.needs-you { border-color: var(--you); background: linear-gradient(var(--you-bg), var(--you-bg)) var(--surface); box-shadow: var(--elevation-bar) var(--you); }
 .card.failed { border-color: var(--bad); background: linear-gradient(var(--bad-bg), var(--bad-bg)) var(--surface); box-shadow: var(--elevation-bar) var(--bad); }
+.card.missing-project-token { border-color: var(--you); background: linear-gradient(var(--you-bg), var(--you-bg)) var(--surface); box-shadow: var(--elevation-bar) var(--you); }
 
 .card-head { display: flex; align-items: center; gap: var(--space-10); margin-bottom: var(--space-12); }
 .card-head h2 { margin: 0; font-size: var(--font-size-lg); }

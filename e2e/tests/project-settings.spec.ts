@@ -13,6 +13,7 @@
 //   "a changed form shows Unsaved changes. and leaving the page asks first"
 // - Collaborators: add one and remove one: "a collaborator can be added and removed"
 // - The maintenance settings save: "the maintenance settings save"
+// - The Forge account card: "the Forge account card saves a project token by its access and keeps the switch per login"
 // - Removing a project takes it off the picker:
 //   "removing a project takes it off the picker"
 // - Project MCP page:
@@ -216,6 +217,59 @@ test('the maintenance settings save', async ({ page, project }) => {
   await expect(card.getByLabel('Manifest files')).toHaveValue('debian/control\ndebian/rules');
   await expect(card.getByLabel('Build config files')).toHaveValue('packaging/build.yaml');
   await expect(card.getByLabel('Upstream repository')).toHaveValue('e2e/upstream');
+});
+
+test('the Forge account card saves a project token by its access and keeps the switch per login', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project));
+  const card = page.locator('#forge-account');
+  await expect(page.getByText('has no project token')).toBeVisible();
+  await expect(card.getByRole('link', { name: `e2e/${project}` })).toHaveAttribute(
+    'href',
+    `https://github.com/e2e/${project}`,
+  );
+  await expect(card.getByRole('link', { name: `e2e/${project}` })).toHaveAttribute(
+    'target',
+    '_blank',
+  );
+
+  const save = async (token: string) => {
+    await card.getByLabel('Project token').fill(token);
+    await card.getByRole('button', { name: 'Save project token' }).click();
+  };
+  await save('tok-e2e-ghost');
+  await expect(page.getByText(`ghost-bot cannot see e2e/${project}`)).toBeVisible();
+  await expect(page.getByText('has no project token')).toBeVisible();
+
+  await save('tok-e2e-bob');
+  await expect(page.getByText('only Read access')).toBeVisible();
+  await expect(card.locator('.forge-account')).toHaveText('bob-bot');
+
+  await save('tok-e2e-alice');
+  await expect(page.getByText('Saved. The project token belongs to alice-bot.')).toBeVisible();
+  expect(await page.content()).not.toContain('tok-e2e-alice');
+  await expect(page.getByText('has no project token')).toHaveCount(0);
+  await page.goto(`/?project=${project}`);
+  await expect(page.getByText('has no project token')).toHaveCount(0);
+
+  await page.goto(settingsPath(project));
+  const mine = card.getByLabel('Use my account');
+  await expect(mine).not.toBeChecked();
+  // The sticky save bar and top bar cover these controls at every scroll position.
+  await mine.dispatchEvent('click');
+  await card.getByRole('button', { name: 'Save switch' }).dispatchEvent('click');
+  await expect(card.getByText('You have no GitHub token')).toBeVisible();
+  await expect(card.getByRole('link', { name: 'Save your GitHub token' })).toHaveAttribute(
+    'href',
+    '/settings/forges/github',
+  );
+  await expect(card.getByLabel('Use my account')).toBeChecked();
+
+  const clear = card.getByRole('button', { name: 'Clear project token' });
+  await clear.dispatchEvent('click');
+  await expect(page.getByText('has no project token')).toBeVisible();
 });
 
 test('removing a project takes it off the picker', async ({ page, project }) => {

@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS project_collaborators (
     login TEXT NOT NULL,
     added_by TEXT NOT NULL,
     added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    use_my_account INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project, login)
 );
 CREATE TABLE IF NOT EXISTS project_maintenance (
@@ -331,6 +332,9 @@ pub struct Collaborator {
     pub added_by: String,
     /// UTC, as SQLite's `CURRENT_TIMESTAMP` writes it.
     pub added_at: String,
+    /// Whether this collaborator's request jobs run as their own forge
+    /// account instead of the project's.
+    pub use_my_account: bool,
 }
 
 /// What a session last ran with: its agent and that agent's model and effort.
@@ -546,6 +550,19 @@ impl Store {
         )?;
         if has_review == 0 {
             conn.execute("ALTER TABLE project_models ADD COLUMN review TEXT", [])?;
+        }
+        // `use_my_account` joined `project_collaborators` with the project
+        // forge token. A fresh database has it from SCHEMA. The default is off.
+        let has_use_my_account: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('project_collaborators') WHERE name = 'use_my_account'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_use_my_account == 0 {
+            conn.execute(
+                "ALTER TABLE project_collaborators ADD COLUMN use_my_account INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         // `llm_review` joined `project_settings` after auto-merge shipped, so
         // add it to a table that predates it. A fresh database already has the
@@ -1897,7 +1914,7 @@ impl Store {
     pub fn collaborators(&self, project: &str) -> Result<Vec<Collaborator>, StoreError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT login, added_by, added_at FROM project_collaborators
+            "SELECT login, added_by, added_at, use_my_account FROM project_collaborators
              WHERE project = ?1 ORDER BY added_at, login",
         )?;
         let rows = stmt.query_map([project], |row| {
@@ -1905,9 +1922,48 @@ impl Store {
                 login: row.get(0)?,
                 added_by: row.get(1)?,
                 added_at: row.get(2)?,
+                use_my_account: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether `login` has "Use my account" on for `project`. A login that is
+    /// not a collaborator reads as off.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn use_my_account(&self, project: &str, login: &str) -> Result<bool, StoreError> {
+        let on = self
+            .conn()
+            .query_row(
+                "SELECT use_my_account FROM project_collaborators WHERE project = ?1 AND login = ?2",
+                params![project, login],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        Ok(on.unwrap_or(false))
+    }
+
+    /// Sets the "Use my account" switch of the collaborator `login`. A login
+    /// that is not a collaborator is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_use_my_account(
+        &self,
+        project: &str,
+        login: &str,
+        on: bool,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE project_collaborators SET use_my_account = ?3
+             WHERE project = ?1 AND login = ?2",
+            params![project, login, on],
+        )?;
+        Ok(())
     }
 
     /// Whether `login` is a collaborator on `project`.

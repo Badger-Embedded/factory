@@ -16,6 +16,10 @@ if [ "$1" = api ]; then
           echo '{"login":"bob-bot","id":22}'
           exit 0
           ;;
+        tok-e2e-ghost)
+          echo '{"login":"ghost-bot","id":33}'
+          exit 0
+          ;;
       esac
       echo "gh: Bad credentials (HTTP 401)" >&2
       exit 1
@@ -35,6 +39,25 @@ if [ "$1" = api ]; then
     repos/e2e/good/actions/workflows)
       echo '{"total_count":1}'
       exit 0
+      ;;
+    repos/e2e/*/*) ;;
+    repos/e2e/*)
+      # The account's access to a project's repository, by token: alice-bot
+      # has Write, bob-bot has Read and ghost-bot cannot see it.
+      case "$GH_TOKEN" in
+        tok-e2e-alice)
+          echo '{"permissions":{"admin":false,"maintain":false,"push":true}}'
+          exit 0
+          ;;
+        tok-e2e-bob)
+          echo '{"permissions":{"admin":false,"maintain":false,"push":false}}'
+          exit 0
+          ;;
+        tok-e2e-ghost)
+          echo "gh: Not Found (HTTP 404)" >&2
+          exit 1
+          ;;
+      esac
       ;;
   esac
 fi
