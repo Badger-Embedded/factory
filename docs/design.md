@@ -296,7 +296,7 @@ Not built yet: the other factory skills (unslop, no-comments, open-pr, spec inte
 
 `open-pr` changes from maestro's version: the worker stops when its commits are ready, and the factory pushes and opens the pull request.
 
-This repository follows the same standards as maestro: `CONTRIBUTING.md`, a check on pull request titles and descriptions, and prek hooks. It has no ruleset on `main`. GitHub allows rulesets on a private repository only on a paid plan, and the factory stays private for now. Nothing on GitHub blocks a direct push or a merge with failing checks, so the reviewer merges only after CI passes. Merges are squash only, and GitHub deletes the branch after a merge.
+This repository follows the same standards as maestro: `CONTRIBUTING.md`, a check on pull request titles and descriptions, and prek hooks. Two gitleaks hooks guard against committed secrets: one scans staged changes, the other the current branch's history, which CI runs through `just lint`. `--redact` keeps values out of logs, and a known fixture goes into `.gitleaksignore` by fingerprint, never by directory. The repository has no ruleset on `main`. GitHub allows rulesets on a private repository only on a paid plan, and the factory stays private for now. Nothing on GitHub blocks a direct push or a merge with failing checks, so the reviewer merges only after CI passes. Merges are squash only, and GitHub deletes the branch after a merge.
 
 The `Title and description` job reads the title and body with `gh pr view`, not from the event payload. The payload is a snapshot from when the event fired, so rerunning the job after an edit to the description checked the old text. `gh pr view` returns the current text. The job needs `pull-requests: read` for it.
 
