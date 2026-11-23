@@ -283,6 +283,7 @@ test.describe('as a login of its own', () => {
 
     await page.goto(`/?project=ren${tag}`);
     await button(page).click();
+    await expect(page.getByLabel('Find a project')).toBeFocused();
     const link = page.locator(`#picker-list a[href="/?project=other${tag}"]`);
     await link.focus();
     await expect(link).toBeFocused();

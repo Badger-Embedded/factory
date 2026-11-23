@@ -11,8 +11,72 @@
     panel.style.maxHeight = Math.max(room, 0) + "px";
   }
 
+  const search = document.getElementById("picker-search");
+  const empty = picker.querySelector(".picker-empty");
+  const status = picker.querySelector(".picker-status");
+  search.hidden = false;
+
+  function rows() {
+    const list = document.getElementById("picker-list");
+    return list ? Array.from(list.querySelectorAll("li")) : [];
+  }
+
+  function visibleRows() {
+    return rows().filter(function (row) { return !row.hidden; });
+  }
+
+  let activeId = null;
+
+  function highlight(row) {
+    activeId = row ? row.dataset.id : null;
+    rows().forEach(function (other) { other.classList.toggle("active", other === row); });
+    if (row) {
+      status.textContent = row.dataset.name;
+      row.scrollIntoView({ block: "nearest" });
+    } else {
+      status.textContent = search.value.trim() === "" ? "" : "No project matches.";
+    }
+  }
+
+  function applyFilter(keepActive) {
+    const query = search.value.trim().toLowerCase();
+    rows().forEach(function (row) {
+      row.hidden = query !== "" &&
+        !row.dataset.name.toLowerCase().includes(query) &&
+        !row.dataset.id.toLowerCase().includes(query);
+    });
+    const shown = visibleRows();
+    empty.hidden = shown.length > 0;
+    const kept = keepActive === true && shown.find(function (row) { return row.dataset.id === activeId; });
+    highlight(kept || shown[0] || null);
+  }
+
+  search.addEventListener("input", function () { applyFilter(false); });
+  search.addEventListener("keydown", function (event) {
+    if (event.isComposing || event.keyCode === 229) return;
+    const shown = visibleRows();
+    const at = shown.findIndex(function (row) { return row.classList.contains("active"); });
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (shown.length === 0) return;
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      highlight(shown[Math.min(Math.max(at + step, 0), shown.length - 1)]);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const link = at >= 0 ? shown[at].querySelector("a") : null;
+      if (link) window.location.href = link.href;
+    }
+  });
+
   picker.addEventListener("toggle", function () {
     summary.setAttribute("aria-expanded", picker.open ? "true" : "false");
+    if (picker.open) {
+      applyFilter(false);
+      search.focus();
+    } else {
+      search.value = "";
+      applyFilter(false);
+    }
     fitPanel();
   });
   window.addEventListener("resize", fitPanel);
@@ -20,6 +84,7 @@
     if (picker.open && !picker.contains(event.target)) picker.open = false;
   });
   document.addEventListener("keydown", function (event) {
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Escape" && picker.open) {
       picker.open = false;
       summary.focus();
@@ -52,6 +117,7 @@
     if (detached) clearCurrent(list);
     const row = list.querySelector('a[aria-current="page"] .picker-name');
     if (row) current.textContent = row.textContent;
+    applyFilter(true);
     if (focusedHref !== null) {
       for (const link of list.querySelectorAll("a")) {
         if (link.getAttribute("href") === focusedHref) link.focus();
@@ -80,6 +146,7 @@
           badge.replaceWith(freshBadge);
         }
         htmx.process(fresh);
+        applyFilter(true);
       });
   });
 })();
