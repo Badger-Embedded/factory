@@ -321,12 +321,17 @@ fn wrapper_exit(build_ok: bool, shell_ok: bool, command: &str) -> Option<i32> {
         dir.path().display(),
         std::env::var("PATH").unwrap()
     );
-    std::process::Command::new(&args[image + 1])
+    let tmp = dir.path().join("tmp");
+    fs::create_dir(&tmp).unwrap();
+    let code = std::process::Command::new(&args[image + 1])
         .args(&args[image + 2..])
         .env("PATH", path)
+        .env("TMPDIR", &tmp)
         .status()
         .unwrap()
-        .code()
+        .code();
+    assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0, "left a marker");
+    code
 }
 
 #[test]
@@ -336,6 +341,10 @@ fn the_wrapper_tells_setup_failures_from_command_failures() {
     assert_eq!(wrapper_exit(false, true, "exit 0"), Some(86));
     assert_eq!(wrapper_exit(true, false, "exit 0"), Some(86));
     assert_eq!(wrapper_exit(true, true, "exit 86"), Some(1));
+    assert_eq!(
+        wrapper_exit(true, true, "rm -f \"$TMPDIR\"/tmp.*; exit 3"),
+        Some(3)
+    );
 }
 
 #[tokio::test]

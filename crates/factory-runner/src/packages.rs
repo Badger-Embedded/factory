@@ -6,18 +6,21 @@ pub const FAILED_CODE: i32 = 86;
 
 /// Takes the package count, then that many package names, and runs the rest
 /// as the command. It builds the packages first so a failure is reported
-/// before the command starts. The command touches a marker file when it
-/// starts, so an exit before that is a setup failure and exits 86. A command
+/// before the command starts. The command writes a line to a deleted file
+/// held open on a descriptor when it starts, which command cleanup of
+/// temporary files cannot erase, so an exit before that is a setup failure and exits 86. A command
 /// that exits 86 itself is reported as 1. The package names arrive as
 /// arguments, never inside this text.
 const SCRIPT: &str = r#"n=$1; shift
 pkgs=()
 for ((i = 0; i < n; i++)); do pkgs+=("nixpkgs#$1"); shift; done
 nix build --no-link "${pkgs[@]}" >&2 || exit 86
-started=$(mktemp -u)
-nix shell "${pkgs[@]}" --command bash -c 'touch "$0" && exec "$@"' "$started" "$@"
+f=$(mktemp)
+exec 9>"$f" 8<"$f"
+rm -f "$f"
+nix shell "${pkgs[@]}" --command bash -c 'echo >&9; exec "$@" 8<&- 9>&-' bash "$@"
 code=$?
-if [ ! -e "$started" ]; then exit 86; fi
+if ! IFS= read -r -u 8 _; then exit 86; fi
 if [ "$code" -eq 86 ]; then exit 1; fi
 exit "$code""#;
 
