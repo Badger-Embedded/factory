@@ -226,12 +226,14 @@ pub trait Forge: Send + Sync {
     ) -> BoxFuture<'a, Result<PrDetails, String>>;
 
     /// Asks Renovate to rebase its pull request by ticking the rebase
-    /// checkbox in the description, or reports that there is none.
+    /// checkbox in the description, or reports that there is none or that the
+    /// head is no longer `head`.
     fn request_renovate_rebase<'a>(
         &'a self,
         account: &'a Account,
         repo: &'a str,
         number: u64,
+        head: &'a str,
     ) -> BoxFuture<'a, Result<RebaseCheckbox, String>>;
 
     /// Posts a comment on the pull request.

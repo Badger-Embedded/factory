@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, Gap, Gates, Job,
-    PrerequisiteState, Rejected, Session, Stage, Wait,
+    Agent, AgentResult, Ask, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, Gap, Gates, Job,
+    PrerequisiteState, Rejected, Session, Stage, Turn, Wait,
 };
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -218,6 +218,11 @@ CREATE TABLE IF NOT EXISTS renovate_prs (
     number INTEGER NOT NULL,
     job_id INTEGER NOT NULL,
     PRIMARY KEY (project, number)
+);
+CREATE TABLE IF NOT EXISTS rebase_claims (
+    job_id INTEGER NOT NULL,
+    fix_job INTEGER NOT NULL,
+    PRIMARY KEY (job_id, fix_job)
 );
 CREATE TABLE IF NOT EXISTS dismissed_gaps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1033,6 +1038,61 @@ impl Store {
         Ok(row)
     }
 
+    /// Claims the one request to Renovate to rebase for fix job `fix_job` of
+    /// Renovate job `job_id`. Returns `false` when an earlier call claimed it,
+    /// so a restart between the write and its result never writes twice.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn claim_rebase(&self, job_id: i64, fix_job: i64) -> Result<bool, StoreError> {
+        let claimed = self.conn().execute(
+            "INSERT OR IGNORE INTO rebase_claims (job_id, fix_job) VALUES (?1, ?2)",
+            params![job_id, fix_job],
+        )?;
+        Ok(claimed == 1)
+    }
+
+    /// Creates the fix job for the stopped Renovate job `renovate_id`, with
+    /// `login` as its requester, and links it to the Renovate job in one
+    /// transaction. A second call while the first fix job is unfinished is
+    /// rejected and creates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Rejected`] when the Renovate job is not at
+    /// Triage stopped or already waits for a fix job.
+    pub fn start_fix(
+        &self,
+        renovate_id: i64,
+        login: &str,
+        instructions: Option<&str>,
+    ) -> Result<i64, StoreError> {
+        let project = self.get(renovate_id)?.project;
+        let gates = self.project_gates(&project)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, renovate_id)?;
+        let mut check = row.job.clone();
+        check
+            .apply(Event::FixStarted { job: 0 })
+            .map_err(StoreError::Rejected)?;
+        let (Some(pr), Turn::User(Ask::Renovate { reason, .. })) =
+            (row.job.renovate_pr(), row.job.turn())
+        else {
+            return Err(StoreError::Rejected(Rejected::Unexpected {
+                stage: row.job.stage().clone(),
+                event: Event::FixStarted { job: 0 },
+            }));
+        };
+        let text = pr.fix_request(reason, instructions);
+        let new = Job::fix(text, gates, renovate_id, pr.number);
+        let id = Self::insert_job(&tx, &project, login, &new)?;
+        Self::apply_in(&tx, &mut row, Event::FixStarted { job: id })?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     /// Approves the gap job `id` for `login`. The job moves to `requested`
     /// and `login` becomes its requester in one transaction, so the two never
     /// disagree.
@@ -1252,6 +1312,7 @@ impl Store {
             "logs",
             "sessions",
             "cost_closed_jobs",
+            "rebase_claims",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
@@ -1411,7 +1472,10 @@ impl Store {
             Event::ChecksError { error } => Some(error.clone()),
             _ => None,
         };
-        let observed = matches!(event, Event::RenovateObserved { .. });
+        let observed = matches!(
+            event,
+            Event::RenovateObserved { .. } | Event::FixEnded { .. }
+        );
         let before = observed.then(|| row.job.clone());
         row.job.apply(event).map_err(StoreError::Rejected)?;
         if before.is_some_and(|before| before == row.job) {

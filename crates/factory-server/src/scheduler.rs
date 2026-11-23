@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use factory_core::{
-    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, ExistingGap, Gap, Job, MAX_FAILED_ROUNDS,
-    PackagingContext, PrDescription, RetryLimits, ReviewState, Session, Stage,
+    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, ExistingGap, FixLink, FixOutcome,
+    FixState, Gap, Job, MAX_FAILED_ROUNDS, PackagingContext, PrDescription, RetryLimits,
+    ReviewState, Session, Stage,
 };
 use factory_runner::{
     Account, Expect, ForgeKind, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport,
@@ -244,6 +245,43 @@ pub fn watch_only_event(observation: &Observation) -> Option<Event> {
     }
 }
 
+/// How asking Renovate to rebase a pull request went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rebase {
+    Requested,
+    /// The description has no rebase checkbox.
+    NoCheckbox,
+    /// The head is no longer the one the fix job merged against.
+    HeadMoved,
+}
+
+/// How a finished fix job ended, or `None` while it runs or can still be
+/// retried. A merge returns `Merged` with an empty head, which the caller
+/// fills in from the forge.
+fn fix_outcome(fix: &Job) -> Option<FixOutcome> {
+    match fix.stage() {
+        Stage::Merged => {
+            let numbered = fix.plan().iter().filter(|pr| pr.number.is_some()).count();
+            Some(if numbered == 0 {
+                FixOutcome::Closed
+            } else {
+                FixOutcome::Merged {
+                    head: String::new(),
+                }
+            })
+        }
+        Stage::Cancelled => Some(FixOutcome::Cancelled),
+        Stage::Failed { reason, .. } if !fix.can_retry() && reason == FIX_PR_CLOSED => {
+            Some(FixOutcome::Closed)
+        }
+        Stage::Failed { .. } if fix.is_dismissed() => Some(FixOutcome::Dismissed),
+        _ => None,
+    }
+}
+
+/// The reason core gives a job whose pull request closed without merging.
+const FIX_PR_CLOSED: &str = "the pull request was closed without merging";
+
 /// One look at a Renovate pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenovateWatchRequest {
@@ -412,6 +450,27 @@ pub trait Executor: Send + Sync + 'static {
         number: u64,
         head: &str,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Reads the head commit of the pull request.
+    fn renovate_head(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> impl Future<Output = Result<String, String>> + Send;
+
+    /// Asks Renovate to rebase the pull request, unless its head is no longer
+    /// `head`. The check and the description the write builds on come from
+    /// one read.
+    fn request_rebase(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) -> impl Future<Output = Result<Rebase, String>> + Send;
 
     /// The event for a merged Renovate pull request. `manifest_files` is
     /// `Some` for a packaging project, and the event then says whether the
@@ -670,6 +729,7 @@ impl<E: Executor> Scheduler<E> {
                 | Command::WatchRenovate { .. }
                 | Command::PostComment { .. }
                 | Command::MergeRenovate { .. }
+                | Command::RequestRebase { .. }
                 | Command::GatherPackaging { .. })
                     if self.due(row.id) =>
                 {
@@ -766,6 +826,15 @@ impl<E: Executor> Scheduler<E> {
                             &head,
                             manifest_files,
                         )
+                        .await;
+                });
+            }
+            Command::RequestRebase { number, head } => {
+                let repo = project.repo.clone();
+                let scheduler = Arc::clone(self);
+                self.spawn(id, Kind::Factory, async move {
+                    scheduler
+                        .request_rebase(id, &resolved, &repo, number, &head)
                         .await;
                 });
             }
@@ -1635,11 +1704,136 @@ impl<E: Executor> Scheduler<E> {
     async fn watch_renovate(&self, settings: &Settings, request: RenovateWatchRequest) {
         let job_id = request.job_id;
         self.wait(settings, job_id);
+        self.follow_fix(&request).await;
         match self.executor.watch_renovate(request).await {
             Ok(Some(event)) => self.apply(job_id, event),
             Ok(None) => {}
             Err(err) => self.retry_later(settings, job_id, &err),
         }
+    }
+
+    /// Reports how the fix job of Renovate job `job_id` ended, when it did.
+    /// It reads the fix job on every watch, since a watch of an unchanged
+    /// head reports nothing.
+    async fn follow_fix(&self, request: &RenovateWatchRequest) {
+        let job_id = request.job_id;
+        let Ok(row) = self.store.get(job_id) else {
+            return;
+        };
+        let Some(pr) = row.job.renovate_pr() else {
+            return;
+        };
+        let Some(FixLink {
+            job: fix_id,
+            state: FixState::Running,
+            ..
+        }) = &pr.fix
+        else {
+            return;
+        };
+        let fix_id = *fix_id;
+        // A reused id belongs to another job, so it counts as deleted.
+        let mut outcome = match self.store.get(fix_id) {
+            Ok(fix) if fix.job.fix_source() == Some((job_id, pr.number)) => {
+                match fix_outcome(&fix.job) {
+                    Some(outcome) => outcome,
+                    None => return,
+                }
+            }
+            Ok(_) | Err(StoreError::NotFound(_)) => FixOutcome::Deleted,
+            Err(err) => {
+                tracing::error!("reading fix job #{fix_id}: {err}");
+                return;
+            }
+        };
+        if matches!(outcome, FixOutcome::Merged { .. }) {
+            // The head now, not the last one polled: a newer head the watch
+            // has not seen yet still needs the rebase, and one that arrives
+            // after this read is handled as a new head.
+            match self
+                .executor
+                .renovate_head(
+                    request.forge,
+                    &request.account,
+                    &request.repo,
+                    request.number,
+                )
+                .await
+            {
+                Ok(head) => outcome = FixOutcome::Merged { head },
+                Err(err) => {
+                    tracing::warn!("reading the head of #{}: {err}", request.number);
+                    return;
+                }
+            }
+        }
+        self.apply(
+            job_id,
+            Event::FixEnded {
+                job: fix_id,
+                outcome,
+            },
+        );
+    }
+
+    async fn request_rebase(
+        &self,
+        job_id: i64,
+        resolved: &Resolved,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) {
+        let fix = self.store.get(job_id).ok().and_then(|row| {
+            let link = row.job.renovate_pr()?.fix.as_ref()?;
+            Some(link.job)
+        });
+        // The claim comes before the write. A claim left by a run that died
+        // before it stored the result means the write may have happened, so
+        // the factory asks the user instead of writing again.
+        if let Some(fix) = fix {
+            match self.store.claim_rebase(job_id, fix) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let reason = "the factory restarted while asking Renovate to rebase".to_owned();
+                    self.note(
+                        job_id,
+                        &format!("Could not ask Renovate to rebase: {reason}"),
+                    );
+                    self.apply(job_id, Event::RebaseFailed { reason });
+                    return;
+                }
+                Err(err) => {
+                    tracing::error!("claiming the rebase of job #{job_id}: {err}");
+                    return;
+                }
+            }
+        }
+        let event = match self
+            .executor
+            .request_rebase(resolved.forge, &resolved.account, repo, number, head)
+            .await
+        {
+            Ok(Rebase::Requested) => {
+                self.note(
+                    job_id,
+                    &format!("Asked Renovate to rebase #{number} after the fix job merged."),
+                );
+                Event::RebaseRequested
+            }
+            Ok(Rebase::HeadMoved) => Event::RebaseSkipped,
+            Ok(Rebase::NoCheckbox) => Event::RebaseFailed {
+                reason: format!("#{number} has no rebase checkbox"),
+            },
+            Err(reason) => {
+                self.note(
+                    job_id,
+                    &format!("Could not ask Renovate to rebase: {reason}"),
+                );
+                Event::RebaseFailed { reason }
+            }
+        };
+        self.apply(job_id, event);
     }
 
     async fn post_comment(

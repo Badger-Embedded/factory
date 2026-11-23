@@ -883,7 +883,9 @@ impl GitHub {
         .map(|_| ())
     }
 
-    /// Ticks Renovate's rebase checkbox in the pull request description.
+    /// Ticks Renovate's rebase checkbox in the pull request description,
+    /// unless the head is no longer `head`. The head and the description come
+    /// from one read, so the write never builds on a newer head's body.
     ///
     /// # Errors
     ///
@@ -893,21 +895,35 @@ impl GitHub {
         account: &Account,
         repo: &str,
         number: u64,
+        head: &str,
     ) -> Result<RebaseCheckbox, String> {
         #[derive(Deserialize)]
         struct Body {
             body: Option<String>,
+            #[serde(rename = "headRefOid")]
+            head: String,
         }
         let number_text = number.to_string();
         let out = self
             .run(
                 account,
-                &["pr", "view", &number_text, "--repo", repo, "--json", "body"],
+                &[
+                    "pr",
+                    "view",
+                    &number_text,
+                    "--repo",
+                    repo,
+                    "--json",
+                    "body,headRefOid",
+                ],
                 None,
             )
             .await?;
         let view: Body = serde_json::from_str(&out)
             .map_err(|_| "gh pr view returned unexpected output".to_owned())?;
+        if view.head != head {
+            return Ok(RebaseCheckbox::HeadMoved);
+        }
         let body = view.body.unwrap_or_default();
         let Some(ticked) = tick_rebase_checkbox(&body) else {
             return Ok(RebaseCheckbox::Missing);
@@ -1258,6 +1274,9 @@ pub enum RebaseCheckbox {
     Ticked,
     /// The description has no rebase checkbox.
     Missing,
+    /// The pull request has another head than the caller expected, so
+    /// nothing was written.
+    HeadMoved,
 }
 
 /// `body` with Renovate's rebase checkbox ticked: the first
@@ -1448,8 +1467,11 @@ impl Forge for GitHub {
         account: &'a Account,
         repo: &'a str,
         number: u64,
+        head: &'a str,
     ) -> BoxFuture<'a, Result<RebaseCheckbox, String>> {
-        Box::pin(GitHub::request_renovate_rebase(self, account, repo, number))
+        Box::pin(GitHub::request_renovate_rebase(
+            self, account, repo, number, head,
+        ))
     }
 
     fn comment<'a>(

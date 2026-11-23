@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
 use factory_runner::{
-    Account, BranchSummary, Ci, Credential, ForgeKind, Git, Observation, PrState, Remote,
-    RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend, observe,
+    Account, BranchSummary, Ci, Credential, ForgeKind, Git, Observation, PrState, RebaseCheckbox,
+    Remote, RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend, observe,
     place_files, place_images, remove_container, run, run_checks, show_files, show_images,
 };
 
@@ -16,8 +16,8 @@ use crate::forges::Forges;
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PackagingRequest, PublishRequest,
-    Published, ReadyAction, RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest,
-    WatchReport, WatchRequest, ready_action, watch_only_event,
+    Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, SessionSink,
+    SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -560,6 +560,43 @@ impl Executor for PodmanExecutor {
         let forge = self.forges.forge(forge);
         forge.approve(account, repo, number, head, APPROVAL).await?;
         forge.merge_head(account, repo, number, head).await
+    }
+
+    async fn request_rebase(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) -> Result<Rebase, String> {
+        Ok(
+            match self
+                .forges
+                .forge(forge)
+                .request_renovate_rebase(account, repo, number, head)
+                .await?
+            {
+                RebaseCheckbox::Ticked => Rebase::Requested,
+                RebaseCheckbox::Missing => Rebase::NoCheckbox,
+                RebaseCheckbox::HeadMoved => Rebase::HeadMoved,
+            },
+        )
+    }
+
+    async fn renovate_head(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<String, String> {
+        Ok(self
+            .forges
+            .forge(forge)
+            .pr_info(account, repo, number)
+            .await?
+            .head)
     }
 
     async fn renovate_merged(

@@ -15,7 +15,7 @@ use factory_core::Event;
 use factory_runner::{Account, Expect, ForgeKind, Git, GitHub, WorkerConfig};
 use factory_server::{
     AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos, LocalSecrets,
-    MASTER_KEY_LEN, PlanUsageCache, PodmanExecutor, SecretStore, Settings, Store,
+    MASTER_KEY_LEN, PlanUsageCache, PodmanExecutor, Rebase, SecretStore, Settings, Store,
 };
 
 /// A subscription `auth.json`, shaped like the one `codex login` writes.
@@ -548,4 +548,31 @@ async fn a_verdict_for_the_merged_head_gives_its_range() {
 
     assert_eq!(context.from.as_deref(), Some("va"));
     assert_eq!(context.to.as_deref(), Some("vb"));
+}
+
+#[tokio::test]
+async fn a_rebase_request_ticks_the_checkbox_only_while_the_head_is_the_one_that_merged() {
+    let body = "Bumps app\r\n\r\n - [ ] <!-- rebase-check -->rebase\r\n";
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("h1", body, &[]), 0);
+    let account = Account::default();
+
+    let moved = podman
+        .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h0")
+        .await;
+    assert_eq!(moved, Ok(Rebase::HeadMoved));
+    assert!(!std::fs::read_to_string(&calls).unwrap().contains("PATCH"));
+
+    let requested = podman
+        .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .await;
+    assert_eq!(requested, Ok(Rebase::Requested));
+    assert!(std::fs::read_to_string(&calls).unwrap().contains("PATCH"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, _) = gh_executor(dir.path(), &view("h1", "no checkbox", &[]), 0);
+    let missing = podman
+        .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .await;
+    assert_eq!(missing, Ok(Rebase::NoCheckbox));
 }

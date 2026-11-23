@@ -15,7 +15,7 @@ use factory_runner::{
 use factory_server::{
     Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink,
     McpProjectSettings, McpRuntime, McpStages, McpWarnings, Project, ProjectForge, Projects,
-    PublishRequest, Published, ReadyAction, RenovateWatchRequest, RerunRequest, RunTokens,
+    PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, RunTokens,
     Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
     StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots,
     format_cost, ready_action, watch_only_event,
@@ -69,6 +69,13 @@ struct FakeExecutor {
     merged: Mutex<Vec<(u64, String)>>,
     merge_failures: Mutex<VecDeque<RenovateNow>>,
     approved: Mutex<Vec<(u64, String)>>,
+    /// The results of the next rebase requests. With none queued the request
+    /// succeeds.
+    rebases: Mutex<VecDeque<Result<Rebase, String>>>,
+    /// The head the fake reads from the pull request, `h1` when unset.
+    current_head: Mutex<Option<String>>,
+    /// Each rebase request as `(number, head)`.
+    rebase_calls: Mutex<Vec<(u64, String)>>,
     /// The files the merged pull request changed.
     pr_files: Mutex<Vec<String>>,
     gathered: Mutex<Vec<factory_server::PackagingRequest>>,
@@ -116,6 +123,9 @@ impl FakeExecutor {
             merged: Mutex::new(Vec::new()),
             merge_failures: Mutex::new(VecDeque::new()),
             approved: Mutex::new(Vec::new()),
+            rebases: Mutex::new(VecDeque::new()),
+            current_head: Mutex::new(None),
+            rebase_calls: Mutex::new(Vec::new()),
             pr_files: Mutex::new(Vec::new()),
             gathered: Mutex::new(Vec::new()),
             resolved_range: Mutex::new(None),
@@ -408,6 +418,42 @@ impl Executor for FakeExecutor {
         }
         self.merged.lock().unwrap().push((number, head.to_owned()));
         Ok(())
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn renovate_head(
+        &self,
+        _forge: ForgeKind,
+        _account: &Account,
+        _repo: &str,
+        _number: u64,
+    ) -> Result<String, String> {
+        Ok(self
+            .current_head
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "h1".to_owned()))
+    }
+
+    async fn request_rebase(
+        &self,
+        _forge: ForgeKind,
+        _account: &Account,
+        _repo: &str,
+        number: u64,
+        head: &str,
+    ) -> Result<Rebase, String> {
+        tokio::task::yield_now().await;
+        self.rebase_calls
+            .lock()
+            .unwrap()
+            .push((number, head.to_owned()));
+        self.rebases
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(Rebase::Requested))
     }
 
     async fn stop(&self, job_id: i64) {
@@ -5438,4 +5484,305 @@ async fn a_restart_keeps_the_count_of_checks_that_could_not_run() {
         Stage::Failed { .. }
     ));
     assert_eq!(executor.checks_run.lock().unwrap().len(), 5);
+}
+
+/// A Renovate job stopped on `h1`, with a fix job started for it by alice.
+async fn fix_started() -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    i64,
+    i64,
+) {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    for _ in 0..4 {
+        step(&scheduler).await;
+    }
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Stopped));
+    let fix = store
+        .start_fix(id, "alice", Some("update the smoke test"))
+        .unwrap();
+    (store, executor, scheduler, id, fix)
+}
+
+/// As [`fix_started`], with the fix job driven to an open pull request, so
+/// the scheduler leaves it alone.
+async fn fixing_setup() -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    i64,
+    i64,
+) {
+    let (store, executor, scheduler, id, fix) = fix_started().await;
+    for event in [
+        Event::Start,
+        Event::Agent(AgentResult::Clarified),
+        Event::Agent(AgentResult::Spec("s".into())),
+        Event::Approve,
+        Event::Agent(AgentResult::Plan(vec![planned_pr("a")])),
+        Event::Approve,
+        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::ChecksPassed,
+        Event::Published { number: 30 },
+    ] {
+        store.apply(fix, event).unwrap();
+    }
+    (store, executor, scheduler, id, fix)
+}
+
+fn event_names(store: &Store, id: i64) -> Vec<String> {
+    store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.event)
+        .collect()
+}
+
+#[tokio::test]
+async fn starting_a_fix_creates_one_linked_job() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || needs_you(&store, id).is_some()).await;
+    for _ in 0..4 {
+        step(&scheduler).await;
+    }
+    let jobs = store.list().unwrap().len();
+
+    let fix = store
+        .start_fix(id, "alice", Some("use the new API"))
+        .unwrap();
+    let row = store.get(fix).unwrap();
+    assert_eq!(row.requested_by, "alice");
+    assert_eq!(row.project, "maestro");
+    assert_eq!(*row.job.stage(), Stage::Requested);
+    assert_eq!(row.job.fix_source(), Some((id, 7)));
+    assert!(row.job.request().contains("use the new API"));
+    assert!(row.job.request().contains("https://example/pull/7"));
+    assert!(row.job.request().contains("the new API"));
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Fixing));
+    assert_eq!(pr_of(&store, id).fix.unwrap().job, fix);
+
+    assert!(store.start_fix(id, "alice", None).is_err());
+    assert_eq!(store.list().unwrap().len(), jobs + 1);
+}
+
+#[tokio::test]
+async fn a_merged_fix_asks_renovate_to_rebase_once() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    step(&scheduler).await;
+    assert!(executor.rebase_calls.lock().unwrap().is_empty());
+
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        event_names(&store, id).contains(&"rebase-requested".to_owned())
+    })
+    .await;
+    let rows = store.events(id).unwrap().len();
+    let jobs = store.list().unwrap().len();
+    for _ in 0..4 {
+        step(&scheduler).await;
+    }
+
+    assert_eq!(
+        executor.rebase_calls.lock().unwrap().clone(),
+        vec![(7, "h1".to_owned())]
+    );
+    assert_eq!(store.events(id).unwrap().len(), rows);
+    assert_eq!(store.list().unwrap().len(), jobs);
+    let names = event_names(&store, id);
+    assert_eq!(names.iter().filter(|n| *n == "fix-ended").count(), 1);
+}
+
+#[tokio::test]
+async fn a_rebase_that_cannot_be_requested_waits_for_the_user_and_a_new_head_restarts() {
+    for result in [Ok(Rebase::NoCheckbox), Err("gh is down".to_owned())] {
+        let (store, executor, scheduler, id, fix) = fixing_setup().await;
+        executor.rebases.lock().unwrap().push_back(result);
+        store.apply(fix, Event::Merged).unwrap();
+        step_until(&scheduler, || {
+            needs_you(&store, id) == Some(RenovateWait::RebaseFailed)
+        })
+        .await;
+        assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+
+        *executor.renovate_now.lock().unwrap() = failing("h2");
+        step_until(&scheduler, || {
+            pr_of(&store, id).head.as_deref() == Some("h2")
+        })
+        .await;
+        assert_eq!(pr_of(&store, id).head.as_deref(), Some("h2"));
+        step_until(&scheduler, || {
+            !executor.rerun_requests.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_moved_head_skips_the_rebase_request() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    executor
+        .rebases
+        .lock()
+        .unwrap()
+        .push_back(Ok(Rebase::HeadMoved));
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        event_names(&store, id).contains(&"rebase-skipped".to_owned())
+    })
+    .await;
+    assert!(pr_of(&store, id).fix.is_none());
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_cancelled_or_deleted_fix_returns_the_job_to_stopped() {
+    let (store, _executor, scheduler, id, fix) = fixing_setup().await;
+    store.apply(fix, Event::Cancel).unwrap();
+    step(&scheduler).await;
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Stopped));
+    let reason = match store.get(id).unwrap().job.turn() {
+        Turn::User(Ask::Renovate { reason, .. }) => reason.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        reason.contains(&format!("Fix job #{fix} was cancelled")),
+        "{reason}"
+    );
+    assert!(pr_of(&store, id).fix.is_none());
+
+    let again = store.start_fix(id, "bob", None).unwrap();
+    store.apply(again, Event::Cancel).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    store.delete_job(again, dir.path()).unwrap();
+    assert!(store.get(again).is_err());
+    step(&scheduler).await;
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Stopped));
+    assert!(pr_of(&store, id).fix.is_none());
+}
+
+#[tokio::test]
+async fn a_failed_fix_keeps_the_renovate_job_waiting() {
+    let (store, _executor, scheduler, id, fix) = fix_started().await;
+    store.apply(fix, Event::Start).unwrap();
+    store
+        .apply(
+            fix,
+            Event::AgentFailed {
+                reason: "boom".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        store.get(fix).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+    step(&scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Fixing));
+    assert_eq!(pr_of(&store, id).fix.unwrap().job, fix);
+}
+
+#[tokio::test]
+async fn a_merged_or_closed_renovate_pull_request_ends_the_job_and_leaves_the_fix() {
+    for (now, stage) in [
+        (RenovateNow::Merged, Stage::Merged),
+        (RenovateNow::Closed, Stage::Cancelled),
+    ] {
+        let (store, executor, scheduler, id, fix) = fixing_setup().await;
+        let before = store.get(fix).unwrap().job.stage().clone();
+        *executor.renovate_now.lock().unwrap() = now;
+        step(&scheduler).await;
+        assert_eq!(*store.get(id).unwrap().job.stage(), stage);
+        assert_eq!(*store.get(fix).unwrap().job.stage(), before);
+    }
+}
+
+#[tokio::test]
+async fn a_new_head_while_the_fix_runs_keeps_the_link() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    *executor.renovate_now.lock().unwrap() = failing("h2");
+    step_until(&scheduler, || {
+        pr_of(&store, id).head.as_deref() == Some("h2")
+    })
+    .await;
+    assert_eq!(pr_of(&store, id).fix.unwrap().job, fix);
+
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        !executor.rebase_calls.lock().unwrap().is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_rebase_names_the_head_read_when_the_fix_merged() {
+    let (store, executor, scheduler, _id, fix) = fixing_setup().await;
+    // Renovate pushed h2 and the watch has not seen it yet.
+    *executor.current_head.lock().unwrap() = Some("h2".into());
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        !executor.rebase_calls.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(
+        executor.rebase_calls.lock().unwrap().clone(),
+        vec![(7, "h2".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_head_seen_after_the_merge_is_a_new_head_and_adds_no_second_request() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        event_names(&store, id).contains(&"rebase-requested".to_owned())
+    })
+    .await;
+    *executor.current_head.lock().unwrap() = Some("h2".into());
+    *executor.renovate_now.lock().unwrap() = failing("h2");
+    step_until(&scheduler, || {
+        pr_of(&store, id).head.as_deref() == Some("h2")
+    })
+    .await;
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+    assert!(pr_of(&store, id).fix.is_none());
+}
+
+#[tokio::test]
+async fn a_fix_pull_request_closed_unmerged_returns_the_job_to_stopped() {
+    let (store, _executor, scheduler, id, fix) = fixing_setup().await;
+    store.apply(fix, Event::ClosedUnmerged).unwrap();
+    assert!(matches!(
+        store.get(fix).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+    step(&scheduler).await;
+    assert_eq!(needs_you(&store, id), Some(RenovateWait::Stopped));
+    let reason = match store.get(id).unwrap().job.turn() {
+        Turn::User(Ask::Renovate { reason, .. }) => reason.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        reason.contains(&format!("Fix job #{fix} was closed without merging")),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_after_the_rebase_write_asks_the_user_and_writes_nothing_again() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    // The earlier run claimed the request and died before it stored the result.
+    assert!(store.claim_rebase(id, fix).unwrap());
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        needs_you(&store, id) == Some(RenovateWait::RebaseFailed)
+    })
+    .await;
+    assert!(executor.rebase_calls.lock().unwrap().is_empty());
 }

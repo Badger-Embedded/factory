@@ -747,7 +747,7 @@ fn renovate_body() -> String {
 }
 
 fn view_json(body: &str) -> String {
-    serde_json::json!({ "body": body }).to_string()
+    serde_json::json!({ "body": body, "headRefOid": "h1" }).to_string()
 }
 
 fn rebase_github(dir: &Path, body: &str) -> (GitHub, PathBuf, PathBuf) {
@@ -812,13 +812,13 @@ async fn request_renovate_rebase_writes_the_ticked_description() {
     let body = renovate_body();
     let (github, calls, stdin) = rebase_github(dir.path(), &body);
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Ticked);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\napi --method PATCH repos/o/r/pulls/5 -F body=@-\n"
+        "pr view 5 --repo o/r --json body,headRefOid\napi --method PATCH repos/o/r/pulls/5 -F body=@-\n"
     );
     assert_eq!(
         fs::read_to_string(&stdin).unwrap(),
@@ -831,13 +831,13 @@ async fn request_renovate_rebase_without_a_checkbox_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls, _) = rebase_github(dir.path(), "Update dep.\n- [ ] other\n");
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Missing);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\n"
+        "pr view 5 --repo o/r --json body,headRefOid\n"
     );
 }
 
@@ -849,13 +849,13 @@ async fn request_renovate_rebase_ignores_a_marker_without_a_checkbox() {
         "Update dep.\n<!-- rebase-check -->\n- [ ] unrelated <!-- rebase-check -->\n",
     );
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Missing);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\n"
+        "pr view 5 --repo o/r --json body,headRefOid\n"
     );
 }
 
@@ -864,13 +864,28 @@ async fn request_renovate_rebase_skips_the_write_when_already_ticked() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls, _) = rebase_github(dir.path(), " - [x] <!-- rebase-check -->retry\n");
     let result = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap();
     assert_eq!(result, RebaseCheckbox::Ticked);
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json body\n"
+        "pr view 5 --repo o/r --json body,headRefOid\n"
+    );
+}
+
+#[tokio::test]
+async fn request_renovate_rebase_writes_nothing_for_another_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls, _) = rebase_github(dir.path(), &renovate_body());
+    let result = github
+        .request_renovate_rebase(&account(), "o/r", 5, "h0")
+        .await
+        .unwrap();
+    assert_eq!(result, RebaseCheckbox::HeadMoved);
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "pr view 5 --repo o/r --json body,headRefOid\n"
     );
 }
 
@@ -879,7 +894,7 @@ async fn request_renovate_rebase_reports_the_gh_error() {
     let dir = tempfile::tempdir().unwrap();
     let (github, _) = recording_github(dir.path(), "echo 'gh: HTTP 502' >&2; exit 1");
     let err = github
-        .request_renovate_rebase(&account(), "o/r", 5)
+        .request_renovate_rebase(&account(), "o/r", 5, "h1")
         .await
         .unwrap_err();
     assert!(err.contains("HTTP 502"), "{err}");
