@@ -206,6 +206,7 @@ fn stdio_entry() -> McpServerEntry {
 #[test]
 fn a_stdio_server_becomes_a_local_entry_with_no_token() {
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
     let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
     let plain = copilot_args(&run);
     run.mcp = Some(McpConfig {
@@ -214,8 +215,11 @@ fn a_stdio_server_becomes_a_local_entry_with_no_token() {
     });
     let args = copilot_args(&run);
 
-    let config: serde_json::Value =
-        serde_json::from_str(value_after(&args, "--additional-mcp-config")).unwrap();
+    assert_eq!(
+        value_after(&args, "--additional-mcp-config"),
+        "@/copilot/factory-mcp.json"
+    );
+    let config = written_config(&run, dir.path());
     assert_eq!(
         config["mcpServers"],
         serde_json::json!({ "pw": {
@@ -230,9 +234,36 @@ fn a_stdio_server_becomes_a_local_entry_with_no_token() {
     assert_eq!(env_names(&args), env_names(&plain));
 }
 
+fn written_config(run: &WorkerRun, dir: &Path) -> serde_json::Value {
+    backend(Agent::Copilot).unwrap().prepare(run).unwrap();
+    serde_json::from_str(&fs::read_to_string(dir.join("copilot/factory-mcp.json")).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn stdio_arguments_too_big_for_one_argv_element_go_through_the_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
+    let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
+    let big: Vec<String> = (0..64).map(|i| format!("{i:x<4096}")).collect();
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![McpServerEntry::Stdio {
+            name: "pw".into(),
+            command: "playwright-mcp".into(),
+            args: big.clone(),
+        }],
+    });
+    // Linux rejects one argv element of 128 KiB or more.
+    assert!(copilot_args(&run).iter().all(|arg| arg.len() < 128 * 1024));
+    let config = written_config(&run, dir.path());
+    assert_eq!(config["mcpServers"]["pw"]["args"], serde_json::json!(big));
+}
+
 #[test]
 fn a_remote_and_a_stdio_server_share_a_copilot_run() {
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("copilot")).unwrap();
     let mut run = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
     run.mcp = Some(McpConfig {
         proxy: Some(McpProxy {
@@ -247,8 +278,7 @@ fn a_remote_and_a_stdio_server_share_a_copilot_run() {
         ],
     });
     let args = copilot_args(&run);
-    let config: serde_json::Value =
-        serde_json::from_str(value_after(&args, "--additional-mcp-config")).unwrap();
+    let config = written_config(&run, dir.path());
     assert_eq!(config["mcpServers"]["context7"]["type"], "http");
     assert_eq!(config["mcpServers"]["pw"]["type"], "local");
     assert!(env_names(&args).contains(&"FACTORY_MCP_TOKEN"));

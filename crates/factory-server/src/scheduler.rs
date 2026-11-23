@@ -1382,8 +1382,6 @@ impl<E: Executor> Scheduler<E> {
             .filter(|server| matches!(server, ActiveServer::Remote(_)))
             .map(|server| server.name().to_owned())
             .collect();
-        // Only a remote server goes through the proxy, so a run with stdio
-        // servers alone gets no token.
         let proxy = (!remote.is_empty()).then(|| McpProxy {
             url: self.mcp.proxy_url.clone(),
             token: self.mcp.tokens.issue(job_id, project, &remote),

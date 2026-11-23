@@ -198,9 +198,15 @@ fn stdio_entry() -> McpServerEntry {
     }
 }
 
+fn written_config(run: &WorkerRun, dir: &Path) -> toml::Value {
+    backend(Agent::Codex).unwrap().prepare(run).unwrap();
+    toml::from_str(&fs::read_to_string(dir.join("codex/config.toml")).unwrap()).unwrap()
+}
+
 #[test]
-fn a_stdio_server_becomes_toml_overrides_with_a_startup_timeout_and_no_token() {
+fn a_stdio_server_goes_into_config_toml_with_a_startup_timeout_and_no_token() {
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("codex")).unwrap();
     let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
     let plain = codex_args(&run);
     run.mcp = Some(McpConfig {
@@ -209,38 +215,48 @@ fn a_stdio_server_becomes_toml_overrides_with_a_startup_timeout_and_no_token() {
     });
     let args = codex_args(&run);
 
-    let overrides: Vec<&String> = args
-        .iter()
-        .filter(|arg| arg.starts_with("mcp_servers."))
-        .collect();
+    assert_eq!(args, plain);
     // The quote, backslash and space in the second argument are escaped, so
     // TOML reads them back unchanged.
+    let config = written_config(&run, dir.path());
+    let server = &config["mcp_servers"]["pw"];
+    assert_eq!(server["command"].as_str(), Some("playwright-mcp"));
     assert_eq!(
-        overrides,
-        [
-            r#"mcp_servers.pw.command="playwright-mcp""#,
-            r#"mcp_servers.pw.args=["--no-sandbox","a \"b\\c\" d"]"#,
-            "mcp_servers.pw.startup_timeout_sec=120",
-        ]
+        server["args"],
+        toml::Value::try_from(["--no-sandbox", "a \"b\\c\" d"]).unwrap()
     );
-    let value: toml::Value = toml::from_str(&format!(
-        "args = {}",
-        overrides[1].strip_prefix("mcp_servers.pw.args=").unwrap()
-    ))
-    .unwrap();
-    assert_eq!(value["args"][1].as_str(), Some("a \"b\\c\" d"));
-
+    assert_eq!(server["startup_timeout_sec"].as_integer(), Some(120));
+    assert_eq!(config["cli_auth_credentials_store"].as_str(), Some("file"));
     assert!(!env_names(&args).contains(&"FACTORY_MCP_TOKEN"), "{args:?}");
-    assert!(!args.iter().any(|arg| arg.contains("factory:8081")));
-    // No container flag is added: only the config overrides differ.
-    let flags = |args: &[String]| args.iter().filter(|a| a.starts_with("--")).count();
-    assert_eq!(flags(&args), flags(&plain));
-    assert_eq!(env_names(&args), env_names(&plain));
+}
+
+#[test]
+fn stdio_arguments_too_big_for_one_argv_element_go_through_config_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("codex")).unwrap();
+    let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
+    let big: Vec<String> = (0..64).map(|i| format!("{i:x<4096}")).collect();
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![McpServerEntry::Stdio {
+            name: "pw".into(),
+            command: "playwright-mcp".into(),
+            args: big.clone(),
+        }],
+    });
+    // Linux rejects one argv element of 128 KiB or more.
+    assert!(codex_args(&run).iter().all(|arg| arg.len() < 128 * 1024));
+    let config = written_config(&run, dir.path());
+    assert_eq!(
+        config["mcp_servers"]["pw"]["args"],
+        toml::Value::try_from(big).unwrap()
+    );
 }
 
 #[test]
 fn a_remote_and_a_stdio_server_share_a_codex_run() {
     let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("codex")).unwrap();
     let mut run = codex_run(dir.path(), SessionRun::Start(THREAD.into()));
     run.mcp = Some(McpConfig {
         proxy: Some(McpProxy {
@@ -259,9 +275,11 @@ fn a_remote_and_a_stdio_server_share_a_codex_run() {
         args.iter()
             .any(|arg| { arg == "mcp_servers.context7.url=\"http://factory:8081/mcp/context7\"" })
     );
-    assert!(
-        args.iter()
-            .any(|arg| arg.starts_with("mcp_servers.pw.command="))
+    assert!(!args.iter().any(|arg| arg.starts_with("mcp_servers.pw.")));
+    let config = written_config(&run, dir.path());
+    assert_eq!(
+        config["mcp_servers"]["pw"]["command"].as_str(),
+        Some("playwright-mcp")
     );
     assert!(env_names(&args).contains(&"FACTORY_MCP_TOKEN"));
 }

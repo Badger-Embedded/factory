@@ -1007,7 +1007,9 @@ fn stdio_entry() -> McpServerEntry {
 
 #[test]
 fn podman_args_give_a_stdio_server_a_command_entry_and_no_token_or_proxy() {
-    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Resume(SESSION.into()));
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("claude")).unwrap();
+    let mut run = worker_run(dir.path(), SessionRun::Resume(SESSION.into()));
     let plain = strings(&podman_args(&WorkerConfig::default(), &run));
     run.mcp = Some(McpConfig {
         proxy: None,
@@ -1015,7 +1017,15 @@ fn podman_args_give_a_stdio_server_a_command_entry_and_no_token_or_proxy() {
     });
     let args = strings(&podman_args(&WorkerConfig::default(), &run));
 
-    let config: Value = serde_json::from_str(value_after(&args, "--mcp-config")).unwrap();
+    assert_eq!(
+        value_after(&args, "--mcp-config"),
+        "/claude/factory-mcp.json"
+    );
+    backend(Agent::Claude).unwrap().prepare(&run).unwrap();
+    let config: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join("claude/factory-mcp.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         config["mcpServers"],
         json!({ "pw": {
@@ -1040,7 +1050,9 @@ fn podman_args_give_a_stdio_server_a_command_entry_and_no_token_or_proxy() {
 
 #[test]
 fn podman_args_carry_a_remote_and_a_stdio_server_together() {
-    let mut run = worker_run(Path::new("/jobs/7"), SessionRun::Start(SESSION.into()));
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("claude")).unwrap();
+    let mut run = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     run.mcp = Some(McpConfig {
         proxy: Some(McpProxy {
             url: "http://factory:8081".into(),
@@ -1053,8 +1065,11 @@ fn podman_args_carry_a_remote_and_a_stdio_server_together() {
             stdio_entry(),
         ],
     });
-    let args = strings(&podman_args(&WorkerConfig::default(), &run));
-    let config: Value = serde_json::from_str(value_after(&args, "--mcp-config")).unwrap();
+    backend(Agent::Claude).unwrap().prepare(&run).unwrap();
+    let config: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join("claude/factory-mcp.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         config["mcpServers"]["context7"],
         json!({
@@ -1064,6 +1079,31 @@ fn podman_args_carry_a_remote_and_a_stdio_server_together() {
         })
     );
     assert_eq!(config["mcpServers"]["pw"]["type"], "stdio");
+}
+
+#[test]
+fn stdio_arguments_too_big_for_one_argv_element_go_through_the_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("claude")).unwrap();
+    let mut run = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
+    let big: Vec<String> = (0..64).map(|i| format!("{i:x<4096}")).collect();
+    run.mcp = Some(McpConfig {
+        proxy: None,
+        servers: vec![McpServerEntry::Stdio {
+            name: "pw".into(),
+            command: "playwright-mcp".into(),
+            args: big.clone(),
+        }],
+    });
+    let args = podman_args(&WorkerConfig::default(), &run);
+    // Linux rejects one argv element of 128 KiB or more.
+    assert!(args.iter().all(|arg| arg.len() < 128 * 1024));
+    backend(Agent::Claude).unwrap().prepare(&run).unwrap();
+    let config: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join("claude/factory-mcp.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["mcpServers"]["pw"]["args"], json!(big));
 }
 
 #[test]

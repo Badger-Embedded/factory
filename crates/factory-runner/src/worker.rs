@@ -88,6 +88,14 @@ impl McpConfig {
     pub fn names(&self) -> Vec<&str> {
         self.servers.iter().map(McpServerEntry::name).collect()
     }
+
+    /// Whether any active server is a stdio server.
+    #[must_use]
+    pub fn has_stdio(&self) -> bool {
+        self.servers
+            .iter()
+            .any(|server| matches!(server, McpServerEntry::Stdio { .. }))
+    }
 }
 
 /// One active MCP server in a run's config.

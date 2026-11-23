@@ -209,7 +209,6 @@ impl Executor for FakeExecutor {
             session(id);
         }
         log(LogLine::Text("Reading the repository.".into()));
-        // The tool names the test queued, logged the way the agent's output is.
         let tools = self.tool_calls.lock().unwrap().pop_front();
         for name in tools.into_iter().flatten() {
             log(LogLine::Tool {

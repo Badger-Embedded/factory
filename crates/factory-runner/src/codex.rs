@@ -104,7 +104,25 @@ impl AgentBackend for CodexAgent {
     }
 
     fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
-        fs::write(run.config_dir.join(CONFIG_FILE), CONFIG_TOML)?;
+        let mut config = CONFIG_TOML.to_owned();
+        for entry in run.mcp.iter().flat_map(|mcp| &mcp.servers) {
+            if let McpServerEntry::Stdio {
+                name,
+                command,
+                args,
+            } = entry
+            {
+                // Codex's startup timeout defaults to 10 seconds, too short for
+                // a first download.
+                let _ = write!(
+                    config,
+                    "\n[mcp_servers.{name}]\ncommand = {}\nargs = {}\nstartup_timeout_sec = {STDIO_STARTUP_TIMEOUT_SECS}\n",
+                    toml_string(command),
+                    toml_array(args)
+                );
+            }
+        }
+        fs::write(run.config_dir.join(CONFIG_FILE), config)?;
         fs::write(
             run.config_dir.join(SCHEMA_FILE),
             run.expect.strict_schema().to_string(),
@@ -155,9 +173,8 @@ impl AgentBackend for CodexAgent {
         ));
         // A remote MCP server is pointed at the proxy. The run token is passed
         // by name, not value, so it stays out of the arguments; the proxy swaps
-        // it for the project's stored headers. A stdio server is a command with
-        // arguments and a startup timeout, since Codex's default is 10 seconds.
-        // A run with no active server adds nothing.
+        // it for the project's stored headers. A run with no active server adds
+        // nothing.
         if let Some(mcp) = run.mcp.as_ref() {
             for entry in &mcp.servers {
                 match entry {
@@ -175,23 +192,9 @@ impl AgentBackend for CodexAgent {
                             "mcp_servers.{server}.bearer_token_env_var=\"{MCP_TOKEN_ENV}\""
                         ));
                     }
-                    McpServerEntry::Stdio {
-                        name,
-                        command,
-                        args,
-                    } => {
-                        codex.push("-c".into());
-                        codex.push(format!(
-                            "mcp_servers.{name}.command={}",
-                            toml_string(command)
-                        ));
-                        codex.push("-c".into());
-                        codex.push(format!("mcp_servers.{name}.args={}", toml_array(args)));
-                        codex.push("-c".into());
-                        codex.push(format!(
-                            "mcp_servers.{name}.startup_timeout_sec={STDIO_STARTUP_TIMEOUT_SECS}"
-                        ));
-                    }
+                    // Stdio entries live in config.toml, since their arguments
+                    // can outgrow one argv element.
+                    McpServerEntry::Stdio { .. } => {}
                 }
             }
         }

@@ -16,6 +16,7 @@
 //! the stream, so the parser keys a failure off a non-zero `result.exitCode`.
 
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 
 use factory_core::Agent;
@@ -33,6 +34,7 @@ use crate::worker::{
 /// keeps `session-state/<id>/` for a resumed run, next to the login the device
 /// flow stores.
 const CONFIG_DIR: &str = "/copilot";
+const MCP_CONFIG_FILE: &str = "factory-mcp.json";
 
 /// The environment variable Copilot reads its GitHub token from. It is first in
 /// the CLI's lookup order, so the factory's stored login wins over any token in
@@ -96,6 +98,13 @@ impl AgentBackend for CopilotAgent {
         "copilot"
     }
 
+    fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
+        match run.mcp.as_ref().filter(|mcp| mcp.has_stdio()) {
+            Some(mcp) => fs::write(run.config_dir.join(MCP_CONFIG_FILE), mcp_config(mcp)),
+            None => Ok(()),
+        }
+    }
+
     fn session_for(&self, host_config_dir: &Path, id: &str) -> SessionRun {
         if host_config_dir.join("session-state").join(id).is_dir() {
             SessionRun::Resume(id.to_owned())
@@ -153,7 +162,11 @@ impl AgentBackend for CopilotAgent {
         );
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             copilot.push("--additional-mcp-config".into());
-            copilot.push(mcp_config(mcp));
+            if mcp.has_stdio() {
+                copilot.push(format!("@{CONFIG_DIR}/{MCP_CONFIG_FILE}"));
+            } else {
+                copilot.push(mcp_config(mcp));
+            }
         }
         // The image bakes the review skills at `/factory-agents` whether or not
         // the factory mounts its own copy there, so the flag always resolves and

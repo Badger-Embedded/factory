@@ -23,6 +23,7 @@ use crate::worker::{
 /// The Claude Code config directory inside the worker, mounted from the job's
 /// `claude` directory on the host. It keeps the session files `--resume` reads.
 const CONFIG_DIR: &str = "/claude";
+const MCP_CONFIG_FILE: &str = "factory-mcp.json";
 
 /// Settings for every Claude run. Claude Code adds a `Co-Authored-By` trailer
 /// to commits and a footer to pull request descriptions unless `attribution`
@@ -65,6 +66,13 @@ impl AgentBackend for ClaudeAgent {
 
     fn host_config_dir(&self) -> &'static str {
         "claude"
+    }
+
+    fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
+        match run.mcp.as_ref().filter(|mcp| mcp.has_stdio()) {
+            Some(mcp) => fs::write(run.config_dir.join(MCP_CONFIG_FILE), mcp_config(mcp)),
+            None => Ok(()),
+        }
     }
 
     fn session_for(&self, host_config_dir: &Path, id: &str) -> SessionRun {
@@ -114,10 +122,15 @@ impl AgentBackend for ClaudeAgent {
         );
         // One `http` entry per active MCP server, pointed at the proxy with the
         // run token. A run with no active server adds nothing, so its arguments
-        // match a run from before MCP.
+        // match a run from before MCP. A run with a stdio server reads the config
+        // from a file, since its arguments can outgrow one argv element.
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             claude.push("--mcp-config".into());
-            claude.push(mcp_config(mcp));
+            if mcp.has_stdio() {
+                claude.push(format!("{CONFIG_DIR}/{MCP_CONFIG_FILE}"));
+            } else {
+                claude.push(mcp_config(mcp));
+            }
         }
         claude.into_iter().map(OsString::from).collect()
     }
@@ -156,12 +169,7 @@ impl AgentBackend for ClaudeAgent {
 /// first start of a package runner downloads the package and the default is 30
 /// seconds. Settings carry it, so the container gets no `--env` for it.
 fn settings(mcp: Option<&McpConfig>) -> String {
-    let has_stdio = mcp.is_some_and(|mcp| {
-        mcp.servers
-            .iter()
-            .any(|server| matches!(server, McpServerEntry::Stdio { .. }))
-    });
-    if has_stdio {
+    if mcp.is_some_and(McpConfig::has_stdio) {
         serde_json::json!({
             "attribution": { "commit": "", "pr": "", "sessionUrl": false },
             "env": { "MCP_TIMEOUT": (STDIO_STARTUP_TIMEOUT_SECS * 1000).to_string() },
