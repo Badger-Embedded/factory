@@ -2440,7 +2440,7 @@ async fn save_project_maintenance(
     Path(project): Path<String>,
     Form(form): Form<MaintenanceForm>,
 ) -> Result<Markup, AppError> {
-    visible_project(&state, &headers, &project)?;
+    let record = visible_project(&state, &headers, &project)?;
     let part = pages::PipelinePart::parse(None);
     let kind = if form.packaging_type.is_empty() {
         Some(PackagingType::default())
@@ -2472,10 +2472,79 @@ async fn save_project_maintenance(
             Some(maintenance),
         );
     }
+    let mut notice = "Saved.".to_owned();
+    if maintenance.renovate {
+        match renovate_access(&state, &project, &record).await? {
+            Err(problem) => {
+                return project_page_with(
+                    &state,
+                    &headers,
+                    &project,
+                    part,
+                    None,
+                    Some(&problem),
+                    Some(maintenance),
+                );
+            }
+            Ok(Some(warning)) => {
+                notice.push(' ');
+                notice.push_str(&warning);
+            }
+            Ok(None) => {}
+        }
+    }
     state
         .store
         .save_project_maintenance(&project, &maintenance)?;
-    project_page(&state, &headers, &project, part, Some("Saved."), None)
+    project_page(&state, &headers, &project, part, Some(&notice), None)
+}
+
+/// Reads the project account's access to the repository for Renovate triage.
+/// The inner `Err` is a refusal, the `Ok` a warning to show with the save.
+async fn renovate_access(
+    state: &AppState,
+    name: &str,
+    project: &Project,
+) -> Result<Result<Option<String>, String>, AppError> {
+    let kind = project_forge_kind(project)?;
+    let owner = ForgeTokenOwner::Project {
+        project: name,
+        forge: kind,
+    };
+    if state.store.forge_account(owner)?.is_none() {
+        return Ok(Err(format!(
+            "Renovate pull requests need a project token. Save one in the Forge account card on /settings/projects/{}#forge-account.",
+            query_escape(name)
+        )));
+    }
+    let unchecked = |login: &str| {
+        Ok(Ok(Some(format!(
+            "The access of {login} to {} was not checked.",
+            project.repo
+        ))))
+    };
+    let Ok(Some((token, found))) = state.secrets.forge_token_with_account(owner) else {
+        let login = state
+            .store
+            .forge_account(owner)?
+            .map_or_else(String::new, |account| account.login);
+        return unchecked(&login);
+    };
+    let forge = state.forges.forge(kind);
+    let account = forge.account(token, &found);
+    let display = kind.display_name();
+    Ok(match forge.access(&account, &project.repo).await {
+        Ok(Access::NotVisible) => Err(format!(
+            "The project account {} cannot see {} on {display}. Renovate was not turned on.",
+            found.login, project.repo
+        )),
+        Ok(Access::Read) => Ok(Some(format!(
+            "The project account {} has only Read access to {}, so the factory cannot rerun failed CI and cannot merge Renovate pull requests, even with auto-merge on.",
+            found.login, project.repo
+        ))),
+        Ok(Access::Write | Access::Admin) => Ok(None),
+        Err(_) => return unchecked(&found.login),
+    })
 }
 
 #[derive(Deserialize)]
