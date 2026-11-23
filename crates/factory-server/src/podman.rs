@@ -521,12 +521,14 @@ impl Executor for PodmanExecutor {
 
     async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
         let operation = request.account.resolve()?;
-        require_write(
-            &operation,
-            self.forges.forge(request.forge).as_ref(),
-            &request.repo,
-        )
-        .await?;
+        if request.renovate {
+            require_write(
+                &operation,
+                self.forges.forge(request.forge).as_ref(),
+                &request.repo,
+            )
+            .await?;
+        }
         blame(
             &operation.owner,
             self.forges

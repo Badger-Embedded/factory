@@ -738,14 +738,17 @@ test('a safe Renovate pull request on a Read-only account waits as ready to merg
   await expect(page.getByRole('button', { name: 'Retry' })).toHaveCount(0);
 });
 
-test('a transient failure on a Read-only account stops triage and offers Retry', async ({ page, factory, project }) => {
+test('a transient failure on a Read-only account stops triage and Retry resumes it', async ({ page, factory, project }) => {
   const id = factory.fixture('renovate', '--project', project, '--number', '7', '--url', 'https://stored.example/pull/7');
   factory.fixture('apply', '--job', id, '--event', 'renovate-read-transient');
   await page.goto(`/jobs/${id}`);
 
   await expect(page.getByText('Triage stopped')).toBeVisible();
   await expect(page.locator('.status-detail')).toContainText('cannot rerun CI without Write');
-  await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry' }).click();
+
+  await expect(page.getByText('Triage stopped')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Retry' })).toHaveCount(0);
 });
 
 test('a stopped Renovate job starts a fix job and links to it', async ({ page, factory, project }) => {

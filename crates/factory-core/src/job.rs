@@ -2331,6 +2331,9 @@ impl Job {
             pr.reruns = 0;
             pr.auto_reruns = 0;
             pr.stopped = None;
+            if !pr.access.can_rerun {
+                return Ok((Stage::Renovate, Turn::Factory));
+            }
             pr.rerun = RerunKind::Retry;
             return Ok((
                 Stage::Renovate,

@@ -2522,7 +2522,7 @@ fn read_access_sends_failed_ci_to_the_failure_analysis_with_no_rerun() {
 }
 
 #[test]
-fn retry_after_a_read_only_stop_returns_to_a_fresh_watch_when_the_rerun_is_denied() {
+fn retry_after_a_read_only_stop_watches_afresh_and_reruns_nothing() {
     let mut job = renovate_job();
     observe_as(&mut job, "h1", failed("log"), false, read_only());
     apply(
@@ -2536,8 +2536,6 @@ fn retry_after_a_read_only_stop_returns_to_a_fresh_watch_when_the_rerun_is_denie
     waits(&job, RenovateWait::Stopped);
 
     apply(&mut job, Event::Retry);
-    assert!(matches!(job.turn(), Turn::RerunCi { .. }));
-    apply(&mut job, Event::RerunDenied);
     assert_eq!(job.turn(), &Turn::Factory);
 
     observe_as(&mut job, "h1", failed("log"), false, read_only());

@@ -1113,6 +1113,7 @@ async fn a_rerun_and_a_merge_check_the_access_of_the_account_they_resolve() {
             account: account.clone(),
             repo: "o/r".into(),
             number: 5,
+            renovate: true,
         })
         .await;
     assert!(
@@ -1138,6 +1139,7 @@ async fn a_rerun_and_a_merge_check_the_access_of_the_account_they_resolve() {
             account: account.clone(),
             repo: "o/r".into(),
             number: 5,
+            renovate: true,
         })
         .await;
     if let Err(err) = rerun {

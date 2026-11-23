@@ -151,7 +151,7 @@ fn events_named(name: &str) -> Result<Vec<Event>> {
             Event::Commented,
         ],
         "renovate-read-transient" => vec![
-            renovate_read(RenovateCi::Failed {
+            read_only_auto_merge_observation(RenovateCi::Failed {
                 log: "registry timeout".into(),
             }),
             Event::Agent(AgentResult::FailureVerdict {
@@ -161,7 +161,7 @@ fn events_named(name: &str) -> Result<Vec<Event>> {
             Event::Commented,
         ],
         "renovate-read-ready" => vec![
-            renovate_read(RenovateCi::Passed {
+            read_only_auto_merge_observation(RenovateCi::Passed {
                 details: Some(Box::new(factory_core::PrDiff {
                     diff: "+serde = 1.0.2".into(),
                     body: "Bumps serde".into(),
@@ -174,15 +174,13 @@ fn events_named(name: &str) -> Result<Vec<Event>> {
                 from: None,
                 to: None,
             }))),
-            renovate_read(RenovateCi::Passed { details: None }),
+            read_only_auto_merge_observation(RenovateCi::Passed { details: None }),
         ],
         other => return Err(format!("unknown event {other}").into()),
     })
 }
 
-/// An observation by a project account that has Read access only, with
-/// auto-merge on.
-fn renovate_read(ci: RenovateCi) -> Event {
+fn read_only_auto_merge_observation(ci: RenovateCi) -> Event {
     Event::RenovateObserved {
         head: "abc1234".into(),
         ci,
