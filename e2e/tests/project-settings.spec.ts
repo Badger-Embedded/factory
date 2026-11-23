@@ -254,17 +254,16 @@ test('the Forge account card saves a project token by its access and keeps the s
   await expect(page.getByText('has no project token')).toHaveCount(0);
 
   await page.goto(settingsPath(project));
-  const switchCard = page.locator('#use-my-account');
-  const mine = switchCard.getByLabel('Use my account');
+  const mine = card.getByLabel('Use my account');
   await expect(mine).not.toBeChecked();
   await mine.check();
-  await switchCard.getByRole('button', { name: 'Save switch' }).click();
-  await expect(switchCard.getByText('You have no GitHub token')).toBeVisible();
-  await expect(switchCard.getByRole('link', { name: 'Save your GitHub token' })).toHaveAttribute(
+  await card.getByRole('button', { name: 'Save switch' }).click();
+  await expect(card.getByText('You have no GitHub token')).toBeVisible();
+  await expect(card.getByRole('link', { name: 'Save your GitHub token' })).toHaveAttribute(
     'href',
     '/settings/forges/github',
   );
-  await expect(switchCard.getByLabel('Use my account')).toBeChecked();
+  await expect(card.getByLabel('Use my account')).toBeChecked();
 
   await card.getByRole('button', { name: 'Clear project token' }).click();
   await expect(page.getByText('has no project token')).toBeVisible();

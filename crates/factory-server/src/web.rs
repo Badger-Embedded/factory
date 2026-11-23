@@ -2187,8 +2187,11 @@ async fn save_project_forge_token(
     Path(name): Path<String>,
     Form(form): Form<ForgeTokenForm>,
 ) -> Result<Markup, AppError> {
-    let project = visible_project(&state, &headers, &name)?;
+    visible_project(&state, &headers, &name)?;
     require_csrf(&state, &user(&headers), &form.csrf)?;
+    let Some((project, instance)) = state.store.project_with_instance(&name)? else {
+        return Err(AppError::UnknownProject(name));
+    };
     let kind = project_forge_kind(&project)?;
     let part = pages::PipelinePart::parse(None);
     if !state.secrets.available() {
@@ -2200,7 +2203,6 @@ async fn save_project_forge_token(
         return project_page(&state, &headers, &name, part, Some("Saved."), None);
     }
     let login = user(&headers);
-    let removals = state.store.removals();
     let saved = forge_tokens::save_for_repo(
         state.secrets.as_ref(),
         state.forges.forge(kind).as_ref(),
@@ -2213,7 +2215,7 @@ async fn save_project_forge_token(
         &ProjectGuard {
             project: &name,
             login: &login,
-            removals,
+            instance,
         },
     )
     .await;
@@ -2262,7 +2264,7 @@ async fn save_project_forge_token(
             }
             (
                 None,
-                Some("A project was removed while the token was checked. Nothing was saved. Save it again.".to_owned()),
+                Some("The project changed while the token was checked. Nothing was saved. Save it again.".to_owned()),
             )
         }
         Err(SaveError::Secrets(err)) => return Err(err.into()),

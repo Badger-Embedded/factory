@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (forge, repo)
 );
+CREATE TABLE IF NOT EXISTS project_instances (
+    instance INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL UNIQUE
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     project TEXT NOT NULL,
@@ -322,12 +326,13 @@ impl Maintenance {
     }
 }
 
-/// The project and login a token save started for, and the value of
-/// [`Store::removals`] when it started.
+/// The project instance and login a token save started for. `instance` comes
+/// from [`Store::project_with_instance`]. A project removed and onboarded again
+/// under the same name has a new one.
 pub struct ProjectGuard<'a> {
     pub project: &'a str,
     pub login: &'a str,
-    pub removals: u64,
+    pub instance: i64,
 }
 
 /// One collaborator of a project: a login that may see and act on it.
@@ -421,9 +426,6 @@ pub struct Store {
     /// How many times the database has been opened, from `store_boots`.
     epoch: u64,
     reads: AtomicU64,
-    /// How many project removals this process has started. A token save that
-    /// began before a removal reads it to see that its project may be gone.
-    removals: AtomicU64,
 }
 
 /// The jobs as one read saw them, each with the id of its latest
@@ -662,7 +664,6 @@ impl Store {
             conn: Mutex::new(conn),
             epoch,
             reads: AtomicU64::new(0),
-            removals: AtomicU64::new(0),
         })
     }
 
@@ -2079,16 +2080,42 @@ impl Store {
         Ok(())
     }
 
-    /// How many project removals have started in this process.
-    #[must_use]
-    pub fn removals(&self) -> u64 {
-        self.removals.load(Ordering::SeqCst)
+    /// The project `name` with the identifier of this instance of it, read
+    /// in one transaction. The identifier is never reused, so a project removed
+    /// and onboarded again under the name has a different one.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_with_instance(&self, name: &str) -> Result<Option<(Project, i64)>, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let project = tx
+            .query_row(
+                "SELECT forge, repo, base, checks FROM projects WHERE name = ?1",
+                [name],
+                project_row_without_name,
+            )
+            .optional()?;
+        let Some(project) = project else {
+            return Ok(None);
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO project_instances (project) VALUES (?1)",
+            [name],
+        )?;
+        let instance = tx.query_row(
+            "SELECT instance FROM project_instances WHERE project = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Some((project, instance)))
     }
 
     /// As [`Store::put_forge_token`] for a project token, and writes nothing
-    /// when a project was removed since `guard` was taken, or when the project
-    /// is gone or `guard.login` is no longer its collaborator. Returns whether
-    /// it wrote.
+    /// unless the project instance in `guard` still exists and `guard.login` is
+    /// still its collaborator. Returns whether it wrote.
     ///
     /// # Errors
     ///
@@ -2106,14 +2133,14 @@ impl Store {
         let tx = conn.transaction()?;
         let present: bool = tx.query_row(
             "SELECT EXISTS (
-                 SELECT 1 FROM projects p
-                 JOIN project_collaborators c ON c.project = p.name
-                 WHERE p.name = ?1 AND c.login = ?2
+                 SELECT 1 FROM project_instances i
+                 JOIN project_collaborators c ON c.project = i.project
+                 WHERE i.project = ?1 AND i.instance = ?2 AND c.login = ?3
              )",
-            params![guard.project, guard.login],
+            params![guard.project, guard.instance, guard.login],
             |row| row.get(0),
         )?;
-        if !present || self.removals() != guard.removals {
+        if !present {
             return Ok(false);
         }
         tx.execute(
@@ -2337,7 +2364,6 @@ impl Store {
     /// Fails on a database error. Nothing is written when it fails.
     pub fn remove_project(&self, name: &str) -> Result<(), StoreError> {
         let mut conn = self.conn();
-        self.removals.fetch_add(1, Ordering::SeqCst);
         let tx = conn.transaction()?;
         let ids: Vec<i64> = {
             let mut stmt = tx.prepare("SELECT id FROM jobs WHERE project = ?1 ORDER BY id")?;
@@ -2378,6 +2404,7 @@ impl Store {
             "renovate_prs",
             "dismissed_gaps",
             "project_forge_accounts",
+            "project_instances",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;

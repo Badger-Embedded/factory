@@ -12059,6 +12059,38 @@ async fn a_save_that_finishes_after_the_project_was_removed_stores_nothing() {
 }
 
 #[tokio::test]
+async fn removing_another_project_meanwhile_does_not_stop_a_save() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .create_project(
+            "other",
+            ForgeKind::GitHub,
+            "Badger-Embedded/other",
+            "main",
+            None,
+            Some(USER),
+        )
+        .unwrap();
+    let reply = save_while(&dashboard, || {
+        dashboard.store.remove_project("other").unwrap();
+    })
+    .await;
+    assert!(
+        reply
+            .body
+            .contains("Saved. The project token belongs to slow-bot.")
+    );
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn a_save_by_a_login_removed_meanwhile_stores_nothing() {
     let dashboard = forge_token_dashboard(true);
     dashboard

@@ -1761,10 +1761,7 @@ fn project_forge_account_card(project: &str, card: &ForgeAccountCard) -> Markup 
                     button.danger formaction={ (base) "/forge-token/clear" } formnovalidate { "Clear project token" }
                 }
             }
-        }
-        div.card #use-my-account {
-            h2 { "Use my account" }
-            form.settings-form method="post" action={ (base) "/use-my-account" } {
+            form.settings-form.forge-switch method="post" action={ (base) "/use-my-account" } {
                 input type="hidden" name="csrf" value=(card.csrf);
                 div.field {
                     label.check {
