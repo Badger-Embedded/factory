@@ -5361,3 +5361,81 @@ async fn turning_packaging_off_between_the_merge_and_the_gathering_ends_the_job(
     assert_eq!(analysis_runs(&executor), 0);
     assert_eq!(pr_of(&store, id).gaps, None);
 }
+
+fn failing_checks(executor: &FakeExecutor, times: usize) {
+    let mut queue = executor.checks.lock().unwrap();
+    for _ in 0..times {
+        queue.push_back(Err("bash: just: command not found".into()));
+    }
+}
+
+#[tokio::test]
+async fn checks_that_cannot_run_fail_the_job_after_five_runs() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    failing_checks(&executor, 10);
+
+    for _ in 0..8 {
+        step(&scheduler).await;
+    }
+
+    let row = store.get(id).unwrap();
+    let Stage::Failed { reason, retry, .. } = row.job.stage() else {
+        panic!("not failed: {:?}", row.job.stage());
+    };
+    assert_eq!(retry, &Some(factory_core::RetryTarget::Verifying { pr: 0 }));
+    assert!(reason.contains("bash: just: command not found"), "{reason}");
+    assert!(row.job.checks_could_not_run());
+    assert_eq!(executor.checks_run.lock().unwrap().len(), 5);
+    let logs = store.logs(id, 100).unwrap();
+    let retries = logs
+        .iter()
+        .filter(|line| line.text.contains("tries again in"))
+        .count();
+    assert_eq!(retries, 4);
+}
+
+#[tokio::test]
+async fn a_restart_keeps_the_count_of_checks_that_could_not_run() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    failing_checks(&executor, 5);
+    for _ in 0..3 {
+        step(&scheduler).await;
+    }
+    assert_eq!(executor.checks_run.lock().unwrap().len(), 3);
+
+    let fresh = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(
+            [(
+                "maestro".to_owned(),
+                Project {
+                    forge: ProjectForge::Known(ForgeKind::GitHub),
+                    repo: "Badger-Embedded/maestro".into(),
+                    base: "main".into(),
+                    checks: Some("just lint".into()),
+                    models: factory_server::StageModels::default(),
+                    auto_merge: false,
+                    llm_review: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
+    );
+    step(&fresh).await;
+    step(&fresh).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+    assert_eq!(executor.checks_run.lock().unwrap().len(), 5);
+}

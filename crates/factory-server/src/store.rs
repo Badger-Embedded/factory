@@ -1408,6 +1408,7 @@ impl Store {
             Event::AgentFailed { reason }
             | Event::ReviewFailed { reason }
             | Event::Agent(AgentResult::RerunCi { reason }) => Some(reason.clone()),
+            Event::ChecksError { error } => Some(error.clone()),
             _ => None,
         };
         let observed = matches!(event, Event::RenovateObserved { .. });

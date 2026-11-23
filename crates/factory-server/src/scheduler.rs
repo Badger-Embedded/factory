@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use factory_core::{
-    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, ExistingGap, Gap, Job, PackagingContext,
-    PrDescription, RetryLimits, ReviewState, Session, Stage,
+    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, ExistingGap, Gap, Job, MAX_FAILED_ROUNDS,
+    PackagingContext, PrDescription, RetryLimits, ReviewState, Session, Stage,
 };
 use factory_runner::{
     Account, Expect, ForgeKind, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport,
@@ -341,7 +341,9 @@ pub trait Executor: Send + Sync + 'static {
         session: SessionSink,
     ) -> impl Future<Output = RunReport> + Send;
 
-    /// Runs the project's checks in a worker.
+    /// Runs the project's checks in a worker. An `Err` here counts as one
+    /// checks error. After [`MAX_FAILED_ROUNDS`] in a row the job fails
+    /// instead of trying again.
     fn run_checks(
         &self,
         settings: &Settings,
@@ -1285,7 +1287,30 @@ impl<E: Executor> Scheduler<E> {
                     );
                     scheduler.apply(job_id, event);
                 }
-                Err(err) => scheduler.retry_later(&settings, job_id, &err),
+                Err(err) => {
+                    let failed = match scheduler
+                        .store
+                        .apply(job_id, Event::ChecksError { error: err.clone() })
+                    {
+                        Ok(row) => matches!(row.job.stage(), Stage::Failed { .. }),
+                        Err(error) => {
+                            scheduler.report(job_id, Err(error));
+                            false
+                        }
+                    };
+                    if failed {
+                        scheduler.note(
+                            job_id,
+                            &format!(
+                                "{err}. The checks could not run {MAX_FAILED_ROUNDS} times in a \
+                                 row, so the job failed."
+                            ),
+                        );
+                        scheduler.wake.notify_one();
+                    } else {
+                        scheduler.retry_later(&settings, job_id, &err);
+                    }
+                }
             }
         });
         Ok(())
