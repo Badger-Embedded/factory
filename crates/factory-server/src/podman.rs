@@ -585,6 +585,19 @@ impl Executor for PodmanExecutor {
         )
     }
 
+    async fn merged_at(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<String>, String> {
+        self.forges
+            .forge(forge)
+            .merged_at(account, repo, number)
+            .await
+    }
+
     async fn renovate_head(
         &self,
         forge: ForgeKind,

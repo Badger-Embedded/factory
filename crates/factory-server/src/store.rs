@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, Ask, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, Gap, Gates, Job,
-    PrerequisiteState, Rejected, Session, Stage, Turn, Wait,
+    Agent, AgentResult, Ask, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink, FixState, Gap,
+    Gates, Job, PrerequisiteState, RebaseState, Rejected, Session, Stage, Turn, Wait,
 };
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -384,6 +384,17 @@ pub struct LogEntry {
     /// `text`, `tool`, `other` for agent output, or `factory`.
     pub kind: String,
     pub text: String,
+}
+
+/// Whether the factory may write a Renovate rebase request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// The caller may write the request.
+    Granted,
+    /// An earlier call claimed it and stored no result.
+    Taken,
+    /// The job no longer owes this request.
+    Stale,
 }
 
 /// One entry of a job's history: something that happened to the job, and
@@ -1039,18 +1050,42 @@ impl Store {
     }
 
     /// Claims the one request to Renovate to rebase for fix job `fix_job` of
-    /// Renovate job `job_id`. Returns `false` when an earlier call claimed it,
-    /// so a restart between the write and its result never writes twice.
+    /// Renovate job `job_id`, in the transaction that checks the job still
+    /// owes that request for `head`. A claim that exists means an earlier call
+    /// may have written, so a restart between the write and its result never
+    /// writes twice.
     ///
     /// # Errors
     ///
     /// Fails on a database error.
-    pub fn claim_rebase(&self, job_id: i64, fix_job: i64) -> Result<bool, StoreError> {
-        let claimed = self.conn().execute(
+    pub fn claim_rebase(&self, job_id: i64, fix_job: i64, head: &str) -> Result<Claim, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row = Self::load(&tx, job_id)?;
+        let owed = matches!(
+            row.job.renovate_pr().and_then(|pr| pr.fix.as_ref()),
+            Some(FixLink {
+                job,
+                state: FixState::Merged {
+                    head: owed,
+                    rebase: RebaseState::Pending,
+                },
+                ..
+            }) if *job == fix_job && owed == head
+        );
+        if !owed {
+            return Ok(Claim::Stale);
+        }
+        let claimed = tx.execute(
             "INSERT OR IGNORE INTO rebase_claims (job_id, fix_job) VALUES (?1, ?2)",
             params![job_id, fix_job],
         )?;
-        Ok(claimed == 1)
+        tx.commit()?;
+        Ok(if claimed == 1 {
+            Claim::Granted
+        } else {
+            Claim::Taken
+        })
     }
 
     /// Creates the fix job for the stopped Renovate job `renovate_id`, with

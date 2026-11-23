@@ -890,19 +890,52 @@ async fn request_renovate_rebase_writes_nothing_for_another_head() {
 }
 
 #[tokio::test]
-async fn head_commit_reads_the_last_commit_time_as_utc_text() {
+async fn head_commit_dates_a_force_push_by_the_push_not_the_commit() {
     let dir = tempfile::tempdir().unwrap();
     let (github, calls) = recording_github(
         dir.path(),
-        r#"echo '{"headRefOid":"h2","commits":[{"committedDate":"2026-01-01T00:00:00Z"},{"committedDate":"2026-01-02T03:04:05Z"}]}'"#,
+        r#"echo '{"headRefOid":"h2","timelineItems":{"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"h1","committedDate":"2026-01-01T00:00:00Z"}},{"__typename":"PullRequestCommit","commit":{"oid":"h2","committedDate":"2026-01-01T01:00:00Z"}},{"__typename":"HeadRefForcePushedEvent","createdAt":"2026-01-02T03:04:05Z","afterCommit":{"oid":"h2"}}]}}'"#,
     );
     let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
     assert_eq!(head.sha, "h2");
-    assert_eq!(head.committed_at, "2026-01-02 03:04:05");
+    assert_eq!(head.changed_at, "2026-01-02 03:04:05");
+    assert!(
+        fs::read_to_string(&calls)
+            .unwrap()
+            .starts_with("api graphql")
+    );
+}
+
+#[tokio::test]
+async fn head_commit_falls_back_to_the_commit_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"echo '{"headRefOid":"h1","timelineItems":{"nodes":[{"__typename":"PullRequestCommit","commit":{"oid":"h1","committedDate":"2026-01-01T00:00:00Z"}}]}}'"#,
+    );
+    let head = github.head_commit(&account(), "o/r", 5).await.unwrap();
+    assert_eq!(head.changed_at, "2026-01-01 00:00:00");
+}
+
+#[tokio::test]
+async fn merged_at_reads_the_merge_time_and_none_for_an_open_pull_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) =
+        recording_github(dir.path(), r#"echo '{"mergedAt":"2026-01-02T03:04:05Z"}'"#);
+    assert_eq!(
+        github
+            .merged_at(&account(), "o/r", 5)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2026-01-02 03:04:05")
+    );
     assert_eq!(
         fs::read_to_string(&calls).unwrap(),
-        "pr view 5 --repo o/r --json headRefOid,commits\n"
+        "pr view 5 --repo o/r --json mergedAt\n"
     );
+    let (github, _) = recording_github(dir.path(), r#"echo '{"mergedAt":null}'"#);
+    assert_eq!(github.merged_at(&account(), "o/r", 5).await.unwrap(), None);
 }
 
 #[tokio::test]

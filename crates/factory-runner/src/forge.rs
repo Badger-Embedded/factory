@@ -219,13 +219,21 @@ pub trait Forge: Send + Sync {
         number: u64,
     ) -> BoxFuture<'a, Result<PrInfo, String>>;
 
-    /// The head commit of a pull request and when it was committed.
+    /// The head commit of a pull request and when it became the head.
     fn head_commit<'a>(
         &'a self,
         account: &'a Account,
         repo: &'a str,
         number: u64,
     ) -> BoxFuture<'a, Result<HeadCommit, String>>;
+
+    /// When the pull request merged, or `None` while it is not merged.
+    fn merged_at<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Option<String>, String>>;
 
     /// As [`Forge::pr_info`], plus the diff.
     fn pr_details<'a>(

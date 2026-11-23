@@ -74,7 +74,8 @@ struct FakeExecutor {
     rebases: Mutex<VecDeque<Result<Rebase, String>>>,
     /// The head the fake reads from the pull request, `h1` when unset.
     current_head: Mutex<Option<String>>,
-    head_committed_at: Mutex<Option<String>>,
+    head_changed_at: Mutex<Option<String>>,
+    fix_merged_at: Mutex<Option<String>>,
     /// Each rebase request as `(number, head)`.
     rebase_calls: Mutex<Vec<(u64, String)>>,
     /// The files the merged pull request changed.
@@ -126,7 +127,8 @@ impl FakeExecutor {
             approved: Mutex::new(Vec::new()),
             rebases: Mutex::new(VecDeque::new()),
             current_head: Mutex::new(None),
-            head_committed_at: Mutex::new(None),
+            head_changed_at: Mutex::new(None),
+            fix_merged_at: Mutex::new(None),
             rebase_calls: Mutex::new(Vec::new()),
             pr_files: Mutex::new(Vec::new()),
             gathered: Mutex::new(Vec::new()),
@@ -423,6 +425,23 @@ impl Executor for FakeExecutor {
     }
 
     #[allow(clippy::unused_async_trait_impl)]
+    async fn merged_at(
+        &self,
+        _forge: ForgeKind,
+        _account: &Account,
+        _repo: &str,
+        _number: u64,
+    ) -> Result<Option<String>, String> {
+        Ok(Some(
+            self.fix_merged_at
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "2000-01-01 00:00:00".to_owned()),
+        ))
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
     async fn renovate_head(
         &self,
         _forge: ForgeKind,
@@ -437,8 +456,8 @@ impl Executor for FakeExecutor {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "h1".to_owned()),
-            committed_at: self
-                .head_committed_at
+            changed_at: self
+                .head_changed_at
                 .lock()
                 .unwrap()
                 .clone()
@@ -481,7 +500,13 @@ fn questions() -> Event {
 fn setup(
     respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
 ) -> (Arc<Store>, Arc<FakeExecutor>, Arc<Scheduler<FakeExecutor>>) {
-    let store = Arc::new(Store::open_in_memory().unwrap());
+    setup_in(Arc::new(Store::open_in_memory().unwrap()), respond)
+}
+
+fn setup_in(
+    store: Arc<Store>,
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+) -> (Arc<Store>, Arc<FakeExecutor>, Arc<Scheduler<FakeExecutor>>) {
     let executor = FakeExecutor::new(respond);
     let projects: Projects = [(
         "maestro".to_owned(),
@@ -4747,7 +4772,19 @@ fn renovate_setup(
     Arc<Scheduler<FakeExecutor>>,
     i64,
 ) {
-    let (store, executor, scheduler) = setup(respond);
+    renovate_setup_in(Arc::new(Store::open_in_memory().unwrap()), respond)
+}
+
+fn renovate_setup_in(
+    store: Arc<Store>,
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    i64,
+) {
+    let (store, executor, scheduler) = setup_in(store, respond);
     quick_polls(&store);
     enable_renovate(&store);
     let id = store
@@ -5504,7 +5541,19 @@ async fn fix_started() -> (
     i64,
     i64,
 ) {
-    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    fix_started_in(Arc::new(Store::open_in_memory().unwrap())).await
+}
+
+async fn fix_started_in(
+    store: Arc<Store>,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    i64,
+    i64,
+) {
+    let (store, executor, scheduler, id) = renovate_setup_in(store, transient_runs);
     *executor.renovate_now.lock().unwrap() = failing("h1");
     step_until(&scheduler, || needs_you(&store, id).is_some()).await;
     for _ in 0..4 {
@@ -5526,7 +5575,19 @@ async fn fixing_setup() -> (
     i64,
     i64,
 ) {
-    let (store, executor, scheduler, id, fix) = fix_started().await;
+    fixing_setup_in(Arc::new(Store::open_in_memory().unwrap())).await
+}
+
+async fn fixing_setup_in(
+    store: Arc<Store>,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    i64,
+    i64,
+) {
+    let (store, executor, scheduler, id, fix) = fix_started_in(store).await;
     for event in [
         Event::Start,
         Event::Agent(AgentResult::Clarified),
@@ -5747,12 +5808,13 @@ async fn the_rebase_names_the_head_read_when_the_fix_merged() {
 }
 
 #[tokio::test]
-async fn a_head_committed_after_the_merge_asks_for_no_rebase() {
+async fn a_commit_pushed_after_the_merge_asks_for_no_rebase() {
     let (store, executor, scheduler, id, fix) = fixing_setup().await;
     store.apply(fix, Event::Merged).unwrap();
-    // Renovate pushed h2 after the merge, before the first watch saw the merge.
+    // h2 was made before the merge, but GitHub recorded its push after the
+    // merge and before the first watch saw the merge.
     *executor.current_head.lock().unwrap() = Some("h2".into());
-    *executor.head_committed_at.lock().unwrap() = Some("9999-01-01 00:00:00".into());
+    *executor.head_changed_at.lock().unwrap() = Some("2000-01-02 00:00:00".into());
     *executor.renovate_now.lock().unwrap() = failing("h2");
     step_until(&scheduler, || {
         pr_of(&store, id).head.as_deref() == Some("h2")
@@ -5803,20 +5865,33 @@ async fn a_fix_pull_request_closed_unmerged_returns_the_job_to_stopped() {
 
 #[tokio::test]
 async fn a_restart_after_the_rebase_write_asks_the_user_and_writes_nothing_again() {
-    let (store, executor, scheduler, id, fix) = fixing_setup().await;
-    // The state a restart finds: the merge is stored as pending and the earlier
-    // run claimed the request and died before it stored the result.
-    store.apply(fix, Event::Merged).unwrap();
-    store
-        .apply(
-            id,
-            Event::FixEnded {
-                job: fix,
-                outcome: FixOutcome::Merged { head: "h1".into() },
-            },
-        )
-        .unwrap();
-    assert!(store.claim_rebase(id, fix).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let (id, fix) = {
+        let store = Arc::new(Store::open(&path).unwrap());
+        let (store, _executor, scheduler, id, fix) = fixing_setup_in(store).await;
+        store.apply(fix, Event::Merged).unwrap();
+        // The scheduler stored the merge and claimed the request, then died
+        // after the write and before it stored the result.
+        store
+            .apply(
+                id,
+                Event::FixEnded {
+                    job: fix,
+                    outcome: FixOutcome::Merged { head: "h1".into() },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.claim_rebase(id, fix, "h1").unwrap(),
+            factory_server::Claim::Granted
+        );
+        drop(scheduler);
+        (id, fix)
+    };
+    let store = Arc::new(Store::open(&path).unwrap());
+    let (store, executor, scheduler) = setup_in(store, transient_runs);
+    assert!(pr_of(&store, id).fix.is_some_and(|link| link.job == fix));
     step_until(&scheduler, || {
         needs_you(&store, id) == Some(RenovateWait::RebaseFailed)
     })
@@ -5831,16 +5906,51 @@ async fn a_restart_after_the_rebase_write_asks_the_user_and_writes_nothing_again
 }
 
 #[tokio::test]
-async fn a_claim_left_by_an_earlier_fix_does_not_block_a_later_one() {
-    let (store, executor, scheduler, id, fix) = fixing_setup().await;
-    // An earlier fix with this id left a claim that no stored result retired.
-    assert!(store.claim_rebase(id, fix).unwrap());
+async fn a_stale_rebase_command_does_not_claim_again() {
+    let (store, _executor, _scheduler, id, fix) = fixing_setup().await;
+    store.apply(fix, Event::Merged).unwrap();
+    store
+        .apply(
+            id,
+            Event::FixEnded {
+                job: fix,
+                outcome: FixOutcome::Merged { head: "h1".into() },
+            },
+        )
+        .unwrap();
+    store.apply(id, Event::RebaseRequested).unwrap();
+    assert_eq!(
+        store.claim_rebase(id, fix, "h1").unwrap(),
+        factory_server::Claim::Stale
+    );
+    assert_eq!(
+        store.claim_rebase(id, fix, "h0").unwrap(),
+        factory_server::Claim::Stale
+    );
+}
+
+#[tokio::test]
+async fn a_claim_left_by_a_deleted_fix_does_not_block_the_fix_that_reuses_its_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let (store, executor, scheduler, id, fix) =
+        fixing_setup_in(Arc::new(Store::open(&path).unwrap())).await;
+    // A claim whose result never got stored, as a crash leaves it.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO rebase_claims (job_id, fix_job) VALUES (?1, ?2)",
+            [id, fix],
+        )
+        .unwrap();
     store.apply(fix, Event::Cancel).unwrap();
     step_until(&scheduler, || {
         needs_you(&store, id) == Some(RenovateWait::Stopped)
     })
     .await;
+    store.delete_job(fix, dir.path()).unwrap();
     let again = store.start_fix(id, "alice", None).unwrap();
+    assert_eq!(again, fix);
     for event in [
         Event::Start,
         Event::Agent(AgentResult::Clarified),

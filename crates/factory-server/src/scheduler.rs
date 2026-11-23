@@ -24,7 +24,7 @@ use crate::projects::{Project, Projects, StageAgents};
 use crate::proxy::RunTokens;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
-use crate::store::{FACTORY_REQUESTER, JobRow, Store, StoreError};
+use crate::store::{Claim, FACTORY_REQUESTER, JobRow, Store, StoreError};
 use crate::warnings::McpWarnings;
 use crate::workers::{WorkerSlots, unix_now};
 
@@ -451,7 +451,7 @@ pub trait Executor: Send + Sync + 'static {
         head: &str,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
-    /// Reads the head commit of the pull request and when it was committed.
+    /// Reads the head commit of the pull request and when it became the head.
     fn renovate_head(
         &self,
         forge: ForgeKind,
@@ -459,6 +459,15 @@ pub trait Executor: Send + Sync + 'static {
         repo: &str,
         number: u64,
     ) -> impl Future<Output = Result<HeadCommit, String>> + Send;
+
+    /// When the pull request merged, or `None` while it is not merged.
+    fn merged_at(
+        &self,
+        forge: ForgeKind,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> impl Future<Output = Result<Option<String>, String>> + Send;
 
     /// Asks Renovate to rebase the pull request, unless its head is no longer
     /// `head`. The check and the description the write builds on come from
@@ -1764,16 +1773,26 @@ impl<E: Executor> Scheduler<E> {
         );
     }
 
-    /// The head Renovate's pull request had when fix job `fix_id` merged. A
-    /// head committed after the merge is not that head, so it gets the empty
-    /// head, which no pull request has and which asks for no rebase. Neither
-    /// the last polled head nor the time of this read says which side of the
-    /// merge a new head came on.
+    /// The head Renovate's pull request had when fix job `fix_id` merged. The
+    /// forge says when the fix pull requests merged and when the current head
+    /// became the head, so a head that arrived after the merge, whenever its
+    /// commit was made, gets the empty head. No pull request has that head, so
+    /// the request is skipped and the new head restarts triage.
     async fn merge_head(
         &self,
         request: &RenovateWatchRequest,
         fix_id: i64,
     ) -> Result<String, String> {
+        let fix = self.store.get(fix_id).map_err(|err| err.to_string())?;
+        let mut merged_at: Option<String> = None;
+        for number in fix.job.plan().iter().filter_map(|pr| pr.number) {
+            let at = self
+                .executor
+                .merged_at(request.forge, &request.account, &request.repo, number)
+                .await?;
+            merged_at = merged_at.max(at);
+        }
+        let merged_at = merged_at.ok_or("the forge shows no merged fix pull request")?;
         let head = self
             .executor
             .renovate_head(
@@ -1783,16 +1802,10 @@ impl<E: Executor> Scheduler<E> {
                 request.number,
             )
             .await?;
-        let merged_at = self
-            .store
-            .events(fix_id)
-            .map_err(|err| err.to_string())?
-            .into_iter()
-            .find(|event| event.stage == Stage::Merged.name())
-            .map(|event| event.at);
-        Ok(match merged_at {
-            Some(merged_at) if head.committed_at > merged_at => String::new(),
-            _ => head.sha,
+        Ok(if head.changed_at > merged_at {
+            String::new()
+        } else {
+            head.sha
         })
     }
 
@@ -1813,14 +1826,10 @@ impl<E: Executor> Scheduler<E> {
         // the result means the write may have happened, so the factory asks
         // the user instead of writing again.
         let fix = match self.store.get(job_id) {
-            Ok(row) => row.job.renovate_pr().and_then(|pr| match &pr.fix {
-                Some(FixLink {
-                    job,
-                    state: FixState::Merged { .. },
-                    ..
-                }) => Some(*job),
-                _ => None,
-            }),
+            Ok(row) => row
+                .job
+                .renovate_pr()
+                .and_then(|pr| pr.fix.as_ref().map(|link| link.job)),
             Err(err) => {
                 tracing::error!("reading job #{job_id}: {err}");
                 return;
@@ -1829,9 +1838,10 @@ impl<E: Executor> Scheduler<E> {
         let Some(fix) = fix else {
             return;
         };
-        match self.store.claim_rebase(job_id, fix) {
-            Ok(true) => {}
-            Ok(false) => {
+        match self.store.claim_rebase(job_id, fix, head) {
+            Ok(Claim::Granted) => {}
+            Ok(Claim::Stale) => return,
+            Ok(Claim::Taken) => {
                 let reason = "the factory restarted while asking Renovate to rebase".to_owned();
                 self.note(
                     job_id,
