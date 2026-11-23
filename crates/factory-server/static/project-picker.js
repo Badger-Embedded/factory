@@ -27,9 +27,21 @@
   });
 
   let focusedHref = null;
+  let detached = false;
+
+  function clearCurrent(list) {
+    list.querySelectorAll("[aria-current]").forEach(function (link) {
+      link.removeAttribute("aria-current");
+    });
+  }
+
   document.body.addEventListener("htmx:beforeSwap", function (event) {
     const target = event.detail.target;
     if (!target || target.id !== "picker-list") return;
+    if (detached && event.detail.xhr.responseText.trim() === "") {
+      event.detail.shouldSwap = false;
+      return;
+    }
     const active = document.activeElement;
     focusedHref = active && target.contains(active) ? active.getAttribute("href") : null;
   });
@@ -37,6 +49,7 @@
     const target = event.detail.target;
     if (!target || target.id !== "picker-list") return;
     const list = document.getElementById("picker-list");
+    if (detached) clearCurrent(list);
     const row = list.querySelector('a[aria-current="page"] .picker-name');
     if (row) current.textContent = row.textContent;
     if (focusedHref !== null) {
@@ -52,12 +65,15 @@
     fetch("/", { headers: { Accept: "text/html" } })
       .then(function (response) { return response.text(); })
       .then(function (html) {
-        const fresh = new DOMParser().parseFromString(html, "text/html").getElementById("picker-list");
         const list = document.getElementById("picker-list");
-        if (!fresh || !list) return;
-        fresh.querySelectorAll("[aria-current]").forEach(function (link) {
-          link.removeAttribute("aria-current");
-        });
+        if (!list) return;
+        let fresh = new DOMParser().parseFromString(html, "text/html").getElementById("picker-list");
+        if (!fresh) {
+          fresh = list.cloneNode(false);
+          fresh.setAttribute("hx-get", "/fragments/picker");
+        }
+        detached = true;
+        clearCurrent(fresh);
         list.replaceWith(fresh);
         htmx.process(fresh);
       });

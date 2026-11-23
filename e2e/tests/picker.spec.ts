@@ -207,6 +207,37 @@ test.describe('as a login of its own', () => {
     await expect(draft).toHaveValue('half-written request');
     const hidden = await page.request.get(`/fragments/picker?project=gone${tag}`);
     expect(hidden.status()).toBe(404);
+
+    job(factory, `stay${tag}`, 'spec');
+    await expect(row(page, `stay${tag}`).locator('.badge.you')).toHaveText(/1/, { timeout: 15_000 });
+    await expect(page.locator('#picker-list [aria-current]')).toHaveCount(0);
+    await expect(button(page)).toHaveText(`gone${tag}`);
+    await expect(draft).toHaveValue('half-written request');
+  });
+
+  test('removing the last visible project leaves an empty list that finds a new project', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    projectFor(factory, login, `only${tag}`);
+
+    await page.goto(`/?project=only${tag}`);
+    const draft = page.locator('textarea').first();
+    await draft.fill('half-written request');
+
+    const other = await page.context().newPage();
+    await other.goto(`/settings/projects/only${tag}`);
+    await other.getByLabel('Project name').fill(`only${tag}`);
+    await other.getByRole('button', { name: `Remove only${tag}` }).click();
+    await expect(other.getByText(`Removed project only${tag}.`)).toBeVisible();
+
+    await expect(row(page, `only${tag}`)).toHaveCount(0, { timeout: 15_000 });
+    await expect(draft).toHaveValue('half-written request');
+
+    projectFor(factory, login, `new${tag}`);
+    await expect(row(page, `new${tag}`)).toHaveCount(1, { timeout: 15_000 });
+    await expect(page.locator('#picker-list [aria-current]')).toHaveCount(0);
+    await expect(draft).toHaveValue('half-written request');
   });
 
   test('a rename updates the button and keeps focus on the same row while the panel is open', async ({ page, factory }, testInfo) => {
