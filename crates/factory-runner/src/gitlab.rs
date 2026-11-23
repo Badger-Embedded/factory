@@ -32,6 +32,10 @@ const MAX_PAGES: usize = 50;
 /// Variables of the factory's own environment that would give `glab` a
 /// credential or a host the call did not ask for.
 const INHERITED: &[&str] = &[
+    "GLAB_IS_OAUTH2",
+    "OAUTH2_REFRESH_TOKEN",
+    "GLAB_SKIP_TLS_VERIFY",
+    "SKIP_TLS_VERIFY",
     "JOB_TOKEN",
     "CI_JOB_TOKEN",
     "API_PROTOCOL",
@@ -231,8 +235,8 @@ struct DiffVersionJson {
     head_commit_sha: String,
     #[serde(default)]
     state: String,
-    #[serde(default)]
-    diffs: Vec<DiffJson>,
+    diffs: Option<Vec<DiffJson>>,
+    real_size: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -790,7 +794,17 @@ impl GitLab {
                 detail.state
             ));
         }
-        Ok(detail.diffs)
+        let real_size = match &detail.real_size {
+            Some(serde_json::Value::String(text)) => text.parse::<usize>().ok(),
+            Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|n| usize::try_from(n).ok()),
+            _ => None,
+        };
+        match detail.diffs {
+            Some(diffs) if Some(diffs.len()) == real_size => Ok(diffs),
+            _ => Err(format!(
+                "the diff of merge request {number} is missing files, so it cannot be reviewed in full"
+            )),
+        }
     }
 
     async fn pr_info(&self, account: &Account, repo: &str, number: u64) -> Result<PrInfo, String> {

@@ -611,13 +611,13 @@ async fn pr_details_builds_a_unified_diff_and_refuses_one_gitlab_cut() {
         r#"case "$4" in
   */merge_requests/7) echo '{"iid":7,"title":"Update dep","description":"Body","sha":"abc"}' ;;
   */merge_requests/7/versions) echo '[{"id":3,"head_commit_sha":"abc","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
-  */merge_requests/7/versions/3) echo '{"head_commit_sha":"abc","state":"collected","diffs":[
+  */merge_requests/7/versions/3) echo '{"head_commit_sha":"abc","state":"collected","real_size":"2","diffs":[
     {"old_path":"a.txt","new_path":"a.txt","new_file":false,"deleted_file":false,"diff":"@@ -1 +1 @@\n-old\n+new\n"},
     {"old_path":"b.txt","new_path":"b.txt","new_file":true,"deleted_file":false,"diff":"@@ -0,0 +1 @@\n+added"}
   ]}' ;;
   */merge_requests/8) echo '{"iid":8,"sha":"def"}' ;;
   */merge_requests/8/versions) echo '[{"id":4,"head_commit_sha":"def","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
-  */merge_requests/8/versions/4) echo '{"head_commit_sha":"def","state":"collected","diffs":[{"old_path":"big","new_path":"big","too_large":true,"diff":""}]}' ;;
+  */merge_requests/8/versions/4) echo '{"head_commit_sha":"def","state":"collected","real_size":"1","diffs":[{"old_path":"big","new_path":"big","too_large":true,"diff":""}]}' ;;
 esac"#,
     );
     let details = glab.pr_details(&account(), "o/r", 7).await.unwrap();
@@ -961,12 +961,18 @@ async fn only_a_collected_diff_of_the_reviewed_head_is_reviewed() {
   */merge_requests/7/versions/1) echo '{"head_commit_sha":"a","state":"overflow","diffs":[{"old_path":"a","new_path":"a","diff":""}]}' ;;
   */merge_requests/8) echo '{"iid":8,"sha":"a"}' ;;
   */merge_requests/8/versions) echo '[{"id":2,"head_commit_sha":"older","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/10) echo '{"iid":10,"sha":"a"}' ;;
+  */merge_requests/10/versions) echo '[{"id":5,"head_commit_sha":"a","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/10/versions/5) echo '{"head_commit_sha":"a","state":"collected","real_size":"1"}' ;;
+  */merge_requests/11) echo '{"iid":11,"sha":"a"}' ;;
+  */merge_requests/11/versions) echo '[{"id":6,"head_commit_sha":"a","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/11/versions/6) echo '{"head_commit_sha":"a","state":"collected","real_size":"2","diffs":[{"old_path":"a","new_path":"a","diff":""}]}' ;;
   */merge_requests/9) echo '{"iid":9,"sha":"a"}' ;;
   */merge_requests/9/versions) echo '[{"id":3,"head_commit_sha":"a","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
-  */merge_requests/9/versions/3) echo '{"head_commit_sha":"b","state":"collected","diffs":[{"old_path":"a","new_path":"a","diff":""}]}' ;;
+  */merge_requests/9/versions/3) echo '{"head_commit_sha":"b","state":"collected","real_size":"1","diffs":[{"old_path":"a","new_path":"a","diff":""}]}' ;;
 esac"#,
     );
-    for number in [7, 8, 9] {
+    for number in [7, 8, 9, 10, 11] {
         let err = glab
             .pr_details(&account(), "o/r", number)
             .await
@@ -987,6 +993,10 @@ fn ambient_overrides_do_not_change_the_call() {
             ("GITLAB_ACCESS_TOKEN", "ambient"),
             ("API_PROTOCOL", "http"),
             ("GLAB_API_PROTOCOL", "http"),
+            ("GLAB_IS_OAUTH2", "true"),
+            ("OAUTH2_REFRESH_TOKEN", "ambient"),
+            ("GLAB_SKIP_TLS_VERIFY", "true"),
+            ("SKIP_TLS_VERIFY", "true"),
         ])
         .output()
         .unwrap();
@@ -995,6 +1005,7 @@ fn ambient_overrides_do_not_change_the_call() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
 }
 
 /// Run by `ambient_overrides_do_not_change_the_call` with the overrides set,
@@ -1005,9 +1016,7 @@ async fn ambient_run() {
     let dir = tempfile::tempdir().unwrap();
     let (mut glab, log) = fake_glab(
         dir.path(),
-        r#"for v in JOB_TOKEN CI_JOB_TOKEN API_PROTOCOL GIT_DIR GITLAB_ACCESS_TOKEN; do
-  [ -z "${!v}" ] || { echo "leaked $v" >&2; exit 2; }
-done
+        r#"[ -z "$JOB_TOKEN$CI_JOB_TOKEN$API_PROTOCOL$GIT_DIR$GITLAB_ACCESS_TOKEN$GLAB_IS_OAUTH2$OAUTH2_REFRESH_TOKEN$GLAB_SKIP_TLS_VERIFY$SKIP_TLS_VERIFY" ] || { echo leaked >&2; exit 2; }
 [ "$GLAB_API_PROTOCOL" = https ] && [ "$GITLAB_API_PROTOCOL" = https ] || exit 2
 echo '{"iid":7,"state":"merged"}'"#,
     );
