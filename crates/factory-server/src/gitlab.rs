@@ -94,6 +94,8 @@ fn glob_matches(pattern: &str, branch: &str) -> bool {
     true
 }
 
+const MAX_RULE_PAGES: u32 = 50;
+
 impl GlabRepos {
     /// A JSON read that is `None` when the resource is missing.
     async fn read<T: for<'de> Deserialize<'de>>(
@@ -121,16 +123,6 @@ impl GlabRepos {
         base: &str,
         access: Access,
     ) -> Result<Merge, String> {
-        let endpoint = format!("{}/protected_branches?per_page=100", gitlab_project(repo));
-        let rules = match self
-            .read::<Vec<ProtectedBranchJson>>(account, &endpoint)
-            .await
-        {
-            Ok(Some(rules)) => rules,
-            Ok(None) => return Ok(Merge::Unverified),
-            Err(err) if err.contains("HTTP 403") => return Ok(Merge::Unverified),
-            Err(err) => return Err(err),
-        };
         let level = if access == Access::Admin {
             MAINTAINER
         } else {
@@ -138,25 +130,44 @@ impl GlabRepos {
         };
         let mut matched = false;
         let mut unverified = false;
-        for rule in rules.iter().filter(|rule| glob_matches(&rule.name, base)) {
-            matched = true;
-            for allowed in &rule.merge_access_levels {
-                if allowed.user_id.is_some() || allowed.group_id.is_some() {
-                    // The account's id and groups are not known here.
-                    unverified = true;
-                } else if allowed
-                    .access_level
-                    .is_some_and(|needed| needed > 0 && needed <= level)
-                {
-                    return Ok(Merge::Allowed);
+        for page in 1..=MAX_RULE_PAGES {
+            let endpoint = format!(
+                "{}/protected_branches?per_page=100&page={page}",
+                gitlab_project(repo)
+            );
+            let rules = match self
+                .read::<Vec<ProtectedBranchJson>>(account, &endpoint)
+                .await
+            {
+                Ok(Some(rules)) if !rules.is_empty() => rules,
+                Ok(Some(_)) => {
+                    return Ok(if !matched || unverified {
+                        Merge::Unverified
+                    } else {
+                        Merge::Denied
+                    });
+                }
+                Ok(None) => return Ok(Merge::Unverified),
+                Err(err) if err.contains("HTTP 403") => return Ok(Merge::Unverified),
+                Err(err) => return Err(err),
+            };
+            for rule in rules.iter().filter(|rule| glob_matches(&rule.name, base)) {
+                matched = true;
+                for allowed in &rule.merge_access_levels {
+                    if allowed.user_id.is_some() || allowed.group_id.is_some() {
+                        // The account's id and groups are not known here.
+                        unverified = true;
+                    } else if allowed
+                        .access_level
+                        .is_some_and(|needed| needed > 0 && needed <= level)
+                    {
+                        return Ok(Merge::Allowed);
+                    }
                 }
             }
         }
-        Ok(if !matched || unverified {
-            Merge::Unverified
-        } else {
-            Merge::Denied
-        })
+        // A list this long was not read to its end, so it cannot deny.
+        Ok(Merge::Unverified)
     }
 
     async fn check_repo(
@@ -230,19 +241,26 @@ impl GlabRepos {
         }
         // A pipeline of the same commit on another ref, such as a feature
         // branch or a tag, is not CI of the base branch.
-        let has_pipeline = match &branch.commit {
-            Some(commit) => {
-                let endpoint = format!(
-                    "{project}/pipelines?ref={}&sha={}&per_page=1",
-                    gitlab_encode(base),
-                    gitlab_encode(&commit.id)
-                );
-                self.read::<Vec<serde_json::Value>>(account, &endpoint)
-                    .await?
-                    .is_some_and(|pipelines| !pipelines.is_empty())
+        let mut has_pipeline = false;
+        if let Some(commit) = &branch.commit {
+            let endpoint = format!(
+                "{project}/pipelines?ref={}&sha={}&per_page=1",
+                gitlab_encode(base),
+                gitlab_encode(&commit.id)
+            );
+            match self
+                .read::<Vec<serde_json::Value>>(account, &endpoint)
+                .await
+            {
+                Ok(pipelines) => {
+                    has_pipeline = pipelines.is_some_and(|pipelines| !pipelines.is_empty());
+                }
+                // GitLab refuses the listing when CI/CD is disabled or the
+                // account cannot read builds, so there is no CI to wait for.
+                Err(err) if err.contains("HTTP 403") => {}
+                Err(err) => return Err(err),
             }
-            None => false,
-        };
+        }
         if !has_pipeline {
             report.warnings.push(format!(
                 "The head of the base branch \"{base}\" in {repo} has no pipeline, so the factory has no CI to wait for."

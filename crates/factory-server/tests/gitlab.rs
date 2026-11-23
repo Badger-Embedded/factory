@@ -24,6 +24,10 @@ struct Salsa {
     /// The protected branch rules, as the JSON array GitLab lists. Level 0
     /// is GitLab's "No one".
     rules: &'static str,
+    /// The second page of rules.
+    rules_page2: &'static str,
+    /// Whether the pipeline listing answers HTTP 403, as with CI/CD disabled.
+    pipelines_forbidden: bool,
     /// The ref a pipeline of the base branch's head commit ran on, if any.
     pipeline_ref: Option<&'static str>,
 }
@@ -36,6 +40,8 @@ impl Salsa {
             branch: true,
             protected: true,
             rules: r#"[{"name":"main","merge_access_levels":[{"access_level":30}]}]"#,
+            rules_page2: "[]",
+            pipelines_forbidden: false,
             pipeline_ref: Some("main"),
         }
     }
@@ -62,9 +68,10 @@ echo "$GITLAB_HOST $GITLAB_TOKEN $*" >> "{log}"
 case "$4" in
   projects/team%2Fsub%2Fpkg) echo '{{"squash_option":"{squash}","permissions":{{"project_access":{{"access_level":{level}}},"group_access":null}}}}' ;;
   projects/team%2Fsub%2Fpkg/repository/branches/main) {branch} ;;
-  'projects/team%2Fsub%2Fpkg/protected_branches?per_page=100') echo '{rules}' ;;
-  "projects/team%2Fsub%2Fpkg/pipelines?ref={pipeline_ref}&sha=abc123&per_page=1") echo '{pipelines}' ;;
-  projects/team%2Fsub%2Fpkg/pipelines*) echo '[]' ;;
+  'projects/team%2Fsub%2Fpkg/protected_branches?per_page=100&page=1') echo '{rules}' ;;
+  'projects/team%2Fsub%2Fpkg/protected_branches?per_page=100&page=2') echo '{rules_page2}' ;;
+  'projects/team%2Fsub%2Fpkg/protected_branches?per_page=100&page=3') echo '[]' ;;
+  projects/team%2Fsub%2Fpkg/pipelines*) {pipelines_answer} ;;
   *) echo 'glab: 404 Not Found (HTTP 404)' >&2; exit 1 ;;
 esac
 "#,
@@ -72,6 +79,14 @@ esac
             squash = self.squash,
             level = self.level,
             rules = self.rules,
+            rules_page2 = self.rules_page2,
+            pipelines_answer = if self.pipelines_forbidden {
+                "echo 'glab: 403 Forbidden (HTTP 403)' >&2; exit 1".to_owned()
+            } else {
+                format!(
+                    r#"if [ "$4" = "projects/team%2Fsub%2Fpkg/pipelines?ref={pipeline_ref}&sha=abc123&per_page=1" ]; then echo '{pipelines}'; else echo '[]'; fi"#
+                )
+            },
         );
         GlabRepos {
             gitlab: GitLab {
@@ -289,6 +304,28 @@ async fn a_pipeline_on_another_ref_is_not_ci_of_the_base_branch() {
         ..Salsa::fit()
     };
     let (report, _) = check(&salsa, "team/sub/pkg").await;
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("no pipeline"));
+}
+
+#[tokio::test]
+async fn a_grant_on_the_second_page_of_rules_lets_a_developer_merge() {
+    let salsa = Salsa {
+        rules_page2: r#"[{"name":"*","merge_access_levels":[{"access_level":30}]}]"#,
+        ..with_rules(r#"[{"name":"main","merge_access_levels":[{"access_level":40}]}]"#)
+    };
+    let (report, _) = check(&salsa, "team/sub/pkg").await;
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+#[tokio::test]
+async fn disabled_ci_is_a_warning_and_not_an_error() {
+    let salsa = Salsa {
+        pipelines_forbidden: true,
+        ..Salsa::fit()
+    };
+    let (report, _) = check(&salsa, "team/sub/pkg").await;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     assert!(report.warnings[0].contains("no pipeline"));
 }
