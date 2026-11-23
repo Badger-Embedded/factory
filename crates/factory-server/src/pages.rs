@@ -3207,7 +3207,7 @@ pub fn job(
     models: &StageModels,
     efforts: &StageEfforts,
     auto_merge: bool,
-    gap_links: &[i64],
+    links: &JobLinks,
     prerequisites: &[PrerequisiteView],
 ) -> Markup {
     let job = &row.job;
@@ -3220,13 +3220,13 @@ pub fn job(
         &html! {},
         &html! {
             (job_poll(false, id, job))
-            (job_header(id, row, repo_url, cost_usd, estimated))
+            (job_header(id, row, links, repo_url, cost_usd, estimated))
             @if let Some(problem) = project.and_then(|project| project.forge.problem()) {
                 div.card.failed { (problem) }
             }
             div.job-layout {
                 div.job-now {
-                    (status_region(false, id, &row.project, job, settings, auto_merge, gap_links, prerequisites))
+                    (status_region(false, id, &row.project, job, settings, auto_merge, links, prerequisites))
                     (queued_after_region(false, job, prerequisites))
                     p.meta { "Approval gates: " (gates_line(job.gates())) }
                 }
@@ -3273,7 +3273,7 @@ pub fn job_fragment(
     models: &StageModels,
     efforts: &StageEfforts,
     auto_merge: bool,
-    gap_links: &[i64],
+    links: &JobLinks,
     prerequisites: &[PrerequisiteView],
 ) -> Markup {
     let job = &row.job;
@@ -3282,7 +3282,7 @@ pub fn job_fragment(
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd, any_estimated(events)))
         (timeline_region(true, job, events, models, efforts))
-        (status_region(true, row.id, &row.project, job, settings, auto_merge, gap_links, prerequisites))
+        (status_region(true, row.id, &row.project, job, settings, auto_merge, links, prerequisites))
         (queued_after_region(true, job, prerequisites))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
@@ -3362,7 +3362,7 @@ fn status_region(
     job: &Job,
     settings: &Settings,
     auto_merge: bool,
-    gap_links: &[i64],
+    links: &JobLinks,
     prerequisites: &[PrerequisiteView],
 ) -> Markup {
     html! {
@@ -3371,7 +3371,7 @@ fn status_region(
             @if *job.stage() == Stage::Requested && wait != Wait::Ready {
                 (waiting_card(id, job, &wait, prerequisites))
             } @else {
-                (status_card(id, project, job, settings, auto_merge, gap_links, prerequisites))
+                (status_card(id, project, job, settings, auto_merge, links, prerequisites))
             }
         }
     }
@@ -3597,6 +3597,7 @@ fn log_region(oob: bool, logs: &[LogEntry]) -> Markup {
 fn job_header(
     id: i64,
     row: &JobRow,
+    links: &JobLinks,
     repo_url: Option<Links<'_>>,
     cost_usd: f64,
     estimated: bool,
@@ -3613,7 +3614,11 @@ fn job_header(
         @if let Some((source, number)) = job.fix_source() {
             p.meta {
                 "Fixes Renovate pull request #" (number) ", in "
-                a href={ "/jobs/" (source) } { "job " (source) }
+                @if links.source == Some(source) {
+                    a href={ "/jobs/" (source) } { "job " (source) }
+                } @else {
+                    "a job that is no longer available"
+                }
                 "."
             }
         }
@@ -3641,9 +3646,9 @@ fn renovate_link(job: &Job, links: Option<Links<'_>>) -> Markup {
     }
 }
 
-/// `gap_links` holds the gap jobs that still belong to this Renovate job. A
+/// `links.gaps` holds the gap jobs that still belong to this Renovate job. A
 /// job id can be reused after its job expires, so any other id gets no link.
-fn renovate_details(pr: &RenovatePr, settings: &Settings, gap_links: &[i64]) -> Markup {
+fn renovate_details(pr: &RenovatePr, settings: &Settings, links: &JobLinks) -> Markup {
     html! {
         ul.renovate-details {
             li {
@@ -3660,7 +3665,14 @@ fn renovate_details(pr: &RenovatePr, settings: &Settings, gap_links: &[i64]) -> 
                 li { "Summary: " (verdict.summary) }
             }
             @if let Some(fix) = &pr.fix {
-                li { "Fix job: " a href={ "/jobs/" (fix.job) } { "job " (fix.job) } }
+                li {
+                    "Fix job: "
+                    @if links.fix == Some(fix.job) {
+                        a href={ "/jobs/" (fix.job) } { "job " (fix.job) }
+                    } @else {
+                        "a job that is no longer available"
+                    }
+                }
             }
             @match &pr.gaps {
                 Some(jobs) if jobs.is_empty() => li { "No gaps found" },
@@ -3668,7 +3680,7 @@ fn renovate_details(pr: &RenovatePr, settings: &Settings, gap_links: &[i64]) -> 
                     "Packaging gaps found: "
                     @for (i, job) in jobs.iter().enumerate() {
                         @if i > 0 { ", " }
-                        @if gap_links.contains(job) {
+                        @if links.gaps.contains(job) {
                             a href={ "/jobs/" (job) } { "job " (job) }
                         } @else {
                             "a job that is no longer available"
@@ -3949,13 +3961,27 @@ fn log_card(logs: &[LogEntry]) -> Markup {
     }
 }
 
+/// The jobs a job page links to, each checked against the stored job, since
+/// SQLite reuses the id of a deleted job.
+#[derive(Default)]
+pub struct JobLinks {
+    /// Gap jobs that still belong to the Renovate job.
+    pub gaps: Vec<i64>,
+    /// The Renovate job's fix job, when it still is that job's fix job.
+    pub fix: Option<i64>,
+    /// The Renovate job a fix job is for, when it still is that pull request's job.
+    pub source: Option<i64>,
+    /// The token the job page's own forms carry.
+    pub csrf: String,
+}
+
 fn renovate_wait_card(
     id: i64,
     job: &Job,
     settings: &Settings,
     reason: &str,
     state: RenovateWait,
-    gap_links: &[i64],
+    links: &JobLinks,
 ) -> Markup {
     let heading = match state {
         RenovateWait::Stopped => "Triage stopped",
@@ -3968,9 +3994,9 @@ fn renovate_wait_card(
         return html! {
             div.card.status {
                 span.badge.factory { "waiting for fix" }
-                span.status-detail { (fix_reason(job, reason)) }
+                span.status-detail { (fix_reason(job, reason, links)) }
                 @if let Some(pr) = job.renovate_pr() {
-                    (renovate_details(pr, settings, gap_links))
+                    (renovate_details(pr, settings, links))
                 }
             }
         };
@@ -3981,9 +4007,14 @@ fn renovate_wait_card(
                 span.badge.you { "needs you" }
                 h2 { (heading) }
             }
-            p.status-detail { (reason) }
+            p.status-detail {
+                @for (i, line) in reason.lines().enumerate() {
+                    @if i > 0 { br; }
+                    (line)
+                }
+            }
             @if let Some(pr) = job.renovate_pr() {
-                (renovate_details(pr, settings, gap_links))
+                (renovate_details(pr, settings, links))
             }
             @if job.can_retry() {
                 div.row.actions {
@@ -3994,6 +4025,7 @@ fn renovate_wait_card(
             }
             @if state == RenovateWait::Stopped {
                 form.fix-form method="post" action={ "/jobs/" (id) "/fix" } {
+                    input type="hidden" name="csrf" value=(links.csrf);
                     label for="fix-instructions" { "Fix it in a separate pull request" }
                     textarea #fix-instructions name="instructions" rows="3"
                         placeholder="What should the fix change? Optional." {}
@@ -4008,12 +4040,12 @@ fn renovate_wait_card(
     }
 }
 
-/// The wait reason with the fix job's `#N` as a link to that job.
-fn fix_reason(job: &Job, reason: &str) -> Markup {
+fn fix_reason(job: &Job, reason: &str, links: &JobLinks) -> Markup {
     let target = job
         .renovate_pr()
         .and_then(|pr| pr.fix.as_ref())
-        .map(|fix| fix.job);
+        .map(|fix| fix.job)
+        .filter(|fix| links.fix == Some(*fix));
     let found = target.and_then(|job| {
         let mark = format!("#{job}");
         reason.find(&mark).map(|at| (job, at, mark.len()))
@@ -4063,7 +4095,7 @@ fn status_card(
     job: &Job,
     settings: &Settings,
     auto_merge: bool,
-    gap_links: &[i64],
+    links: &JobLinks,
     prerequisites: &[PrerequisiteView],
 ) -> Markup {
     let wait = prerequisite_wait(prerequisites);
@@ -4118,7 +4150,7 @@ fn status_card(
             }),
         ) => publish_card(id, job, *pr, summary),
         (_, Turn::User(Ask::Renovate { reason, state })) => {
-            renovate_wait_card(id, job, settings, reason, *state, gap_links)
+            renovate_wait_card(id, job, settings, reason, *state, links)
         }
         (Stage::Proposed, _) => proposal_card(id, job),
         (
@@ -4133,7 +4165,7 @@ fn status_card(
                 (turn_badge(job, auto_merge, &wait))
                 span.status-detail { (turn_detail(job, settings, auto_merge, &wait)) }
                 @if let Some(pr) = job.renovate_pr() {
-                    (renovate_details(pr, settings, gap_links))
+                    (renovate_details(pr, settings, links))
                 }
             }
         },

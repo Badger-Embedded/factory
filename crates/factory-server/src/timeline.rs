@@ -58,9 +58,7 @@ struct Step {
 
 struct Timeline {
     steps: Vec<Step>,
-    /// What happened with a Renovate job's fix job, in order. These events
-    /// happen in the `renovate` stage, which has no step of its own.
-    fixes: Vec<Note>,
+    fix_notes: Vec<Note>,
     /// The step the job is in, or for a failed or cancelled job the step it
     /// was in when that happened. `None` when the history does not say.
     current: Option<usize>,
@@ -98,10 +96,10 @@ fn build(job: &Job, events: &[JobEvent]) -> Timeline {
     let mut steps: Vec<Step> = (0..=merged_order(prs)).map(|_| Step::default()).collect();
     let mut current = None;
     let mut active: Option<usize> = None;
-    let mut fixes = Vec::new();
+    let mut fix_notes = Vec::new();
     for event in events {
         if let Some(text) = fix_note(event) {
-            fixes.push(Note {
+            fix_notes.push(Note {
                 at: event.at.clone(),
                 text,
             });
@@ -133,7 +131,7 @@ fn build(job: &Job, events: &[JobEvent]) -> Timeline {
     }
     Timeline {
         steps,
-        fixes,
+        fix_notes,
         current,
     }
 }
@@ -331,9 +329,9 @@ pub(crate) fn timeline(
             }
             @for pr in 0..prs { (pr_group(job, &timeline, models, efforts, pr)) }
             ol.tl { (step(job, &timeline, models, efforts, merged)) }
-            @if !timeline.fixes.is_empty() {
+            @if !timeline.fix_notes.is_empty() {
                 ul.rounds.fix-notes {
-                    @for note in &timeline.fixes {
+                    @for note in &timeline.fix_notes {
                         li { span { (note.text) } span.when { (localtime::time(&note.at)) } }
                     }
                 }

@@ -2809,6 +2809,77 @@ async fn the_fix_form_shows_only_on_a_stopped_renovate_job() {
     assert!(!page.contains("/fix\""));
 }
 
+fn first_value(html: &str, selector: &str, attr: &str) -> String {
+    scraper::Html::parse_document(html)
+        .select(&scraper::Selector::parse(selector).unwrap())
+        .next()
+        .and_then(|node| node.value().attr(attr))
+        .unwrap_or_else(|| panic!("no {selector}"))
+        .to_owned()
+}
+
+fn timeline_text(html: &str) -> String {
+    scraper::Html::parse_document(html)
+        .select(&scraper::Selector::parse("div.timeline").unwrap())
+        .next()
+        .expect("the page has a timeline")
+        .text()
+        .collect()
+}
+
+/// Posts the fix form as `login` with the token the job page carries.
+async fn post_fix(dashboard: &Dashboard, login: &str, id: i64, instructions: &str) -> Reply {
+    let page = dashboard.get_as(login, &format!("/jobs/{id}")).await.body;
+    let csrf = first_value(&page, ".fix-form input[name=csrf]", "value");
+    dashboard
+        .post_as(
+            login,
+            &format!("/jobs/{id}/fix"),
+            &format!("instructions={instructions}&csrf={csrf}"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_fix_post_without_a_valid_token_creates_nothing() {
+    let dashboard = dashboard();
+    let id = stopped_renovate_job(&dashboard);
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let token = first_value(&page, ".fix-form input[name=csrf]", "value");
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await.body;
+    let polled = first_value(&fragment, ".fix-form input[name=csrf]", "value");
+    assert!(!token.is_empty() && !polled.is_empty());
+
+    dashboard
+        .store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+    let other = dashboard
+        .get_as("bob@example.com", &format!("/jobs/{id}"))
+        .await
+        .body;
+    let others = first_value(&other, ".fix-form input[name=csrf]", "value");
+    for form in [
+        "instructions=x".to_owned(),
+        "instructions=x&csrf=".to_owned(),
+        "instructions=x&csrf=forged".to_owned(),
+        format!("instructions=x&csrf={others}"),
+    ] {
+        let reply = dashboard.post(&format!("/jobs/{id}/fix"), &form).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{form}");
+    }
+    assert!(dashboard.store.get(id + 1).is_err());
+
+    let accepted = dashboard
+        .post(
+            &format!("/jobs/{id}/fix"),
+            &format!("instructions=x&csrf={polled}"),
+        )
+        .await;
+    assert_eq!(accepted.status, StatusCode::SEE_OTHER);
+    assert!(dashboard.store.get(id + 1).is_ok());
+}
+
 #[tokio::test]
 async fn starting_a_fix_creates_one_linked_job_and_leaves_needs_you() {
     let dashboard = dashboard();
@@ -2820,12 +2891,7 @@ async fn starting_a_fix_creates_one_linked_job_and_leaves_needs_you() {
     assert_eq!(stranger.status, StatusCode::NOT_FOUND);
     assert!(dashboard.store.get(id + 1).is_err());
 
-    let reply = dashboard
-        .post(
-            &format!("/jobs/{id}/fix"),
-            "instructions=update+the+smoke+test",
-        )
-        .await;
+    let reply = post_fix(&dashboard, USER, id, "update+the+smoke+test").await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     let fix = dashboard.store.get(id + 1).unwrap();
     assert_eq!(fix.requested_by, USER);
@@ -2839,21 +2905,26 @@ async fn starting_a_fix_creates_one_linked_job_and_leaves_needs_you() {
         assert!(fix.job.request().contains(part), "{part}");
     }
 
-    let again = dashboard.post(&format!("/jobs/{id}/fix"), "").await;
-    assert_eq!(again.status, StatusCode::CONFLICT);
+    let again = dashboard
+        .post(&format!("/jobs/{id}/fix"), "instructions=&csrf=stale")
+        .await;
+    assert!(matches!(
+        again.status,
+        StatusCode::CONFLICT | StatusCode::FORBIDDEN
+    ));
     assert!(dashboard.store.get(id + 2).is_err());
 
     let page = dashboard.get(&format!("/jobs/{id}")).await.body;
     assert!(page.contains(&format!(
-        "Waiting for fix job <a href=\"/jobs/{}\">#{}</a>",
-        fix.id, fix.id
+        "Waiting for fix job <a href=\"/jobs/{0}\">#{0}</a>",
+        fix.id
     )));
     assert!(!page.contains("/retry\""));
     assert!(!page.contains("/fix\" "));
-    assert!(page.contains("Started fix job #"));
+    assert!(timeline_text(&page).contains(&format!("Started fix job #{}", fix.id)));
 
     let fix_page = dashboard.get(&format!("/jobs/{}", fix.id)).await.body;
-    assert!(fix_page.contains(&format!("href=\"/jobs/{id}\"")));
+    assert!(fix_page.contains(&format!("<a href=\"/jobs/{id}\">job {id}</a>")));
 
     let board = dashboard.get("/").await.body;
     assert!(board.contains("Running <span class=\"count\">"));
@@ -2875,10 +2946,24 @@ async fn starting_a_fix_creates_one_linked_job_and_leaves_needs_you() {
 }
 
 #[tokio::test]
+async fn a_second_fix_post_is_a_conflict() {
+    let dashboard = dashboard();
+    let id = stopped_renovate_job(&dashboard);
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let csrf = first_value(&page, ".fix-form input[name=csrf]", "value");
+    let form = format!("instructions=&csrf={csrf}");
+    let first = dashboard.post(&format!("/jobs/{id}/fix"), &form).await;
+    assert_eq!(first.status, StatusCode::SEE_OTHER);
+    let second = dashboard.post(&format!("/jobs/{id}/fix"), &form).await;
+    assert_eq!(second.status, StatusCode::CONFLICT);
+    assert!(dashboard.store.get(id + 2).is_err());
+}
+
+#[tokio::test]
 async fn a_cancelled_fix_job_brings_back_the_fix_form() {
     let dashboard = dashboard();
     let id = stopped_renovate_job(&dashboard);
-    dashboard.post(&format!("/jobs/{id}/fix"), "").await;
+    post_fix(&dashboard, USER, id, "").await;
     dashboard.apply(
         id,
         Event::FixEnded {
@@ -2889,17 +2974,23 @@ async fn a_cancelled_fix_job_brings_back_the_fix_form() {
 
     let page = dashboard.get(&format!("/jobs/{id}")).await.body;
     assert!(page.contains("Triage stopped"));
-    assert!(page.contains(&format!("Fix job #{}", id + 1)));
     assert!(page.contains(&format!("action=\"/jobs/{id}/retry\"")));
     assert!(page.contains(&format!("action=\"/jobs/{id}/fix\"")));
-    assert!(page.contains("was cancelled"));
+    let line = scraper::Html::parse_document(&page)
+        .select(&scraper::Selector::parse("p.status-detail").unwrap())
+        .next()
+        .unwrap()
+        .inner_html();
+    assert!(line.contains("<br>"), "{line}");
+    assert!(line.contains(&format!("Fix job #{} was cancelled", id + 1)));
+    assert!(timeline_text(&page).contains(&format!("Fix job #{} was cancelled", id + 1)));
 }
 
 #[tokio::test]
 async fn a_failed_rebase_request_shows_under_needs_you() {
     let dashboard = dashboard();
     let id = stopped_renovate_job(&dashboard);
-    dashboard.post(&format!("/jobs/{id}/fix"), "").await;
+    post_fix(&dashboard, USER, id, "").await;
     dashboard.apply(
         id,
         Event::FixEnded {
@@ -2919,8 +3010,46 @@ async fn a_failed_rebase_request_shows_under_needs_you() {
     let page = dashboard.get(&format!("/jobs/{id}")).await.body;
     assert!(page.contains("could not ask Renovate to rebase. Rebase the pull request by hand."));
     assert!(!page.contains("/fix\" "));
+    let timeline = timeline_text(&page);
+    assert!(timeline.contains("Could not ask Renovate to rebase: no checkbox"));
+    assert!(timeline.contains(&format!("Fix job #{} merged", id + 1)));
     let board = dashboard.get("/").await.body;
     assert!(board.contains("Needs you <span class=\"count\">1</span>"));
+}
+
+#[tokio::test]
+async fn a_fix_link_to_a_reused_job_id_is_plain_text() {
+    let dashboard = dashboard();
+    let id = stopped_renovate_job(&dashboard);
+    post_fix(&dashboard, USER, id, "").await;
+    let fix = id + 1;
+
+    // The fix job expires and its id now names an unrelated job.
+    dashboard
+        .store
+        .delete_job(fix, Path::new("/nonexistent"))
+        .unwrap();
+    let other = dashboard.new_job().await;
+    assert_eq!(other, fix);
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(!page.contains(&format!("href=\"/jobs/{fix}\"")));
+    assert!(page.contains("a job that is no longer available"));
+}
+
+#[tokio::test]
+async fn a_fix_job_back_link_to_a_reused_job_id_is_plain_text() {
+    let dashboard = dashboard();
+    let id = stopped_renovate_job(&dashboard);
+    post_fix(&dashboard, USER, id, "").await;
+    let fix = id + 1;
+
+    dashboard
+        .store
+        .delete_job(id, Path::new("/nonexistent"))
+        .unwrap();
+    let page = dashboard.get(&format!("/jobs/{fix}")).await.body;
+    assert!(!page.contains(&format!("href=\"/jobs/{id}\"")));
+    assert!(page.contains("a job that is no longer available"));
 }
 
 #[tokio::test]

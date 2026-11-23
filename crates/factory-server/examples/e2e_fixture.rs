@@ -137,7 +137,6 @@ fn events_named(name: &str) -> Result<Vec<Event>> {
         "questions" => vec![Event::Agent(AgentResult::Questions(vec![Question {
             text: "Which hub model should the first version support?".into(),
         }]))],
-        // CI failed with no rerun left, so triage stops and comments.
         "renovate-stopped" => vec![
             Event::RenovateObserved {
                 head: "abc1234".into(),
