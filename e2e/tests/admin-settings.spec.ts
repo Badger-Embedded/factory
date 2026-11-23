@@ -80,6 +80,20 @@ test('Pull request polling saves and keeps its value', async ({ page }) => {
   await expect(page.getByLabel('Seconds between looks at a pull request')).toHaveValue('77');
 });
 
+test('a form that still posts to /settings/github saves the interval', async ({ page }) => {
+  await page.goto('/settings/polling');
+  await page.getByLabel('Seconds between looks at a pull request').fill('55');
+  await page.locator('form.settings-form').evaluate((form: HTMLFormElement) => {
+    form.action = '/settings/github';
+  });
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page).toHaveURL(/\/settings\/polling$/);
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto('/settings/polling');
+  await expect(page.getByLabel('Seconds between looks at a pull request')).toHaveValue('55');
+});
+
 test('Renovate saves and keeps its values', async ({ page }) => {
   await page.goto('/settings/renovate');
   await page.getByLabel('Automatic reruns').fill('1');

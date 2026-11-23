@@ -1839,12 +1839,13 @@ async fn show_claude(
     claude_page(&state, &headers, None)
 }
 
-/// Sends the old GitHub settings URL to the polling page. A POST keeps its
-/// method and body, so a form opened before the move still saves.
+/// Sends the old GitHub settings URL to the polling page.
 async fn redirect_polling_get() -> Redirect {
     Redirect::to("/settings/polling")
 }
 
+/// A 307 keeps the method and body, so a form opened before the move still
+/// saves.
 async fn redirect_polling_post() -> Redirect {
     Redirect::temporary("/settings/polling")
 }
