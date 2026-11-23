@@ -174,6 +174,7 @@ pub fn index(
     project: Option<&Project>,
     workers: &Workers,
     notifications: bool,
+    project_token_missing: bool,
 ) -> Markup {
     let all: Vec<&JobRow> = jobs
         .iter()
@@ -206,6 +207,9 @@ pub fn index(
                 }
                 @if let Some(problem) = &problem {
                     div.card.failed { (problem) }
+                }
+                @if project_token_missing {
+                    (missing_project_token_notice(selected))
                 }
                 (composer(selected))
                 (board(&all, costs, auto_merge, selected, project))
@@ -523,6 +527,23 @@ pub struct ProjectSettings {
     pub maintenance: Maintenance,
     /// Set when the project's forge is not one the factory supports.
     pub forge_problem: Option<String>,
+    /// The Forge account card. `None` when the project's forge is unknown.
+    pub forge_account: Option<ForgeAccountCard>,
+}
+
+/// What the Forge account card shows: the project token state and the
+/// current login's own switch.
+pub struct ForgeAccountCard {
+    pub kind: ForgeKind,
+    pub repo: String,
+    /// The account the project token belongs to, or `None` with no token.
+    pub project_account: Option<ForgeAccount>,
+    pub secrets_available: bool,
+    pub csrf: String,
+    /// Whether the current login has "Use my account" on.
+    pub use_my_account: bool,
+    /// Whether the current login has a token for the project's forge.
+    pub has_user_token: bool,
 }
 
 /// One agent the stage panel's agent control offers: its stable id, the name
@@ -1590,6 +1611,12 @@ pub fn settings_project(
             @if let Some(problem) = &project.forge_problem {
                 div.card.failed { (problem) }
             }
+            @if let Some(card) = &project.forge_account {
+                @if card.project_account.is_none() {
+                    (missing_project_token_notice(&project.name))
+                }
+                (project_forge_account_card(&project.name, card))
+            }
             (project_maintenance_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
@@ -1609,7 +1636,7 @@ fn remove_project_card(project: &ProjectSettings) -> Markup {
             h2 { "Remove project" }
             p.hint {
                 "Cancels any running job, which stops its container, and deletes this "
-                "project's settings, its maintenance settings, its collaborators, its stored MCP header values and the "
+                "project's settings, its maintenance settings, its collaborators, its project and upstream tokens, its stored MCP header values and the "
                 "cost history of its jobs. The job rows stay until they expire, and open pull "
                 "requests are left alone. This cannot be undone. Type the project name to confirm."
             }
@@ -1677,6 +1704,84 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
                 }
             }
             (save_bar("Save maintenance"))
+        }
+    }
+}
+
+fn missing_project_token_notice(project: &str) -> Markup {
+    html! {
+        div.card.missing-project-token {
+            "This project has no project token. Jobs do not use project tokens yet, but once they do, a job that does not run as a personal account cannot run without one. "
+            a href={ "/settings/projects/" (crate::web::query_escape(project)) "#forge-account" } {
+                "Save a project token"
+            }
+            "."
+        }
+    }
+}
+
+fn project_forge_account_card(project: &str, card: &ForgeAccountCard) -> Markup {
+    let base = format!("/settings/projects/{}", crate::web::query_escape(project));
+    let name = card.kind.display_name();
+    let secrets = card.secrets_available;
+    html! {
+        div.card #forge-account {
+            h2 { "Forge account" }
+            p.hint {
+                "This project is on " (name) ", repository "
+                (external_link(&card.kind.web_url(&card.repo), &card.repo, None, None))
+                ". Jobs do not use these tokens yet. Any collaborator can replace the project token. \
+                 Stored encrypted and never shown."
+            }
+            form.settings-form method="post" action={ (base) "/forge-token" } {
+                input type="hidden" name="csrf" value=(card.csrf);
+                @if !secrets {
+                    p.hint.bad { "The master key is missing, so a token cannot be saved here. Clear still works." }
+                }
+                div.field {
+                    label for="project-token" { "Project token" }
+                    input #project-token.wide type="password" name="token"
+                        autocomplete="off" spellcheck="false"
+                        placeholder=(if card.project_account.is_some() { "set" } else { "not set" })
+                        disabled[!secrets];
+                    p.hint {
+                        @if let Some(account) = &card.project_account {
+                            "A token is stored. It belongs to the account " strong.forge-account { (account.login) } ". "
+                        } @else {
+                            "No token is stored. "
+                        }
+                        "Paste a new one to replace it. An empty field keeps it."
+                    }
+                }
+                div.save-bar {
+                    span.save-bar-note { "No unsaved changes." }
+                    button.primary disabled[!secrets] { "Save project token" }
+                }
+                div.danger-zone {
+                    button.danger formaction={ (base) "/forge-token/clear" } formnovalidate { "Clear project token" }
+                }
+            }
+            form.settings-form.forge-switch method="post" action={ (base) "/use-my-account" } {
+                input type="hidden" name="csrf" value=(card.csrf);
+                div.field {
+                    label.check {
+                        input type="checkbox" name="on" value="on" checked[card.use_my_account];
+                        " Use my account"
+                    }
+                    p.hint {
+                        "Records that you want the jobs you request to run as your own " (name) " account once jobs use it. Off by default. "
+                        "This switch is yours alone."
+                    }
+                    @if card.use_my_account && !card.has_user_token {
+                        p.hint.bad {
+                            "You have no " (name) " token, so this switch has nothing to run as. "
+                            a href={ "/settings/forges/" (card.kind.as_str()) } { "Save your " (name) " token" }
+                            "."
+                        }
+                    }
+                }
+                (save_bar("Save switch"))
+            }
         }
     }
 }

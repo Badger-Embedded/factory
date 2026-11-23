@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (forge, repo)
 );
+CREATE TABLE IF NOT EXISTS project_instances (
+    instance INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL UNIQUE
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     project TEXT NOT NULL,
@@ -187,6 +191,7 @@ CREATE TABLE IF NOT EXISTS project_collaborators (
     login TEXT NOT NULL,
     added_by TEXT NOT NULL,
     added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    use_my_account INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project, login)
 );
 CREATE TABLE IF NOT EXISTS project_maintenance (
@@ -321,6 +326,15 @@ impl Maintenance {
     }
 }
 
+/// The project instance and login a token save started for. `instance` comes
+/// from [`Store::project_with_instance`]. A project removed and onboarded again
+/// under the same name has a new one.
+pub struct ProjectGuard<'a> {
+    pub project: &'a str,
+    pub login: &'a str,
+    pub instance: i64,
+}
+
 /// One collaborator of a project: a login that may see and act on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collaborator {
@@ -331,6 +345,9 @@ pub struct Collaborator {
     pub added_by: String,
     /// UTC, as SQLite's `CURRENT_TIMESTAMP` writes it.
     pub added_at: String,
+    /// Whether this collaborator's request jobs run as their own forge
+    /// account instead of the project's.
+    pub use_my_account: bool,
 }
 
 /// What a session last ran with: its agent and that agent's model and effort.
@@ -546,6 +563,17 @@ impl Store {
         )?;
         if has_review == 0 {
             conn.execute("ALTER TABLE project_models ADD COLUMN review TEXT", [])?;
+        }
+        let has_use_my_account: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('project_collaborators') WHERE name = 'use_my_account'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_use_my_account == 0 {
+            conn.execute(
+                "ALTER TABLE project_collaborators ADD COLUMN use_my_account INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         // `llm_review` joined `project_settings` after auto-merge shipped, so
         // add it to a table that predates it. A fresh database already has the
@@ -1897,7 +1925,7 @@ impl Store {
     pub fn collaborators(&self, project: &str) -> Result<Vec<Collaborator>, StoreError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT login, added_by, added_at FROM project_collaborators
+            "SELECT login, added_by, added_at, use_my_account FROM project_collaborators
              WHERE project = ?1 ORDER BY added_at, login",
         )?;
         let rows = stmt.query_map([project], |row| {
@@ -1905,9 +1933,48 @@ impl Store {
                 login: row.get(0)?,
                 added_by: row.get(1)?,
                 added_at: row.get(2)?,
+                use_my_account: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether `login` has "Use my account" on for `project`. A login that is
+    /// not a collaborator reads as off.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn use_my_account(&self, project: &str, login: &str) -> Result<bool, StoreError> {
+        let on = self
+            .conn()
+            .query_row(
+                "SELECT use_my_account FROM project_collaborators WHERE project = ?1 AND login = ?2",
+                params![project, login],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        Ok(on.unwrap_or(false))
+    }
+
+    /// Sets the "Use my account" switch of the collaborator `login`. A login
+    /// that is not a collaborator is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_use_my_account(
+        &self,
+        project: &str,
+        login: &str,
+        on: bool,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE project_collaborators SET use_my_account = ?3
+             WHERE project = ?1 AND login = ?2",
+            params![project, login, on],
+        )?;
+        Ok(())
     }
 
     /// Whether `login` is a collaborator on `project`.
@@ -2011,6 +2078,81 @@ impl Store {
         write_forge_account(&tx, owner, account)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The project `name` with the identifier of this instance of it, read
+    /// in one transaction. The identifier is never reused, so a project removed
+    /// and onboarded again under the name has a different one.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_with_instance(&self, name: &str) -> Result<Option<(Project, i64)>, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let project = tx
+            .query_row(
+                "SELECT forge, repo, base, checks FROM projects WHERE name = ?1",
+                [name],
+                project_row_without_name,
+            )
+            .optional()?;
+        let Some(project) = project else {
+            return Ok(None);
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO project_instances (project) VALUES (?1)",
+            [name],
+        )?;
+        let instance = tx.query_row(
+            "SELECT instance FROM project_instances WHERE project = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Some((project, instance)))
+    }
+
+    /// As [`Store::put_forge_token`] for a project token, and writes nothing
+    /// unless the project instance in `guard` still exists and `guard.login` is
+    /// still its collaborator. Returns whether it wrote.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn put_project_forge_token(
+        &self,
+        at: SecretRef<'_>,
+        backend: &str,
+        value: &[u8],
+        owner: ForgeTokenOwner<'_>,
+        account: &ForgeAccount,
+        guard: &ProjectGuard<'_>,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let present: bool = tx.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project_instances i
+                 JOIN project_collaborators c ON c.project = i.project
+                 WHERE i.project = ?1 AND i.instance = ?2 AND c.login = ?3
+             )",
+            params![guard.project, guard.instance, guard.login],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO secrets (project, server, header, backend, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (project, server, header)
+             DO UPDATE SET backend = excluded.backend, value = excluded.value",
+            params![at.project, at.server, at.header, backend, value],
+        )?;
+        write_forge_account(&tx, owner, account)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Removes the sealed forge token and its account in one transaction.
@@ -2262,6 +2404,7 @@ impl Store {
             "renovate_prs",
             "dismissed_gaps",
             "project_forge_accounts",
+            "project_instances",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;

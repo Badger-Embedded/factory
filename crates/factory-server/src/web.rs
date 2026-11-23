@@ -11,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage};
-use factory_runner::{Expect, ForgeKind};
+use factory_runner::{Access, Expect, ForgeKind};
 use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -31,8 +31,8 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectTotals,
-    Store, StoreError,
+    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectGuard,
+    ProjectTotals, Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -172,6 +172,18 @@ pub fn app(
         .route(
             "/settings/projects/{project}/collaborators/remove",
             post(remove_project_collaborator),
+        )
+        .route(
+            "/settings/projects/{project}/forge-token",
+            post(save_project_forge_token),
+        )
+        .route(
+            "/settings/projects/{project}/forge-token/clear",
+            post(clear_project_forge_token),
+        )
+        .route(
+            "/settings/projects/{project}/use-my-account",
+            post(set_use_my_account),
         )
         .route(
             "/settings/projects/{project}/maintenance",
@@ -503,6 +515,16 @@ async fn index(
     let data = load_board(&state, &login, query.project, cookie_project(&headers))?;
     let plan_usage = usage_tile(&state);
     let notifications = state.store.notifications_enabled(&login)?;
+    let project_token_missing = match (
+        data.selected.as_deref(),
+        data.project.as_ref().and_then(|p| p.forge.kind()),
+    ) {
+        (Some(project), Some(forge)) => state
+            .store
+            .forge_account(ForgeTokenOwner::Project { project, forge })?
+            .is_none(),
+        _ => false,
+    };
     let page = pages::index(
         &login,
         &data.names,
@@ -515,6 +537,7 @@ async fn index(
         data.project.as_ref(),
         &data.workers,
         notifications,
+        project_token_missing,
     );
     match data.selected.as_deref().filter(|_| explicit) {
         Some(name) => {
@@ -1741,7 +1764,7 @@ fn project_page_with(
     maintenance: Option<Maintenance>,
 ) -> Result<Markup, AppError> {
     let project = visible_project(state, headers, name)?;
-    let mut settings = project_settings(state, name, &project)?;
+    let mut settings = project_settings(state, &user(headers), name, &project)?;
     if let Some(maintenance) = maintenance {
         settings.maintenance = maintenance;
     }
@@ -1773,6 +1796,7 @@ impl StageQuery {
 /// gates, and its settings for each registered MCP server.
 fn project_settings(
     state: &AppState,
+    login: &str,
     name: &str,
     project: &Project,
 ) -> Result<ProjectSettings, StoreError> {
@@ -1802,6 +1826,24 @@ fn project_settings(
                 .collect(),
         })
         .collect();
+    let forge_account = match project.forge.kind() {
+        Some(kind) => Some(pages::ForgeAccountCard {
+            kind,
+            repo: project.repo.clone(),
+            project_account: state.store.forge_account(ForgeTokenOwner::Project {
+                project: name,
+                forge: kind,
+            })?,
+            secrets_available: state.secrets.available(),
+            csrf: state.csrf.issue(login),
+            use_my_account: state.store.use_my_account(name, login)?,
+            has_user_token: state
+                .store
+                .forge_account(ForgeTokenOwner::User { login, forge: kind })?
+                .is_some(),
+        }),
+        None => None,
+    };
     Ok(ProjectSettings {
         name: name.to_owned(),
         models: state.store.project_models(name, &project.models)?,
@@ -1816,6 +1858,7 @@ fn project_settings(
         collaborators: state.store.collaborators(name)?,
         maintenance: state.store.project_maintenance(name)?,
         forge_problem: project.forge.problem(),
+        forge_account,
     })
 }
 
@@ -2119,6 +2162,185 @@ async fn remove_project_collaborator(
         None,
     )?
     .into_response())
+}
+
+#[derive(Deserialize)]
+struct UseMyAccountForm {
+    #[serde(default)]
+    on: String,
+    #[serde(default)]
+    csrf: String,
+}
+
+/// The kind of the project's forge, or a bad request for a project on an
+/// unknown forge, which has no token to keep.
+fn project_forge_kind(project: &Project) -> Result<ForgeKind, AppError> {
+    project
+        .forge
+        .kind()
+        .ok_or_else(|| AppError::BadRequest(project.forge.problem().unwrap_or_default()))
+}
+
+async fn save_project_forge_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<ForgeTokenForm>,
+) -> Result<Markup, AppError> {
+    visible_project(&state, &headers, &name)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let Some((project, instance)) = state.store.project_with_instance(&name)? else {
+        return Err(AppError::UnknownProject(name));
+    };
+    let kind = project_forge_kind(&project)?;
+    let part = pages::PipelinePart::parse(None);
+    if !state.secrets.available() {
+        let problem = "The master key is missing, so the token was not saved.";
+        return project_page(&state, &headers, &name, part, None, Some(problem));
+    }
+    let token = form.token.trim();
+    if token.is_empty() {
+        return project_page(&state, &headers, &name, part, Some("Saved."), None);
+    }
+    let login = user(&headers);
+    let saved = forge_tokens::save_for_repo(
+        state.secrets.as_ref(),
+        state.forges.forge(kind).as_ref(),
+        ForgeTokenOwner::Project {
+            project: &name,
+            forge: kind,
+        },
+        token,
+        &project.repo,
+        &ProjectGuard {
+            project: &name,
+            login: &login,
+            instance,
+        },
+    )
+    .await;
+    let display = kind.display_name();
+    let (notice, problem) = match saved {
+        Ok(saved) => {
+            let login = &saved.account.login;
+            let text = match saved.access {
+                Some(Access::Write) => format!("Saved. The project token belongs to {login}."),
+                Some(Access::Read) => format!(
+                    "Saved. The project token belongs to {login}, which has only Read access to {}. Request jobs cannot push as it, and Renovate triage cannot rerun CI or merge.",
+                    project.repo
+                ),
+                Some(Access::Admin) => format!(
+                    "Saved. The project token belongs to {login}, which has Admin access to {}. The design asks for Write, so a ruleset's Admin bypass does not apply to it.",
+                    project.repo
+                ),
+                Some(Access::NotVisible) => unreachable!("a token with no access is not saved"),
+                None => format!(
+                    "Saved. The project token belongs to {login}. Its access to {} was not checked.",
+                    project.repo
+                ),
+            };
+            (Some(text), None)
+        }
+        Err(SaveError::Rejected) => (
+            None,
+            Some(format!("{display} rejected the token. Nothing was saved.")),
+        ),
+        Err(SaveError::Lookup(message)) => (
+            None,
+            Some(format!(
+                "Could not look the account up on {display}: {message}. Nothing was saved."
+            )),
+        ),
+        Err(SaveError::NotVisible(account)) => (
+            None,
+            Some(format!(
+                "The account {} cannot see {} on {display}. Nothing was saved.",
+                account.login, project.repo
+            )),
+        ),
+        Err(SaveError::Gone) => {
+            if !state.store.is_collaborator(&name, &login)? {
+                return Err(AppError::UnknownProject(name));
+            }
+            (
+                None,
+                Some("The project changed while the token was checked. Nothing was saved. Save it again.".to_owned()),
+            )
+        }
+        Err(SaveError::Secrets(err)) => return Err(err.into()),
+        Err(SaveError::Store(err)) => return Err(err.into()),
+    };
+    project_page(
+        &state,
+        &headers,
+        &name,
+        part,
+        notice.as_deref(),
+        problem.as_deref(),
+    )
+}
+
+async fn clear_project_forge_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<ForgeClearForm>,
+) -> Result<Markup, AppError> {
+    let project = visible_project(&state, &headers, &name)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let kind = project_forge_kind(&project)?;
+    let cleared = forge_tokens::clear(
+        state.secrets.as_ref(),
+        ForgeTokenOwner::Project {
+            project: &name,
+            forge: kind,
+        },
+    );
+    match cleared {
+        Ok(()) => project_page(
+            &state,
+            &headers,
+            &name,
+            pages::PipelinePart::parse(None),
+            Some("Cleared."),
+            None,
+        ),
+        Err(SaveError::Secrets(err)) => Err(err.into()),
+        Err(SaveError::Store(err)) => Err(err.into()),
+        Err(
+            SaveError::Rejected | SaveError::Lookup(_) | SaveError::NotVisible(_) | SaveError::Gone,
+        ) => {
+            unreachable!("clearing makes no lookup")
+        }
+    }
+}
+
+/// Sets the switch of the request's own login. The form names no login, so
+/// one collaborator cannot change another's switch.
+async fn set_use_my_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<UseMyAccountForm>,
+) -> Result<Markup, AppError> {
+    visible_project(&state, &headers, &name)?;
+    let login = user(&headers);
+    require_csrf(&state, &login, &form.csrf)?;
+    let on = form.on == "on";
+    state.store.set_use_my_account(&name, &login, on)?;
+    let notice = if on {
+        "Saved. \"Use my account\" is on for you in this project. Jobs do not use it yet."
+    } else {
+        "Saved. \"Use my account\" is off for you in this project. Jobs do not use it yet."
+    };
+    project_page(
+        &state,
+        &headers,
+        &name,
+        pages::PipelinePart::parse(None),
+        Some(notice),
+        None,
+    )
 }
 
 #[derive(Deserialize)]
@@ -2849,6 +3071,9 @@ async fn save_forge_token(
         ),
         Err(SaveError::Secrets(err)) => return Err(err.into()),
         Err(SaveError::Store(err)) => return Err(err.into()),
+        Err(SaveError::NotVisible(_) | SaveError::Gone) => {
+            unreachable!("a user token is saved with no repository or project")
+        }
     };
     forge_page(&state, &headers, kind, Some(&notice))
 }
@@ -2873,7 +3098,11 @@ async fn clear_forge_token(
         Ok(()) => forge_page(&state, &headers, kind, Some("Cleared.")),
         Err(SaveError::Secrets(err)) => Err(err.into()),
         Err(SaveError::Store(err)) => Err(err.into()),
-        Err(SaveError::Rejected | SaveError::Lookup(_)) => unreachable!("clearing makes no lookup"),
+        Err(
+            SaveError::Rejected | SaveError::Lookup(_) | SaveError::NotVisible(_) | SaveError::Gone,
+        ) => {
+            unreachable!("clearing makes no lookup")
+        }
     }
 }
 

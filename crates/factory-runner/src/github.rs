@@ -7,7 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use factory_core::PrDescription;
 
-use crate::forge::{Account, BoxFuture, Forge, ForgeAccount, LookupError};
+use crate::forge::{Access, Account, BoxFuture, Forge, ForgeAccount, LookupError};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -1189,7 +1189,49 @@ struct ApiUser {
     id: u64,
 }
 
+#[derive(Deserialize)]
+struct ApiRepoAccess {
+    #[serde(default)]
+    permissions: ApiPermissions,
+}
+
+#[derive(Default, Deserialize)]
+struct ApiPermissions {
+    #[serde(default)]
+    admin: bool,
+    #[serde(default)]
+    maintain: bool,
+    #[serde(default)]
+    push: bool,
+}
+
 impl Forge for GitHub {
+    fn access<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+    ) -> BoxFuture<'a, Result<Access, String>> {
+        Box::pin(async move {
+            let path = format!("repos/{repo}");
+            let args = ["api", path.as_str(), "--hostname", "github.com"];
+            let out = match self.run(account, &args, None).await {
+                Ok(out) => out,
+                Err(err) if err.contains("HTTP 404") => return Ok(Access::NotVisible),
+                Err(err) => return Err(err),
+            };
+            let json: ApiRepoAccess = serde_json::from_str(&out)
+                .map_err(|_| "gh api repos returned unexpected output".to_owned())?;
+            let p = json.permissions;
+            Ok(if p.admin {
+                Access::Admin
+            } else if p.maintain || p.push {
+                Access::Write
+            } else {
+                Access::Read
+            })
+        })
+    }
+
     fn lookup_account<'a>(
         &'a self,
         token: &'a str,

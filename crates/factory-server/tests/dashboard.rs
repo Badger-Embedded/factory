@@ -9448,7 +9448,7 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     ] {
         let body = dashboard.get(uri).await.body;
         let bars = if uri == "/settings/projects/maestro" {
-            2
+            4
         } else {
             1
         };
@@ -11544,7 +11544,26 @@ if [ "$1 $2 $3 $4" = "api user --hostname github.com" ]; then
   case "$GH_TOKEN" in
     tok-alice) echo '{"login":"alice-bot","id":11}'; exit 0 ;;
     tok-bob) echo '{"login":"bob-bot","id":22}'; exit 0 ;;
+    tok-reader) echo '{"login":"reader-bot","id":33}'; exit 0 ;;
+    tok-admin) echo '{"login":"admin-bot","id":44}'; exit 0 ;;
+    tok-ghost) echo '{"login":"ghost-bot","id":55}'; exit 0 ;;
+    tok-blind) echo '{"login":"blind-bot","id":66}'; exit 0 ;;
+    tok-slow) echo '{"login":"slow-bot","id":77}'; exit 0 ;;
     *) echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
+  esac
+fi
+if [ "$1 $2 $3 $4" = "api repos/Badger-Embedded/maestro --hostname github.com" ]; then
+  case "$GH_TOKEN" in
+    tok-alice|tok-bob) echo '{"permissions":{"admin":false,"maintain":false,"push":true}}'; exit 0 ;;
+    tok-reader) echo '{"permissions":{"admin":false,"maintain":false,"push":false}}'; exit 0 ;;
+    tok-admin) echo '{"permissions":{"admin":true,"maintain":true,"push":true}}'; exit 0 ;;
+    tok-ghost) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+    tok-slow)
+      here=$(dirname "$0")
+      touch "$here/started"
+      while [ ! -e "$here/go" ]; do sleep 0.02; done
+      echo '{"permissions":{"admin":false,"maintain":false,"push":true}}'; exit 0 ;;
+    *) echo "gh: boom" >&2; exit 1 ;;
   esac
 fi
 echo "fake gh: unexpected: $*" >&2
@@ -11689,6 +11708,411 @@ async fn forge_post(dashboard: &Dashboard, login: &str, action: &str, form: &str
             &format!("{form}&csrf={csrf}"),
         )
         .await
+}
+
+const PROJECT_PAGE: &str = "/settings/projects/maestro";
+const DAVE: &str = "dave@example.com";
+
+/// Loads the project page as `login`, then posts `form` to `action` under it
+/// with the form token the page carries.
+async fn project_post(dashboard: &Dashboard, login: &str, action: &str, form: &str) -> Reply {
+    let page = dashboard.get_as(login, PROJECT_PAGE).await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let csrf = doc
+        .select(&scraper::Selector::parse("#forge-account input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the card carries a csrf token")
+        .to_owned();
+    dashboard
+        .post_as(
+            login,
+            &format!("{PROJECT_PAGE}/{action}"),
+            &format!("{form}&csrf={csrf}"),
+        )
+        .await
+}
+
+fn project_owner() -> ForgeTokenOwner<'static> {
+    ForgeTokenOwner::Project {
+        project: "maestro",
+        forge: ForgeKind::GitHub,
+    }
+}
+
+#[tokio::test]
+async fn any_collaborator_saves_and_clears_the_project_token() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+
+    let page = dashboard.get_as(USER, PROJECT_PAGE).await.body;
+    assert!(page.contains("Forge account"));
+    assert!(page.contains("No token is stored."));
+    assert!(page.contains("has no project token"));
+    assert!(page.contains("href=\"https://github.com/Badger-Embedded/maestro\""));
+    let board = dashboard.get_as(USER, "/").await.body;
+    assert!(board.contains("has no project token"));
+    assert!(board.contains("/settings/projects/maestro#forge-account"));
+
+    let saved = project_post(&dashboard, USER, "forge-token", "token=tok-alice").await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert!(saved.body.contains("alice-bot"));
+    assert!(!saved.body.contains("tok-alice"));
+    assert!(!saved.body.contains("has no project token"));
+    assert!(
+        !dashboard
+            .get_as(USER, "/")
+            .await
+            .body
+            .contains("has no project token")
+    );
+
+    let replaced = project_post(&dashboard, DAVE, "forge-token", "token=tok-bob").await;
+    assert!(replaced.body.contains("bob-bot"));
+    let account = dashboard
+        .store
+        .forge_account(project_owner())
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.login, "bob-bot");
+
+    project_post(&dashboard, USER, "forge-token", "token=").await;
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_some()
+    );
+
+    let cleared = project_post(&dashboard, USER, "forge-token/clear", "").await;
+    assert!(cleared.body.contains("Cleared."));
+    assert!(cleared.body.contains("has no project token"));
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    assert!(secrets.forge_token(project_owner()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_project_token_is_checked_against_the_repository_before_it_is_stored() {
+    let dashboard = forge_token_dashboard(true);
+    let save = |token: &'static str| {
+        let dashboard = &dashboard;
+        async move { project_post(dashboard, USER, "forge-token", &format!("token={token}")).await }
+    };
+
+    let ghost = save("tok-ghost").await;
+    assert!(
+        ghost
+            .body
+            .contains("ghost-bot cannot see Badger-Embedded/maestro")
+    );
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+
+    let rejected = save("tok-wrong-secret").await;
+    assert!(rejected.body.contains("rejected the token"));
+    assert!(!rejected.body.contains("tok-wrong-secret"));
+
+    let reader = save("tok-reader").await;
+    assert!(reader.body.contains("only Read access"));
+    assert!(reader.body.contains("cannot rerun CI or merge"));
+    assert!(!reader.body.contains("tok-reader"));
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_some()
+    );
+
+    let admin = save("tok-admin").await;
+    assert!(admin.body.contains("Admin access"));
+
+    let write = save("tok-alice").await;
+    assert!(
+        write
+            .body
+            .contains("Saved. The project token belongs to alice-bot.")
+    );
+    assert!(!write.body.contains("Read access") && !write.body.contains("Admin access"));
+
+    let blind = save("tok-blind").await;
+    assert!(blind.body.contains("blind-bot"));
+    assert!(blind.body.contains("was not checked"));
+    let account = dashboard
+        .store
+        .forge_account(project_owner())
+        .unwrap()
+        .unwrap();
+    assert_eq!(account.login, "blind-bot");
+}
+
+#[tokio::test]
+async fn without_a_master_key_the_project_token_is_refused_and_still_clears() {
+    let dashboard = forge_token_dashboard(false);
+    let page = dashboard.get_as(USER, PROJECT_PAGE).await.body;
+    assert!(page.contains("master key is missing"));
+    let refused = project_post(&dashboard, USER, "forge-token", "token=tok-alice").await;
+    assert!(refused.body.contains("was not saved"));
+    assert!(!refused.body.contains("tok-alice"));
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+
+    dashboard
+        .store
+        .set_forge_account(
+            project_owner(),
+            &ForgeAccount {
+                login: "old".into(),
+                id: 1,
+            },
+        )
+        .unwrap();
+    let cleared = project_post(&dashboard, USER, "forge-token/clear", "").await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_touch_the_project_token_or_a_switch() {
+    let dashboard = forge_token_dashboard(true);
+    for route in ["forge-token", "forge-token/clear", "use-my-account"] {
+        let reply = dashboard
+            .post_as(
+                STRANGER,
+                &format!("{PROJECT_PAGE}/{route}"),
+                "token=tok-alice&on=on&csrf=x",
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{route}");
+    }
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_collaborator_changes_only_their_own_use_my_account_switch() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    assert!(!dashboard.store.use_my_account("maestro", USER).unwrap());
+
+    let on = project_post(&dashboard, USER, "use-my-account", "on=on").await;
+    assert_eq!(on.status, StatusCode::OK);
+    assert!(dashboard.store.use_my_account("maestro", USER).unwrap());
+    assert!(!dashboard.store.use_my_account("maestro", DAVE).unwrap());
+    assert!(on.body.contains("You have no GitHub token"));
+    assert!(on.body.contains("href=\"/settings/forges/github\""));
+
+    // A login field in the form changes nothing about another collaborator.
+    project_post(
+        &dashboard,
+        DAVE,
+        "use-my-account",
+        &format!("on=on&login={USER}"),
+    )
+    .await;
+    project_post(&dashboard, DAVE, "use-my-account", "").await;
+    assert!(dashboard.store.use_my_account("maestro", USER).unwrap());
+    assert!(!dashboard.store.use_my_account("maestro", DAVE).unwrap());
+
+    forge_post(&dashboard, USER, "token", "token=tok-alice").await;
+    let page = dashboard.get_as(USER, PROJECT_PAGE).await.body;
+    assert!(!page.contains("You have no GitHub token"));
+
+    project_post(&dashboard, USER, "use-my-account", "").await;
+    assert!(!dashboard.store.use_my_account("maestro", USER).unwrap());
+
+    project_post(&dashboard, DAVE, "use-my-account", "on=on").await;
+    dashboard
+        .store
+        .remove_collaborator("maestro", DAVE)
+        .unwrap();
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    assert!(!dashboard.store.use_my_account("maestro", DAVE).unwrap());
+}
+
+#[tokio::test]
+async fn removing_a_project_deletes_its_token_so_a_reused_name_has_none() {
+    let dashboard = forge_token_dashboard(true);
+    project_post(&dashboard, USER, "forge-token", "token=tok-alice").await;
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_some()
+    );
+
+    let removed = dashboard
+        .post(&format!("{PROJECT_PAGE}/remove"), "confirm=maestro")
+        .await;
+    assert_eq!(removed.status, StatusCode::SEE_OTHER);
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    assert!(secrets.forge_token(project_owner()).unwrap().is_none());
+
+    dashboard
+        .store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some(USER),
+        )
+        .unwrap();
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+    assert!(secrets.forge_token(project_owner()).unwrap().is_none());
+}
+
+/// Runs a project-token save of `tok-slow` and, while its access check waits,
+/// runs `meanwhile`. Returns the save's reply.
+async fn save_while(dashboard: &Dashboard, meanwhile: impl FnOnce()) -> Reply {
+    let started = dashboard.data.path().join("started");
+    let go = dashboard.data.path().join("go");
+    let save = project_post(dashboard, USER, "forge-token", "token=tok-slow");
+    let driver = async {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        meanwhile();
+        std::fs::write(&go, "").unwrap();
+    };
+    tokio::join!(save, driver).0
+}
+
+#[tokio::test]
+async fn a_save_that_finishes_after_the_project_was_removed_stores_nothing() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    let reply = save_while(&dashboard, || {
+        dashboard.store.remove_project("maestro").unwrap();
+        dashboard
+            .store
+            .create_project(
+                "maestro",
+                ForgeKind::GitHub,
+                "Badger-Embedded/maestro",
+                "main",
+                None,
+                Some(USER),
+            )
+            .unwrap();
+        dashboard.store.project_with_instance("maestro").unwrap();
+    })
+    .await;
+    assert!(reply.body.contains("Nothing was saved"));
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    assert!(secrets.forge_token(project_owner()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn removing_another_project_meanwhile_does_not_stop_a_save() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .create_project(
+            "other",
+            ForgeKind::GitHub,
+            "Badger-Embedded/other",
+            "main",
+            None,
+            Some(USER),
+        )
+        .unwrap();
+    let reply = save_while(&dashboard, || {
+        dashboard.store.remove_project("other").unwrap();
+    })
+    .await;
+    assert!(
+        reply
+            .body
+            .contains("Saved. The project token belongs to slow-bot.")
+    );
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_save_by_a_login_removed_meanwhile_stores_nothing() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    let reply = save_while(&dashboard, || {
+        dashboard
+            .store
+            .remove_collaborator("maestro", USER)
+            .unwrap();
+    })
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
