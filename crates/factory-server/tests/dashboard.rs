@@ -4483,6 +4483,90 @@ async fn the_picker_lists_and_counts_only_the_projects_the_login_collaborates_on
     assert_eq!(hidden.status, StatusCode::NOT_FOUND);
 }
 
+fn badge_label(body: &str) -> Option<String> {
+    let doc = scraper::Html::parse_document(body);
+    let badge = doc
+        .select(&scraper::Selector::parse("#picker-badge").unwrap())
+        .next()
+        .unwrap();
+    badge.value().attr("aria-label").map(str::to_string)
+}
+
+#[tokio::test]
+async fn the_badge_totals_the_other_projects_attention() {
+    let dashboard = four_projects();
+    let failed = job_in(&dashboard, "b-failed").await;
+    fail_job(&dashboard, failed);
+    for name in ["c-you", "c-you", "d-running"] {
+        let id = job_in(&dashboard, name).await;
+        to_spec_approval(&dashboard, id);
+    }
+    let own = job_in(&dashboard, "a-idle").await;
+    to_spec_approval(&dashboard, own);
+
+    let body = dashboard.get("/?project=a-idle").await.body;
+    assert_eq!(
+        badge_label(&body).as_deref(),
+        Some("3 need you in 2 other projects, 1 failed in 1 other project")
+    );
+    assert!(body.contains("<span class=\"badge you\">3</span><span class=\"badge bad\">1</span>"));
+    let fragment = dashboard.get("/fragments/picker?project=a-idle").await.body;
+    assert!(fragment.contains("hx-swap-oob=\"true\""));
+    assert_eq!(badge_label(&fragment), badge_label(&body));
+}
+
+#[tokio::test]
+async fn the_badge_is_hidden_without_attention_elsewhere() {
+    let dashboard = four_projects();
+    let own = job_in(&dashboard, "c-you").await;
+    to_spec_approval(&dashboard, own);
+    let body = dashboard.get("/?project=c-you").await.body;
+    assert_eq!(badge_label(&body), None);
+    assert!(body.contains("<span id=\"picker-badge\" hidden></span>"));
+    let one = job_in(&dashboard, "b-failed").await;
+    fail_job(&dashboard, one);
+    let body = dashboard.get("/?project=c-you").await.body;
+    assert_eq!(
+        badge_label(&body).as_deref(),
+        Some("1 failed in 1 other project")
+    );
+}
+
+#[tokio::test]
+async fn the_badge_ignores_projects_the_login_does_not_collaborate_on() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .add_collaborator("tool", MAESTRO_ONLY, USER)
+        .unwrap();
+    let hidden = job_in(&dashboard, "maestro").await;
+    fail_job(&dashboard, hidden);
+    let body = dashboard.get_as(MAESTRO_ONLY, "/").await.body;
+    assert_eq!(badge_label(&body), None);
+    let fragment = dashboard
+        .get_as(MAESTRO_ONLY, "/fragments/picker?project=tool")
+        .await;
+    assert_eq!(badge_label(&fragment.body), None);
+}
+
+#[tokio::test]
+async fn a_recovery_poll_without_a_project_counts_every_project_and_polls_unselected() {
+    let dashboard = four_projects();
+    let id = job_in(&dashboard, "a-idle").await;
+    to_spec_approval(&dashboard, id);
+    let other = job_in(&dashboard, "c-you").await;
+    to_spec_approval(&dashboard, other);
+
+    let fragment = dashboard.get("/fragments/picker").await;
+    assert_eq!(fragment.status, StatusCode::OK);
+    assert_eq!(
+        badge_label(&fragment.body).as_deref(),
+        Some("2 need you in 2 other projects")
+    );
+    assert!(fragment.body.contains("hx-get=\"/fragments/picker?v="));
+    assert!(!fragment.body.contains("aria-current"));
+}
+
 #[tokio::test]
 async fn the_picker_fragment_answers_204_for_a_matching_version() {
     let dashboard = two_projects();

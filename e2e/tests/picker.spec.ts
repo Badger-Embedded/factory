@@ -215,6 +215,40 @@ test.describe('as a login of its own', () => {
     await expect(draft).toHaveValue('half-written request');
   });
 
+  test('after the selected project is removed the badge counts every remaining project and hides with the last', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    const [gone, a, b] = [`gone${tag}`, `a${tag}`, `b${tag}`];
+    for (const name of [gone, a, b]) projectFor(factory, login, name);
+    job(factory, gone, 'spec');
+    job(factory, a, 'failed');
+    job(factory, b, 'spec');
+
+    await page.goto(`/?project=${gone}`);
+    const badge = page.locator('#picker-badge');
+    await expect(badge).toHaveAttribute('aria-label', '1 need you in 1 other project, 1 failed in 1 other project');
+
+    const other = await page.context().newPage();
+    const remove = async (name: string) => {
+      await other.goto(`/settings/projects/${name}`);
+      await other.getByLabel('Project name').fill(name);
+      await other.getByRole('button', { name: `Remove ${name}` }).click();
+      await expect(other.getByText(`Removed project ${name}.`)).toBeVisible();
+    };
+    await remove(gone);
+
+    await expect(row(page, gone)).toHaveCount(0, { timeout: 15_000 });
+    await expect(badge).toHaveAttribute('aria-label', '1 need you in 1 other project, 1 failed in 1 other project');
+    await expect(page.locator('#picker-list')).toHaveAttribute('hx-get', /^\/fragments\/picker\?v=/);
+
+    await remove(a);
+    await expect(badge).toHaveAttribute('aria-label', '1 need you in 1 other project', { timeout: 15_000 });
+    await remove(b);
+    await expect(row(page, b)).toHaveCount(0, { timeout: 15_000 });
+    await expect(badge).toBeHidden();
+  });
+
   test('removing the last visible project leaves an empty list that finds a new project', async ({ page, factory }, testInfo) => {
     const login = uniqueLogin(testInfo.workerIndex);
     const tag = login.split('@')[0];

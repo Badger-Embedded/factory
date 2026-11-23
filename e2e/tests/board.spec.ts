@@ -56,6 +56,47 @@ test('the project picker switches the board', async ({ page, project }) => {
   await expect(page.getByRole('link', { name: 'Support a second USB hub' })).toBeVisible();
 });
 
+async function badgeLogin(page: Page, factory: { fixture(...args: string[]): string }, projects: string[]) {
+  const login = `badge-${projects[0]}@example.com`;
+  for (const name of projects) factory.fixture('project', '--name', name, '--login', login);
+  await page.setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+}
+
+test('the badge totals the other projects', async ({ page, factory }, testInfo) => {
+  const id = `b${testInfo.workerIndex}-${Date.now()}`;
+  const [home, one, two, three] = [`${id}-h`, `${id}-1`, `${id}-2`, `${id}-3`];
+  await badgeLogin(page, factory, [home, one, two, three]);
+  factory.fixture('job', '--project', home, '--stage', 'spec');
+  await page.goto(`/?project=${home}`);
+  await expect(page.locator('#picker-badge')).toBeHidden();
+
+  factory.fixture('job', '--project', one, '--stage', 'spec');
+  factory.fixture('job', '--project', one, '--stage', 'plan');
+  factory.fixture('job', '--project', two, '--stage', 'spec');
+  factory.fixture('job', '--project', three, '--stage', 'failed');
+  await page.goto(`/?project=${home}`);
+
+  const badge = page.locator('#picker-badge');
+  await expect(badge.locator('.badge.you')).toHaveText('3');
+  await expect(badge.locator('.badge.bad')).toHaveText('1');
+  const label = '3 need you in 2 other projects, 1 failed in 1 other project';
+  await expect(badge).toHaveAttribute('aria-label', label);
+  await expect(badge).toHaveAttribute('title', label);
+});
+
+test('the badge follows a job in another project', async ({ page, factory }, testInfo) => {
+  const id = `f${testInfo.workerIndex}-${Date.now()}`;
+  const [home, other] = [`${id}-h`, `${id}-o`];
+  await badgeLogin(page, factory, [home, other]);
+  await page.goto(`/?project=${home}`);
+  await expect(page.locator('#picker-badge')).toBeHidden();
+
+  factory.fixture('job', '--project', other, '--stage', 'spec');
+  const badge = page.locator('#picker-badge');
+  await expect(badge.locator('.badge.you')).toHaveText('1', { timeout: 10_000 });
+  await expect(badge).toHaveAttribute('aria-label', '1 need you in 1 other project');
+});
+
 test.describe('without a project', () => {
   test.use({ extraHTTPHeaders: { 'Tailscale-User-Login': OUTSIDER } });
 

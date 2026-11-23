@@ -738,13 +738,15 @@ async fn picker_fragment(
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
     let version = query.v.clone();
-    let data = load_board(&state, &user(&headers), query.project, None)?;
-    let Some(project) = data.selected.as_deref() else {
-        return Ok(html! {}.into_response());
+    let data = load_board(&state, &user(&headers), query.project.clone(), None)?;
+    let selected = if query.project.is_some() {
+        data.selected.as_deref().unwrap_or_default()
+    } else {
+        ""
     };
     Ok(region_response(
         version.as_deref(),
-        pages::picker(&data.attention, project),
+        pages::picker(&data.attention, selected, true),
     ))
 }
 

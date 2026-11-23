@@ -62,19 +62,23 @@
   document.body.addEventListener("htmx:responseError", function (event) {
     const target = event.detail.target;
     if (!target || target.id !== "picker-list" || event.detail.xhr.status !== 404) return;
-    fetch("/", { headers: { Accept: "text/html" } })
+    fetch("/fragments/picker", { headers: { Accept: "text/html" } })
       .then(function (response) { return response.text(); })
       .then(function (html) {
         const list = document.getElementById("picker-list");
+        const badge = document.getElementById("picker-badge");
         if (!list) return;
-        let fresh = new DOMParser().parseFromString(html, "text/html").getElementById("picker-list");
-        if (!fresh) {
-          fresh = list.cloneNode(false);
-          fresh.setAttribute("hx-get", "/fragments/picker");
-        }
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        const fresh = doc.getElementById("picker-list");
+        const freshBadge = doc.getElementById("picker-badge");
+        if (!fresh) return;
         detached = true;
         clearCurrent(fresh);
         list.replaceWith(fresh);
+        if (badge && freshBadge) {
+          freshBadge.removeAttribute("hx-swap-oob");
+          badge.replaceWith(freshBadge);
+        }
         htmx.process(fresh);
       });
   });
