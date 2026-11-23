@@ -229,7 +229,7 @@ test('a display name shows in the picker, the sidebar and the heading', async ({
   ).toHaveAttribute('href', settingsPath(project));
 
   await page.goto('/');
-  await expect(page.getByLabel('Project', { exact: true })).toHaveText('My Project');
+  await expect(page.getByLabel('Project', { exact: true }).locator('.picker-current')).toHaveText('My Project');
   const current = page.locator('#picker-list a[aria-current="page"]');
   await expect(current.locator('.picker-name')).toHaveText('My Project');
   await expect(current).toHaveAttribute('href', `/?project=${project}`);
@@ -479,7 +479,7 @@ test('the Forge account card saves a project token by its access and keeps the s
 
 test('removing a project takes it off the picker', async ({ page, project }) => {
   await page.goto(`/?project=${project}`);
-  await expect(page.getByLabel('Project', { exact: true })).toHaveText(project);
+  await expect(page.getByLabel('Project', { exact: true }).locator('.picker-current')).toHaveText(project);
   await expect(page.locator(`#picker-list li[data-id="${project}"]`)).toHaveCount(1);
 
   await page.goto(settingsPath(project));

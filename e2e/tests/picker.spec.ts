@@ -176,7 +176,7 @@ test.describe('as a login of its own', () => {
     await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
 
     await page.goto(`/?project=${name}`);
-    await expect(button(page)).toHaveText('Pretty Name');
+    await expect(button(page).locator('.picker-current')).toHaveText('Pretty Name');
     await button(page).click();
     const link = page.locator('#picker-list a[aria-current="page"]');
     await expect(link.locator('.picker-name')).toHaveText('Pretty Name');
@@ -211,7 +211,7 @@ test.describe('as a login of its own', () => {
     job(factory, `stay${tag}`, 'spec');
     await expect(row(page, `stay${tag}`).locator('.badge.you')).toHaveText(/1/, { timeout: 15_000 });
     await expect(page.locator('#picker-list [aria-current]')).toHaveCount(0);
-    await expect(button(page)).toHaveText(`gone${tag}`);
+    await expect(button(page).locator('.picker-current')).toHaveText(`gone${tag}`);
     await expect(draft).toHaveValue('half-written request');
   });
 
@@ -295,7 +295,7 @@ test.describe('as a login of its own', () => {
     await card.getByRole('button', { name: 'Save name' }).click();
     await expect(second.getByText('Saved.', { exact: true })).toBeVisible();
 
-    await expect(button(page)).toHaveText('Renamed', { timeout: 15_000 });
+    await expect(button(page).locator('.picker-current')).toHaveText('Renamed', { timeout: 15_000 });
     await expect(page.locator('.picker-panel')).toBeVisible();
     await expect(page.locator(`#picker-list a[href="/?project=other${tag}"]`)).toBeFocused();
   });
