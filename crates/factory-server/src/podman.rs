@@ -550,7 +550,7 @@ impl Executor for PodmanExecutor {
             &operation.owner,
             self.forges
                 .forge(forge)
-                .renovate_prs(&operation.account, repo, base)
+                .renovate_prs(&operation.account, repo, base, None)
                 .await,
         )
     }

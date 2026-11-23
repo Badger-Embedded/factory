@@ -14,6 +14,7 @@ mod files;
 mod forge;
 mod git;
 mod github;
+mod gitlab;
 mod images;
 mod outcome;
 mod prompt;
@@ -34,6 +35,7 @@ pub use github::{
     PrStatus, RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login, observe,
     parse_renovate_prs, parse_status, tick_rebase_checkbox,
 };
+pub use gitlab::{GitLab, gitlab_job_id};
 pub use images::{place_images, show_images};
 pub use outcome::{Expect, event_from_output, event_from_result, failed_event};
 pub use prompt::{job_prompt, prompt};

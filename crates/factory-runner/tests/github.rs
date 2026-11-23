@@ -632,7 +632,7 @@ async fn renovate_prs_lists_open_pull_requests_on_the_base() {
         r#"echo '{"number": 5, "title": "Update dep", "html_url": "u", "user": {"login": "renovate[bot]"}, "head": {"sha": "aaa"}}'"#,
     );
     let prs = github
-        .renovate_prs(&account(), "o/r", "main")
+        .renovate_prs(&account(), "o/r", "main", None)
         .await
         .unwrap();
     assert_eq!(prs.len(), 1);

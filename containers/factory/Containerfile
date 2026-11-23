@@ -1,4 +1,4 @@
-# The factory: dashboard, job loop and the gh and git it publishes with.
+# The factory: dashboard, job loop and the gh, glab and git it publishes with.
 # It starts workers through the host's podman socket.
 FROM docker.io/library/rust:1-trixie AS build
 WORKDIR /src
@@ -8,6 +8,7 @@ RUN cargo build --release --locked -p factory-server
 
 FROM docker.io/library/ubuntu:26.04
 ARG GH_VERSION=2.104.0
+ARG GLAB_VERSION=1.130.0
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # hadolint ignore=DL3008
@@ -17,6 +18,9 @@ RUN apt-get update \
     && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
        | tar -xz -C /usr/local --strip-components=1 \
     && gh --version \
+    && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.tar.gz" \
+       | tar -xz -C /usr/local bin/glab \
+    && glab --version \
     && ln -s /usr/bin/podman-remote /usr/local/bin/podman
 
 COPY --from=build /src/target/release/factory-server /usr/local/bin/factory-server

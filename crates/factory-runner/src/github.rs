@@ -12,10 +12,10 @@ use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-const MAX_LOG: usize = 30_000;
+pub(crate) const MAX_LOG: usize = 30_000;
 /// The largest diff `pr_details` returns. A larger one is an error,
 /// because a review of a cut diff could approve changes it never saw.
-const MAX_DIFF: usize = 200_000;
+pub(crate) const MAX_DIFF: usize = 200_000;
 /// The most changed files GitHub's compare API lists.
 const COMPARE_FILE_LIMIT: usize = 300;
 
@@ -1605,6 +1605,7 @@ impl Forge for GitHub {
         account: &'a Account,
         repo: &'a str,
         base: &'a str,
+        _author: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Vec<RenovatePr>, String>> {
         Box::pin(GitHub::renovate_prs(self, account, repo, base))
     }
@@ -1729,7 +1730,7 @@ impl Forge for GitHub {
     }
 }
 
-fn tail(text: &str, max: usize) -> &str {
+pub(crate) fn tail(text: &str, max: usize) -> &str {
     if text.len() <= max {
         return text;
     }
