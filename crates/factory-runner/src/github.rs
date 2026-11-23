@@ -883,6 +883,47 @@ impl GitHub {
         .map(|_| ())
     }
 
+    /// Ticks Renovate's rebase checkbox in the pull request description.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the read or the write fails.
+    async fn request_renovate_rebase(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<RebaseCheckbox, String> {
+        #[derive(Deserialize)]
+        struct Body {
+            body: Option<String>,
+        }
+        let number_text = number.to_string();
+        let out = self
+            .run(
+                account,
+                &["pr", "view", &number_text, "--repo", repo, "--json", "body"],
+                None,
+            )
+            .await?;
+        let view: Body = serde_json::from_str(&out)
+            .map_err(|_| "gh pr view returned unexpected output".to_owned())?;
+        let body = view.body.unwrap_or_default();
+        let Some(ticked) = tick_rebase_checkbox(&body) else {
+            return Ok(RebaseCheckbox::Missing);
+        };
+        if ticked != body {
+            let path = format!("repos/{repo}/pulls/{number}");
+            self.run(
+                account,
+                &["api", "--method", "PATCH", &path, "-F", "body=@-"],
+                Some(&ticked),
+            )
+            .await?;
+        }
+        Ok(RebaseCheckbox::Ticked)
+    }
+
     /// Squash-merges the pull request and deletes its branch, only while its
     /// head is still `head`. GitHub refuses the merge when someone pushed
     /// since, so a commit nobody checked never lands.
@@ -1205,6 +1246,42 @@ struct ApiPermissions {
     push: bool,
 }
 
+/// The marker Renovate puts on the rebase/retry checkbox line of its pull
+/// request description.
+const REBASE_MARKER: &str = "<!-- rebase-check -->";
+
+/// What asking Renovate to rebase found in the description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseCheckbox {
+    /// The checkbox is ticked, by this call or before it.
+    Ticked,
+    /// The description has no rebase checkbox.
+    Missing,
+}
+
+/// `body` with Renovate's rebase checkbox ticked: the first
+/// `- [ ] <!-- rebase-check -->` becomes `- [x] <!-- rebase-check -->`, the
+/// exact text Renovate looks for, and every other byte stays. `None` when
+/// the body has no such checkbox, so a stray marker or a checkbox with
+/// anything between it and the marker does not count. A box that is already
+/// ticked comes back unchanged.
+#[must_use]
+pub fn tick_rebase_checkbox(body: &str) -> Option<String> {
+    let open = format!("- [ ] {REBASE_MARKER}");
+    let done = format!("- [x] {REBASE_MARKER}");
+    match (body.find(&open), body.find(&done)) {
+        (Some(at), ticked) if ticked.is_none_or(|t| at < t) => {
+            let mut out = String::with_capacity(body.len());
+            out.push_str(&body[..at]);
+            out.push_str(&done);
+            out.push_str(&body[at + open.len()..]);
+            Some(out)
+        }
+        (_, Some(_)) => Some(body.to_owned()),
+        _ => None,
+    }
+}
+
 impl Forge for GitHub {
     fn access<'a>(
         &'a self,
@@ -1363,6 +1440,15 @@ impl Forge for GitHub {
         number: u64,
     ) -> BoxFuture<'a, Result<PrDetails, String>> {
         Box::pin(GitHub::pr_details(self, account, repo, number))
+    }
+
+    fn request_renovate_rebase<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<RebaseCheckbox, String>> {
+        Box::pin(GitHub::request_renovate_rebase(self, account, repo, number))
     }
 
     fn comment<'a>(

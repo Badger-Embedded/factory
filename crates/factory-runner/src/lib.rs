@@ -28,8 +28,8 @@ pub use forge::{Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, Look
 pub use git::{Git, Remote};
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, Observation, PrDetails, PrInfo, PrState, PrStatus,
-    RenovatePr, Rerun, actions_job_id, is_renovate_login, observe, parse_renovate_prs,
-    parse_status,
+    RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login, observe,
+    parse_renovate_prs, parse_status, tick_rebase_checkbox,
 };
 pub use images::{place_images, show_images};
 pub use outcome::{Expect, event_from_output, event_from_result, failed_event};

@@ -11,7 +11,7 @@ use std::pin::Pin;
 
 use factory_core::PrDescription;
 
-use crate::github::{FailedCheck, PrDetails, PrInfo, PrStatus, RenovatePr, Rerun};
+use crate::github::{FailedCheck, PrDetails, PrInfo, PrStatus, RebaseCheckbox, RenovatePr, Rerun};
 
 /// A boxed future, so the trait stays object safe without a macro crate.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -224,6 +224,15 @@ pub trait Forge: Send + Sync {
         repo: &'a str,
         number: u64,
     ) -> BoxFuture<'a, Result<PrDetails, String>>;
+
+    /// Asks Renovate to rebase its pull request by ticking the rebase
+    /// checkbox in the description, or reports that there is none.
+    fn request_renovate_rebase<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<RebaseCheckbox, String>>;
 
     /// Posts a comment on the pull request.
     fn comment<'a>(
