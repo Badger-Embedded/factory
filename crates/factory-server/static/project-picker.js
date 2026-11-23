@@ -8,7 +8,7 @@
     panel.style.maxHeight = "";
     if (!picker.open) return;
     const room = window.innerHeight - panel.getBoundingClientRect().top - 8;
-    panel.style.maxHeight = Math.max(room, 120) + "px";
+    panel.style.maxHeight = Math.max(room, 0) + "px";
   }
 
   picker.addEventListener("toggle", function () {
@@ -46,11 +46,20 @@
       focusedHref = null;
     }
   });
-  // The selected project was removed elsewhere, so reopen the board on one that remains.
   document.body.addEventListener("htmx:responseError", function (event) {
     const target = event.detail.target;
-    if (target && target.id === "picker-list" && event.detail.xhr.status === 404) {
-      window.location.replace("/");
-    }
+    if (!target || target.id !== "picker-list" || event.detail.xhr.status !== 404) return;
+    fetch("/", { headers: { Accept: "text/html" } })
+      .then(function (response) { return response.text(); })
+      .then(function (html) {
+        const fresh = new DOMParser().parseFromString(html, "text/html").getElementById("picker-list");
+        const list = document.getElementById("picker-list");
+        if (!fresh || !list) return;
+        fresh.querySelectorAll("[aria-current]").forEach(function (link) {
+          link.removeAttribute("aria-current");
+        });
+        list.replaceWith(fresh);
+        htmx.process(fresh);
+      });
   });
 })();

@@ -183,7 +183,7 @@ test.describe('as a login of its own', () => {
     await expect(link).toHaveAttribute('href', `/?project=${name}`);
   });
 
-  test('removing the selected project in another tab moves this board to a remaining project', async ({ page, factory }, testInfo) => {
+  test('removing the selected project in another tab keeps the draft and lists the remaining projects', async ({ page, factory }, testInfo) => {
     const login = uniqueLogin(testInfo.workerIndex);
     const tag = login.split('@')[0];
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
@@ -192,6 +192,8 @@ test.describe('as a login of its own', () => {
 
     await page.goto(`/?project=gone${tag}`);
     await expect(row(page, `stay${tag}`)).toHaveCount(1);
+    const draft = page.locator('textarea').first();
+    await draft.fill('half-written request');
 
     const other = await page.context().newPage();
     await other.goto(`/settings/projects/gone${tag}`);
@@ -199,9 +201,12 @@ test.describe('as a login of its own', () => {
     await other.getByRole('button', { name: `Remove gone${tag}` }).click();
     await expect(other.getByText(`Removed project gone${tag}.`)).toBeVisible();
 
-    await expect(page).toHaveURL(/\/$/, { timeout: 15_000 });
-    await expect(button(page)).toContainText(`stay${tag}`);
-    await expect(page.locator('#picker-list li')).toHaveCount(1);
+    await expect(row(page, `gone${tag}`)).toHaveCount(0, { timeout: 15_000 });
+    await expect(row(page, `stay${tag}`)).toHaveCount(1);
+    await expect(page).toHaveURL(new RegExp(`project=gone${tag}$`));
+    await expect(draft).toHaveValue('half-written request');
+    const hidden = await page.request.get(`/fragments/picker?project=gone${tag}`);
+    expect(hidden.status()).toBe(404);
   });
 
   test('a rename updates the button and keeps focus on the same row while the panel is open', async ({ page, factory }, testInfo) => {
@@ -241,6 +246,12 @@ test.describe('as a login of its own', () => {
     await button(page).click();
     const panel = await page.locator('.picker-panel').boundingBox();
     expect(panel!.y + panel!.height).toBeLessThanOrEqual(400);
+
+    await page.setViewportSize({ width: 390, height: 180 });
+    await page.reload();
+    await button(page).click();
+    const short = await page.locator('.picker-panel').boundingBox();
+    expect(short!.y + short!.height).toBeLessThanOrEqual(180);
   });
 });
 
