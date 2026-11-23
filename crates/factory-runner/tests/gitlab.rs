@@ -22,7 +22,7 @@ fn fake_glab(dir: &Path, body: &str) -> (GitLab, PathBuf) {
         dir,
         "glab",
         &format!(
-            "#!/bin/bash\nprintf '%s|%s|%s|%s\\n' \"$GITLAB_HOST\" \"${{GITLAB_TOKEN-none}}\" \"${{GLAB_CONFIG_DIR:+config}}\" \"$*\" >> '{}'\ncase \"$*\" in *'=@-'*) cat > '{}' ;; esac\n{body}\n",
+            "#!/bin/bash\n[ \"${{@: -2:1}}\" = --hostname ] && [ \"${{@: -1}}\" = \"$GITLAB_HOST\" ] || {{ echo 'glab: no --hostname' >&2; exit 2; }}\n[ \"$GLAB_ENABLE_CI_AUTOLOGIN\" = false ] || exit 2\nargs=\"$*\"\nprintf '%s|%s|%s|%s\\n' \"$GITLAB_HOST\" \"${{GITLAB_TOKEN-none}}\" \"${{GLAB_CONFIG_DIR:+config}}\" \"${{args% --hostname *}}\" >> '{}'\ncase \"$*\" in *'=@-'*) cat > '{}' ;; esac\n{body}\n",
             calls.display(),
             stdin.display(),
         ),
@@ -258,7 +258,7 @@ const NOTES: &str = r#"[
   {"body":"Use a constant here.","author":{"username":"alice"},"created_at":"2026-11-20T12:00:00.000Z",
    "position":{"new_path":"src/a.rs","new_line":42,"old_path":"src/a.rs","old_line":null}},
   {"body":"On a removed line.","author":{"username":"alice"},"created_at":"2026-11-20T12:05:00.000Z",
-   "position":{"new_path":null,"new_line":null,"old_path":"src/b.rs","old_line":9}}
+   "position":{"new_path":"src/b.rs","new_line":null,"old_path":"src/b.rs","old_line":9}}
 ]"#;
 
 fn status_script() -> String {
@@ -412,7 +412,7 @@ async fn open_pr_edits_the_open_merge_request_and_reruns_failed_checks() {
     let (glab, log) = fake_glab(
         dir.path(),
         &format!(
-            "case \"$3 $4\" in\n  GET*merge_requests) echo '[{{\"iid\":7}}]' ;;\n  PUT*) echo '{{\"iid\":7}}' ;;\n  POST*retry) echo '{{}}' ;;\n  GET*/merge_requests/7) echo '{MR}' ;;\n  GET*/pipelines/99/jobs) echo '{JOBS}' ;;\n  GET*/notes) echo '[]' ;;\nesac"
+            "case \"$3 $4\" in\n  GET*merge_requests) echo '[{{\"iid\":6,\"project_id\":5,\"source_project_id\":9,\"target_branch\":\"main\"}},{{\"iid\":8,\"project_id\":5,\"source_project_id\":5,\"target_branch\":\"other\"}},{{\"iid\":7,\"project_id\":5,\"source_project_id\":5,\"target_branch\":\"main\"}}]' ;;\n  PUT*) echo '{{\"iid\":7}}' ;;\n  POST*retry) echo '{{}}' ;;\n  GET*/merge_requests/7) echo '{MR}' ;;\n  GET*/pipelines/99/jobs) echo '{JOBS}' ;;\n  GET*/notes) echo '[]' ;;\nesac"
         ),
     );
     let number = glab
@@ -536,7 +536,7 @@ async fn merged_pr_finds_the_merged_merge_request_of_a_branch() {
     let dir = tempfile::tempdir().unwrap();
     let (glab, log) = fake_glab(
         dir.path(),
-        r#"case "$*" in *state=merged*) echo '[{"iid":31}]' ;; *) echo '[]' ;; esac"#,
+        r#"case "$*" in *state=merged*) echo '[{"iid":30,"project_id":5,"source_project_id":9},{"iid":31,"project_id":5,"source_project_id":5}]' ;; *) echo '[]' ;; esac"#,
     );
     assert_eq!(
         glab.merged_pr(&account(), "team/sub/pkg", "factory/job-1")
@@ -591,7 +591,7 @@ async fn a_listing_reads_every_page() {
     let (glab, log) = fake_glab(
         dir.path(),
         &format!(
-            "case \"$*\" in\n  *page=1) echo '[{}]' ;;\n  *) echo '[{{\"iid\":101,\"title\":\"t\",\"sha\":\"s\"}}]' ;;\nesac",
+            "case \"$*\" in\n  *page=1\\ *) echo '[{}]' ;;\n  *) echo '[{{\"iid\":101,\"title\":\"t\",\"sha\":\"s\"}}]' ;;\nesac",
             full.join(",")
         ),
     );
@@ -609,12 +609,12 @@ async fn pr_details_builds_a_unified_diff_and_refuses_one_gitlab_cut() {
     let (glab, _) = fake_glab(
         dir.path(),
         r#"case "$4" in
-  */merge_requests/7) echo '{"iid":7,"title":"Update dep","description":"Body","sha":"abc"}' ;;
+  */merge_requests/7) echo '{"iid":7,"title":"Update dep","description":"Body","sha":"abc","changes_count":"2"}' ;;
   */merge_requests/7/diffs) echo '[
     {"old_path":"a.txt","new_path":"a.txt","new_file":false,"deleted_file":false,"diff":"@@ -1 +1 @@\n-old\n+new\n"},
     {"old_path":"b.txt","new_path":"b.txt","new_file":true,"deleted_file":false,"diff":"@@ -0,0 +1 @@\n+added"}
   ]' ;;
-  */merge_requests/8) echo '{"iid":8,"sha":"def"}' ;;
+  */merge_requests/8) echo '{"iid":8,"sha":"def","changes_count":"1"}' ;;
   */merge_requests/8/diffs) echo '[{"old_path":"big","new_path":"big","too_large":true,"diff":""}]' ;;
 esac"#,
     );
@@ -862,4 +862,109 @@ async fn a_failure_never_carries_the_token_and_a_refusal_is_marked() {
     );
     let err = glab.merge(&account(), "o/r", 15).await.unwrap_err();
     assert!(err.starts_with(factory_runner::REJECTED), "{err}");
+}
+
+#[tokio::test]
+async fn only_a_successful_pipeline_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        r#"case "$4" in
+  */notes) echo '[]' ;;
+  */merge_requests/*) n=${4##*/}
+    echo "{\"iid\":$n,\"state\":\"opened\",\"sha\":\"a\",\"head_pipeline\":{\"id\":$n,\"sha\":\"a\",\"status\":\"$(case $n in 1) echo success;; 2) echo manual;; 3) echo skipped;; 4) echo running;; esac)\"}}" ;;
+  */pipelines/1/jobs) echo '[{"id":1,"name":"build","status":"success"}]' ;;
+  */pipelines/2/jobs) echo '[{"id":1,"name":"build","status":"success"},{"id":2,"name":"deploy","status":"manual","allow_failure":false}]' ;;
+  */pipelines/3/jobs) echo '[{"id":1,"name":"build","status":"skipped"}]' ;;
+  */pipelines/4/jobs) echo '[{"id":1,"name":"build","status":"success"}]' ;;
+esac"#,
+    );
+    let ci = |number: u64| {
+        let glab = &glab;
+        async move {
+            glab.status(&account(), "o/r", number, &[])
+                .await
+                .unwrap()
+                .ci
+        }
+    };
+    assert_eq!(ci(1).await, Ci::Passed);
+    assert_eq!(ci(2).await, Ci::Pending);
+    assert_eq!(ci(3).await, Ci::NoChecks);
+    assert_eq!(ci(4).await, Ci::Pending);
+}
+
+#[tokio::test]
+async fn a_fork_pipeline_is_read_and_retried_in_its_own_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, log) = fake_glab(
+        dir.path(),
+        r#"case "$4" in
+  projects/o%2Fr/merge_requests/7) echo '{"iid":7,"state":"opened","sha":"a","head_pipeline":{"id":50,"project_id":77,"sha":"a","status":"failed"}}' ;;
+  projects/77/pipelines/50/jobs) echo '[{"id":9,"name":"lint","status":"failed","web_url":"https://salsa.debian.org/fork/r/-/jobs/9"}]' ;;
+  projects/77/pipelines/50/retry) echo '{}' ;;
+  projects/o%2Fr/merge_requests/7/notes) echo '[]' ;;
+  projects/fork%2Fr/jobs/9/trace) echo 'fork trace' ;;
+esac"#,
+    );
+    let status = glab.status(&account(), "o/r", 7, &[]).await.unwrap();
+    let Ci::Failed(checks) = status.ci else {
+        panic!("expected failed checks");
+    };
+    let report = glab
+        .failure_report(&account(), "o/r", &checks)
+        .await
+        .unwrap();
+    assert!(report.contains("fork trace"), "{report}");
+    assert_eq!(
+        glab.rerun_failed(&account(), "o/r", 7).await.unwrap(),
+        Rerun::Started(vec![9])
+    );
+    assert!(
+        calls(&log)
+            .iter()
+            .any(|line| line.ends_with("api --method POST projects/77/pipelines/50/retry"))
+    );
+}
+
+#[tokio::test]
+async fn a_fork_merge_request_with_the_same_branch_is_not_ours() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        r#"case "$3 $4" in
+  GET*merge_requests) echo '[{"iid":3,"project_id":5,"source_project_id":9,"target_branch":"main"}]' ;;
+  POST*merge_requests) echo '{"iid":12}' ;;
+esac"#,
+    );
+    let number = glab
+        .open_pr(&account(), "o/r", "main", "factory/job-1", &description())
+        .await
+        .unwrap();
+    assert_eq!(number, 12);
+    assert_eq!(
+        glab.merged_pr(&account(), "o/r", "factory/job-1").await,
+        Ok(None)
+    );
+}
+
+#[tokio::test]
+async fn a_diff_list_shorter_than_the_change_count_is_not_reviewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        r#"case "$4" in
+  */merge_requests/7) echo '{"iid":7,"sha":"a","changes_count":"3"}' ;;
+  */merge_requests/8) echo '{"iid":8,"sha":"a","changes_count":"1000+"}' ;;
+  */diffs) echo '[{"old_path":"a","new_path":"a","diff":"@@ -1 +1 @@\n-a\n+b\n"}]' ;;
+esac"#,
+    );
+    for number in [7, 8] {
+        let err = glab
+            .pr_details(&account(), "o/r", number)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot be reviewed in full"), "{err}");
+        assert!(glab.pr_info(&account(), "o/r", number).await.is_err());
+    }
 }

@@ -31,7 +31,8 @@ const MAX_PAGES: usize = 50;
 
 /// Variables of the factory's own environment that would give `glab` a
 /// credential or a host the call did not ask for.
-const INHERITED: [&str; 6] = [
+const INHERITED: [&str; 7] = [
+    "CI_JOB_TOKEN",
     "GITLAB_TOKEN",
     "GITLAB_ACCESS_TOKEN",
     "OAUTH_TOKEN",
@@ -117,11 +118,20 @@ struct MrJson {
     merged_at: Option<String>,
     #[serde(default)]
     web_url: String,
+    #[serde(default)]
+    target_branch: String,
+    project_id: Option<u64>,
+    source_project_id: Option<u64>,
+    // A number, or a string such as "1000+" when GitLab stopped counting.
+    changes_count: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct PipelineJson {
     id: u64,
+    /// The project that owns the pipeline. For a merge request from a fork
+    /// it is usually the fork.
+    project_id: Option<u64>,
     #[serde(default)]
     sha: String,
     #[serde(default)]
@@ -266,7 +276,9 @@ pub fn gitlab_job_id(url: &str) -> Option<&str> {
 
 /// The checks of a pipeline's jobs. A job that may fail does not fail the
 /// merge request.
-fn ci_of_jobs(jobs: Vec<JobJson>) -> Ci {
+/// The pipeline's own status decides a pass: a blocking manual job leaves
+/// the pipeline `manual`, and a pipeline of only skipped jobs is `skipped`.
+fn ci_of_jobs(jobs: Vec<JobJson>, pipeline_status: &str) -> Ci {
     let any = !jobs.is_empty();
     let mut failed = Vec::new();
     let mut pending = false;
@@ -290,10 +302,12 @@ fn ci_of_jobs(jobs: Vec<JobJson>) -> Ci {
         Ci::Failed(failed)
     } else if pending {
         Ci::Pending
-    } else if any {
+    } else if !any || matches!(pipeline_status, "skipped" | "failed" | "canceled") {
+        Ci::NoChecks
+    } else if pipeline_status == "success" {
         Ci::Passed
     } else {
-        Ci::NoChecks
+        Ci::Pending
     }
 }
 
@@ -336,12 +350,16 @@ impl GitLab {
         for (flag, key, value) in fields {
             command.arg(flag).arg(format!("{key}={value}"));
         }
+        command.args(["--hostname", &self.host]);
+        // Outside any checkout, so no repository-local glab config applies.
+        command.current_dir(config_dir()?);
         for name in INHERITED {
             command.env_remove(name);
         }
         command
             .env("GITLAB_HOST", &self.host)
             .env("GLAB_CONFIG_DIR", config_dir()?)
+            .env("GLAB_ENABLE_CI_AUTOLOGIN", "false")
             .env("GLAB_CHECK_UPDATE", "false")
             .env("GLAB_SEND_TELEMETRY", "false")
             .env("NO_COLOR", "1")
@@ -442,18 +460,21 @@ impl GitLab {
         .await
     }
 
+    /// The project path prefix of a pipeline's endpoints.
+    fn pipeline_base(repo: &str, pipeline: &PipelineJson) -> String {
+        pipeline
+            .project_id
+            .map_or_else(|| project(repo), |id| format!("projects/{id}"))
+    }
+
     async fn jobs(
         &self,
         account: &Account,
-        repo: &str,
+        base: &str,
         pipeline: u64,
     ) -> Result<Vec<JobJson>, String> {
-        self.get_all(
-            account,
-            &format!("{}/pipelines/{pipeline}/jobs", project(repo)),
-            &[],
-        )
-        .await
+        self.get_all(account, &format!("{base}/pipelines/{pipeline}/jobs"), &[])
+            .await
     }
 
     /// The pipeline on the merge request's head, or `None` when it has none
@@ -471,19 +492,25 @@ impl GitLab {
         repo: &str,
         branch: &str,
         state: &str,
+        base: Option<&str>,
     ) -> Result<Option<u64>, String> {
+        // The list holds merge requests from forks too, so match the source
+        // project and not only the branch name.
         let list: Vec<MrJson> = self
-            .get_json(
+            .get_all(
                 account,
                 &format!("{}/merge_requests", project(repo)),
-                &[
-                    ("source_branch", branch),
-                    ("state", state),
-                    ("per_page", "1"),
-                ],
+                &[("source_branch", branch), ("state", state)],
             )
             .await?;
-        Ok(list.first().map(|mr| mr.iid))
+        Ok(list
+            .iter()
+            .find(|mr| {
+                mr.project_id.is_some()
+                    && mr.source_project_id == mr.project_id
+                    && base.is_none_or(|base| mr.target_branch == base)
+            })
+            .map(|mr| mr.iid))
     }
 
     async fn open_pr(
@@ -494,7 +521,9 @@ impl GitLab {
         branch: &str,
         description: &PrDescription,
     ) -> Result<u64, String> {
-        let existing = self.first_mr(account, repo, branch, "opened").await?;
+        let existing = self
+            .first_mr(account, repo, branch, "opened", Some(base))
+            .await?;
         let list = format!("{}/merge_requests", project(repo));
         if let Some(number) = existing {
             let was_failed = match self.status(account, repo, number, &[]).await {
@@ -562,7 +591,7 @@ impl GitLab {
             return Ok(Rerun::NothingToRerun);
         };
         let failed: Vec<u64> = self
-            .jobs(account, repo, pipeline.id)
+            .jobs(account, &Self::pipeline_base(repo, pipeline), pipeline.id)
             .await?
             .into_iter()
             .filter(|job| matches!(job.status.as_str(), "failed" | "canceled"))
@@ -574,7 +603,11 @@ impl GitLab {
         self.api(
             account,
             "POST",
-            &format!("{}/pipelines/{}/retry", project(repo), pipeline.id),
+            &format!(
+                "{}/pipelines/{}/retry",
+                Self::pipeline_base(repo, pipeline),
+                pipeline.id
+            ),
             &[],
             None,
         )
@@ -617,13 +650,19 @@ impl GitLab {
         }
         let ci = match Self::head_pipeline(&mr) {
             None => Ci::NoChecks,
-            Some(pipeline) => match ci_of_jobs(self.jobs(account, repo, pipeline.id).await?) {
+            Some(pipeline) => match ci_of_jobs(
+                self.jobs(account, &Self::pipeline_base(repo, pipeline), pipeline.id)
+                    .await?,
+                &pipeline.status,
+            ) {
                 // A pipeline that failed before it made a job, such as for an
                 // invalid configuration, has no job to name.
-                Ci::NoChecks if pipeline.status == "failed" => Ci::Failed(vec![FailedCheck {
-                    name: "pipeline".into(),
-                    url: (!pipeline.web_url.is_empty()).then(|| pipeline.web_url.clone()),
-                }]),
+                Ci::NoChecks if matches!(pipeline.status.as_str(), "failed" | "canceled") => {
+                    Ci::Failed(vec![FailedCheck {
+                        name: "pipeline".into(),
+                        url: (!pipeline.web_url.is_empty()).then(|| pipeline.web_url.clone()),
+                    }])
+                }
                 ci => ci,
             },
         };
@@ -645,10 +684,11 @@ impl GitLab {
                 continue;
             }
             let location = note.position.and_then(|position| {
-                let (path, line) = match (position.new_path, position.old_path) {
-                    (Some(path), _) => (path, position.new_line),
-                    (None, Some(path)) => (path, position.old_line),
-                    (None, None) => return None,
+                // A note on a removed line has both paths and only `old_line`.
+                let (path, line) = match (position.new_line, position.old_line) {
+                    (Some(line), _) => (position.new_path.or(position.old_path)?, Some(line)),
+                    (None, Some(line)) => (position.old_path.or(position.new_path)?, Some(line)),
+                    (None, None) => (position.new_path.or(position.old_path)?, None),
                 };
                 Some(match line {
                     Some(line) => format!("{path}:{line}"),
@@ -676,20 +716,36 @@ impl GitLab {
         &self,
         account: &Account,
         repo: &str,
-        number: u64,
+        mr: &MrJson,
     ) -> Result<Vec<DiffJson>, String> {
-        self.get_all(
-            account,
-            &format!("{}/merge_requests/{number}/diffs", project(repo)),
-            &[],
-        )
-        .await
+        let number = mr.iid;
+        let diffs: Vec<DiffJson> = self
+            .get_all(
+                account,
+                &format!("{}/merge_requests/{number}/diffs", project(repo)),
+                &[],
+            )
+            .await?;
+        // GitLab's total diff limits drop files with no flag on the rest.
+        let expected = match &mr.changes_count {
+            None | Some(serde_json::Value::Null) => Some(0),
+            Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|n| usize::try_from(n).ok()),
+            Some(serde_json::Value::String(text)) => text.parse().ok(),
+            Some(_) => None,
+        };
+        if expected != Some(diffs.len()) {
+            return Err(format!(
+                "GitLab sent {} of the changed files of merge request {number}, so it cannot be reviewed in full",
+                diffs.len()
+            ));
+        }
+        Ok(diffs)
     }
 
     async fn pr_info(&self, account: &Account, repo: &str, number: u64) -> Result<PrInfo, String> {
         let mr = self.mr(account, repo, number).await?;
         let files = self
-            .changes(account, repo, number)
+            .changes(account, repo, &mr)
             .await?
             .into_iter()
             .map(|diff| diff.new_path)
@@ -709,7 +765,7 @@ impl GitLab {
         number: u64,
     ) -> Result<PrDetails, String> {
         let mr = self.mr(account, repo, number).await?;
-        let changes = self.changes(account, repo, number).await?;
+        let changes = self.changes(account, repo, &mr).await?;
         let mut diff = String::new();
         for change in &changes {
             if change.too_large || change.collapsed {
@@ -928,6 +984,16 @@ impl GitLab {
         Ok((!diff.diff.is_empty()).then_some(diff.diff))
     }
 
+    /// The project path in a job URL on this host.
+    fn job_project(&self, url: &str) -> Option<String> {
+        let rest = url
+            .strip_prefix("https://")?
+            .strip_prefix(self.host.as_str())?
+            .strip_prefix('/')?;
+        let (path, _) = rest.split_once("/-/jobs/")?;
+        (!path.is_empty()).then(|| path.to_owned())
+    }
+
     async fn failure_report(
         &self,
         account: &Account,
@@ -939,8 +1005,15 @@ impl GitLab {
             let _ = writeln!(report, "Check {:?} failed.", check.name);
             match check.url.as_deref().and_then(gitlab_job_id) {
                 Some(job) => {
+                    // A fork's pipeline runs in the fork, so read the trace
+                    // from the project the job's URL names.
+                    let owner = check
+                        .url
+                        .as_deref()
+                        .and_then(|url| self.job_project(url))
+                        .map_or_else(|| project(repo), |path| project(&path));
                     match self
-                        .get(account, &format!("{}/jobs/{job}/trace", project(repo)), &[])
+                        .get(account, &format!("{owner}/jobs/{job}/trace"), &[])
                         .await
                     {
                         Ok(log) => report.push_str(tail(&log, MAX_LOG)),
@@ -1083,7 +1156,7 @@ impl Forge for GitLab {
         repo: &'a str,
         branch: &'a str,
     ) -> BoxFuture<'a, Result<Option<u64>, String>> {
-        Box::pin(self.first_mr(account, repo, branch, "merged"))
+        Box::pin(self.first_mr(account, repo, branch, "merged", None))
     }
 
     fn open_pr<'a>(
