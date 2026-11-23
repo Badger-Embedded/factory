@@ -533,6 +533,26 @@ fn a_factory_failure_while_summarizing_keeps_the_publish_approval_wait() {
 }
 
 #[test]
+fn a_factory_failure_keeps_the_failed_rounds_already_counted() {
+    let mut job = watching(7);
+    for _ in 2..MAX_FAILED_ROUNDS {
+        apply(&mut job, Event::CiFailed { log: "fail".into() });
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(&mut job, Event::ChecksPassed);
+        apply(&mut job, Event::Published { number: 7 });
+    }
+    apply(&mut job, Event::CiFailed { log: "fail".into() });
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    fail_factory_step(&mut job);
+
+    apply(&mut job, Event::Retry);
+    apply(&mut job, Event::CiFailed { log: "last".into() });
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+}
+
+#[test]
 fn a_factory_failure_resumes_a_pending_ci_rerun() {
     let mut job = watching(7);
     apply(

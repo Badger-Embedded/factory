@@ -1888,7 +1888,14 @@ impl Job {
 
         match self.retry_step() {
             Some((stage, turn)) => {
-                if !matches!(turn, Turn::Agent(_)) {
+                let resumed = matches!(
+                    &self.stage,
+                    Stage::Failed {
+                        retry: Some(RetryTarget::Resume { .. }),
+                        ..
+                    }
+                );
+                if !matches!(turn, Turn::Agent(_)) && !resumed {
                     self.failed_rounds = 0;
                 }
                 Ok((stage, turn))
@@ -1993,8 +2000,6 @@ impl Job {
         }
     }
 
-    /// Whether a factory step in `turn` can fail the job: an unfinished job
-    /// that is not waiting for an agent run.
     fn interruptible(&self, turn: &Turn) -> bool {
         !matches!(turn, Turn::Agent(_)) && !self.is_finished()
     }
