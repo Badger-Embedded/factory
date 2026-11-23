@@ -426,7 +426,7 @@ fn a_stray_closing_fence_after_an_earlier_block_fails_the_run() {
 #[test]
 fn a_longer_fence_in_the_summary_is_not_closed_by_a_shorter_one() {
     let json = commits_outcome("Why.");
-    let summary = "Summary.\n\n````markdown\n```sh\njust lint\n```\n````";
+    let summary = "Summary.\n\n````markdown\n```sh\njust lint\n````";
     let text = format!("{summary}\n\n```json\n{json}\n```");
     let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
     assert_eq!(result.event, commits_event("Why."));
