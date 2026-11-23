@@ -238,7 +238,7 @@ fn requested_tools(data: Option<&Value>) -> bool {
 }
 
 fn message_result(expect: Expect, text: &str) -> RunResult {
-    let event = match serde_json::from_str::<Value>(unfence(text)) {
+    let event = match serde_json::from_str::<Value>(json_slice(text)) {
         Ok(value) => event_from_output(expect, Some(value)),
         Err(err) => failed_event(
             expect,
@@ -252,20 +252,28 @@ fn message_result(expect: Expect, text: &str) -> RunResult {
     }
 }
 
-/// The JSON inside a single fenced code block, or the trimmed text when there is
-/// no fence. The prompt allows one fence around the whole message, so a leading
-/// triple-backtick with an optional language on its line and a trailing
-/// triple-backtick are stripped; anything else is left for the JSON parser to
-/// reject.
-fn unfence(text: &str) -> &str {
+/// The JSON to parse from the final message. When the trimmed message ends with
+/// a fenced code block, that block's content, whatever text comes before it. The
+/// opening fence is the last line that starts with triple backticks and its
+/// language tag is dropped. Otherwise the whole trimmed text, so bare JSON
+/// parses and text after the closing fence is left for the JSON parser to
+/// reject. A JSON string holds no raw newline, so triple backticks inside one
+/// never start a line.
+fn json_slice(text: &str) -> &str {
     let text = text.trim();
-    let Some(rest) = text.strip_prefix("```") else {
+    let Some(head) = text.strip_suffix("```") else {
         return text;
     };
-    let Some(inner) = rest.strip_suffix("```") else {
+    if !head.is_empty() && !head.ends_with('\n') {
         return text;
+    }
+    let open = match head.rfind("\n```") {
+        Some(at) => at + 1,
+        None if head.starts_with("```") => 0,
+        None => return text,
     };
-    inner.split_once('\n').map_or("", |(_, body)| body).trim()
+    let block = &head[open + 3..];
+    block.split_once('\n').map_or("", |(_, body)| body).trim()
 }
 
 fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {

@@ -10,7 +10,7 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use factory_core::{Agent, AgentResult, Event};
+use factory_core::{Agent, AgentResult, Event, PrDescription};
 use factory_runner::{
     AgentItem, Expect, LogLine, McpConfig, RunResult, SessionRun, WorkerConfig, WorkerRun, backend,
     run,
@@ -362,6 +362,64 @@ fn a_valid_final_message_resolves_the_stage_result_with_or_without_a_fence() {
                 cost_usd: None,
             }
         );
+    }
+}
+
+fn commits_outcome(body: &str) -> String {
+    serde_json::json!({
+        "outcome": "commits_ready",
+        "pull_request": {"title": "Add reboot", "body": body},
+    })
+    .to_string()
+}
+
+fn commits_event(body: &str) -> Event {
+    Event::Agent(AgentResult::CommitsReady(PrDescription {
+        title: "Add reboot".into(),
+        body: body.into(),
+    }))
+}
+
+const SUMMARY: &str = "The work is done.\n\n- Added the page.\n- Added a test.";
+
+#[test]
+fn prose_before_a_fenced_outcome_resolves_the_result() {
+    for fence in ["```json", "```"] {
+        let text = format!("{SUMMARY}\n\n{fence}\n{}\n```", commits_outcome("Why."));
+        let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
+        assert_eq!(result.event, commits_event("Why."), "{fence}");
+    }
+}
+
+#[test]
+fn backticks_in_a_json_string_do_not_end_the_block() {
+    let body = "Run:\n```sh\njust lint\n```";
+    let json = commits_outcome(body);
+    for text in [
+        format!("```json\n{json}\n```"),
+        format!("{SUMMARY}\n\n```json\n{json}\n```"),
+    ] {
+        let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
+        assert_eq!(result.event, commits_event(body));
+    }
+}
+
+#[test]
+fn text_after_the_fence_or_a_non_json_block_fails_the_run() {
+    let json = commits_outcome("Why.");
+    for text in [
+        format!("{SUMMARY}\n\n```json\n{json}\n```\n\nDone."),
+        format!("{SUMMARY}\n\n```sh\njust lint\n```"),
+    ] {
+        let line = assistant_message(&text);
+        match last_result(&parse(Expect::Commits, &line)).event {
+            Event::AgentFailed { reason } => {
+                assert!(reason.contains("not valid JSON"), "{reason}");
+            }
+            other => panic!("expected AgentFailed, got {other:?}"),
+        }
+        let review = last_result(&parse(Expect::Review, &line)).event;
+        assert!(matches!(review, Event::ReviewFailed { .. }), "{review:?}");
     }
 }
 
