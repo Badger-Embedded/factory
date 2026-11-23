@@ -31,6 +31,39 @@ impl ForgeKind {
         }
     }
 
+    /// Every kind, in the order the pages list them.
+    pub const ALL: [ForgeKind; 1] = [ForgeKind::GitHub];
+
+    /// The name pages show for the kind.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "GitHub",
+        }
+    }
+
+    /// The host the kind's projects live on.
+    #[must_use]
+    pub fn host(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "github.com",
+        }
+    }
+
+    /// The web page of the repository `repo`.
+    #[must_use]
+    pub fn web_url(self, repo: &str) -> String {
+        format!("https://{}/{repo}", self.host())
+    }
+
+    /// The web page of pull request `number` of the repository `repo`.
+    #[must_use]
+    pub fn pr_url(self, repo: &str, number: u64) -> String {
+        match self {
+            ForgeKind::GitHub => format!("{}/pull/{number}", self.web_url(repo)),
+        }
+    }
+
     /// The kind named `name`, or `None` for an unknown name.
     #[must_use]
     pub fn parse(name: &str) -> Option<ForgeKind> {

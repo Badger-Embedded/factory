@@ -626,7 +626,7 @@ impl<E: Executor> Scheduler<E> {
                     let Some(expect) = Expect::for_task(job.stage(), &task) else {
                         continue;
                     };
-                    let resolved = self.resolve(&row, &project);
+                    let resolved = self.resolve(&row, &project)?;
                     let (request, skipped) = self
                         .agent_request(&row, &job, &project, &resolved, session, &task, expect)?;
                     let scheduler = Arc::clone(self);
@@ -642,15 +642,15 @@ impl<E: Executor> Scheduler<E> {
                     self.summarize(row.id, &project, &settings);
                 }
                 Command::Publish { pr } if self.due(row.id) => {
-                    let resolved = self.resolve(&row, &project);
+                    let resolved = self.resolve(&row, &project)?;
                     self.publish(row.id, pr, &job, &project, &resolved, &settings)?;
                 }
                 watch @ Command::WatchPr { .. } if self.due(row.id) => {
-                    let resolved = self.resolve(&row, &project);
+                    let resolved = self.resolve(&row, &project)?;
                     self.watch_pr(&row, &job, &project, &resolved, &settings, &watch)?;
                 }
                 Command::RerunCi { number, reason, .. } if self.due(row.id) => {
-                    let resolved = self.resolve(&row, &project);
+                    let resolved = self.resolve(&row, &project)?;
                     let request = RerunRequest {
                         job_id: row.id,
                         forge: resolved.forge,
@@ -692,7 +692,7 @@ impl<E: Executor> Scheduler<E> {
         command: Command,
     ) -> Result<(), StoreError> {
         let id = row.id;
-        let resolved = self.resolve(row, project);
+        let resolved = self.resolve(row, project)?;
         match command {
             Command::RerunRenovate { number, reason } => {
                 let request = RerunRequest {
@@ -829,7 +829,7 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    fn resolve(&self, row: &JobRow, project: &Project) -> Resolved {
+    fn resolve(&self, row: &JobRow, project: &Project) -> Result<Resolved, StoreError> {
         self.accounts
             .resolve(&row.project, project, &row.requested_by)
     }
@@ -898,7 +898,13 @@ impl<E: Executor> Scheduler<E> {
             if !due {
                 continue;
             }
-            let resolved = self.accounts.resolve(&name, &project, FACTORY_REQUESTER);
+            let resolved = match self.accounts.resolve(&name, &project, FACTORY_REQUESTER) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    tracing::error!("skipping the Renovate discovery of {name}: {err}");
+                    continue;
+                }
+            };
             let listed = self
                 .executor
                 .renovate_prs(
@@ -1002,7 +1008,14 @@ impl<E: Executor> Scheduler<E> {
     /// left for the next pass, so a transient fault does not fail the job.
     fn project_for(&self, row: &JobRow, job: &Job) -> Result<Option<Project>, StoreError> {
         match self.projects.lookup(&row.project) {
-            Ok(project @ Some(_)) => Ok(project),
+            Ok(Some(project)) => {
+                if let Some(problem) = project.forge.problem() {
+                    tracing::error!("job {}: project {}: {problem}", row.id, row.project);
+                    self.fail_job_step(row, job, &problem)?;
+                    return Ok(None);
+                }
+                Ok(Some(project))
+            }
             Ok(None) => {
                 self.fail_unknown_project(row, job)?;
                 Ok(None)
@@ -1016,6 +1029,11 @@ impl<E: Executor> Scheduler<E> {
 
     fn fail_unknown_project(&self, row: &JobRow, job: &Job) -> Result<(), StoreError> {
         let reason = format!("project {:?} is not configured", row.project);
+        self.fail_job_step(row, job, &reason)
+    }
+
+    fn fail_job_step(&self, row: &JobRow, job: &Job, reason: &str) -> Result<(), StoreError> {
+        let reason = reason.to_owned();
         if matches!(job.next_command(), Some(Command::RunAgent { .. })) {
             self.store.apply(row.id, Event::AgentFailed { reason })?;
         } else {

@@ -3,6 +3,7 @@
 use factory_runner::{Account, ForgeKind};
 
 use crate::projects::Project;
+use crate::store::StoreError;
 
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -25,17 +26,25 @@ impl Accounts {
     }
 
     /// The account a job of `project` requested by `requested_by` runs as.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::UnknownForge`] when the project's forge is not
+    /// one the factory supports.
     pub fn resolve(
         &self,
-        _project_name: &str,
-        _project: &Project,
+        project_name: &str,
+        project: &Project,
         _requested_by: &str,
-    ) -> Resolved {
-        Resolved {
-            forge: ForgeKind::GitHub,
+    ) -> Result<Resolved, StoreError> {
+        let forge = project
+            .forge
+            .kind()
+            .ok_or_else(|| StoreError::UnknownForge(project_name.to_owned()))?;
+        Ok(Resolved {
+            forge,
             ignore: vec![self.factory.login.clone()],
             account: self.factory.clone(),
-        }
+        })
     }
 }

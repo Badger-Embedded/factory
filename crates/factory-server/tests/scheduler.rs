@@ -13,11 +13,11 @@ use factory_runner::{
 };
 use factory_server::{
     Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink,
-    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Project, Projects, PublishRequest,
-    Published, ReadyAction, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef,
-    SecretStore, SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store,
-    SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots, format_cost,
-    ready_action, watch_only_event,
+    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Project, ProjectForge, Projects,
+    PublishRequest, Published, ReadyAction, RenovateWatchRequest, RerunRequest, RunTokens,
+    Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
+    StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots,
+    format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -429,6 +429,7 @@ fn setup(
     let projects: Projects = [(
         "maestro".to_owned(),
         Project {
+            forge: ProjectForge::Known(ForgeKind::GitHub),
             repo: "Badger-Embedded/maestro".into(),
             base: "main".into(),
             checks: Some("just lint".into()),
@@ -482,6 +483,7 @@ fn setup_mcp(
     let projects: Projects = [(
         "maestro".to_owned(),
         Project {
+            forge: ProjectForge::Known(ForgeKind::GitHub),
             repo: "Badger-Embedded/maestro".into(),
             base: "main".into(),
             checks: Some("just lint".into()),
@@ -680,6 +682,7 @@ async fn a_project_onboarded_while_running_is_picked_up() {
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             Some("just lint"),
@@ -1653,6 +1656,7 @@ async fn a_project_without_checks_publishes_unchecked() {
     let projects: Projects = [(
         "bare".to_owned(),
         Project {
+            forge: ProjectForge::Known(ForgeKind::GitHub),
             repo: "o/bare".into(),
             base: "main".into(),
             checks: None,
@@ -1699,6 +1703,57 @@ async fn a_project_without_checks_publishes_unchecked() {
 }
 
 #[tokio::test]
+async fn a_project_on_an_unknown_forge_fails_its_job_and_leaves_the_others_running() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::Clarified));
+    let project = |forge, repo: &str| Project {
+        forge,
+        repo: repo.into(),
+        base: "main".into(),
+        checks: None,
+        models: factory_server::StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    };
+    let projects: Projects = [
+        (
+            "odd".to_owned(),
+            project(ProjectForge::Unknown("elsewhere".into()), "o/odd"),
+        ),
+        (
+            "fine".to_owned(),
+            project(ProjectForge::Known(ForgeKind::GitHub), "o/fine"),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let scheduler2 = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
+    );
+    drop(scheduler);
+    let odd = store.create("odd", "alice", "x").unwrap();
+    let fine = store.create("fine", "alice", "x").unwrap();
+    executor.release(1);
+
+    step(&scheduler2).await;
+
+    let failed = store.get(odd).unwrap();
+    assert!(
+        matches!(failed.job.stage(), Stage::Failed { reason, .. } if reason.contains("elsewhere"))
+    );
+    assert!(!matches!(
+        store.get(fine).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+    assert_eq!(executor.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn a_failed_publish_waits_before_it_is_tried_again() {
     let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
     let id = to_commits_ready(&store, &executor, &scheduler).await;
@@ -1727,6 +1782,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
             [(
                 "maestro".to_owned(),
                 Project {
+                    forge: ProjectForge::Known(ForgeKind::GitHub),
                     repo: "Badger-Embedded/maestro".into(),
                     base: "main".into(),
                     checks: Some("just lint".into()),
@@ -2812,6 +2868,7 @@ async fn a_project_does_not_use_the_models_of_another() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let executor = FakeExecutor::new(|_| questions());
     let project = |repo: &str| Project {
+        forge: ProjectForge::Known(ForgeKind::GitHub),
         repo: repo.into(),
         base: "main".into(),
         checks: None,
@@ -3524,6 +3581,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
     let projects: Projects = [(
         "maestro".to_owned(),
         Project {
+            forge: ProjectForge::Known(ForgeKind::GitHub),
             repo: "Badger-Embedded/maestro".into(),
             base: "main".into(),
             checks: None,
@@ -4005,6 +4063,7 @@ async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
     let projects: Projects = [(
         "maestro".to_owned(),
         Project {
+            forge: ProjectForge::Known(ForgeKind::GitHub),
             repo: "Badger-Embedded/maestro".into(),
             base: "main".into(),
             checks: Some("just lint".into()),
@@ -4380,6 +4439,7 @@ async fn discovery_makes_one_job_per_renovate_pull_request() {
         let projects: Projects = [(
             "maestro".to_owned(),
             Project {
+                forge: ProjectForge::Known(ForgeKind::GitHub),
                 repo: "Badger-Embedded/maestro".into(),
                 base: "main".into(),
                 checks: None,

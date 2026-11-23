@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use factory_core::DEFAULT_AGENT;
+use factory_runner::ForgeKind;
 use serde::Deserialize;
 
 use crate::store::{Store, StoreError};
@@ -80,8 +81,54 @@ impl Default for StageAgents {
     }
 }
 
-/// One target repository. The `projects` table holds `repo`, `base` and the
-/// optional `checks`. A project's models and its auto-merge and LLM-review
+/// The forge a project's row names. A name no kind carries is kept, so one bad
+/// row is an error for that project and not for the list it is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectForge {
+    Known(ForgeKind),
+    Unknown(String),
+}
+
+impl ProjectForge {
+    /// The forge of the stored kind name `name`.
+    #[must_use]
+    pub fn from_name(name: &str) -> ProjectForge {
+        ForgeKind::parse(name).map_or_else(|| ProjectForge::Unknown(name.to_owned()), Self::Known)
+    }
+
+    /// The kind, or `None` for an unknown name.
+    #[must_use]
+    pub fn kind(&self) -> Option<ForgeKind> {
+        match self {
+            ProjectForge::Known(kind) => Some(*kind),
+            ProjectForge::Unknown(_) => None,
+        }
+    }
+
+    /// What to show for a project whose forge is unknown, or `None` when it is known.
+    #[must_use]
+    pub fn problem(&self) -> Option<String> {
+        match self {
+            ProjectForge::Known(_) => None,
+            ProjectForge::Unknown(name) => Some(format!(
+                "This project is on the forge {name:?}, which this factory does not support, so none of its jobs can run."
+            )),
+        }
+    }
+}
+
+impl From<ForgeKind> for ProjectForge {
+    fn from(kind: ForgeKind) -> Self {
+        ProjectForge::Known(kind)
+    }
+}
+
+fn github() -> ProjectForge {
+    ProjectForge::Known(ForgeKind::GitHub)
+}
+
+/// One target repository. The `projects` table holds `forge`, `repo`, `base`
+/// and the optional `checks`. A project's models and its auto-merge and LLM-review
 /// flags live in `project_models` and `project_settings`, so a project read
 /// from the store carries those three fields at their defaults. The `[models]`,
 /// `auto_merge` and `llm_review` fields are read only when a `project.toml` is
@@ -89,7 +136,11 @@ impl Default for StageAgents {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
-    /// The GitHub repository as `owner/name`.
+    /// The forge the repository lives on. A `project.toml` has no such field,
+    /// so an import reads `github`.
+    #[serde(skip, default = "github")]
+    pub forge: ProjectForge,
+    /// The repository as the forge names it, `owner/name` on GitHub.
     pub repo: String,
     /// The branch pull requests target.
     pub base: String,
@@ -277,6 +328,7 @@ pub fn import_tomls(store: &Store, dir: &Path) -> Result<(), ImportError> {
     for (name, (_, project)) in &found {
         store.create_project(
             name,
+            ForgeKind::GitHub,
             &project.repo,
             &project.base,
             project.checks.as_deref(),

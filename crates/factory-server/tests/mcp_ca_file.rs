@@ -13,6 +13,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::header;
 use axum::routing::any;
+use factory_runner::ForgeKind;
 use factory_server::Store;
 
 const INIT_JSON: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub","version":"1.0"}}}"#;
@@ -62,7 +63,14 @@ async fn the_dashboard_check_trusts_the_ca_in_the_file() {
 
     let store = Store::open(&dir.path().join("factory.db")).unwrap();
     store
-        .create_project("demo", "o/demo", "main", None, Some("local"))
+        .create_project(
+            "demo",
+            ForgeKind::GitHub,
+            "o/demo",
+            "main",
+            None,
+            Some("local"),
+        )
         .unwrap();
     store
         .create_mcp_server("stub", &format!("{}/mcp", tls.base), &[])

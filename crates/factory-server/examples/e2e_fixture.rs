@@ -23,6 +23,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question};
+use factory_runner::ForgeKind;
 use factory_server::Store;
 
 const ADMIN: &str = "admin@e2e.test";
@@ -138,6 +139,7 @@ fn create_job(store: &Store, project: &str, stage: &str, request: &str) -> Resul
 fn seed(store: &Store) -> Result<()> {
     store.create_project(
         SHARED_PROJECT,
+        ForgeKind::GitHub,
         "e2e/maestro",
         "main",
         Some("just test"),
@@ -225,7 +227,14 @@ fn main() -> Result<()> {
             let name = one("name")?;
             let logins = flags.get("login").ok_or("missing --login")?;
             let repo = one("repo").map_or_else(|_| format!("e2e/{name}"), Clone::clone);
-            store.create_project(name, &repo, "main", None, Some(&logins[0]))?;
+            store.create_project(
+                name,
+                ForgeKind::GitHub,
+                &repo,
+                "main",
+                None,
+                Some(&logins[0]),
+            )?;
             for login in &logins[1..] {
                 store.add_collaborator(name, login, &logins[0])?;
             }
