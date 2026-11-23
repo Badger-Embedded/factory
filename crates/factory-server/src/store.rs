@@ -221,7 +221,8 @@ CREATE TABLE IF NOT EXISTS project_maintenance (
     packaging_type TEXT,
     manifest_files TEXT NOT NULL DEFAULT '[]',
     build_config_files TEXT NOT NULL DEFAULT '[]',
-    upstream_repo TEXT
+    upstream_repo TEXT,
+    renovate_author TEXT
 );
 CREATE TABLE IF NOT EXISTS renovate_prs (
     project TEXT NOT NULL,
@@ -326,6 +327,9 @@ pub struct Packaging {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Maintenance {
     pub renovate: bool,
+    /// The login Renovate opens its pull requests as, for a forge with no
+    /// fixed Renovate account. `None` on GitHub.
+    pub renovate_author: Option<String>,
     pub packaging: Option<Packaging>,
 }
 
@@ -602,6 +606,7 @@ impl Store {
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA)?;
         Self::migrate_project_forge(&conn)?;
+        Self::migrate_renovate_author(&conn)?;
         let has_display_name: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'display_name'",
             [],
@@ -722,6 +727,21 @@ impl Store {
             epoch,
             reads: AtomicU64::new(0),
         })
+    }
+
+    fn migrate_renovate_author(conn: &Connection) -> Result<(), StoreError> {
+        let has: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('project_maintenance') WHERE name = 'renovate_author'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has == 0 {
+            conn.execute(
+                "ALTER TABLE project_maintenance ADD COLUMN renovate_author TEXT",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     /// `forge` joined `projects` after the table shipped with `repo` unique on
@@ -3422,7 +3442,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT renovate, packaging, packaging_type, manifest_files,
-                        build_config_files, upstream_repo
+                        build_config_files, upstream_repo, renovate_author
                  FROM project_maintenance WHERE project = ?1",
                 [project],
                 |row| {
@@ -3433,11 +3453,13 @@ impl Store {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((renovate, packaging, kind, manifest, build, upstream)) = row else {
+        let Some((renovate, packaging, kind, manifest, build, upstream, renovate_author)) = row
+        else {
             return Ok(Maintenance::default());
         };
         let packaging = if packaging {
@@ -3455,6 +3477,7 @@ impl Store {
         };
         Ok(Maintenance {
             renovate,
+            renovate_author,
             packaging,
         })
     }
@@ -4599,14 +4622,15 @@ fn write_maintenance(
     conn.execute(
         "INSERT INTO project_maintenance
             (project, renovate, packaging, packaging_type, manifest_files,
-             build_config_files, upstream_repo)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             build_config_files, upstream_repo, renovate_author)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT (project) DO UPDATE SET renovate = excluded.renovate,
             packaging = excluded.packaging,
             packaging_type = excluded.packaging_type,
             manifest_files = excluded.manifest_files,
             build_config_files = excluded.build_config_files,
-            upstream_repo = excluded.upstream_repo",
+            upstream_repo = excluded.upstream_repo,
+            renovate_author = excluded.renovate_author",
         params![
             project,
             maintenance.renovate,
@@ -4615,6 +4639,7 @@ fn write_maintenance(
             serde_json::to_string(&packaging.map_or(&[][..], |p| &p.manifest_files[..]))?,
             serde_json::to_string(&packaging.map_or(&[][..], |p| &p.build_config_files[..]))?,
             packaging.map(|p| p.upstream_repo.as_str()),
+            maintenance.renovate_author,
         ],
     )?;
     Ok(())

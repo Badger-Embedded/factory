@@ -9446,6 +9446,45 @@ async fn a_salsa_project_is_checked_by_the_salsa_checker_and_stores_its_forge() 
 }
 
 #[tokio::test]
+async fn a_salsa_project_needs_its_renovate_account_and_a_github_project_shows_none() {
+    let (store, dashboard) =
+        salsa_dashboard(Arc::new(FakeRepos::fit()), Arc::new(FakeSalsa::default()));
+    dashboard
+        .post("/onboard", "forge=salsa&repo=team%2Fsub%2Fpkg&action=skip")
+        .await;
+
+    let page = dashboard.get("/settings/projects/pkg").await.body;
+    assert!(page.contains("name=\"renovate_author\""));
+    let reply = dashboard
+        .post("/settings/projects/pkg/maintenance", "renovate=on")
+        .await;
+    assert!(reply.body.contains("Give the Renovate account"));
+    let reply = dashboard
+        .post(
+            "/settings/projects/pkg/maintenance",
+            "renovate=on&renovate_author=a%2Fb",
+        )
+        .await;
+    assert!(reply.body.contains("must be a Salsa username"));
+    assert!(!store.project_maintenance("pkg").unwrap().renovate);
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/pkg/maintenance",
+            "renovate_author=+renovate-bot+",
+        )
+        .await;
+    assert!(reply.body.contains("Saved."), "{}", reply.body);
+    assert_eq!(
+        store.project_maintenance("pkg").unwrap().renovate_author,
+        Some("renovate-bot".to_owned())
+    );
+
+    let page = dashboard.get("/settings/projects/maestro").await.body;
+    assert!(!page.contains("renovate_author"));
+}
+
+#[tokio::test]
 async fn the_wizard_keeps_the_selected_forge_on_a_redraw() {
     let (_store, dashboard) = salsa_dashboard(
         Arc::new(FakeRepos::fit()),
@@ -11630,6 +11669,7 @@ fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
             project,
             &factory_server::Maintenance {
                 renovate: true,
+                renovate_author: None,
                 packaging: None,
             },
         )
@@ -12994,6 +13034,7 @@ async fn turning_renovate_off_needs_no_forge_and_no_token() {
     let dashboard = dashboard_with(store);
     let maintenance = factory_server::Maintenance {
         renovate: true,
+        renovate_author: None,
         packaging: None,
     };
     dashboard
@@ -13039,6 +13080,7 @@ fn maintenance_settings_round_trip_through_the_store() {
     };
     let maintenance = factory_server::Maintenance {
         renovate: true,
+        renovate_author: Some("renovate-bot".into()),
         packaging: Some(packaging),
     };
     assert!(maintenance.check().is_ok());
@@ -14201,6 +14243,7 @@ fn seed_non_default_settings(dashboard: &Dashboard) {
         .unwrap();
     let maintenance = factory_server::Maintenance {
         renovate: true,
+        renovate_author: None,
         packaging: None,
     };
     store

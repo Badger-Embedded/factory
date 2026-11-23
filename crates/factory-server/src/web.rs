@@ -2508,6 +2508,13 @@ struct MaintenanceForm {
     build_config_files: String,
     #[serde(default)]
     upstream_repo: String,
+    #[serde(default)]
+    renovate_author: String,
+}
+
+fn renovate_account_well_formed(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn path_lines(text: &str) -> Vec<String> {
@@ -2518,7 +2525,10 @@ fn path_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn maintenance_from_form(form: &MaintenanceForm) -> (Maintenance, Option<String>) {
+fn maintenance_from_form(
+    form: &MaintenanceForm,
+    forge: Option<ForgeKind>,
+) -> (Maintenance, Option<String>) {
     let kind = if form.packaging_type.is_empty() {
         Some(PackagingType::default())
     } else {
@@ -2530,11 +2540,21 @@ fn maintenance_from_form(form: &MaintenanceForm) -> (Maintenance, Option<String>
         build_config_files: path_lines(&form.build_config_files),
         upstream_repo: form.upstream_repo.trim().to_owned(),
     });
+    let salsa = forge == Some(ForgeKind::Salsa);
+    let author = form.renovate_author.trim();
     let maintenance = Maintenance {
         renovate: form.renovate.is_some(),
+        renovate_author: (salsa && !author.is_empty()).then(|| author.to_owned()),
         packaging,
     };
     let refusal = match (&maintenance.packaging, kind) {
+        (_, _) if salsa && maintenance.renovate && author.is_empty() => Some(
+            "Give the Renovate account: the Salsa username Renovate opens its merge requests as."
+                .to_owned(),
+        ),
+        (_, _) if salsa && !renovate_account_well_formed(author) => Some(
+            "The Renovate account must be a Salsa username, with no spaces or slashes.".to_owned(),
+        ),
         (Some(_), None) => Some("The packaging type must be snap, deb or other.".to_owned()),
         _ => maintenance.check().err(),
     };
@@ -2552,7 +2572,7 @@ async fn save_project_maintenance(
         return Err(AppError::UnknownProject(project));
     };
     let part = pages::PipelinePart::parse(None);
-    let (maintenance, refusal) = maintenance_from_form(&form);
+    let (maintenance, refusal) = maintenance_from_form(&form, record.forge.kind());
     if let Some(problem) = refusal {
         return project_page_with(
             &state,

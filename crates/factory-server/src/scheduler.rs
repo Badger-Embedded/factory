@@ -453,13 +453,15 @@ pub trait Executor: Send + Sync + 'static {
     /// count it again.
     fn rerun(&self, request: RerunRequest) -> impl Future<Output = Result<Rerun, String>> + Send;
 
-    /// Lists the open pull requests Renovate made against `base`.
+    /// Lists the open pull requests Renovate made against `base`. `author` is
+    /// the login Renovate runs as on a forge with no fixed Renovate account.
     fn renovate_prs(
         &self,
         forge: ForgeKind,
         account: &AccountSource,
         repo: &str,
         base: &str,
+        author: Option<&str>,
     ) -> impl Future<Output = Result<Vec<RenovatePr>, String>> + Send;
 
     /// Looks at a Renovate pull request and returns the event to report, or
@@ -1043,7 +1045,8 @@ impl<E: Executor> Scheduler<E> {
     /// that fails is logged and tried again on the next pass.
     async fn discover_renovate(&self) -> Result<(), StoreError> {
         for (name, project) in self.projects.list()? {
-            if !self.store.project_maintenance(&name)?.renovate {
+            let maintenance = self.store.project_maintenance(&name)?;
+            if !maintenance.renovate {
                 continue;
             }
             let due = self
@@ -1070,6 +1073,19 @@ impl<E: Executor> Scheduler<E> {
                     continue;
                 }
             };
+            let author = (resolved.forge == ForgeKind::Salsa)
+                .then_some(maintenance.renovate_author.as_deref())
+                .flatten();
+            if resolved.forge == ForgeKind::Salsa && author.is_none() {
+                tracing::warn!(
+                    "skipping the Renovate discovery of {name}: set the Renovate account in its Maintenance settings"
+                );
+                self.discovered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name.clone(), Instant::now());
+                continue;
+            }
             let listed = self
                 .executor
                 .renovate_prs(
@@ -1077,6 +1093,7 @@ impl<E: Executor> Scheduler<E> {
                     &resolved.source,
                     &project.repo,
                     &project.base,
+                    author,
                 )
                 .await;
             let prs = match listed {
