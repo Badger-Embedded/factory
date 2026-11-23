@@ -774,6 +774,86 @@ test('a stopped Renovate job starts a fix job and links to it', async ({ page, f
   await expect(page.locator('textarea[name=instructions]')).toBeVisible();
 });
 
+test('fix notes show the text and the time apart', async ({ page, factory, project }) => {
+  const id = factory.fixture(
+    'renovate',
+    '--project',
+    project,
+    '--number',
+    '7',
+    '--url',
+    'https://stored.example/pull/7',
+  );
+  factory.fixture('apply', '--job', id, '--event', 'renovate-stopped');
+  await page.goto(`/jobs/${id}`);
+  await page.locator('textarea[name=instructions]').fill('Update the smoke test');
+  await page.getByRole('button', { name: 'Fix in a separate pull request' }).click();
+  const fix = (await page.locator('.status-detail').getByRole('link').getAttribute('href'))!
+    .split('/')
+    .pop()!;
+  await page.goto(`/jobs/${id}`);
+
+  const rows = page.locator('#job-timeline .fix-notes li');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toHaveText(/^Started fix job #\d+\s+\d{2}:\d{2}$/);
+  await expect(page.locator('#job-timeline .fix-notes')).toHaveCSS('list-style-type', 'none');
+
+  const parts = async () =>
+    rows.evaluateAll((lis) =>
+      lis.map((li) => {
+        const text = li.children[0];
+        const when = li.querySelector('.when')!;
+        const t = text.getBoundingClientRect();
+        const w = when.getBoundingClientRect();
+        const s = getComputedStyle(when);
+        return {
+          gap: w.left - t.right,
+          right: w.right,
+          overflow: li.scrollWidth > li.clientWidth,
+          lines: (() => {
+            const range = document.createRange();
+            range.selectNodeContents(when.querySelector('time')!.firstChild!);
+            return new Set(Array.from(range.getClientRects()).map((r) => Math.round(r.top))).size;
+          })(),
+          textLines: (() => {
+            const range = document.createRange();
+            range.selectNodeContents(text);
+            return new Set(Array.from(range.getClientRects()).map((r) => Math.round(r.top))).size;
+          })(),
+          color: s.color,
+          textColor: getComputedStyle(text).color,
+          font: s.fontFamily,
+        };
+      }),
+    );
+  const [first] = await parts();
+  expect(first.gap).toBeGreaterThan(4);
+  expect(first.color).not.toBe(first.textColor);
+  expect(first.font).toMatch(/mono/i);
+
+  factory.fixture('apply', '--job', id, '--fix', fix);
+  await page.goto(`/jobs/${id}`);
+  await expect(rows).toHaveCount(2);
+  const both = await parts();
+  expect(both[0].right).toBeCloseTo(both[1].right, 0);
+
+  await page.setViewportSize({ width: 600, height: 900 });
+  for (const row of await parts()) {
+    expect(row.overflow).toBe(false);
+    expect(row.gap).toBeGreaterThan(0);
+    expect(row.lines).toBe(1);
+  }
+
+  await rows.first().locator('span').first().evaluate((el) => {
+    el.textContent = `Started fix job #1 ${'a-very-long-note-'.repeat(20)}`;
+  });
+  const [long] = await parts();
+  expect(long.overflow).toBe(false);
+  expect(long.textLines).toBeGreaterThan(1);
+  expect(long.lines).toBe(1);
+  expect(long.gap).toBeGreaterThan(0);
+});
+
 test('a job page on an unknown forge shows the notice and a plain Renovate number', async ({
   page,
   factory,
