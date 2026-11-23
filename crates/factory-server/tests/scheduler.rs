@@ -1809,6 +1809,53 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
 }
 
 #[tokio::test]
+async fn a_project_that_moves_to_an_unknown_forge_stops_a_job_in_a_factory_turn() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
+    let odd = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(
+            [(
+                "maestro".to_owned(),
+                Project {
+                    forge: ProjectForge::Unknown("elsewhere".into()),
+                    repo: "Badger-Embedded/maestro".into(),
+                    base: "main".into(),
+                    checks: None,
+                    models: factory_server::StageModels::default(),
+                    auto_merge: false,
+                    llm_review: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
+    );
+
+    step(&odd).await;
+    let published = executor.published.lock().unwrap().len();
+    let logs = store.logs(id, 50).unwrap().len();
+    step(&odd).await;
+    step(&odd).await;
+
+    let job = store.get(id).unwrap().job;
+    assert!(
+        matches!(job.stage(), Stage::Failed { reason, .. } if reason.contains("elsewhere")),
+        "{:?}",
+        job.stage()
+    );
+    assert_eq!(executor.published.lock().unwrap().len(), published);
+    assert_eq!(store.logs(id, 50).unwrap().len(), logs);
+}
+
+#[tokio::test]
 async fn a_pull_request_merged_before_the_push_moves_the_job_on() {
     let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
     let id = to_commits_ready(&store, &executor, &scheduler).await;

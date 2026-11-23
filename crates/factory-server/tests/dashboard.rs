@@ -2609,12 +2609,19 @@ fn the_forge_migration_moves_every_project_to_github() {
         assert_eq!(project.forge, ProjectForge::Known(ForgeKind::GitHub));
     }
     assert_eq!(projects[0].1.checks.as_deref(), Some("just test"));
-    // The rebuilt table is unique by forge plus repo.
-    assert!(matches!(
-        store.create_project("three", ForgeKind::GitHub, "o/one", "main", None, None),
-        Err(StoreError::DuplicateRepo(ForgeKind::GitHub, _))
-    ));
     drop(store);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('three', 'elsewhere', 'o/one', 'main')",
+        [],
+    )
+    .unwrap();
+    let duplicate = conn.execute(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('four', 'github', 'o/one', 'main')",
+        [],
+    );
+    assert!(duplicate.is_err());
+    drop(conn);
     Store::open(&path).unwrap();
 }
 

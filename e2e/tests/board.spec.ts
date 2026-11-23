@@ -4,6 +4,8 @@
 //   the worker tiles: "lists the seeded jobs in their sections with totals and workers"
 // - The project picker switches the board without a submit button:
 //   "the project picker switches the board"
+// - A project on an unknown forge shows a notice and no source link, and a
+//   healthy project keeps its link: "a project on an unknown forge shows a notice instead of a source link"
 // - A login on no project sees the empty state and the onboarding link:
 //   "a login on no project is sent to onboarding"
 // - Submitting the New request form creates a job that shows on the board:
@@ -372,4 +374,24 @@ test.describe('as a collaborator', () => {
     await page.goto('/');
     await expect(page.getByLabel('Project')).toHaveValue(SHARED_PROJECT);
   });
+});
+
+test('a project on an unknown forge shows a notice instead of a source link', async ({
+  page,
+  project,
+  factory,
+}) => {
+  const odd = `${project}-odd`;
+  factory.fixture('project', '--name', odd, '--login', ADMIN, '--forge', 'elsewhere');
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto(`/?project=${odd}`);
+
+  await expect(page.locator('div.card.failed')).toContainText('elsewhere');
+  await expect(page.locator('a.source-link')).toHaveCount(0);
+
+  await page.getByLabel('Project').selectOption(project);
+  await expect(page).toHaveURL(new RegExp(`project=${project}$`));
+  await expect(page.locator('div.card.failed')).toHaveCount(0);
+  const link = page.locator('div.status-row a.source-link');
+  await expect(link).toHaveAttribute('href', `https://github.com/e2e/${project}`);
 });

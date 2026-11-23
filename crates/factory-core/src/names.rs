@@ -118,6 +118,7 @@ impl Event {
             Event::CiRerun => "ci-rerun",
             Event::NothingToRerun => "nothing-to-rerun",
             Event::MergeFailed => "merge-failed",
+            Event::FactoryFailed { .. } => "factory-failed",
             Event::Conflicted { .. } => "conflicted",
             Event::ReviewComments { .. } => "review-comments",
             Event::StartReview { .. } => "start-review",

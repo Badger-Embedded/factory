@@ -507,6 +507,23 @@ fn an_agent_failure_fails_the_job_with_the_failed_task_to_retry() {
 }
 
 #[test]
+fn a_factory_failure_stops_a_watching_job_and_retry_resumes_it() {
+    let mut job = watching(9);
+    apply(
+        &mut job,
+        Event::FactoryFailed {
+            reason: "unsupported forge".into(),
+        },
+    );
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert_eq!(job.next_command(), None);
+    assert!(job.can_retry());
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+}
+
+#[test]
 fn cancel_ends_the_job_and_later_events_are_rejected() {
     let mut job = Job::new("add a reboot button", Gates::default());
     apply(&mut job, Event::Start);

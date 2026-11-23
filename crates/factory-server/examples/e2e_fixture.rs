@@ -238,6 +238,12 @@ fn main() -> Result<()> {
             for login in &logins[1..] {
                 store.add_collaborator(name, login, &logins[0])?;
             }
+            if let Ok(forge) = one("forge") {
+                rusqlite::Connection::open(&db)?.execute(
+                    "UPDATE projects SET forge = ?1 WHERE name = ?2",
+                    [forge, name],
+                )?;
+            }
         }
         "job" => {
             let request = one("request").map_or("A request from the fixture", |text| text.as_str());

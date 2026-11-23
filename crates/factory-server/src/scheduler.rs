@@ -1011,7 +1011,7 @@ impl<E: Executor> Scheduler<E> {
             Ok(Some(project)) => {
                 if let Some(problem) = project.forge.problem() {
                     tracing::error!("job {}: project {}: {problem}", row.id, row.project);
-                    self.fail_job_step(row, job, &problem)?;
+                    self.fail_unsupported_forge(row, job, &problem)?;
                     return Ok(None);
                 }
                 Ok(Some(project))
@@ -1029,16 +1029,27 @@ impl<E: Executor> Scheduler<E> {
 
     fn fail_unknown_project(&self, row: &JobRow, job: &Job) -> Result<(), StoreError> {
         let reason = format!("project {:?} is not configured", row.project);
-        self.fail_job_step(row, job, &reason)
-    }
-
-    fn fail_job_step(&self, row: &JobRow, job: &Job, reason: &str) -> Result<(), StoreError> {
-        let reason = reason.to_owned();
         if matches!(job.next_command(), Some(Command::RunAgent { .. })) {
             self.store.apply(row.id, Event::AgentFailed { reason })?;
         } else {
             self.store.append_factory_log(row.id, &reason)?;
         }
+        Ok(())
+    }
+
+    fn fail_unsupported_forge(
+        &self,
+        row: &JobRow,
+        job: &Job,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let reason = reason.to_owned();
+        let event = if matches!(job.next_command(), Some(Command::RunAgent { .. })) {
+            Event::AgentFailed { reason }
+        } else {
+            Event::FactoryFailed { reason }
+        };
+        self.store.apply(row.id, event)?;
         Ok(())
     }
 

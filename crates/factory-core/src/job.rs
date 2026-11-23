@@ -559,6 +559,8 @@ pub enum RetryTarget {
     Verifying { pr: usize },
     /// Watch the pull request's CI and review again.
     CiAndReview { pr: usize },
+    /// Watch the Renovate pull request again.
+    Renovate,
     /// Run `task` again in `stage`, the stage the failed run belonged to.
     /// The stage picks the session, so the run resumes the session that
     /// failed, in the same checkout.
@@ -866,6 +868,12 @@ pub enum Event {
     },
     Agent(AgentResult),
     AgentFailed {
+        reason: String,
+    },
+    /// The factory cannot run the step it owes, so the job fails with `reason`.
+    /// A retry resumes the step where the job has a retry target. Applies to
+    /// every unfinished job that is not waiting for an agent run.
+    FactoryFailed {
         reason: String,
     },
     Answer(Vec<String>),
@@ -1291,6 +1299,12 @@ impl Job {
                 ),
                 Turn::Done,
             ),
+
+            (stage, turn, E::FactoryFailed { reason })
+                if !matches!(turn, Turn::Agent(_)) && !self.is_finished() =>
+            {
+                factory_failure(stage, reason)
+            }
 
             (_, Turn::User(Ask::Answers { questions }), E::Answer(answers)) => {
                 let questions = questions.clone();
@@ -1949,6 +1963,7 @@ impl Job {
             Some(RetryTarget::CiAndReview { pr }) => {
                 Some((Stage::CiAndReview { pr: *pr }, Turn::Factory))
             }
+            Some(RetryTarget::Renovate) => Some((Stage::Renovate, Turn::Factory)),
             Some(RetryTarget::Agent { stage, task }) => {
                 Some(((**stage).clone(), Turn::Agent((**task).clone())))
             }
@@ -1983,4 +1998,16 @@ impl Job {
             event,
         }
     }
+}
+
+/// The failed state of a job whose factory step failed, and where a retry
+/// resumes it.
+fn factory_failure(stage: &Stage, reason: String) -> (Stage, Turn) {
+    let retry = match stage {
+        Stage::Verifying { pr } | Stage::PrOpen { pr } => Some(RetryTarget::Verifying { pr: *pr }),
+        Stage::CiAndReview { pr } => Some(RetryTarget::CiAndReview { pr: *pr }),
+        Stage::Renovate => Some(RetryTarget::Renovate),
+        _ => None,
+    };
+    (Job::failed(reason, retry), Turn::Done)
 }

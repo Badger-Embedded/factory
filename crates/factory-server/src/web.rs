@@ -641,7 +641,13 @@ async fn board_fragment(
     };
     Ok(region_response(
         version.as_deref(),
-        pages::board(&data.rows(), &data.costs, data.auto_merge, project),
+        pages::board(
+            &data.rows(),
+            &data.costs,
+            data.auto_merge,
+            project,
+            data.project.as_ref(),
+        ),
     ))
 }
 

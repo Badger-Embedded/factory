@@ -208,7 +208,7 @@ pub fn index(
                     div.card.failed { (problem) }
                 }
                 (composer(selected))
-                (board(&all, costs, auto_merge, selected))
+                (board(&all, costs, auto_merge, selected, project))
                 (stats(totals, selected))
             } @else {
                 div.card {
@@ -2722,7 +2722,9 @@ pub fn board(
     costs: &HashMap<i64, f64>,
     auto_merge: bool,
     project: &str,
+    repo: Option<&Project>,
 ) -> Region {
+    let links = Links::of(repo);
     let in_section = |section: Section| -> Vec<&JobRow> {
         rows.iter()
             .copied()
@@ -2740,13 +2742,13 @@ pub fn board(
                 section class={ "inbox inbox-" (section.name()) } {
                     h2 { (section.title()) " " span.count { (jobs.len()) } }
                     @if section == Section::Done && jobs.len() > DONE_SHOWN {
-                        (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge))
+                        (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge, links))
                         details.older data-key=(section.name()) {
                             summary { "Show " (jobs.len() - DONE_SHOWN) " older" }
-                            (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge))
+                            (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge, links))
                         }
                     } @else {
-                        (job_rows(&jobs, costs, auto_merge))
+                        (job_rows(&jobs, costs, auto_merge, links))
                     }
                 }
             }
@@ -2762,7 +2764,12 @@ pub fn board(
     Region { version, markup }
 }
 
-fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Markup {
+fn job_rows(
+    rows: &[&JobRow],
+    costs: &HashMap<i64, f64>,
+    auto_merge: bool,
+    links: Option<Links<'_>>,
+) -> Markup {
     html! {
         ul.jobs {
             @for row in rows {
@@ -2773,7 +2780,7 @@ fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Ma
                         (first_line(row.job.request()))
                     }
                     div.job-sub {
-                        (renovate_link(&row.job))
+                        (renovate_link(&row.job, links))
                         (turn_badge(&row.job, auto_merge))
                         @if !row.job.is_finished() { (flow_steps(&row.job)) }
                         @if let Some(detail) = row_detail(&row.job) {
@@ -2955,6 +2962,9 @@ pub fn job(
         &html! {
             (job_poll(false, id, job))
             (job_header(id, row, repo_url, cost_usd, estimated))
+            @if let Some(problem) = project.and_then(|project| project.forge.problem()) {
+                div.card.failed { (problem) }
+            }
             div.job-layout {
                 div.job-now {
                     (status_region(false, id, job, settings, auto_merge, gap_links))
@@ -3309,7 +3319,7 @@ fn job_header(
             (cost_badge(false, cost_usd, estimated))
         }
         @if job.renovate_pr().is_some() {
-            p.meta { (renovate_link(job)) }
+            p.meta { (renovate_link(job, repo_url)) }
         }
         p.meta {
             @if let Some(links) = repo_url {
@@ -3322,11 +3332,15 @@ fn job_header(
     }
 }
 
-fn renovate_link(job: &Job) -> Markup {
+fn renovate_link(job: &Job, links: Option<Links<'_>>) -> Markup {
     html! {
         @if let Some(pr) = job.renovate_pr() {
             span.badge.factory { "Renovate" }
-            a.renovate-pr href=(pr.url) { "#" (pr.number) }
+            @if let Some(links) = links {
+                (external_link(&links.pr_url(pr.number), html! { "#" (pr.number) }, Some("renovate-pr"), None))
+            } @else {
+                span.renovate-pr { "#" (pr.number) }
+            }
         }
     }
 }
