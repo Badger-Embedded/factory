@@ -13,6 +13,7 @@
 
   const search = document.getElementById("picker-search");
   const empty = picker.querySelector(".picker-empty");
+  const status = picker.querySelector(".picker-status");
   search.hidden = false;
 
   function rows() {
@@ -30,16 +31,14 @@
     activeId = row ? row.dataset.id : null;
     rows().forEach(function (other) { other.classList.toggle("active", other === row); });
     if (row) {
-      search.setAttribute("aria-activedescendant", row.id);
+      status.textContent = row.dataset.name;
       row.scrollIntoView({ block: "nearest" });
     } else {
-      search.removeAttribute("aria-activedescendant");
+      status.textContent = search.value.trim() === "" ? "" : "No project matches.";
     }
   }
 
-  // Hides the rows that miss the query and keeps the highlighted project when
-  // it is still shown, else highlights the first shown row.
-  function applyFilter() {
+  function applyFilter(keepActive) {
     const query = search.value.trim().toLowerCase();
     rows().forEach(function (row) {
       row.hidden = query !== "" &&
@@ -48,11 +47,13 @@
     });
     const shown = visibleRows();
     empty.hidden = shown.length > 0;
-    highlight(shown.find(function (row) { return row.dataset.id === activeId; }) || shown[0] || null);
+    const kept = keepActive === true && shown.find(function (row) { return row.dataset.id === activeId; });
+    highlight(kept || shown[0] || null);
   }
 
-  search.addEventListener("input", applyFilter);
+  search.addEventListener("input", function () { applyFilter(false); });
   search.addEventListener("keydown", function (event) {
+    if (event.isComposing || event.keyCode === 229) return;
     const shown = visibleRows();
     const at = shown.findIndex(function (row) { return row.classList.contains("active"); });
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -70,11 +71,11 @@
   picker.addEventListener("toggle", function () {
     summary.setAttribute("aria-expanded", picker.open ? "true" : "false");
     if (picker.open) {
-      applyFilter();
+      applyFilter(false);
       search.focus();
     } else {
       search.value = "";
-      applyFilter();
+      applyFilter(false);
     }
     fitPanel();
   });
@@ -83,6 +84,7 @@
     if (picker.open && !picker.contains(event.target)) picker.open = false;
   });
   document.addEventListener("keydown", function (event) {
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Escape" && picker.open) {
       picker.open = false;
       summary.focus();
@@ -115,7 +117,7 @@
     if (detached) clearCurrent(list);
     const row = list.querySelector('a[aria-current="page"] .picker-name');
     if (row) current.textContent = row.textContent;
-    applyFilter();
+    applyFilter(true);
     if (focusedHref !== null) {
       for (const link of list.querySelectorAll("a")) {
         if (link.getAttribute("href") === focusedHref) link.focus();
@@ -144,7 +146,7 @@
           badge.replaceWith(freshBadge);
         }
         htmx.process(fresh);
-        applyFilter();
+        applyFilter(true);
       });
   });
 })();

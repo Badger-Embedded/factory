@@ -4,12 +4,6 @@
 //   the worker tiles: "lists the seeded jobs in their sections with totals and workers"
 // - The project picker switches the board through its row links:
 //   "the project picker switches the board"
-// - The picker's search box has focus on open, filters rows by name or identifier
-//   in any case, moves a highlight with the arrow keys and opens it with Enter, and
-//   says when nothing matches: "the picker search filters and opens the match",
-//   "opening the picker focuses the search and closing clears it"
-// - A poll updates the picker rows while the panel stays open with the typed
-//   filter and focus: "a poll keeps the picker search text, focus and filter"
 // - A login on no project sees the empty state and the onboarding link:
 //   "a login on no project is sent to onboarding"
 // - Submitting the New request form creates a job that shows on the board:
@@ -127,7 +121,30 @@ test('the picker search filters and opens the match', async ({ page, factory }, 
   await page.getByLabel('Project', { exact: true }).click();
   await page.getByLabel('Find a project').fill('no-such-project');
   await expect(rows).toHaveCount(0);
-  await expect(page.getByText('No project matches.')).toBeVisible();
+  await expect(page.locator('.picker-empty')).toBeVisible();
+  await expect(page.locator('.picker-status')).toHaveText('No project matches.');
+});
+
+test('broadening or reopening the search highlights the first row', async ({ page, factory }, testInfo) => {
+  const id = `r${testInfo.workerIndex}-${Date.now()}`;
+  const [alpha, alphabet, beta] = [`${id}-alpha`, `${id}-alphabet`, `${id}-beta`];
+  await badgeLogin(page, factory, [alpha, alphabet, beta]);
+  await page.goto(`/?project=${beta}`);
+  const search = page.getByLabel('Find a project');
+  const active = page.locator('#picker-list li.active');
+
+  await page.getByLabel('Project', { exact: true }).click();
+  await search.fill(`${id}-alphabet`);
+  await expect(active).toHaveAttribute('data-id', alphabet);
+  await search.fill(`${id}-alpha`);
+  await expect(active).toHaveAttribute('data-id', alpha);
+  await search.press('ArrowDown');
+  await expect(active).toHaveAttribute('data-id', alphabet);
+
+  await search.press('Escape');
+  await page.getByLabel('Project', { exact: true }).click();
+  await expect(active).toHaveAttribute('data-id', alpha);
+  await expect(page.locator('.picker-status')).toHaveText(alpha);
 });
 
 test('opening the picker focuses the search and closing clears it', async ({ page, factory }, testInfo) => {

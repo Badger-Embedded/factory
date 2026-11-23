@@ -647,9 +647,9 @@ fn project_selector(
             }
             div.picker-panel {
                 input.picker-search #picker-search type="search" hidden
-                    role="combobox" aria-label="Find a project" aria-controls="picker-list"
-                    aria-expanded="true" aria-autocomplete="list" autocomplete="off"
+                    aria-label="Find a project" autocomplete="off"
                     spellcheck="false" placeholder="Find a project…";
+                p.picker-status.visually-hidden role="status" {}
                 (picker(attention, selected, false))
                 p.picker-empty hidden { "No project matches." }
             }

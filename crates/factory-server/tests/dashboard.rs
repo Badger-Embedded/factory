@@ -4274,7 +4274,8 @@ async fn the_picker_has_a_search_box_and_a_hidden_empty_message() {
     let search = one("#project-picker .picker-panel > input#picker-search").unwrap();
     assert_eq!(search.value().attr("type"), Some("search"));
     assert_eq!(search.value().attr("aria-label"), Some("Find a project"));
-    assert_eq!(search.value().attr("aria-controls"), Some("picker-list"));
+    assert!(search.value().attr("role").is_none());
+    assert!(one("#project-picker .picker-panel > p.picker-status[role=status]").is_some());
     let empty = one("#project-picker .picker-panel > p.picker-empty").unwrap();
     assert!(empty.value().attr("hidden").is_some());
     assert_eq!(empty.text().collect::<String>(), "No project matches.");
