@@ -1703,6 +1703,82 @@ async fn a_project_without_checks_publishes_unchecked() {
 }
 
 #[tokio::test]
+async fn an_edited_checks_command_applies_to_a_job_created_before_the_edit() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(Projects::from_store(Arc::clone(&store))),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
+    );
+    store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/maestro",
+            "main",
+            Some("just lint"),
+            Some("alice"),
+        )
+        .unwrap();
+    let to_verifying = |text: &str| {
+        let id = store.create("maestro", "alice", text).unwrap();
+        for event in [
+            Event::Start,
+            Event::Agent(AgentResult::Clarified),
+            Event::Agent(AgentResult::Spec("s".into())),
+            Event::Approve,
+            Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+                title: "t".into(),
+                summary: "s".into(),
+                number: None,
+                description: None,
+                notes: None,
+            }])),
+            Event::Approve,
+            Event::Agent(AgentResult::CommitsReady(ready())),
+        ] {
+            store.apply(id, event).unwrap();
+        }
+        id
+    };
+
+    let first = to_verifying("one");
+    store
+        .save_project_checks("maestro", Some("just lint && just test"))
+        .unwrap();
+    step(&scheduler).await;
+    assert_eq!(
+        executor.checks_run.lock().unwrap()[0].command,
+        "just lint && just test"
+    );
+    let logs = store.logs(first, 20).unwrap();
+    assert!(
+        logs.iter()
+            .any(|line| line.text == "Running the checks: just lint && just test"),
+        "{logs:?}"
+    );
+
+    let second = to_verifying("two");
+    store.save_project_checks("maestro", None).unwrap();
+    step(&scheduler).await;
+    assert_eq!(executor.checks_run.lock().unwrap().len(), 1);
+    assert_eq!(
+        store.get(second).unwrap().job.stage(),
+        &Stage::PrOpen { pr: 0 }
+    );
+    let logs = store.logs(second, 20).unwrap();
+    assert!(
+        logs.iter().any(|line| line.text.contains("no checks")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_project_on_an_unknown_forge_fails_its_job_and_leaves_the_others_running() {
     let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::Clarified));
     let project = |forge, repo: &str| Project {

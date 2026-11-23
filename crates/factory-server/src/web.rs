@@ -185,10 +185,7 @@ pub fn app(
             "/settings/projects/{project}/use-my-account",
             post(set_use_my_account),
         )
-        .route(
-            "/settings/projects/{project}/maintenance",
-            post(save_project_maintenance),
-        )
+        .merge(project_card_routes())
         .route("/settings/projects/{project}/remove", post(remove_project))
         .route(
             "/settings/projects/{project}/mcp/{server}",
@@ -275,6 +272,18 @@ async fn require_admin(
         pages::error(status, "This page is for factory admins."),
     )
         .into_response()
+}
+
+fn project_card_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/settings/projects/{project}/maintenance",
+            post(save_project_maintenance),
+        )
+        .route(
+            "/settings/projects/{project}/checks",
+            post(save_project_checks),
+        )
 }
 
 fn copilot_routes() -> Router<AppState> {
@@ -1859,6 +1868,8 @@ fn project_settings(
         maintenance: state.store.project_maintenance(name)?,
         forge_problem: project.forge.problem(),
         forge_account,
+        checks: project.checks.clone(),
+        checks_csrf: state.csrf.issue(login),
     })
 }
 
@@ -2407,6 +2418,36 @@ async fn save_project_maintenance(
         .store
         .save_project_maintenance(&project, &maintenance)?;
     project_page(&state, &headers, &project, part, Some("Saved."), None)
+}
+
+#[derive(Deserialize)]
+struct ChecksForm {
+    #[serde(default)]
+    checks: String,
+    #[serde(default)]
+    csrf: String,
+}
+
+async fn save_project_checks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<ChecksForm>,
+) -> Result<Markup, AppError> {
+    visible_project(&state, &headers, &project)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let checks = form.checks.trim();
+    state
+        .store
+        .save_project_checks(&project, (!checks.is_empty()).then_some(checks))?;
+    project_page(
+        &state,
+        &headers,
+        &project,
+        pages::PipelinePart::parse(None),
+        Some("Saved."),
+        None,
+    )
 }
 
 #[derive(Deserialize)]

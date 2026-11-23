@@ -192,6 +192,25 @@ test('a collaborator can be added and removed', async ({ page, project }) => {
   await expect(row(ADMIN)).toBeVisible();
 });
 
+test('the local checks command saves and clears', async ({ page, project }) => {
+  await page.goto(settingsPath(project));
+  const card = page.locator('form.settings-form').filter({ hasText: 'Local checks' });
+  const field = card.getByLabel('Local checks command (optional)');
+  await expect(field).toHaveValue('');
+  await field.fill('  just lint && just test  ');
+  await card.getByRole('button', { name: 'Save checks' }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto(settingsPath(project));
+  await expect(field).toHaveValue('just lint && just test');
+  await field.fill('');
+  await card.getByRole('button', { name: 'Save checks' }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto(settingsPath(project));
+  await expect(field).toHaveValue('');
+});
+
 test('the maintenance settings save', async ({ page, project }) => {
   await page.goto(settingsPath(project));
   const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });

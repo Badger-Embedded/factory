@@ -529,7 +529,14 @@ pub struct ProjectSettings {
     pub forge_problem: Option<String>,
     /// The Forge account card. `None` when the project's forge is unknown.
     pub forge_account: Option<ForgeAccountCard>,
+    /// The project's local checks command, or `None` when it has none.
+    pub checks: Option<String>,
+    /// The form token the Local checks card posts.
+    pub checks_csrf: String,
 }
+
+const CHECKS_LABEL: &str = "Local checks command (optional)";
+const CHECKS_HINT: &str = "The factory runs this with bash in the worker, in the job's checkout, before it pushes, such as nix develop -c just lint && nix develop -c just test. It is separate from GitHub's CI on the pull request. Leave it empty to push without local checks.";
 
 /// What the Forge account card shows: the project token state and the
 /// current login's own switch.
@@ -1617,6 +1624,7 @@ pub fn settings_project(
                 }
                 (project_forge_account_card(&project.name, card))
             }
+            (project_checks_card(project))
             (project_maintenance_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
@@ -1646,6 +1654,24 @@ fn remove_project_card(project: &ProjectSettings) -> Markup {
                     placeholder=(project.name);
                 button.danger { "Remove " (project.name) }
             }
+        }
+    }
+}
+
+fn project_checks_card(project: &ProjectSettings) -> Markup {
+    html! {
+        form.card.settings-form method="post"
+            action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/checks" } {
+            h2 { "Local checks" }
+            div.field {
+                label for="checks" { (CHECKS_LABEL) }
+                input #checks.wide type="text" name="checks"
+                    value=(project.checks.as_deref().unwrap_or(""));
+                p.hint { (CHECKS_HINT) }
+                p.hint { "A change applies the next time checks start for any job. A run already in the worker keeps the command it started with." }
+            }
+            input type="hidden" name="csrf" value=(project.checks_csrf);
+            (save_bar("Save checks"))
         }
     }
 }
@@ -2744,9 +2770,9 @@ pub fn onboard(
                     p.hint { "The branch pull requests target. Defaults to main." }
                 }
                 div.field {
-                    label for="checks" { "Local checks command (optional)" }
+                    label for="checks" { (CHECKS_LABEL) }
                     input #checks.wide type="text" name="checks" value=(view.checks);
-                    p.hint { "The factory runs this with bash in the worker, in the job's checkout, before it pushes, such as nix develop -c just lint && nix develop -c just test. It is separate from GitHub's CI on the pull request. Leave it empty to push without local checks." }
+                    p.hint { (CHECKS_HINT) }
                 }
                 @if let Some(report) = report {
                     (onboard_results(report))
