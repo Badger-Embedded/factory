@@ -6460,12 +6460,14 @@ async fn a_refused_token_reading_a_merged_fix_fails_the_job_and_retry_resumes_th
         .lock()
         .unwrap()
         .push_back(credential_failure("the token was refused"));
+    let watched = executor.renovate_watched.lock().unwrap().len();
     store.apply(fix, Event::Merged).unwrap();
     step_until(&scheduler, || {
         matches!(store.get(id).unwrap().job.stage(), Stage::Failed { .. })
     })
     .await;
     assert!(executor.rebase_calls.lock().unwrap().is_empty());
+    assert_eq!(executor.renovate_watched.lock().unwrap().len(), watched);
 
     store.apply(id, Event::Retry).unwrap();
     step_until(&scheduler, || {

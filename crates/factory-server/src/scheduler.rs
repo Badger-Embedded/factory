@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -1794,7 +1795,9 @@ impl<E: Executor> Scheduler<E> {
     async fn watch_renovate(&self, settings: &Settings, request: RenovateWatchRequest) {
         let job_id = request.job_id;
         self.wait(settings, job_id);
-        self.follow_fix(&request).await;
+        if self.follow_fix(&request).await.is_break() {
+            return;
+        }
         match self.executor.watch_renovate(request).await {
             Ok(Some(event)) => self.apply(job_id, event),
             Ok(None) => {}
@@ -1805,13 +1808,13 @@ impl<E: Executor> Scheduler<E> {
     /// Reports how the fix job of Renovate job `job_id` ended, when it did.
     /// It reads the fix job on every watch, since a watch of an unchanged
     /// head reports nothing.
-    async fn follow_fix(&self, request: &RenovateWatchRequest) {
+    async fn follow_fix(&self, request: &RenovateWatchRequest) -> ControlFlow<()> {
         let job_id = request.job_id;
         let Ok(row) = self.store.get(job_id) else {
-            return;
+            return ControlFlow::Continue(());
         };
         let Some(pr) = row.job.renovate_pr() else {
-            return;
+            return ControlFlow::Continue(());
         };
         let Some(FixLink {
             job: fix_id,
@@ -1819,7 +1822,7 @@ impl<E: Executor> Scheduler<E> {
             ..
         }) = &pr.fix
         else {
-            return;
+            return ControlFlow::Continue(());
         };
         let fix_id = *fix_id;
         // A reused id belongs to another job, so it counts as deleted.
@@ -1827,13 +1830,13 @@ impl<E: Executor> Scheduler<E> {
             Ok(fix) if fix.job.fix_source() == Some((job_id, pr.number)) => {
                 match fix_outcome(&fix.job) {
                     Some(outcome) => outcome,
-                    None => return,
+                    None => return ControlFlow::Continue(()),
                 }
             }
             Ok(_) | Err(StoreError::NotFound(_)) => FixOutcome::Deleted,
             Err(err) => {
                 tracing::error!("reading fix job #{fix_id}: {err}");
-                return;
+                return ControlFlow::Continue(());
             }
         };
         if matches!(outcome, FixOutcome::Merged { .. }) {
@@ -1847,10 +1850,10 @@ impl<E: Executor> Scheduler<E> {
                                 reason: reason.to_owned(),
                             },
                         );
-                    } else {
-                        tracing::warn!("reading the head of #{}: {err}", request.number);
+                        return ControlFlow::Break(());
                     }
-                    return;
+                    tracing::warn!("reading the head of #{}: {err}", request.number);
+                    return ControlFlow::Continue(());
                 }
             }
         }
@@ -1861,6 +1864,7 @@ impl<E: Executor> Scheduler<E> {
                 outcome,
             },
         );
+        ControlFlow::Continue(())
     }
 
     /// How fix job `fix_id` merged relative to Renovate's pull request head.
