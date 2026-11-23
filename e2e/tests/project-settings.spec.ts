@@ -1,0 +1,418 @@
+// Project settings (/settings/projects/{name}) use cases, by test name. The
+// project fixture gives each test its own project; the MCP tests run against
+// a server of their own that trusts the TLS stub MCP server's CA.
+//
+// - Pipeline: selecting a stage, a gate or merge shows its panel and updates
+//   ?stage= in the address: "selecting a stage, a gate or merge shows its panel
+//   and updates the address"
+// - Changing a stage's agent redraws its model and effort choices:
+//   "changing a stage's agent redraws its model and effort choices"
+// - A saved agent, model, effort and gate persist after a reload:
+//   "a saved agent, model, effort, gate and merge setting persist after a reload"
+// - A changed form shows "Unsaved changes." and leaving the page asks first:
+//   "a changed form shows Unsaved changes. and leaving the page asks first"
+// - Collaborators: add one and remove one: "a collaborator can be added and removed"
+// - The maintenance settings save: "the maintenance settings save"
+// - Removing a project takes it off the picker:
+//   "removing a project takes it off the picker"
+// - Project MCP page:
+//   - enable a server, save a header value, run the connection check against
+//     the stub and see the result: "MCP: enable a server, save a header value and check the connection"
+//   - refresh the tool list: "MCP: a refresh lists the tools the server offers now"
+//   - filter the tools, All on and All off, and save tool toggles that persist:
+//     "MCP: filter the tools, use All on and All off, and keep the saved toggles"
+// - A login that is not a collaborator gets the 404 page for the project, its
+//   settings, its jobs and its MCP pages:
+//   "a login that is not a collaborator gets the 404 page"
+import type { Page } from '@playwright/test';
+import { startMcpStub, STUB_TOOLS, type McpStub } from '../mcp-stub';
+import {
+  ADMIN,
+  COLLABORATOR,
+  expect,
+  startFactory,
+  test,
+  type Factory,
+} from '../fixtures';
+
+const node = (page: Page, part: string) => page.locator(`.pipeline [data-part="${part}"]`);
+const panel = (page: Page, part: string) => page.locator(`[data-panel="${part}"]`);
+const settingsPath = (project: string, query = '') => `/settings/projects/${project}${query}`;
+
+test('selecting a stage, a gate or merge shows its panel and updates the address', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project));
+  await expect(panel(page, 'clarify')).toBeVisible();
+  await expect(panel(page, 'spec')).toBeHidden();
+
+  await node(page, 'spec').click();
+  await expect(panel(page, 'spec')).toBeVisible();
+  await expect(panel(page, 'clarify')).toBeHidden();
+  await expect(node(page, 'spec')).toHaveAttribute('aria-current', 'step');
+  await expect(page).toHaveURL(new RegExp(`/settings/projects/${project}\\?stage=spec$`));
+
+  await node(page, 'gate-plan').click();
+  await expect(panel(page, 'gate-plan')).toBeVisible();
+  await expect(panel(page, 'gate-plan').getByRole('heading', { name: 'Approve the plan' })).toBeVisible();
+  await expect(panel(page, 'spec')).toBeHidden();
+  await expect(page).toHaveURL(/\?stage=gate-plan$/);
+
+  await node(page, 'merge').click();
+  await expect(panel(page, 'merge')).toBeVisible();
+  await expect(panel(page, 'gate-plan')).toBeHidden();
+  await expect(page).toHaveURL(/\?stage=merge$/);
+
+  await page.goto(settingsPath(project, '?stage=implement'));
+  await expect(panel(page, 'implement')).toBeVisible();
+  await expect(panel(page, 'clarify')).toBeHidden();
+});
+
+test("changing a stage's agent redraws its model and effort choices", async ({ page, project }) => {
+  await page.goto(settingsPath(project, '?stage=spec'));
+  const spec = panel(page, 'spec');
+  const chips = spec.locator('.model-chips .chip');
+  const efforts = spec.locator('[data-effort-seg] label');
+  await expect(chips).toHaveText(['CLI default', 'fable', 'opus', 'sonnet', 'haiku']);
+  await expect(efforts).toHaveText(['low', 'medium', 'high', 'xhigh', 'max']);
+  await expect(spec.getByRole('radio', { name: 'medium' })).toBeChecked();
+
+  // A model of the old agent is cleared, and the node follows the field.
+  await spec.getByRole('button', { name: 'opus' }).click();
+  await expect(spec.getByLabel('Model')).toHaveValue('opus');
+  await expect(node(page, 'spec').locator('[data-model-label]')).toHaveText('opus');
+  await spec.getByRole('radio', { name: 'high', exact: true }).check();
+
+  await spec.getByRole('radio', { name: 'Codex' }).check();
+  await expect(chips).toHaveText(['CLI default', 'gpt-6.1-sol', 'gpt-6.1-codex']);
+  await expect(efforts).toHaveText(['minimal', 'low', 'medium', 'high', 'xhigh']);
+  await expect(spec.getByRole('radio', { name: 'high', exact: true })).toBeChecked();
+  await expect(spec.getByLabel('Model')).toHaveValue('');
+  await expect(node(page, 'spec').locator('[data-model-label]')).toHaveText('CLI default');
+  await expect(spec.locator('[data-model-hint]')).toContainText('installed codex CLI');
+
+  // An effort the next agent lacks falls back to that agent's default.
+  await spec.getByRole('radio', { name: 'minimal' }).check();
+  await spec.getByRole('radio', { name: 'Claude' }).check();
+  await expect(efforts).toHaveText(['low', 'medium', 'high', 'xhigh', 'max']);
+  await expect(spec.getByRole('radio', { name: 'medium' })).toBeChecked();
+  await expect(chips).toHaveText(['CLI default', 'fable', 'opus', 'sonnet', 'haiku']);
+});
+
+test('a saved agent, model, effort, gate and merge setting persist after a reload', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project, '?stage=spec'));
+  const spec = panel(page, 'spec');
+  await spec.getByRole('radio', { name: 'Codex' }).check();
+  await spec.getByRole('button', { name: 'gpt-6.1-sol' }).click();
+  await spec.getByRole('radio', { name: 'xhigh' }).check();
+
+  await node(page, 'gate-plan').click();
+  const planGate = panel(page, 'gate-plan').getByRole('checkbox', { name: 'The job waits for you here' });
+  await expect(planGate).toBeChecked();
+  await planGate.uncheck();
+  await expect(node(page, 'gate-plan')).toHaveClass(/changed/);
+  await expect(panel(page, 'gate-plan').locator('.gate-changed')).toBeVisible();
+
+  await node(page, 'merge').click();
+  await panel(page, 'merge').getByRole('checkbox', { name: /Merge pull requests/ }).check();
+  await expect(node(page, 'merge').locator('[data-merge-label]')).toHaveText('Automatic');
+
+  await page.getByRole('button', { name: `Save ${project}` }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await expect(panel(page, 'merge')).toBeVisible();
+
+  await page.goto(settingsPath(project, '?stage=spec'));
+  await expect(spec.getByRole('radio', { name: 'Codex' })).toBeChecked();
+  await expect(spec.getByLabel('Model')).toHaveValue('gpt-6.1-sol');
+  await expect(spec.getByRole('radio', { name: 'xhigh' })).toBeChecked();
+  await expect(node(page, 'spec').locator('[data-model-label]')).toHaveText('gpt-6.1-sol');
+  await expect(node(page, 'gate-plan')).toHaveClass(/changed/);
+  await node(page, 'gate-plan').click();
+  await expect(planGate).not.toBeChecked();
+  await expect(panel(page, 'gate-plan').getByRole('button', { name: 'Use the default' })).toBeVisible();
+  await node(page, 'merge').click();
+  await expect(panel(page, 'merge').getByRole('checkbox', { name: /Merge pull requests/ })).toBeChecked();
+});
+
+test('a changed form shows Unsaved changes. and leaving the page asks first', async ({
+  page,
+  project,
+}) => {
+  const dialogs: string[] = [];
+  page.on('dialog', (dialog) => {
+    dialogs.push(dialog.type());
+    void dialog.dismiss();
+  });
+  await page.goto(settingsPath(project));
+  const bar = page.locator('.pipeline-form .save-bar-note');
+  await expect(bar).toHaveText('No unsaved changes.');
+
+  // Chromium shows the prompt only after a real input on the page.
+  await node(page, 'spec').click();
+  await panel(page, 'spec').getByLabel('Model').pressSequentially('opus');
+  await expect(bar).toHaveText('Unsaved changes.');
+
+  await page.getByRole('link', { name: 'Settings' }).first().click();
+  await expect.poll(() => dialogs).toEqual(['beforeunload']);
+  await expect(page).toHaveURL(new RegExp(`/settings/projects/${project}`));
+
+  // A save does not ask, and a saved form is no longer dirty.
+  await page.getByRole('button', { name: `Save ${project}` }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await expect(bar).toHaveText('No unsaved changes.');
+  await page.getByRole('link', { name: 'Settings' }).first().click();
+  await expect(page).not.toHaveURL(new RegExp(project));
+  expect(dialogs).toEqual(['beforeunload']);
+});
+
+test('a collaborator can be added and removed', async ({ page, project }) => {
+  await page.goto(settingsPath(project));
+  const row = (login: string) => page.locator('.server-row').filter({ hasText: login });
+  await expect(row(ADMIN)).toBeVisible();
+  // The only collaborator cannot be removed.
+  await expect(row(ADMIN).getByRole('button', { name: 'Remove' })).toHaveCount(0);
+
+  await page.getByLabel('Tailscale login').fill('bob@e2e.test');
+  await page.getByRole('button', { name: 'Add collaborator' }).click();
+  await expect(page.getByText('Added bob@e2e.test.')).toBeVisible();
+  await expect(row('bob@e2e.test')).toContainText(`added by ${ADMIN}`);
+
+  await page.goto(settingsPath(project));
+  await expect(row('bob@e2e.test')).toBeVisible();
+  await row('bob@e2e.test').getByRole('button', { name: 'Remove' }).click();
+  await expect(page.getByText('Removed bob@e2e.test.')).toBeVisible();
+  await expect(row('bob@e2e.test')).toHaveCount(0);
+
+  await page.goto(settingsPath(project));
+  await expect(row('bob@e2e.test')).toHaveCount(0);
+  await expect(row(ADMIN)).toBeVisible();
+});
+
+test('the maintenance settings save', async ({ page, project }) => {
+  await page.goto(settingsPath(project));
+  const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
+  await card.getByLabel('Renovate pull requests').check();
+  await card.getByLabel('Packaging project').check();
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  // A packaging project needs a manifest file, and the form comes back with its fields.
+  await expect(page.getByText('Give at least one manifest file.')).toBeVisible();
+  await expect(card.getByLabel('Manifest files')).toBeVisible();
+
+  await card.getByLabel('Type').selectOption('deb');
+  await card.getByLabel('Manifest files').fill('debian/control\ndebian/rules');
+  await card.getByLabel('Build config files').fill('packaging/build.yaml');
+  await card.getByLabel('Upstream repository').fill('e2e/upstream');
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto(settingsPath(project));
+  await expect(card.getByLabel('Renovate pull requests')).toBeChecked();
+  await expect(card.getByLabel('Packaging project')).toBeChecked();
+  await expect(card.getByLabel('Type')).toHaveValue('deb');
+  await expect(card.getByLabel('Manifest files')).toHaveValue('debian/control\ndebian/rules');
+  await expect(card.getByLabel('Build config files')).toHaveValue('packaging/build.yaml');
+  await expect(card.getByLabel('Upstream repository')).toHaveValue('e2e/upstream');
+});
+
+test('removing a project takes it off the picker', async ({ page, project }) => {
+  await page.goto(`/?project=${project}`);
+  await expect(page.getByLabel('Project')).toHaveValue(project);
+  await expect(page.getByLabel('Project').locator(`option:text-is("${project}")`)).toHaveCount(1);
+
+  await page.goto(settingsPath(project));
+  // The name must match exactly, so a wrong one removes nothing.
+  await page.getByLabel('Project name').fill(`${project}x`);
+  await page.getByRole('button', { name: `Remove ${project}` }).click();
+  await expect(page.getByText(`Nothing was removed. Type ${project} to remove the project.`)).toBeVisible();
+
+  await page.getByLabel('Project name').fill(project);
+  await page.getByRole('button', { name: `Remove ${project}` }).click();
+  await expect(page.getByText(`Removed project ${project}.`)).toBeVisible();
+
+  await page.goto('/');
+  await expect(page.getByLabel('Project').locator(`option:text-is("${project}")`)).toHaveCount(0);
+  const response = await page.goto(settingsPath(project));
+  expect(response?.status()).toBe(404);
+});
+
+test('a login that is not a collaborator gets the 404 page', async ({ page, project, factory }) => {
+  const job = factory.fixture('job', '--project', project, '--stage', 'requested');
+  await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': COLLABORATOR });
+  for (const path of [`/?project=${project}`, settingsPath(project), settingsPath(project, '?stage=spec')]) {
+    expect((await page.goto(path))?.status(), path).toBe(404);
+    await expect(page.getByText(`no project ${project}`)).toBeVisible();
+  }
+
+  const jobPage = await page.goto(`/jobs/${job}`);
+  expect(jobPage?.status()).toBe(404);
+  await expect(page.getByText(`no job ${job}`)).toBeVisible();
+
+  // An admin who collaborates on the project still sees it.
+  await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': ADMIN });
+  expect((await page.goto(settingsPath(project)))?.status()).toBe(200);
+  expect((await page.goto(`/jobs/${job}`))?.status()).toBe(200);
+});
+
+// The project MCP page talks to a stub MCP server over TLS, which the
+// factory trusts through FACTORY_MCP_CA_FILE. Each test has its own project on
+// a server of the file's own, since a registered MCP server is factory-wide.
+const SERVER = 'docs';
+const HEADER = 'X-Key';
+const SECRET = 'secret-e2e-value';
+
+interface McpEnv {
+  factory: Factory;
+  stub: McpStub;
+}
+
+let mcpCounter = 0;
+
+const mcpTest = test.extend<{ mcpProject: string }, { mcp: McpEnv }>({
+  mcp: [
+    async ({}, use) => {
+      const { factory, stop } = await startFactory();
+      try {
+        const stub = await startMcpStub(factory);
+        try {
+          const added = await fetch(`${factory.url}/settings/mcp`, {
+            method: 'POST',
+            headers: { 'Tailscale-User-Login': ADMIN, 'content-type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ name: SERVER, url: stub.url, header: HEADER }),
+            redirect: 'manual',
+          });
+          expect(added.status).toBeLessThan(400);
+          await use({ factory, stub });
+        } finally {
+          await stub.stop();
+        }
+      } finally {
+        await stop();
+      }
+    },
+    { scope: 'worker' },
+  ],
+  baseURL: async ({ mcp }, use) => {
+    await use(mcp.factory.url);
+  },
+  mcpProject: async ({ mcp }, use, testInfo) => {
+    const name = `m${testInfo.workerIndex}-${mcpCounter++}`;
+    mcp.factory.fixture('project', '--name', name, '--login', ADMIN);
+    await use(name);
+  },
+});
+
+const mcpPath = (project: string) => `/settings/projects/${project}/mcp/${SERVER}`;
+const toolBox = (page: Page, tool: string) =>
+  page.locator('.mcp-tool').filter({ has: page.locator(`code:text-is("${tool}")`) }).getByRole('checkbox');
+
+mcpTest(
+  'MCP: enable a server, save a header value and check the connection',
+  async ({ page, mcp, mcpProject }) => {
+    await page.goto(settingsPath(mcpProject));
+    await expect(page.locator('.server-row').filter({ hasText: SERVER })).toContainText('Off');
+    await page.getByRole('link', { name: 'Configure' }).click();
+    await expect(page).toHaveURL(mcpPath(mcpProject));
+    await expect(page.getByRole('heading', { name: `${SERVER} for ${mcpProject}` })).toBeVisible();
+
+    await page.getByLabel(`Run this server for ${mcpProject}`).check();
+    await page.getByRole('checkbox', { name: 'spec', exact: true }).check();
+    await page.getByRole('checkbox', { name: 'plan', exact: true }).check();
+    await expect(page.getByLabel(HEADER, { exact: true })).toHaveAttribute('placeholder', 'not set');
+    await page.getByLabel(HEADER, { exact: true }).fill(SECRET);
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+    await page.goto(mcpPath(mcpProject));
+    await expect(page.getByLabel(`Run this server for ${mcpProject}`)).toBeChecked();
+    await expect(page.getByRole('checkbox', { name: 'spec', exact: true })).toBeChecked();
+    await expect(page.getByRole('checkbox', { name: 'clarify', exact: true })).not.toBeChecked();
+    await expect(page.getByLabel(HEADER, { exact: true })).toHaveAttribute('placeholder', 'set');
+    await expect(page.getByText('A value is stored.')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Refresh connection' }).click();
+    await expect(page.locator('.mcp-check-result')).toContainText('Connected: e2e-stub 1.2.3, protocol 2025-03-26.');
+    await expect(page.locator('.mcp-check-result')).toContainText(`Listed ${STUB_TOOLS.length} tools.`);
+    expect(mcp.stub.seen(HEADER)).toContain(SECRET);
+
+    await page.goto(settingsPath(mcpProject));
+    await expect(page.getByText(`On in 2 of 5 stages · ${STUB_TOOLS.length} of ${STUB_TOOLS.length} tools on`)).toBeVisible();
+    await expect(page.getByText('Key stored')).toBeVisible();
+  },
+);
+
+mcpTest('MCP: a refresh lists the tools the server offers now', async ({ page, mcp, mcpProject }) => {
+  await page.goto(mcpPath(mcpProject));
+  await expect(page.getByText('No tools listed yet.')).toBeVisible();
+  await page.getByRole('button', { name: 'Refresh connection' }).click();
+  await expect(page.locator('.mcp-tool')).toHaveCount(STUB_TOOLS.length);
+  await expect(page.locator('.mcp-tool-count')).toHaveText(`${STUB_TOOLS.length} of ${STUB_TOOLS.length} on`);
+
+  mcp.stub.setTools([...STUB_TOOLS.slice(1), { name: 'brand_new', description: 'Appeared later' }]);
+  try {
+    await page.getByRole('button', { name: 'Refresh connection' }).click();
+    await expect(toolBox(page, 'brand_new')).toBeVisible();
+    await expect(page.locator('.mcp-tool').filter({ hasText: 'read_file' })).toContainText('no longer offered');
+    await expect(page.locator('.mcp-tool').filter({ hasText: 'brand_new' })).toContainText('Appeared later');
+    await expect(page.locator('.mcp-tool').filter({ hasText: 'brand_new' }).locator('.badge')).toHaveText('new');
+  } finally {
+    mcp.stub.setTools(STUB_TOOLS);
+  }
+});
+
+mcpTest(
+  'MCP: filter the tools, use All on and All off, and keep the saved toggles',
+  async ({ page, mcpProject }) => {
+    await page.goto(mcpPath(mcpProject));
+    await page.getByLabel(`Run this server for ${mcpProject}`).check();
+    await page.getByRole('checkbox', { name: 'spec', exact: true }).check();
+    await page.getByRole('button', { name: 'Refresh connection' }).click();
+    const tools = page.locator('.mcp-tool');
+    await expect(tools).toHaveCount(STUB_TOOLS.length);
+    const count = page.locator('.mcp-tool-count');
+    const filter = page.getByPlaceholder(`Filter ${STUB_TOOLS.length} tools`);
+
+    await filter.fill('file');
+    await expect(page.locator('.mcp-tool:visible')).toHaveCount(2);
+    await expect(toolBox(page, 'read_file')).toBeVisible();
+    await expect(toolBox(page, 'list_dir')).toBeHidden();
+
+    // The buttons act on the tools the filter shows.
+    await page.getByRole('button', { name: 'All off' }).click();
+    await expect(count).toHaveText(`${STUB_TOOLS.length - 2} of ${STUB_TOOLS.length} on`);
+    await filter.fill('');
+    await expect(page.locator('.mcp-tool:visible')).toHaveCount(STUB_TOOLS.length);
+    await page.getByRole('button', { name: 'All off' }).click();
+    await expect(count).toHaveText(`0 of ${STUB_TOOLS.length} on`);
+    await page.getByRole('button', { name: 'All on' }).click();
+    await expect(count).toHaveText(`${STUB_TOOLS.length} of ${STUB_TOOLS.length} on`);
+
+    await toolBox(page, 'write_file').uncheck();
+    await toolBox(page, 'fetch_page').uncheck();
+    await expect(count).toHaveText(`${STUB_TOOLS.length - 2} of ${STUB_TOOLS.length} on`);
+    await expect(page.locator('form.settings-form .save-bar-note')).toHaveText('Unsaved changes.');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+    await page.goto(mcpPath(mcpProject));
+    await expect(count).toHaveText(`${STUB_TOOLS.length - 2} of ${STUB_TOOLS.length} on`);
+    await expect(toolBox(page, 'write_file')).not.toBeChecked();
+    await expect(toolBox(page, 'fetch_page')).not.toBeChecked();
+    await expect(toolBox(page, 'read_file')).toBeChecked();
+    await expect(toolBox(page, 'list_dir')).toBeChecked();
+    await expect(toolBox(page, 'search_docs')).toBeChecked();
+  },
+);
+
+mcpTest('a login that is not a collaborator gets the 404 page for a project MCP page', async ({
+  page,
+  mcpProject,
+}) => {
+  await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': COLLABORATOR });
+  const response = await page.goto(mcpPath(mcpProject));
+  expect(response?.status()).toBe(404);
+  await expect(page.getByText(`no project ${mcpProject}`)).toBeVisible();
+});

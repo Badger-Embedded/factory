@@ -8,14 +8,18 @@
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
 //! e2e_fixture apply --db P --job ID --event start|approve|cancel|questions
 //! e2e_fixture log --db P --job ID --text TEXT [--count N]
+//! e2e_fixture tls --db P --dir D
 //! ```
 //!
-//! `job` prints the new job's id.
+//! `job` prints the new job's id. `tls` writes `ca.pem`, `cert.pem` and
+//! `key.pem` into `D`: a throwaway CA and a leaf certificate for `127.0.0.1`,
+//! so the stub MCP server can serve TLS and the factory can trust it through
+//! `FACTORY_MCP_CA_FILE`. It does not open the database.
 
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use factory_core::{AgentResult, Event, PlannedPr, PrDescription, Question};
 use factory_server::Store;
@@ -160,6 +164,24 @@ fn seed(store: &Store) -> Result<()> {
     Ok(())
 }
 
+fn write_tls(dir: &Path) -> Result<()> {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+
+    let ca_key = KeyPair::generate()?;
+    let mut ca_params = CertificateParams::new(Vec::new())?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = ca_params.self_signed(&ca_key)?;
+    let leaf_key = KeyPair::generate()?;
+    let leaf =
+        CertificateParams::new(vec!["127.0.0.1".to_owned()])?.signed_by(&leaf_key, &ca, &ca_key)?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("ca.pem"), ca.pem())?;
+    std::fs::write(dir.join("cert.pem"), leaf.pem())?;
+    std::fs::write(dir.join("key.pem"), leaf_key.serialize_pem())?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing subcommand")?;
@@ -178,6 +200,9 @@ fn main() -> Result<()> {
             .and_then(|values| values.first())
             .ok_or_else(|| format!("missing --{name}").into())
     };
+    if command == "tls" {
+        return write_tls(Path::new(one("dir")?));
+    }
     let db = PathBuf::from(one("db")?);
     if let Some(dir) = db.parent() {
         std::fs::create_dir_all(dir)?;
