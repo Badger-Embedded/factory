@@ -211,8 +211,16 @@ test('the local checks command saves and clears', async ({ page, project }) => {
   await expect(field).toHaveValue('');
 });
 
+const saveProjectToken = async (page: Page, token: string) => {
+  const card = page.locator('#forge-account');
+  await card.getByLabel('Project token').fill(token);
+  await card.getByRole('button', { name: 'Save project token' }).click();
+};
+
 test('the maintenance settings save', async ({ page, project }) => {
   await page.goto(settingsPath(project));
+  await saveProjectToken(page, 'tok-e2e-alice');
+  await expect(page.getByText('Saved. The project token belongs to alice-bot.')).toBeVisible();
   const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
   await card.getByLabel('Renovate pull requests').check();
   await card.getByLabel('Packaging project').check();
@@ -235,6 +243,28 @@ test('the maintenance settings save', async ({ page, project }) => {
   await expect(card.getByLabel('Manifest files')).toHaveValue('debian/control\ndebian/rules');
   await expect(card.getByLabel('Build config files')).toHaveValue('packaging/build.yaml');
   await expect(card.getByLabel('Upstream repository')).toHaveValue('e2e/upstream');
+});
+
+test('turning Renovate on checks the project account', async ({ page, project }) => {
+  await page.goto(settingsPath(project));
+  const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
+  const save = async () => {
+    await card.getByLabel('Renovate pull requests').check();
+    await card.getByRole('button', { name: 'Save maintenance' }).click();
+  };
+
+  await save();
+  await expect(page.getByText('Renovate pull requests need a project token.')).toBeVisible();
+
+  await saveProjectToken(page, 'tok-e2e-bob');
+  await save();
+  await expect(page.getByText('bob-bot has only Read access')).toBeVisible();
+  await expect(page.getByText('cannot rerun failed CI')).toBeVisible();
+
+  await saveProjectToken(page, 'tok-e2e-alice');
+  await save();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Read access')).toHaveCount(0);
 });
 
 test('the Forge account card saves a project token by its access and keeps the switch per login', async ({

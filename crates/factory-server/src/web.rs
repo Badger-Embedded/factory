@@ -11,7 +11,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage, Wait};
-use factory_runner::{Access, Account, Expect, ForgeKind};
+use factory_runner::{Access, Account, Expect, ForgeAccount, ForgeKind};
 use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -31,8 +31,8 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, PrerequisiteEdit,
-    PrerequisiteView, ProjectGuard, ProjectTotals, Store, StoreError,
+    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, MaintenanceSave, Packaging, PackagingType,
+    PrerequisiteEdit, PrerequisiteView, ProjectGuard, ProjectTotals, Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -2497,14 +2497,7 @@ fn path_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-async fn save_project_maintenance(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(project): Path<String>,
-    Form(form): Form<MaintenanceForm>,
-) -> Result<Markup, AppError> {
-    visible_project(&state, &headers, &project)?;
-    let part = pages::PipelinePart::parse(None);
+fn maintenance_from_form(form: &MaintenanceForm) -> (Maintenance, Option<String>) {
     let kind = if form.packaging_type.is_empty() {
         Some(PackagingType::default())
     } else {
@@ -2524,6 +2517,21 @@ async fn save_project_maintenance(
         (Some(_), None) => Some("The packaging type must be snap, deb or other.".to_owned()),
         _ => maintenance.check().err(),
     };
+    (maintenance, refusal)
+}
+
+async fn save_project_maintenance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<MaintenanceForm>,
+) -> Result<Markup, AppError> {
+    visible_project(&state, &headers, &project)?;
+    let Some((record, instance)) = state.store.project_with_instance(&project)? else {
+        return Err(AppError::UnknownProject(project));
+    };
+    let part = pages::PipelinePart::parse(None);
+    let (maintenance, refusal) = maintenance_from_form(&form);
     if let Some(problem) = refusal {
         return project_page_with(
             &state,
@@ -2535,10 +2543,142 @@ async fn save_project_maintenance(
             Some(maintenance),
         );
     }
-    state
-        .store
-        .save_project_maintenance(&project, &maintenance)?;
-    project_page(&state, &headers, &project, part, Some("Saved."), None)
+    let mut notice = "Saved.".to_owned();
+    let mut credential = None;
+    if maintenance.renovate {
+        match renovate_access(&state, &project, &record).await? {
+            RenovateCheck::Refused(problem) => {
+                return project_page_with(
+                    &state,
+                    &headers,
+                    &project,
+                    part,
+                    None,
+                    Some(&problem),
+                    Some(maintenance),
+                );
+            }
+            RenovateCheck::Warned { warning, sealed } => {
+                notice.push(' ');
+                notice.push_str(&warning);
+                credential = Some(sealed);
+            }
+            RenovateCheck::Passed { sealed } => credential = Some(sealed),
+        }
+    }
+    let login = user(&headers);
+    let credential = match &credential {
+        Some(sealed) => Some((
+            ForgeTokenOwner::Project {
+                project: &project,
+                forge: project_forge_kind(&record)?,
+            },
+            sealed.as_slice(),
+        )),
+        None => None,
+    };
+    let saved = state.store.save_project_maintenance_guarded(
+        &ProjectGuard {
+            project: &project,
+            login: &login,
+            instance,
+        },
+        &maintenance,
+        credential,
+    )?;
+    let problem = match saved {
+        MaintenanceSave::Saved => {
+            return project_page(&state, &headers, &project, part, Some(&notice), None);
+        }
+        MaintenanceSave::Gone => {
+            if !state.store.is_collaborator(&project, &login)? {
+                return Err(AppError::UnknownProject(project));
+            }
+            "The project changed while the access was checked. Nothing was saved. Save it again."
+        }
+        MaintenanceSave::TokenChanged => {
+            "The project token changed while the access was checked. Nothing was saved. Save it again."
+        }
+    };
+    project_page_with(
+        &state,
+        &headers,
+        &project,
+        part,
+        None,
+        Some(problem),
+        Some(maintenance),
+    )
+}
+
+enum RenovateCheck {
+    Refused(String),
+    Warned { warning: String, sealed: Vec<u8> },
+    Passed { sealed: Vec<u8> },
+}
+
+/// Reads the project account's access to the repository for Renovate triage.
+async fn renovate_access(
+    state: &AppState,
+    name: &str,
+    project: &Project,
+) -> Result<RenovateCheck, AppError> {
+    let kind = project_forge_kind(project)?;
+    let owner = ForgeTokenOwner::Project {
+        project: name,
+        forge: kind,
+    };
+    let missing = || {
+        RenovateCheck::Refused(format!(
+            "Renovate pull requests need a project token. Save one in the Forge account card on /settings/projects/{}#forge-account.",
+            query_escape(name)
+        ))
+    };
+    let unchecked = |account: ForgeAccount, sealed: Vec<u8>| RenovateCheck::Warned {
+        warning: format!(
+            "The access of {} to {} was not checked.",
+            account.login, project.repo
+        ),
+        sealed,
+    };
+    // Read before the token, so a token replaced in between fails the write guard.
+    let (row_project, header) = owner.row();
+    let Some((_, sealed)) = state.store.get_secret(SecretRef {
+        project: &row_project,
+        server: "",
+        header: &header,
+    })?
+    else {
+        return Ok(missing());
+    };
+    let (token, found) = match state.secrets.forge_token_with_account(owner) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(missing()),
+        Err(_) => {
+            return Ok(match state.store.forge_account(owner)? {
+                Some(account) => unchecked(account, sealed),
+                None => missing(),
+            });
+        }
+    };
+    let forge = state.forges.forge(kind);
+    let account = forge.account(token, &found);
+    let display = kind.display_name();
+    Ok(match forge.access(&account, &project.repo).await {
+        Ok(Access::NotVisible) => RenovateCheck::Refused(format!(
+            "The project account {} cannot see {} on {display}. Renovate was not turned on.",
+            found.login, project.repo
+        )),
+        Ok(Access::Read) => RenovateCheck::Warned {
+            warning: format!(
+                "The project account {} has only Read access to {}, so the factory cannot rerun failed CI and cannot merge Renovate pull requests, even with auto-merge on.",
+                found.login, project.repo
+            ),
+            sealed,
+        },
+        Ok(Access::Write | Access::Admin) => RenovateCheck::Passed { sealed },
+        Err(_) => unchecked(found, sealed),
+    })
 }
 
 #[derive(Deserialize)]

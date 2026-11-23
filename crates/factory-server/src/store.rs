@@ -3364,29 +3364,55 @@ impl Store {
         project: &str,
         maintenance: &Maintenance,
     ) -> Result<(), StoreError> {
-        let packaging = maintenance.packaging.as_ref();
-        self.conn().execute(
-            "INSERT INTO project_maintenance
-                (project, renovate, packaging, packaging_type, manifest_files,
-                 build_config_files, upstream_repo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (project) DO UPDATE SET renovate = excluded.renovate,
-                packaging = excluded.packaging,
-                packaging_type = excluded.packaging_type,
-                manifest_files = excluded.manifest_files,
-                build_config_files = excluded.build_config_files,
-                upstream_repo = excluded.upstream_repo",
-            params![
-                project,
-                maintenance.renovate,
-                packaging.is_some(),
-                packaging.map(|p| p.kind.as_str()),
-                serde_json::to_string(&packaging.map_or(&[][..], |p| &p.manifest_files[..]))?,
-                serde_json::to_string(&packaging.map_or(&[][..], |p| &p.build_config_files[..]))?,
-                packaging.map(|p| p.upstream_repo.as_str()),
-            ],
+        write_maintenance(&self.conn(), project, maintenance)
+    }
+
+    /// As [`Store::save_project_maintenance`], and writes only while the
+    /// project instance and collaborator in `guard` still exist and, when
+    /// `credential` is given, while the sealed token stored for its owner is
+    /// still those bytes. A token saved again is sealed anew, so it differs
+    /// even when it is the same string.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_project_maintenance_guarded(
+        &self,
+        guard: &ProjectGuard<'_>,
+        maintenance: &Maintenance,
+        credential: Option<(ForgeTokenOwner<'_>, &[u8])>,
+    ) -> Result<MaintenanceSave, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let present: bool = tx.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project_instances i
+                 JOIN project_collaborators c ON c.project = i.project
+                 WHERE i.project = ?1 AND i.instance = ?2 AND c.login = ?3
+             )",
+            params![guard.project, guard.instance, guard.login],
+            |row| row.get(0),
         )?;
-        Ok(())
+        if !present {
+            return Ok(MaintenanceSave::Gone);
+        }
+        if let Some((owner, sealed)) = credential {
+            let (project, header) = owner.row();
+            let current: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM secrets
+                     WHERE project = ?1 AND server = '' AND header = ?2",
+                    params![project, header],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current.as_deref() != Some(sealed) {
+                return Ok(MaintenanceSave::TokenChanged);
+            }
+        }
+        write_maintenance(&tx, guard.project, maintenance)?;
+        tx.commit()?;
+        Ok(MaintenanceSave::Saved)
     }
 
     /// Sets the local checks command of `project`. `None` means no checks. It
@@ -4445,6 +4471,46 @@ fn erase_forge_account(conn: &Connection, owner: ForgeTokenOwner<'_>) -> Result<
             )?
         }
     };
+    Ok(())
+}
+
+/// What [`Store::save_project_maintenance_guarded`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceSave {
+    Saved,
+    /// The project or the collaborator no longer exists.
+    Gone,
+    /// The project token that was checked is no longer the stored one.
+    TokenChanged,
+}
+
+fn write_maintenance(
+    conn: &Connection,
+    project: &str,
+    maintenance: &Maintenance,
+) -> Result<(), StoreError> {
+    let packaging = maintenance.packaging.as_ref();
+    conn.execute(
+        "INSERT INTO project_maintenance
+            (project, renovate, packaging, packaging_type, manifest_files,
+             build_config_files, upstream_repo)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (project) DO UPDATE SET renovate = excluded.renovate,
+            packaging = excluded.packaging,
+            packaging_type = excluded.packaging_type,
+            manifest_files = excluded.manifest_files,
+            build_config_files = excluded.build_config_files,
+            upstream_repo = excluded.upstream_repo",
+        params![
+            project,
+            maintenance.renovate,
+            packaging.is_some(),
+            packaging.map(|p| p.kind.as_str()),
+            serde_json::to_string(&packaging.map_or(&[][..], |p| &p.manifest_files[..]))?,
+            serde_json::to_string(&packaging.map_or(&[][..], |p| &p.build_config_files[..]))?,
+            packaging.map(|p| p.upstream_repo.as_str()),
+        ],
+    )?;
     Ok(())
 }
 

@@ -84,7 +84,7 @@ impl ForgeTokenOwner<'_> {
     /// The `project` and `header` of the row. The `server` is empty, which no
     /// MCP server name can be, so deleting an MCP server never matches a
     /// forge token row.
-    fn row(&self) -> (String, String) {
+    pub(crate) fn row(&self) -> (String, String) {
         match *self {
             ForgeTokenOwner::User { login, forge } => (
                 String::new(),
