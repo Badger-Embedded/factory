@@ -8,9 +8,10 @@ use factory_core::{
     PrDescription, Question, Stage, Task, UsageWindow,
 };
 use factory_runner::{
-    Expect, LogLine, McpConfig, McpServerStatus, PlacedFile, ResultMessage, SessionRun, StreamItem,
-    WorkerConfig, WorkerRun, backend, event_from_result, job_prompt, parse_line, place_files,
-    place_images, podman_args, prompt, remove_container, run, show_files, show_images,
+    Expect, LogLine, McpConfig, McpServerEntry, McpServerStatus, PlacedFile, ResultMessage,
+    SessionRun, StreamItem, WorkerConfig, WorkerRun, backend, event_from_result, job_prompt,
+    parse_line, place_files, place_images, podman_args, prompt, remove_container, run, show_files,
+    show_images,
 };
 use serde_json::{Value, json};
 
@@ -965,7 +966,9 @@ fn podman_args_give_each_active_server_a_proxy_entry_with_the_run_token() {
     run.mcp = Some(McpConfig {
         proxy_url: "http://factory:8081".into(),
         token: "d34db33f".into(),
-        servers: vec!["context7".into(), "docs".into()],
+        servers: ["context7", "docs"]
+            .map(|name| McpServerEntry::Remote { name: name.into() })
+            .to_vec(),
     });
     let args = strings(&podman_args(&WorkerConfig::default(), &run));
 

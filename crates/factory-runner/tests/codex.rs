@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Agent, AgentResult, Event};
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, RunResult, SessionRun, TokenUsage, WorkerConfig,
-    WorkerRun, backend, run,
+    AgentItem, Expect, LogLine, McpConfig, McpServerEntry, RunResult, SessionRun, TokenUsage,
+    WorkerConfig, WorkerRun, backend, run,
 };
 use serde_json::Value;
 
@@ -148,7 +148,9 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     run.mcp = Some(McpConfig {
         proxy_url: "http://factory:8081".into(),
         token: "d34db33f-run-token".into(),
-        servers: vec!["context7".into(), "docs".into()],
+        servers: ["context7", "docs"]
+            .map(|name| McpServerEntry::Remote { name: name.into() })
+            .to_vec(),
     });
     let args = codex_args(&run);
 
@@ -224,7 +226,9 @@ fn a_claude_run_is_unchanged_by_the_codex_backend() {
         mcp: Some(McpConfig {
             proxy_url: "http://factory:8081".into(),
             token: "run-token".into(),
-            servers: vec!["context7".into()],
+            servers: vec![McpServerEntry::Remote {
+                name: "context7".into(),
+            }],
         }),
     };
     let args = strings(&factory_runner::podman_args(&WorkerConfig::default(), &run));

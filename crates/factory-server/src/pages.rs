@@ -10,7 +10,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use crate::check::{CheckOutcome, ToolList};
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
-use crate::mcp::{McpServer, McpStages, McpToolState};
+use crate::mcp::{McpServer, McpStages, McpToolState, McpTransport};
 use factory_runner::{ForgeAccount, ForgeKind};
 
 use crate::projects::{Project, ProjectLabel};
@@ -2371,7 +2371,7 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
             @for server in servers {
                 div.server-row {
                     span.server-name { (server.name) }
-                    span.hint.server-url { (server.url) }
+                    span.hint.server-url { (remote_url(server)) }
                     a.link-button href={ "/settings/mcp/" (crate::web::query_escape(&server.name)) } { "Open" }
                 }
             }
@@ -2405,13 +2405,22 @@ fn mcp_servers(servers: &[McpServer], secrets_available: bool) -> Markup {
     }
 }
 
+fn remote_url(server: &McpServer) -> &str {
+    let McpTransport::Remote { url, .. } = &server.transport;
+    url
+}
+
 /// One server's edit form on its own page: its URL and header names, a Delete
 /// button that posts the same form to the delete route, and the save bar. The name is fixed,
 /// because it keys the stored secrets and the proxy path.
 fn mcp_server_form(server: &McpServer, pending: Option<&PendingEdit>) -> Markup {
     let action = format!("/settings/mcp/{}", server.name);
-    let url = pending.map_or(server.url.as_str(), |pending| pending.url.as_str());
-    let headers = pending.map_or(server.headers.as_slice(), |pending| {
+    let McpTransport::Remote {
+        url: stored_url,
+        headers: stored_headers,
+    } = &server.transport;
+    let url = pending.map_or(stored_url.as_str(), |pending| pending.url.as_str());
+    let headers = pending.map_or(stored_headers.as_slice(), |pending| {
         pending.headers.as_slice()
     });
     let label = pending.map_or_else(

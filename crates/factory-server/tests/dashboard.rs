@@ -10247,7 +10247,10 @@ async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
             .mcp_server("context7")
             .unwrap()
             .unwrap()
-            .headers,
+            .as_remote()
+            .unwrap()
+            .1
+            .to_vec(),
         vec!["Authorization".to_owned()],
     );
 
@@ -10260,8 +10263,11 @@ async fn an_mcp_server_is_added_edited_and_deleted_through_the_settings_page() {
         .await;
     assert_eq!(edited.status, StatusCode::OK);
     let server = dashboard.store.mcp_server("context7").unwrap().unwrap();
-    assert_eq!(server.url, "https://mcp.context7.com/v2/mcp");
-    assert_eq!(server.headers, Vec::<String>::new());
+    assert_eq!(
+        server.as_remote().unwrap().0,
+        "https://mcp.context7.com/v2/mcp"
+    );
+    assert_eq!(server.as_remote().unwrap().1, Vec::<String>::new());
 
     // Delete it.
     let deleted = dashboard
@@ -10328,7 +10334,10 @@ async fn header_rows_are_trimmed_deduplicated_and_empty_rows_dropped() {
             .mcp_server("context7")
             .unwrap()
             .unwrap()
-            .headers,
+            .as_remote()
+            .unwrap()
+            .1
+            .to_vec(),
         vec!["Authorization".to_owned(), "X-Team".to_owned()],
     );
 }
@@ -10375,7 +10384,10 @@ async fn an_edit_form_shows_a_filled_row_per_name_and_an_empty_one() {
             .mcp_server("context7")
             .unwrap()
             .unwrap()
-            .headers,
+            .as_remote()
+            .unwrap()
+            .1
+            .to_vec(),
         Vec::<String>::new(),
     );
 }
@@ -11695,7 +11707,10 @@ async fn an_edit_that_deletes_stored_values_waits_for_a_confirm() {
             .mcp_server("context7")
             .unwrap()
             .unwrap()
-            .headers,
+            .as_remote()
+            .unwrap()
+            .1
+            .to_vec(),
         vec!["Authorization".to_owned()]
     );
     assert!(has_value(&dashboard, "maestro", "Authorization"));
@@ -11714,7 +11729,10 @@ async fn an_edit_that_deletes_stored_values_waits_for_a_confirm() {
             .mcp_server("context7")
             .unwrap()
             .unwrap()
-            .headers,
+            .as_remote()
+            .unwrap()
+            .1
+            .to_vec(),
         vec!["X-Api-Key".to_owned()]
     );
     assert!(!has_value(&dashboard, "maestro", "Authorization"));
@@ -11733,7 +11751,14 @@ async fn an_origin_change_with_stored_values_waits_for_a_confirm() {
         .await;
     assert!(reply.body.contains("Not saved yet."));
     assert_eq!(
-        dashboard.store.mcp_server("context7").unwrap().unwrap().url,
+        dashboard
+            .store
+            .mcp_server("context7")
+            .unwrap()
+            .unwrap()
+            .as_remote()
+            .unwrap()
+            .0,
         "https://mcp.context7.com/mcp"
     );
     assert!(has_value(&dashboard, "maestro", "Authorization"));

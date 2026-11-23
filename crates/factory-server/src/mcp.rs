@@ -27,16 +27,46 @@ const RESERVED_HEADERS: &[&str] = &[
     "last-event-id",
 ];
 
-/// A remote MCP server in the registry.
+/// An MCP server in the registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServer {
     /// 1 to 32 characters of `a-z`, `0-9` and `-`, unique across the registry.
     pub name: String,
-    /// The server's streamable-HTTP endpoint. Always `https`.
-    pub url: String,
-    /// The header names a project may give a value for. May be empty. Each is a
-    /// valid HTTP token and not reserved; no two differ only in case.
-    pub headers: Vec<String>,
+    pub transport: McpTransport,
+}
+
+/// How a run reaches an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpTransport {
+    /// A streamable-HTTP server the factory proxy forwards to.
+    Remote {
+        /// The server's endpoint. Always `https`.
+        url: String,
+        /// The header names a project may give a value for. May be empty. Each
+        /// is a valid HTTP token and not reserved; no two differ only in case.
+        headers: Vec<String>,
+    },
+}
+
+impl McpServer {
+    #[must_use]
+    pub fn remote(name: impl Into<String>, url: impl Into<String>, headers: Vec<String>) -> Self {
+        Self {
+            name: name.into(),
+            transport: McpTransport::Remote {
+                url: url.into(),
+                headers,
+            },
+        }
+    }
+
+    /// The URL and header names when the server is remote.
+    #[must_use]
+    pub fn as_remote(&self) -> Option<(&str, &[String])> {
+        match &self.transport {
+            McpTransport::Remote { url, headers } => Some((url, headers)),
+        }
+    }
 }
 
 /// The stages a server may run in for a project: the same five as the project

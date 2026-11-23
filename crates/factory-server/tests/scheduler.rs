@@ -4299,7 +4299,7 @@ fn mcp_stage(request: &AgentRequest) -> Vec<String> {
     request
         .mcp
         .as_ref()
-        .map(|mcp| mcp.servers.clone())
+        .map(|mcp| mcp.names().into_iter().map(str::to_owned).collect())
         .unwrap_or_default()
 }
 
@@ -4555,7 +4555,7 @@ async fn a_run_token_is_live_during_the_run_and_revoked_after() {
         .mcp
         .clone()
         .expect("context7 is active for the clarify run");
-    assert_eq!(mcp.servers, ["context7"]);
+    assert_eq!(mcp.names(), ["context7"]);
     assert_eq!(mcp.proxy_url, "http://factory:8081");
     assert!(mcp.token.len() >= 64, "a 256-bit token as hex");
     // The worker is still running, so the proxy honours its token.

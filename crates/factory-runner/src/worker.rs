@@ -68,9 +68,35 @@ pub struct McpConfig {
     /// header, scoped to this job and these servers, and revoked when the run
     /// ends.
     pub token: String,
-    /// The active server names. Each becomes one `http` entry keyed by the
-    /// name, pointing at `<proxy_url>/mcp/<name>`. Never empty when this is set.
-    pub servers: Vec<String>,
+    /// The active servers. Each becomes one entry in the agent's MCP config.
+    /// Never empty when this is set.
+    pub servers: Vec<McpServerEntry>,
+}
+
+impl McpConfig {
+    /// The active server names, in config order.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        self.servers.iter().map(McpServerEntry::name).collect()
+    }
+}
+
+/// One active MCP server in a run's config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServerEntry {
+    /// A remote server behind the proxy. It becomes one `http` entry keyed by
+    /// the name, pointing at `<proxy_url>/mcp/<name>`.
+    Remote { name: String },
+}
+
+impl McpServerEntry {
+    /// The server's name, the key of its entry in the agent's MCP config.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Remote { name } => name,
+        }
+    }
 }
 
 /// Whether a run starts the session or continues it.

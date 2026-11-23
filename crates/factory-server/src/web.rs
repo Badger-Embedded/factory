@@ -24,7 +24,7 @@ use crate::device_login::DeviceLogin;
 use crate::forge_tokens::{self, SaveError};
 use crate::forges::Forges;
 use crate::github::RepoReport;
-use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
+use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTransport};
 use crate::pages::{self, HeaderState, JobLinks, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{
     Project, ProjectForge, ProjectLabel, Projects, StageAgents, StageEfforts, StageModels,
@@ -3298,8 +3298,8 @@ fn server_settings(
     server: McpServer,
 ) -> Result<ServerSettings, StoreError> {
     let saved = state.store.project_mcp(project, &server.name)?;
-    let headers = server
-        .headers
+    let McpTransport::Remote { headers, .. } = &server.transport;
+    let headers = headers
         .iter()
         .map(|header: &String| {
             let at = SecretRef {
@@ -3393,9 +3393,12 @@ async fn save_project_mcp(
         form.get(&format!("{base}.header.{header}"))
             .filter(|value| !value.is_empty())
     };
+    let McpTransport::Remote {
+        headers: registered_headers,
+        ..
+    } = &registered.transport;
     if !state.secrets.available()
-        && registered
-            .headers
+        && registered_headers
             .iter()
             .any(|header| value(header).is_some())
     {
@@ -3422,7 +3425,7 @@ async fn save_project_mcp(
     state
         .store
         .save_mcp_tool_states(&project, &registered.name, &tools)?;
-    for header in &registered.headers {
+    for header in registered_headers {
         let at = SecretRef {
             project: &project,
             server: &registered.name,
@@ -3574,8 +3577,11 @@ async fn check_mcp_server(
     // A declared header with no resolved value has none stored, or one that
     // would not decrypt. The result names these, and the check runs without
     // them.
-    let missing: Vec<String> = registered
-        .headers
+    let McpTransport::Remote {
+        headers: registered_headers,
+        ..
+    } = &registered.transport;
+    let missing: Vec<String> = registered_headers
         .iter()
         .filter(|name| !headers.iter().any(|(have, _)| have == *name))
         .cloned()

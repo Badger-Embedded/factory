@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage};
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
-use crate::worker::{SessionRun, WorkerConfig, WorkerRun};
+use crate::worker::{McpServerEntry, SessionRun, WorkerConfig, WorkerRun};
 
 /// The Codex config directory inside the worker, mounted from the job's `codex`
 /// directory on the host and passed to Codex as `CODEX_HOME`. It keeps the
@@ -148,16 +148,20 @@ impl AgentBackend for CodexAgent {
         // the proxy swaps it for the project's stored headers. A run with no
         // active server adds nothing.
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
-            for server in &mcp.servers {
-                codex.push("-c".into());
-                codex.push(format!(
-                    "mcp_servers.{server}.url=\"{}/mcp/{server}\"",
-                    mcp.proxy_url
-                ));
-                codex.push("-c".into());
-                codex.push(format!(
-                    "mcp_servers.{server}.bearer_token_env_var=\"{MCP_TOKEN_ENV}\""
-                ));
+            for entry in &mcp.servers {
+                match entry {
+                    McpServerEntry::Remote { name: server } => {
+                        codex.push("-c".into());
+                        codex.push(format!(
+                            "mcp_servers.{server}.url=\"{}/mcp/{server}\"",
+                            mcp.proxy_url
+                        ));
+                        codex.push("-c".into());
+                        codex.push(format!(
+                            "mcp_servers.{server}.bearer_token_env_var=\"{MCP_TOKEN_ENV}\""
+                        ));
+                    }
+                }
             }
         }
         codex.push(run.prompt.clone());

@@ -12,8 +12,8 @@ use factory_core::{
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, NOT_PERMITTED, Observation, RenovatePr,
-    Rerun, RunReport, job_prompt,
+    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, McpServerEntry, NOT_PERMITTED, Observation,
+    RenovatePr, Rerun, RunReport, job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -22,7 +22,7 @@ use crate::accounts::{
     AccountSource, Accounts, ResolveError, Resolved, credential_failure, credential_reason,
 };
 use crate::cost::{codex_cost, format_cost};
-use crate::mcp::McpServer;
+use crate::mcp::{McpServer, McpTransport};
 use crate::projects::{Project, Projects, StageAgents};
 use crate::proxy::RunTokens;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
@@ -1316,10 +1316,10 @@ impl<E: Executor> Scheduler<E> {
         };
         let agent_session = self.store.agent_session(row.id, session)?;
         let selection = self.mcp_config(row.id, &row.project, expect)?;
-        let mcp_servers = selection
+        let mcp_servers: Vec<String> = selection
             .config
             .as_ref()
-            .map(|config| config.servers.as_slice())
+            .map(|config| config.names().into_iter().map(str::to_owned).collect())
             .unwrap_or_default();
         let request = AgentRequest {
             job_id: row.id,
@@ -1335,7 +1335,7 @@ impl<E: Executor> Scheduler<E> {
             agent_session,
             agent,
             expect,
-            prompt: job_prompt(job, task, expect, agent, mcp_servers),
+            prompt: job_prompt(job, task, expect, agent, &mcp_servers),
             model,
             effort: Some(effort),
             mcp: selection.config,
@@ -1355,7 +1355,10 @@ impl<E: Executor> Scheduler<E> {
             McpConfig {
                 proxy_url: self.mcp.proxy_url.clone(),
                 token,
-                servers: active,
+                servers: active
+                    .into_iter()
+                    .map(|name| McpServerEntry::Remote { name })
+                    .collect(),
             }
         });
         Ok(McpSelection { config, skipped })
@@ -1407,7 +1410,8 @@ impl<E: Executor> Scheduler<E> {
     /// skips the server, so a broken credential never lands in a worker's
     /// config. A transient database error propagates and the run waits.
     fn mcp_secrets_usable(&self, project: &str, server: &McpServer) -> Result<bool, StoreError> {
-        for header in &server.headers {
+        let McpTransport::Remote { headers, .. } = &server.transport;
+        for header in headers {
             let at = SecretRef {
                 project,
                 server: &server.name,
