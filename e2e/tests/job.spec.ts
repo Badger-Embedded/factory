@@ -16,10 +16,6 @@
 // - Typed text in a form field survives that update, and the log keeps its
 //   scroll position: "a draft survives a state change while its field has focus",
 //   "the log keeps its scroll position when a poll swaps it"
-// - The LLM review card shows a review pass, and an opened MCP server group in
-//   the MCP tool calls card stays open across a poll:
-//   "a reviewed job shows its review pass", "an opened MCP server group stays
-//   open across a poll"
 // - Times render in the browser's time zone on load and after a poll:
 //   "times render in the browser's time zone on load and after a poll"
 // - GitHub links open in a new tab and factory links do not:
@@ -241,10 +237,10 @@ test('an opened MCP server group stays open across a poll', async ({ page, facto
   await group.locator('summary').click();
   await expect(group).toHaveJSProperty('open', true);
 
-  factory.fixture('log', '--job', id, '--text', 'after the group opened');
-  await expect(page.locator('#job-log')).toContainText('after the group opened');
+  factory.fixture('mcp', '--job', id, '--server', 'github', '--tool', 'create_issue');
+  await expect(group.locator('li.mcp-call')).toHaveCount(3);
+  await expect(card.locator('.log-count')).toContainText('3 calls');
   await expect(group).toHaveJSProperty('open', true);
-  await expect(group.locator('li.mcp-call')).toHaveCount(2);
 });
 
 test.describe('in a time zone that is not UTC', () => {

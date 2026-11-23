@@ -249,7 +249,14 @@ fn main() -> Result<()> {
         "mcp" => {
             let job = one("job")?.parse()?;
             let (server, tool) = (one("server")?, one("tool")?);
-            if flags.contains_key("blocked") {
+            let blocked = match flags.get("blocked").map(|v| v[0].as_str()) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(other) => {
+                    return Err(format!("--blocked takes true or false, not {other}").into());
+                }
+            };
+            if blocked {
                 store.record_mcp_tool_blocked(job, server, tool)?;
             } else {
                 store.record_mcp_tool_call(job, server, tool)?;
