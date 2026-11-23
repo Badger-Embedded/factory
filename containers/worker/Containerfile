@@ -1,6 +1,7 @@
 # The worker: Claude Code, Codex, GitHub Copilot, git and nix. It also carries
-# Python and common shell tools, so agents don't reach for a nix shell to inspect a binary
-# or parse JSON. The factory runs it with --userns=keep-id, so the image user
+# Python and common shell tools for small jobs such as inspecting a binary or parsing JSON.
+# The prompt tells agents to use `nix shell nixpkgs#...` for what the image lacks.
+# The factory runs it with --userns=keep-id, so the image user
 # has the UID of the host user that runs podman, 1000 on moon.
 FROM docker.io/library/ubuntu:26.04
 

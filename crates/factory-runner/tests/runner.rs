@@ -1337,6 +1337,96 @@ fn the_mcp_paragraph_names_the_servers_for_the_review_prompt() {
     }
 }
 
+const NIX_PARAGRAPH: &str = "Nix is installed in this environment, with flakes enabled. When a \
+     tool or binary the work needs is missing, try it from nixpkgs before you conclude it is \
+     unavailable, for example `nix shell nixpkgs#<package> -c <command>`. The repository's own \
+     instructions still decide how to build and test: if they name a dev shell or a command, use \
+     that. This is for tools that neither the repository's setup nor this environment provides.";
+
+#[test]
+fn every_prompt_carries_the_nix_paragraph_once() {
+    for needle in ["nix shell", "nixpkgs", "nix shell nixpkgs#"] {
+        assert!(NIX_PARAGRAPH.contains(needle));
+    }
+    assert!(NIX_PARAGRAPH.contains("The repository's own instructions still decide"));
+
+    let job = approved_job(Job::new("Add a reboot button", Gates::default()));
+    let implement = Task::Implement {
+        pr: job.plan()[0].clone(),
+    };
+    let mut reviewing = watching(7);
+    reviewing.apply(start_review()).unwrap();
+    let gaps = gaps_task();
+    let analyze = Task::AnalyzeFailure { log: "boom".into() };
+    let check = Task::CheckDiff {
+        diff: "+v = 1".into(),
+        body: "Bumps serde".into(),
+    };
+    let clarify = Task::Clarify {
+        request: "Add a reboot button".into(),
+    };
+    let fix_ci = Task::FixCi { log: "boom".into() };
+    let fix_checks = Task::FixChecks {
+        report: "boom".into(),
+    };
+    let answer = Task::Answer {
+        questions: vec![Question {
+            text: "Which board?".into(),
+        }],
+        answers: vec!["rpi5".into()],
+    };
+    let revise = Task::Revise {
+        feedback: "x".into(),
+    };
+    let two = ["a".to_owned(), "b".to_owned()];
+    for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
+        let mut texts = vec![
+            prompt(&clarify, Expect::Clarify, agent),
+            prompt(&Task::WriteSpec, Expect::Spec, agent),
+            prompt(&Task::WritePlan, Expect::Plan, agent),
+            prompt(&fix_ci, Expect::FixCi, agent),
+            prompt(&fix_checks, Expect::Commits, agent),
+            prompt(&answer, Expect::Clarify, agent),
+            prompt(&revise, Expect::Commits, agent),
+            prompt(&Task::Review, Expect::Review, agent),
+            prompt(&analyze, Expect::FailureAnalysis, agent),
+            prompt(&check, Expect::DiffCheck, agent),
+            prompt(&gaps, Expect::PackagingGaps, agent),
+        ];
+        for servers in [&two[..], &[]] {
+            texts.push(job_prompt(
+                &job,
+                &implement,
+                Expect::Commits,
+                agent,
+                servers,
+            ));
+            texts.push(job_prompt(
+                &reviewing,
+                &Task::Review,
+                Expect::Review,
+                agent,
+                servers,
+            ));
+        }
+        for text in texts {
+            assert_eq!(
+                text.matches(NIX_PARAGRAPH).count(),
+                1,
+                "the {agent:?} prompt does not carry the nix paragraph once: {text}"
+            );
+        }
+    }
+
+    let schema = serde_json::to_string_pretty(&Expect::Commits.schema()).unwrap();
+    let copilot = job_prompt(&job, &implement, Expect::Commits, Agent::Copilot, &[]);
+    let after = copilot.split(NIX_PARAGRAPH).nth(1).unwrap();
+    assert!(after.starts_with("\n\nThis agent has no structured-output mode"));
+    assert!(after.ends_with(&format!("\n\n{schema}")));
+    let with = job_prompt(&job, &implement, Expect::Commits, Agent::Copilot, &two);
+    assert!(with.ends_with(&format!("{schema}\n\n{MCP_PARAGRAPH}")));
+}
+
 #[test]
 fn a_prompt_with_no_mcp_server_gets_no_paragraph() {
     let job = approved_job(Job::new("Add a reboot button", Gates::default()));

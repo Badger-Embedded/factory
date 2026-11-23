@@ -112,9 +112,21 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
          done. Use outcome \"{questions}\" only when you need an answer from the requester to \
          continue, and list the questions."
     );
-    append_schema(&mut text, agent, expect);
+    end_prompt(&mut text, agent, expect);
     text
 }
+
+fn end_prompt(text: &mut String, agent: Agent, expect: Expect) {
+    text.push_str("\n\n");
+    text.push_str(NIX_PARAGRAPH);
+    append_schema(text, agent, expect);
+}
+
+const NIX_PARAGRAPH: &str = "Nix is installed in this environment, with flakes enabled. When a tool or \
+     binary the work needs is missing, try it from nixpkgs before you conclude it is unavailable, \
+     for example `nix shell nixpkgs#<package> -c <command>`. The repository's own instructions \
+     still decide how to build and test: if they name a dev shell or a command, use that. This is \
+     for tools that neither the repository's setup nor this environment provides.";
 
 /// Appends the stage's JSON schema to the prompt when the agent's backend has
 /// no output-schema flag and asks for it in the prompt. The backend owns the
@@ -142,7 +154,7 @@ fn failure_prompt(log: &str, agent: Agent) -> String {
          End with outcome \"transient\" or \"caused_by_update\", and a reason that cites \
          the lines of the log that show it."
     );
-    append_schema(&mut text, agent, Expect::FailureAnalysis);
+    end_prompt(&mut text, agent, Expect::FailureAnalysis);
     text
 }
 
@@ -161,7 +173,7 @@ fn diff_prompt(diff: &str, body: &str, agent: Agent) -> String {
          it, and a short summary of the update. When the diff shows the upstream versions \
          or refs the update moves between, give them as \"from\" and \"to\"."
     );
-    append_schema(&mut text, agent, Expect::DiffCheck);
+    end_prompt(&mut text, agent, Expect::DiffCheck);
     text
 }
 
@@ -283,7 +295,7 @@ fn gaps_prompt(context: &PackagingContext, agent: Agent) -> String {
          none.",
         gap_rules(&context.kind)
     );
-    append_schema(&mut text, agent, Expect::PackagingGaps);
+    end_prompt(&mut text, agent, Expect::PackagingGaps);
     text
 }
 
@@ -375,7 +387,7 @@ fn review_prompt(context: &ReviewContext, agent: Agent) -> String {
         "End with outcome \"approve\" when the change is ready to merge, or \"changes\" with \
          feedback the author can act on when it is not.",
     );
-    append_schema(&mut text, agent, Expect::Review);
+    end_prompt(&mut text, agent, Expect::Review);
     text
 }
 
@@ -389,6 +401,8 @@ const DECISIONS_RULE: &str = "The requester's answers and the approved spec are 
 /// The prompt for one agent run of `job`. A job with fresh sessions starts
 /// its spec, plan and implement runs in a new session, so those prompts
 /// carry what the session has not seen. Every other run uses [`prompt`].
+///
+/// Every prompt carries the nix paragraph once, before the schema instruction.
 ///
 /// `mcp_servers` is the run's active MCP server names, in config order. When it
 /// is non-empty the prompt ends with a paragraph that names them and tells the
