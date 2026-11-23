@@ -130,6 +130,7 @@ pub fn app(
         .route("/fragments/stats", get(stats_fragment))
         .route("/fragments/workers", get(workers_fragment))
         .route("/fragments/board", get(board_fragment))
+        .route("/fragments/picker", get(picker_fragment))
         .route("/style.css", get(stylesheet))
         .route("/htmx.min.js", get(htmx))
         .route("/onboard", get(show_onboard).post(submit_onboard))
@@ -464,6 +465,7 @@ fn region_response(requested: Option<&str>, region: pages::Region) -> Response {
 /// place keeps a fragment and the full page on the same data.
 struct BoardData {
     names: Vec<ProjectLabel>,
+    attention: Vec<pages::ProjectAttention>,
     selected: Option<String>,
     jobs: Vec<JobRow>,
     costs: HashMap<i64, f64>,
@@ -519,20 +521,33 @@ fn load_board(
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
     let waits = state.store.waits()?;
+    let defaults: HashMap<String, bool> = state
+        .projects
+        .list()?
+        .into_iter()
+        .map(|(name, project)| (name, project.auto_merge))
+        .collect();
+    let auto_merges: HashMap<String, bool> = state
+        .store
+        .project_auto_merges(login)?
+        .into_iter()
+        .map(|(name, saved)| {
+            let default = defaults.get(&name).copied().unwrap_or(false);
+            (name, saved.unwrap_or(default))
+        })
+        .collect();
+    let attention = pages::project_attention(&names, &jobs, &waits, &auto_merges);
     let (totals, auto_merge, project) = match &selected {
-        Some(name) => {
-            let project = state.projects.lookup(name)?;
-            let default = project.as_ref().is_some_and(|p| p.auto_merge);
-            (
-                state.store.project_totals(name)?,
-                state.store.project_auto_merge(name, default)?,
-                project,
-            )
-        }
+        Some(name) => (
+            state.store.project_totals(name)?,
+            auto_merges.get(name).copied().unwrap_or(false),
+            state.projects.lookup(name)?,
+        ),
         None => (ProjectTotals::default(), false, None),
     };
     Ok(BoardData {
         names,
+        attention,
         selected,
         jobs,
         costs,
@@ -571,6 +586,7 @@ async fn index(
     let page = pages::index(
         &login,
         &data.names,
+        &data.attention,
         data.selected.as_deref(),
         &data.jobs,
         &data.costs,
@@ -713,6 +729,22 @@ async fn workers_fragment(
     Ok(region_response(
         version.as_deref(),
         pages::workers(&data.workers, &data.jobs, &data.names, project),
+    ))
+}
+
+async fn picker_fragment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IndexQuery>,
+) -> Result<Response, AppError> {
+    let version = query.v.clone();
+    let data = load_board(&state, &user(&headers), query.project, None)?;
+    let Some(project) = data.selected.as_deref() else {
+        return Ok(html! {}.into_response());
+    };
+    Ok(region_response(
+        version.as_deref(),
+        pages::picker(&data.attention, project),
     ))
 }
 

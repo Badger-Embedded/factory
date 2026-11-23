@@ -2,7 +2,7 @@
 //
 // - The board lists the seeded jobs in their sections, with the totals line and
 //   the worker tiles: "lists the seeded jobs in their sections with totals and workers"
-// - The project picker switches the board without a submit button:
+// - The project picker switches the board through its row links:
 //   "the project picker switches the board"
 // - A login on no project sees the empty state and the onboarding link:
 //   "a login on no project is sent to onboarding"
@@ -15,7 +15,7 @@
 // - An opened "Show N older" disclosure stays open across a poll:
 //   "an opened Show older disclosure stays open across a poll"
 import type { Page } from '@playwright/test';
-import { ADMIN, COLLABORATOR, OUTSIDER, SHARED_PROJECT, expect, test } from '../fixtures';
+import { ADMIN, COLLABORATOR, OUTSIDER, SHARED_PROJECT, chooseProject, expect, test } from '../fixtures';
 
 // A 1x1 PNG, so the server's byte check accepts it as an image.
 const PNG_BASE64 =
@@ -50,7 +50,7 @@ test('the project picker switches the board', async ({ page, project }) => {
   await expect(page.getByRole('heading', { name: 'Needs you' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Support a second USB hub' })).toHaveCount(0);
 
-  await page.getByLabel('Project').selectOption(SHARED_PROJECT);
+  await chooseProject(page, SHARED_PROJECT);
 
   await expect(page).toHaveURL(new RegExp(`[?&]project=${SHARED_PROJECT}$`));
   await expect(page.getByRole('link', { name: 'Support a second USB hub' })).toBeVisible();
@@ -195,7 +195,7 @@ test("the board links the selected project's repository", async ({ page, project
   await expect(page.locator('#workers')).toContainText('Worker 1 polled', { timeout: 15_000 });
   await expect(link).toBeVisible();
 
-  await page.getByLabel('Project').selectOption(SHARED_PROJECT);
+  await chooseProject(page, SHARED_PROJECT);
   await expect(link).toHaveText(`e2e/${SHARED_PROJECT}`);
   await expect(link).toHaveAttribute('href', `https://github.com/e2e/${SHARED_PROJECT}`);
 
@@ -401,7 +401,7 @@ test.describe('as a collaborator', () => {
 
   test('sees the shared project', async ({ page }) => {
     await page.goto('/');
-    await expect(page.getByLabel('Project')).toHaveValue(SHARED_PROJECT);
+    await expect(page.getByLabel('Project', { exact: true })).toContainText(SHARED_PROJECT);
   });
 });
 
@@ -418,7 +418,7 @@ test('a project on an unknown forge shows a notice instead of a source link', as
   await expect(page.locator('div.card.failed')).toContainText('elsewhere');
   await expect(page.locator('a.source-link')).toHaveCount(0);
 
-  await page.getByLabel('Project').selectOption(project);
+  await chooseProject(page, project);
   await expect(page).toHaveURL(new RegExp(`project=${project}$`));
   await expect(page.locator('div.card.failed')).toHaveCount(0);
   const link = page.locator('div.status-row a.source-link');

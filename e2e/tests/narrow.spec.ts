@@ -38,7 +38,7 @@ async function inViewport(locator: Locator, page: Page) {
 
 async function topbarInViewport(page: Page) {
   await inViewport(page.getByRole('link', { name: 'factory' }), page);
-  await inViewport(page.getByLabel('Project'), page);
+  await inViewport(page.getByLabel('Project', { exact: true }), page);
   await inViewport(page.getByRole('link', { name: 'Onboard' }), page);
   await inViewport(page.getByRole('link', { name: 'Settings' }), page);
 }
@@ -91,7 +91,7 @@ test.describe('phone, 390 px', () => {
     await page.goto(`/?project=${name}`);
 
     await noSidewaysScroll(page);
-    await inViewport(page.getByLabel('Project'), page);
+    await inViewport(page.getByLabel('Project', { exact: true }), page);
   });
 
   test('the top bar stays at the top of the viewport after scrolling', async ({ page, factory }, testInfo) => {
@@ -160,7 +160,7 @@ test.describe('laptop, 1280 px', () => {
 
     const items = [
       page.getByRole('link', { name: 'factory' }),
-      page.getByLabel('Project'),
+      page.getByLabel('Project', { exact: true }),
       page.getByRole('link', { name: 'Onboard' }),
       page.getByRole('link', { name: 'Settings' }),
       page.locator('span.user'),

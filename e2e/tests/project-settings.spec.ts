@@ -229,9 +229,10 @@ test('a display name shows in the picker, the sidebar and the heading', async ({
   ).toHaveAttribute('href', settingsPath(project));
 
   await page.goto('/');
-  const picker = page.getByLabel('Project', { exact: true });
-  await expect(picker).toHaveValue(project);
-  await expect(picker.locator('option:checked')).toHaveText('My Project');
+  await expect(page.getByLabel('Project', { exact: true })).toHaveText('My Project');
+  const current = page.locator('#picker-list a[aria-current="page"]');
+  await expect(current.locator('.picker-name')).toHaveText('My Project');
+  await expect(current).toHaveAttribute('href', `/?project=${project}`);
 
   await page.goto(settingsPath(project));
   await field.fill('');
@@ -478,8 +479,8 @@ test('the Forge account card saves a project token by its access and keeps the s
 
 test('removing a project takes it off the picker', async ({ page, project }) => {
   await page.goto(`/?project=${project}`);
-  await expect(page.getByLabel('Project')).toHaveValue(project);
-  await expect(page.getByLabel('Project').locator(`option:text-is("${project}")`)).toHaveCount(1);
+  await expect(page.getByLabel('Project', { exact: true })).toHaveText(project);
+  await expect(page.locator(`#picker-list li[data-id="${project}"]`)).toHaveCount(1);
 
   await page.goto(settingsPath(project));
   // The name must match exactly, so a wrong one removes nothing.
@@ -492,7 +493,7 @@ test('removing a project takes it off the picker', async ({ page, project }) => 
   await expect(page.getByText(`Removed project ${project}.`)).toBeVisible();
 
   await page.goto('/');
-  await expect(page.getByLabel('Project').locator(`option:text-is("${project}")`)).toHaveCount(0);
+  await expect(page.locator(`#picker-list li[data-id="${project}"]`)).toHaveCount(0);
   const response = await page.goto(settingsPath(project));
   expect(response?.status()).toBe(404);
 });
