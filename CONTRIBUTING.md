@@ -103,6 +103,7 @@ Do not credit AI tools in commits or pull requests. An agent commits as the pers
 | Why, Docs and Verification sections, trailer format, no AI credit | `check-pr-message.sh`                                                |
 | Code changes come with tests                                      | `tests-accompany-changes` (`just check-tests`)                       |
 | Tests live in `tests/`, `factory-core` does no I/O                | `no-inline-tests` and `core-no-io` ast-grep rules                    |
+| No committed secrets                                              | `gitleaks-staged` and `gitleaks-history` prek hooks                  |
 | Docs updated with the change                                      | Review                                                               |
 | `Signed-off-by` in the description                                | Review                                                               |
 

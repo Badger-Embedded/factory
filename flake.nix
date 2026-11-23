@@ -28,6 +28,7 @@
             shellcheck
             hadolint
             actionlint
+            gitleaks
             just
             nodejs
           ];
