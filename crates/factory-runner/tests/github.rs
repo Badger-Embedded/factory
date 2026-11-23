@@ -683,6 +683,39 @@ fi"#,
 }
 
 #[tokio::test]
+async fn a_gh_that_exits_without_reading_the_body_still_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(dir.path(), "exit 0");
+    let big = "x".repeat(256 * 1024);
+    github.comment(&account(), "o/r", 5, &big).await.unwrap();
+    github
+        .approve(&account(), "o/r", 5, "abc", &big)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_gh_that_fails_before_reading_the_body_reports_its_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(dir.path(), "echo 'bad credentials' >&2; exit 1");
+    let big = "x".repeat(256 * 1024);
+    let errors = [
+        github
+            .comment(&account(), "o/r", 5, &big)
+            .await
+            .unwrap_err(),
+        github
+            .approve(&account(), "o/r", 5, "abc", &big)
+            .await
+            .unwrap_err(),
+    ];
+    for err in errors {
+        assert!(err.contains("bad credentials"), "{err}");
+        assert!(!err.contains("Broken pipe"), "{err}");
+    }
+}
+
+#[tokio::test]
 async fn comment_and_approve_send_the_body_on_stdin() {
     let dir = tempfile::tempdir().unwrap();
     let stdin = dir.path().join("stdin");
