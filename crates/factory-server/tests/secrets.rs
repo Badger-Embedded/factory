@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use factory_runner::ForgeKind;
+use factory_runner::{ForgeAccount, ForgeKind};
 
 use factory_server::{
     CodexAuthError, CopilotTokenError, ForgeTokenOwner, LOCAL_BACKEND, LocalSecrets,
@@ -13,6 +13,13 @@ use factory_server::{
 
 fn store() -> Arc<Store> {
     Arc::new(Store::open_in_memory().expect("open in-memory store"))
+}
+
+fn account() -> ForgeAccount {
+    ForgeAccount {
+        login: "bot".into(),
+        id: 5,
+    }
 }
 
 fn key(seed: u8) -> [u8; MASTER_KEY_LEN] {
@@ -743,7 +750,7 @@ fn forge_tokens_round_trip_per_owner_and_hold_no_plaintext() {
         (upstream, "tok-upstream"),
     ] {
         assert!(secrets.forge_token(owner).unwrap().is_none());
-        secrets.put_forge_token(owner, token).unwrap();
+        secrets.put_forge_token(owner, token, &account()).unwrap();
     }
     for (owner, token) in [
         (alice, "tok-alice"),
@@ -797,7 +804,7 @@ fn a_forge_token_ciphertext_moved_to_another_row_fails_to_decrypt() {
         (project, alice),
     ] {
         for owner in [alice, project, upstream] {
-            secrets.put_forge_token(owner, "tok").unwrap();
+            secrets.put_forge_token(owner, "tok", &account()).unwrap();
         }
         assert!(
             matches!(
@@ -818,7 +825,9 @@ fn a_forge_token_ciphertext_swapped_with_an_mcp_header_or_reserved_row_fails() {
         forge: GITHUB,
     };
     let header = at("maestro", "context7", "Authorization");
-    secrets.put_forge_token(alice, "tok-alice").unwrap();
+    secrets
+        .put_forge_token(alice, "tok-alice", &account())
+        .unwrap();
     secrets.put(header, "Bearer sk-header").unwrap();
     secrets.set_claude_token("sk-ant-oat01-token").unwrap();
     let (_, header_header) = forge_row(alice);
@@ -855,11 +864,11 @@ fn an_unavailable_store_refuses_forge_tokens_but_still_deletes_them() {
         login: "alice",
         forge: GITHUB,
     };
-    local.put_forge_token(alice, "tok").unwrap();
+    local.put_forge_token(alice, "tok", &account()).unwrap();
 
     let secrets = UnavailableSecrets::new(Arc::clone(&store));
     assert!(matches!(
-        secrets.put_forge_token(alice, "tok"),
+        secrets.put_forge_token(alice, "tok", &account()),
         Err(SecretError::Unavailable)
     ));
     assert!(matches!(
@@ -868,4 +877,45 @@ fn an_unavailable_store_refuses_forge_tokens_but_still_deletes_them() {
     ));
     secrets.delete_forge_token(alice).unwrap();
     assert!(local.forge_token(alice).unwrap().is_none());
+}
+
+#[test]
+fn a_failed_account_write_rolls_the_forge_token_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    let alice = ForgeTokenOwner::User {
+        login: "alice",
+        forge: GITHUB,
+    };
+    secrets
+        .put_forge_token(alice, "tok-old", &account())
+        .unwrap();
+
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other
+        .execute_batch(
+            "CREATE TRIGGER no_account_write BEFORE UPDATE ON user_forge_accounts
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;
+             CREATE TRIGGER no_account_erase BEFORE DELETE ON user_forge_accounts
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+
+    assert!(
+        secrets
+            .put_forge_token(alice, "tok-new", &account())
+            .is_err()
+    );
+    assert_eq!(
+        secrets.forge_token(alice).unwrap().as_deref(),
+        Some("tok-old")
+    );
+    assert!(secrets.delete_forge_token(alice).is_err());
+    assert_eq!(
+        secrets.forge_token(alice).unwrap().as_deref(),
+        Some("tok-old")
+    );
+    assert_eq!(store.forge_account(alice).unwrap(), Some(account()));
 }

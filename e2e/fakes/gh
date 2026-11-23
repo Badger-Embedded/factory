@@ -3,6 +3,10 @@
 if [ "$1" = api ]; then
   case "$2" in
     user)
+      if [ "$3 $4" != "--hostname github.com" ]; then
+        echo "gh: api user must pin the host (got: $*)" >&2
+        exit 1
+      fi
       case "$GH_TOKEN" in
         tok-e2e-alice)
           echo '{"login":"alice-bot","id":11}'

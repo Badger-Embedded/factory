@@ -32,7 +32,7 @@ use std::sync::Arc;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
-use factory_runner::ForgeKind;
+use factory_runner::{ForgeAccount, ForgeKind};
 
 use crate::store::{Store, StoreError};
 
@@ -267,13 +267,19 @@ pub trait SecretStore: Send + Sync {
     /// Fails on a storage error.
     fn clear_copilot_token(&self) -> Result<(), SecretError>;
 
-    /// Stores `value` as the forge token of `owner`, replacing any token
+    /// Stores `value` as the forge token of `owner`, together with the
+    /// `account` it belongs to, in one transaction. It replaces any token
     /// already there.
     ///
     /// # Errors
     ///
     /// Fails when the store is unavailable or on a storage error.
-    fn put_forge_token(&self, owner: ForgeTokenOwner<'_>, value: &str) -> Result<(), SecretError>;
+    fn put_forge_token(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        value: &str,
+        account: &ForgeAccount,
+    ) -> Result<(), SecretError>;
 
     /// The forge token of `owner`, or `None` when none is stored.
     ///
@@ -283,7 +289,8 @@ pub trait SecretStore: Send + Sync {
     /// decrypt, or on a storage error.
     fn forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<Option<String>, SecretError>;
 
-    /// Deletes the forge token of `owner`. Clearing a token that is not there
+    /// Deletes the forge token of `owner` and its recorded account in one
+    /// transaction. Clearing a token that is not there
     /// is fine, and it works with the store unavailable.
     ///
     /// # Errors
@@ -460,10 +467,15 @@ impl SecretStore for LocalSecrets {
         Ok(())
     }
 
-    fn put_forge_token(&self, owner: ForgeTokenOwner<'_>, value: &str) -> Result<(), SecretError> {
+    fn put_forge_token(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        value: &str,
+        account: &ForgeAccount,
+    ) -> Result<(), SecretError> {
         let stored = self.seal(&owner.aad(), value)?;
         let (project, header) = owner.row();
-        self.store.put_secret(
+        self.store.put_forge_token(
             SecretRef {
                 project: &project,
                 server: "",
@@ -471,6 +483,8 @@ impl SecretStore for LocalSecrets {
             },
             LOCAL_BACKEND,
             &stored,
+            owner,
+            account,
         )?;
         Ok(())
     }
@@ -495,11 +509,14 @@ impl SecretStore for LocalSecrets {
 
 fn delete_forge_row(store: &Store, owner: ForgeTokenOwner<'_>) -> Result<(), SecretError> {
     let (project, header) = owner.row();
-    store.delete_secret(SecretRef {
-        project: &project,
-        server: "",
-        header: &header,
-    })?;
+    store.delete_forge_token(
+        SecretRef {
+            project: &project,
+            server: "",
+            header: &header,
+        },
+        owner,
+    )?;
     Ok(())
 }
 
@@ -582,6 +599,7 @@ impl SecretStore for UnavailableSecrets {
         &self,
         _owner: ForgeTokenOwner<'_>,
         _value: &str,
+        _account: &ForgeAccount,
     ) -> Result<(), SecretError> {
         Err(SecretError::Unavailable)
     }

@@ -234,7 +234,7 @@ fn dashboard_with_admins(
     secrets: Arc<dyn SecretStore>,
     admins: Vec<String>,
 ) -> Dashboard {
-    dashboard_with_gh(store, github, secrets, admins, GitHub::default())
+    dashboard_with_gh(store, github, secrets, admins, |_| GitHub::default())
 }
 
 fn dashboard_with_gh(
@@ -242,7 +242,7 @@ fn dashboard_with_gh(
     github: Arc<dyn RepoChecker>,
     secrets: Arc<dyn SecretStore>,
     admins: Vec<String>,
-    gh: GitHub,
+    gh: impl FnOnce(&Path) -> GitHub,
 ) -> Dashboard {
     for (name, _) in store.list_projects().unwrap() {
         store.add_collaborator(&name, USER, "test").unwrap();
@@ -275,7 +275,7 @@ fn dashboard_with_gh(
             Arc::new(Notify::new()),
             data.path().to_owned(),
             Arc::clone(&usage),
-            Forges::new(Arc::new(gh), github),
+            Forges::new(Arc::new(gh(data.path())), github),
             Arc::clone(&slots),
             secrets,
             Arc::clone(&checker) as Arc<dyn McpChecker>,
@@ -11535,12 +11535,12 @@ fn forge_token_dashboard(secrets_available: bool) -> Dashboard {
             Some("alice"),
         )
         .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let gh = support::executable(
-        dir.path(),
-        "gh",
-        r#"#!/usr/bin/env bash
-if [ "$1 $2" = "api user" ]; then
+    let gh = |dir: &Path| {
+        let gh = support::executable(
+            dir,
+            "gh",
+            r#"#!/usr/bin/env bash
+if [ "$1 $2 $3 $4" = "api user --hostname github.com" ]; then
   case "$GH_TOKEN" in
     tok-alice) echo '{"login":"alice-bot","id":11}'; exit 0 ;;
     tok-bob) echo '{"login":"bob-bot","id":22}'; exit 0 ;;
@@ -11550,25 +11550,24 @@ fi
 echo "fake gh: unexpected: $*" >&2
 exit 1
 "#,
-    );
+        );
+        GitHub {
+            gh,
+            ..GitHub::default()
+        }
+    };
     let secrets: Arc<dyn SecretStore> = if secrets_available {
         Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)))
     } else {
         Arc::new(UnavailableSecrets::new(Arc::clone(&store)))
     };
-    let dashboard = dashboard_with_gh(
+    dashboard_with_gh(
         store,
         Arc::new(FakeRepos::fit()),
         secrets,
         vec!["boss@example.com".to_owned()],
-        GitHub {
-            gh,
-            ..GitHub::default()
-        },
-    );
-    // The script must outlive the dashboard's requests.
-    std::mem::forget(dir);
-    dashboard
+        gh,
+    )
 }
 
 const FORGE_PAGE: &str = "/settings/forges/github";
@@ -11688,6 +11687,16 @@ async fn without_a_master_key_the_forge_page_disables_the_field_and_still_clears
         )
         .await;
     assert!(!refused.body.contains("tok-alice"));
+    assert!(refused.body.contains("was not saved"));
+    let empty = dashboard
+        .post_as(
+            "carol@example.com",
+            &format!("{FORGE_PAGE}/token"),
+            "token=",
+        )
+        .await;
+    assert!(empty.body.contains("was not saved"));
+    assert!(!empty.body.contains("Saved."));
     let owner = ForgeTokenOwner::User {
         login: "carol@example.com",
         forge: ForgeKind::GitHub,
@@ -11713,6 +11722,57 @@ async fn without_a_master_key_the_forge_page_disables_the_field_and_still_clears
         .await;
     assert_eq!(cleared.status, StatusCode::OK);
     assert!(dashboard.store.forge_account(owner).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cross_site_forge_token_requests_change_nothing() {
+    let dashboard = forge_token_dashboard(true);
+    let owner = ForgeTokenOwner::User {
+        login: "carol@example.com",
+        forge: ForgeKind::GitHub,
+    };
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    let send = |path: &str, form: &str, extra: (&str, &str)| {
+        let request = Request::post(format!("{FORGE_PAGE}/{path}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(USER_HEADER, "carol@example.com")
+            .header(header::HOST, "factory.test")
+            .header(extra.0, extra.1)
+            .body(Body::from(form.to_owned()))
+            .unwrap();
+        dashboard.send(request)
+    };
+
+    let foreign = [
+        ("origin", "https://evil.example"),
+        ("origin", "null"),
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-site", "same-site"),
+    ];
+    for extra in foreign {
+        let saved = send("token", "token=tok-alice", extra).await;
+        assert_eq!(saved.status, StatusCode::FORBIDDEN, "{extra:?}");
+        assert!(dashboard.store.forge_account(owner).unwrap().is_none());
+        assert!(secrets.forge_token(owner).unwrap().is_none());
+    }
+
+    let saved = send(
+        "token",
+        "token=tok-alice",
+        ("origin", "http://factory.test"),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert!(secrets.forge_token(owner).unwrap().is_some());
+    for extra in foreign {
+        let cleared = send("token/clear", "", extra).await;
+        assert_eq!(cleared.status, StatusCode::FORBIDDEN, "{extra:?}");
+        assert!(dashboard.store.forge_account(owner).unwrap().is_some());
+        assert!(secrets.forge_token(owner).unwrap().is_some());
+    }
+    let cleared = send("token/clear", "", ("sec-fetch-site", "same-origin")).await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert!(secrets.forge_token(owner).unwrap().is_none());
 }
 
 #[tokio::test]

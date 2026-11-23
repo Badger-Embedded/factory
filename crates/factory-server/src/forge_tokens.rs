@@ -31,7 +31,7 @@ impl From<StoreError> for SaveError {
 }
 
 /// Looks the account up as `token`, then stores the token and the account for
-/// `owner`. A token the forge rejects is not stored. With the secret store
+/// `owner` in one transaction. A token the forge rejects is not stored. With the secret store
 /// unavailable nothing is looked up or stored.
 ///
 /// # Errors
@@ -40,7 +40,6 @@ impl From<StoreError> for SaveError {
 /// the lookup cannot run, or on a storage error.
 pub async fn save(
     secrets: &dyn SecretStore,
-    store: &Store,
     forge: &dyn Forge,
     owner: ForgeTokenOwner<'_>,
     token: &str,
@@ -52,8 +51,7 @@ pub async fn save(
         LookupError::Rejected => SaveError::Rejected,
         LookupError::Failed(message) => SaveError::Lookup(message),
     })?;
-    secrets.put_forge_token(owner, token)?;
-    store.set_forge_account(owner, &account)?;
+    secrets.put_forge_token(owner, token, &account)?;
     Ok(account)
 }
 
@@ -75,12 +73,7 @@ pub fn stored(
 /// # Errors
 ///
 /// Fails on a storage error.
-pub fn clear(
-    secrets: &dyn SecretStore,
-    store: &Store,
-    owner: ForgeTokenOwner<'_>,
-) -> Result<(), SaveError> {
+pub fn clear(secrets: &dyn SecretStore, owner: ForgeTokenOwner<'_>) -> Result<(), SaveError> {
     secrets.delete_forge_token(owner)?;
-    store.clear_forge_account(owner)?;
     Ok(())
 }

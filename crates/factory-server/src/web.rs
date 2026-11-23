@@ -318,6 +318,7 @@ fn visible_job(state: &AppState, headers: &HeaderMap, id: i64) -> Result<JobRow,
 
 enum AppError {
     BadRequest(String),
+    Forbidden(String),
     NotFound(String),
     Io(String),
     UnknownProject(String),
@@ -356,6 +357,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            AppError::Forbidden(message) => (StatusCode::FORBIDDEN, message),
             AppError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             AppError::UnknownProject(name) => (StatusCode::NOT_FOUND, format!("no project {name}")),
             AppError::Io(message) => {
@@ -2756,6 +2758,25 @@ async fn cancel_codex_login(
     codex_page(&state, &headers, None).await
 }
 
+/// Refuses a request a browser marks as cross-site, or whose `Origin` names
+/// another host than the one requested. The login comes from the proxy, so
+/// browser cookie rules do not protect these forms. A request with neither
+/// header is not from a browser form.
+fn require_same_origin(headers: &HeaderMap) -> Result<(), AppError> {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let cross_site = text("sec-fetch-site").is_some_and(|site| site != "same-origin");
+    let other_origin = text("origin").is_some_and(|origin| {
+        let host = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+        origin == "null" || Some(host) != text("host")
+    });
+    if cross_site || other_origin {
+        return Err(AppError::Forbidden(
+            "cross-site requests are not allowed here".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn forge_kind(name: &str) -> Result<ForgeKind, AppError> {
     ForgeKind::parse(name).ok_or_else(|| AppError::NotFound(format!("no forge {name}")))
 }
@@ -2796,10 +2817,7 @@ async fn save_forge_token(
     Form(form): Form<CopilotTokenForm>,
 ) -> Result<Markup, AppError> {
     let kind = forge_kind(&forge)?;
-    let token = form.token.trim();
-    if token.is_empty() {
-        return forge_page(&state, &headers, kind, Some("Saved."));
-    }
+    require_same_origin(&headers)?;
     if !state.secrets.available() {
         return forge_page(
             &state,
@@ -2808,6 +2826,10 @@ async fn save_forge_token(
             Some("The master key is missing, so the token was not saved."),
         );
     }
+    let token = form.token.trim();
+    if token.is_empty() {
+        return forge_page(&state, &headers, kind, Some("Saved."));
+    }
     let login = user(&headers);
     let owner = ForgeTokenOwner::User {
         login: &login,
@@ -2815,7 +2837,6 @@ async fn save_forge_token(
     };
     let saved = forge_tokens::save(
         state.secrets.as_ref(),
-        &state.store,
         state.forges.forge(kind).as_ref(),
         owner,
         token,
@@ -2843,10 +2864,10 @@ async fn clear_forge_token(
     Path(forge): Path<String>,
 ) -> Result<Markup, AppError> {
     let kind = forge_kind(&forge)?;
+    require_same_origin(&headers)?;
     let login = user(&headers);
     let cleared = forge_tokens::clear(
         state.secrets.as_ref(),
-        &state.store,
         ForgeTokenOwner::User {
             login: &login,
             forge: kind,

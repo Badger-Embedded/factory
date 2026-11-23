@@ -1,14 +1,3 @@
-// Forge token use cases, by test name. Each test runs against its own server,
-// since the tokens are stored per login.
-//
-// - A login that is not an admin saves a token, sees the account it belongs
-//   to, and clears it, and the page never shows the token:
-//   "a non-admin saves and clears their GitHub token"
-// - A token the forge rejects is not stored and not echoed:
-//   "a rejected token is not stored"
-// - Two logins see only their own token: "two logins see only their own token"
-// - The sidebar lists Forges to every login, and an unknown forge is a 404:
-//   "the sidebar lists the forges and an unknown forge is a 404"
 import { expect, startFactory, test as base, type Factory, COLLABORATOR } from '../fixtures';
 
 const test = base.extend<{ own: Factory }>({

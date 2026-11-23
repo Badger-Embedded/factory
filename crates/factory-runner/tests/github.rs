@@ -944,7 +944,7 @@ async fn lookup_account_reads_the_account_the_token_runs_as() {
     let gh = script(
         dir.path(),
         "gh",
-        r#"if [ "$1 $2" = "api user" ] && [ "$GH_TOKEN" = tok-good ]; then
+        r#"if [ "$1 $2 $3 $4" = "api user --hostname github.com" ] && [ "$GH_TOKEN" = tok-good ]; then
   echo '{"login":"octobot","id":42}'
 elif [ "$GH_TOKEN" = tok-boom ]; then
   echo "gh: boom tok-boom" >&2; exit 1

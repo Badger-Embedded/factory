@@ -1202,7 +1202,7 @@ impl Forge for GitHub {
                 email: String::new(),
             };
             let out = self
-                .run(&probe, &["api", "user"], None)
+                .run(&probe, &["api", "user", "--hostname", "github.com"], None)
                 .await
                 .map_err(|err| {
                     if err.contains("HTTP 401") || err.contains("HTTP 403") {
