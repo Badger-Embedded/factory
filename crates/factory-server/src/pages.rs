@@ -1719,7 +1719,6 @@ pub fn settings_project(
             }
             (project_checks_card(project))
             (project_maintenance_card(project))
-            (project_upstream_token_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
                 div.card.failed { (problem) }
@@ -1793,6 +1792,7 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
         form.card.settings-form method="post"
             action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/maintenance" } {
             h2 { "Maintenance" }
+            input type="hidden" name="csrf" value=(project.checks_csrf);
             div.field {
                 label.check {
                     input type="checkbox" name="renovate" value="on" checked[maintenance.renovate];
@@ -1867,59 +1867,44 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
                         p.hint.upstream-check-result.bad[check.readable != Some(true)] role="status" { (check.text) }
                     }
                 }
+                (upstream_token_field(project, packaging.upstream_forge))
             }
             (save_bar("Save maintenance"))
         }
     }
 }
 
-fn project_upstream_token_card(project: &ProjectSettings) -> Markup {
-    let Some(packaging) = project.maintenance.packaging.as_ref() else {
-        return html! {};
-    };
+/// The optional token for the upstream on `forge`. It sits in the Maintenance
+/// form, so a save or a clear acts on the upstream forge chosen there, before
+/// the card itself is saved.
+fn upstream_token_field(project: &ProjectSettings, forge: ForgeKind) -> Markup {
     let base = format!(
         "/settings/projects/{}/upstream-token",
         crate::web::query_escape(&project.name)
     );
-    let name = packaging.upstream_forge.display_name();
     let card = &project.upstream;
     let secrets = card.secrets_available;
     html! {
-        div.card #upstream-token {
-            h2 { "Upstream token" }
+        div.field #upstream-token {
+            label for="upstream-token-field" { "Upstream token" }
+            input #upstream-token-field.wide type="password" name="token"
+                autocomplete="off" spellcheck="false"
+                placeholder=(if card.account.is_some() { "set" } else { "not set" })
+                disabled[!secrets];
             p.hint {
-                "Optional. Most upstreams are public and are read with no token. Save a " (name)
-                " token whose account can read the upstream repository when it is private, or to lift the rate limit on unauthenticated reads. \
-                 Stored encrypted and never shown."
+                @if let Some(account) = &card.account {
+                    "A " (forge.display_name()) " token is stored. It belongs to the account " strong.forge-account { (account.login) } ". "
+                } @else {
+                    "No " (forge.display_name()) " token is stored. "
+                }
+                "Optional. Most upstreams are public and are read with no token. Save a token whose account can read the upstream repository when it is private, or to lift the rate limit on unauthenticated reads. \
+                 Stored encrypted and never shown. An empty field keeps the stored token."
             }
-            form.settings-form method="post" action=(base) {
-                input type="hidden" name="csrf" value=(project.checks_csrf);
-                @if !secrets {
-                    p.hint.bad { "The master key is missing, so a token cannot be saved here. Clear still works." }
-                }
-                div.field {
-                    label for="upstream-token-field" { "Upstream token" }
-                    input #upstream-token-field.wide type="password" name="token"
-                        autocomplete="off" spellcheck="false"
-                        placeholder=(if card.account.is_some() { "set" } else { "not set" })
-                        disabled[!secrets];
-                    p.hint {
-                        @if let Some(account) = &card.account {
-                            "A token is stored. It belongs to the account " strong.forge-account { (account.login) } ". "
-                        } @else {
-                            "No token is stored. "
-                        }
-                        "Paste a new one to replace it. An empty field keeps it."
-                    }
-                }
-                div.save-bar {
-                    span.save-bar-note { "No unsaved changes." }
-                    button.primary disabled[!secrets] { "Save upstream token" }
-                }
-                div.danger-zone {
-                    button.danger formaction={ (base) "/clear" } formnovalidate { "Clear upstream token" }
-                }
+            @if !secrets {
+                p.hint.bad { "The master key is missing, so a token cannot be saved here. Clear still works." }
             }
+            button type="submit" formnovalidate disabled[!secrets] formaction=(base) { "Save upstream token" }
+            button.danger type="submit" formnovalidate formaction={ (base) "/clear" } { "Clear upstream token" }
         }
     }
 }

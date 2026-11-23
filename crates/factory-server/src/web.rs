@@ -1957,6 +1957,13 @@ fn project_page_full(
     if let Some(maintenance) = maintenance {
         settings.maintenance = maintenance;
     }
+    settings.upstream.account = match &settings.maintenance.packaging {
+        Some(packaging) => state.store.forge_account(ForgeTokenOwner::Upstream {
+            project: name,
+            forge: packaging.upstream_forge,
+        })?,
+        None => None,
+    };
     settings.upstream.check = check;
     Ok(pages::settings_project(
         &user(headers),
@@ -2622,9 +2629,44 @@ fn maintenance_from_form(
     (maintenance, refusal)
 }
 
+/// The sealed bytes of a token row when a check read it, or `None` for a row
+/// that was absent. The save writes only while the row still holds them.
+struct TokenSnapshot {
+    upstream: bool,
+    forge: ForgeKind,
+    sealed: Option<Vec<u8>>,
+}
+
+fn snapshot_token(
+    state: &AppState,
+    project: &str,
+    upstream: bool,
+    forge: ForgeKind,
+) -> Result<TokenSnapshot, StoreError> {
+    let owner = if upstream {
+        ForgeTokenOwner::Upstream { project, forge }
+    } else {
+        ForgeTokenOwner::Project { project, forge }
+    };
+    let (row, header) = owner.row();
+    let sealed = state
+        .store
+        .get_secret(SecretRef {
+            project: &row,
+            server: "",
+            header: &header,
+        })?
+        .map(|(_, sealed)| sealed);
+    Ok(TokenSnapshot {
+        upstream,
+        forge,
+        sealed,
+    })
+}
+
 struct SaveChecks {
     notice: String,
-    credential: Option<Vec<u8>>,
+    snapshots: Vec<TokenSnapshot>,
     check: Option<pages::UpstreamCheckView>,
 }
 
@@ -2637,15 +2679,36 @@ async fn save_checks(
     maintenance: &Maintenance,
 ) -> Result<Result<SaveChecks, (String, Option<pages::UpstreamCheckView>)>, AppError> {
     let mut notice = "Saved.".to_owned();
-    let mut credential = None;
+    let mut snapshots = Vec::new();
     if maintenance.renovate {
+        let project_forge = project_forge_kind(record)?;
         match renovate_access(state, project, record).await? {
             RenovateCheck::Refused(problem) => return Ok(Err((problem, None))),
             RenovateCheck::Warned { warning, sealed } => {
                 notice = format!("{notice} {warning}");
-                credential = Some(sealed);
+                snapshots.push(TokenSnapshot {
+                    upstream: false,
+                    forge: project_forge,
+                    sealed: Some(sealed),
+                });
             }
-            RenovateCheck::Passed { sealed } => credential = Some(sealed),
+            RenovateCheck::Passed { sealed } => snapshots.push(TokenSnapshot {
+                upstream: false,
+                forge: project_forge,
+                sealed: Some(sealed),
+            }),
+        }
+    }
+    if let Some(packaging) = &maintenance.packaging {
+        let project_forge = project_forge_kind(record)?;
+        snapshots.push(snapshot_token(
+            state,
+            project,
+            true,
+            packaging.upstream_forge,
+        )?);
+        if packaging.upstream_forge == project_forge && !maintenance.renovate {
+            snapshots.push(snapshot_token(state, project, false, project_forge)?);
         }
     }
     let check = match &maintenance.packaging {
@@ -2664,7 +2727,7 @@ async fn save_checks(
     }
     Ok(Ok(SaveChecks {
         notice,
-        credential,
+        snapshots,
         check,
     }))
 }
@@ -2672,7 +2735,7 @@ async fn save_checks(
 const STALE_PROJECT: &str =
     "The project changed while the access was checked. Nothing was saved. Save it again.";
 const STALE_TOKEN: &str =
-    "The project token changed while the access was checked. Nothing was saved. Save it again.";
+    "A token changed while the access was checked. Nothing was saved. Save it again.";
 
 async fn save_project_maintenance(
     State(state): State<AppState>,
@@ -2714,7 +2777,7 @@ async fn save_project_maintenance(
     };
     let SaveChecks {
         notice,
-        credential,
+        snapshots,
         check,
     } = checks;
     let login = user(&headers);
@@ -2723,7 +2786,23 @@ async fn save_project_maintenance(
         .project_maintenance(&project)?
         .packaging
         .map(|packaging| packaging.upstream_forge);
-    let credential = project_credential(&project, &record, credential.as_deref())?;
+    let credentials: Vec<_> = snapshots
+        .iter()
+        .map(|snapshot| {
+            let owner = if snapshot.upstream {
+                ForgeTokenOwner::Upstream {
+                    project: &project,
+                    forge: snapshot.forge,
+                }
+            } else {
+                ForgeTokenOwner::Project {
+                    project: &project,
+                    forge: snapshot.forge,
+                }
+            };
+            (owner, snapshot.sealed.as_deref())
+        })
+        .collect();
     let saved = state.store.save_project_maintenance_guarded(
         &ProjectGuard {
             project: &project,
@@ -2731,7 +2810,7 @@ async fn save_project_maintenance(
             instance,
         },
         &maintenance,
-        credential,
+        &credentials,
     )?;
     let problem = match saved {
         MaintenanceSave::Saved => {
@@ -2762,21 +2841,6 @@ async fn save_project_maintenance(
         Some(problem),
         Some(maintenance),
     )
-}
-
-fn project_credential<'a>(
-    project: &'a str,
-    record: &Project,
-    sealed: Option<&'a [u8]>,
-) -> Result<Option<(ForgeTokenOwner<'a>, &'a [u8])>, AppError> {
-    let Some(sealed) = sealed else {
-        return Ok(None);
-    };
-    let owner = ForgeTokenOwner::Project {
-        project,
-        forge: project_forge_kind(record)?,
-    };
-    Ok(Some((owner, sealed)))
 }
 
 /// The stored upstream token is bound to its forge, so it does not carry
@@ -2921,26 +2985,59 @@ async fn check_project_upstream(
     )
 }
 
+/// The upstream forge a token form acts on: the one chosen on the card, else
+/// the saved one.
+fn token_form_forge(
+    state: &AppState,
+    name: &str,
+    project: &Project,
+    draft: &Maintenance,
+) -> Result<ForgeKind, AppError> {
+    match &draft.packaging {
+        Some(packaging) => Ok(packaging.upstream_forge),
+        None => upstream_forge_of(state, name, project),
+    }
+}
+
 async fn save_upstream_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Form(form): Form<ForgeTokenForm>,
+    Form(form): Form<UpstreamTokenForm>,
 ) -> Result<Markup, AppError> {
     let project = visible_project(&state, &headers, &name)?;
-    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let login = user(&headers);
+    require_csrf(&state, &login, &form.csrf)?;
     let part = pages::PipelinePart::parse(None);
-    let kind = upstream_forge_of(&state, &name, &project)?;
+    let (draft, _) = maintenance_from_form(&form.draft(), project.forge.kind());
+    let kind = token_form_forge(&state, &name, &project, &draft)?;
+    let redraw = |notice: Option<&str>, problem: Option<&str>| {
+        project_page_full(
+            &state,
+            &headers,
+            &name,
+            part,
+            notice,
+            problem,
+            Some(draft.clone()),
+            None,
+        )
+    };
     if !state.secrets.available() {
-        let problem = "The master key is missing, so the token was not saved.";
-        return project_page(&state, &headers, &name, part, None, Some(problem));
+        return redraw(
+            None,
+            Some("The master key is missing, so the token was not saved."),
+        );
     }
     let token = form.token.trim();
     if token.is_empty() {
-        return project_page(&state, &headers, &name, part, Some("Saved."), None);
+        return redraw(Some("Saved."), None);
     }
+    let Some((_, instance)) = state.store.project_with_instance(&name)? else {
+        return Err(AppError::UnknownProject(name));
+    };
     let display = kind.display_name();
-    let saved = forge_tokens::save(
+    let saved = forge_tokens::save_guarded(
         state.secrets.as_ref(),
         state.forges.forge(kind).as_ref(),
         ForgeTokenOwner::Upstream {
@@ -2948,6 +3045,11 @@ async fn save_upstream_token(
             forge: kind,
         },
         token,
+        &ProjectGuard {
+            project: &name,
+            login: &login,
+            instance,
+        },
     )
     .await;
     let (notice, problem) = match saved {
@@ -2968,44 +3070,44 @@ async fn save_upstream_token(
                 "Could not look the account up on {display}: {message}. Nothing was saved."
             )),
         ),
+        Err(SaveError::Gone) => {
+            if !state.store.is_collaborator(&name, &login)? {
+                return Err(AppError::UnknownProject(name));
+            }
+            (None, Some(STALE_PROJECT.to_owned()))
+        }
         Err(SaveError::Secrets(err)) => return Err(err.into()),
         Err(SaveError::Store(err)) => return Err(err.into()),
-        Err(SaveError::NotVisible(_) | SaveError::Gone) => {
+        Err(SaveError::NotVisible(_)) => {
             unreachable!("an upstream token is saved with no repository check")
         }
     };
-    project_page(
-        &state,
-        &headers,
-        &name,
-        part,
-        notice.as_deref(),
-        problem.as_deref(),
-    )
+    redraw(notice.as_deref(), problem.as_deref())
 }
 
 async fn clear_upstream_token_route(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Form(form): Form<ForgeClearForm>,
+    Form(form): Form<UpstreamTokenForm>,
 ) -> Result<Markup, AppError> {
     let project = visible_project(&state, &headers, &name)?;
     require_csrf(&state, &user(&headers), &form.csrf)?;
-    let kind = upstream_forge_of(&state, &name, &project)?;
+    let (draft, _) = maintenance_from_form(&form.draft(), project.forge.kind());
+    let kind = token_form_forge(&state, &name, &project, &draft)?;
     clear_upstream_token(&state, &name, kind)?;
-    project_page(
+    project_page_full(
         &state,
         &headers,
         &name,
         pages::PipelinePart::parse(None),
         Some("Cleared."),
         None,
+        Some(draft),
+        None,
     )
 }
 
-/// The forge of the project's packaging upstream, which is the project's own
-/// forge until a packaging upstream names another.
 fn upstream_forge_of(
     state: &AppState,
     name: &str,
@@ -3896,6 +3998,46 @@ struct ForgeTokenForm {
     token: String,
     #[serde(default)]
     csrf: String,
+}
+
+/// The upstream token forms carry the Maintenance card's current fields, so a
+/// token saved or cleared before the card is saved redraws the same draft and
+/// acts on the upstream forge chosen there.
+#[derive(Deserialize)]
+struct UpstreamTokenForm {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    csrf: String,
+    renovate: Option<String>,
+    packaging: Option<String>,
+    #[serde(default)]
+    packaging_type: String,
+    #[serde(default)]
+    manifest_files: String,
+    #[serde(default)]
+    build_config_files: String,
+    #[serde(default)]
+    upstream_repo: String,
+    #[serde(default)]
+    upstream_forge: String,
+    #[serde(default)]
+    renovate_author: String,
+}
+
+impl UpstreamTokenForm {
+    fn draft(&self) -> MaintenanceForm {
+        MaintenanceForm {
+            renovate: self.renovate.clone(),
+            packaging: self.packaging.clone(),
+            packaging_type: self.packaging_type.clone(),
+            manifest_files: self.manifest_files.clone(),
+            build_config_files: self.build_config_files.clone(),
+            upstream_repo: self.upstream_repo.clone(),
+            upstream_forge: self.upstream_forge.clone(),
+            renovate_author: self.renovate_author.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize)]

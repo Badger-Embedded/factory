@@ -302,6 +302,43 @@ test('the upstream forge is checked and an unreadable upstream is refused', asyn
   ).toBeVisible();
 });
 
+test('a private upstream on another forge is configured from scratch with its own token', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project));
+  await saveProjectToken(page, 'tok-e2e-alice');
+  const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
+  await card.getByLabel('Renovate pull requests').check();
+  await card.getByLabel('Packaging project').check();
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await card.getByLabel('Type').selectOption('deb');
+  await card.getByLabel('Manifest files').fill('debian/control');
+  await card.getByLabel('Upstream forge').selectOption('salsa');
+  await card.getByLabel('Upstream repository').fill('e2e/sub/private');
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await expect(page.getByRole('status')).toContainText('e2e/sub/private could not be read on Salsa');
+  await expect(page.getByText('No Salsa token is stored.')).toBeVisible();
+
+  // The token saves for the forge chosen in the form, which is not saved yet.
+  await card.getByLabel('Upstream token').fill('tok-e2e-deb');
+  await card.getByRole('button', { name: 'Save upstream token' }).click();
+  await expect(page.getByText('deb-bot', { exact: true })).toBeVisible();
+  await expect(card.getByLabel('Upstream forge')).toHaveValue('salsa');
+  await expect(card.getByLabel('Upstream repository')).toHaveValue('e2e/sub/private');
+  await expect(card.getByLabel('Upstream token')).toHaveValue('');
+
+  await card.getByLabel('Manifest files').fill('debian/control\ndebian/rules');
+  await card.getByRole('button', { name: 'Save maintenance' }).click();
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+  await expect(card.getByLabel('Upstream forge')).toHaveValue('salsa');
+  await card.getByLabel('Upstream repository').fill('e2e/sub/private');
+  await card.getByRole('button', { name: 'Check connection' }).click();
+  await expect(
+    page.getByText('Checked with the upstream token of deb-bot: e2e/sub/private is readable on Salsa.'),
+  ).toBeVisible();
+});
+
 test('turning Renovate on checks the project account', async ({ page, project }) => {
   await page.goto(settingsPath(project));
   const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });

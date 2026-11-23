@@ -259,7 +259,7 @@ fn dashboard_with_gh(
     admins: Vec<String>,
     gh: impl FnOnce(&Path) -> GitHub,
 ) -> Dashboard {
-    dashboard_build(store, github, None, secrets, admins, gh)
+    dashboard_build(store, github, None, |_| None, secrets, admins, gh)
 }
 
 /// As [`dashboard_with_gh`], with the Salsa onboarding checks answered by
@@ -268,6 +268,7 @@ fn dashboard_build(
     store: Arc<Store>,
     github: Arc<dyn RepoChecker>,
     salsa: Option<Arc<dyn RepoChecker>>,
+    salsa_forge: impl FnOnce(&Path) -> Option<Arc<dyn factory_runner::Forge>>,
     secrets: Arc<dyn SecretStore>,
     admins: Vec<String>,
     gh: impl FnOnce(&Path) -> GitHub,
@@ -305,6 +306,10 @@ fn dashboard_build(
             Arc::clone(&usage),
             {
                 let forges = Forges::new(Arc::new(gh(data.path())), github);
+                let forges = match salsa_forge(data.path()) {
+                    Some(forge) => forges.with_salsa(forge),
+                    None => forges,
+                };
                 match salsa {
                     Some(salsa) => forges.with_salsa_checker(salsa),
                     None => forges,
@@ -9416,6 +9421,7 @@ fn salsa_dashboard(github: Arc<FakeRepos>, salsa: Arc<FakeSalsa>) -> (Arc<Store>
         Arc::clone(&store),
         github,
         Some(salsa),
+        |_| None,
         secrets,
         admins,
         |_| GitHub::default(),
@@ -9517,6 +9523,7 @@ async fn a_salsa_project_without_a_salsa_token_links_the_salsa_page() {
         Arc::clone(&store),
         github,
         Some(salsa),
+        |_| None,
         secrets,
         admins,
         |_| GitHub::default(),
@@ -12978,7 +12985,7 @@ async fn a_renovate_save_after_the_project_token_was_cleared_or_replaced_stores_
             .unwrap();
     })
     .await;
-    assert!(reply.body.contains("project token changed"));
+    assert!(reply.body.contains("A token changed"));
     assert!(
         !dashboard
             .store
@@ -12992,7 +12999,7 @@ async fn a_renovate_save_after_the_project_token_was_cleared_or_replaced_stores_
         seed_project_token(&dashboard, "tok-bob", "bob-bot", 22);
     })
     .await;
-    assert!(reply.body.contains("project token changed"));
+    assert!(reply.body.contains("A token changed"));
     assert!(
         !dashboard
             .store
@@ -13009,7 +13016,7 @@ async fn a_renovate_save_after_the_token_was_replaced_by_one_of_the_same_account
         seed_project_token(&dashboard, "tok-reader", "slow-bot", 77);
     })
     .await;
-    assert!(reply.body.contains("project token changed"));
+    assert!(reply.body.contains("A token changed"));
     assert!(
         !dashboard
             .store
@@ -13412,6 +13419,26 @@ fn forge_token_dashboard(secrets_available: bool) -> Dashboard {
     forge_token_dashboard_at(secrets_available, "http://127.0.0.1:9".to_owned())
 }
 
+/// A `glab` that logs each call to `glab-calls` and finds only `team/tool`.
+fn fake_salsa(dir: &Path) -> Arc<dyn factory_runner::Forge> {
+    let glab = support::executable(
+        dir,
+        "glab",
+        r#"#!/usr/bin/env bash
+echo "[$GITLAB_TOKEN] host=$GITLAB_HOST $*" >> "$(dirname "$0")/glab-calls"
+if [ "$*" = "api --method GET projects/team%2Ftool --hostname salsa.debian.org" ]; then
+  echo '{"permissions":{}}'; exit 0
+fi
+echo "glab: 404 Not Found (HTTP 404)" >&2
+exit 1
+"#,
+    );
+    Arc::new(factory_runner::GitLab {
+        glab,
+        ..factory_runner::GitLab::default()
+    })
+}
+
 /// As [`forge_token_dashboard`], with the API a read with no token goes to.
 fn forge_token_dashboard_at(secrets_available: bool, api_base: String) -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
@@ -13439,10 +13466,21 @@ if [ "$1 $2 $3 $4" = "api user --hostname github.com" ]; then
     tok-ghost) echo '{"login":"ghost-bot","id":55}'; exit 0 ;;
     tok-blind) echo '{"login":"blind-bot","id":66}'; exit 0 ;;
     tok-slow) echo '{"login":"slow-bot","id":77}'; exit 0 ;;
+    tok-lag)
+      here=$(dirname "$0")
+      touch "$here/started"
+      while [ ! -e "$here/go" ]; do sleep 0.02; done
+      echo '{"login":"lag-bot","id":88}'; exit 0 ;;
     *) echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
   esac
 fi
 if [ "$1 $2 $3 $4" = "api repos/o/tool --hostname github.com" ]; then
+  echo '{"permissions":{"admin":false,"maintain":false,"push":false}}'; exit 0
+fi
+if [ "$1 $2 $3 $4" = "api repos/o/slowrepo --hostname github.com" ]; then
+  here=$(dirname "$0")
+  touch "$here/started"
+  while [ ! -e "$here/go" ]; do sleep 0.02; done
   echo '{"permissions":{"admin":false,"maintain":false,"push":false}}'; exit 0
 fi
 if [ "$1 $2 $3 $4" = "api repos/o/secret --hostname github.com" ]; then
@@ -13481,9 +13519,11 @@ exit 1
     } else {
         Arc::new(UnavailableSecrets::new(Arc::clone(&store)))
     };
-    dashboard_with_gh(
+    dashboard_build(
         store,
         Arc::new(FakeRepos::fit()),
+        None,
+        |dir| Some(fake_salsa(dir)),
         secrets,
         vec!["boss@example.com".to_owned()],
         gh,
@@ -14727,15 +14767,17 @@ async fn upstream_post(dashboard: &Dashboard, action: &str, form: &str) -> Reply
     let page = dashboard.get(PROJECT_PAGE).await;
     let doc = scraper::Html::parse_document(&page.body);
     let csrf = doc
-        .select(&scraper::Selector::parse("#upstream-token input[name=csrf]").unwrap())
+        .select(
+            &scraper::Selector::parse("form[action$=\"/maintenance\"] input[name=csrf]").unwrap(),
+        )
         .next()
         .and_then(|input| input.value().attr("value"))
-        .expect("the upstream token card carries a csrf token")
+        .expect("the maintenance form carries a csrf token")
         .to_owned();
     dashboard
         .post(
             &format!("{PROJECT_PAGE}/upstream-token{action}"),
-            &format!("{form}&csrf={csrf}"),
+            &format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&{form}&csrf={csrf}"),
         )
         .await
 }
@@ -14836,12 +14878,16 @@ async fn a_read_with_no_token_is_checked_and_a_failed_check_does_not_stop_the_sa
     let dashboard = forge_token_dashboard_at(true, api);
     seed_project_token(&dashboard, "tok-alice", "alice-bot", 11);
     // The upstream is on Salsa, so the GitHub project token does not apply.
-    // The fake host has no glab, so the read fails or finds nothing.
     let on_salsa = format!("{UPSTREAM_FORM}&upstream_repo=team%2Ftool").replace("github", "salsa");
     let reply = dashboard
         .post(&format!("{PROJECT_PAGE}/maintenance/check"), &on_salsa)
         .await;
     assert!(reply.body.contains("Checked with no token: team/tool"));
+    let calls = std::fs::read_to_string(dashboard.data.path().join("glab-calls")).unwrap();
+    assert_eq!(
+        calls.trim(),
+        "[] host=salsa.debian.org api --method GET projects/team%2Ftool --hostname salsa.debian.org"
+    );
 
     let none = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool");
     let reply = dashboard
@@ -14884,6 +14930,197 @@ async fn saving_packaging_when_the_upstream_check_cannot_run_still_saves() {
             .unwrap()
             .packaging
             .is_some()
+    );
+}
+
+async fn upstream_csrf(dashboard: &Dashboard) -> String {
+    let page = dashboard.get(PROJECT_PAGE).await;
+    scraper::Html::parse_document(&page.body)
+        .select(
+            &scraper::Selector::parse("form[action$=\"/maintenance\"] input[name=csrf]").unwrap(),
+        )
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the maintenance form carries a csrf token")
+        .to_owned()
+}
+
+/// Posts `uri` and runs `meanwhile` once the fake `gh` is blocked in the call
+/// that the post made.
+async fn post_while(
+    dashboard: &Dashboard,
+    uri: &str,
+    form: &str,
+    meanwhile: impl FnOnce(),
+) -> Reply {
+    let started = dashboard.data.path().join("started");
+    let go = dashboard.data.path().join("go");
+    let post = dashboard.post(uri, form);
+    let driver = async {
+        for _ in 0..500 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "the forge call did not start within 5 s");
+        meanwhile();
+        std::fs::write(&go, "").unwrap();
+    };
+    tokio::join!(post, driver).0
+}
+
+fn upstream_owner() -> ForgeTokenOwner<'static> {
+    ForgeTokenOwner::Upstream {
+        project: "maestro",
+        forge: ForgeKind::GitHub,
+    }
+}
+
+#[tokio::test]
+async fn an_upstream_token_saved_after_the_project_was_recreated_stores_nothing() {
+    let dashboard = dashboard_with_project_token();
+    let csrf = upstream_csrf(&dashboard).await;
+    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&token=tok-lag&csrf={csrf}");
+
+    let reply = post_while(
+        &dashboard,
+        &format!("{PROJECT_PAGE}/upstream-token"),
+        &form,
+        || {
+            dashboard.store.remove_project("maestro").unwrap();
+            dashboard
+                .store
+                .create_project(
+                    "maestro",
+                    ForgeKind::GitHub,
+                    "Badger-Embedded/maestro",
+                    "main",
+                    None,
+                    Some(USER),
+                )
+                .unwrap();
+            dashboard.store.project_with_instance("maestro").unwrap();
+        },
+    )
+    .await;
+
+    assert!(reply.body.contains("The project changed"));
+    assert!(
+        dashboard
+            .store
+            .forge_account(upstream_owner())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_token_saved_by_a_login_removed_meanwhile_stores_nothing() {
+    let dashboard = dashboard_with_project_token();
+    let csrf = upstream_csrf(&dashboard).await;
+    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Ftool&token=tok-lag&csrf={csrf}");
+
+    let reply = post_while(
+        &dashboard,
+        &format!("{PROJECT_PAGE}/upstream-token"),
+        &form,
+        || {
+            dashboard
+                .store
+                .remove_collaborator("maestro", USER)
+                .unwrap();
+        },
+    )
+    .await;
+
+    assert_ne!(reply.status, StatusCode::OK);
+    assert!(
+        dashboard
+            .store
+            .forge_account(upstream_owner())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_maintenance_save_refuses_a_result_checked_before_an_upstream_token_appeared() {
+    let dashboard = dashboard_with_project_token();
+    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Fslowrepo");
+
+    let reply = post_while(
+        &dashboard,
+        &format!("{PROJECT_PAGE}/maintenance"),
+        &form,
+        || {
+            LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+                .put_forge_token(
+                    upstream_owner(),
+                    "tok-reader",
+                    &ForgeAccount {
+                        login: "reader-bot".into(),
+                        id: 33,
+                    },
+                )
+                .unwrap();
+        },
+    )
+    .await;
+
+    assert!(
+        reply
+            .body
+            .contains("A token changed while the access was checked")
+    );
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_maintenance_save_refuses_a_result_checked_with_an_upstream_token_since_cleared() {
+    let dashboard = dashboard_with_project_token();
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .put_forge_token(
+            upstream_owner(),
+            "tok-reader",
+            &ForgeAccount {
+                login: "reader-bot".into(),
+                id: 33,
+            },
+        )
+        .unwrap();
+    let form = format!("{UPSTREAM_FORM}&upstream_repo=o%2Fslowrepo");
+
+    let reply = post_while(
+        &dashboard,
+        &format!("{PROJECT_PAGE}/maintenance"),
+        &form,
+        || {
+            LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+                .delete_forge_token(upstream_owner())
+                .unwrap();
+        },
+    )
+    .await;
+    assert!(
+        reply
+            .body
+            .contains("A token changed while the access was checked")
+    );
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .is_none()
     );
 }
 

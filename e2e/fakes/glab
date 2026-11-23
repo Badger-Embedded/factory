@@ -40,6 +40,15 @@ if [ "$1" = api ] && [ "$GITLAB_HOST" = salsa.debian.org ]; then
           echo '[]'
           exit 0
           ;;
+        projects/e2e%2Fsub%2Fprivate)
+          # Readable only with deb-bot's token, as a private repository is.
+          if [ "$GITLAB_TOKEN" = tok-e2e-deb ]; then
+            echo '{"permissions":{"project_access":null,"group_access":null}}'
+            exit 0
+          fi
+          echo "glab: 404 Not Found (HTTP 404)" >&2
+          exit 1
+          ;;
         projects/*)
           echo "glab: 404 Not Found (HTTP 404)" >&2
           exit 1

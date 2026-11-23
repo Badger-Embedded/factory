@@ -62,6 +62,32 @@ pub async fn save(
     Ok(account)
 }
 
+/// As [`save`], and writes only while the project and collaborator in
+/// `guard` still exist, so a lookup that outlives its project stores nothing.
+///
+/// # Errors
+///
+/// As [`save`], and [`SaveError::Gone`] when the guard no longer holds.
+pub async fn save_guarded(
+    secrets: &dyn SecretStore,
+    forge: &dyn Forge,
+    owner: ForgeTokenOwner<'_>,
+    token: &str,
+    guard: &ProjectGuard<'_>,
+) -> Result<ForgeAccount, SaveError> {
+    if !secrets.available() {
+        return Err(SecretError::Unavailable.into());
+    }
+    let account = forge.lookup_account(token).await.map_err(|err| match err {
+        LookupError::Rejected => SaveError::Rejected,
+        LookupError::Failed(message) => SaveError::Lookup(message),
+    })?;
+    if !secrets.put_project_forge_token(owner, token, &account, guard)? {
+        return Err(SaveError::Gone);
+    }
+    Ok(account)
+}
+
 /// What a token saved for a repository belongs to and may do there.
 pub struct RepoSave {
     pub account: ForgeAccount,

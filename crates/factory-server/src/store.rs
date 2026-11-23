@@ -743,8 +743,8 @@ impl Store {
         })
     }
 
-    /// `upstream_forge` joined `project_maintenance` later. A NULL reads as the
-    /// project's own forge, so no row needs a value.
+    /// A NULL `upstream_forge` reads as the project's own forge, so no row
+    /// needs a value.
     fn migrate_upstream_forge(conn: &Connection) -> Result<(), StoreError> {
         let has: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('project_maintenance') WHERE name = 'upstream_forge'",
@@ -3544,10 +3544,10 @@ impl Store {
     }
 
     /// As [`Store::save_project_maintenance`], and writes only while the
-    /// project instance and collaborator in `guard` still exist and, when
-    /// `credential` is given, while the sealed token stored for its owner is
-    /// still those bytes. A token saved again is sealed anew, so it differs
-    /// even when it is the same string.
+    /// project instance and collaborator in `guard` still exist and the sealed
+    /// token stored for each owner in `credentials` is still those bytes, or
+    /// is still absent for `None`. A token saved again is sealed anew, so it
+    /// differs even when it is the same string.
     ///
     /// # Errors
     ///
@@ -3556,7 +3556,7 @@ impl Store {
         &self,
         guard: &ProjectGuard<'_>,
         maintenance: &Maintenance,
-        credential: Option<(ForgeTokenOwner<'_>, &[u8])>,
+        credentials: &[(ForgeTokenOwner<'_>, Option<&[u8]>)],
     ) -> Result<MaintenanceSave, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -3572,7 +3572,7 @@ impl Store {
         if !present {
             return Ok(MaintenanceSave::Gone);
         }
-        if let Some((owner, sealed)) = credential {
+        for (owner, sealed) in credentials {
             let (project, header) = owner.row();
             let current: Option<Vec<u8>> = tx
                 .query_row(
@@ -3582,7 +3582,7 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if current.as_deref() != Some(sealed) {
+            if current.as_deref() != *sealed {
                 return Ok(MaintenanceSave::TokenChanged);
             }
         }
@@ -4656,7 +4656,7 @@ pub enum MaintenanceSave {
     Saved,
     /// The project or the collaborator no longer exists.
     Gone,
-    /// The project token that was checked is no longer the stored one.
+    /// A token that was checked is no longer the stored one.
     TokenChanged,
 }
 
