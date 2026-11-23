@@ -287,6 +287,7 @@ fn project_card_routes() -> Router<AppState> {
             "/settings/projects/{project}/checks",
             post(save_project_checks),
         )
+        .route("/settings/projects/{project}/name", post(save_project_name))
 }
 
 fn copilot_routes() -> Router<AppState> {
@@ -474,22 +475,16 @@ impl BoardData {
     }
 }
 
-/// The projects `login` collaborates on, as pages label them, in name order.
+/// The projects `login` collaborates on, as pages label them, in shown-name order.
 fn project_labels(state: &AppState, login: &str) -> Result<Vec<ProjectLabel>, StoreError> {
-    Ok(state
-        .store
-        .projects_for(login)?
-        .into_iter()
-        .map(ProjectLabel::plain)
-        .collect())
+    state.store.project_labels_for(login)
 }
 
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the label will come from the store, which can fail"
-)]
-fn project_label(_state: &AppState, name: &str) -> Result<ProjectLabel, StoreError> {
-    Ok(ProjectLabel::plain(name))
+fn project_label(state: &AppState, name: &str) -> Result<ProjectLabel, StoreError> {
+    Ok(ProjectLabel {
+        id: name.to_owned(),
+        shown: state.store.project_shown_name(name)?,
+    })
 }
 
 fn load_board(
@@ -2738,6 +2733,70 @@ async fn save_project_checks(
 }
 
 #[derive(Deserialize)]
+struct NameForm {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    csrf: String,
+}
+
+/// The display name to store for `project` from what the form held: `None`
+/// clears it, `Err` is the problem to show.
+fn display_name_value(project: &str, raw: &str) -> Result<Option<String>, String> {
+    let value = raw.trim();
+    if value.is_empty() || value == project {
+        return Ok(None);
+    }
+    if value.chars().count() > 64 {
+        return Err("A project name is at most 64 characters.".to_owned());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("A project name has no control characters.".to_owned());
+    }
+    Ok(Some(value.to_owned()))
+}
+
+async fn save_project_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(form): Form<NameForm>,
+) -> Result<Response, AppError> {
+    visible_project(&state, &headers, &project)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    // Onboarding holds this lock from its name check to its insert.
+    let _one_onboarding_at_a_time = state.onboarding.lock().await;
+    let problem = match display_name_value(&project, &form.display_name) {
+        Ok(value) => match state
+            .store
+            .save_project_display_name(&project, value.as_deref())
+        {
+            Ok(()) => {
+                return Ok(Redirect::to(&format!(
+                    "/settings/projects/{}?notice=Saved.",
+                    query_escape(&project)
+                ))
+                .into_response());
+            }
+            Err(StoreError::DuplicateName(name)) => {
+                format!("A project named {name:?} already exists.")
+            }
+            Err(err) => return Err(err.into()),
+        },
+        Err(problem) => problem,
+    };
+    Ok(project_page(
+        &state,
+        &headers,
+        &project,
+        pages::PipelinePart::parse(None),
+        None,
+        Some(&problem),
+    )?
+    .into_response())
+}
+
+#[derive(Deserialize)]
 struct RemoveProjectForm {
     #[serde(default)]
     confirm: String,
@@ -3814,7 +3873,7 @@ async fn onboard_report(
                 "The project name {name:?} is empty or has a character other than a letter, digit, dash, underscore or dot."
             ),
         );
-    } else if state.store.project(name)?.is_some() {
+    } else if state.store.name_in_use(name)? {
         report
             .errors
             .insert(0, format!("A project named {name:?} already exists."));

@@ -13,7 +13,9 @@ use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
-use crate::projects::{Project, ProjectForge, StageAgents, StageEfforts, StageModels};
+use crate::projects::{
+    Project, ProjectForge, ProjectLabel, StageAgents, StageEfforts, StageModels,
+};
 use crate::secrets::{ForgeTokenOwner, SecretRef};
 use crate::settings::Settings;
 
@@ -28,6 +30,7 @@ CREATE TABLE IF NOT EXISTS projects (
     base TEXT NOT NULL,
     checks TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    display_name TEXT,
     UNIQUE (forge, repo)
 );
 CREATE TABLE IF NOT EXISTS project_instances (
@@ -599,6 +602,14 @@ impl Store {
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA)?;
         Self::migrate_project_forge(&conn)?;
+        let has_display_name: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'display_name'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_display_name == 0 {
+            conn.execute("ALTER TABLE projects ADD COLUMN display_name TEXT", [])?;
+        }
         // `review` joined the model stages after the table shipped, so add it to
         // a `project_models` table that predates it. A fresh database already
         // has the column from SCHEMA, so this skips it.
@@ -832,7 +843,11 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let name_taken = tx
-            .query_row("SELECT 1 FROM projects WHERE name = ?1", [name], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM projects WHERE name = ?1 OR display_name = ?1",
+                [name],
+                |_| Ok(()),
+            )
             .optional()?
             .is_some();
         if name_taken {
@@ -2818,6 +2833,97 @@ impl Store {
         )?;
         let rows = stmt.query_map([login], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The projects `login` collaborates on, with the name pages show for
+    /// each, in shown-name order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_labels_for(&self, login: &str) -> Result<Vec<ProjectLabel>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.project, COALESCE(p.display_name, c.project)
+             FROM project_collaborators c LEFT JOIN projects p ON p.name = c.project
+             WHERE c.login = ?1 ORDER BY 2, 1",
+        )?;
+        let rows = stmt.query_map([login], |row| {
+            Ok(ProjectLabel {
+                id: row.get(0)?,
+                shown: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The name pages show for `project`: its display name, else `project`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_shown_name(&self, project: &str) -> Result<String, StoreError> {
+        let display: Option<Option<String>> = self
+            .conn()
+            .query_row(
+                "SELECT display_name FROM projects WHERE name = ?1",
+                [project],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(display.flatten().unwrap_or_else(|| project.to_owned()))
+    }
+
+    /// Whether `name` is the identifier or the display name of any project.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn name_in_use(&self, name: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM projects WHERE name = ?1 OR display_name = ?1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Sets the display name of `project`, or clears it with `None`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::DuplicateName`] when another project has that
+    /// identifier or display name, and on a database error.
+    pub fn save_project_display_name(
+        &self,
+        project: &str,
+        display_name: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if let Some(value) = display_name {
+            let taken = tx
+                .query_row(
+                    "SELECT 1 FROM projects
+                     WHERE name != ?1 AND (name = ?2 OR display_name = ?2)",
+                    params![project, value],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if taken {
+                return Err(StoreError::DuplicateName(value.to_owned()));
+            }
+        }
+        tx.execute(
+            "UPDATE projects SET display_name = ?2 WHERE name = ?1",
+            params![project, display_name],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Adds `login` as a collaborator on `project`, added by `by`. A login that
