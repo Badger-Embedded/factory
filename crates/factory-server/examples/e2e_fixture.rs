@@ -4,15 +4,16 @@
 //!
 //! ```sh
 //! e2e_fixture seed --db P
-//! e2e_fixture project --db P --name N [--repo OWNER/REPO] --login L [--login L ...]
+//! e2e_fixture project --db P --name N [--repo OWNER/REPO] [--forge NAME] --login L [--login L ...]
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
+//! e2e_fixture renovate --db P --project N --number NUMBER --url URL
 //! e2e_fixture apply --db P --job ID --event start|approve|cancel|questions
 //! e2e_fixture log --db P --job ID --text TEXT [--count N]
 //! e2e_fixture mcp --db P --job ID --server S --tool T [--blocked true]
 //! e2e_fixture tls --db P --dir D
 //! ```
 //!
-//! `job` prints the new job's id. `tls` writes `ca.pem`, `cert.pem` and
+//! `job` and `renovate` print the new job's id. `tls` writes `ca.pem`, `cert.pem` and
 //! `key.pem` into `D`: a throwaway CA and a leaf certificate for `127.0.0.1`,
 //! so the stub MCP server can serve TLS and the factory can trust it through
 //! `FACTORY_MCP_CA_FILE`. It does not open the database.
@@ -248,6 +249,17 @@ fn main() -> Result<()> {
         "job" => {
             let request = one("request").map_or("A request from the fixture", |text| text.as_str());
             let id = create_job(&store, one("project")?, one("stage")?, request)?;
+            println!("{id}");
+        }
+        "renovate" => {
+            let id = store
+                .create_renovate_job(
+                    one("project")?,
+                    one("number")?.parse()?,
+                    "Update dependency foo to v2",
+                    one("url")?,
+                )?
+                .ok_or("the pull request already has a job")?;
             println!("{id}");
         }
         "apply" => {

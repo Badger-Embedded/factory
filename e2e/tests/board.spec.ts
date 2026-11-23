@@ -4,8 +4,6 @@
 //   the worker tiles: "lists the seeded jobs in their sections with totals and workers"
 // - The project picker switches the board without a submit button:
 //   "the project picker switches the board"
-// - A project on an unknown forge shows a notice and no source link, and a
-//   healthy project keeps its link: "a project on an unknown forge shows a notice instead of a source link"
 // - A login on no project sees the empty state and the onboarding link:
 //   "a login on no project is sent to onboarding"
 // - Submitting the New request form creates a job that shows on the board:
@@ -394,4 +392,27 @@ test('a project on an unknown forge shows a notice instead of a source link', as
   await expect(page.locator('div.card.failed')).toHaveCount(0);
   const link = page.locator('div.status-row a.source-link');
   await expect(link).toHaveAttribute('href', `https://github.com/e2e/${project}`);
+});
+
+test('Renovate pull requests link through the forge and show a plain number on an unknown forge', async ({
+  page,
+  project,
+  factory,
+}) => {
+  const odd = `${project}-odd`;
+  factory.fixture('project', '--name', odd, '--login', ADMIN, '--forge', 'elsewhere');
+  const url = 'https://stored.example/pull/7';
+  factory.fixture('renovate', '--project', project, '--number', '7', '--url', url);
+  factory.fixture('renovate', '--project', odd, '--number', '8', '--url', url);
+
+  await page.goto(`/?project=${project}`);
+  const link = page.locator('a.renovate-pr');
+  await expect(link).toHaveText('#7');
+  await expect(link).toHaveAttribute('href', `https://github.com/e2e/${project}/pull/7`);
+  await expect(link).toHaveAttribute('target', '_blank');
+  await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+
+  await page.goto(`/?project=${odd}`);
+  await expect(page.locator('.renovate-pr')).toHaveText('#8');
+  await expect(page.locator('a.renovate-pr')).toHaveCount(0);
 });

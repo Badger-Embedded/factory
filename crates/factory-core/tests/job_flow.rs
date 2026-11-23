@@ -506,11 +506,9 @@ fn an_agent_failure_fails_the_job_with_the_failed_task_to_retry() {
     assert!(job.can_retry());
 }
 
-#[test]
-fn a_factory_failure_stops_a_watching_job_and_retry_resumes_it() {
-    let mut job = watching(9);
+fn fail_factory_step(job: &mut Job) {
     apply(
-        &mut job,
+        job,
         Event::FactoryFailed {
             reason: "unsupported forge".into(),
         },
@@ -518,9 +516,56 @@ fn a_factory_failure_stops_a_watching_job_and_retry_resumes_it() {
     assert!(matches!(job.stage(), Stage::Failed { .. }));
     assert_eq!(job.next_command(), None);
     assert!(job.can_retry());
+}
+
+#[test]
+fn a_factory_failure_while_summarizing_keeps_the_publish_approval_wait() {
+    let mut job = at_publish_gate(&["only"]);
+    fail_factory_step(&mut job);
 
     apply(&mut job, Event::Retry);
-    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+    assert_eq!(
+        job.turn(),
+        &Turn::User(Ask::PublishApproval { summary: None })
+    );
+    assert_eq!(job.next_command(), Some(Command::Summarize { pr: 0 }));
+}
+
+#[test]
+fn a_factory_failure_resumes_a_pending_ci_rerun() {
+    let mut job = watching(7);
+    apply(
+        &mut job,
+        Event::CiFailed {
+            log: "flaky".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::RerunCi {
+            reason: "network timeout".into(),
+        }),
+    );
+    let before = job.next_command();
+    assert!(matches!(before, Some(Command::RerunCi { .. })));
+    fail_factory_step(&mut job);
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.next_command(), before);
+}
+
+#[test]
+fn a_factory_failure_while_gathering_packaging_context_can_be_retried() {
+    let mut job = gathering();
+    fail_factory_step(&mut job);
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Packaging);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::GatherPackaging { number: 42 })
+    );
 }
 
 #[test]
