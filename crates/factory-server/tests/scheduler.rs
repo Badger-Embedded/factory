@@ -80,6 +80,8 @@ struct FakeExecutor {
     current_head: Mutex<Option<String>>,
     head_pushed_at: Mutex<Option<String>>,
     fix_merged_at: Mutex<Option<String>>,
+    /// Errors the fake gives the next reads of a merged fix pull request.
+    fix_read_errors: Mutex<VecDeque<String>>,
     /// Each rebase request as `(number, head)`.
     rebase_calls: Mutex<Vec<(u64, String)>>,
     /// The files the merged pull request changed.
@@ -135,6 +137,7 @@ impl FakeExecutor {
             current_head: Mutex::new(None),
             head_pushed_at: Mutex::new(None),
             fix_merged_at: Mutex::new(None),
+            fix_read_errors: Mutex::new(VecDeque::new()),
             rebase_calls: Mutex::new(Vec::new()),
             pr_files: Mutex::new(Vec::new()),
             gathered: Mutex::new(Vec::new()),
@@ -452,6 +455,9 @@ impl Executor for FakeExecutor {
         _repo: &str,
         _number: u64,
     ) -> Result<Option<String>, String> {
+        if let Some(err) = self.fix_read_errors.lock().unwrap().pop_front() {
+            return Err(err);
+        }
         Ok(Some(
             self.fix_merged_at
                 .lock()
@@ -6444,4 +6450,51 @@ async fn a_missing_project_token_on_a_factory_step_fails_the_job() {
         "{reason}"
     );
     assert_eq!(executor.published.lock().unwrap().len(), published);
+}
+
+#[tokio::test]
+async fn a_refused_token_reading_a_merged_fix_fails_the_job_and_retry_resumes_the_read() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    executor
+        .fix_read_errors
+        .lock()
+        .unwrap()
+        .push_back(credential_failure("the token was refused"));
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        matches!(store.get(id).unwrap().job.stage(), Stage::Failed { .. })
+    })
+    .await;
+    assert!(executor.rebase_calls.lock().unwrap().is_empty());
+
+    store.apply(id, Event::Retry).unwrap();
+    step_until(&scheduler, || {
+        !executor.rebase_calls.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_token_asking_for_a_rebase_fails_the_job_and_retry_asks_again() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    executor
+        .rebases
+        .lock()
+        .unwrap()
+        .push_back(Err(credential_failure("the token was refused")));
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        matches!(store.get(id).unwrap().job.stage(), Stage::Failed { .. })
+    })
+    .await;
+    assert_ne!(needs_you(&store, id), Some(RenovateWait::RebaseFailed));
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+
+    store.apply(id, Event::Retry).unwrap();
+    step_until(&scheduler, || {
+        event_names(&store, id).contains(&"rebase-requested".to_owned())
+    })
+    .await;
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 2);
 }

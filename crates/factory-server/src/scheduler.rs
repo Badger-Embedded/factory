@@ -1840,7 +1840,16 @@ impl<E: Executor> Scheduler<E> {
             match self.merge_head(request, fix_id).await {
                 Ok(merged) => outcome = merged,
                 Err(err) => {
-                    tracing::warn!("reading the head of #{}: {err}", request.number);
+                    if let Some(reason) = credential_reason(&err) {
+                        self.apply(
+                            job_id,
+                            Event::FactoryFailed {
+                                reason: reason.to_owned(),
+                            },
+                        );
+                    } else {
+                        tracing::warn!("reading the head of #{}: {err}", request.number);
+                    }
                     return;
                 }
             }
@@ -1975,6 +1984,15 @@ impl<E: Executor> Scheduler<E> {
             Ok(Rebase::NoCheckbox) => Event::RebaseFailed {
                 reason: format!("#{number} has no rebase checkbox"),
             },
+            Err(err) if credential_reason(&err).is_some() => {
+                // The forge refused the credential, so nothing was written and Retry may ask again.
+                if let Err(err) = self.store.release_rebase_claim(job_id) {
+                    tracing::error!("releasing the rebase claim of job #{job_id}: {err}");
+                }
+                Event::FactoryFailed {
+                    reason: credential_reason(&err).unwrap_or_default().to_owned(),
+                }
+            }
             Err(reason) => {
                 self.note(
                     job_id,

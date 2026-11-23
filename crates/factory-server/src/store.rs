@@ -1100,6 +1100,18 @@ impl Store {
         })
     }
 
+    /// Drops the claim of Renovate job `job_id`, for a request the forge
+    /// refused before any write.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn release_rebase_claim(&self, job_id: i64) -> Result<(), StoreError> {
+        self.conn()
+            .execute("DELETE FROM rebase_claims WHERE job_id = ?1", [job_id])?;
+        Ok(())
+    }
+
     /// When the factory first saw `head` on Renovate job `job_id`'s pull
     /// request, as SQLite's `CURRENT_TIMESTAMP` writes it. The head was the
     /// head by then.
