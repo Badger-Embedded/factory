@@ -186,7 +186,7 @@ fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/settings/gates", get(show_gates).post(save_gates))
         .route(
             "/settings/github",
-            get(redirect_polling).post(redirect_polling),
+            get(redirect_polling_get).post(redirect_polling_post),
         )
         .route("/settings/polling", get(show_polling).post(save_polling))
         .route("/settings/renovate", get(show_renovate).post(save_renovate))
@@ -1839,12 +1839,18 @@ async fn show_claude(
     claude_page(&state, &headers, None)
 }
 
-/// Sends the old Claude account URL to the agent's page under Agents, so a
-/// bookmark or a link made before the move still lands on the token card.
-async fn redirect_polling() -> Redirect {
+/// Sends the old GitHub settings URL to the polling page. A POST keeps its
+/// method and body, so a form opened before the move still saves.
+async fn redirect_polling_get() -> Redirect {
     Redirect::to("/settings/polling")
 }
 
+async fn redirect_polling_post() -> Redirect {
+    Redirect::temporary("/settings/polling")
+}
+
+/// Sends the old Claude account URL to the agent's page under Agents, so a
+/// bookmark or a link made before the move still lands on the token card.
 async fn redirect_claude() -> Redirect {
     Redirect::to("/settings/agents/claude")
 }

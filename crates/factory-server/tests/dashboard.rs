@@ -9410,14 +9410,18 @@ async fn the_old_claude_url_redirects_to_the_agent_page() {
 #[tokio::test]
 async fn the_old_github_url_redirects_to_the_polling_page() {
     let dashboard = dashboard();
-    for reply in [
-        dashboard.get("/settings/github").await,
-        dashboard.post("/settings/github", "poll_seconds=30").await,
-    ] {
-        assert_eq!(reply.status, StatusCode::SEE_OTHER);
-        assert_eq!(reply.location.as_deref(), Some("/settings/polling"));
-    }
-    assert_ne!(dashboard.store.settings().unwrap().poll_seconds, 30);
+    let reply = dashboard.get("/settings/github").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/settings/polling"));
+
+    // A form opened before the move posts to the old path and still saves.
+    let reply = dashboard.post("/settings/github", "poll_seconds=30").await;
+    assert_eq!(reply.status, StatusCode::TEMPORARY_REDIRECT);
+    let target = reply.location.unwrap();
+    assert_eq!(target, "/settings/polling");
+    let reply = dashboard.post(&target, "poll_seconds=30").await;
+    assert!(reply.body.contains("Saved."));
+    assert_eq!(dashboard.store.settings().unwrap().poll_seconds, 30);
 }
 
 #[tokio::test]
