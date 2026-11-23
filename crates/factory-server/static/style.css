@@ -420,6 +420,7 @@ select:focus, textarea:focus, button:focus-visible { outline: var(--focus-ring);
 .field > .label { display: block; font-weight: var(--weight-semibold); margin: 0 0 var(--space-6); }
 .mcp-header-row, .mcp-arg-row { display: flex; gap: var(--space-8); align-items: center; margin-bottom: var(--space-8); }
 .mcp-header-row > .grow, .mcp-arg-row > .grow { flex: 1 1 auto; }
+.mcp-command-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 .mcp-headers + .add-header, .mcp-args + .add-arg { margin-bottom: var(--space-6); }
 .kind-choice { border: 0; padding: 0; margin: 0 0 var(--space-14); }
 .kind-choice label { margin-right: var(--space-14); }

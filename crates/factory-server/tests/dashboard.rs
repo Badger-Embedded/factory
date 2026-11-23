@@ -10384,7 +10384,7 @@ async fn a_remote_servers_project_page_has_no_extra_arguments() {
     let reply = dashboard
         .post(
             "/settings/projects/maestro/mcp/context7",
-            "mcp.context7.enabled=on&mcp.context7.stage.spec=on&arg=--headless",
+            "mcp.context7.enabled=on&mcp.context7.stage.spec=on&arg=--headless&arg_escaped=a%5Cx",
         )
         .await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -10422,7 +10422,6 @@ async fn extra_arguments_are_saved_in_order_and_shown_in_the_command_line() {
         page.contains("npx -y @playwright/mcp@0.0.83 --headless --viewport-size=1280x720 'a b'")
     );
 
-    // Off keeps the list.
     dashboard.post(uri, "arg=--headless").await;
     assert!(
         !dashboard

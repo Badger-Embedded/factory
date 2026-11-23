@@ -2313,9 +2313,6 @@ pub fn settings_project_mcp(
     )
 }
 
-/// The part of a stdio server's project block below the stage checkboxes: the
-/// command and base arguments read-only, the project's extra arguments, and the
-/// command line a run starts.
 fn stdio_block(stdio: &StdioSettings) -> Markup {
     let line = std::iter::once(&stdio.command)
         .chain(&stdio.args)
@@ -2349,7 +2346,7 @@ fn stdio_block(stdio: &StdioSettings) -> Markup {
             }
             template { (arg_row("")) }
             button.add-arg type="button" { "Add argument" }
-            p.hint { "Appended after the server's own arguments, in this order, for this project's runs only. The agent can read them, so no secret belongs here. An argument is passed as one value, with no shell splitting, and may not contain ${. A change applies at the job's next run." }
+            p.hint { "Appended after the server's own arguments, in this order, for this project's runs only. The agent can read them, so no secret belongs here. An argument is passed as one value, with no shell splitting, and may not contain ${. Runs do not start stdio servers yet, so a saved list takes effect once worker support lands." }
         }
         div.field {
             span.label { "Command line a run starts" }
@@ -2359,8 +2356,15 @@ fn stdio_block(stdio: &StdioSettings) -> Markup {
     }
 }
 
-/// `part` as a shell word, so the preview shows where one argument ends.
 fn shell_quote(part: &str) -> String {
+    if part.contains(['\r', '\n']) {
+        let escaped = part
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\r', "\\r")
+            .replace('\n', "\\n");
+        return format!("$'{escaped}'");
+    }
     let plain = !part.is_empty()
         && part
             .bytes()

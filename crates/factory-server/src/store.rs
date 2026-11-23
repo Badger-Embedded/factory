@@ -4458,11 +4458,11 @@ impl Store {
     }
 
     /// The extra arguments `project` appends after the base arguments of the
-    /// stdio server `server`, in order. Empty when none are stored.
+    /// stdio server `server`, in order. Empty when no row is stored.
     ///
     /// # Errors
     ///
-    /// Fails on a database error.
+    /// Fails on a database error or when the stored list is not valid JSON.
     pub fn project_mcp_args(&self, project: &str, server: &str) -> Result<Vec<String>, StoreError> {
         let stored: Option<String> = self
             .conn()
@@ -4472,9 +4472,10 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(stored
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default())
+        match stored {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Saves `project`'s extra arguments for `server`, writing only this row.

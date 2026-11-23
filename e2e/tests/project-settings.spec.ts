@@ -707,6 +707,8 @@ test('a stdio MCP server takes extra arguments, keeps them when off and shows in
   await args.last().fill('--viewport-size=1280x720');
   await args.nth(1).fill('--junk');
   await page.getByRole('button', { name: 'Remove' }).nth(1).click();
+  await page.getByRole('button', { name: 'Add argument' }).click();
+  await args.last().fill('a  b');
   await expect(page.getByText('Unsaved changes.')).toBeVisible();
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
@@ -714,7 +716,8 @@ test('a stdio MCP server takes extra arguments, keeps them when off and shows in
   await page.goto(path);
   await expect(args.nth(0)).toHaveValue('--headless');
   await expect(args.nth(1)).toHaveValue('--viewport-size=1280x720');
-  await expect(line).toHaveText('playwright-mcp --no-sandbox --headless --viewport-size=1280x720');
+  await expect(line).toHaveText("playwright-mcp --no-sandbox --headless --viewport-size=1280x720 'a  b'");
+  expect(await line.evaluate((el) => getComputedStyle(el).whiteSpace)).toBe('pre-wrap');
 
   await enable.uncheck();
   await page.getByRole('button', { name: 'Save', exact: true }).click();

@@ -3383,14 +3383,14 @@ async fn save_project_mcp(
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
     let registered = project_and_server(&state, &headers, &project, &server)?;
-    // The extra arguments are a repeated field, which the map below would
-    // collapse, so they are read from the pairs in order.
     let mut extra_args = Vec::new();
-    for (key, value) in &pairs {
-        match key.as_str() {
-            "arg" => extra_args.push(value.clone()),
-            "arg_escaped" => extra_args.push(unescape_arg(value)?),
-            _ => {}
+    if registered.as_stdio().is_some() {
+        for (key, value) in &pairs {
+            match key.as_str() {
+                "arg" => extra_args.push(value.clone()),
+                "arg_escaped" => extra_args.push(unescape_arg(value)?),
+                _ => {}
+            }
         }
     }
     let form = ProjectForm(pairs.into_iter().collect());
