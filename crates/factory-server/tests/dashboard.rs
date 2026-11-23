@@ -14454,23 +14454,27 @@ async fn a_display_name_save_waits_for_a_running_onboarding() {
     seed_user_token(&store, "bob@example.com");
     let dashboard = dashboard_with(Arc::clone(&store));
     let pass = dashboard.slots.lock_pass().await;
-    let wait = |ms| tokio::time::sleep(std::time::Duration::from_millis(ms));
     let onboard = dashboard.post_as(
         "bob@example.com",
         "/onboard",
         "repo=acme%2Ffresh&name=fresh&action=skip",
     );
-    let save = async {
-        wait(100).await;
-        name_post(&dashboard, USER, "fresh").await
-    };
-    let release = async {
-        wait(400).await;
-        assert_eq!(store.project_shown_name("maestro").unwrap(), "maestro");
-        assert!(store.project("fresh").unwrap().is_none());
-        drop(pass);
-    };
-    let (onboarded, saved, ()) = tokio::join!(onboard, save, release);
+    let save = name_post(&dashboard, USER, "fresh");
+    tokio::pin!(onboard, save);
+    // Onboarding stops at the held pass lock, after its name check.
+    for _ in 0..20 {
+        let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(onboard.as_mut().poll(cx)));
+        assert!(polled.await.is_pending());
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..20 {
+        let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(save.as_mut().poll(cx)));
+        assert!(polled.await.is_pending(), "the save ran during onboarding");
+        tokio::task::yield_now().await;
+    }
+    assert!(store.project("fresh").unwrap().is_none());
+    drop(pass);
+    let (onboarded, saved) = tokio::join!(onboard, save);
     assert_eq!(onboarded.status, StatusCode::SEE_OTHER);
     assert!(saved.body.contains("already exists"));
     assert_eq!(store.project_shown_name("maestro").unwrap(), "maestro");
