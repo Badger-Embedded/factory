@@ -2522,6 +2522,34 @@ fn read_access_sends_failed_ci_to_the_failure_analysis_with_no_rerun() {
 }
 
 #[test]
+fn retry_after_a_read_only_stop_returns_to_a_fresh_watch_when_the_rerun_is_denied() {
+    let mut job = renovate_job();
+    observe_as(&mut job, "h1", failed("log"), false, read_only());
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "registry timeout".into(),
+        }),
+    );
+    post_comment(&mut job);
+    waits(&job, RenovateWait::Stopped);
+
+    apply(&mut job, Event::Retry);
+    assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+    apply(&mut job, Event::RerunDenied);
+    assert_eq!(job.turn(), &Turn::Factory);
+
+    observe_as(&mut job, "h1", failed("log"), false, read_only());
+    assert_runs(
+        &job,
+        Session::Renovate(2),
+        Task::AnalyzeFailure { log: "log".into() },
+    );
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (0, 0));
+}
+
+#[test]
 fn a_transient_verdict_on_read_access_comments_and_stops_until_a_new_head() {
     let mut job = renovate_job();
     observe_as(&mut job, "h1", failed("log"), false, read_only());
@@ -2539,7 +2567,6 @@ fn a_transient_verdict_on_read_access_comments_and_stops_until_a_new_head() {
     waits(&job, RenovateWait::Stopped);
     assert!(!matches!(job.turn(), Turn::RerunCi { .. }));
 
-    // The same head stays stopped, and a new head starts triage again.
     observe_as(&mut job, "h1", failed("log"), false, read_only());
     waits(&job, RenovateWait::Stopped);
     observe_as(
@@ -2575,7 +2602,6 @@ fn read_access_with_auto_merge_waits_as_ready_and_names_the_account() {
         Some(Command::MergeRenovate { .. })
     ));
 
-    // Write granted: the next observation merges it.
     observe_as(
         &mut job,
         "h1",

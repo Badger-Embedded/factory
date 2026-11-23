@@ -1244,6 +1244,9 @@ pub enum Event {
     /// The failed check of a Renovate pull request has no Actions run to
     /// rerun, so no rerun happened and no count changes.
     NothingToRerun,
+    /// The project account may not rerun CI now. No rerun happened, so the
+    /// job watches again and reads the access afresh.
+    RerunDenied,
     /// The approval or the merge of a Renovate head failed. The job goes back
     /// to watching, so the next look sees the current head and state.
     MergeFailed,
@@ -1946,6 +1949,10 @@ impl Job {
                  leaves this pull request to a person."
                     .to_owned(),
             ),
+            (Turn::RerunCi { .. }, E::RerunDenied) => {
+                pr.pending = None;
+                Turn::Factory
+            }
             (Turn::Factory, E::MergeFailed) => {
                 if pr.pending.take() != Some(Pending::Merge) {
                     return Err(self.unexpected(E::MergeFailed));

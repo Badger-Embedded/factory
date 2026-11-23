@@ -76,6 +76,11 @@ impl ForgeKind {
     }
 }
 
+/// Starts the error of a write the account may no longer make, read just
+/// before the write. The factory returns the job to watching instead of
+/// retrying the write.
+pub const NOT_PERMITTED: &str = "the account may not make this change: ";
+
 /// Starts the error of a forge or git command that failed because the forge
 /// refused the credentials. [`rejected_by_forge`] decides this from the
 /// command's own output, where the command runs.

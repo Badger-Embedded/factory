@@ -10,7 +10,7 @@ use factory_core::{
 };
 use factory_runner::{
     Account, Expect, ForgeAccount, ForgeKind, GitHub, HeadCommit, LogLine, McpUnavailable,
-    Observation, RenovatePr, Rerun, RunReport, TokenUsage, is_renovate_login,
+    NOT_PERMITTED, Observation, RenovatePr, Rerun, RunReport, TokenUsage, is_renovate_login,
 };
 use factory_server::{
     AccountSource, Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, FACTORY_REQUESTER,
@@ -5306,6 +5306,42 @@ async fn a_refused_token_before_a_merge_fails_the_job_and_retry_merges() {
     .await;
     assert_eq!(executor.approved.lock().unwrap().len(), 2);
     assert_eq!(*executor.merged.lock().unwrap(), [(7, "h1".to_owned())]);
+}
+
+#[tokio::test]
+async fn a_merge_the_account_may_no_longer_make_goes_back_to_watching_without_a_stop() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    executor
+        .merge_errors
+        .lock()
+        .unwrap()
+        .push_back(format!("{NOT_PERMITTED}bot may not merge #7."));
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert_eq!(executor.approved.lock().unwrap().len(), 2);
+    assert!(!is_failed(&store, id));
+}
+
+#[tokio::test]
+async fn a_rerun_the_account_may_no_longer_make_goes_back_to_watching_and_counts_nothing() {
+    let (store, executor, scheduler, id) = renovate_setup(transient_runs);
+    executor
+        .reruns
+        .lock()
+        .unwrap()
+        .push_back(Err(format!("{NOT_PERMITTED}bot needs Write access.")));
+    *executor.renovate_now.lock().unwrap() = failing("h1");
+    step_until(&scheduler, || {
+        executor.rerun_requests.lock().unwrap().len() >= 2
+    })
+    .await;
+    assert!(!is_failed(&store, id));
+    assert_eq!(needs_you(&store, id), None);
+    assert_eq!(pr_of(&store, id).reruns, 1);
 }
 
 #[tokio::test]

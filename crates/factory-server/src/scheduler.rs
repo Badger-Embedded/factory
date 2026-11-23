@@ -12,8 +12,8 @@ use factory_core::{
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport,
-    job_prompt,
+    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, NOT_PERMITTED, Observation, RenovatePr,
+    Rerun, RunReport, job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -2079,6 +2079,10 @@ impl<E: Executor> Scheduler<E> {
                     }
                 }
             }
+            Err(err) if err.starts_with(NOT_PERMITTED) => {
+                self.note(job_id, &format!("Did not merge #{number}: {err}"));
+                self.apply(job_id, Event::MergeFailed);
+            }
             Err(err) => {
                 // A credential failure stops the job with the merge pending,
                 // so Retry merges again. The merge event only applies to a job
@@ -2129,6 +2133,10 @@ impl<E: Executor> Scheduler<E> {
                     Event::CiRerun
                 };
                 self.apply(job_id, event);
+            }
+            Err(err) if renovate && err.starts_with(NOT_PERMITTED) => {
+                self.note(job_id, &format!("Did not rerun CI on #{number}: {err}"));
+                self.apply(job_id, Event::RerunDenied);
             }
             Err(err) => self.retry_later(settings, job_id, &err),
         }

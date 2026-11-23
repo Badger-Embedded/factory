@@ -722,6 +722,32 @@ test('a job page links its Renovate pull request through the forge', async ({ pa
   await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
 });
 
+test('a safe Renovate pull request on a Read-only account waits as ready to merge and names the account', async ({
+  page,
+  factory,
+  project,
+}) => {
+  const id = factory.fixture('renovate', '--project', project, '--number', '7', '--url', 'https://stored.example/pull/7');
+  factory.fixture('apply', '--job', id, '--event', 'renovate-read-ready');
+  await page.goto(`/jobs/${id}`);
+
+  await expect(page.getByText('Ready to merge').first()).toBeVisible();
+  const detail = page.locator('.status-detail');
+  await expect(detail).toContainText('project-bot');
+  await expect(detail).toContainText('Write');
+  await expect(page.getByRole('button', { name: 'Retry' })).toHaveCount(0);
+});
+
+test('a transient failure on a Read-only account stops triage and offers Retry', async ({ page, factory, project }) => {
+  const id = factory.fixture('renovate', '--project', project, '--number', '7', '--url', 'https://stored.example/pull/7');
+  factory.fixture('apply', '--job', id, '--event', 'renovate-read-transient');
+  await page.goto(`/jobs/${id}`);
+
+  await expect(page.getByText('Triage stopped')).toBeVisible();
+  await expect(page.locator('.status-detail')).toContainText('cannot rerun CI without Write');
+  await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+});
+
 test('a stopped Renovate job starts a fix job and links to it', async ({ page, factory, project }) => {
   const id = factory.fixture(
     'renovate',

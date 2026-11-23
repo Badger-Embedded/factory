@@ -7,13 +7,13 @@ use std::time::SystemTime;
 
 use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateAccess, RenovateCi};
 use factory_runner::{
-    Access, BranchSummary, Ci, Credential, ForgeKind, Git, HeadCommit, Observation, PrState,
-    RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun,
-    backend, observe, place_files, place_images, remove_container, run, run_checks, show_files,
-    show_images,
+    Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, NOT_PERMITTED,
+    Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun,
+    WorkerConfig, WorkerRun, backend, observe, place_files, place_images, remove_container, run,
+    run_checks, show_files, show_images,
 };
 
-use crate::accounts::{AccountSource, blame, credential_reason};
+use crate::accounts::{AccountSource, Operation, blame, credential_reason};
 use crate::forges::Forges;
 use crate::registry::AgentRegistry;
 use crate::scheduler::{
@@ -521,6 +521,12 @@ impl Executor for PodmanExecutor {
 
     async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
         let operation = request.account.resolve()?;
+        require_write(
+            &operation,
+            self.forges.forge(request.forge).as_ref(),
+            &request.repo,
+        )
+        .await?;
         blame(
             &operation.owner,
             self.forges
@@ -668,6 +674,7 @@ impl Executor for PodmanExecutor {
     ) -> Result<(), String> {
         let forge = self.forges.forge(forge);
         let approver = account.resolve()?;
+        require_merge(&approver, forge.as_ref(), repo, number).await?;
         blame(
             &approver.owner,
             forge
@@ -675,6 +682,7 @@ impl Executor for PodmanExecutor {
                 .await,
         )?;
         let merger = account.resolve()?;
+        require_merge(&merger, forge.as_ref(), repo, number).await?;
         blame(
             &merger.owner,
             forge.merge_head(&merger.account, repo, number, head).await,
@@ -913,4 +921,47 @@ fn version_field(line: &str) -> Option<(String, String)> {
     let key = key.trim();
     let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
     (VERSION_KEYS.contains(&key) && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
+}
+
+/// Fails with [`NOT_PERMITTED`] unless the account of `operation` has Write
+/// in `repo` now.
+async fn require_write(operation: &Operation, forge: &dyn Forge, repo: &str) -> Result<(), String> {
+    let level = blame(
+        &operation.owner,
+        forge.access(&operation.account, repo).await,
+    )?;
+    if matches!(level, Access::Write | Access::Admin) {
+        return Ok(());
+    }
+    Err(format!(
+        "{NOT_PERMITTED}{} needs Write access to {repo}.",
+        operation.account.login
+    ))
+}
+
+/// Fails with [`NOT_PERMITTED`] unless the account of `operation` may merge
+/// pull request `number` now.
+async fn require_merge(
+    operation: &Operation,
+    forge: &dyn Forge,
+    repo: &str,
+    number: u64,
+) -> Result<(), String> {
+    let level = blame(
+        &operation.owner,
+        forge.access(&operation.account, repo).await,
+    )?;
+    let may = blame(
+        &operation.owner,
+        forge
+            .may_merge(&operation.account, repo, number, level)
+            .await,
+    )?;
+    if may {
+        return Ok(());
+    }
+    Err(format!(
+        "{NOT_PERMITTED}{} may not merge #{number} in {repo}.",
+        operation.account.login
+    ))
 }

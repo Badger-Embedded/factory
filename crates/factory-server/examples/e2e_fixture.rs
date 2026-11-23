@@ -24,7 +24,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    AgentResult, Event, FixOutcome, PlannedPr, PrDescription, Question, RenovateCi, RetryLimits,
+    AgentResult, DiffVerdict, Event, FixOutcome, PlannedPr, PrDescription, Question,
+    RenovateAccess, RenovateCi, RetryLimits,
 };
 use factory_runner::ForgeKind;
 use factory_server::Store;
@@ -149,8 +150,50 @@ fn events_named(name: &str) -> Result<Vec<Event>> {
             },
             Event::Commented,
         ],
+        "renovate-read-transient" => vec![
+            renovate_read(RenovateCi::Failed {
+                log: "registry timeout".into(),
+            }),
+            Event::Agent(AgentResult::FailureVerdict {
+                transient: true,
+                reason: "registry timeout".into(),
+            }),
+            Event::Commented,
+        ],
+        "renovate-read-ready" => vec![
+            renovate_read(RenovateCi::Passed {
+                details: Some(Box::new(factory_core::PrDiff {
+                    diff: "+serde = 1.0.2".into(),
+                    body: "Bumps serde".into(),
+                })),
+            }),
+            Event::Agent(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+                safe: true,
+                reason: "only a version changes".into(),
+                summary: "Bumps serde".into(),
+                from: None,
+                to: None,
+            }))),
+            renovate_read(RenovateCi::Passed { details: None }),
+        ],
         other => return Err(format!("unknown event {other}").into()),
     })
+}
+
+/// An observation by a project account that has Read access only, with
+/// auto-merge on.
+fn renovate_read(ci: RenovateCi) -> Event {
+    Event::RenovateObserved {
+        head: "abc1234".into(),
+        ci,
+        limits: RetryLimits { auto: 3, total: 7 },
+        auto_merge: true,
+        access: Box::new(RenovateAccess {
+            can_rerun: false,
+            can_merge: false,
+            account: "project-bot".into(),
+        }),
+    }
 }
 
 fn create_job(
