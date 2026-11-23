@@ -550,7 +550,7 @@ impl Executor for PodmanExecutor {
             &operation.owner,
             self.forges
                 .forge(forge)
-                .renovate_prs(&operation.account, repo, base)
+                .renovate_prs(&operation.account, repo, base, None)
                 .await,
         )
     }
@@ -631,6 +631,9 @@ impl Executor for PodmanExecutor {
                             .pr_details(&reader.account, &request.repo, request.number)
                             .await,
                     )?;
+                    if details.head != status.head {
+                        return Ok(None);
+                    }
                     Some(Box::new(PrDiff {
                         diff: details.diff,
                         body: details.body,

@@ -31,6 +31,7 @@
             gitleaks
             just
             nodejs
+            glab
           ];
 
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";

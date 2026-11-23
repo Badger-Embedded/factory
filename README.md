@@ -26,6 +26,7 @@ Run the browser tests with `nix develop -c just e2e`. They start their own serve
 | `FACTORY_WORKER_VOLUMES` | unset | Space-separated `--volume` values for every worker, such as `factory-nix:/nix` |
 | `GH_TOKEN` | unset | Read once at startup to give each existing GitHub project that token as its project token, when the secret store is available. Jobs and onboarding do not use it. Workers never get it. |
 | `FACTORY_GH` | `gh` | The GitHub CLI |
+| `FACTORY_GLAB` | `glab` | The GitLab CLI, used for Salsa projects |
 | `FACTORY_MCP_CA_FILE` | unset | PEM file of extra root certificates that the MCP connection check and the MCP proxy trust next to the built-in roots, for a server whose certificate is not from a public CA. The factory stops at startup if the file cannot be read. |
 
 The worker limit, image, memory and CPUs are settings stored in the database. The job loop reads them on every pass.

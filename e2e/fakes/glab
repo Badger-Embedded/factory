@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Stands in for the GitLab CLI. The browser tests never reach Salsa.
+if [ "$1" = api ] && [ "$GITLAB_HOST" = salsa.debian.org ]; then
+  case "$2 $3" in
+    "--method GET")
+      if [ "$4" = user ]; then
+        case "$GITLAB_TOKEN" in
+          tok-e2e-deb)
+            echo '{"id":7,"username":"deb-bot"}'
+            exit 0
+            ;;
+        esac
+        echo "glab: 401 Unauthorized (HTTP 401)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+echo "glab: unexpected call: $*" >&2
+exit 1

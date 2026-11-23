@@ -80,6 +80,7 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     FACTORY_ADMINS: ADMIN,
     FACTORY_MASTER_KEY: randomBytes(32).toString('hex'),
     FACTORY_GH: path.join(__dirname, 'fakes', 'gh'),
+    FACTORY_GLAB: path.join(__dirname, 'fakes', 'glab'),
     FACTORY_PODMAN: path.join(__dirname, 'fakes', 'podman'),
     FACTORY_MCP_CA_FILE: path.join(tls, 'ca.pem'),
   };

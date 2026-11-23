@@ -3,7 +3,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_runner::{ForgeKind, Git, GitHub, WorkerConfig};
+use factory_runner::{ForgeKind, Git, GitHub, GitLab, WorkerConfig};
 use factory_server::{
     Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, HttpMcpChecker,
     LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor,
@@ -233,7 +233,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(GhRepos {
             gh: path_var("FACTORY_GH", "gh"),
         }),
-    );
+    )
+    .with_salsa(Arc::new(GitLab {
+        glab: path_var("FACTORY_GLAB", "glab"),
+        host: ForgeKind::Salsa.host().into(),
+        ..GitLab::default()
+    }));
 
     if let Some(token) = gh_token() {
         factory_server::forge_tokens::copy_gh_token(

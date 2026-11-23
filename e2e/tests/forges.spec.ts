@@ -69,6 +69,19 @@ test('two logins see only their own token', async ({ browser, own }) => {
   await expect(dave.locator('.forge-account')).toHaveText('bob-bot');
 });
 
+test('a Salsa token is checked against Salsa and saved', async ({ page }) => {
+  await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': COLLABORATOR });
+  await page.goto('/settings/forges/salsa');
+  await page.getByLabel('Token').fill('tok-e2e-wrong');
+  await page.getByRole('button', { name: 'Save token' }).click();
+  await expect(page.getByText('Salsa rejected the token. Nothing was saved.')).toBeVisible();
+
+  await page.getByLabel('Token').fill('tok-e2e-deb');
+  await page.getByRole('button', { name: 'Save token' }).click();
+  await expect(page.getByText('Saved. The token belongs to deb-bot.')).toBeVisible();
+  expect(await page.content()).not.toContain('tok-e2e-deb');
+});
+
 test('the sidebar lists the forges and an unknown forge is a 404', async ({ page }) => {
   await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': COLLABORATOR });
   await page.goto('/settings/notifications');

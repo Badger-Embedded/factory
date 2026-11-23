@@ -1152,3 +1152,43 @@ async fn a_rerun_and_a_merge_check_the_access_of_the_account_they_resolve() {
         assert!(!err.starts_with(factory_runner::NOT_PERMITTED), "{err}");
     }
 }
+
+#[tokio::test]
+async fn a_push_between_the_status_and_the_diff_polls_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, _) = access_executor(dir.path(), "h2");
+    let view = |head: &str| {
+        serde_json::json!({
+            "state": "OPEN",
+            "title": "Update app",
+            "body": "",
+            "headRefOid": head,
+            "files": [{"path": "a"}],
+            "statusCheckRollup": [{"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        })
+        .to_string()
+    };
+    std::fs::write(dir.path().join("first.json"), view("h2")).unwrap();
+    std::fs::write(dir.path().join("later.json"), view("h3")).unwrap();
+    let gh = dir.path().join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/bash\ncase \"$*\" in\n\
+             \"pr view\"*) if [ -f '{n}' ]; then cat '{later}'; else touch '{n}'; cat '{first}'; fi;;\n\
+             \"pr diff\"*) echo 'diff';;\n\
+             \"api repos/o/r --hostname github.com\") echo '{WRITE_ACCESS}';;\n\
+             esac\n",
+            n = dir.path().join("seen").display(),
+            first = dir.path().join("first.json").display(),
+            later = dir.path().join("later.json").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let event = podman.watch_renovate(renovate_watch(false)).await.unwrap();
+    assert_eq!(event, None);
+}

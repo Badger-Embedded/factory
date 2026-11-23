@@ -1,6 +1,6 @@
 //! The interface to a git forge: pull requests, checks and the credentials
-//! git needs to clone and push. [`GitHub`](crate::GitHub) is its only
-//! implementation.
+//! git needs to clone and push. [`GitHub`](crate::GitHub) and
+//! [`GitLab`](crate::GitLab) implement it.
 //!
 //! Every call takes the [`Account`] it runs as, so the caller picks the
 //! account per operation and the forge holds no token of its own.
@@ -22,6 +22,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForgeKind {
     GitHub,
+    Salsa,
 }
 
 impl ForgeKind {
@@ -30,17 +31,19 @@ impl ForgeKind {
     pub fn as_str(self) -> &'static str {
         match self {
             ForgeKind::GitHub => "github",
+            ForgeKind::Salsa => "salsa",
         }
     }
 
     /// Every kind, in the order the pages list them.
-    pub const ALL: [ForgeKind; 1] = [ForgeKind::GitHub];
+    pub const ALL: [ForgeKind; 2] = [ForgeKind::GitHub, ForgeKind::Salsa];
 
     /// The name pages show for the kind.
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
             ForgeKind::GitHub => "GitHub",
+            ForgeKind::Salsa => "Salsa",
         }
     }
 
@@ -49,6 +52,7 @@ impl ForgeKind {
     pub fn host(self) -> &'static str {
         match self {
             ForgeKind::GitHub => "github.com",
+            ForgeKind::Salsa => "salsa.debian.org",
         }
     }
 
@@ -63,7 +67,30 @@ impl ForgeKind {
     pub fn pr_url(self, repo: &str, number: u64) -> String {
         match self {
             ForgeKind::GitHub => format!("{}/pull/{number}", self.web_url(repo)),
+            ForgeKind::Salsa => format!("{}/-/merge_requests/{number}", self.web_url(repo)),
         }
+    }
+
+    /// Whether `repo` has the form the kind's repositories have: `owner/name`
+    /// on GitHub, and the full project path of two or more segments on Salsa.
+    /// Each segment is non-empty and holds only letters, digits, `-`, `_` and
+    /// `.`, and is not `.` or `..`.
+    #[must_use]
+    pub fn valid_repo(self, repo: &str) -> bool {
+        let segments: Vec<&str> = repo.split('/').collect();
+        let count_ok = match self {
+            ForgeKind::GitHub => segments.len() == 2,
+            ForgeKind::Salsa => segments.len() >= 2,
+        };
+        count_ok
+            && segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && *segment != "."
+                    && *segment != ".."
+                    && segment
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            })
     }
 
     /// The kind named `name`, or `None` for an unknown name.
@@ -71,6 +98,7 @@ impl ForgeKind {
     pub fn parse(name: &str) -> Option<ForgeKind> {
         match name {
             "github" => Some(ForgeKind::GitHub),
+            "salsa" => Some(ForgeKind::Salsa),
             _ => None,
         }
     }
@@ -169,7 +197,7 @@ pub enum Access {
 
 /// What the factory asks of a forge. Errors are the forge CLI's message.
 pub trait Forge: Send + Sync {
-    /// Where `repo` (`owner/name`) is cloned from.
+    /// Where `repo` is cloned from.
     fn clone_url(&self, repo: &str) -> String;
 
     /// The account `token` belongs to, read by calling the forge as that
@@ -244,12 +272,15 @@ pub trait Forge: Send + Sync {
         number: u64,
     ) -> BoxFuture<'a, Result<(), String>>;
 
-    /// The open pull requests that Renovate made against `base`.
+    /// The open pull requests that Renovate made against `base`. `author` is
+    /// the account Renovate runs as. GitHub has a fixed Renovate account and
+    /// ignores it, and a forge without one fails when it is `None`.
     fn renovate_prs<'a>(
         &'a self,
         account: &'a Account,
         repo: &'a str,
         base: &'a str,
+        author: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Vec<RenovatePr>, String>>;
 
     /// The title, description, head and files of a pull request.
