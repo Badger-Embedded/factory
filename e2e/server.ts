@@ -16,6 +16,8 @@ export const SHARED_PROJECT = 'maestro';
 export interface Factory {
   url: string;
   db: string;
+  /** Holds `ca.pem`, `cert.pem` and `key.pem`; the server trusts `ca.pem` for MCP servers. */
+  tls: string;
   /** Runs `e2e_fixture` against the server's database and returns its output. */
   fixture(...args: string[]): string;
 }
@@ -54,7 +56,14 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     execFileSync(path.join(target, 'examples', 'e2e_fixture'), [...args, '--db', db], {
       encoding: 'utf8',
     }).trim();
-  fixture('seed');
+  const tls = path.join(dir, 'tls');
+  try {
+    fixture('seed');
+    fixture('tls', '--dir', tls);
+  } catch (error) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
 
   const port = await freePort();
   const proxyPort = await freePort();
@@ -71,6 +80,7 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     FACTORY_MASTER_KEY: randomBytes(32).toString('hex'),
     FACTORY_GH: path.join(__dirname, 'fakes', 'gh'),
     FACTORY_PODMAN: path.join(__dirname, 'fakes', 'podman'),
+    FACTORY_MCP_CA_FILE: path.join(tls, 'ca.pem'),
   };
   delete env.FACTORY_WORKERS;
   delete env.GH_TOKEN;
@@ -100,5 +110,5 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     await cleanup();
     throw error;
   }
-  return { factory: { url, db, fixture }, stop: cleanup };
+  return { factory: { url, db, tls, fixture }, stop: cleanup };
 }
