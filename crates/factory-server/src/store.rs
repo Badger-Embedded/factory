@@ -3442,6 +3442,29 @@ impl Store {
         Ok(stored.unwrap_or(default))
     }
 
+    /// The saved auto-merge setting of every project `login` collaborates on,
+    /// in one read. A project without a saved row maps to `None`, and the
+    /// caller applies the project file default as [`Store::project_auto_merge`]
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_auto_merges(
+        &self,
+        login: &str,
+    ) -> Result<HashMap<String, Option<bool>>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.project, s.auto_merge
+             FROM project_collaborators c
+             LEFT JOIN project_settings s ON s.project = c.project
+             WHERE c.login = ?1",
+        )?;
+        let rows = stmt.query_map([login], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
     /// # Errors
     ///
     /// Fails on a database error.

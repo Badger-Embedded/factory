@@ -166,6 +166,7 @@ pub fn error(status: StatusCode, message: &str) -> Markup {
 pub fn index(
     user: &str,
     project_names: &[ProjectLabel],
+    attention: &[ProjectAttention],
     selected: Option<&str>,
     jobs: &[JobRow],
     costs: &HashMap<i64, f64>,
@@ -184,7 +185,7 @@ pub fn index(
         .collect();
     let nav = selected.map_or_else(
         || html! {},
-        |selected| project_selector(project_names, selected),
+        |selected| project_selector(project_names, attention, selected),
     );
     let links = Links::of(project);
     let problem = project.and_then(|project| project.forge.problem());
@@ -558,19 +559,137 @@ fn shown_name<'a>(labels: &'a [ProjectLabel], id: &'a str) -> &'a str {
         .map_or(id, |label| label.shown.as_str())
 }
 
-fn project_selector(labels: &[ProjectLabel], selected: &str) -> Markup {
+/// What a project asks of the reader, counted with the board's own lane
+/// function so a picker count equals the board's section count.
+pub struct ProjectAttention {
+    pub label: ProjectLabel,
+    /// The jobs in the project's Needs you section.
+    pub needs_you: usize,
+    /// The jobs in the project's Failed section.
+    pub failed: usize,
+    /// Whether any job is in the Agent or Factory lane.
+    pub running: bool,
+}
+
+impl ProjectAttention {
+    /// The group the picker sorts by, and the value of the row's
+    /// `data-attention`.
+    fn kind(&self) -> &'static str {
+        if self.needs_you > 0 {
+            "you"
+        } else if self.failed > 0 {
+            "failed"
+        } else if self.running {
+            "running"
+        } else {
+            "idle"
+        }
+    }
+}
+
+/// The picker's entries: one per project in `labels`, which the caller limits
+/// to the projects the login collaborates on, so a job of any other project
+/// adds to no count. `labels` come in shown-name order and the sort is stable,
+/// so each group keeps that order. A project missing from `auto_merge` counts
+/// its reviews as needing you.
+pub fn project_attention(
+    labels: &[ProjectLabel],
+    jobs: &[JobRow],
+    waits: &HashMap<i64, Wait>,
+    auto_merge: &HashMap<String, bool>,
+) -> Vec<ProjectAttention> {
+    let mut entries: Vec<ProjectAttention> = labels
+        .iter()
+        .map(|label| ProjectAttention {
+            label: label.clone(),
+            needs_you: 0,
+            failed: 0,
+            running: false,
+        })
+        .collect();
+    let index: HashMap<&str, usize> = labels
+        .iter()
+        .enumerate()
+        .map(|(at, label)| (label.id.as_str(), at))
+        .collect();
+    for row in jobs {
+        let Some(&at) = index.get(row.project.as_str()) else {
+            continue;
+        };
+        let merge = auto_merge.get(&row.project).copied().unwrap_or(false);
+        let entry = &mut entries[at];
+        match status(&row.job, merge, wait_of(waits, row.id)).lane {
+            Lane::You => entry.needs_you += 1,
+            Lane::Failed => entry.failed += 1,
+            Lane::Agent | Lane::Factory => entry.running = true,
+            Lane::Done => {}
+        }
+    }
+    entries.sort_by_key(|entry| match entry.kind() {
+        "you" => 0,
+        "failed" => 1,
+        "running" => 2,
+        _ => 3,
+    });
+    entries
+}
+
+fn project_selector(
+    labels: &[ProjectLabel],
+    attention: &[ProjectAttention],
+    selected: &str,
+) -> Markup {
     html! {
-        form.project-picker method="get" action="/" {
-            label.visually-hidden for="project" { "Project" }
-            select #project name="project" {
-                @for label in labels {
-                    option value=(label.id) selected[label.id == selected] { (label.shown) }
-                }
+        details.project-picker #project-picker {
+            summary role="button" aria-label="Project" aria-expanded="false" {
+                span.picker-current { (shown_name(labels, selected)) }
+                span.picker-chevron aria-hidden="true" {}
             }
-            noscript { button { "Go" } }
+            div.picker-panel {
+                (picker(attention, selected))
+            }
             script { (PreEscaped(PROJECT_PICKER)) }
         }
     }
+}
+
+/// The picker's project list. Only this list polls, so the `<details>` around
+/// it keeps its open state.
+pub fn picker(attention: &[ProjectAttention], selected: &str) -> Region {
+    let inner = html! {
+        @for entry in attention {
+            @let label = &entry.label;
+            li data-attention=(entry.kind()) data-id=(label.id) data-name=(label.shown) {
+                a href={ "/?project=" (crate::web::query_escape(&label.id)) }
+                    aria-current=[(label.id == selected).then_some("page")] {
+                    span.picker-name title=(label.shown) { (label.shown) }
+                    @if entry.needs_you > 0 {
+                        span.badge.you {
+                            (entry.needs_you)
+                            span.visually-hidden { " need you" }
+                        }
+                    }
+                    @if entry.failed > 0 {
+                        span.badge.bad {
+                            (entry.failed)
+                            span.visually-hidden { " failed" }
+                        }
+                    }
+                    @if entry.kind() == "running" {
+                        span.picker-running { span.visually-hidden { "running" } }
+                    }
+                }
+            }
+        }
+    };
+    let version = version_of(&inner);
+    let markup = html! {
+        ul #picker-list hx-get=(fragment_url("picker", selected, &version))
+            hx-trigger=(POLL_TRIGGER) hx-swap="outerHTML" {
+            (inner)
+        }
+    };
+    Region { version, markup }
 }
 
 /// A project's block on the settings page: its models, efforts and flags, and

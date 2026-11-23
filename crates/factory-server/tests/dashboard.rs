@@ -1050,10 +1050,7 @@ fn apply_all(store: &Store, id: i64, events: impl IntoIterator<Item = Event>) {
 async fn the_index_lists_jobs_and_flags_those_waiting_for_the_user() {
     let dashboard = dashboard();
     let page = dashboard.get("/").await;
-    assert!(
-        page.body
-            .contains("<option value=\"maestro\" selected>maestro</option>")
-    );
+    assert_current_project(&page.body, "maestro", "maestro");
     assert!(page.body.contains("name=\"project\" value=\"maestro\""));
 
     let id = dashboard.new_job().await;
@@ -3537,10 +3534,7 @@ async fn the_index_defaults_to_the_first_project() {
     dashboard.new_job().await;
     dashboard.post_job("tool", "Tool change", &[]).await;
     let page = dashboard.get("/").await;
-    assert!(
-        page.body
-            .contains("<option value=\"maestro\" selected>maestro</option>")
-    );
+    assert_current_project(&page.body, "maestro", "maestro");
     assert!(page.body.contains("Add a reboot button</a>"));
     assert!(!page.body.contains("Tool change"));
 }
@@ -3554,10 +3548,7 @@ async fn the_board_shows_only_the_selected_project() {
 
     let page = dashboard.get("/?project=tool").await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(
-        page.body
-            .contains("<option value=\"tool\" selected>tool</option>")
-    );
+    assert_current_project(&page.body, "tool", "tool");
     assert!(page.body.contains("Tool change"));
     assert!(!page.body.contains("Add a reboot button</a>"));
     assert!(!page.body.contains("class=\"inbox inbox-you\""));
@@ -3617,10 +3608,7 @@ async fn the_cookie_picks_the_project_after_a_visit_elsewhere() {
     assert!(project_cookie(&settings).is_none());
 
     let page = dashboard.get_with_cookie(USER, "/", &cookie).await;
-    assert!(
-        page.body
-            .contains("<option value=\"tool\" selected>tool</option>")
-    );
+    assert_current_project(&page.body, "tool", "tool");
     assert!(page.body.contains("Tool change"));
     assert!(project_cookie(&page).is_none());
 }
@@ -3631,10 +3619,7 @@ async fn an_explicit_project_beats_the_cookie() {
     let page = dashboard
         .get_with_cookie(USER, "/?project=maestro", "factory_project=tool")
         .await;
-    assert!(
-        page.body
-            .contains("<option value=\"maestro\" selected>maestro</option>")
-    );
+    assert_current_project(&page.body, "maestro", "maestro");
     assert_eq!(
         project_cookie(&page).as_deref(),
         Some("factory_project=maestro")
@@ -3664,11 +3649,7 @@ async fn a_stale_or_foreign_cookie_falls_back_to_the_first_project() {
     ] {
         let page = dashboard.get_with_cookie(USER, "/", cookie).await;
         assert_eq!(page.status, StatusCode::OK, "{cookie}");
-        assert!(
-            page.body
-                .contains("<option value=\"maestro\" selected>maestro</option>"),
-            "{cookie}"
-        );
+        assert_current_project(&page.body, "maestro", "maestro");
         assert!(project_cookie(&page).is_none());
     }
     let page = dashboard
@@ -3734,10 +3715,7 @@ async fn an_unusual_project_name_round_trips_through_the_cookie() {
     let uri = "/?project=my%20proj%3B%20%C3%A9%2Cx";
     let cookie = project_cookie(&dashboard.get(uri).await).unwrap();
     let page = dashboard.get_with_cookie(USER, "/", &cookie).await;
-    assert!(
-        page.body
-            .contains("<option value=\"my proj; é,x\" selected>my proj; é,x</option>")
-    );
+    assert_current_project(&page.body, "my%20proj%3B%20%C3%A9%2Cx", "my proj; é,x");
 }
 
 const STRANGER: &str = "mallory@example.com";
@@ -3750,8 +3728,7 @@ async fn a_non_collaborators_board_is_the_empty_state() {
         page.body
             .contains("You are not a collaborator on any project.")
     );
-    assert!(!page.body.contains("<select id=\"project\""));
-    assert!(!page.body.contains("<option"));
+    assert!(!page.body.contains("project-picker"));
     assert!(!page.body.contains("maestro"));
     assert!(page.body.contains("href=\"/onboard\""));
 }
@@ -3764,6 +3741,7 @@ async fn a_hidden_project_board_and_fragments_are_not_found() {
         "/fragments/board?project=maestro",
         "/fragments/stats?project=maestro",
         "/fragments/workers?project=maestro",
+        "/fragments/picker?project=maestro",
     ] {
         assert_eq!(
             dashboard.get_as(STRANGER, uri).await.status,
@@ -4273,16 +4251,18 @@ async fn saving_one_settings_form_keeps_the_prompt_for_the_other() {
 }
 
 #[tokio::test]
-async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
+async fn the_picker_is_in_the_topbar_and_the_form_has_no_project_select() {
     let page = two_projects().get("/?project=tool").await;
     let main = page.body.find("<main>").unwrap();
     let (topbar, rest) = page.body.split_at(main);
-    assert!(topbar.contains("<select id=\"project\" name=\"project\">"));
-    assert!(topbar.contains("<option value=\"maestro\">maestro</option>"));
-    assert!(topbar.contains("<option value=\"tool\" selected>tool</option>"));
-    assert!(topbar.contains("<label class=\"visually-hidden\" for=\"project\">Project</label>"));
-    assert!(topbar.contains("<noscript><button>Go</button></noscript>"));
-    assert!(!rest.contains("<select"));
+    assert!(!page.body.contains("<select"));
+    assert!(topbar.contains("<details class=\"project-picker\" id=\"project-picker\">"));
+    assert!(
+        topbar.contains("<summary role=\"button\" aria-label=\"Project\" aria-expanded=\"false\">")
+    );
+    assert!(topbar.contains("<span class=\"picker-current\">tool</span>"));
+    assert!(topbar.contains("<a href=\"/?project=maestro\">"));
+    assert_current_project(&page.body, "tool", "tool");
     assert!(rest.contains("<input type=\"hidden\" name=\"project\" value=\"tool\">"));
 }
 
@@ -4290,12 +4270,236 @@ async fn the_selector_is_in_the_topbar_and_the_form_has_no_project_select() {
 async fn the_picker_sits_after_the_brand_and_before_the_nav() {
     let page = two_projects().get("/?project=tool").await;
     let brand = page.body.find("class=\"brand\"").unwrap();
-    let picker = page.body.find("<select id=\"project\"").unwrap();
+    let picker = page.body.find("<details class=\"project-picker\"").unwrap();
     let topbar_end = page.body.find("class=\"topbar-end\"").unwrap();
     let onboard = page.body.find("href=\"/onboard\"").unwrap();
     assert!(brand < picker, "the picker comes after the brand");
     assert!(picker < topbar_end, "the picker comes before .topbar-end");
     assert!(picker < onboard, "the picker comes before the Onboard link");
+}
+
+/// The picker's current row, as its link and the name it shows.
+fn current_project(body: &str) -> Option<(String, String)> {
+    let doc = scraper::Html::parse_document(body);
+    let link = doc
+        .select(&scraper::Selector::parse("#picker-list a[aria-current=page]").unwrap())
+        .next()?;
+    let name = scraper::Selector::parse(".picker-name").unwrap();
+    let shown = link.select(&name).next()?.text().collect::<String>();
+    Some((link.value().attr("href")?.to_owned(), shown))
+}
+
+/// Asserts the picker marks the project with the URL-escaped identifier `id`
+/// as current and shows `shown` for it.
+fn assert_current_project(body: &str, id: &str, shown: &str) {
+    assert_eq!(
+        current_project(body),
+        Some((format!("/?project={id}"), shown.to_owned()))
+    );
+}
+
+/// The picker's rows in order: identifier, group, and the text of the badges.
+fn picker_rows(body: &str) -> Vec<(String, String, Vec<String>)> {
+    let doc = scraper::Html::parse_document(body);
+    let selector = |css: &str| scraper::Selector::parse(css).unwrap();
+    doc.select(&selector("#picker-list > li"))
+        .map(|row| {
+            let badges = row
+                .select(&selector(".badge, .picker-running"))
+                .map(|badge| badge.text().collect::<String>())
+                .collect();
+            (
+                row.value().attr("data-id").unwrap().to_owned(),
+                row.value().attr("data-attention").unwrap().to_owned(),
+                badges,
+            )
+        })
+        .collect()
+}
+
+/// The jobs in the board's Needs you and Failed sections.
+fn board_counts(body: &str) -> (usize, usize) {
+    let doc = scraper::Html::parse_document(body);
+    let selector = |css: &str| scraper::Selector::parse(css).unwrap();
+    let count = |lane: &str| {
+        doc.select(&selector(&format!("section.inbox-{lane} h2 .count")))
+            .next()
+            .map_or(0, |count| count.text().collect::<String>().parse().unwrap())
+    };
+    (count("you"), count("failed"))
+}
+
+fn picker_counts(body: &str, project: &str) -> (usize, usize) {
+    let (_, _, badges) = picker_rows(body)
+        .into_iter()
+        .find(|(id, ..)| id == project)
+        .unwrap();
+    let number = |suffix: &str| {
+        badges
+            .iter()
+            .find_map(|text| text.strip_suffix(suffix))
+            .map_or(0, |count| count.trim().parse().unwrap())
+    };
+    (number(" need you"), number(" failed"))
+}
+
+async fn job_in(dashboard: &Dashboard, project: &str) -> i64 {
+    let reply = dashboard.post_job(project, "A change", &[]).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    reply
+        .location
+        .unwrap()
+        .strip_prefix("/jobs/")
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+fn fail_job(dashboard: &Dashboard, id: i64) {
+    dashboard.apply(id, Event::Start);
+    dashboard.apply(
+        id,
+        Event::AgentFailed {
+            reason: "boom".into(),
+        },
+    );
+}
+
+#[tokio::test]
+async fn picker_counts_equal_the_board_section_counts() {
+    let dashboard = dashboard();
+    let question = dashboard.new_job().await;
+    dashboard.apply(question, Event::Start);
+    dashboard.apply(
+        question,
+        Event::Agent(AgentResult::Questions(vec![Question {
+            text: "Which?".into(),
+        }])),
+    );
+    let spec = dashboard.new_job().await;
+    to_spec_approval(&dashboard, spec);
+    let plan = dashboard.new_job().await;
+    to_spec_approval(&dashboard, plan);
+    dashboard.apply(plan, Event::Approve);
+    dashboard.apply(plan, Event::Agent(AgentResult::Plan(plan_of_one())));
+    let review = dashboard.new_job().await;
+    to_spec_approval(&dashboard, review);
+    dashboard.apply(review, Event::Approve);
+    dashboard.apply(review, Event::Agent(AgentResult::Plan(plan_of_one())));
+    dashboard.apply(review, Event::Approve);
+    dashboard.apply(review, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(review, Event::ChecksPassed);
+    dashboard.apply(review, Event::Published { number: 3 });
+    let failed = dashboard.new_job().await;
+    fail_job(&dashboard, failed);
+    let publish = at_publish_gate(&dashboard).await;
+    dashboard.apply(publish, Event::Summarized(branch_summary()));
+    let dismissed = dashboard.new_job().await;
+    fail_job(&dashboard, dismissed);
+    dashboard.apply(dismissed, Event::Dismiss);
+
+    let body = dashboard.get("/").await.body;
+    assert_eq!(picker_counts(&body, "maestro"), (5, 1));
+    assert_eq!(board_counts(&body), (5, 1));
+
+    dashboard
+        .store
+        .save_project_auto_merge("maestro", true)
+        .unwrap();
+    let body = dashboard.get("/").await.body;
+    assert_eq!(picker_counts(&body, "maestro"), (4, 1));
+    assert_eq!(board_counts(&body), (4, 1));
+    assert!(body.contains(
+        "<span class=\"badge you\">4<span class=\"visually-hidden\"> need you</span></span>"
+    ));
+    assert!(body.contains(
+        "<span class=\"badge bad\">1<span class=\"visually-hidden\"> failed</span></span>"
+    ));
+}
+
+fn four_projects() -> Dashboard {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    for name in ["a-idle", "b-failed", "c-you", "d-running"] {
+        store
+            .create_project(
+                name,
+                ForgeKind::GitHub,
+                &format!("o/{name}"),
+                "main",
+                None,
+                Some("alice"),
+            )
+            .unwrap();
+    }
+    dashboard_with(store)
+}
+
+#[tokio::test]
+async fn the_picker_orders_needs_you_then_failed_then_running_then_the_rest() {
+    let dashboard = four_projects();
+    let failed = job_in(&dashboard, "b-failed").await;
+    fail_job(&dashboard, failed);
+    let you = job_in(&dashboard, "c-you").await;
+    to_spec_approval(&dashboard, you);
+    job_in(&dashboard, "d-running").await;
+
+    let body = dashboard.get("/?project=a-idle").await.body;
+    let rows = picker_rows(&body);
+    let order: Vec<_> = rows.iter().map(|(id, ..)| id.as_str()).collect();
+    assert_eq!(order, ["c-you", "b-failed", "d-running", "a-idle"]);
+    let groups: Vec<_> = rows.iter().map(|(_, group, _)| group.as_str()).collect();
+    assert_eq!(groups, ["you", "failed", "running", "idle"]);
+    assert_eq!(rows[3].2, Vec::<String>::new());
+    assert_eq!(rows[2].2, ["running"]);
+}
+
+#[tokio::test]
+async fn the_picker_lists_and_counts_only_the_projects_the_login_collaborates_on() {
+    let dashboard = two_projects();
+    dashboard
+        .store
+        .add_collaborator("tool", MAESTRO_ONLY, USER)
+        .unwrap();
+    let id = job_in(&dashboard, "tool").await;
+    fail_job(&dashboard, id);
+    let hidden = job_in(&dashboard, "maestro").await;
+    fail_job(&dashboard, hidden);
+
+    let body = dashboard.get_as(MAESTRO_ONLY, "/").await.body;
+    let rows = picker_rows(&body);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "tool");
+    assert_eq!(picker_counts(&body, "tool"), (0, 1));
+    assert!(!body.contains("data-id=\"maestro\""));
+
+    let fragment = dashboard
+        .get_as(MAESTRO_ONLY, "/fragments/picker?project=tool")
+        .await;
+    assert_eq!(fragment.status, StatusCode::OK);
+    assert!(!fragment.body.contains("maestro"));
+    let hidden = dashboard
+        .get_as(MAESTRO_ONLY, "/fragments/picker?project=maestro")
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_picker_fragment_answers_204_for_a_matching_version() {
+    let dashboard = two_projects();
+    let body = dashboard.get("/?project=tool").await.body;
+    let doc = scraper::Html::parse_document(&body);
+    let list = doc
+        .select(&scraper::Selector::parse("#picker-list").unwrap())
+        .next()
+        .unwrap();
+    let url = list.value().attr("hx-get").unwrap().replace("&amp;", "&");
+    assert!(url.starts_with("/fragments/picker?project=tool&v="));
+    assert_eq!(list.value().attr("hx-trigger"), Some("every 5s"));
+    let reply = dashboard.get(&url).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let stale = dashboard.get("/fragments/picker?project=tool&v=old").await;
+    assert_eq!(stale.status, StatusCode::OK);
+    assert!(stale.body.contains("data-id=\"maestro\""));
 }
 
 #[tokio::test]
@@ -8834,7 +9038,7 @@ async fn each_board_region_polls_its_fragment_every_five_seconds() {
     let dashboard = dashboard();
     let body = dashboard.get("/").await.body;
     // The plan usage wrapper keeps a fixed URL and sends its version in
-    // `hx-vals`; the other three carry the version in the poll URL as `&v=`.
+    // `hx-vals`; the other four carry the version in the poll URL as `&v=`.
     assert!(body.contains("hx-get=\"/fragments/plan-usage\""));
     for url in [
         "/fragments/stats?project=maestro",
@@ -8844,8 +9048,8 @@ async fn each_board_region_polls_its_fragment_every_five_seconds() {
         assert!(body.contains(&format!("hx-get=\"{url}&amp;v=")), "{url}");
     }
     // One trigger per region: the worker tiles, the usage meters, the job
-    // rows and the totals line.
-    assert_eq!(body.matches("hx-trigger=\"every 5s\"").count(), 4);
+    // rows, the totals line and the project picker's list.
+    assert_eq!(body.matches("hx-trigger=\"every 5s\"").count(), 5);
     assert!(!body.contains("/fragments/lanes"));
 }
 
@@ -14491,11 +14695,7 @@ async fn saving_a_display_name_shows_it_and_keeps_the_identifier() {
     assert!(page.contains("Remove My Project"));
     assert!(page.contains(r#"value="My Project""#));
     let board = dashboard.get("/").await;
-    assert!(
-        board
-            .body
-            .contains("<option value=\"maestro\" selected>My Project</option>")
-    );
+    assert_current_project(&board.body, "maestro", "My Project");
     assert!(board.body.contains("Describe a change for My Project…"));
     let job = dashboard.get(&format!("/jobs/{id}")).await.body;
     assert!(job.contains("My Project"));
