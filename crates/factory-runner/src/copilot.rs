@@ -252,28 +252,33 @@ fn message_result(expect: Expect, text: &str) -> RunResult {
     }
 }
 
-/// The JSON to parse from the final message. When the trimmed message ends with
-/// a fenced code block, that block's content, whatever text comes before it. The
-/// opening fence is the last line that starts with triple backticks and its
-/// language tag is dropped. Otherwise the whole trimmed text, so bare JSON
-/// parses and text after the closing fence is left for the JSON parser to
-/// reject. A JSON string holds no raw newline, so triple backticks inside one
-/// never start a line.
+/// The JSON to parse from the final message: the content of the fenced block
+/// that ends the message, whatever text precedes it, or the whole trimmed text
+/// when the message does not end with a closing fence. A fence line starts with
+/// triple backticks after optional indentation. Backticks inside a valid JSON
+/// string cannot start a raw line.
 fn json_slice(text: &str) -> &str {
     let text = text.trim();
-    let Some(head) = text.strip_suffix("```") else {
-        return text;
-    };
-    if !head.is_empty() && !head.ends_with('\n') {
-        return text;
+    let mut open: Option<usize> = None;
+    let mut body: Option<&str> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            match open.take() {
+                None => open = Some(offset + line.len()),
+                Some(start) => {
+                    body = Some(text[start..offset].trim());
+                    if offset + line.len() < text.len() || line.trim() != "```" {
+                        body = None;
+                    }
+                }
+            }
+        } else if body.is_some() {
+            body = None;
+        }
+        offset += line.len();
     }
-    let open = match head.rfind("\n```") {
-        Some(at) => at + 1,
-        None if head.starts_with("```") => 0,
-        None => return text,
-    };
-    let block = &head[open + 3..];
-    block.split_once('\n').map_or("", |(_, body)| body).trim()
+    body.filter(|_| open.is_none()).unwrap_or(text)
 }
 
 fn parse_tool_start(data: Option<&Value>) -> Vec<AgentItem> {

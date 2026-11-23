@@ -405,6 +405,25 @@ fn backticks_in_a_json_string_do_not_end_the_block() {
 }
 
 #[test]
+fn an_indented_closing_fence_still_closes_a_single_block() {
+    let text = format!("```json\n{}\n  ```", commits_outcome("Why."));
+    let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
+    assert_eq!(result.event, commits_event("Why."));
+}
+
+#[test]
+fn a_stray_closing_fence_after_an_earlier_block_fails_the_run() {
+    let text = format!(
+        "Summary.\n\n```text\nnotes\n```\n\n{}\n```",
+        commits_outcome("Why.")
+    );
+    match last_result(&parse(Expect::Commits, &assistant_message(&text))).event {
+        Event::AgentFailed { reason } => assert!(reason.contains("not valid JSON"), "{reason}"),
+        other => panic!("expected AgentFailed, got {other:?}"),
+    }
+}
+
+#[test]
 fn text_after_the_fence_or_a_non_json_block_fails_the_run() {
     let json = commits_outcome("Why.");
     for text in [
