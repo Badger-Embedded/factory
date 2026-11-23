@@ -4258,12 +4258,40 @@ async fn the_picker_is_in_the_topbar_and_the_form_has_no_project_select() {
     assert!(!page.body.contains("<select"));
     assert!(topbar.contains("<details class=\"project-picker\" id=\"project-picker\">"));
     assert!(
-        topbar.contains("<summary role=\"button\" aria-label=\"Project\" aria-expanded=\"false\">")
+        topbar.contains("<summary role=\"button\" aria-label=\"Project\" aria-expanded=\"false\" aria-keyshortcuts=\"p\">")
     );
     assert!(topbar.contains("<span class=\"picker-current\">tool</span>"));
     assert!(topbar.contains("<a href=\"/?project=maestro\">"));
     assert_current_project(&page.body, "tool", "tool");
     assert!(rest.contains("<input type=\"hidden\" name=\"project\" value=\"tool\">"));
+}
+
+#[tokio::test]
+async fn the_picker_shows_its_keys_as_kbd_caps() {
+    let page = two_projects().get("/?project=tool").await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let sel = |s: &str| scraper::Selector::parse(s).unwrap();
+    let cap = doc
+        .select(&sel(
+            "#project-picker summary[aria-keyshortcuts=p] > kbd[aria-hidden=true]",
+        ))
+        .next()
+        .unwrap();
+    assert_eq!(cap.text().collect::<String>(), "P");
+    let footer = doc
+        .select(&sel("#project-picker .picker-panel > div.picker-keys"))
+        .next()
+        .unwrap();
+    let caps: Vec<String> = footer
+        .select(&sel("kbd"))
+        .map(|k| k.text().collect::<String>())
+        .collect();
+    assert_eq!(caps, ["↑", "↓", "Enter", "Esc", "N", "Shift", "N"]);
+    assert!(
+        footer.value().attr("hidden").is_some(),
+        "hidden until the script runs"
+    );
+    assert!(cap.value().attr("hidden").is_some());
 }
 
 #[tokio::test]

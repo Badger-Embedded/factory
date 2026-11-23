@@ -15,6 +15,10 @@
   const empty = picker.querySelector(".picker-empty");
   const status = picker.querySelector(".picker-status");
   search.hidden = false;
+  const keys = picker.querySelector(".picker-keys");
+  const keyCap = summary.querySelector(".picker-key");
+  keys.hidden = false;
+  keyCap.hidden = false;
 
   function rows() {
     const list = document.getElementById("picker-list");
@@ -51,6 +55,37 @@
     highlight(kept || shown[0] || null);
   }
 
+  function needsYou(row) {
+    return row.dataset.attention === "you" || row.dataset.attention === "failed";
+  }
+
+  function otherAttention() {
+    return rows().filter(function (row) {
+      return needsYou(row) && !row.querySelector('a[aria-current="page"]');
+    });
+  }
+
+  function dimHints() {
+    const none = otherAttention().length === 0;
+    keys.querySelectorAll(".picker-hint-n").forEach(function (hint) {
+      hint.classList.toggle("dimmed", none);
+    });
+  }
+
+  function jump(step) {
+    const all = rows();
+    const at = all.findIndex(function (row) { return row.querySelector('a[aria-current="page"]'); });
+    for (let i = 1; i <= all.length; i++) {
+      const row = all[(((at < 0 ? (step > 0 ? -1 : 0) : at) + step * i) % all.length + all.length) % all.length];
+      if (row.querySelector('a[aria-current="page"]')) continue;
+      const link = row.querySelector("a");
+      if (needsYou(row) && link) {
+        window.location.assign(link.href);
+        return;
+      }
+    }
+  }
+
   search.addEventListener("input", function () { applyFilter(false); });
   search.addEventListener("keydown", function (event) {
     if (event.isComposing || event.keyCode === 229) return;
@@ -85,6 +120,24 @@
   });
   document.addEventListener("keydown", function (event) {
     if (event.isComposing || event.keyCode === 229) return;
+    if (event.ctrlKey || event.altKey || event.metaKey) return;
+    const target = event.target;
+    const typing = target instanceof Element &&
+      (target.closest("input, textarea, select, [contenteditable]") || target.isContentEditable);
+    if (!typing) {
+      const key = event.key.toLowerCase();
+      if (key === "p" && !event.shiftKey) {
+        event.preventDefault();
+        picker.open = true;
+        search.focus();
+        return;
+      }
+      if (key === "n") {
+        event.preventDefault();
+        jump(event.shiftKey ? -1 : 1);
+        return;
+      }
+    }
     if (event.key === "Escape" && picker.open) {
       picker.open = false;
       summary.focus();
@@ -118,6 +171,7 @@
     const row = list.querySelector('a[aria-current="page"] .picker-name');
     if (row) current.textContent = row.textContent;
     applyFilter(true);
+    dimHints();
     if (focusedHref !== null) {
       for (const link of list.querySelectorAll("a")) {
         if (link.getAttribute("href") === focusedHref) link.focus();
@@ -147,6 +201,8 @@
         }
         htmx.process(fresh);
         applyFilter(true);
+        dimHints();
       });
   });
+  dimHints();
 })();

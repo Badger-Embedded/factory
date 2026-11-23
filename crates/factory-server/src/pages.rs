@@ -641,8 +641,10 @@ fn project_selector(
 ) -> Markup {
     html! {
         details.project-picker #project-picker {
-            summary role="button" aria-label="Project" aria-expanded="false" {
+            summary role="button" aria-label="Project" aria-expanded="false"
+                aria-keyshortcuts="p" {
                 span.picker-current { (shown_name(labels, selected)) }
+                kbd.picker-key aria-hidden="true" hidden { "P" }
                 span.picker-chevron aria-hidden="true" {}
             }
             div.picker-panel {
@@ -652,6 +654,13 @@ fn project_selector(
                 p.picker-status.visually-hidden role="status" {}
                 (picker(attention, selected, false))
                 p.picker-empty hidden { "No project matches." }
+                div.picker-keys hidden {
+                    span.picker-hint { kbd { "↑" } " " kbd { "↓" } " move" }
+                    span.picker-hint { kbd { "Enter" } " open" }
+                    span.picker-hint { kbd { "Esc" } " close" }
+                    span.picker-hint.picker-hint-n { kbd { "N" } " next that needs you" }
+                    span.picker-hint.picker-hint-n { kbd { "Shift" } " " kbd { "N" } " previous" }
+                }
             }
             script { (PreEscaped(PROJECT_PICKER)) }
         }
