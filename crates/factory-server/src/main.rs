@@ -3,9 +3,9 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_runner::{Account, ForgeKind, Git, GitHub, WorkerConfig};
+use factory_runner::{Account, Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, HttpMcpChecker,
+    Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, HttpMcpChecker,
     LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor,
     PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler, SecretStore, Store,
     StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
@@ -256,8 +256,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let executor = PodmanExecutor {
             base: worker_base(worker_network.clone()),
             git: Git::default(),
-            forge: forges.forge(ForgeKind::GitHub),
-            factory_account: factory_account(),
+            forges: forges.clone(),
             data_dir: data_dir.clone(),
             registry: Arc::clone(&agents),
             store: Arc::clone(&store),
@@ -275,6 +274,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 proxy_url: proxy_url.clone(),
                 warnings: Arc::clone(&mcp_warnings),
             },
+            Accounts::new(factory_account()),
         );
         slots = scheduler.slots();
         tokio::spawn(scheduler.run());

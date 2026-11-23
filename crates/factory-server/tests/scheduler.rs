@@ -8,15 +8,16 @@ use factory_core::{
     PackagingContext, PrDescription, Question, RenovateCi, RenovateWait, ReviewState, Stage, Turn,
 };
 use factory_runner::{
-    Expect, LogLine, McpUnavailable, Observation, RenovatePr, Rerun, RunReport, TokenUsage,
-    is_renovate_login,
+    Account, Expect, ForgeKind, LogLine, McpUnavailable, Observation, RenovatePr, Rerun, RunReport,
+    TokenUsage, is_renovate_login,
 };
 use factory_server::{
-    AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink, McpProjectSettings,
-    McpRuntime, McpStages, McpWarnings, Project, Projects, PublishRequest, Published, ReadyAction,
-    RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink,
-    Settings, StageAgents, StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets,
-    WatchReport, WatchRequest, WorkerSlots, format_cost, ready_action, watch_only_event,
+    Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink,
+    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Project, Projects, PublishRequest,
+    Published, ReadyAction, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef,
+    SecretStore, SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store,
+    SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots, format_cost,
+    ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -247,7 +248,13 @@ impl Executor for FakeExecutor {
     }
 
     #[allow(clippy::unused_async_trait_impl)]
-    async fn renovate_prs(&self, repo: &str, base: &str) -> Result<Vec<RenovatePr>, String> {
+    async fn renovate_prs(
+        &self,
+        _forge: ForgeKind,
+        _account: &Account,
+        repo: &str,
+        base: &str,
+    ) -> Result<Vec<RenovatePr>, String> {
         self.renovate_listed
             .lock()
             .unwrap()
@@ -270,6 +277,8 @@ impl Executor for FakeExecutor {
             RenovateNow::Nothing => None,
             RenovateNow::Merged => Some(
                 self.renovate_merged(
+                    request.forge,
+                    &request.account,
                     &request.repo,
                     request.number,
                     request.manifest_files.as_deref(),
@@ -300,7 +309,14 @@ impl Executor for FakeExecutor {
         })
     }
 
-    async fn comment(&self, _repo: &str, number: u64, body: &str) -> Result<(), String> {
+    async fn comment(
+        &self,
+        _forge: ForgeKind,
+        _account: &Account,
+        _repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), String> {
         tokio::task::yield_now().await;
         self.comments
             .lock()
@@ -311,6 +327,8 @@ impl Executor for FakeExecutor {
 
     async fn renovate_merged(
         &self,
+        _forge: ForgeKind,
+        _account: &Account,
         _repo: &str,
         _number: u64,
         manifest_files: Option<&[String]>,
@@ -370,7 +388,14 @@ impl Executor for FakeExecutor {
         Ok(context)
     }
 
-    async fn merge_renovate(&self, _repo: &str, number: u64, head: &str) -> Result<(), String> {
+    async fn merge_renovate(
+        &self,
+        _forge: ForgeKind,
+        _account: &Account,
+        _repo: &str,
+        number: u64,
+        head: &str,
+    ) -> Result<(), String> {
         tokio::task::yield_now().await;
         self.approved
             .lock()
@@ -421,6 +446,7 @@ fn setup(
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
     );
     (store, executor, scheduler)
 }
@@ -474,6 +500,7 @@ fn setup_mcp(
         Arc::new(Notify::new()),
         PathBuf::new(),
         runtime,
+        Accounts::new(Account::default()),
     );
     (store, executor, scheduler, tokens)
 }
@@ -643,6 +670,7 @@ async fn a_project_onboarded_while_running_is_picked_up() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
     );
 
     let id = store
@@ -1642,6 +1670,7 @@ async fn a_project_without_checks_publishes_unchecked() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
     );
     drop(scheduler);
     for event in [
@@ -1713,6 +1742,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
     );
     step(&fresh).await;
     assert_eq!(executor.published.lock().unwrap().len(), 2);
@@ -2311,6 +2341,7 @@ mod purge {
             Arc::new(Notify::new()),
             data.path().to_owned(),
             mcp_runtime(&store).0,
+            Accounts::new(Account::default()),
         );
         let db = rusqlite::Connection::open(&path).unwrap();
         Fixture {
@@ -2801,6 +2832,7 @@ async fn a_project_does_not_use_the_models_of_another() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
     );
     store
         .save_project_models("maestro", &models("maestro-c", "", "", ""))
@@ -3509,6 +3541,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
     );
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -3587,6 +3620,8 @@ async fn a_rerun_request_reaches_the_executor_and_its_reason_is_logged() {
         requests,
         vec![RerunRequest {
             job_id: id,
+            forge: ForgeKind::GitHub,
+            account: Account::default(),
             repo: "Badger-Embedded/maestro".into(),
             number: 12,
         }]
@@ -3987,6 +4022,7 @@ async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
         Arc::new(Notify::new()),
         data.path().to_owned(),
         mcp_runtime(&store).0,
+        Accounts::new(Account::default()),
     );
 
     let id = store
@@ -4361,6 +4397,7 @@ async fn discovery_makes_one_job_per_renovate_pull_request() {
             Arc::new(Notify::new()),
             PathBuf::new(),
             mcp_runtime(store).0,
+            Accounts::new(Account::default()),
         )
     };
 

@@ -12,10 +12,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use factory_core::Event;
-use factory_runner::{Account, Expect, Git, GitHub, WorkerConfig};
+use factory_runner::{Account, Expect, ForgeKind, Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, LocalSecrets, MASTER_KEY_LEN,
-    PlanUsageCache, PodmanExecutor, SecretStore, Settings, Store,
+    AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos, LocalSecrets,
+    MASTER_KEY_LEN, PlanUsageCache, PodmanExecutor, SecretStore, Settings, Store,
 };
 
 /// A subscription `auth.json`, shaped like the one `codex login` writes.
@@ -29,6 +29,16 @@ fn registry(secrets: &Arc<dyn SecretStore>) -> Arc<AgentRegistry> {
     ))
 }
 
+fn forges(github: GitHub) -> Forges {
+    Forges::new(
+        Arc::new(github),
+        Arc::new(GhRepos {
+            gh: PathBuf::from("gh"),
+            token: None,
+        }),
+    )
+}
+
 fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) -> PodmanExecutor {
     PodmanExecutor {
         base: WorkerConfig::default(),
@@ -37,8 +47,7 @@ fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) 
         git: Git {
             git: PathBuf::from("/nonexistent/git"),
         },
-        forge: Arc::new(GitHub::default()),
-        factory_account: Account::default(),
+        forges: forges(GitHub::default()),
         data_dir,
         registry,
         store,
@@ -49,6 +58,8 @@ fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) 
 fn request() -> AgentRequest {
     AgentRequest {
         job_id: 7,
+        forge: ForgeKind::GitHub,
+        account: Account::default(),
         repo: "owner/name".into(),
         base: "main".into(),
         branch: None,
@@ -240,12 +251,15 @@ async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_move
         dir.path().to_owned(),
         Arc::new(Store::open_in_memory().unwrap()),
     );
-    podman.forge = Arc::new(GitHub {
+    podman.forges = forges(GitHub {
         gh,
         ..GitHub::default()
     });
 
-    podman.merge_renovate("o/r", 5, "checked1").await.unwrap();
+    podman
+        .merge_renovate(ForgeKind::GitHub, &Account::default(), "o/r", 5, "checked1")
+        .await
+        .unwrap();
 
     let calls = std::fs::read_to_string(&calls).unwrap();
     assert_eq!(calls.lines().count(), 2, "{calls}");
@@ -293,7 +307,7 @@ fn gh_executor(
         dir.to_owned(),
         Arc::new(Store::open_in_memory().unwrap()),
     );
-    podman.forge = Arc::new(GitHub {
+    podman.forges = forges(GitHub {
         gh,
         ..GitHub::default()
     });
@@ -314,6 +328,8 @@ fn packaging_request(
     range: Option<(&str, &str)>,
 ) -> factory_server::PackagingRequest {
     factory_server::PackagingRequest {
+        forge: ForgeKind::GitHub,
+        account: Account::default(),
         repo: "o/r".into(),
         upstream: "up/app".into(),
         base: "main".into(),
@@ -335,7 +351,13 @@ async fn a_merge_that_touches_no_manifest_never_downloads_its_diff() {
     let manifests = vec!["snap/snapcraft.yaml".to_owned()];
 
     let event = podman
-        .renovate_merged("o/r", 5, Some(&manifests))
+        .renovate_merged(
+            ForgeKind::GitHub,
+            &Account::default(),
+            "o/r",
+            5,
+            Some(&manifests),
+        )
         .await
         .unwrap();
 

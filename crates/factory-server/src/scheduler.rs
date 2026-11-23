@@ -10,18 +10,20 @@ use factory_core::{
     PrDescription, RetryLimits, ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Expect, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport, job_prompt,
+    Account, Expect, ForgeKind, LogLine, McpConfig, Observation, RenovatePr, Rerun, RunReport,
+    job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::accounts::{Accounts, Resolved};
 use crate::cost::{codex_cost, format_cost};
 use crate::mcp::McpServer;
 use crate::projects::{Project, Projects, StageAgents};
 use crate::proxy::RunTokens;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
 use crate::settings::Settings;
-use crate::store::{JobRow, Store, StoreError};
+use crate::store::{FACTORY_REQUESTER, JobRow, Store, StoreError};
 use crate::warnings::McpWarnings;
 use crate::workers::{WorkerSlots, unix_now};
 
@@ -81,7 +83,10 @@ fn stage_name(expect: Expect) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRequest {
     pub job_id: i64,
-    /// The GitHub repository as `owner/name`.
+    pub forge: ForgeKind,
+    /// The account the operation runs as. Its token never reaches a worker.
+    pub account: Account,
+    /// The repository as `owner/name`.
     pub repo: String,
     /// The branch pull requests target.
     pub base: String,
@@ -135,6 +140,9 @@ pub struct SummaryRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRequest {
     pub job_id: i64,
+    pub forge: ForgeKind,
+    /// The account the operation runs as. Its token never reaches a worker.
+    pub account: Account,
     pub repo: String,
     pub base: String,
     pub branch: String,
@@ -161,6 +169,11 @@ pub enum Published {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchRequest {
     pub job_id: i64,
+    pub forge: ForgeKind,
+    /// The account the operation runs as. Its token never reaches a worker.
+    pub account: Account,
+    /// The logins whose comments are not review feedback.
+    pub ignore: Vec<String>,
     pub repo: String,
     /// The branch the pull request targets.
     pub base: String,
@@ -235,6 +248,11 @@ pub fn watch_only_event(observation: &Observation) -> Option<Event> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenovateWatchRequest {
     pub job_id: i64,
+    pub forge: ForgeKind,
+    /// The account the operation runs as. Its token never reaches a worker.
+    pub account: Account,
+    /// The logins whose comments are not review feedback.
+    pub ignore: Vec<String>,
     pub repo: String,
     pub number: u64,
     /// The head the job has a diff verdict for. The executor fetches the diff
@@ -258,6 +276,9 @@ pub struct RenovateWatchRequest {
 /// What the packaging analysis of a merged Renovate pull request reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackagingRequest {
+    pub forge: ForgeKind,
+    /// The account the operation runs as. Its token never reaches a worker.
+    pub account: Account,
     /// The maintained repository as `owner/name`.
     pub repo: String,
     /// The upstream repository as `owner/name`.
@@ -278,6 +299,9 @@ pub struct PackagingRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RerunRequest {
     pub job_id: i64,
+    pub forge: ForgeKind,
+    /// The account the operation runs as. Its token never reaches a worker.
+    pub account: Account,
     pub repo: String,
     pub number: u64,
 }
@@ -353,6 +377,8 @@ pub trait Executor: Send + Sync + 'static {
     /// Lists the open pull requests Renovate made against `base`.
     fn renovate_prs(
         &self,
+        forge: ForgeKind,
+        account: &Account,
         repo: &str,
         base: &str,
     ) -> impl Future<Output = Result<Vec<RenovatePr>, String>> + Send;
@@ -367,6 +393,8 @@ pub trait Executor: Send + Sync + 'static {
     /// Posts `body` as a comment on the pull request.
     fn comment(
         &self,
+        forge: ForgeKind,
+        account: &Account,
         repo: &str,
         number: u64,
         body: &str,
@@ -376,6 +404,8 @@ pub trait Executor: Send + Sync + 'static {
     /// `head`, and only that head.
     fn merge_renovate(
         &self,
+        forge: ForgeKind,
+        account: &Account,
         repo: &str,
         number: u64,
         head: &str,
@@ -386,6 +416,8 @@ pub trait Executor: Send + Sync + 'static {
     /// pull request changed one of them.
     fn renovate_merged(
         &self,
+        forge: ForgeKind,
+        account: &Account,
         repo: &str,
         number: u64,
         manifest_files: Option<&[String]>,
@@ -490,6 +522,7 @@ pub struct Scheduler<E> {
     store: Arc<Store>,
     projects: Arc<Projects>,
     executor: Arc<E>,
+    accounts: Accounts,
     wake: Arc<Notify>,
     data_dir: PathBuf,
     /// Jobs whose factory step waits until the given time: the next look at
@@ -509,11 +542,13 @@ impl<E: Executor> Scheduler<E> {
         wake: Arc<Notify>,
         data_dir: PathBuf,
         mcp: McpRuntime,
+        accounts: Accounts,
     ) -> Arc<Self> {
         Arc::new(Scheduler {
             store,
             projects,
             executor,
+            accounts,
             wake,
             data_dir,
             not_before: Mutex::new(HashMap::new()),
@@ -591,8 +626,9 @@ impl<E: Executor> Scheduler<E> {
                     let Some(expect) = Expect::for_task(job.stage(), &task) else {
                         continue;
                     };
-                    let (request, skipped) =
-                        self.agent_request(&row, &job, &project, session, &task, expect)?;
+                    let resolved = self.resolve(&row, &project);
+                    let (request, skipped) = self
+                        .agent_request(&row, &job, &project, &resolved, session, &task, expect)?;
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
                     self.spawn(row.id, Kind::Worker, async move {
@@ -606,14 +642,19 @@ impl<E: Executor> Scheduler<E> {
                     self.summarize(row.id, &project, &settings);
                 }
                 Command::Publish { pr } if self.due(row.id) => {
-                    self.publish(row.id, pr, &job, &project, &settings)?;
+                    let resolved = self.resolve(&row, &project);
+                    self.publish(row.id, pr, &job, &project, &resolved, &settings)?;
                 }
                 watch @ Command::WatchPr { .. } if self.due(row.id) => {
-                    self.watch_pr(&row, &job, &project, &settings, &watch)?;
+                    let resolved = self.resolve(&row, &project);
+                    self.watch_pr(&row, &job, &project, &resolved, &settings, &watch)?;
                 }
                 Command::RerunCi { number, reason, .. } if self.due(row.id) => {
+                    let resolved = self.resolve(&row, &project);
                     let request = RerunRequest {
                         job_id: row.id,
+                        forge: resolved.forge,
+                        account: resolved.account,
                         repo: project.repo.clone(),
                         number,
                     };
@@ -651,10 +692,13 @@ impl<E: Executor> Scheduler<E> {
         command: Command,
     ) -> Result<(), StoreError> {
         let id = row.id;
+        let resolved = self.resolve(row, project);
         match command {
             Command::RerunRenovate { number, reason } => {
                 let request = RerunRequest {
                     job_id: id,
+                    forge: resolved.forge,
+                    account: resolved.account,
                     repo: project.repo.clone(),
                     number,
                 };
@@ -671,6 +715,9 @@ impl<E: Executor> Scheduler<E> {
             } => {
                 let request = RenovateWatchRequest {
                     job_id: id,
+                    forge: resolved.forge,
+                    account: resolved.account,
+                    ignore: resolved.ignore,
                     repo: project.repo.clone(),
                     number,
                     verdict_head,
@@ -697,7 +744,7 @@ impl<E: Executor> Scheduler<E> {
                 let settings = settings.clone();
                 self.spawn(id, Kind::Factory, async move {
                     scheduler
-                        .post_comment(&settings, id, &repo, number, &body)
+                        .post_comment(&settings, id, &resolved, &repo, number, &body)
                         .await;
                 });
             }
@@ -708,12 +755,20 @@ impl<E: Executor> Scheduler<E> {
                 let settings = settings.clone();
                 self.spawn(id, Kind::Factory, async move {
                     scheduler
-                        .merge_renovate(&settings, id, &repo, number, &head, manifest_files)
+                        .merge_renovate(
+                            &settings,
+                            id,
+                            &resolved,
+                            &repo,
+                            number,
+                            &head,
+                            manifest_files,
+                        )
                         .await;
                 });
             }
             Command::GatherPackaging { number } => {
-                self.start_gathering(row, job, project, settings, number)?;
+                self.start_gathering(row, job, project, &resolved, settings, number)?;
             }
             _ => {}
         }
@@ -725,6 +780,7 @@ impl<E: Executor> Scheduler<E> {
         row: &JobRow,
         job: &Job,
         project: &Project,
+        resolved: &Resolved,
         settings: &Settings,
         number: u64,
     ) -> Result<(), StoreError> {
@@ -741,6 +797,8 @@ impl<E: Executor> Scheduler<E> {
         };
         let verdict = job.renovate_pr().and_then(|pr| pr.verdict.as_ref());
         let request = PackagingRequest {
+            forge: resolved.forge,
+            account: resolved.account.clone(),
             repo: project.repo.clone(),
             upstream: packaging.upstream_repo,
             base: project.base.clone(),
@@ -769,6 +827,11 @@ impl<E: Executor> Scheduler<E> {
                 .await;
         });
         Ok(())
+    }
+
+    fn resolve(&self, row: &JobRow, project: &Project) -> Resolved {
+        self.accounts
+            .resolve(&row.project, project, &row.requested_by)
     }
 
     fn manifest_files(&self, project: &str) -> Result<Option<Vec<String>>, StoreError> {
@@ -835,9 +898,15 @@ impl<E: Executor> Scheduler<E> {
             if !due {
                 continue;
             }
+            let resolved = self.accounts.resolve(&name, &project, FACTORY_REQUESTER);
             let listed = self
                 .executor
-                .renovate_prs(&project.repo, &project.base)
+                .renovate_prs(
+                    resolved.forge,
+                    &resolved.account,
+                    &project.repo,
+                    &project.base,
+                )
                 .await;
             let prs = match listed {
                 Ok(prs) => prs,
@@ -962,11 +1031,16 @@ impl<E: Executor> Scheduler<E> {
     /// [`Scheduler::agent`] revokes it when the worker exits. The scheduler
     /// reads the registry and the project's settings on every run, so a settings
     /// change reaches a job in flight at its next run.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a separate fact of the operation that starts"
+    )]
     fn agent_request(
         &self,
         row: &JobRow,
         job: &Job,
         project: &Project,
+        resolved: &Resolved,
         session: Session,
         task: &factory_core::Task,
         expect: Expect,
@@ -1027,6 +1101,8 @@ impl<E: Executor> Scheduler<E> {
             .unwrap_or_default();
         let request = AgentRequest {
             job_id: row.id,
+            forge: resolved.forge,
+            account: resolved.account.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
             branch: match session {
@@ -1207,6 +1283,7 @@ impl<E: Executor> Scheduler<E> {
         pr: usize,
         job: &Job,
         project: &Project,
+        resolved: &Resolved,
         settings: &Settings,
     ) -> Result<(), StoreError> {
         let Some(description) = job.plan()[pr].description.clone() else {
@@ -1218,6 +1295,8 @@ impl<E: Executor> Scheduler<E> {
         };
         let request = PublishRequest {
             job_id,
+            forge: resolved.forge,
+            account: resolved.account.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
             branch: branch_name(job_id, pr),
@@ -1270,6 +1349,7 @@ impl<E: Executor> Scheduler<E> {
         row: &JobRow,
         job: &Job,
         project: &Project,
+        resolved: &Resolved,
         settings: &Settings,
         command: &Command,
     ) -> Result<(), StoreError> {
@@ -1283,6 +1363,9 @@ impl<E: Executor> Scheduler<E> {
         };
         let request = WatchRequest {
             job_id: row.id,
+            forge: resolved.forge,
+            account: resolved.account.clone(),
+            ignore: resolved.ignore.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
             number,
@@ -1509,11 +1592,16 @@ impl<E: Executor> Scheduler<E> {
         &self,
         settings: &Settings,
         job_id: i64,
+        resolved: &Resolved,
         repo: &str,
         number: u64,
         body: &str,
     ) {
-        match self.executor.comment(repo, number, body).await {
+        match self
+            .executor
+            .comment(resolved.forge, &resolved.account, repo, number, body)
+            .await
+        {
             Ok(()) => {
                 self.note(job_id, &format!("Commented on #{number}: {body}"));
                 self.apply(job_id, Event::Commented);
@@ -1522,16 +1610,25 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a separate fact of the operation that starts"
+    )]
     async fn merge_renovate(
         &self,
         settings: &Settings,
         job_id: i64,
+        resolved: &Resolved,
         repo: &str,
         number: u64,
         head: &str,
         manifest_files: Option<Vec<String>>,
     ) {
-        match self.executor.merge_renovate(repo, number, head).await {
+        match self
+            .executor
+            .merge_renovate(resolved.forge, &resolved.account, repo, number, head)
+            .await
+        {
             Ok(()) => {
                 self.note(
                     job_id,
@@ -1544,7 +1641,13 @@ impl<E: Executor> Scheduler<E> {
                 // merged.
                 match self
                     .executor
-                    .renovate_merged(repo, number, manifest_files.as_deref())
+                    .renovate_merged(
+                        resolved.forge,
+                        &resolved.account,
+                        repo,
+                        number,
+                        manifest_files.as_deref(),
+                    )
                     .await
                 {
                     Ok(event) => self.apply(job_id, event),

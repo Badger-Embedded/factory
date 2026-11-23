@@ -196,12 +196,14 @@ pub trait Forge: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<String>, String>>;
 
     /// The pull request's state, checks and review comments. Comments from
-    /// the factory's own login are left out.
+    /// the logins in `ignore` are left out, such as the account the job runs
+    /// as.
     fn status<'a>(
         &'a self,
         account: &'a Account,
         repo: &'a str,
         number: u64,
+        ignore: &'a [String],
     ) -> BoxFuture<'a, Result<PrStatus, String>>;
 
     /// The failed checks with the end of each failed job's log.

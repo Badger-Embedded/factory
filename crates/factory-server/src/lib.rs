@@ -1,5 +1,6 @@
 //! The factory's dashboard and job store.
 
+mod accounts;
 mod check;
 mod codex;
 mod copilot;
@@ -24,6 +25,7 @@ mod warnings;
 mod web;
 mod workers;
 
+pub use accounts::{Accounts, Resolved};
 pub use check::{CheckOutcome, HttpMcpChecker, McpChecker, TOTAL_TIMEOUT, ToolList};
 pub use codex::{CodexLogin, CodexRun};
 pub use copilot::{CopilotTokenError, validate_copilot_token};

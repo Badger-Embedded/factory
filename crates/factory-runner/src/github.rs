@@ -23,8 +23,6 @@ const COMPARE_FILE_LIMIT: usize = 300;
 #[derive(Debug, Clone)]
 pub struct GitHub {
     pub gh: PathBuf,
-    /// The factory's own login. Its comments are not review feedback.
-    pub bot_login: String,
     /// How many times `rerun_failed` reads the pull request while
     /// it waits for GitHub to stop reporting the old failure.
     pub settle_polls: u32,
@@ -35,7 +33,6 @@ impl Default for GitHub {
     fn default() -> Self {
         GitHub {
             gh: PathBuf::from("gh"),
-            bot_login: "moonthebot".into(),
             settle_polls: 10,
             settle_interval: Duration::from_secs(3),
         }
@@ -315,12 +312,12 @@ const FAILED_CONCLUSIONS: [&str; 5] = [
 
 /// Parses `gh pr view --json state,mergeable,statusCheckRollup,comments,reviews` and
 /// the review comments API as one JSON object per line. Comments by
-/// `bot_login` or by GitHub apps are left out.
+/// a login in `ignore` or by GitHub apps are left out.
 ///
 /// # Errors
 ///
 /// Fails when either JSON does not parse.
-pub fn parse_status(view: &str, inline: &str, bot_login: &str) -> Result<PrStatus, String> {
+pub fn parse_status(view: &str, inline: &str, ignore: &[String]) -> Result<PrStatus, String> {
     let view: ViewJson =
         serde_json::from_str(view).map_err(|err| format!("gh pr view output: {err}"))?;
     let inline: Vec<InlineCommentJson> = inline
@@ -366,7 +363,7 @@ pub fn parse_status(view: &str, inline: &str, bot_login: &str) -> Result<PrStatu
 
     let human = |login: &Option<Login>| -> Option<String> {
         let login = login.as_ref()?.login.clone();
-        (login != bot_login && !login.ends_with("[bot]")).then_some(login)
+        (!ignore.contains(&login) && !login.ends_with("[bot]")).then_some(login)
     };
     let mut comments = Vec::new();
     for comment in view.comments {
@@ -547,7 +544,7 @@ impl GitHub {
             .await?;
         if let Ok(number) = existing.trim().parse::<u64>() {
             let number_text = number.to_string();
-            let was_failed = match self.status(account, repo, number).await {
+            let was_failed = match self.status(account, repo, number, &[]).await {
                 Ok(status) => matches!(status.ci, Ci::Failed(_)),
                 Err(err) => {
                     tracing::error!("reading the checks of pull request {number}: {err}");
@@ -680,7 +677,10 @@ impl GitHub {
             .await?;
         }
         for _ in 0..self.settle_polls {
-            if !matches!(self.status(account, repo, number).await?.ci, Ci::Failed(_)) {
+            if !matches!(
+                self.status(account, repo, number, &[]).await?.ci,
+                Ci::Failed(_)
+            ) {
                 break;
             }
             tokio::time::sleep(self.settle_interval).await;
@@ -1054,7 +1054,13 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when a call fails or its output does not parse.
-    async fn status(&self, account: &Account, repo: &str, number: u64) -> Result<PrStatus, String> {
+    async fn status(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        ignore: &[String],
+    ) -> Result<PrStatus, String> {
         let number_text = number.to_string();
         let view = self
             .run(
@@ -1084,7 +1090,7 @@ impl GitHub {
                 None,
             )
             .await?;
-        parse_status(&view, &inline, &self.bot_login)
+        parse_status(&view, &inline, ignore)
     }
 
     /// The failed checks with the end of each GitHub Actions job's failed
@@ -1328,8 +1334,9 @@ impl Forge for GitHub {
         account: &'a Account,
         repo: &'a str,
         number: u64,
+        ignore: &'a [String],
     ) -> BoxFuture<'a, Result<PrStatus, String>> {
-        Box::pin(GitHub::status(self, account, repo, number))
+        Box::pin(GitHub::status(self, account, repo, number, ignore))
     }
 
     fn failure_report<'a>(

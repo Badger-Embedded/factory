@@ -46,9 +46,13 @@ fn description() -> PrDescription {
     }
 }
 
+fn ignore() -> Vec<String> {
+    vec!["moonthebot".into()]
+}
+
 #[test]
 fn status_reads_state_checks_and_human_comments() {
-    let status = parse_status(VIEW, INLINE, "moonthebot").unwrap();
+    let status = parse_status(VIEW, INLINE, &ignore()).unwrap();
     assert_eq!(status.state, PrState::Open);
     assert_eq!(status.head, "4f1c2e9a7b3d");
     assert_eq!(
@@ -79,28 +83,25 @@ fn unfinished_checks_are_pending_and_finished_ones_pass() {
         {"name": "Lint and test", "status": "IN_PROGRESS", "conclusion": ""},
         {"context": "ci/legacy", "state": "SUCCESS"}]}"#;
     assert_eq!(
-        parse_status(pending, "", "moonthebot").unwrap().ci,
+        parse_status(pending, "", &ignore()).unwrap().ci,
         Ci::Pending
     );
 
     let passed = r#"{"state": "OPEN", "statusCheckRollup": [
         {"name": "Lint and test", "status": "COMPLETED", "conclusion": "SUCCESS"},
         {"name": "Docs", "status": "COMPLETED", "conclusion": "SKIPPED"}]}"#;
-    assert_eq!(
-        parse_status(passed, "", "moonthebot").unwrap().ci,
-        Ci::Passed
-    );
+    assert_eq!(parse_status(passed, "", &ignore()).unwrap().ci, Ci::Passed);
 
     let merged = r#"{"state": "MERGED"}"#;
     assert_eq!(
-        parse_status(merged, "", "moonthebot").unwrap().state,
+        parse_status(merged, "", &ignore()).unwrap().state,
         PrState::Merged
     );
 }
 
 #[test]
 fn merge_and_ci_failure_come_before_comments() {
-    let mut status = parse_status(VIEW, INLINE, "moonthebot").unwrap();
+    let mut status = parse_status(VIEW, INLINE, &ignore()).unwrap();
     assert!(matches!(observe(&status, None), Observation::CiFailed(_)));
 
     status.state = PrState::Merged;
@@ -111,7 +112,7 @@ fn merge_and_ci_failure_come_before_comments() {
 
 #[test]
 fn only_comments_newer_than_the_watermark_are_delivered() {
-    let mut status = parse_status(VIEW, INLINE, "moonthebot").unwrap();
+    let mut status = parse_status(VIEW, INLINE, &ignore()).unwrap();
     status.ci = Ci::Passed;
 
     let Observation::Comments { text, seen_until } = observe(&status, Some("2026-11-19T11:00:00Z"))
@@ -290,7 +291,7 @@ async fn check_results_become_events_and_podman_errors_are_retried() {
 
 #[test]
 fn a_green_pull_request_without_new_comments_is_ready() {
-    let mut status = parse_status(VIEW, INLINE, "moonthebot").unwrap();
+    let mut status = parse_status(VIEW, INLINE, &ignore()).unwrap();
     status.ci = Ci::Passed;
     assert_eq!(
         observe(&status, Some("2026-11-19T12:05:00Z")),
@@ -309,7 +310,7 @@ fn a_pull_request_without_any_checks_is_not_ready() {
     let status = parse_status(
         r#"{"state": "OPEN", "statusCheckRollup": []}"#,
         "",
-        "moonthebot",
+        &ignore(),
     )
     .unwrap();
     assert_eq!(status.ci, Ci::NoChecks);
@@ -385,7 +386,7 @@ fn a_conflict_comes_before_ci_and_comments() {
         "\"state\": \"OPEN\", \"mergeable\": \"CONFLICTING\",",
         1,
     );
-    let status = parse_status(&conflicting, INLINE, "moonthebot").unwrap();
+    let status = parse_status(&conflicting, INLINE, &ignore()).unwrap();
     assert!(status.conflicting);
     assert_eq!(observe(&status, None), Observation::Conflicted);
 
@@ -395,7 +396,7 @@ fn a_conflict_comes_before_ci_and_comments() {
             &format!("\"state\": \"OPEN\", \"mergeable\": \"{mergeable}\","),
             1,
         );
-        let status = parse_status(&view, INLINE, "moonthebot").unwrap();
+        let status = parse_status(&view, INLINE, &ignore()).unwrap();
         assert!(!status.conflicting, "{mergeable}");
         assert!(matches!(observe(&status, None), Observation::CiFailed(_)));
     }
@@ -450,7 +451,6 @@ fn quick(gh: PathBuf) -> GitHub {
         gh,
         settle_polls: 3,
         settle_interval: std::time::Duration::ZERO,
-        ..GitHub::default()
     }
 }
 
