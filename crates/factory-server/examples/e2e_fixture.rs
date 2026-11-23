@@ -24,7 +24,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    AgentResult, Event, PlannedPr, PrDescription, Question, RenovateCi, RetryLimits,
+    AgentResult, Event, FixOutcome, PlannedPr, PrDescription, Question, RenovateCi, RetryLimits,
 };
 use factory_runner::ForgeKind;
 use factory_server::Store;
@@ -227,6 +227,18 @@ fn write_tls(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn end_fix(store: &Store, job: i64, fix: i64) -> Result<()> {
+    store.apply(fix, Event::Cancel)?;
+    store.apply(
+        job,
+        Event::FixEnded {
+            job: fix,
+            outcome: FixOutcome::Cancelled,
+        },
+    )?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing subcommand")?;
@@ -301,6 +313,7 @@ fn main() -> Result<()> {
                 store.apply(one("job")?.parse()?, event)?;
             }
         }
+        "end-fix" => end_fix(&store, one("job")?.parse()?, one("fix")?.parse()?)?,
         "log" => {
             let job = one("job")?.parse()?;
             let text = one("text")?;

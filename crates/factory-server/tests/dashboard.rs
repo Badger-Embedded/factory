@@ -2827,7 +2827,6 @@ fn timeline_text(html: &str) -> String {
         .collect()
 }
 
-/// Posts the fix form as `login` with the token the job page carries.
 async fn post_fix(dashboard: &Dashboard, login: &str, id: i64, instructions: &str) -> Reply {
     let page = dashboard.get_as(login, &format!("/jobs/{id}")).await.body;
     let csrf = first_value(&page, ".fix-form input[name=csrf]", "value");
@@ -3024,7 +3023,6 @@ async fn a_fix_link_to_a_reused_job_id_is_plain_text() {
     post_fix(&dashboard, USER, id, "").await;
     let fix = id + 1;
 
-    // The fix job expires and its id now names an unrelated job.
     dashboard
         .store
         .delete_job(fix, Path::new("/nonexistent"))

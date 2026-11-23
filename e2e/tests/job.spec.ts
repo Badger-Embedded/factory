@@ -662,6 +662,7 @@ test('a stopped Renovate job starts a fix job and links to it', async ({ page, f
   await expect(page.getByRole('button', { name: 'Retry' })).toHaveCount(0);
   await expect(page.locator('textarea[name=instructions]')).toHaveCount(0);
 
+  const fix = (await waiting.getByRole('link').getAttribute('href'))!.split('/').pop()!;
   await waiting.getByRole('link').click();
   await expect(page).toHaveURL(/\/jobs\/\d+$/);
   await expect(page.getByText('Update the smoke test').first()).toBeVisible();
@@ -670,6 +671,24 @@ test('a stopped Renovate job starts a fix job and links to it', async ({ page, f
   await expect(back).not.toHaveAttribute('target', '_blank');
   await back.click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${id}$`));
+
+  factory.fixture('end-fix', '--job', id, '--fix', fix);
+  await page.goto(`/jobs/${id}`);
+  const stopped = page.locator('.status-detail');
+  const rows = await stopped.evaluate((el) => {
+    const range = document.createRange();
+    const tops = new Set<number>();
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      range.selectNodeContents(n);
+      for (const rect of Array.from(range.getClientRects())) tops.add(Math.round(rect.top));
+    }
+    return tops.size;
+  });
+  expect(rows).toBeGreaterThan(1);
+  await expect(stopped).toContainText(`Fix job #${fix} was cancelled.`);
+  await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible();
+  await expect(page.locator('textarea[name=instructions]')).toBeVisible();
 });
 
 test('a job page on an unknown forge shows the notice and a plain Renovate number', async ({
