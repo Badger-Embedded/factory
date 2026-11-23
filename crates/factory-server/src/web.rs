@@ -19,6 +19,7 @@ use tokio::sync::Notify;
 use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::copilot::validate_copilot_token;
 use crate::device_login::DeviceLogin;
+use crate::forge_tokens::{self, SaveError};
 use crate::forges::Forges;
 use crate::github::RepoReport;
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
@@ -26,7 +27,7 @@ use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
-use crate::secrets::{SecretError, SecretRef, SecretStore, validate_codex_auth};
+use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
     FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectTotals,
@@ -147,6 +148,12 @@ pub fn app(
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(settings_home))
+        .route("/settings/forges/{forge}", get(show_forge))
+        .route("/settings/forges/{forge}/token", post(save_forge_token))
+        .route(
+            "/settings/forges/{forge}/token/clear",
+            post(clear_forge_token),
+        )
         .route(
             "/settings/notifications",
             get(show_notifications).post(save_notifications),
@@ -2747,6 +2754,110 @@ async fn cancel_codex_login(
 ) -> Result<Markup, AppError> {
     state.device_login.cancel().await;
     codex_page(&state, &headers, None).await
+}
+
+fn forge_kind(name: &str) -> Result<ForgeKind, AppError> {
+    ForgeKind::parse(name).ok_or_else(|| AppError::NotFound(format!("no forge {name}")))
+}
+
+fn forge_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    kind: ForgeKind,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    let account = state.store.forge_account(ForgeTokenOwner::User {
+        login: &login,
+        forge: kind,
+    })?;
+    Ok(pages::settings_forge(
+        &login,
+        &settings_nav(state, &login)?,
+        kind,
+        account.as_ref(),
+        state.secrets.available(),
+        notice,
+    ))
+}
+
+async fn show_forge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(forge): Path<String>,
+) -> Result<Markup, AppError> {
+    forge_page(&state, &headers, forge_kind(&forge)?, None)
+}
+
+async fn save_forge_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(forge): Path<String>,
+    Form(form): Form<CopilotTokenForm>,
+) -> Result<Markup, AppError> {
+    let kind = forge_kind(&forge)?;
+    let token = form.token.trim();
+    if token.is_empty() {
+        return forge_page(&state, &headers, kind, Some("Saved."));
+    }
+    if !state.secrets.available() {
+        return forge_page(
+            &state,
+            &headers,
+            kind,
+            Some("The master key is missing, so the token was not saved."),
+        );
+    }
+    let login = user(&headers);
+    let owner = ForgeTokenOwner::User {
+        login: &login,
+        forge: kind,
+    };
+    let saved = forge_tokens::save(
+        state.secrets.as_ref(),
+        &state.store,
+        state.forges.forge(kind).as_ref(),
+        owner,
+        token,
+    )
+    .await;
+    let notice = match saved {
+        Ok(account) => format!("Saved. The token belongs to {}.", account.login),
+        Err(SaveError::Rejected) => format!(
+            "{} rejected the token. Nothing was saved.",
+            kind.display_name()
+        ),
+        Err(SaveError::Lookup(message)) => format!(
+            "Could not look the account up on {}: {message}. Nothing was saved.",
+            kind.display_name()
+        ),
+        Err(SaveError::Secrets(err)) => return Err(err.into()),
+        Err(SaveError::Store(err)) => return Err(err.into()),
+    };
+    forge_page(&state, &headers, kind, Some(&notice))
+}
+
+async fn clear_forge_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(forge): Path<String>,
+) -> Result<Markup, AppError> {
+    let kind = forge_kind(&forge)?;
+    let login = user(&headers);
+    let cleared = forge_tokens::clear(
+        state.secrets.as_ref(),
+        &state.store,
+        ForgeTokenOwner::User {
+            login: &login,
+            forge: kind,
+        },
+    );
+    match cleared {
+        Ok(()) => forge_page(&state, &headers, kind, Some("Cleared.")),
+        Err(SaveError::Secrets(err)) => Err(err.into()),
+        Err(SaveError::Store(err)) => Err(err.into()),
+        Err(SaveError::Rejected | SaveError::Lookup(_)) => unreachable!("clearing makes no lookup"),
+    }
 }
 
 async fn show_copilot(

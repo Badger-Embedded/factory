@@ -13,12 +13,12 @@ use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
-use factory_runner::{ForgeKind, GitHub};
+use factory_runner::{ForgeAccount, ForgeKind, GitHub};
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin,
-    FACTORY_REQUESTER, Forges, GitHubRepos, LocalSecrets, LoginProcess, LoginSpawner,
-    MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, ProjectForge, Projects,
-    Protection, RepoChecker, RepoInfo, RepoReport, SecretStore, Settings, StageAgents,
+    FACTORY_REQUESTER, ForgeTokenOwner, Forges, GitHubRepos, LocalSecrets, LoginProcess,
+    LoginSpawner, MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, ProjectForge,
+    Projects, Protection, RepoChecker, RepoInfo, RepoReport, SecretStore, Settings, StageAgents,
     StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER, UnavailableSecrets,
     WorkerSlots, app,
 };
@@ -234,6 +234,16 @@ fn dashboard_with_admins(
     secrets: Arc<dyn SecretStore>,
     admins: Vec<String>,
 ) -> Dashboard {
+    dashboard_with_gh(store, github, secrets, admins, GitHub::default())
+}
+
+fn dashboard_with_gh(
+    store: Arc<Store>,
+    github: Arc<dyn RepoChecker>,
+    secrets: Arc<dyn SecretStore>,
+    admins: Vec<String>,
+    gh: GitHub,
+) -> Dashboard {
     for (name, _) in store.list_projects().unwrap() {
         store.add_collaborator(&name, USER, "test").unwrap();
     }
@@ -265,7 +275,7 @@ fn dashboard_with_admins(
             Arc::new(Notify::new()),
             data.path().to_owned(),
             Arc::clone(&usage),
-            Forges::new(Arc::new(GitHub::default()), github),
+            Forges::new(Arc::new(gh), github),
             Arc::clone(&slots),
             secrets,
             Arc::clone(&checker) as Arc<dyn McpChecker>,
@@ -10114,6 +10124,29 @@ fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
             b"sealed",
         )
         .unwrap();
+    store
+        .set_forge_account(
+            ForgeTokenOwner::Project {
+                project,
+                forge: ForgeKind::GitHub,
+            },
+            &ForgeAccount {
+                login: "bot".into(),
+                id: 7,
+            },
+        )
+        .unwrap();
+    store
+        .put_secret(
+            factory_server::SecretRef {
+                project,
+                server: "",
+                header: "forge-project",
+            },
+            "local",
+            b"sealed",
+        )
+        .unwrap();
     store.add_cost(job, 1.5, false).unwrap();
 }
 
@@ -10151,6 +10184,7 @@ async fn removing_a_project_cancels_its_jobs_and_deletes_its_data() {
         ("project_totals", "project"),
         ("project_collaborators", "project"),
         ("project_maintenance", "project"),
+        ("project_forge_accounts", "project"),
         ("secrets", "project"),
     ] {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1");
@@ -11485,4 +11519,211 @@ async fn a_reused_gap_job_id_is_not_linked_from_an_older_result() {
     let page = dashboard.get(&format!("/jobs/{id}")).await.body;
     assert!(!page.contains(&format!("href=\"/jobs/{reused}\"")));
     assert!(page.contains("no longer available"));
+}
+
+/// A dashboard whose `gh` answers `api user` by the `GH_TOKEN` it gets: the
+/// token `tok-alice` is the account `alice-bot` and `tok-bob` is `bob-bot`.
+fn forge_token_dashboard(secrets_available: bool) -> Dashboard {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gh = support::executable(
+        dir.path(),
+        "gh",
+        r#"#!/usr/bin/env bash
+if [ "$1 $2" = "api user" ]; then
+  case "$GH_TOKEN" in
+    tok-alice) echo '{"login":"alice-bot","id":11}'; exit 0 ;;
+    tok-bob) echo '{"login":"bob-bot","id":22}'; exit 0 ;;
+    *) echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
+  esac
+fi
+echo "fake gh: unexpected: $*" >&2
+exit 1
+"#,
+    );
+    let secrets: Arc<dyn SecretStore> = if secrets_available {
+        Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)))
+    } else {
+        Arc::new(UnavailableSecrets::new(Arc::clone(&store)))
+    };
+    let dashboard = dashboard_with_gh(
+        store,
+        Arc::new(FakeRepos::fit()),
+        secrets,
+        vec!["boss@example.com".to_owned()],
+        GitHub {
+            gh,
+            ..GitHub::default()
+        },
+    );
+    // The script must outlive the dashboard's requests.
+    std::mem::forget(dir);
+    dashboard
+}
+
+const FORGE_PAGE: &str = "/settings/forges/github";
+
+#[tokio::test]
+async fn a_non_admin_saves_and_clears_their_forge_token_and_the_page_never_shows_it() {
+    let dashboard = forge_token_dashboard(true);
+    let page = dashboard.get_as("carol@example.com", FORGE_PAGE).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("No token is stored."));
+    assert!(page.body.contains(">Forges<"));
+    assert!(page.body.contains("href=\"/settings/forges/github\""));
+
+    let saved = dashboard
+        .post_as(
+            "carol@example.com",
+            &format!("{FORGE_PAGE}/token"),
+            "token=tok-alice",
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert!(saved.body.contains("alice-bot"));
+    assert!(!saved.body.contains("tok-alice"));
+    let page = dashboard.get_as("carol@example.com", FORGE_PAGE).await;
+    assert!(page.body.contains("A token is stored."));
+    assert!(!page.body.contains("tok-alice"));
+
+    // An empty save keeps the token.
+    dashboard
+        .post_as(
+            "carol@example.com",
+            &format!("{FORGE_PAGE}/token"),
+            "token=",
+        )
+        .await;
+    let owner = ForgeTokenOwner::User {
+        login: "carol@example.com",
+        forge: ForgeKind::GitHub,
+    };
+    assert!(dashboard.store.forge_account(owner).unwrap().is_some());
+
+    let cleared = dashboard
+        .post_as(
+            "carol@example.com",
+            &format!("{FORGE_PAGE}/token/clear"),
+            "",
+        )
+        .await;
+    assert!(cleared.body.contains("Cleared."));
+    assert!(cleared.body.contains("No token is stored."));
+    assert!(dashboard.store.forge_account(owner).unwrap().is_none());
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    assert!(secrets.forge_token(owner).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_forge_token_the_forge_rejects_is_not_stored_and_not_echoed() {
+    let dashboard = forge_token_dashboard(true);
+    let rejected = dashboard
+        .post_as(
+            USER,
+            &format!("{FORGE_PAGE}/token"),
+            "token=tok-wrong-secret",
+        )
+        .await;
+    assert_eq!(rejected.status, StatusCode::OK);
+    assert!(rejected.body.contains("rejected the token"));
+    assert!(!rejected.body.contains("tok-wrong-secret"));
+    let owner = ForgeTokenOwner::User {
+        login: USER,
+        forge: ForgeKind::GitHub,
+    };
+    assert!(dashboard.store.forge_account(owner).unwrap().is_none());
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    assert!(secrets.forge_token(owner).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn two_logins_see_only_their_own_forge_token() {
+    let dashboard = forge_token_dashboard(true);
+    let save = format!("{FORGE_PAGE}/token");
+    dashboard
+        .post_as("carol@example.com", &save, "token=tok-alice")
+        .await;
+    dashboard
+        .post_as("dave@example.com", &save, "token=tok-bob")
+        .await;
+
+    let carol = dashboard.get_as("carol@example.com", FORGE_PAGE).await.body;
+    let dave = dashboard.get_as("dave@example.com", FORGE_PAGE).await.body;
+    assert!(carol.contains("alice-bot") && !carol.contains("bob-bot"));
+    assert!(dave.contains("bob-bot") && !dave.contains("alice-bot"));
+
+    dashboard
+        .post_as(
+            "carol@example.com",
+            &format!("{FORGE_PAGE}/token/clear"),
+            "",
+        )
+        .await;
+    let dave = dashboard.get_as("dave@example.com", FORGE_PAGE).await.body;
+    assert!(dave.contains("bob-bot"));
+}
+
+#[tokio::test]
+async fn without_a_master_key_the_forge_page_disables_the_field_and_still_clears() {
+    let dashboard = forge_token_dashboard(false);
+    let page = dashboard.get_as("carol@example.com", FORGE_PAGE).await.body;
+    assert!(page.contains("master key is missing"));
+    assert!(page.contains("disabled"));
+
+    let refused = dashboard
+        .post_as(
+            "carol@example.com",
+            &format!("{FORGE_PAGE}/token"),
+            "token=tok-alice",
+        )
+        .await;
+    assert!(!refused.body.contains("tok-alice"));
+    let owner = ForgeTokenOwner::User {
+        login: "carol@example.com",
+        forge: ForgeKind::GitHub,
+    };
+    assert!(dashboard.store.forge_account(owner).unwrap().is_none());
+
+    dashboard
+        .store
+        .set_forge_account(
+            owner,
+            &ForgeAccount {
+                login: "old".into(),
+                id: 1,
+            },
+        )
+        .unwrap();
+    let cleared = dashboard
+        .post_as(
+            "carol@example.com",
+            &format!("{FORGE_PAGE}/token/clear"),
+            "",
+        )
+        .await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert!(dashboard.store.forge_account(owner).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_unknown_forge_is_a_404() {
+    let dashboard = forge_token_dashboard(true);
+    assert_eq!(
+        dashboard.get("/settings/forges/other").await.status,
+        StatusCode::NOT_FOUND
+    );
+    let post = dashboard
+        .post("/settings/forges/other/token", "token=x")
+        .await;
+    assert_eq!(post.status, StatusCode::NOT_FOUND);
 }

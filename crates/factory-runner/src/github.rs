@@ -7,7 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use factory_core::PrDescription;
 
-use crate::forge::{Account, BoxFuture, Forge};
+use crate::forge::{Account, BoxFuture, Forge, ForgeAccount, LookupError};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -1183,7 +1183,53 @@ impl GitHub {
     }
 }
 
+#[derive(Deserialize)]
+struct ApiUser {
+    login: String,
+    id: u64,
+}
+
 impl Forge for GitHub {
+    fn lookup_account<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> BoxFuture<'a, Result<ForgeAccount, LookupError>> {
+        Box::pin(async move {
+            let probe = Account {
+                token: Some(token.to_owned()),
+                login: String::new(),
+                name: String::new(),
+                email: String::new(),
+            };
+            let out = self
+                .run(&probe, &["api", "user"], None)
+                .await
+                .map_err(|err| {
+                    if err.contains("HTTP 401") || err.contains("HTTP 403") {
+                        LookupError::Rejected
+                    } else {
+                        LookupError::Failed(err.replace(token, "<redacted>"))
+                    }
+                })?;
+            let user: ApiUser = serde_json::from_str(&out).map_err(|_| {
+                LookupError::Failed("gh api user returned unexpected output".into())
+            })?;
+            Ok(ForgeAccount {
+                login: user.login,
+                id: user.id,
+            })
+        })
+    }
+
+    fn account(&self, token: String, found: &ForgeAccount) -> Account {
+        Account {
+            token: Some(token),
+            login: found.login.clone(),
+            name: found.login.clone(),
+            email: format!("{}+{}@users.noreply.github.com", found.id, found.login),
+        }
+    }
+
     fn clone_url(&self, repo: &str) -> String {
         format!("https://github.com/{repo}.git")
     }

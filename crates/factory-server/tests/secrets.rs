@@ -3,9 +3,12 @@
 
 use std::sync::Arc;
 
+use factory_runner::ForgeKind;
+
 use factory_server::{
-    CodexAuthError, CopilotTokenError, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN, SecretError,
-    SecretRef, SecretStore, Store, UnavailableSecrets, validate_codex_auth, validate_copilot_token,
+    CodexAuthError, CopilotTokenError, ForgeTokenOwner, LOCAL_BACKEND, LocalSecrets,
+    MASTER_KEY_LEN, SecretError, SecretRef, SecretStore, Store, UnavailableSecrets,
+    validate_codex_auth, validate_copilot_token,
 };
 
 fn store() -> Arc<Store> {
@@ -676,4 +679,193 @@ fn validate_copilot_token_errors_never_echo_the_input() {
         let shown = format!("{err} {err:?}");
         assert!(!shown.contains("secret"), "{shown}");
     }
+}
+
+const GITHUB: ForgeKind = ForgeKind::GitHub;
+
+/// The raw row a forge token owner's ciphertext sits in.
+fn forge_row(owner: ForgeTokenOwner<'_>) -> (String, String) {
+    match owner {
+        ForgeTokenOwner::User { login, forge } => (
+            String::new(),
+            format!("forge-user:{}:{login}", forge.as_str()),
+        ),
+        ForgeTokenOwner::Project { project, .. } => (project.into(), "forge-project".into()),
+        ForgeTokenOwner::Upstream { project, .. } => (project.into(), "forge-upstream".into()),
+    }
+}
+
+/// Moves the ciphertext of `from` into the row of `to` and returns what
+/// reading `to` gives.
+fn move_forge_token(
+    store: &Store,
+    secrets: &LocalSecrets,
+    from: ForgeTokenOwner<'_>,
+    to: ForgeTokenOwner<'_>,
+) -> Result<Option<String>, SecretError> {
+    let (project, header) = forge_row(from);
+    let (backend, bytes) = store
+        .get_secret(at(&project, "", &header))
+        .expect("raw row")
+        .expect("row exists");
+    let (project, header) = forge_row(to);
+    store
+        .put_secret(at(&project, "", &header), &backend, &bytes)
+        .expect("plant the bytes");
+    secrets.forge_token(to)
+}
+
+#[test]
+fn forge_tokens_round_trip_per_owner_and_hold_no_plaintext() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    let alice = ForgeTokenOwner::User {
+        login: "alice",
+        forge: GITHUB,
+    };
+    let bob = ForgeTokenOwner::User {
+        login: "bob",
+        forge: GITHUB,
+    };
+    let project = ForgeTokenOwner::Project {
+        project: "maestro",
+        forge: GITHUB,
+    };
+    let upstream = ForgeTokenOwner::Upstream {
+        project: "maestro",
+        forge: GITHUB,
+    };
+
+    for (owner, token) in [
+        (alice, "tok-alice"),
+        (bob, "tok-bob"),
+        (project, "tok-project"),
+        (upstream, "tok-upstream"),
+    ] {
+        assert!(secrets.forge_token(owner).unwrap().is_none());
+        secrets.put_forge_token(owner, token).unwrap();
+    }
+    for (owner, token) in [
+        (alice, "tok-alice"),
+        (bob, "tok-bob"),
+        (project, "tok-project"),
+        (upstream, "tok-upstream"),
+    ] {
+        assert_eq!(secrets.forge_token(owner).unwrap().as_deref(), Some(token));
+        let (row_project, header) = forge_row(owner);
+        let (_, bytes) = store
+            .get_secret(at(&row_project, "", &header))
+            .unwrap()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(token));
+    }
+
+    secrets.delete_forge_token(alice).unwrap();
+    assert!(secrets.forge_token(alice).unwrap().is_none());
+    assert_eq!(
+        secrets.forge_token(bob).unwrap().as_deref(),
+        Some("tok-bob")
+    );
+    secrets.delete_forge_token(alice).unwrap();
+}
+
+#[test]
+fn a_forge_token_ciphertext_moved_to_another_row_fails_to_decrypt() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    let alice = ForgeTokenOwner::User {
+        login: "alice",
+        forge: GITHUB,
+    };
+    let bob = ForgeTokenOwner::User {
+        login: "bob",
+        forge: GITHUB,
+    };
+    let project = ForgeTokenOwner::Project {
+        project: "maestro",
+        forge: GITHUB,
+    };
+    let upstream = ForgeTokenOwner::Upstream {
+        project: "maestro",
+        forge: GITHUB,
+    };
+    for (from, to) in [
+        (alice, bob),
+        (alice, project),
+        (project, upstream),
+        (upstream, project),
+        (project, alice),
+    ] {
+        for owner in [alice, project, upstream] {
+            secrets.put_forge_token(owner, "tok").unwrap();
+        }
+        assert!(
+            matches!(
+                move_forge_token(&store, &secrets, from, to),
+                Err(SecretError::Decrypt)
+            ),
+            "{from:?} into {to:?}",
+        );
+    }
+}
+
+#[test]
+fn a_forge_token_ciphertext_swapped_with_an_mcp_header_or_reserved_row_fails() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    let alice = ForgeTokenOwner::User {
+        login: "alice",
+        forge: GITHUB,
+    };
+    let header = at("maestro", "context7", "Authorization");
+    secrets.put_forge_token(alice, "tok-alice").unwrap();
+    secrets.put(header, "Bearer sk-header").unwrap();
+    secrets.set_claude_token("sk-ant-oat01-token").unwrap();
+    let (_, header_header) = forge_row(alice);
+
+    // The forge token's ciphertext in an MCP header row and in the Claude row.
+    let (backend, bytes) = store
+        .get_secret(at("", "", &header_header))
+        .unwrap()
+        .unwrap();
+    store.put_secret(header, &backend, &bytes).unwrap();
+    assert!(matches!(secrets.get(header), Err(SecretError::Decrypt)));
+    store
+        .put_secret(at("", "", "claude-token"), &backend, &bytes)
+        .unwrap();
+    assert!(matches!(secrets.claude_token(), Err(SecretError::Decrypt)));
+
+    // An MCP header ciphertext in the forge token row.
+    secrets.put(header, "Bearer sk-header").unwrap();
+    let (backend, bytes) = store.get_secret(header).unwrap().unwrap();
+    store
+        .put_secret(at("", "", &header_header), &backend, &bytes)
+        .unwrap();
+    assert!(matches!(
+        secrets.forge_token(alice),
+        Err(SecretError::Decrypt)
+    ));
+}
+
+#[test]
+fn an_unavailable_store_refuses_forge_tokens_but_still_deletes_them() {
+    let store = store();
+    let local = LocalSecrets::new(&key(1), Arc::clone(&store));
+    let alice = ForgeTokenOwner::User {
+        login: "alice",
+        forge: GITHUB,
+    };
+    local.put_forge_token(alice, "tok").unwrap();
+
+    let secrets = UnavailableSecrets::new(Arc::clone(&store));
+    assert!(matches!(
+        secrets.put_forge_token(alice, "tok"),
+        Err(SecretError::Unavailable)
+    ));
+    assert!(matches!(
+        secrets.forge_token(alice),
+        Err(SecretError::Unavailable)
+    ));
+    secrets.delete_forge_token(alice).unwrap();
+    assert!(local.forge_token(alice).unwrap().is_none());
 }
