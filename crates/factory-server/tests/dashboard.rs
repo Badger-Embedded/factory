@@ -1545,6 +1545,97 @@ async fn the_job_page_loads_its_update_script_but_the_board_does_not() {
     assert!(!dashboard.get("/").await.body.contains("sessionStorage"));
 }
 
+/// A job page with all six content cards.
+fn to_all_six_cards(dashboard: &Dashboard, id: i64) {
+    to_review_turn(dashboard, id);
+    dashboard.apply(id, Event::ReviewApproved);
+    dashboard
+        .store
+        .record_mcp_tool_call(id, "context7", "query-docs")
+        .unwrap();
+    append_a_log_line(dashboard, id);
+}
+
+fn section_toggle(section: &str) -> String {
+    format!("aria-controls=\"section-{section}\"")
+}
+
+#[tokio::test]
+async fn the_six_content_cards_carry_a_section_and_a_toggle() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_all_six_cards(&dashboard, id);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(page.contains(&format!("<div class=\"job-main\" data-job=\"{id}\">")));
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await.body;
+    let swapped = ["spec", "plan", "reviews", "mcp-calls", "log"];
+    for section in ["request", "spec", "plan", "reviews", "mcp-calls", "log"] {
+        let marker = format!("data-section=\"{section}\"");
+        assert_eq!(page.matches(&marker).count(), 1, "{section}");
+        assert!(page.contains(&section_toggle(section)), "{section}");
+        assert!(
+            page.contains(&format!("id=\"section-{section}\"")),
+            "{section}"
+        );
+        if swapped.contains(&section) {
+            assert_eq!(fragment.matches(&marker).count(), 1, "{section} swapped");
+            assert!(fragment.contains(&section_toggle(section)), "{section}");
+        }
+    }
+    // Every card is rendered expanded, and none is hidden.
+    assert_eq!(page.matches("class=\"section-toggle\"").count(), 6);
+    assert_eq!(page.matches("aria-expanded=\"true\"").count(), 6);
+    assert!(!page.contains("aria-expanded=\"false\""));
+    assert!(!page.contains("class=\"card-body\" hidden"));
+    // The cards are not keyed disclosures for `details-state.js`.
+    assert!(!page.contains("data-section=\"spec\" data-key"));
+
+    // The status card and the timeline do not collapse.
+    let region = |id: &str, until: &str| {
+        let at = page.find(&format!("id=\"{id}\"")).expect(id);
+        let start = page[..at].rfind('<').unwrap();
+        let end = start + page[start..].find(until).expect(until);
+        page[start..end].to_string()
+    };
+    for (id, slice) in [
+        ("job-status", region("job-status", "<aside")),
+        ("job-timeline", region("job-timeline", "class=\"job-main\"")),
+    ] {
+        assert!(slice.len() > 100, "{id} slice is the region");
+        assert!(!slice.contains("data-section"), "{id}");
+        assert!(!slice.contains("section-toggle"), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn the_edit_link_sits_outside_the_request_toggle() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let button = page.find("section-toggle").unwrap();
+    let close = button + page[button..].find("</button>").unwrap();
+    assert!(!page[button..close].contains("/edit"));
+    assert!(page.contains(&format!("href=\"/jobs/{id}/edit\"")));
+}
+
+#[tokio::test]
+async fn only_the_job_page_loads_the_sections_script() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+
+    let marker = "factory.job-sections:";
+    assert!(
+        dashboard
+            .get(&format!("/jobs/{id}"))
+            .await
+            .body
+            .contains(marker)
+    );
+    assert!(!dashboard.get("/").await.body.contains(marker));
+}
+
 /// A distinctive line from `local-time.js`.
 const LOCAL_TIME_MARKER: &str = "time[datetime][data-format]";
 
