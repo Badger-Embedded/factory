@@ -3840,6 +3840,8 @@ fn renovate_wait_card(
         RenovateWait::Stopped => "Triage stopped",
         RenovateWait::Ready => "Ready to merge",
         RenovateWait::Unsafe => "The update is not safe to merge",
+        RenovateWait::Fixing => "Waiting for a fix job",
+        RenovateWait::RebaseFailed => "Rebase the pull request",
     };
     html! {
         div.card.needs-you {
@@ -4160,6 +4162,9 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
             ),
             Some(Command::ProposeGaps { .. }) => {
                 "The factory is creating a job for each packaging gap.".into()
+            }
+            Some(Command::RequestRebase { number, .. }) => {
+                format!("The factory is asking Renovate to rebase pull request #{number}.")
             }
             Some(
                 Command::RunAgent { .. }

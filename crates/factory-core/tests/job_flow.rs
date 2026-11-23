@@ -1,8 +1,8 @@
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event, Gates, Job, JobKind,
-    MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, PrDiff, Question, Rejected,
-    RenovateCi, RenovateWait, RetryLimits, RetryTarget, ReviewPass, ReviewState, ReviewStop,
-    Session, Stage, Task, Turn, Verdict,
+    AgentResult, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event, FixOutcome, Gates,
+    Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, PrDiff, Question,
+    Rejected, RenovateCi, RenovateWait, RetryLimits, RetryTarget, ReviewPass, ReviewState,
+    ReviewStop, Session, Stage, Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -3134,4 +3134,362 @@ fn a_failed_analysis_run_can_be_retried() {
     assert!(job.can_retry());
     apply(&mut job, Event::Retry);
     assert_eq!(job.stage(), &Stage::Packaging);
+}
+
+const STOPPED_AT_ONCE: RetryLimits = RetryLimits { auto: 0, total: 0 };
+
+fn stopped_job() -> Job {
+    let mut job = renovate_job();
+    observe(&mut job, "h1", failed("log"), STOPPED_AT_ONCE, false);
+    post_comment(&mut job);
+    waits(&job, RenovateWait::Stopped);
+    job
+}
+
+fn fixing_job() -> Job {
+    let mut job = stopped_job();
+    apply(&mut job, Event::FixStarted { job: 7 });
+    waits(&job, RenovateWait::Fixing);
+    job
+}
+
+fn fix_ended(job: &mut Job, outcome: FixOutcome) {
+    apply(job, Event::FixEnded { job: 7, outcome });
+}
+
+fn fix_merged_on(job: &mut Job, head: &str) {
+    apply(
+        job,
+        Event::FixEnded {
+            job: 7,
+            outcome: FixOutcome::Merged { head: head.into() },
+        },
+    );
+}
+
+fn reason_of(job: &Job) -> &str {
+    match job.turn() {
+        Turn::User(Ask::Renovate { reason, .. }) => reason,
+        other => panic!("expected a Renovate wait, got {other:?}"),
+    }
+}
+
+fn rebase_head(job: &Job) -> Option<String> {
+    match job.next_command() {
+        Some(Command::RequestRebase { number: 42, head }) => Some(head),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_fix_job_starts_at_requested_and_knows_its_source() {
+    let job = Job::fix("fix it", Gates::default(), 63, 42);
+    assert_eq!(job.stage(), &Stage::Requested);
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(job.fix_source(), Some((63, 42)));
+    assert_eq!(job.gap_source(), None);
+    assert!(job.renovate_pr().is_none());
+    assert_eq!(renovate_job().fix_source(), None);
+}
+
+#[test]
+fn the_fix_request_names_the_pull_request_and_the_constraints() {
+    let text = pr_of(&renovate_job()).fix_request("CI fails.", Some("update the smoke test"));
+    for needle in [
+        "#42",
+        "https://github.com/o/r/pull/42",
+        "CI fails.",
+        "update the smoke test",
+        "must not include the dependency update itself",
+        "CI on the base branch as it is today",
+    ] {
+        assert!(text.contains(needle), "missing {needle:?} in {text}");
+    }
+    let bare = pr_of(&renovate_job()).fix_request("CI fails.", Some("  "));
+    assert!(!bare.contains("Instructions"));
+}
+
+#[test]
+fn a_fix_starts_once_and_the_job_waits_for_it() {
+    let mut job = fixing_job();
+    assert_eq!(reason_of(&job), "Waiting for fix job #7");
+    assert!(!job.can_retry());
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::WatchRenovate {
+            watch_only: true,
+            ..
+        })
+    ));
+    let before = job.clone();
+    assert!(job.apply(Event::FixStarted { job: 8 }).is_err());
+    assert_eq!(job, before);
+
+    let mut ready = renovate_job();
+    assert!(ready.apply(Event::FixStarted { job: 7 }).is_err());
+}
+
+#[test]
+fn a_merged_fix_queues_one_rebase_request() {
+    let mut job = fixing_job();
+    fix_merged_on(&mut job, "h1");
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(rebase_head(&job).as_deref(), Some("h1"));
+
+    let before = job.clone();
+    fix_merged_on(&mut job, "h1");
+    assert_eq!(job, before);
+
+    apply(&mut job, Event::RebaseRequested);
+    waits(&job, RenovateWait::Fixing);
+    assert_eq!(
+        reason_of(&job),
+        "Fix job #7 merged. Waiting for Renovate to rebase the pull request."
+    );
+    assert_eq!(rebase_head(&job), None);
+    let before = job.clone();
+    fix_merged_on(&mut job, "h1");
+    assert_eq!(job, before);
+    assert!(!job.can_retry());
+}
+
+#[test]
+fn another_fix_job_ending_changes_nothing() {
+    let mut job = fixing_job();
+    let before = job.clone();
+    apply(
+        &mut job,
+        Event::FixEnded {
+            job: 8,
+            outcome: FixOutcome::Merged { head: "h1".into() },
+        },
+    );
+    assert_eq!(job, before);
+}
+
+#[test]
+fn a_cancelled_or_dismissed_fix_returns_to_stopped_with_the_earlier_reason() {
+    for (outcome, line) in [
+        (FixOutcome::Cancelled, "Fix job #7 was cancelled."),
+        (FixOutcome::Closed, "Fix job #7 was closed without merging."),
+        (
+            FixOutcome::Dismissed,
+            "Fix job #7 was dismissed after a failure.",
+        ),
+        (FixOutcome::Deleted, "Fix job #7 was deleted."),
+    ] {
+        let mut job = fixing_job();
+        fix_ended(&mut job, outcome);
+        waits(&job, RenovateWait::Stopped);
+        assert_eq!(
+            reason_of(&job),
+            format!("CI still fails after 0 reruns on this head commit.\n{line}")
+        );
+        assert!(job.can_retry());
+        assert_eq!(pr_of(&job).fix, None);
+
+        apply(&mut job, Event::FixStarted { job: 9 });
+        waits(&job, RenovateWait::Fixing);
+    }
+}
+
+#[test]
+fn a_failed_fix_leaves_the_job_waiting() {
+    let mut job = fixing_job();
+    let before = job.clone();
+    observe(&mut job, "h1", failed("log"), STOPPED_AT_ONCE, false);
+    assert_eq!(job, before);
+}
+
+#[test]
+fn a_new_head_keeps_a_running_fix() {
+    let mut job = fixing_job();
+    observe(&mut job, "h2", RenovateCi::Pending, LIMITS, false);
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert!(pr_of(&job).fix.is_some());
+
+    observe(&mut job, "h2", failed("log"), STOPPED_AT_ONCE, false);
+    post_comment(&mut job);
+    waits(&job, RenovateWait::Fixing);
+    assert_eq!(reason_of(&job), "Waiting for fix job #7");
+    assert_eq!(
+        pr_of(&job).stopped.as_deref(),
+        Some("CI still fails after 0 reruns on this head commit.")
+    );
+
+    fix_merged_on(&mut job, "h2");
+    assert_eq!(rebase_head(&job).as_deref(), Some("h2"));
+}
+
+#[test]
+fn a_fix_that_ends_on_a_new_head_restores_the_stopped_card() {
+    let mut job = fixing_job();
+    observe(&mut job, "h2", RenovateCi::Pending, LIMITS, false);
+    fix_ended(&mut job, FixOutcome::Cancelled);
+    waits(&job, RenovateWait::Stopped);
+    assert_eq!(
+        reason_of(&job),
+        "CI still fails after 0 reruns on this head commit.\nFix job #7 was cancelled."
+    );
+    assert!(job.can_retry());
+    assert_eq!(pr_of(&job).fix, None);
+}
+
+#[test]
+fn a_fix_merged_on_an_older_head_asks_for_that_head() {
+    let mut job = fixing_job();
+    observe(&mut job, "h2", RenovateCi::Pending, LIMITS, false);
+    fix_merged_on(&mut job, "h1");
+    assert_eq!(rebase_head(&job).as_deref(), Some("h1"));
+}
+
+#[test]
+fn a_fix_merged_on_a_head_not_yet_observed_asks_for_that_head() {
+    let mut job = fixing_job();
+    fix_merged_on(&mut job, "h2");
+    assert_eq!(rebase_head(&job).as_deref(), Some("h2"));
+}
+
+#[test]
+fn the_merge_time_head_is_the_baseline_after_the_rebase_result() {
+    let results = [
+        Event::RebaseRequested,
+        Event::RebaseFailed { reason: "x".into() },
+    ];
+    for result in results {
+        let mut job = fixing_job();
+        observe(&mut job, "h1", RenovateCi::Pending, LIMITS, false);
+        fix_merged_on(&mut job, "h2");
+        apply(&mut job, result);
+        let before = job.clone();
+        observe(&mut job, "h2", failed("log"), LIMITS, false);
+        assert_eq!(job, before);
+        observe(&mut job, "h3", failed("log"), LIMITS, false);
+        assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+        assert_eq!(pr_of(&job).fix, None);
+    }
+}
+
+#[test]
+fn a_new_head_after_the_rebase_request_starts_triage_over() {
+    let merged = || {
+        let mut job = fixing_job();
+        fix_merged_on(&mut job, "h1");
+        apply(&mut job, Event::RebaseRequested);
+        job
+    };
+
+    let mut job = merged();
+    let before = job.clone();
+    observe(&mut job, "h1", failed("log"), LIMITS, false);
+    assert_eq!(job, before);
+
+    observe(&mut job, "h2", failed("log"), LIMITS, false);
+    assert_eq!((pr_of(&job).reruns, pr_of(&job).auto_reruns), (0, 0));
+    assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+    assert_eq!(pr_of(&job).fix, None);
+
+    let mut job = merged();
+    observe(&mut job, "h2", passed(), LIMITS, false);
+    assert!(matches!(job.turn(), Turn::Agent(Task::CheckDiff { .. })));
+}
+
+#[test]
+fn a_failed_rebase_request_asks_for_a_hand_rebase_and_a_new_head_restarts() {
+    let mut job = fixing_job();
+    fix_merged_on(&mut job, "h1");
+    apply(
+        &mut job,
+        Event::RebaseFailed {
+            reason: "no checkbox".into(),
+        },
+    );
+    waits(&job, RenovateWait::RebaseFailed);
+    assert_eq!(
+        reason_of(&job),
+        "Fix job #7 merged, but the factory could not ask Renovate to rebase. Rebase the \
+         pull request by hand."
+    );
+    assert!(!job.can_retry());
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::WatchRenovate {
+            watch_only: true,
+            ..
+        })
+    ));
+    let before = job.clone();
+    observe(&mut job, "h1", failed("log"), LIMITS, false);
+    assert_eq!(job, before);
+
+    observe(&mut job, "h2", failed("log"), LIMITS, false);
+    assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+}
+
+#[test]
+fn a_skipped_rebase_request_goes_back_to_triage() {
+    let mut job = fixing_job();
+    fix_merged_on(&mut job, "h1");
+    apply(&mut job, Event::RebaseSkipped);
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(pr_of(&job).fix, None);
+    observe(&mut job, "h2", failed("log"), LIMITS, false);
+    assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+}
+
+#[test]
+fn rebase_events_need_a_pending_request_and_an_observation_waits_for_it() {
+    let mut job = fixing_job();
+    for event in [
+        Event::RebaseRequested,
+        Event::RebaseSkipped,
+        Event::RebaseFailed { reason: "x".into() },
+    ] {
+        assert!(job.clone().apply(event).is_err());
+    }
+    fix_merged_on(&mut job, "h1");
+    let observed = Event::RenovateObserved {
+        head: "h2".into(),
+        ci: RenovateCi::Pending,
+        limits: LIMITS,
+        auto_merge: false,
+    };
+    assert!(job.apply(observed).is_err());
+}
+
+#[test]
+fn renovate_merged_or_closed_ends_the_job_while_a_fix_runs() {
+    let ends = [
+        (Event::Merged, Stage::Merged),
+        (Event::ClosedUnmerged, Stage::Cancelled),
+    ];
+    for (event, stage) in ends {
+        let mut running = fixing_job();
+        apply(&mut running, event.clone());
+        assert_eq!(running.stage(), &stage);
+
+        let mut pending = fixing_job();
+        fix_merged_on(&mut pending, "h1");
+        apply(&mut pending, event.clone());
+        assert_eq!(pending.stage(), &stage);
+
+        let mut waiting = fixing_job();
+        fix_merged_on(&mut waiting, "h1");
+        apply(&mut waiting, Event::RebaseRequested);
+        apply(&mut waiting, event);
+        assert_eq!(waiting.stage(), &stage);
+    }
+}
+
+#[test]
+fn a_renovate_job_stored_before_fix_jobs_loads_with_no_fix() {
+    let mut json = serde_json::to_value(stopped_job()).unwrap();
+    let pr = &mut json["kind"]["Renovate"];
+    assert!(pr.as_object_mut().unwrap().remove("fix").is_some());
+    let job: Job = serde_json::from_value(json).unwrap();
+    assert_eq!(pr_of(&job).fix, None);
+    waits(&job, RenovateWait::Stopped);
+
+    let back: Job = serde_json::from_str(&serde_json::to_string(&fixing_job()).unwrap()).unwrap();
+    assert_eq!(back, fixing_job());
 }
