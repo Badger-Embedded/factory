@@ -18,7 +18,9 @@ use tokio::sync::Notify;
 
 use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::copilot::validate_copilot_token;
+use crate::csrf::CsrfKey;
 use crate::device_login::DeviceLogin;
+use crate::forge_tokens::{self, SaveError};
 use crate::forges::Forges;
 use crate::github::RepoReport;
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
@@ -26,7 +28,7 @@ use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
-use crate::secrets::{SecretError, SecretRef, SecretStore, validate_codex_auth};
+use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
     FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectTotals,
@@ -68,6 +70,7 @@ struct AppState {
     onboarding: Arc<tokio::sync::Mutex<()>>,
     copilot_login: Arc<DeviceLogin>,
     admins: Arc<Vec<String>>,
+    csrf: Arc<CsrfKey>,
 }
 
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
@@ -115,6 +118,7 @@ pub fn app(
         onboarding: Arc::new(tokio::sync::Mutex::new(())),
         copilot_login,
         admins: Arc::new(admins),
+        csrf: Arc::new(CsrfKey::generate()),
     };
     Router::new()
         .route("/", get(index))
@@ -147,6 +151,12 @@ pub fn app(
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/settings", get(settings_home))
+        .route("/settings/forges/{forge}", get(show_forge))
+        .route("/settings/forges/{forge}/token", post(save_forge_token))
+        .route(
+            "/settings/forges/{forge}/token/clear",
+            post(clear_forge_token),
+        )
         .route(
             "/settings/notifications",
             get(show_notifications).post(save_notifications),
@@ -311,6 +321,7 @@ fn visible_job(state: &AppState, headers: &HeaderMap, id: i64) -> Result<JobRow,
 
 enum AppError {
     BadRequest(String),
+    Forbidden(String),
     NotFound(String),
     Io(String),
     UnknownProject(String),
@@ -349,6 +360,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            AppError::Forbidden(message) => (StatusCode::FORBIDDEN, message),
             AppError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             AppError::UnknownProject(name) => (StatusCode::NOT_FOUND, format!("no project {name}")),
             AppError::Io(message) => {
@@ -2749,11 +2761,141 @@ async fn cancel_codex_login(
     codex_page(&state, &headers, None).await
 }
 
+fn require_csrf(state: &AppState, login: &str, token: &str) -> Result<(), AppError> {
+    if state.csrf.accepts(login, token) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "the form is missing its token or it is stale, reload the page".into(),
+        ))
+    }
+}
+
+fn forge_kind(name: &str) -> Result<ForgeKind, AppError> {
+    ForgeKind::parse(name).ok_or_else(|| AppError::NotFound(format!("no forge {name}")))
+}
+
+fn forge_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    kind: ForgeKind,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    let account = state.store.forge_account(ForgeTokenOwner::User {
+        login: &login,
+        forge: kind,
+    })?;
+    Ok(pages::settings_forge(
+        &login,
+        &settings_nav(state, &login)?,
+        kind,
+        account.as_ref(),
+        state.secrets.available(),
+        &state.csrf.issue(&login),
+        notice,
+    ))
+}
+
+async fn show_forge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(forge): Path<String>,
+) -> Result<Markup, AppError> {
+    forge_page(&state, &headers, forge_kind(&forge)?, None)
+}
+
+async fn save_forge_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(forge): Path<String>,
+    Form(form): Form<ForgeTokenForm>,
+) -> Result<Markup, AppError> {
+    let kind = forge_kind(&forge)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    if !state.secrets.available() {
+        return forge_page(
+            &state,
+            &headers,
+            kind,
+            Some("The master key is missing, so the token was not saved."),
+        );
+    }
+    let token = form.token.trim();
+    if token.is_empty() {
+        return forge_page(&state, &headers, kind, Some("Saved."));
+    }
+    let login = user(&headers);
+    let owner = ForgeTokenOwner::User {
+        login: &login,
+        forge: kind,
+    };
+    let saved = forge_tokens::save(
+        state.secrets.as_ref(),
+        state.forges.forge(kind).as_ref(),
+        owner,
+        token,
+    )
+    .await;
+    let notice = match saved {
+        Ok(account) => format!("Saved. The token belongs to {}.", account.login),
+        Err(SaveError::Rejected) => format!(
+            "{} rejected the token. Nothing was saved.",
+            kind.display_name()
+        ),
+        Err(SaveError::Lookup(message)) => format!(
+            "Could not look the account up on {}: {message}. Nothing was saved.",
+            kind.display_name()
+        ),
+        Err(SaveError::Secrets(err)) => return Err(err.into()),
+        Err(SaveError::Store(err)) => return Err(err.into()),
+    };
+    forge_page(&state, &headers, kind, Some(&notice))
+}
+
+async fn clear_forge_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(forge): Path<String>,
+    Form(form): Form<ForgeClearForm>,
+) -> Result<Markup, AppError> {
+    let kind = forge_kind(&forge)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let login = user(&headers);
+    let cleared = forge_tokens::clear(
+        state.secrets.as_ref(),
+        ForgeTokenOwner::User {
+            login: &login,
+            forge: kind,
+        },
+    );
+    match cleared {
+        Ok(()) => forge_page(&state, &headers, kind, Some("Cleared.")),
+        Err(SaveError::Secrets(err)) => Err(err.into()),
+        Err(SaveError::Store(err)) => Err(err.into()),
+        Err(SaveError::Rejected | SaveError::Lookup(_)) => unreachable!("clearing makes no lookup"),
+    }
+}
+
 async fn show_copilot(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
     copilot_page(&state, &headers, None).await
+}
+
+#[derive(Deserialize)]
+struct ForgeTokenForm {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    csrf: String,
+}
+
+#[derive(Deserialize)]
+struct ForgeClearForm {
+    #[serde(default)]
+    csrf: String,
 }
 
 #[derive(Deserialize)]

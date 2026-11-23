@@ -7,12 +7,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use factory_core::{
     Agent, AgentResult, DEFAULT_AGENT, Event, Gap, Gates, Job, Rejected, Session, Stage,
 };
-use factory_runner::{ForgeKind, LogLine};
+use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
 use crate::projects::{Project, ProjectForge, StageAgents, StageEfforts, StageModels};
-use crate::secrets::SecretRef;
+use crate::secrets::{ForgeTokenOwner, SecretRef};
 use crate::settings::Settings;
 
 /// The requester of a job the factory creates on its own, with no person behind it.
@@ -216,6 +216,21 @@ CREATE TABLE IF NOT EXISTS user_settings (
     login TEXT PRIMARY KEY,
     notifications INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS user_forge_accounts (
+    login TEXT NOT NULL,
+    forge TEXT NOT NULL,
+    account_login TEXT NOT NULL,
+    account_id INTEGER NOT NULL,
+    PRIMARY KEY (login, forge)
+);
+CREATE TABLE IF NOT EXISTS project_forge_accounts (
+    project TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    forge TEXT NOT NULL,
+    account_login TEXT NOT NULL,
+    account_id INTEGER NOT NULL,
+    PRIMARY KEY (project, kind)
 );
 CREATE TABLE IF NOT EXISTS store_boots (
     id INTEGER PRIMARY KEY AUTOINCREMENT
@@ -1913,6 +1928,112 @@ impl Store {
         Ok(found)
     }
 
+    /// The account the forge token of `owner` belongs to, or `None` when no
+    /// account is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn forge_account(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<ForgeAccount>, StoreError> {
+        let conn = self.conn();
+        let found = match owner {
+            ForgeTokenOwner::User { login, forge } => conn.query_row(
+                "SELECT account_login, account_id FROM user_forge_accounts
+                 WHERE login = ?1 AND forge = ?2",
+                params![login, forge.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            ),
+            ForgeTokenOwner::Project { project, .. }
+            | ForgeTokenOwner::Upstream { project, .. } => conn.query_row(
+                "SELECT account_login, account_id FROM project_forge_accounts
+                     WHERE project = ?1 AND kind = ?2",
+                params![project, project_token_kind(owner)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            ),
+        }
+        .optional()?;
+        Ok(found.map(|(login, id)| ForgeAccount {
+            login,
+            id: id.cast_unsigned(),
+        }))
+    }
+
+    /// Records the account the forge token of `owner` belongs to, replacing
+    /// the one recorded.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_forge_account(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        account: &ForgeAccount,
+    ) -> Result<(), StoreError> {
+        write_forge_account(&self.conn(), owner, account)
+    }
+
+    /// Forgets the account recorded for the forge token of `owner`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn clear_forge_account(&self, owner: ForgeTokenOwner<'_>) -> Result<(), StoreError> {
+        erase_forge_account(&self.conn(), owner)
+    }
+
+    /// Stores the sealed forge token and the account it belongs to in one
+    /// transaction, so a failure leaves neither and a concurrent save or clear
+    /// never leaves one without the other.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn put_forge_token(
+        &self,
+        at: SecretRef<'_>,
+        backend: &str,
+        value: &[u8],
+        owner: ForgeTokenOwner<'_>,
+        account: &ForgeAccount,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO secrets (project, server, header, backend, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (project, server, header)
+             DO UPDATE SET backend = excluded.backend, value = excluded.value",
+            params![at.project, at.server, at.header, backend, value],
+        )?;
+        write_forge_account(&tx, owner, account)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Removes the sealed forge token and its account in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn delete_forge_token(
+        &self,
+        at: SecretRef<'_>,
+        owner: ForgeTokenOwner<'_>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM secrets WHERE project = ?1 AND server = ?2 AND header = ?3",
+            params![at.project, at.server, at.header],
+        )?;
+        erase_forge_account(&tx, owner)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Whether `login` wants browser notifications. A login with no
     /// `user_settings` row has them on.
     ///
@@ -2140,6 +2261,7 @@ impl Store {
             "project_maintenance",
             "renovate_prs",
             "dismissed_gaps",
+            "project_forge_accounts",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;
@@ -3456,4 +3578,67 @@ fn parse_row((id, project, requested_by, created_at, job): RawRow) -> Result<Job
         created_at,
         job: serde_json::from_str(&job)?,
     })
+}
+
+fn project_token_kind(owner: ForgeTokenOwner<'_>) -> &'static str {
+    match owner {
+        ForgeTokenOwner::Upstream { .. } => "upstream",
+        _ => "project",
+    }
+}
+
+fn write_forge_account(
+    conn: &Connection,
+    owner: ForgeTokenOwner<'_>,
+    account: &ForgeAccount,
+) -> Result<(), StoreError> {
+    match owner {
+        ForgeTokenOwner::User { login, forge } => conn.execute(
+            "INSERT INTO user_forge_accounts (login, forge, account_login, account_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (login, forge) DO UPDATE SET
+                 account_login = excluded.account_login,
+                 account_id = excluded.account_id",
+            params![
+                login,
+                forge.as_str(),
+                account.login,
+                account.id.cast_signed()
+            ],
+        )?,
+        ForgeTokenOwner::Project { project, forge }
+        | ForgeTokenOwner::Upstream { project, forge } => conn.execute(
+            "INSERT INTO project_forge_accounts
+                 (project, kind, forge, account_login, account_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (project, kind) DO UPDATE SET
+                 forge = excluded.forge,
+                 account_login = excluded.account_login,
+                 account_id = excluded.account_id",
+            params![
+                project,
+                project_token_kind(owner),
+                forge.as_str(),
+                account.login,
+                account.id.cast_signed()
+            ],
+        )?,
+    };
+    Ok(())
+}
+
+fn erase_forge_account(conn: &Connection, owner: ForgeTokenOwner<'_>) -> Result<(), StoreError> {
+    match owner {
+        ForgeTokenOwner::User { login, forge } => conn.execute(
+            "DELETE FROM user_forge_accounts WHERE login = ?1 AND forge = ?2",
+            params![login, forge.as_str()],
+        )?,
+        ForgeTokenOwner::Project { project, .. } | ForgeTokenOwner::Upstream { project, .. } => {
+            conn.execute(
+                "DELETE FROM project_forge_accounts WHERE project = ?1 AND kind = ?2",
+                params![project, project_token_kind(owner)],
+            )?
+        }
+    };
+    Ok(())
 }

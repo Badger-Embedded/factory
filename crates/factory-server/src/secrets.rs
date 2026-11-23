@@ -1,6 +1,7 @@
 //! Encrypted storage for the factory's at-rest credentials: per-project MCP
-//! header values, the account-wide Claude token, the account-wide Codex login
-//! and the account-wide Copilot token.
+//! header values, the account-wide Claude token, the account-wide Codex login,
+//! the account-wide Copilot token and the forge tokens (a login's own, a
+//! project's and a packaging upstream's).
 //!
 //! A header value for an MCP server is a credential, so it must not sit in
 //! SQLite as plain text. The Claude subscription token from `claude
@@ -19,12 +20,19 @@
 //! from each other, with its own associated data, so deleting or renaming an
 //! MCP server never touches any of them and a ciphertext moved between the
 //! three rows and an MCP header row fails to decrypt.
+//!
+//! A forge token lives in a row of its own per owner, see [`ForgeTokenOwner`].
+//! Its associated data binds the owner kind, the key and the forge, so a
+//! ciphertext moved to another owner's row, to an MCP header row or to a
+//! reserved row fails to decrypt.
 
 use std::fmt;
 use std::sync::Arc;
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+
+use factory_runner::{ForgeAccount, ForgeKind};
 
 use crate::store::{Store, StoreError};
 
@@ -49,6 +57,57 @@ pub struct SecretRef<'a> {
     pub project: &'a str,
     pub server: &'a str,
     pub header: &'a str,
+}
+
+/// Whose forge token a row holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeTokenOwner<'a> {
+    /// The token a login stores for itself on the forge's settings page.
+    User { login: &'a str, forge: ForgeKind },
+    /// The token a project's jobs run as when no personal account applies.
+    Project { project: &'a str, forge: ForgeKind },
+    /// The optional token that reads a packaging upstream.
+    Upstream { project: &'a str, forge: ForgeKind },
+}
+
+impl ForgeTokenOwner<'_> {
+    /// The owner kind, the key and the forge, the three parts the associated
+    /// data binds.
+    fn parts(&self) -> (&'static str, &str, &'static str) {
+        match *self {
+            ForgeTokenOwner::User { login, forge } => ("user", login, forge.as_str()),
+            ForgeTokenOwner::Project { project, forge } => ("project", project, forge.as_str()),
+            ForgeTokenOwner::Upstream { project, forge } => ("upstream", project, forge.as_str()),
+        }
+    }
+
+    /// The `project` and `header` of the row. The `server` is empty, which no
+    /// MCP server name can be, so deleting an MCP server never matches a
+    /// forge token row.
+    fn row(&self) -> (String, String) {
+        match *self {
+            ForgeTokenOwner::User { login, forge } => (
+                String::new(),
+                format!("forge-user:{}:{login}", forge.as_str()),
+            ),
+            ForgeTokenOwner::Project { project, .. } => {
+                (project.to_owned(), "forge-project".into())
+            }
+            ForgeTokenOwner::Upstream { project, .. } => {
+                (project.to_owned(), "forge-upstream".into())
+            }
+        }
+    }
+
+    fn aad(&self) -> Vec<u8> {
+        let (kind, key, forge) = self.parts();
+        let mut aad = FORGE_TOKEN_AAD.to_vec();
+        for part in [kind, key, forge] {
+            aad.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            aad.extend_from_slice(part.as_bytes());
+        }
+        aad
+    }
 }
 
 /// A failure reading or writing a secret. None of these variants carry a
@@ -207,6 +266,37 @@ pub trait SecretStore: Send + Sync {
     ///
     /// Fails on a storage error.
     fn clear_copilot_token(&self) -> Result<(), SecretError>;
+
+    /// Stores `value` as the forge token of `owner`, together with the
+    /// `account` it belongs to, in one transaction. It replaces any token
+    /// already there.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn put_forge_token(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        value: &str,
+        account: &ForgeAccount,
+    ) -> Result<(), SecretError>;
+
+    /// The forge token of `owner`, or `None` when none is stored.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable, when the stored value does not
+    /// decrypt, or on a storage error.
+    fn forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<Option<String>, SecretError>;
+
+    /// Deletes the forge token of `owner` and its recorded account in one
+    /// transaction. Clearing a token that is not there
+    /// is fine, and it works with the store unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error.
+    fn delete_forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<(), SecretError>;
 }
 
 /// The `secrets` row that holds the account-wide Claude token. Its `server` is
@@ -376,6 +466,58 @@ impl SecretStore for LocalSecrets {
         self.store.delete_secret(COPILOT_TOKEN_REF)?;
         Ok(())
     }
+
+    fn put_forge_token(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        value: &str,
+        account: &ForgeAccount,
+    ) -> Result<(), SecretError> {
+        let stored = self.seal(&owner.aad(), value)?;
+        let (project, header) = owner.row();
+        self.store.put_forge_token(
+            SecretRef {
+                project: &project,
+                server: "",
+                header: &header,
+            },
+            LOCAL_BACKEND,
+            &stored,
+            owner,
+            account,
+        )?;
+        Ok(())
+    }
+
+    fn forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<Option<String>, SecretError> {
+        let (project, header) = owner.row();
+        let at = SecretRef {
+            project: &project,
+            server: "",
+            header: &header,
+        };
+        let Some((backend, stored)) = self.store.get_secret(at)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open(&backend, &stored, &owner.aad())?))
+    }
+
+    fn delete_forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<(), SecretError> {
+        delete_forge_row(&self.store, owner)
+    }
+}
+
+fn delete_forge_row(store: &Store, owner: ForgeTokenOwner<'_>) -> Result<(), SecretError> {
+    let (project, header) = owner.row();
+    store.delete_forge_token(
+        SecretRef {
+            project: &project,
+            server: "",
+            header: &header,
+        },
+        owner,
+    )?;
+    Ok(())
 }
 
 /// The backend used in place of [`LocalSecrets`] when no usable master key is
@@ -451,6 +593,23 @@ impl SecretStore for UnavailableSecrets {
     fn clear_copilot_token(&self) -> Result<(), SecretError> {
         self.store.delete_secret(COPILOT_TOKEN_REF)?;
         Ok(())
+    }
+
+    fn put_forge_token(
+        &self,
+        _owner: ForgeTokenOwner<'_>,
+        _value: &str,
+        _account: &ForgeAccount,
+    ) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn forge_token(&self, _owner: ForgeTokenOwner<'_>) -> Result<Option<String>, SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn delete_forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<(), SecretError> {
+        delete_forge_row(&self.store, owner)
     }
 }
 
@@ -551,6 +710,11 @@ const CLAUDE_TOKEN_AAD: &[u8] = b"factory:claude-token:v1";
 const CODEX_AUTH_AAD: &[u8] = b"factory:codex-auth:v1";
 
 const COPILOT_TOKEN_AAD: &[u8] = b"factory:copilot-token:v1";
+
+/// The fixed tag every forge token's associated data starts with, followed by
+/// the length-framed owner kind, key and forge. Like the other tags it reads
+/// as a u64 far larger than any MCP header name's length.
+const FORGE_TOKEN_AAD: &[u8] = b"factory:forge-token:v1";
 
 /// Why a pasted or captured file was refused as a Codex subscription login.
 /// None of these variants carry any part of the input, so a logged or

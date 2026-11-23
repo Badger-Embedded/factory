@@ -108,10 +108,37 @@ impl fmt::Debug for Account {
     }
 }
 
+/// The account a token belongs to, as the forge reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeAccount {
+    pub login: String,
+    pub id: u64,
+}
+
+/// Why an account lookup gave no account. Neither variant carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupError {
+    /// The forge refused the token: HTTP 401 or 403.
+    Rejected,
+    /// The lookup could not run or its answer was not understood.
+    Failed(String),
+}
+
 /// What the factory asks of a forge. Errors are the forge CLI's message.
 pub trait Forge: Send + Sync {
     /// Where `repo` (`owner/name`) is cloned from.
     fn clone_url(&self, repo: &str) -> String;
+
+    /// The account `token` belongs to, read by calling the forge as that
+    /// token.
+    fn lookup_account<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> BoxFuture<'a, Result<ForgeAccount, LookupError>>;
+
+    /// The account that runs as `token`, whose commits carry `found`'s
+    /// login and noreply address.
+    fn account(&self, token: String, found: &ForgeAccount) -> Account;
 
     /// The HTTP header git sends to authenticate as `account`, if it has a
     /// token.

@@ -11,7 +11,7 @@ use crate::check::{CheckOutcome, ToolList};
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages, McpToolState};
-use factory_runner::ForgeKind;
+use factory_runner::{ForgeAccount, ForgeKind};
 
 use crate::projects::Project;
 use crate::projects::{StageAgents, StageEfforts, StageModels};
@@ -564,6 +564,8 @@ pub struct HeaderState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsPage {
     Notifications,
+    /// A forge's page for the login's own token.
+    Forge(ForgeKind),
     Workers,
     Gates,
     Polling,
@@ -639,6 +641,14 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
         nav.settings-nav aria-label="Settings" {
             p.settings-group { "You" }
             (entry("/settings/notifications".into(), "Notifications", &SettingsPage::Notifications))
+            p.settings-group { "Forges" }
+            @for kind in ForgeKind::ALL {
+                (entry(
+                    format!("/settings/forges/{}", kind.as_str()),
+                    kind.display_name(),
+                    &SettingsPage::Forge(kind),
+                ))
+            }
             @if nav.admin {
                 p.settings-group { "Factory" }
                 (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
@@ -1280,6 +1290,69 @@ fn codex_auth_card(stored: bool, secrets_available: bool) -> Markup {
             }
         }
     }
+}
+
+/// A forge's page for the login's own token. `account` is the account the
+/// stored token belongs to. The token is never rendered: the field has no
+/// value, an empty save keeps the stored token and Clear removes it.
+pub fn settings_forge(
+    user: &str,
+    nav: &SettingsNav,
+    kind: ForgeKind,
+    account: Option<&ForgeAccount>,
+    secrets_available: bool,
+    csrf: &str,
+    notice: Option<&str>,
+) -> Markup {
+    let base = format!("/settings/forges/{}", kind.as_str());
+    let name = kind.display_name();
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Forge(kind),
+        name,
+        notice,
+        &html! {
+            h1 { (name) }
+            form.card.settings-form method="post" action=(format!("{base}/token")) {
+                input type="hidden" name="csrf" value=(csrf);
+                h2 { "Your " (name) " token" }
+                p.hint {
+                    "The factory uses this token for the onboarding checks and for jobs in \
+                     projects where you turned on \"Use my account\". The account needs push \
+                     access to those repositories, and the factory ignores pull request \
+                     comments from that account, so use a bot account rather than your own. \
+                     Stored encrypted and never shown."
+                }
+                @if !secrets_available {
+                    p.hint.bad { "The master key is missing, so a token cannot be saved here. Clear still works." }
+                }
+                div.field {
+                    label for="forge-token" { "Token" }
+                    input #forge-token.wide type="password" name="token"
+                        autocomplete="off" spellcheck="false"
+                        placeholder=(if account.is_some() { "set" } else { "not set" })
+                        disabled[!secrets_available];
+                    p.hint {
+                        @if let Some(account) = account {
+                            "A token is stored. It belongs to the account " strong.forge-account { (account.login) } ". "
+                        } @else {
+                            "No token is stored. "
+                        }
+                        "Paste a new one to replace it. An empty field keeps it."
+                    }
+                }
+                // Save comes before Clear, so Enter in the field saves.
+                div.save-bar {
+                    span.save-bar-note { "No unsaved changes." }
+                    button.primary disabled[!secrets_available] { "Save token" }
+                }
+                div.danger-zone {
+                    button.danger formaction=(format!("{base}/token/clear")) formnovalidate { "Clear token" }
+                }
+            }
+        },
+    )
 }
 
 pub fn settings_mcp(

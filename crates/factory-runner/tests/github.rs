@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Event, PrDescription};
 use factory_runner::{
-    Account, Ci, FailedCheck, Forge, GitHub, Observation, PrState, RenovatePr, Rerun, WorkerConfig,
-    actions_job_id, checks_args, is_renovate_login, observe, parse_renovate_prs, parse_status,
-    run_checks,
+    Account, Ci, FailedCheck, Forge, ForgeAccount, GitHub, LookupError, Observation, PrState,
+    RenovatePr, Rerun, WorkerConfig, actions_job_id, checks_args, is_renovate_login, observe,
+    parse_renovate_prs, parse_status, run_checks,
 };
 
 const VIEW: &str = r#"{
@@ -936,4 +936,46 @@ async fn approve_names_the_checked_commit_so_a_later_head_is_not_approved() {
 
 fn account() -> Account {
     Account::default()
+}
+
+#[tokio::test]
+async fn lookup_account_reads_the_account_the_token_runs_as() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = script(
+        dir.path(),
+        "gh",
+        r#"if [ "$1 $2 $3 $4" = "api user --hostname github.com" ] && [ "$GH_TOKEN" = tok-good ]; then
+  echo '{"login":"octobot","id":42}'
+elif [ "$GH_TOKEN" = tok-boom ]; then
+  echo "gh: boom tok-boom" >&2; exit 1
+else
+  echo "gh: Bad credentials (HTTP 401)" >&2; exit 1
+fi"#,
+    );
+    let github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+
+    let found = github.lookup_account("tok-good").await.unwrap();
+    assert_eq!(
+        found,
+        ForgeAccount {
+            login: "octobot".into(),
+            id: 42
+        }
+    );
+    assert_eq!(
+        github.lookup_account("tok-bad").await,
+        Err(LookupError::Rejected)
+    );
+    let Err(LookupError::Failed(message)) = github.lookup_account("tok-boom").await else {
+        panic!("expected a failed lookup");
+    };
+    assert!(!message.contains("tok-boom"), "{message}");
+
+    let account = github.account("tok-good".into(), &found);
+    assert_eq!(account.token.as_deref(), Some("tok-good"));
+    assert_eq!(account.name, "octobot");
+    assert_eq!(account.email, "42+octobot@users.noreply.github.com");
 }

@@ -2,6 +2,24 @@
 # Stands in for the GitHub CLI. The browser tests never reach GitHub.
 if [ "$1" = api ]; then
   case "$2" in
+    user)
+      if [ "$3 $4" != "--hostname github.com" ]; then
+        echo "gh: api user must pin the host (got: $*)" >&2
+        exit 1
+      fi
+      case "$GH_TOKEN" in
+        tok-e2e-alice)
+          echo '{"login":"alice-bot","id":11}'
+          exit 0
+          ;;
+        tok-e2e-bob)
+          echo '{"login":"bob-bot","id":22}'
+          exit 0
+          ;;
+      esac
+      echo "gh: Bad credentials (HTTP 401)" >&2
+      exit 1
+      ;;
     repos/e2e/missing | repos/e2e/missing/*)
       echo "gh: Not Found (HTTP 404)" >&2
       exit 1
