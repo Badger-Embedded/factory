@@ -31,8 +31,23 @@ const MAX_PAGES: usize = 50;
 
 /// Variables of the factory's own environment that would give `glab` a
 /// credential or a host the call did not ask for.
-const INHERITED: [&str; 7] = [
+const INHERITED: &[&str] = &[
+    "JOB_TOKEN",
     "CI_JOB_TOKEN",
+    "API_PROTOCOL",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
     "GITLAB_TOKEN",
     "GITLAB_ACCESS_TOKEN",
     "OAUTH_TOKEN",
@@ -122,8 +137,6 @@ struct MrJson {
     target_branch: String,
     project_id: Option<u64>,
     source_project_id: Option<u64>,
-    // A number, or a string such as "1000+" when GitLab stopped counting.
-    changes_count: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -213,7 +226,19 @@ struct CompareJson {
 }
 
 #[derive(Deserialize)]
+struct DiffVersionJson {
+    #[serde(default)]
+    head_commit_sha: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    diffs: Vec<DiffJson>,
+}
+
+#[derive(Deserialize)]
 struct VersionJson {
+    #[serde(default)]
+    id: u64,
     #[serde(default)]
     head_commit_sha: String,
     created_at: String,
@@ -345,7 +370,14 @@ impl GitLab {
         fields: &[(&str, &str, &str)],
         stdin: Option<&str>,
     ) -> Result<String, String> {
-        let mut command = Command::new(&self.glab);
+        // The child runs in another directory, so a relative path to the
+        // binary is resolved here.
+        let glab = if self.glab.components().count() > 1 {
+            std::path::absolute(&self.glab).unwrap_or_else(|_| self.glab.clone())
+        } else {
+            self.glab.clone()
+        };
+        let mut command = Command::new(glab);
         command.args(["api", "--method", method, endpoint]);
         for (flag, key, value) in fields {
             command.arg(flag).arg(format!("{key}={value}"));
@@ -360,6 +392,9 @@ impl GitLab {
             .env("GITLAB_HOST", &self.host)
             .env("GLAB_CONFIG_DIR", config_dir()?)
             .env("GLAB_ENABLE_CI_AUTOLOGIN", "false")
+            .env("GLAB_API_PROTOCOL", "https")
+            .env("GITLAB_API_PROTOCOL", "https")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GLAB_CHECK_UPDATE", "false")
             .env("GLAB_SEND_TELEMETRY", "false")
             .env("NO_COLOR", "1")
@@ -719,27 +754,43 @@ impl GitLab {
         mr: &MrJson,
     ) -> Result<Vec<DiffJson>, String> {
         let number = mr.iid;
-        let diffs: Vec<DiffJson> = self
+        // The diff of the version whose head is the head under review, so a
+        // push between two reads cannot substitute another diff.
+        let versions: Vec<VersionJson> = self
             .get_all(
                 account,
-                &format!("{}/merge_requests/{number}/diffs", project(repo)),
+                &format!("{}/merge_requests/{number}/versions", project(repo)),
                 &[],
             )
             .await?;
-        // GitLab's total diff limits drop files with no flag on the rest.
-        let expected = match &mr.changes_count {
-            None | Some(serde_json::Value::Null) => Some(0),
-            Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|n| usize::try_from(n).ok()),
-            Some(serde_json::Value::String(text)) => text.parse().ok(),
-            Some(_) => None,
-        };
-        if expected != Some(diffs.len()) {
+        let Some(version) = versions
+            .iter()
+            .filter(|version| version.head_commit_sha == mr.sha)
+            .max_by_key(|version| version.id)
+        else {
             return Err(format!(
-                "GitLab sent {} of the changed files of merge request {number}, so it cannot be reviewed in full",
-                diffs.len()
+                "merge request {number} has no diff version for its head {}, so it cannot be reviewed yet",
+                mr.sha
+            ));
+        };
+        let detail: DiffVersionJson = self
+            .get_json(
+                account,
+                &format!(
+                    "{}/merge_requests/{number}/versions/{}",
+                    project(repo),
+                    version.id
+                ),
+                &[],
+            )
+            .await?;
+        if detail.state != "collected" || detail.head_commit_sha != mr.sha {
+            return Err(format!(
+                "the diff of merge request {number} is {:?}, not collected for its head, so it cannot be reviewed in full",
+                detail.state
             ));
         }
-        Ok(diffs)
+        Ok(detail.diffs)
     }
 
     async fn pr_info(&self, account: &Account, repo: &str, number: u64) -> Result<PrInfo, String> {

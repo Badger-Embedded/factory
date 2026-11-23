@@ -609,13 +609,15 @@ async fn pr_details_builds_a_unified_diff_and_refuses_one_gitlab_cut() {
     let (glab, _) = fake_glab(
         dir.path(),
         r#"case "$4" in
-  */merge_requests/7) echo '{"iid":7,"title":"Update dep","description":"Body","sha":"abc","changes_count":"2"}' ;;
-  */merge_requests/7/diffs) echo '[
+  */merge_requests/7) echo '{"iid":7,"title":"Update dep","description":"Body","sha":"abc"}' ;;
+  */merge_requests/7/versions) echo '[{"id":3,"head_commit_sha":"abc","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/7/versions/3) echo '{"head_commit_sha":"abc","state":"collected","diffs":[
     {"old_path":"a.txt","new_path":"a.txt","new_file":false,"deleted_file":false,"diff":"@@ -1 +1 @@\n-old\n+new\n"},
     {"old_path":"b.txt","new_path":"b.txt","new_file":true,"deleted_file":false,"diff":"@@ -0,0 +1 @@\n+added"}
-  ]' ;;
-  */merge_requests/8) echo '{"iid":8,"sha":"def","changes_count":"1"}' ;;
-  */merge_requests/8/diffs) echo '[{"old_path":"big","new_path":"big","too_large":true,"diff":""}]' ;;
+  ]}' ;;
+  */merge_requests/8) echo '{"iid":8,"sha":"def"}' ;;
+  */merge_requests/8/versions) echo '[{"id":4,"head_commit_sha":"def","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/8/versions/4) echo '{"head_commit_sha":"def","state":"collected","diffs":[{"old_path":"big","new_path":"big","too_large":true,"diff":""}]}' ;;
 esac"#,
     );
     let details = glab.pr_details(&account(), "o/r", 7).await.unwrap();
@@ -949,22 +951,84 @@ esac"#,
 }
 
 #[tokio::test]
-async fn a_diff_list_shorter_than_the_change_count_is_not_reviewed() {
+async fn only_a_collected_diff_of_the_reviewed_head_is_reviewed() {
     let dir = tempfile::tempdir().unwrap();
     let (glab, _) = fake_glab(
         dir.path(),
         r#"case "$4" in
-  */merge_requests/7) echo '{"iid":7,"sha":"a","changes_count":"3"}' ;;
-  */merge_requests/8) echo '{"iid":8,"sha":"a","changes_count":"1000+"}' ;;
-  */diffs) echo '[{"old_path":"a","new_path":"a","diff":"@@ -1 +1 @@\n-a\n+b\n"}]' ;;
+  */merge_requests/7) echo '{"iid":7,"sha":"a"}' ;;
+  */merge_requests/7/versions) echo '[{"id":1,"head_commit_sha":"a","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/7/versions/1) echo '{"head_commit_sha":"a","state":"overflow","diffs":[{"old_path":"a","new_path":"a","diff":""}]}' ;;
+  */merge_requests/8) echo '{"iid":8,"sha":"a"}' ;;
+  */merge_requests/8/versions) echo '[{"id":2,"head_commit_sha":"older","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/9) echo '{"iid":9,"sha":"a"}' ;;
+  */merge_requests/9/versions) echo '[{"id":3,"head_commit_sha":"a","created_at":"2026-11-20T10:00:00.000Z"}]' ;;
+  */merge_requests/9/versions/3) echo '{"head_commit_sha":"b","state":"collected","diffs":[{"old_path":"a","new_path":"a","diff":""}]}' ;;
 esac"#,
     );
-    for number in [7, 8] {
+    for number in [7, 8, 9] {
         let err = glab
             .pr_details(&account(), "o/r", number)
             .await
             .unwrap_err();
-        assert!(err.contains("cannot be reviewed in full"), "{err}");
+        assert!(err.contains("cannot be reviewed"), "{err}");
         assert!(glab.pr_info(&account(), "o/r", number).await.is_err());
     }
+}
+
+#[test]
+fn ambient_overrides_do_not_change_the_call() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "ambient_run"])
+        .envs([
+            ("JOB_TOKEN", "ambient"),
+            ("CI_JOB_TOKEN", "ambient"),
+            ("GIT_DIR", "/nonexistent"),
+            ("GITLAB_ACCESS_TOKEN", "ambient"),
+            ("API_PROTOCOL", "http"),
+            ("GLAB_API_PROTOCOL", "http"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Run by `ambient_overrides_do_not_change_the_call` with the overrides set,
+/// and with the binary named by a relative path.
+#[tokio::test]
+#[ignore = "runs in a child process with ambient overrides"]
+async fn ambient_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut glab, log) = fake_glab(
+        dir.path(),
+        r#"for v in JOB_TOKEN CI_JOB_TOKEN API_PROTOCOL GIT_DIR GITLAB_ACCESS_TOKEN; do
+  [ -z "${!v}" ] || { echo "leaked $v" >&2; exit 2; }
+done
+[ "$GLAB_API_PROTOCOL" = https ] && [ "$GITLAB_API_PROTOCOL" = https ] || exit 2
+echo '{"iid":7,"state":"merged"}'"#,
+    );
+    let cwd = std::env::current_dir().unwrap();
+    glab.glab = pathdiff(&glab.glab, &cwd);
+    assert!(glab.glab.is_relative());
+    let none = Account {
+        token: None,
+        ..account()
+    };
+    let status = glab.status(&none, "o/r", 7, &[]).await.unwrap();
+    assert_eq!(status.state, PrState::Merged);
+    assert_eq!(calls(&log).len(), 1);
+}
+
+/// `path` relative to `base`, both absolute.
+fn pathdiff(path: &Path, base: &Path) -> PathBuf {
+    let up = base.components().count();
+    let mut out = PathBuf::new();
+    for _ in 0..up {
+        out.push("..");
+    }
+    out.join(path.strip_prefix("/").unwrap())
 }
