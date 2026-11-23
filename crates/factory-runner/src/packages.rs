@@ -4,14 +4,22 @@ use std::ffi::OsString;
 /// factory tells that apart from the wrapped command's own failure.
 pub const FAILED_CODE: i32 = 86;
 
-/// Collects the package names before `--`, builds them so a failure is
-/// reported before the command starts, then runs the command in a nix shell.
-/// The package names arrive as arguments, never inside this text.
-const SCRIPT: &str = r#"pkgs=()
-while [ "$1" != -- ]; do pkgs+=("nixpkgs#$1"); shift; done
-shift
+/// Takes the package count, then that many package names, and runs the rest
+/// as the command. It builds the packages first so a failure is reported
+/// before the command starts. The command touches a marker file when it
+/// starts, so an exit before that is a setup failure and exits 86. A command
+/// that exits 86 itself is reported as 1. The package names arrive as
+/// arguments, never inside this text.
+const SCRIPT: &str = r#"n=$1; shift
+pkgs=()
+for ((i = 0; i < n; i++)); do pkgs+=("nixpkgs#$1"); shift; done
 nix build --no-link "${pkgs[@]}" >&2 || exit 86
-exec nix shell "${pkgs[@]}" --command "$@""#;
+started=$(mktemp -u)
+nix shell "${pkgs[@]}" --command bash -c 'touch "$0" && exec "$@"' "$started" "$@"
+code=$?
+if [ ! -e "$started" ]; then exit 86; fi
+if [ "$code" -eq 86 ]; then exit 1; fi
+exit "$code""#;
 
 /// The container command that runs `command` with `packages` on `PATH`,
 /// which is `command` itself when the list is empty.
@@ -24,8 +32,8 @@ pub fn wrap(packages: &[String], command: Vec<OsString>) -> Vec<OsString> {
         .into_iter()
         .map(OsString::from)
         .collect();
+    args.push(packages.len().to_string().into());
     args.extend(packages.iter().map(OsString::from));
-    args.push("--".into());
     args.extend(command);
     args
 }

@@ -503,7 +503,7 @@ fn packages_wrap_the_agent_command_in_nix_shell_and_no_packages_change_nothing()
     assert!(wrapped[image + 3].contains("nix shell"));
     assert_eq!(
         wrapped[image + 4..image + 8],
-        ["factory-worker-packages", "a", "b", "--"]
+        ["factory-worker-packages", "2", "a", "b"]
     );
     assert_eq!(wrapped[image + 8..], plain[image + 1..]);
 }
@@ -528,7 +528,6 @@ async fn a_package_failure_fails_the_run_with_the_packages_named() {
     );
     assert!(reason.contains("attribute nope missing"), "{reason}");
 
-    // Without packages the same exit code is an ordinary failed run.
     worker.packages = Vec::new();
     let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
     assert!(!failure_reason(report.event).contains("worker packages"));

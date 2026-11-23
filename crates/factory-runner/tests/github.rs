@@ -280,14 +280,62 @@ fn checks_with_packages_run_the_command_inside_nix_shell() {
         args[image + 4..],
         [
             "factory-worker-packages",
+            "2",
             "a",
             "b",
-            "--",
             "bash",
             "-c",
             "just lint; echo $HOME"
         ]
     );
+}
+
+/// Runs the generated wrapper for `command` under a fake `nix` whose build
+/// and shell steps succeed or fail as given, and returns its exit code.
+fn wrapper_exit(build_ok: bool, shell_ok: bool, command: &str) -> Option<i32> {
+    let dir = tempfile::tempdir().unwrap();
+    let nix = format!(
+        "case \"$1\" in\nbuild) {} ;;\nshell) {} ;;\nesac",
+        if build_ok { "exit 0" } else { "exit 1" },
+        if shell_ok {
+            "while [ \"$1\" != --command ]; do shift; done; shift; exec \"$@\""
+        } else {
+            "exit 1"
+        },
+    );
+    script(dir.path(), "nix", &nix);
+    let config = WorkerConfig::default();
+    let args: Vec<String> = checks_args(
+        &config,
+        "factory-job-7",
+        Path::new("/jobs/7/work"),
+        command,
+        &["--".to_owned(), "b".to_owned()],
+    )
+    .iter()
+    .map(|arg| arg.to_string_lossy().into_owned())
+    .collect();
+    let image = args.iter().position(|arg| *arg == config.image).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    std::process::Command::new(&args[image + 1])
+        .args(&args[image + 2..])
+        .env("PATH", path)
+        .status()
+        .unwrap()
+        .code()
+}
+
+#[test]
+fn the_wrapper_tells_setup_failures_from_command_failures() {
+    assert_eq!(wrapper_exit(true, true, "exit 0"), Some(0));
+    assert_eq!(wrapper_exit(true, true, "exit 3"), Some(3));
+    assert_eq!(wrapper_exit(false, true, "exit 0"), Some(86));
+    assert_eq!(wrapper_exit(true, false, "exit 0"), Some(86));
+    assert_eq!(wrapper_exit(true, true, "exit 86"), Some(1));
 }
 
 #[tokio::test]
