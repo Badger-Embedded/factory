@@ -24,8 +24,11 @@ pub use agent::{AgentBackend, AgentItem, Credential, RunResult, TokenUsage, back
 pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
 pub use files::{PlacedFile, place_files, show_files};
-pub use forge::{Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError};
-pub use git::{Git, Remote};
+pub use forge::{
+    Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, REJECTED,
+    rejected_by_forge,
+};
+pub use git::{Git, Remote, RemoteSource};
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, HeadCommit, Observation, PrDetails, PrInfo, PrState,
     PrStatus, RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login, observe,

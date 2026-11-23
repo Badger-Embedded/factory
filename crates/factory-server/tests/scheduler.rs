@@ -9,16 +9,17 @@ use factory_core::{
     ReviewState, Stage, Turn, Wait,
 };
 use factory_runner::{
-    Account, Expect, ForgeKind, HeadCommit, LogLine, McpUnavailable, Observation, RenovatePr,
-    Rerun, RunReport, TokenUsage, is_renovate_login,
+    Account, Expect, ForgeAccount, ForgeKind, GitHub, HeadCommit, LogLine, McpUnavailable,
+    Observation, RenovatePr, Rerun, RunReport, TokenUsage, is_renovate_login,
 };
 use factory_server::{
-    Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, JobFile, LogSink,
-    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Project, ProjectForge, Projects,
+    AccountSource, Accounts, AgentRequest, ChecksRequest, CodexPrice, Executor, FACTORY_REQUESTER,
+    ForgeTokenOwner, Forges, GhRepos, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN,
+    McpProjectSettings, McpRuntime, McpStages, McpWarnings, Owner, Project, ProjectForge, Projects,
     PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, RunTokens,
     Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
     StageModels, Store, SummaryRequest, UnavailableSecrets, WatchReport, WatchRequest, WorkerSlots,
-    format_cost, ready_action, watch_only_event,
+    credential_failure, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -68,6 +69,9 @@ struct FakeExecutor {
     /// Each approval and squash merge of `(number, head)`.
     merged: Mutex<Vec<(u64, String)>>,
     merge_failures: Mutex<VecDeque<RenovateNow>>,
+    /// Errors the next approvals and the next reads after a merge return.
+    merge_errors: Mutex<VecDeque<String>>,
+    merged_read_errors: Mutex<VecDeque<String>>,
     approved: Mutex<Vec<(u64, String)>>,
     /// The results of the next rebase requests. With none queued the request
     /// succeeds.
@@ -76,6 +80,8 @@ struct FakeExecutor {
     current_head: Mutex<Option<String>>,
     head_pushed_at: Mutex<Option<String>>,
     fix_merged_at: Mutex<Option<String>>,
+    /// Errors the fake gives the next reads of a merged fix pull request.
+    fix_read_errors: Mutex<VecDeque<String>>,
     /// Each rebase request as `(number, head)`.
     rebase_calls: Mutex<Vec<(u64, String)>>,
     /// The files the merged pull request changed.
@@ -124,11 +130,14 @@ impl FakeExecutor {
             comments: Mutex::new(Vec::new()),
             merged: Mutex::new(Vec::new()),
             merge_failures: Mutex::new(VecDeque::new()),
+            merge_errors: Mutex::new(VecDeque::new()),
+            merged_read_errors: Mutex::new(VecDeque::new()),
             approved: Mutex::new(Vec::new()),
             rebases: Mutex::new(VecDeque::new()),
             current_head: Mutex::new(None),
             head_pushed_at: Mutex::new(None),
             fix_merged_at: Mutex::new(None),
+            fix_read_errors: Mutex::new(VecDeque::new()),
             rebase_calls: Mutex::new(Vec::new()),
             pr_files: Mutex::new(Vec::new()),
             gathered: Mutex::new(Vec::new()),
@@ -229,12 +238,20 @@ impl Executor for FakeExecutor {
 
     async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
         tokio::task::yield_now().await;
+        let default = request.account.resolve().map(|operation| {
+            request.pushed.record(&format!(
+                "{} ({})",
+                operation.account.login,
+                operation.owner.label()
+            ));
+            Published::Open(12)
+        });
         self.published.lock().unwrap().push(request);
         self.publishes
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Ok(Published::Open(12)))
+            .unwrap_or(default)
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
@@ -266,7 +283,7 @@ impl Executor for FakeExecutor {
     async fn renovate_prs(
         &self,
         _forge: ForgeKind,
-        _account: &Account,
+        _account: &AccountSource,
         repo: &str,
         base: &str,
     ) -> Result<Vec<RenovatePr>, String> {
@@ -327,7 +344,7 @@ impl Executor for FakeExecutor {
     async fn comment(
         &self,
         _forge: ForgeKind,
-        _account: &Account,
+        _account: &AccountSource,
         _repo: &str,
         number: u64,
         body: &str,
@@ -343,12 +360,15 @@ impl Executor for FakeExecutor {
     async fn renovate_merged(
         &self,
         _forge: ForgeKind,
-        _account: &Account,
+        _account: &AccountSource,
         _repo: &str,
         _number: u64,
         manifest_files: Option<&[String]>,
     ) -> Result<Event, String> {
         tokio::task::yield_now().await;
+        if let Some(err) = self.merged_read_errors.lock().unwrap().pop_front() {
+            return Err(err);
+        }
         let files = self.pr_files.lock().unwrap();
         Ok(Event::RenovateMerged {
             packaging: manifest_files.is_some(),
@@ -406,7 +426,7 @@ impl Executor for FakeExecutor {
     async fn merge_renovate(
         &self,
         _forge: ForgeKind,
-        _account: &Account,
+        _account: &AccountSource,
         _repo: &str,
         number: u64,
         head: &str,
@@ -416,6 +436,9 @@ impl Executor for FakeExecutor {
             .lock()
             .unwrap()
             .push((number, head.to_owned()));
+        if let Some(err) = self.merge_errors.lock().unwrap().pop_front() {
+            return Err(err);
+        }
         if let Some(now) = self.merge_failures.lock().unwrap().pop_front() {
             *self.renovate_now.lock().unwrap() = now;
             return Err("the head commit changed".into());
@@ -428,10 +451,13 @@ impl Executor for FakeExecutor {
     async fn merged_at(
         &self,
         _forge: ForgeKind,
-        _account: &Account,
+        _account: &AccountSource,
         _repo: &str,
         _number: u64,
     ) -> Result<Option<String>, String> {
+        if let Some(err) = self.fix_read_errors.lock().unwrap().pop_front() {
+            return Err(err);
+        }
         Ok(Some(
             self.fix_merged_at
                 .lock()
@@ -445,7 +471,7 @@ impl Executor for FakeExecutor {
     async fn renovate_head(
         &self,
         _forge: ForgeKind,
-        _account: &Account,
+        _account: &AccountSource,
         _repo: &str,
         _number: u64,
     ) -> Result<HeadCommit, String> {
@@ -464,7 +490,7 @@ impl Executor for FakeExecutor {
     async fn request_rebase(
         &self,
         _forge: ForgeKind,
-        _account: &Account,
+        _account: &AccountSource,
         _repo: &str,
         number: u64,
         head: &str,
@@ -485,6 +511,36 @@ impl Executor for FakeExecutor {
         self.stop_gate.acquire().await.unwrap().forget();
         self.stopped.lock().unwrap().push(job_id);
     }
+}
+
+/// The account every test project's token belongs to.
+fn project_account() -> Account {
+    Account {
+        token: Some("project-token".into()),
+        login: "factory-bot".into(),
+        name: "factory-bot".into(),
+        email: "1+factory-bot@users.noreply.github.com".into(),
+    }
+}
+
+/// Accounts for the projects the tests use, each with a project token.
+fn accounts(store: &Arc<Store>) -> Accounts {
+    let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(store)));
+    for project in ["maestro", "factory", "fine"] {
+        let owner = ForgeTokenOwner::Project {
+            project,
+            forge: ForgeKind::GitHub,
+        };
+        let account = ForgeAccount {
+            login: "factory-bot".into(),
+            id: 1,
+        };
+        secrets
+            .put_forge_token(owner, "project-token", &account)
+            .unwrap();
+    }
+    let forges = Forges::new(Arc::new(GitHub::default()), Arc::new(GhRepos::default()));
+    Accounts::new(Arc::clone(store), secrets, forges)
 }
 
 fn questions() -> Event {
@@ -525,7 +581,7 @@ fn setup_in(
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     (store, executor, scheduler)
 }
@@ -580,7 +636,7 @@ fn setup_mcp(
         Arc::new(Notify::new()),
         PathBuf::new(),
         runtime,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     (store, executor, scheduler, tokens)
 }
@@ -980,7 +1036,7 @@ async fn a_project_onboarded_while_running_is_picked_up() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
 
     let id = store
@@ -1982,7 +2038,7 @@ async fn a_project_without_checks_publishes_unchecked() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     drop(scheduler);
     for event in [
@@ -2021,7 +2077,7 @@ async fn an_edited_checks_command_applies_to_a_job_created_before_the_edit() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     store
         .create_project(
@@ -2117,7 +2173,7 @@ async fn a_project_on_an_unknown_forge_fails_its_job_and_leaves_the_others_runni
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     drop(scheduler);
     let odd = store.create("odd", "alice", "x").unwrap();
@@ -2182,7 +2238,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     step(&fresh).await;
     assert_eq!(executor.published.lock().unwrap().len(), 2);
@@ -2220,7 +2276,7 @@ async fn a_project_that_moves_to_an_unknown_forge_stops_a_job_in_a_factory_turn(
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
 
     step(&odd).await;
@@ -2828,7 +2884,7 @@ mod purge {
             Arc::new(Notify::new()),
             data.path().to_owned(),
             mcp_runtime(&store).0,
-            Accounts::new(Account::default()),
+            accounts(&store),
         );
         let db = rusqlite::Connection::open(&path).unwrap();
         Fixture {
@@ -3320,7 +3376,7 @@ async fn a_project_does_not_use_the_models_of_another() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     store
         .save_project_models("maestro", &models("maestro-c", "", "", ""))
@@ -4030,7 +4086,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -4105,16 +4161,15 @@ async fn a_rerun_request_reaches_the_executor_and_its_reason_is_logged() {
 
     step(&scheduler).await;
     let requests = executor.rerun_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].job_id, id);
+    assert_eq!(requests[0].forge, ForgeKind::GitHub);
     assert_eq!(
-        requests,
-        vec![RerunRequest {
-            job_id: id,
-            forge: ForgeKind::GitHub,
-            account: Account::default(),
-            repo: "Badger-Embedded/maestro".into(),
-            number: 12,
-        }]
+        requests[0].account.resolve().unwrap().account,
+        project_account()
     );
+    assert_eq!(requests[0].repo, "Badger-Embedded/maestro");
+    assert_eq!(requests[0].number, 12);
     let texts: Vec<String> = store
         .logs(id, 50)
         .unwrap()
@@ -4512,7 +4567,7 @@ async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
         Arc::new(Notify::new()),
         data.path().to_owned(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
 
     let id = store
@@ -4900,7 +4955,7 @@ async fn discovery_makes_one_job_per_renovate_pull_request() {
             Arc::new(Notify::new()),
             PathBuf::new(),
             mcp_runtime(store).0,
-            Accounts::new(Account::default()),
+            accounts(store),
         )
     };
 
@@ -4925,6 +4980,28 @@ async fn discovery_makes_one_job_per_renovate_pull_request() {
     step(&scheduler).await;
     assert_eq!(executor.renovate_listed.lock().unwrap().len(), 2);
     assert_eq!(reopened.list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn discovery_skips_a_project_with_no_project_token() {
+    let (store, executor, scheduler) = setup(|_| questions());
+    enable_renovate(&store);
+    executor.renovate_open.lock().unwrap().push((
+        "renovate[bot]".into(),
+        "main".into(),
+        renovate_pr(7),
+    ));
+    user_secrets(&store)
+        .delete_forge_token(ForgeTokenOwner::Project {
+            project: "maestro",
+            forge: ForgeKind::GitHub,
+        })
+        .unwrap();
+
+    step(&scheduler).await;
+
+    assert!(executor.renovate_listed.lock().unwrap().is_empty());
+    assert_eq!(store.list().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -5142,6 +5219,55 @@ async fn a_merge_refused_for_a_moved_head_watches_the_new_head() {
         *executor.approved.lock().unwrap(),
         [(7, "h1".to_owned()), (7, "h2".to_owned())]
     );
+}
+
+fn is_failed(store: &Store, id: i64) -> bool {
+    matches!(store.get(id).unwrap().job.stage(), Stage::Failed { .. })
+}
+
+#[tokio::test]
+async fn a_refused_token_before_a_merge_fails_the_job_and_retry_merges() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    executor
+        .merge_errors
+        .lock()
+        .unwrap()
+        .push_back(credential_failure("The forge rejected the project token"));
+    step_until(&scheduler, || is_failed(&store, id)).await;
+    assert!(executor.merged.lock().unwrap().is_empty());
+
+    store.apply(id, Event::Retry).unwrap();
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert_eq!(executor.approved.lock().unwrap().len(), 2);
+    assert_eq!(*executor.merged.lock().unwrap(), [(7, "h1".to_owned())]);
+}
+
+#[tokio::test]
+async fn a_refused_token_after_a_merge_fails_the_job_and_retry_reads_it_without_merging_again() {
+    let (store, executor, scheduler, id) = renovate_setup(verdict(true));
+    store.save_project_auto_merge("maestro", true).unwrap();
+    *executor.renovate_now.lock().unwrap() = passed("h1");
+    executor
+        .merged_read_errors
+        .lock()
+        .unwrap()
+        .push_back(credential_failure("The forge rejected the project token"));
+    step_until(&scheduler, || is_failed(&store, id)).await;
+    assert_eq!(*executor.merged.lock().unwrap(), [(7, "h1".to_owned())]);
+
+    *executor.renovate_now.lock().unwrap() = RenovateNow::Merged;
+    store.apply(id, Event::Retry).unwrap();
+    step_until(&scheduler, || {
+        *store.get(id).unwrap().job.stage() == Stage::Merged
+    })
+    .await;
+    assert_eq!(executor.approved.lock().unwrap().len(), 1);
+    assert_eq!(executor.merged.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -5518,7 +5644,7 @@ async fn a_restart_keeps_the_count_of_checks_that_could_not_run() {
         Arc::new(Notify::new()),
         PathBuf::new(),
         mcp_runtime(&store).0,
-        Accounts::new(Account::default()),
+        accounts(&store),
     );
     step(&fresh).await;
     step(&fresh).await;
@@ -5980,6 +6106,249 @@ async fn a_stale_rebase_command_does_not_claim_again() {
     );
 }
 
+fn user_secrets(store: &Arc<Store>) -> LocalSecrets {
+    LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(store))
+}
+
+fn save_user_token(store: &Arc<Store>, login: &str, token: &str) {
+    let owner = ForgeTokenOwner::User {
+        login,
+        forge: ForgeKind::GitHub,
+    };
+    let account = ForgeAccount {
+        login: format!("{login}-bot"),
+        id: 5,
+    };
+    user_secrets(store)
+        .put_forge_token(owner, token, &account)
+        .unwrap();
+}
+
+/// Onboards `maestro` with `alice` as a collaborator, her switch as given.
+fn onboard_maestro(store: &Store, switch: bool) {
+    store
+        .create_project_as(
+            "maestro",
+            ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+            switch,
+        )
+        .unwrap();
+}
+
+fn maestro() -> Project {
+    Project {
+        forge: ProjectForge::Known(ForgeKind::GitHub),
+        repo: "Badger-Embedded/maestro".into(),
+        base: "main".into(),
+        checks: None,
+        models: factory_server::StageModels::default(),
+        auto_merge: false,
+        llm_review: false,
+    }
+}
+
+#[test]
+fn the_requesters_token_runs_the_job_only_with_the_switch_on_and_a_token() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let accounts = accounts(&store);
+    onboard_maestro(&store, true);
+    let resolve = |requester: &str| accounts.resolve("maestro", &maestro(), requester).unwrap();
+
+    // The switch is on but alice has no token yet: the project token runs it.
+    assert_eq!(resolve("alice").account, project_account());
+
+    save_user_token(&store, "alice", "alice-token");
+    let mine = resolve("alice");
+    assert_eq!(mine.account.token.as_deref(), Some("alice-token"));
+    assert_eq!(mine.account.login, "alice-bot");
+    assert_eq!(mine.account.email, "5+alice-bot@users.noreply.github.com");
+    assert_eq!(mine.owner.label(), "requester's account");
+    assert_eq!(mine.ignore, ["alice-bot", "factory-bot"]);
+
+    // A job of the factory, and a login that is not a collaborator, never use it.
+    assert_eq!(resolve(FACTORY_REQUESTER).account, project_account());
+    save_user_token(&store, "bob", "bob-token");
+    assert_eq!(resolve("bob").account, project_account());
+
+    // A change applies from the next operation.
+    store.set_use_my_account("maestro", "alice", false).unwrap();
+    let off = resolve("alice");
+    assert_eq!(off.account, project_account());
+    assert_eq!(off.owner.label(), "project account");
+    assert_eq!(off.ignore, ["factory-bot"]);
+    store.set_use_my_account("maestro", "alice", true).unwrap();
+    assert_eq!(
+        resolve("alice").account.token.as_deref(),
+        Some("alice-token")
+    );
+    user_secrets(&store)
+        .delete_forge_token(ForgeTokenOwner::User {
+            login: "alice",
+            forge: ForgeKind::GitHub,
+        })
+        .unwrap();
+    assert_eq!(resolve("alice").account, project_account());
+    save_user_token(&store, "alice", "second-token");
+    assert_eq!(
+        resolve("alice").account.token.as_deref(),
+        Some("second-token")
+    );
+}
+
+#[tokio::test]
+async fn the_publish_log_names_the_account_and_whose_it_is() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    onboard_maestro(&store, true);
+    save_user_token(&store, "alice", "alice-token");
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    let published = executor.published.lock().unwrap()[0].clone();
+    assert_eq!(
+        published
+            .account
+            .resolve()
+            .unwrap()
+            .account
+            .token
+            .as_deref(),
+        Some("alice-token")
+    );
+    let log = store.logs(id, 50).unwrap();
+    assert!(
+        log.iter().any(|line| line.text.contains(&format!(
+            "Pushed factory/job-{id}-pr-1 to Badger-Embedded/maestro as alice-bot (requester's account)."
+        ))),
+        "{log:?}"
+    );
+    assert!(log.iter().all(|line| !line.text.contains("alice-token")));
+}
+
+#[tokio::test]
+async fn the_publish_log_names_the_project_account_for_a_job_on_it() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    let published = executor.published.lock().unwrap()[0].clone();
+    assert_eq!(
+        published.account.resolve().unwrap().account,
+        project_account()
+    );
+    let log = store.logs(id, 50).unwrap();
+    assert!(
+        log.iter()
+            .any(|line| line.text.contains("as factory-bot (project account).")),
+        "{log:?}"
+    );
+}
+
+#[tokio::test]
+async fn comments_from_the_running_account_and_the_project_account_are_ignored() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    onboard_maestro(&store, true);
+    save_user_token(&store, "alice", "alice-token");
+    to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    let watched = executor.watched.lock().unwrap()[0].clone();
+    assert_eq!(
+        watched.account.resolve().unwrap().ignore,
+        ["alice-bot", "factory-bot"]
+    );
+}
+
+#[tokio::test]
+async fn a_job_with_no_project_token_fails_with_where_to_save_one_and_calls_no_forge() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::Clarified));
+    let secrets = user_secrets(&store);
+    secrets
+        .delete_forge_token(ForgeTokenOwner::Project {
+            project: "maestro",
+            forge: ForgeKind::GitHub,
+        })
+        .unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    executor.release(1);
+
+    step(&scheduler).await;
+
+    let reason = match store.get(id).unwrap().job.stage() {
+        Stage::Failed { reason, .. } => reason.clone(),
+        other => panic!("expected a failed job, got {other:?}"),
+    };
+    assert!(
+        reason.contains("Project maestro has no project token")
+            && reason.contains("/settings/projects/maestro"),
+        "{reason}"
+    );
+    assert_eq!(executor.requests().len(), 0);
+    assert!(executor.published.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_rejected_token_fails_the_job_and_retry_runs_with_the_replacement() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    onboard_maestro(&store, true);
+    save_user_token(&store, "alice", "alice-token");
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Err(credential_failure(
+            &Owner::Requester {
+                login: "alice".into(),
+                forge: ForgeKind::GitHub,
+            }
+            .rejected(),
+        )));
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    let reason = match store.get(id).unwrap().job.stage() {
+        Stage::Failed { reason, .. } => reason.clone(),
+        other => panic!("expected a failed job, got {other:?}"),
+    };
+    assert_eq!(
+        reason,
+        "The forge rejected the GitHub token of alice. Save a new one on /settings/forges/github"
+    );
+    assert!(!reason.contains("alice-token"));
+    assert_eq!(executor.published.lock().unwrap().len(), 1);
+
+    // No other token is tried while the job waits for a new one.
+    step(&scheduler).await;
+    assert_eq!(executor.published.lock().unwrap().len(), 1);
+
+    save_user_token(&store, "alice", "replacement");
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+    let published = executor.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 2);
+    assert_eq!(
+        published[1]
+            .account
+            .resolve()
+            .unwrap()
+            .account
+            .token
+            .as_deref(),
+        Some("replacement")
+    );
+}
+
 #[tokio::test]
 async fn a_claim_left_by_a_deleted_fix_does_not_block_the_fix_that_reuses_its_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -6021,4 +6390,113 @@ async fn a_claim_left_by_a_deleted_fix_does_not_block_the_fix_that_reuses_its_id
     })
     .await;
     assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_token_during_a_watch_fails_the_job_but_other_errors_retry() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    step(&scheduler).await;
+    step(&scheduler).await;
+    executor
+        .watches
+        .lock()
+        .unwrap()
+        .push_back(Err("network is down".into()));
+
+    step(&scheduler).await;
+    assert!(
+        !matches!(store.get(id).unwrap().job.stage(), Stage::Failed { .. }),
+        "a transient error must not fail the job"
+    );
+
+    executor
+        .watches
+        .lock()
+        .unwrap()
+        .push_back(Err(credential_failure("the token was refused")));
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_missing_project_token_on_a_factory_step_fails_the_job() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    onboard_maestro(&store, true);
+    quick_polls(&store);
+    let id = to_commits_ready(&store, &executor, &scheduler).await;
+    let published = executor.published.lock().unwrap().len();
+    user_secrets(&store)
+        .delete_forge_token(ForgeTokenOwner::Project {
+            project: "maestro",
+            forge: ForgeKind::GitHub,
+        })
+        .unwrap();
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    let reason = match store.get(id).unwrap().job.stage() {
+        Stage::Failed { reason, .. } => reason.clone(),
+        other => panic!("expected a failed job, got {other:?}"),
+    };
+    assert!(
+        reason.contains("Project maestro has no project token"),
+        "{reason}"
+    );
+    assert_eq!(executor.published.lock().unwrap().len(), published);
+}
+
+#[tokio::test]
+async fn a_refused_token_reading_a_merged_fix_fails_the_job_and_retry_resumes_the_read() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    executor
+        .fix_read_errors
+        .lock()
+        .unwrap()
+        .push_back(credential_failure("the token was refused"));
+    let watched = executor.renovate_watched.lock().unwrap().len();
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        matches!(store.get(id).unwrap().job.stage(), Stage::Failed { .. })
+    })
+    .await;
+    assert!(executor.rebase_calls.lock().unwrap().is_empty());
+    assert_eq!(executor.renovate_watched.lock().unwrap().len(), watched);
+
+    store.apply(id, Event::Retry).unwrap();
+    step_until(&scheduler, || {
+        !executor.rebase_calls.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_token_asking_for_a_rebase_fails_the_job_and_retry_asks_again() {
+    let (store, executor, scheduler, id, fix) = fixing_setup().await;
+    executor
+        .rebases
+        .lock()
+        .unwrap()
+        .push_back(Err(credential_failure("the token was refused")));
+    store.apply(fix, Event::Merged).unwrap();
+    step_until(&scheduler, || {
+        matches!(store.get(id).unwrap().job.stage(), Stage::Failed { .. })
+    })
+    .await;
+    assert_ne!(needs_you(&store, id), Some(RenovateWait::RebaseFailed));
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 1);
+
+    store.apply(id, Event::Retry).unwrap();
+    step_until(&scheduler, || {
+        event_names(&store, id).contains(&"rebase-requested".to_owned())
+    })
+    .await;
+    assert_eq!(executor.rebase_calls.lock().unwrap().len(), 2);
 }

@@ -22,9 +22,6 @@ strip_newline() {
     fi
 }
 
-if ! podman secret exists gh-token; then
-    gh auth token | tr -d '\n' | podman secret create gh-token - >/dev/null
-fi
 # The master key that encrypts per-project MCP header values. 32 random bytes
 # as 64 hex characters, generated once when missing so no step is manual, and
 # left alone on a later run so stored values stay readable. It is never
@@ -33,7 +30,12 @@ if ! podman secret exists factory-master-key; then
     head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n' \
         | podman secret create factory-master-key - >/dev/null
 fi
-strip_newline gh-token
+# An install from before project tokens has a gh-token secret. The factory
+# reads it once and copies it into each GitHub project's token, so the unit
+# below still passes it in. A new install has none and needs none.
+if podman secret exists gh-token; then
+    strip_newline gh-token
+fi
 # The factory reads the Claude token from its secret store and imports this
 # podman secret on first start, so it is no longer required. When it exists,
 # the unit below still passes it in, which gives the factory a token to import.
@@ -58,10 +60,14 @@ fi
 mkdir -p ~/.local/share/factory ~/.config/containers/systemd
 unit=~/.config/containers/systemd/factory.container
 cp deploy/factory.container "$unit"
-# Pass the Claude token only when its podman secret exists: Quadlet refuses to
-# start a unit that names a missing secret, and a fresh install has none.
+# Pass the GitHub and Claude tokens only when their podman secrets exist:
+# Quadlet refuses to start a unit that names a missing secret, and a fresh
+# install has neither.
+if podman secret exists gh-token; then
+    sed -i '/^Secret=factory-master-key,/i Secret=gh-token,type=env,target=GH_TOKEN' "$unit"
+fi
 if podman secret exists claude-token; then
-    sed -i '/^Secret=gh-token,/a Secret=claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN' "$unit"
+    sed -i '/^Secret=factory-master-key,/i Secret=claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN' "$unit"
 fi
 systemctl --user daemon-reload
 systemctl --user restart factory.service

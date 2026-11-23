@@ -9,14 +9,17 @@
 //! points at a missing binary.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use factory_core::Event;
-use factory_runner::{Account, Expect, ForgeKind, Git, GitHub, WorkerConfig};
+use factory_runner::{Account, Expect, Forge, ForgeKind, Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos, LocalSecrets,
-    MASTER_KEY_LEN, PlanUsageCache, PodmanExecutor, Rebase, SecretStore, Settings, Store,
+    AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
+    LocalSecrets, MASTER_KEY_LEN, Operation, Owner, PlanUsageCache, PodmanExecutor, Rebase,
+    SecretStore, Settings, Store,
 };
+
+mod support;
 
 /// A subscription `auth.json`, shaped like the one `codex login` writes.
 const AUTH: &str = r#"{"tokens":{"access_token":"at-1","refresh_token":"rt-1"},"last_refresh":"2026-11-20T00:00:00Z"}"#;
@@ -27,6 +30,15 @@ fn registry(secrets: &Arc<dyn SecretStore>) -> Arc<AgentRegistry> {
         Arc::new(CodexLogin::new(Arc::clone(secrets))),
         Arc::clone(secrets),
     ))
+}
+
+fn test_account() -> Account {
+    Account {
+        token: Some("project-token".into()),
+        login: "factory-bot".into(),
+        name: "factory-bot".into(),
+        email: "1+factory-bot@users.noreply.github.com".into(),
+    }
 }
 
 fn forges(github: GitHub) -> Forges {
@@ -58,7 +70,7 @@ fn request() -> AgentRequest {
     AgentRequest {
         job_id: 7,
         forge: ForgeKind::GitHub,
-        account: Account::default(),
+        account: AccountSource::fixed(test_account()),
         repo: "owner/name".into(),
         base: "main".into(),
         branch: None,
@@ -256,7 +268,13 @@ async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_move
     });
 
     podman
-        .merge_renovate(ForgeKind::GitHub, &Account::default(), "o/r", 5, "checked1")
+        .merge_renovate(
+            ForgeKind::GitHub,
+            &AccountSource::fixed(test_account()),
+            "o/r",
+            5,
+            "checked1",
+        )
         .await
         .unwrap();
 
@@ -328,7 +346,7 @@ fn packaging_request(
 ) -> factory_server::PackagingRequest {
     factory_server::PackagingRequest {
         forge: ForgeKind::GitHub,
-        account: Account::default(),
+        account: AccountSource::fixed(test_account()),
         repo: "o/r".into(),
         upstream: "up/app".into(),
         base: "main".into(),
@@ -352,7 +370,7 @@ async fn a_merge_that_touches_no_manifest_never_downloads_its_diff() {
     let event = podman
         .renovate_merged(
             ForgeKind::GitHub,
-            &Account::default(),
+            &AccountSource::fixed(test_account()),
             "o/r",
             5,
             Some(&manifests),
@@ -555,7 +573,7 @@ async fn a_rebase_request_ticks_the_checkbox_only_while_the_head_is_the_one_that
     let body = "Bumps app\r\n\r\n - [ ] <!-- rebase-check -->rebase\r\n";
     let dir = tempfile::tempdir().unwrap();
     let (podman, calls) = gh_executor(dir.path(), &view("h1", body, &[]), 0);
-    let account = Account::default();
+    let account = AccountSource::fixed(account_with_token("bot", 1, "ghp_bot"));
 
     let moved = podman
         .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h0")
@@ -575,4 +593,388 @@ async fn a_rebase_request_ticks_the_checkbox_only_while_the_head_is_the_one_that
         .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h1")
         .await;
     assert_eq!(missing, Ok(Rebase::NoCheckbox));
+}
+
+fn account_with_token(login: &str, id: u64, token: &str) -> Account {
+    Account {
+        token: Some(token.into()),
+        login: login.into(),
+        name: login.into(),
+        email: format!("{id}+{login}@users.noreply.github.com"),
+    }
+}
+
+/// Every call a fake `git` or `gh` got: its arguments and the token it was
+/// handed, which is `GH_TOKEN` for gh and the `GIT_CONFIG_VALUE_0` header for
+/// git.
+struct Tools {
+    dir: tempfile::TempDir,
+}
+
+impl Tools {
+    fn new() -> Tools {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        support::executable(
+            dir.path(),
+            "gh",
+            &format!(
+                "#!/bin/bash\necho \"gh $* | ${{GH_TOKEN}}\" >> '{calls}'\n\
+                 case \"$*\" in\n\
+                 *--state\\ merged*) ;;\n\
+                 *--state\\ open*) ;;\n\
+                 *\"pr create\"*) echo https://github.com/o/r/pull/9 ;;\n\
+                 esac\n",
+                calls = calls.display()
+            ),
+        );
+        support::executable(
+            dir.path(),
+            "git",
+            &format!(
+                "#!/bin/bash\necho \"git $* | ${{GIT_CONFIG_VALUE_0}}\" >> '{calls}'\n\
+                 while [ \"$1\" = -c ]; do shift 2; done\n\
+                 case \"$1\" in --git-dir=*) shift ;; esac\n\
+                 case \"$1\" in\n\
+                 clone) mkdir -p \"${{@: -1}}/.git\" ;;\n\
+                 log) echo 'abc1234 one' ;;\n\
+                 config) case \"$*\" in *--get-regexp*) exit 1 ;; esac ;;\n\
+                 esac\n",
+                calls = calls.display()
+            ),
+        );
+        Tools { dir }
+    }
+
+    fn executor(&self, store: Arc<Store>) -> PodmanExecutor {
+        let secrets: Arc<dyn SecretStore> =
+            Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+        secrets.set_claude_token("sk-ant-oat01-saved").unwrap();
+        let mut podman = executor(registry(&secrets), self.dir.path().join("data"), store);
+        podman.git = Git {
+            git: self.dir.path().join("git"),
+        };
+        podman.forges = forges(GitHub {
+            gh: self.dir.path().join("gh"),
+            ..GitHub::default()
+        });
+        podman
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("calls")).unwrap_or_default()
+    }
+}
+
+fn header(token: &str) -> String {
+    GitHub::default()
+        .git_auth_header(&account_with_token("any", 1, token))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn clone_push_and_every_gh_call_use_the_token_of_the_account_the_request_names() {
+    let tools = Tools::new();
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mine = account_with_token("alice-bot", 5, "ghp_requester");
+    let mut run = request();
+    run.account = AccountSource::fixed(mine.clone());
+    run.branch = Some("factory/job-7-pr-1".into());
+
+    // The runs fail at `podman`, after the checkout they prepared. The second
+    // finds the checkout and fetches into it.
+    for _ in 0..2 {
+        podman
+            .run_agent(
+                &Settings::default(),
+                run.clone(),
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            )
+            .await;
+    }
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(mine),
+            repo: "o/r".into(),
+            base: "main".into(),
+            branch: "factory/job-7-pr-1".into(),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            pushed: factory_server::PushLog::new(|_| {}),
+        })
+        .await
+        .unwrap();
+
+    let calls = tools.calls();
+    let git: Vec<&str> = calls.lines().filter(|c| c.starts_with("git ")).collect();
+    let gh: Vec<&str> = calls.lines().filter(|c| c.starts_with("gh ")).collect();
+    let expected = header("ghp_requester");
+    for verb in ["clone", "fetch", "push"] {
+        let call = git
+            .iter()
+            .find(|c| c.contains(&format!(" {verb} ")))
+            .unwrap_or_else(|| panic!("no git {verb} in {calls}"));
+        assert!(call.ends_with(&format!("| {expected}")), "{call}");
+    }
+    assert!(gh.len() >= 3, "{calls}");
+    for call in &gh {
+        assert!(call.ends_with("| ghp_requester"), "{call}");
+    }
+    // The token is in the environment only, never in an argument.
+    for call in calls.lines() {
+        let args = call.rsplit_once(" | ").unwrap().0;
+        assert!(!args.contains("ghp_requester"), "{call}");
+    }
+}
+
+#[tokio::test]
+async fn each_call_uses_the_account_of_its_own_request() {
+    let tools = Tools::new();
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    for token in ["ghp_first", "ghp_second"] {
+        podman
+            .forges
+            .forge(ForgeKind::GitHub)
+            .merged_pr(&account_with_token("bot", 1, token), "o/r", "b")
+            .await
+            .unwrap();
+    }
+
+    let calls = tools.calls();
+    let tokens: Vec<&str> = calls
+        .lines()
+        .map(|call| call.rsplit_once("| ").unwrap().1)
+        .collect();
+    assert_eq!(tokens, ["ghp_first", "ghp_second"]);
+}
+
+#[tokio::test]
+async fn a_token_that_changes_during_a_publish_applies_to_the_next_operation() {
+    let tools = Tools::new();
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let source = AccountSource::new(move || {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(Operation {
+            forge: ForgeKind::GitHub,
+            account: account_with_token(&format!("bot{n}"), n as u64, &format!("ghp_token{n}")),
+            owner: Owner::Project {
+                project: "o".into(),
+            },
+            ignore: Vec::new(),
+        })
+    });
+    let pushes = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&pushes);
+    let published = podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: source,
+            repo: "o/r".into(),
+            base: "main".into(),
+            branch: "factory/job-7-pr-1".into(),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            pushed: factory_server::PushLog::new(move |account| {
+                log.lock().unwrap().push(account.to_owned());
+            }),
+        })
+        .await
+        .unwrap();
+
+    let calls = tools.calls();
+    let token_of = |needle: &str| -> String {
+        let call = calls
+            .lines()
+            .find(|c| c.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle} in {calls}"));
+        call.rsplit_once(" | ").unwrap().1.to_owned()
+    };
+    assert_eq!(token_of("gh pr list"), "ghp_token1");
+    assert_eq!(token_of(" push "), header("ghp_token2"));
+    assert_eq!(token_of("gh pr create"), "ghp_token3");
+    assert_eq!(published, factory_server::Published::Open(9));
+    assert_eq!(*pushes.lock().unwrap(), ["bot2 (project account)"]);
+}
+
+#[tokio::test]
+async fn a_push_is_logged_even_when_the_pull_request_step_has_no_account() {
+    let tools = Tools::new();
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = AccountSource::new(move || {
+        let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if n > 2 {
+            return Err(factory_server::ResolveError::Account(
+                "the token was cleared".into(),
+            ));
+        }
+        Ok(Operation {
+            forge: ForgeKind::GitHub,
+            account: account_with_token(&format!("bot{n}"), n as u64, &format!("ghp_token{n}")),
+            owner: Owner::Project {
+                project: "o".into(),
+            },
+            ignore: Vec::new(),
+        })
+    });
+    let pushes = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&pushes);
+    let err = podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: source,
+            repo: "o/r".into(),
+            base: "main".into(),
+            branch: "factory/job-7-pr-1".into(),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            pushed: factory_server::PushLog::new(move |account| {
+                log.lock().unwrap().push(account.to_owned());
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.starts_with("credentials: "), "{err}");
+    assert_eq!(*pushes.lock().unwrap(), ["bot2 (project account)"]);
+}
+
+fn rotating_source() -> AccountSource {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    AccountSource::new(move || {
+        let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(Operation {
+            forge: ForgeKind::GitHub,
+            account: account_with_token("bot", 1, &format!("ghp_token{n}")),
+            owner: Owner::Project {
+                project: "o".into(),
+            },
+            ignore: Vec::new(),
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_token_that_changes_after_the_clone_reaches_the_fetch() {
+    let tools = Tools::new();
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut run = request();
+    run.account = rotating_source();
+    run.branch = Some("factory/job-7-pr-1".into());
+
+    podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+
+    let calls = tools.calls();
+    let token_of = |needle: &str| -> String {
+        let call = calls
+            .lines()
+            .find(|c| c.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle} in {calls}"));
+        call.rsplit_once(" | ").unwrap().1.to_owned()
+    };
+    assert_eq!(token_of(" clone "), header("ghp_token1"));
+    assert_eq!(token_of("--git-dir"), header("ghp_token2"));
+}
+
+#[tokio::test]
+async fn a_refused_token_reading_a_ci_log_after_a_good_status_read_fails_the_watch() {
+    let tools = Tools::new();
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        "#!/bin/bash\n\
+         case \"$*\" in\n\
+         *\"run view\"*) echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;\n\
+         *\"pr view\"*) echo '{\"state\":\"OPEN\",\"headRefOid\":\"h1\",\"statusCheckRollup\":[{\"name\":\"Lint\",\"status\":\"COMPLETED\",\"conclusion\":\"FAILURE\",\"detailsUrl\":\"https://github.com/o/r/actions/runs/4/job/5\"}]}' ;;\n\
+         esac\n",
+    );
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let source = AccountSource::new(|| {
+        Ok(Operation {
+            forge: ForgeKind::GitHub,
+            account: account_with_token("bot", 1, "ghp_token"),
+            owner: Owner::Requester {
+                login: "alice".into(),
+                forge: ForgeKind::GitHub,
+            },
+            ignore: Vec::new(),
+        })
+    });
+    let err = podman
+        .watch(factory_server::WatchRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: source,
+            repo: "o/r".into(),
+            base: "main".into(),
+            number: 5,
+            seen_until: None,
+            auto_merge: false,
+            llm_review: false,
+            review_approved: false,
+            watch_only: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        factory_server::credential_reason(&err),
+        Some(
+            "The forge rejected the GitHub token of alice. Save a new one on /settings/forges/github"
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_refused_token_names_its_owner_where_the_command_ran() {
+    let tools = Tools::new();
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        "#!/bin/bash\necho 'gh: Bad credentials (HTTP 401)' >&2\nexit 1\n",
+    );
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let source = AccountSource::new(|| {
+        Ok(Operation {
+            forge: ForgeKind::GitHub,
+            account: account_with_token("bot", 1, "ghp_token"),
+            owner: Owner::Requester {
+                login: "alice".into(),
+                forge: ForgeKind::GitHub,
+            },
+            ignore: Vec::new(),
+        })
+    });
+    let err = podman
+        .comment(ForgeKind::GitHub, &source, "o/r", 5, "hi")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        factory_server::credential_reason(&err),
+        Some(
+            "The forge rejected the GitHub token of alice. Save a new one on /settings/forges/github"
+        )
+    );
+    assert!(!err.contains("ghp_token"), "{err}");
 }

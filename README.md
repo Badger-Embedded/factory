@@ -24,10 +24,9 @@ Run the browser tests with `nix develop -c just e2e`. They start their own serve
 | `FACTORY_PODMAN` | `podman` | The podman binary. Set `CONTAINER_HOST` to use a remote podman service. |
 | `FACTORY_AGENTS_DIR` | unset | The factory's bundled agent material, mounted read-only into workers |
 | `FACTORY_WORKER_VOLUMES` | unset | Space-separated `--volume` values for every worker, such as `factory-nix:/nix` |
-| `GH_TOKEN` | unset | GitHub token the factory clones, pushes and opens pull requests with until jobs move to project tokens. Onboarding checks no longer use it: they run as the onboarding login's own token. At startup it also seeds the project token of each existing GitHub project once, when the secret store is available. Workers never get it. |
+| `GH_TOKEN` | unset | Read once at startup to give each existing GitHub project that token as its project token, when the secret store is available. Jobs and onboarding do not use it. Workers never get it. |
 | `FACTORY_GH` | `gh` | The GitHub CLI |
 | `FACTORY_MCP_CA_FILE` | unset | PEM file of extra root certificates that the MCP connection check and the MCP proxy trust next to the built-in roots, for a server whose certificate is not from a public CA. The factory stops at startup if the file cannot be read. |
-| `FACTORY_GIT_NAME`, `FACTORY_GIT_EMAIL` | `moonthebot` and its noreply address | Identity on the agent's commits |
 
 The worker limit, image, memory and CPUs are settings stored in the database. The job loop reads them on every pass.
 
@@ -37,6 +36,23 @@ Without `FACTORY_WORKERS=podman`, a new job waits in `requested`. To see the pag
 nix develop -c cargo run -p factory-server --example seed
 ```
 
+## Forge accounts
+
+The factory has no account of its own. Each operation of a job runs as one of two tokens, both stored in the encrypted secret store:
+
+- The project token, saved on the project's settings page in the Forge account card. Any collaborator can save or clear it. Jobs run as it unless the rule below applies. Renovate discovery, Renovate jobs and gap proposals before approval always run as it.
+- A user token, saved on the forge's page under Forges in the settings sidebar. A request job runs as it when its requester has stored one and has turned on "Use my account" for the project, a switch on the same card that is off by default.
+
+A project with no project token cannot run jobs that use it, and the board and the project page say so. A token the forge refuses fails the operation with a message that names the token and the page that replaces it. The account of a token should be a bot account: the factory ignores pull request comments from it, and GitHub does not let an account approve its own pull request. A job's commits carry the account's login and its noreply address.
+
+The access each account needs on the repository:
+
+| Use | Access |
+| --- | --- |
+| Request jobs: clone, push, open a pull request | Write |
+| Renovate triage: list pull requests, read status, logs and diffs, comment | Read |
+| Renovate triage: rerun failed CI, approve and merge | Write |
+
 ## Deploy to moon
 
 ```sh
@@ -44,6 +60,6 @@ just deploy            # origin/main
 just deploy my-branch  # any git ref
 ```
 
-`deploy/deploy.sh` copies the ref's source to `~/factory-src` on `moon.local` and runs `deploy/install.sh` there. That script builds the worker and factory images, installs the Quadlet unit `deploy/factory.container`, restarts `factory.service` and publishes the dashboard on the tailnet with `tailscale serve`. It creates the `gh-token` podman secret from moonthebot's `gh` login when the secret is missing. The factory holds the Claude token in its secret store and you set it on the settings page, so no podman secret is required; when a `claude-token` secret still exists, the unit passes it in so the factory can import it once.
+`deploy/deploy.sh` copies the ref's source to `~/factory-src` on `moon.local` and runs `deploy/install.sh` there. That script builds the worker and factory images, installs the Quadlet unit `deploy/factory.container`, restarts `factory.service` and publishes the dashboard on the tailnet with `tailscale serve`. It creates no `gh-token` podman secret. When one exists from an earlier install, the unit passes it in so the factory can copy it into each project's token once, and you can remove the secret afterwards. The factory holds the Claude token in its secret store and you set it on the settings page, so no podman secret is required; when a `claude-token` secret still exists, the unit passes it in so the factory can import it once.
 
 On moon, the factory keeps its database and job directories in `~/.local/share/factory`. Follow its log with `journalctl --user -u factory -f`.

@@ -28,7 +28,9 @@ Environment=FACTORY_PROXY_LISTEN=0.0.0.0:8081
 Environment=FACTORY_PROXY_URL=http://factory:8081
 Environment=FACTORY_WORKER_NETWORK=factory
 Environment=RUST_LOG=info
-Secret=gh-token,type=env,target=GH_TOKEN
+# install.sh adds a Secret=gh-token line here when that podman secret exists.
+# The factory reads GH_TOKEN once, to give each existing GitHub project that
+# token as its project token, so a new install has no such secret.
 # install.sh adds a Secret=claude-token line here when that podman secret
 # exists. The factory reads the Claude token from its secret store and imports
 # the podman secret on first start, so a fresh install has no such secret, and

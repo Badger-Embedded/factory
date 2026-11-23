@@ -7,7 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use factory_core::PrDescription;
 
-use crate::forge::{Access, Account, BoxFuture, Forge, ForgeAccount, LookupError};
+use crate::forge::{Access, Account, BoxFuture, Forge, ForgeAccount, LookupError, command_error};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -1308,7 +1308,7 @@ impl GitHub {
         account: &Account,
         repo: &str,
         checks: &[FailedCheck],
-    ) -> String {
+    ) -> Result<String, String> {
         let mut report = String::new();
         for check in checks {
             let _ = writeln!(report, "Check {:?} failed.", check.name);
@@ -1324,6 +1324,7 @@ impl GitHub {
                         .await
                     {
                         Ok(log) => report.push_str(tail(&log, MAX_LOG)),
+                        Err(err) if err.contains(crate::forge::REJECTED) => return Err(err),
                         Err(err) => {
                             let _ = writeln!(report, "Could not fetch its log: {err}");
                         }
@@ -1337,7 +1338,7 @@ impl GitHub {
             }
             report.push('\n');
         }
-        report
+        Ok(report)
     }
 
     async fn run(
@@ -1383,10 +1384,13 @@ impl GitHub {
                 _ => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
             }
         } else {
-            Err(format!(
-                "gh {} failed: {}",
-                args.iter().take(2).copied().collect::<Vec<_>>().join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
+            Err(command_error(
+                &format!(
+                    "gh {}",
+                    args.iter().take(2).copied().collect::<Vec<_>>().join(" ")
+                ),
+                &String::from_utf8_lossy(&output.stderr),
+                account.token.as_slice(),
             ))
         }
     }
@@ -1710,7 +1714,7 @@ impl Forge for GitHub {
         account: &'a Account,
         repo: &'a str,
         checks: &'a [FailedCheck],
-    ) -> BoxFuture<'a, String> {
+    ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(GitHub::failure_report(self, account, repo, checks))
     }
 }
