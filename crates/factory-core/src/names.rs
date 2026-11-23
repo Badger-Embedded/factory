@@ -113,6 +113,7 @@ impl Event {
             Event::ChecksPassed => "checks-passed",
             Event::Summarized(_) => "summarized",
             Event::ChecksFailed { .. } => "checks-failed",
+            Event::ChecksError { .. } => "checks-error",
             Event::Published { .. } => "published",
             Event::CiFailed { .. } => "ci-failed",
             Event::CiRerun => "ci-rerun",

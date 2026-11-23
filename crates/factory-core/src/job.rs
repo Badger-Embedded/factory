@@ -38,6 +38,11 @@ pub struct Job {
     spec: Option<String>,
     plan: Vec<PlannedPr>,
     failed_rounds: u32,
+    /// The checks runs in a row that ended in an error, up to
+    /// [`MAX_FAILED_ROUNDS`]. Separate from `failed_rounds`. A job stored
+    /// before this field existed loads with zero.
+    #[serde(default)]
+    checks_errors: u32,
     #[serde(default)]
     gates: Gates,
     /// The answers to the agent's questions, in the order given.
@@ -1139,6 +1144,11 @@ pub enum Event {
         feedback: String,
     },
     ChecksPassed,
+    /// The checks could not run, for example the command exited 125, 126 or
+    /// 127, or podman failed to start.
+    ChecksError {
+        error: String,
+    },
     /// The factory collected what the publish approval shows.
     Summarized(BranchSummary),
     ChecksFailed {
@@ -1285,6 +1295,7 @@ impl Job {
             spec: None,
             plan: Vec::new(),
             failed_rounds: 0,
+            checks_errors: 0,
             gates,
             answers: Vec::new(),
             fresh_sessions: true,
@@ -1396,6 +1407,19 @@ impl Job {
     #[must_use]
     pub fn gates(&self) -> Gates {
         self.gates
+    }
+
+    /// Whether the job failed because the local checks could not run
+    /// [`MAX_FAILED_ROUNDS`] times in a row, as opposed to failing checks.
+    #[must_use]
+    pub fn checks_could_not_run(&self) -> bool {
+        matches!(
+            &self.stage,
+            Stage::Failed {
+                retry: Some(RetryTarget::Verifying { .. }),
+                ..
+            }
+        ) && self.checks_errors >= MAX_FAILED_ROUNDS
     }
 
     #[must_use]
@@ -1560,10 +1584,15 @@ impl Job {
     /// Returns [`Rejected`] when the event does not apply to the job's stage
     /// and turn, or carries data that does not fit the job.
     pub fn apply(&mut self, event: Event) -> Result<(), Rejected> {
+        let ran = matches!(event, Event::ChecksPassed | Event::ChecksFailed { .. });
         let (stage, turn) = self.transition(event)?;
+        if ran {
+            self.checks_errors = 0;
+        }
         if let Stage::Implementing { .. } = stage {
             self.failed_rounds = 0;
             self.review_rounds = 0;
+            self.checks_errors = 0;
         }
         self.stage = stage;
         self.turn = turn;
@@ -1706,6 +1735,9 @@ impl Job {
                 (S::Verifying { pr }, Turn::Factory)
             }
 
+            (S::Verifying { pr }, Turn::Factory, E::ChecksError { error }) => {
+                self.checks_error(*pr, &error)
+            }
             (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => {
                 if self.gates.publish && self.plan[*pr].number.is_none() {
                     (
@@ -2033,6 +2065,22 @@ impl Job {
         }
     }
 
+    fn checks_error(&mut self, pr: usize, error: &str) -> (Stage, Turn) {
+        self.checks_errors += 1;
+        if self.checks_errors >= MAX_FAILED_ROUNDS {
+            let reason = format!(
+                "The local checks could not run {MAX_FAILED_ROUNDS} times in a row. \
+                 The last error: {error}"
+            );
+            (
+                Self::failed(reason, Some(RetryTarget::Verifying { pr })),
+                Turn::Done,
+            )
+        } else {
+            (Stage::Verifying { pr }, Turn::Factory)
+        }
+    }
+
     fn fail_round(&mut self, stage: Stage, next: Turn) -> (Stage, Turn) {
         self.failed_rounds += 1;
         if self.failed_rounds >= MAX_FAILED_ROUNDS {
@@ -2227,6 +2275,7 @@ impl Job {
 
         match self.retry_step() {
             Some((stage, turn)) => {
+                self.checks_errors = 0;
                 let resumed = matches!(
                     &self.stage,
                     Stage::Failed {

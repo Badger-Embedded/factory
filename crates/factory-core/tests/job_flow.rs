@@ -3493,3 +3493,153 @@ fn a_renovate_job_stored_before_fix_jobs_loads_with_no_fix() {
     let back: Job = serde_json::from_str(&serde_json::to_string(&fixing_job()).unwrap()).unwrap();
     assert_eq!(back, fixing_job());
 }
+
+fn verifying() -> Job {
+    let mut job = implementing(&["only"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    job
+}
+
+fn checks_error(job: &mut Job, times: u32) {
+    for _ in 0..times {
+        apply(
+            job,
+            Event::ChecksError {
+                error: "bash: just: command not found".into(),
+            },
+        );
+    }
+}
+
+#[test]
+fn checks_errors_fail_the_job_on_the_last_one() {
+    let mut job = verifying();
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    assert_eq!(job.next_command(), Some(Command::RunChecks { pr: 0 }));
+    assert!(!job.checks_could_not_run());
+
+    checks_error(&mut job, 1);
+    let Stage::Failed { reason, retry, .. } = job.stage() else {
+        panic!("not failed: {:?}", job.stage());
+    };
+    assert_eq!(retry, &Some(RetryTarget::Verifying { pr: 0 }));
+    assert!(reason.contains("5 times in a row"));
+    assert!(reason.contains("bash: just: command not found"));
+    assert_eq!(job.next_command(), None);
+    assert!(job.checks_could_not_run());
+}
+
+#[test]
+fn checks_errors_that_are_not_in_a_row_do_not_add_up() {
+    let mut job = verifying();
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    apply(
+        &mut job,
+        Event::ChecksFailed {
+            report: "lint".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    apply(&mut job, Event::CiFailed { log: "x".into() });
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+}
+
+#[test]
+fn checks_errors_and_failed_rounds_are_counted_apart() {
+    let mut job = verifying();
+    for _ in 1..MAX_FAILED_ROUNDS {
+        apply(
+            &mut job,
+            Event::ChecksFailed {
+                report: "lint".into(),
+            },
+        );
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    }
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+
+    apply(
+        &mut job,
+        Event::ChecksFailed {
+            report: "lint".into(),
+        },
+    );
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert!(!job.checks_could_not_run());
+}
+
+#[test]
+fn checks_errors_leave_the_failed_rounds_alone() {
+    let mut job = verifying();
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    for _ in 1..MAX_FAILED_ROUNDS {
+        apply(
+            &mut job,
+            Event::ChecksFailed {
+                report: "lint".into(),
+            },
+        );
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    }
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+}
+
+#[test]
+fn retry_gives_the_checks_five_fresh_attempts() {
+    let mut job = verifying();
+    checks_error(&mut job, MAX_FAILED_ROUNDS);
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+    assert_eq!(job.next_command(), Some(Command::RunChecks { pr: 0 }));
+    assert!(!job.checks_could_not_run());
+
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+    checks_error(&mut job, 1);
+    assert!(job.checks_could_not_run());
+}
+
+#[test]
+fn too_many_failed_check_rounds_are_not_a_checks_that_could_not_run_failure() {
+    let mut job = verifying();
+    for _ in 1..MAX_FAILED_ROUNDS {
+        apply(
+            &mut job,
+            Event::ChecksFailed {
+                report: "lint".into(),
+            },
+        );
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    }
+    apply(
+        &mut job,
+        Event::ChecksFailed {
+            report: "lint".into(),
+        },
+    );
+    let Stage::Failed { retry, .. } = job.stage() else {
+        panic!("not failed");
+    };
+    assert_eq!(retry, &Some(RetryTarget::Verifying { pr: 0 }));
+    assert!(!job.checks_could_not_run());
+}
+
+#[test]
+fn a_job_stored_without_the_checks_error_count_loads_with_zero() {
+    let mut job = verifying();
+    checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
+    let mut json = serde_json::to_value(&job).unwrap();
+    json.as_object_mut().unwrap().remove("checks_errors");
+    let mut loaded: Job = serde_json::from_value(json).unwrap();
+
+    checks_error(&mut loaded, MAX_FAILED_ROUNDS - 1);
+    assert_eq!(loaded.stage(), &Stage::Verifying { pr: 0 });
+    checks_error(&mut loaded, 1);
+    assert!(loaded.checks_could_not_run());
+}
