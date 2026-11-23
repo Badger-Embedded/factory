@@ -13,13 +13,14 @@ use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
 };
-use factory_runner::GitHub;
+use factory_runner::{ForgeKind, GitHub};
 use factory_server::{
     AgentRegistry, BranchInfo, CheckOutcome, ClaudeToken, CodexLogin, DeviceLogin,
     FACTORY_REQUESTER, Forges, GitHubRepos, LocalSecrets, LoginProcess, LoginSpawner,
-    MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, Projects, Protection,
-    RepoChecker, RepoInfo, RepoReport, SecretStore, Settings, StageAgents, StageEfforts,
-    StageModels, Store, StoreError, ToolList, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    MASTER_KEY_LEN, McpChecker, McpTool, Permission, PlanUsageCache, ProjectForge, Projects,
+    Protection, RepoChecker, RepoInfo, RepoReport, SecretStore, Settings, StageAgents,
+    StageEfforts, StageModels, Store, StoreError, ToolList, USER_HEADER, UnavailableSecrets,
+    WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -190,7 +191,14 @@ fn dashboard() -> Dashboard {
 fn dashboard_for(repo: &str) -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("maestro", repo, "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            repo,
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     dashboard_with(store)
 }
@@ -822,6 +830,7 @@ async fn the_job_header_wraps_created_at_in_a_time_element() {
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -1330,10 +1339,17 @@ fn the_import_leaves_the_global_auto_merge_migration_to_apply() {
 fn create_project_rejects_a_duplicate_name() {
     let store = Store::open_in_memory().unwrap();
     store
-        .create_project("maestro", "o/one", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/one",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     assert!(matches!(
-        store.create_project("maestro", "o/two", "main", None, Some("alice")),
+        store.create_project("maestro", ForgeKind::GitHub, "o/two", "main", None, Some("alice")),
         Err(StoreError::DuplicateName(name)) if name == "maestro"
     ));
     // The rejected call wrote nothing.
@@ -1345,11 +1361,18 @@ fn create_project_rejects_a_duplicate_name() {
 fn create_project_rejects_a_duplicate_repo() {
     let store = Store::open_in_memory().unwrap();
     store
-        .create_project("maestro", "o/repo", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/repo",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     assert!(matches!(
-        store.create_project("tool", "o/repo", "main", None, Some("alice")),
-        Err(StoreError::DuplicateRepo(repo)) if repo == "o/repo"
+        store.create_project("tool", ForgeKind::GitHub, "o/repo", "main", None, Some("alice")),
+        Err(StoreError::DuplicateRepo(_, repo)) if repo == "o/repo"
     ));
     assert_eq!(store.list_projects().unwrap().len(), 1);
 }
@@ -1364,7 +1387,14 @@ async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
 
     // Onboard one while the dashboard runs, as the wizard will.
     store
-        .create_project("widgets", "acme/widgets", "main", None, Some(USER))
+        .create_project(
+            "widgets",
+            ForgeKind::GitHub,
+            "acme/widgets",
+            "main",
+            None,
+            Some(USER),
+        )
         .unwrap();
 
     // It shows on the board selector, the settings page and the new-job form
@@ -1712,6 +1742,7 @@ async fn storage_and_retention_stay_in_utc() {
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -2552,13 +2583,131 @@ async fn links_use_the_repository_from_the_project_file() {
     assert!(!page.body.contains("Badger-Embedded"));
 }
 
+#[test]
+fn the_forge_migration_moves_every_project_to_github() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                 name TEXT PRIMARY KEY,
+                 repo TEXT NOT NULL UNIQUE,
+                 base TEXT NOT NULL,
+                 checks TEXT,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );
+             INSERT INTO projects (name, repo, base, checks)
+                 VALUES ('one', 'o/one', 'main', 'just test'), ('two', 'o/two', 'dev', NULL);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let projects = store.list_projects().unwrap();
+    assert_eq!(projects.len(), 2);
+    for (_, project) in &projects {
+        assert_eq!(project.forge, ProjectForge::Known(ForgeKind::GitHub));
+    }
+    assert_eq!(projects[0].1.checks.as_deref(), Some("just test"));
+    drop(store);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('three', 'elsewhere', 'o/one', 'main')",
+        [],
+    )
+    .unwrap();
+    let duplicate = conn.execute(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('four', 'github', 'o/one', 'main')",
+        [],
+    );
+    assert!(duplicate.is_err());
+    drop(conn);
+    Store::open(&path).unwrap();
+}
+
+#[test]
+fn a_repository_is_unique_by_forge_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Store::open(&path).unwrap();
+    store
+        .create_project("one", ForgeKind::GitHub, "o/repo", "main", None, None)
+        .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('other', 'elsewhere', 'o/repo', 'main')",
+        [],
+    )
+    .unwrap();
+    let other = store.project("other").unwrap().unwrap();
+    assert_eq!(other.forge, ProjectForge::Unknown("elsewhere".to_owned()));
+    assert!(
+        conn.execute(
+            "INSERT INTO projects (name, forge, repo, base) VALUES ('dup', 'elsewhere', 'o/repo', 'main')",
+            [],
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_project_on_an_unknown_forge_is_an_error_for_that_project_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    let store = Arc::new(Store::open(&path).unwrap());
+    store
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('odd', 'elsewhere', 'o/odd', 'main');
+         INSERT INTO project_collaborators (project, login, added_by) VALUES ('odd', 'alice', 'alice');",
+    )
+    .unwrap();
+    let dashboard = dashboard_with(store);
+
+    let board = dashboard.get("/?project=odd").await;
+    assert_eq!(board.status, StatusCode::OK);
+    assert!(board.body.contains("elsewhere"));
+    assert!(!board.body.contains("source-link"));
+    let settings = dashboard.get("/settings/projects/odd").await;
+    assert_eq!(settings.status, StatusCode::OK);
+    assert!(settings.body.contains("does not support"));
+
+    let healthy = dashboard.get("/?project=maestro").await;
+    assert_eq!(healthy.status, StatusCode::OK);
+    assert!(healthy.body.contains("source-link"));
+    assert!(!healthy.body.contains("does not support"));
+}
+
 fn two_projects() -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     store
-        .create_project("tool", "o/tool", "main", None, Some("alice"))
+        .create_project(
+            "tool",
+            ForgeKind::GitHub,
+            "o/tool",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     dashboard_with(store)
 }
@@ -2666,7 +2815,14 @@ async fn a_stale_or_foreign_cookie_falls_back_to_the_first_project() {
     let dashboard = two_projects();
     dashboard
         .store
-        .create_project("secret", "o/secret", "main", None, Some("bob@example.com"))
+        .create_project(
+            "secret",
+            ForgeKind::GitHub,
+            "o/secret",
+            "main",
+            None,
+            Some("bob@example.com"),
+        )
         .unwrap();
     for cookie in [
         "factory_project=nope",
@@ -2723,10 +2879,24 @@ async fn an_unusual_project_name_round_trips_through_the_cookie() {
     let name = "my proj; é,x";
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     store
-        .create_project(name, "o/odd", "main", None, Some("alice"))
+        .create_project(
+            name,
+            ForgeKind::GitHub,
+            "o/odd",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with(store);
     let uri = "/?project=my%20proj%3B%20%C3%A9%2Cx";
@@ -2849,7 +3019,14 @@ async fn the_settings_sidebar_lists_only_the_logins_own_projects() {
     let dashboard = two_projects();
     dashboard
         .store
-        .create_project("stray", "o/stray", "main", None, Some(STRANGER))
+        .create_project(
+            "stray",
+            ForgeKind::GitHub,
+            "o/stray",
+            "main",
+            None,
+            Some(STRANGER),
+        )
         .unwrap();
     let body = dashboard.get_as(STRANGER, "/settings/workers").await.body;
     assert!(body.contains("/settings/projects/stray"));
@@ -3927,6 +4104,7 @@ fn onboarding_copies_the_default_gates_and_later_defaults_leave_the_project_alon
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -3953,7 +4131,7 @@ fn the_gates_migration_copies_the_global_gates_into_each_project_once() {
     let store = Store::open(&path).unwrap();
     for (name, repo) in [("maestro", "o/maestro"), ("factory", "o/factory")] {
         store
-            .create_project(name, repo, "main", None, Some("alice"))
+            .create_project(name, ForgeKind::GitHub, repo, "main", None, Some("alice"))
             .unwrap();
     }
     // A database from before per-project gates has projects but no gate rows.
@@ -3992,7 +4170,14 @@ fn onboarding_makes_the_onboarding_login_the_only_collaborator() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("factory.db")).unwrap();
     store
-        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
 
     let collaborators = store.collaborators("maestro").unwrap();
@@ -4010,7 +4195,14 @@ fn adding_and_removing_collaborators_tracks_who_added_them() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("factory.db")).unwrap();
     store
-        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
 
     store.add_collaborator("maestro", "bob", "alice").unwrap();
@@ -4048,7 +4240,14 @@ fn the_collaborator_migration_seeds_each_project_from_its_requesters_once() {
         ("empty", "o/empty"),
     ] {
         store
-            .create_project(name, repo, "main", None, Some("onboarder"))
+            .create_project(
+                name,
+                ForgeKind::GitHub,
+                repo,
+                "main",
+                None,
+                Some("onboarder"),
+            )
             .unwrap();
     }
     store.create("maestro", "alice", "one request").unwrap();
@@ -5678,6 +5877,7 @@ async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alo
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -5685,7 +5885,14 @@ async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alo
         )
         .unwrap();
     store
-        .create_project("tool", "Badger-Embedded/tool", "main", None, Some("alice"))
+        .create_project(
+            "tool",
+            ForgeKind::GitHub,
+            "Badger-Embedded/tool",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let dashboard = dashboard_with(Arc::clone(&store));
 
@@ -6131,6 +6338,7 @@ async fn saving_the_form_persists_the_agents() {
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -6785,6 +6993,7 @@ async fn a_job_from_before_the_history_shows_its_steps_without_times() {
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -8009,7 +8218,14 @@ async fn squash_merge_disabled_is_rejected_with_no_row() {
 async fn a_duplicate_name_is_rejected_with_no_row() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("widgets", "acme/old", "main", None, Some("alice"))
+        .create_project(
+            "widgets",
+            ForgeKind::GitHub,
+            "acme/old",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     rejected(
         Arc::new(FakeRepos::fit()),
@@ -8024,7 +8240,14 @@ async fn a_duplicate_name_is_rejected_with_no_row() {
 async fn a_duplicate_repo_is_rejected_with_no_row() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("other", "acme/widgets", "main", None, Some("alice"))
+        .create_project(
+            "other",
+            ForgeKind::GitHub,
+            "acme/widgets",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     rejected(
         Arc::new(FakeRepos::fit()),
@@ -8450,6 +8673,7 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -8597,6 +8821,7 @@ async fn without_a_master_key_the_claude_token_field_is_disabled_with_a_message(
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -9829,6 +10054,7 @@ fn file_dashboard() -> (Dashboard, tempfile::TempDir, std::path::PathBuf) {
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -10105,7 +10331,14 @@ impl RepoChecker for GatedChecker {
 async fn concurrent_onboarding_of_one_name_cannot_delete_the_new_projects_jobs() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
-        .create_project("maestro", "acme/old", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "acme/old",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     let old = store.create("maestro", "alice", "Old request").unwrap();
     store.remove_project("maestro").unwrap();
@@ -10174,6 +10407,7 @@ fn admin_dashboard(admins: &[&str]) -> Dashboard {
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -10649,6 +10883,7 @@ fn a_job_that_changes_between_the_two_reads_keeps_its_state_and_event_together()
     store
         .create_project(
             "maestro",
+            ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -10749,7 +10984,14 @@ async fn a_project_made_before_the_table_existed_reads_off() {
     let path = dir.path().join("factory.db");
     let store = Store::open(&path).unwrap();
     store
-        .create_project("maestro", "o/maestro", "main", None, Some("alice"))
+        .create_project(
+            "maestro",
+            ForgeKind::GitHub,
+            "o/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
         .unwrap();
     drop(store);
     rusqlite::Connection::open(&path)

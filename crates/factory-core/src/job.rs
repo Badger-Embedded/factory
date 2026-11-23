@@ -559,10 +559,21 @@ pub enum RetryTarget {
     Verifying { pr: usize },
     /// Watch the pull request's CI and review again.
     CiAndReview { pr: usize },
+    /// Restore the stage and turn a factory step was interrupted in.
+    Resume { stage: Box<Stage>, turn: Box<Turn> },
     /// Run `task` again in `stage`, the stage the failed run belonged to.
     /// The stage picks the session, so the run resumes the session that
     /// failed, in the same checkout.
     Agent { stage: Box<Stage>, task: Box<Task> },
+}
+
+impl RetryTarget {
+    fn resume(stage: &Stage, turn: &Turn) -> Self {
+        Self::Resume {
+            stage: Box::new(stage.clone()),
+            turn: Box::new(turn.clone()),
+        }
+    }
 }
 
 /// Who the job is waiting for.
@@ -866,6 +877,12 @@ pub enum Event {
     },
     Agent(AgentResult),
     AgentFailed {
+        reason: String,
+    },
+    /// The factory cannot run the step it owes, so the job fails with `reason`.
+    /// A retry resumes the step where the job has a retry target. Applies to
+    /// every unfinished job that is not waiting for an agent run.
+    FactoryFailed {
         reason: String,
     },
     Answer(Vec<String>),
@@ -1289,6 +1306,11 @@ impl Job {
                         task: Box::new(task.clone()),
                     }),
                 ),
+                Turn::Done,
+            ),
+
+            (stage, turn, E::FactoryFailed { reason }) if self.interruptible(turn) => (
+                Self::failed(reason, Some(RetryTarget::resume(stage, turn))),
                 Turn::Done,
             ),
 
@@ -1866,7 +1888,14 @@ impl Job {
 
         match self.retry_step() {
             Some((stage, turn)) => {
-                if !matches!(turn, Turn::Agent(_)) {
+                let resumed = matches!(
+                    &self.stage,
+                    Stage::Failed {
+                        retry: Some(RetryTarget::Resume { .. }),
+                        ..
+                    }
+                );
+                if !matches!(turn, Turn::Agent(_)) && !resumed {
                     self.failed_rounds = 0;
                 }
                 Ok((stage, turn))
@@ -1949,6 +1978,9 @@ impl Job {
             Some(RetryTarget::CiAndReview { pr }) => {
                 Some((Stage::CiAndReview { pr: *pr }, Turn::Factory))
             }
+            Some(RetryTarget::Resume { stage, turn }) => {
+                Some(((**stage).clone(), (**turn).clone()))
+            }
             Some(RetryTarget::Agent { stage, task }) => {
                 Some(((**stage).clone(), Turn::Agent((**task).clone())))
             }
@@ -1966,6 +1998,10 @@ impl Job {
             }
             None => None,
         }
+    }
+
+    fn interruptible(&self, turn: &Turn) -> bool {
+        !matches!(turn, Turn::Agent(_)) && !self.is_finished()
     }
 
     /// Whether the job is merged, failed or cancelled, so no step is left.

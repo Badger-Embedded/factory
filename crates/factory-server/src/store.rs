@@ -7,11 +7,11 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use factory_core::{
     Agent, AgentResult, DEFAULT_AGENT, Event, Gap, Gates, Job, Rejected, Session, Stage,
 };
-use factory_runner::LogLine;
+use factory_runner::{ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
-use crate::projects::{Project, StageAgents, StageEfforts, StageModels};
+use crate::projects::{Project, ProjectForge, StageAgents, StageEfforts, StageModels};
 use crate::secrets::SecretRef;
 use crate::settings::Settings;
 
@@ -21,10 +21,12 @@ pub const FACTORY_REQUESTER: &str = "factory";
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS projects (
     name TEXT PRIMARY KEY,
-    repo TEXT NOT NULL UNIQUE,
+    forge TEXT NOT NULL DEFAULT 'github',
+    repo TEXT NOT NULL,
     base TEXT NOT NULL,
     checks TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (forge, repo)
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
@@ -430,8 +432,10 @@ pub enum StoreError {
     Rejected(Rejected),
     /// A project with this name is already onboarded.
     DuplicateName(String),
-    /// A project with this `owner/name` repo is already onboarded.
-    DuplicateRepo(String),
+    /// A project with this forge and repo is already onboarded.
+    DuplicateRepo(ForgeKind, String),
+    /// The named project is on a forge the factory does not support.
+    UnknownForge(String),
     /// An effort level outside the allowed set was submitted. It is not stored.
     InvalidEffort(String),
     /// An agent id that no available agent carries was submitted for a stage.
@@ -451,8 +455,18 @@ impl fmt::Display for StoreError {
             StoreError::NotFound(id) => write!(f, "no job {id}"),
             StoreError::Rejected(rejected) => rejected.fmt(f),
             StoreError::DuplicateName(name) => write!(f, "a project named {name:?} already exists"),
-            StoreError::DuplicateRepo(repo) => {
-                write!(f, "the repository {repo:?} is already onboarded")
+            StoreError::DuplicateRepo(forge, repo) => {
+                write!(
+                    f,
+                    "the {} repository {repo:?} is already onboarded",
+                    forge.display_name()
+                )
+            }
+            StoreError::UnknownForge(project) => {
+                write!(
+                    f,
+                    "project {project:?} is on a forge the factory does not support"
+                )
             }
             StoreError::InvalidEffort(effort) => {
                 write!(f, "{effort:?} is not an allowed effort level")
@@ -506,6 +520,7 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA)?;
+        Self::migrate_project_forge(&conn)?;
         // `review` joined the model stages after the table shipped, so add it to
         // a `project_models` table that predates it. A fresh database already
         // has the column from SCHEMA, so this skips it.
@@ -609,6 +624,39 @@ impl Store {
         })
     }
 
+    /// `forge` joined `projects` after the table shipped with `repo` unique on
+    /// its own. SQLite cannot change a constraint in place, so a table without
+    /// the column is rebuilt with every row on `github`. A fresh database
+    /// already has the column from SCHEMA, so this skips it.
+    fn migrate_project_forge(conn: &Connection) -> Result<(), StoreError> {
+        let has_forge: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'forge'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_forge > 0 {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE projects_new (
+                 name TEXT PRIMARY KEY,
+                 forge TEXT NOT NULL DEFAULT 'github',
+                 repo TEXT NOT NULL,
+                 base TEXT NOT NULL,
+                 checks TEXT,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 UNIQUE (forge, repo)
+             );
+             INSERT INTO projects_new (name, forge, repo, base, checks, created_at)
+                 SELECT name, 'github', repo, base, checks, created_at FROM projects;
+             DROP TABLE projects;
+             ALTER TABLE projects_new RENAME TO projects;
+             COMMIT;",
+        )?;
+        Ok(())
+    }
+
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -623,7 +671,7 @@ impl Store {
     pub fn list_projects(&self) -> Result<Vec<(String, Project)>, StoreError> {
         let conn = self.conn();
         let mut stmt =
-            conn.prepare("SELECT name, repo, base, checks FROM projects ORDER BY name")?;
+            conn.prepare("SELECT name, forge, repo, base, checks FROM projects ORDER BY name")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, project_row(row)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -639,14 +687,14 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT repo, base, checks FROM projects WHERE name = ?1",
+                "SELECT forge, repo, base, checks FROM projects WHERE name = ?1",
                 [name],
                 project_row_without_name,
             )
             .optional()?)
     }
 
-    /// Onboards a project with its `repo`, `base` and optional `checks`. Its
+    /// Onboards a project with its `forge`, `repo`, `base` and optional `checks`. Its
     /// approval gates start as a copy of the default gates in the settings, so
     /// a later change to the defaults leaves the project alone. Its models and
     /// flags start at their defaults; the settings page saves them into
@@ -659,11 +707,12 @@ impl Store {
     /// # Errors
     ///
     /// Fails with [`StoreError::DuplicateName`] when `name` is taken, with
-    /// [`StoreError::DuplicateRepo`] when `repo` is already onboarded, and on
+    /// [`StoreError::DuplicateRepo`] when `repo` is already onboarded on `forge`, and on
     /// a database error. Nothing is written when it fails.
     pub fn create_project(
         &self,
         name: &str,
+        forge: ForgeKind,
         repo: &str,
         base: &str,
         checks: Option<&str>,
@@ -679,15 +728,19 @@ impl Store {
             return Err(StoreError::DuplicateName(name.to_owned()));
         }
         let repo_taken = tx
-            .query_row("SELECT 1 FROM projects WHERE repo = ?1", [repo], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM projects WHERE forge = ?1 AND repo = ?2",
+                [forge.as_str(), repo],
+                |_| Ok(()),
+            )
             .optional()?
             .is_some();
         if repo_taken {
-            return Err(StoreError::DuplicateRepo(repo.to_owned()));
+            return Err(StoreError::DuplicateRepo(forge, repo.to_owned()));
         }
         tx.execute(
-            "INSERT INTO projects (name, repo, base, checks) VALUES (?1, ?2, ?3, ?4)",
-            params![name, repo, base, checks],
+            "INSERT INTO projects (name, forge, repo, base, checks) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, forge.as_str(), repo, base, checks],
         )?;
         let gates = Self::settings_in(&tx)?.gates;
         Self::insert_project_gates(&tx, name, gates)?;
@@ -3360,9 +3413,10 @@ fn session_key(session: Session) -> String {
 
 fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
-        repo: row.get(1)?,
-        base: row.get(2)?,
-        checks: row.get(3)?,
+        forge: ProjectForge::from_name(&row.get::<_, String>(1)?),
+        repo: row.get(2)?,
+        base: row.get(3)?,
+        checks: row.get(4)?,
         models: StageModels::default(),
         auto_merge: false,
         llm_review: false,
@@ -3372,9 +3426,10 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 /// A `projects` row with no `name` column, as `project` selects.
 fn project_row_without_name(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
-        repo: row.get(0)?,
-        base: row.get(1)?,
-        checks: row.get(2)?,
+        forge: ProjectForge::from_name(&row.get::<_, String>(0)?),
+        repo: row.get(1)?,
+        base: row.get(2)?,
+        checks: row.get(3)?,
         models: StageModels::default(),
         auto_merge: false,
         llm_review: false,

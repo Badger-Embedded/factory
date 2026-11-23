@@ -24,7 +24,7 @@
 // - GitHub links open in a new tab and factory links do not:
 //   "GitHub links open in a new tab and factory links stay in the tab"
 import type { Page } from '@playwright/test';
-import { expect, test } from '../fixtures';
+import { ADMIN, expect, test } from '../fixtures';
 
 const STAGES: { stage: string; status: string; detail: string }[] = [
   { stage: 'requested', status: 'queued', detail: 'Waiting for a free worker.' },
@@ -532,4 +532,43 @@ test('the log keeps its place while its card is collapsed', async ({ page, facto
   await toggle(page, 'log').click();
   await expect(log.locator('li')).toHaveCount(82);
   await expect.poll(fromBottom).toBeLessThan(4);
+});
+
+test('a job page links its Renovate pull request through the forge', async ({ page, factory, project }) => {
+  const id = factory.fixture(
+    'renovate',
+    '--project',
+    project,
+    '--number',
+    '7',
+    '--url',
+    'https://stored.example/pull/7',
+  );
+  await page.goto(`/jobs/${id}`);
+
+  const link = page.locator('p.meta a.renovate-pr');
+  await expect(link).toHaveText('#7');
+  await expect(link).toHaveAttribute('href', `https://github.com/e2e/${project}/pull/7`);
+  await expect(link).toHaveAttribute('target', '_blank');
+  await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+});
+
+test('a job page on an unknown forge shows the notice and a plain Renovate number', async ({
+  page,
+  factory,
+  project,
+}) => {
+  const odd = `${project}-odd`;
+  factory.fixture('project', '--name', odd, '--login', ADMIN, '--forge', 'elsewhere');
+  const id = factory.fixture('renovate', '--project', odd, '--number', '8', '--url', 'https://stored.example/pull/8');
+  const waiting = newJob(factory, odd, 'plan');
+
+  for (const job of [id, waiting]) {
+    await page.goto(`/jobs/${job}`);
+    await expect(page.locator('div.card.failed')).toContainText('elsewhere');
+    await expect(page.locator('a.source-link, p.meta a[href^="https://"]')).toHaveCount(0);
+  }
+  await page.goto(`/jobs/${id}`);
+  await expect(page.locator('p.meta .renovate-pr')).toHaveText('#8');
+  await expect(page.locator('a.renovate-pr')).toHaveCount(0);
 });

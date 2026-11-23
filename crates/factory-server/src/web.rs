@@ -23,7 +23,7 @@ use crate::forges::Forges;
 use crate::github::RepoReport;
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 use crate::pages::{self, HeaderState, ProjectSettings, ServerSettings, Workers};
-use crate::projects::{Project, Projects, StageAgents, StageEfforts, StageModels};
+use crate::projects::{Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
 use crate::secrets::{SecretError, SecretRef, SecretStore, validate_codex_auth};
@@ -413,7 +413,7 @@ struct BoardData {
     costs: HashMap<i64, f64>,
     totals: ProjectTotals,
     auto_merge: bool,
-    repo: Option<String>,
+    project: Option<Project>,
     workers: Workers,
 }
 
@@ -449,14 +449,14 @@ fn load_board(
     };
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
-    let (totals, auto_merge, repo) = match &selected {
+    let (totals, auto_merge, project) = match &selected {
         Some(name) => {
             let project = state.projects.lookup(name)?;
             let default = project.as_ref().is_some_and(|p| p.auto_merge);
             (
                 state.store.project_totals(name)?,
                 state.store.project_auto_merge(name, default)?,
-                project.map(|p| p.repo),
+                project,
             )
         }
         None => (ProjectTotals::default(), false, None),
@@ -468,7 +468,7 @@ fn load_board(
         costs,
         totals,
         auto_merge,
-        repo,
+        project,
         workers: Workers {
             limit: state.store.settings()?.max_workers,
             busy: state.slots.busy(),
@@ -496,7 +496,7 @@ async fn index(
         data.totals,
         plan_usage.as_ref(),
         data.auto_merge,
-        data.repo.as_deref(),
+        data.project.as_ref(),
         &data.workers,
         notifications,
     );
@@ -641,7 +641,13 @@ async fn board_fragment(
     };
     Ok(region_response(
         version.as_deref(),
-        pages::board(&data.rows(), &data.costs, data.auto_merge, project),
+        pages::board(
+            &data.rows(),
+            &data.costs,
+            data.auto_merge,
+            project,
+            data.project.as_ref(),
+        ),
     ))
 }
 
@@ -1793,6 +1799,7 @@ fn project_settings(
         servers,
         collaborators: state.store.collaborators(name)?,
         maintenance: state.store.project_maintenance(name)?,
+        forge_problem: project.forge.problem(),
     })
 }
 
@@ -2947,10 +2954,14 @@ async fn submit_onboard(
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         let checks = (!checks.is_empty()).then_some(checks);
-        match state
-            .store
-            .create_project(effective_name, repo, base, checks, Some(&user(&headers)))
-        {
+        match state.store.create_project(
+            effective_name,
+            ForgeKind::GitHub,
+            repo,
+            base,
+            checks,
+            Some(&user(&headers)),
+        ) {
             Ok(()) => {
                 if form.action == "create" {
                     if models != StageModels::default() {
@@ -2973,7 +2984,7 @@ async fn submit_onboard(
             // The pre-check caught a duplicate already, but a project onboarded
             // between the check and here would reach this. Show it like any
             // other blocking error, so no row is written twice.
-            Err(err @ (StoreError::DuplicateName(_) | StoreError::DuplicateRepo(_))) => {
+            Err(err @ (StoreError::DuplicateName(_) | StoreError::DuplicateRepo(..))) => {
                 report.errors.push(err.to_string());
             }
             Err(err) => return Err(err.into()),
@@ -3020,12 +3031,8 @@ async fn onboard_report(
     repo: &str,
     base: &str,
 ) -> Result<RepoReport, AppError> {
-    let mut report = match state
-        .forges
-        .checker(ForgeKind::GitHub)
-        .check(repo, base)
-        .await
-    {
+    let forge = ForgeKind::GitHub;
+    let mut report = match state.forges.checker(forge).check(repo, base).await {
         Ok(report) => report,
         Err(err) => RepoReport {
             errors: vec![format!("The repository checks could not run: {err}")],
@@ -3044,10 +3051,16 @@ async fn onboard_report(
             .errors
             .insert(0, format!("A project named {name:?} already exists."));
     }
-    if state.projects.list()?.iter().any(|(_, p)| p.repo == repo) {
-        report
-            .errors
-            .push(format!("The repository {repo} is already onboarded."));
+    if state
+        .projects
+        .list()?
+        .iter()
+        .any(|(_, p)| p.forge == ProjectForge::Known(forge) && p.repo == repo)
+    {
+        report.errors.push(format!(
+            "The {} repository {repo} is already onboarded.",
+            forge.display_name()
+        ));
     }
     Ok(report)
 }

@@ -11,6 +11,8 @@ use crate::check::{CheckOutcome, ToolList};
 use crate::cost::{format_cost, merge_fraction};
 use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages, McpToolState};
+use factory_runner::ForgeKind;
+
 use crate::projects::Project;
 use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
@@ -169,7 +171,7 @@ pub fn index(
     totals: ProjectTotals,
     plan_usage: Option<&UsageTile>,
     auto_merge: bool,
-    repo: Option<&str>,
+    project: Option<&Project>,
     workers: &Workers,
     notifications: bool,
 ) -> Markup {
@@ -181,6 +183,8 @@ pub fn index(
         || html! {},
         |selected| project_selector(project_names, selected),
     );
+    let links = Links::of(project);
+    let problem = project.and_then(|project| project.forge.problem());
     page(
         user,
         "Jobs",
@@ -190,18 +194,21 @@ pub fn index(
                 (permission_bar())
             }
             @if let Some(selected) = selected {
-                div.status-row.has-source[repo.is_some()] {
+                div.status-row.has-source[links.is_some()] {
                     (self::workers(workers, jobs, project_names, selected))
-                    @if let Some(repo) = repo {
-                        (source_link(repo))
+                    @if let Some(links) = links {
+                        (source_link(links))
                     }
                     (plan_usage_region(plan_usage))
                 }
-                @if repo.is_some() {
+                @if links.is_some() {
                     script { (PreEscaped(SOURCE_LINK)) }
                 }
+                @if let Some(problem) = &problem {
+                    div.card.failed { (problem) }
+                }
                 (composer(selected))
-                (board(&all, costs, auto_merge, selected))
+                (board(&all, costs, auto_merge, selected, project))
                 (stats(totals, selected))
             } @else {
                 div.card {
@@ -514,6 +521,8 @@ pub struct ProjectSettings {
     pub collaborators: Vec<Collaborator>,
     /// The Renovate and packaging switches and the packaging fields.
     pub maintenance: Maintenance,
+    /// Set when the project's forge is not one the factory supports.
+    pub forge_problem: Option<String>,
 }
 
 /// One agent the stage panel's agent control offers: its stable id, the name
@@ -1402,12 +1411,38 @@ fn external_link(
     html! { a class=[class] href=(href) title=[title] target="_blank" rel="noopener noreferrer" { (label) } }
 }
 
-fn source_link(repo: &str) -> Markup {
+/// The repository of a project on a forge the factory supports, which builds
+/// the links to it. A project on an unknown forge has none.
+#[derive(Clone, Copy)]
+struct Links<'a> {
+    forge: ForgeKind,
+    repo: &'a str,
+}
+
+impl<'a> Links<'a> {
+    fn of(project: Option<&'a Project>) -> Option<Links<'a>> {
+        let project = project?;
+        Some(Links {
+            forge: project.forge.kind()?,
+            repo: &project.repo,
+        })
+    }
+
+    fn repo_url(self) -> String {
+        self.forge.web_url(self.repo)
+    }
+
+    fn pr_url(self, number: u64) -> String {
+        self.forge.pr_url(self.repo, number)
+    }
+}
+
+fn source_link(links: Links<'_>) -> Markup {
     external_link(
-        &format!("https://github.com/{repo}"),
-        html! { (branch_icon()) span { (repo) } },
+        &links.repo_url(),
+        html! { (branch_icon()) span { (links.repo) } },
         Some("source-link"),
-        Some("Source on GitHub"),
+        Some(&format!("Source on {}", links.forge.display_name())),
     )
 }
 
@@ -1479,6 +1514,9 @@ pub fn settings_project(
             h1 { (project.name) }
             p.meta { "The path a job takes. Select a stage to set its model, effort and MCP servers, or a ✋ to change that approval gate. " (RUNS_KEEP_VALUES) }
             (project_form(project, selected, nav.admin))
+            @if let Some(problem) = &project.forge_problem {
+                div.card.failed { (problem) }
+            }
             (project_maintenance_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
@@ -2684,7 +2722,9 @@ pub fn board(
     costs: &HashMap<i64, f64>,
     auto_merge: bool,
     project: &str,
+    repo: Option<&Project>,
 ) -> Region {
+    let links = Links::of(repo);
     let in_section = |section: Section| -> Vec<&JobRow> {
         rows.iter()
             .copied()
@@ -2702,13 +2742,13 @@ pub fn board(
                 section class={ "inbox inbox-" (section.name()) } {
                     h2 { (section.title()) " " span.count { (jobs.len()) } }
                     @if section == Section::Done && jobs.len() > DONE_SHOWN {
-                        (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge))
+                        (job_rows(&jobs[..DONE_SHOWN], costs, auto_merge, links))
                         details.older data-key=(section.name()) {
                             summary { "Show " (jobs.len() - DONE_SHOWN) " older" }
-                            (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge))
+                            (job_rows(&jobs[DONE_SHOWN..], costs, auto_merge, links))
                         }
                     } @else {
-                        (job_rows(&jobs, costs, auto_merge))
+                        (job_rows(&jobs, costs, auto_merge, links))
                     }
                 }
             }
@@ -2724,7 +2764,12 @@ pub fn board(
     Region { version, markup }
 }
 
-fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Markup {
+fn job_rows(
+    rows: &[&JobRow],
+    costs: &HashMap<i64, f64>,
+    auto_merge: bool,
+    links: Option<Links<'_>>,
+) -> Markup {
     html! {
         ul.jobs {
             @for row in rows {
@@ -2735,7 +2780,7 @@ fn job_rows(rows: &[&JobRow], costs: &HashMap<i64, f64>, auto_merge: bool) -> Ma
                         (first_line(row.job.request()))
                     }
                     div.job-sub {
-                        (renovate_link(&row.job))
+                        (renovate_link(&row.job, links))
                         (turn_badge(&row.job, auto_merge))
                         @if !row.job.is_finished() { (flow_steps(&row.job)) }
                         @if let Some(detail) = row_detail(&row.job) {
@@ -2907,8 +2952,7 @@ pub fn job(
     gap_links: &[i64],
 ) -> Markup {
     let job = &row.job;
-    let repo = project.map(|project| format!("https://github.com/{}", project.repo));
-    let repo_url = repo.as_deref();
+    let repo_url = Links::of(project);
     let id = row.id;
     let estimated = any_estimated(events);
     page(
@@ -2918,6 +2962,9 @@ pub fn job(
         &html! {
             (job_poll(false, id, job))
             (job_header(id, row, repo_url, cost_usd, estimated))
+            @if let Some(problem) = project.and_then(|project| project.forge.problem()) {
+                div.card.failed { (problem) }
+            }
             div.job-layout {
                 div.job-now {
                     (status_region(false, id, job, settings, auto_merge, gap_links))
@@ -2969,8 +3016,7 @@ pub fn job_fragment(
     gap_links: &[i64],
 ) -> Markup {
     let job = &row.job;
-    let repo = project.map(|project| format!("https://github.com/{}", project.repo));
-    let repo_url = repo.as_deref();
+    let repo_url = Links::of(project);
     html! {
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd, any_estimated(events)))
@@ -3064,7 +3110,7 @@ fn spec_region(oob: bool, job: &Job) -> Markup {
     }
 }
 
-fn plan_region(oob: bool, job: &Job, repo_url: Option<&str>) -> Markup {
+fn plan_region(oob: bool, job: &Job, repo_url: Option<Links<'_>>) -> Markup {
     html! {
         div #job-plan hx-swap-oob=[oob.then_some("true")] { (plan_card(job, repo_url)) }
     }
@@ -3262,7 +3308,7 @@ fn log_region(oob: bool, logs: &[LogEntry]) -> Markup {
 fn job_header(
     id: i64,
     row: &JobRow,
-    repo_url: Option<&str>,
+    repo_url: Option<Links<'_>>,
     cost_usd: f64,
     estimated: bool,
 ) -> Markup {
@@ -3273,11 +3319,11 @@ fn job_header(
             (cost_badge(false, cost_usd, estimated))
         }
         @if job.renovate_pr().is_some() {
-            p.meta { (renovate_link(job)) }
+            p.meta { (renovate_link(job, repo_url)) }
         }
         p.meta {
-            @if let Some(url) = repo_url {
-                (external_link(url, &row.project, None, None))
+            @if let Some(links) = repo_url {
+                (external_link(&links.repo_url(), &row.project, None, None))
             } @else {
                 (row.project)
             }
@@ -3286,11 +3332,15 @@ fn job_header(
     }
 }
 
-fn renovate_link(job: &Job) -> Markup {
+fn renovate_link(job: &Job, links: Option<Links<'_>>) -> Markup {
     html! {
         @if let Some(pr) = job.renovate_pr() {
             span.badge.factory { "Renovate" }
-            a.renovate-pr href=(pr.url) { "#" (pr.number) }
+            @if let Some(links) = links {
+                (external_link(&links.pr_url(pr.number), html! { "#" (pr.number) }, Some("renovate-pr"), None))
+            } @else {
+                span.renovate-pr { "#" (pr.number) }
+            }
         }
     }
 }
@@ -3507,7 +3557,7 @@ fn spec_card(job: &Job) -> Markup {
     }
 }
 
-fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
+fn plan_card(job: &Job, repo_url: Option<Links<'_>>) -> Markup {
     html! {
         @if !job.plan().is_empty() {
             (section_card("plan", "Plan", &html! {}, &html! {
@@ -3517,8 +3567,8 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
                             strong { (pr.title) }
                             @if let Some(number) = pr.number {
                                 " · "
-                                @if let Some(url) = repo_url {
-                                    (external_link(&format!("{url}/pull/{number}"), html! { "#" (number) }, None, None))
+                                @if let Some(links) = repo_url {
+                                    (external_link(&links.pr_url(number), html! { "#" (number) }, None, None))
                                 } @else {
                                     "#" (number)
                                 }

@@ -506,6 +506,88 @@ fn an_agent_failure_fails_the_job_with_the_failed_task_to_retry() {
     assert!(job.can_retry());
 }
 
+fn fail_factory_step(job: &mut Job) {
+    apply(
+        job,
+        Event::FactoryFailed {
+            reason: "unsupported forge".into(),
+        },
+    );
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+    assert_eq!(job.next_command(), None);
+    assert!(job.can_retry());
+}
+
+#[test]
+fn a_factory_failure_while_summarizing_keeps_the_publish_approval_wait() {
+    let mut job = at_publish_gate(&["only"]);
+    fail_factory_step(&mut job);
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+    assert_eq!(
+        job.turn(),
+        &Turn::User(Ask::PublishApproval { summary: None })
+    );
+    assert_eq!(job.next_command(), Some(Command::Summarize { pr: 0 }));
+}
+
+#[test]
+fn a_factory_failure_keeps_the_failed_rounds_already_counted() {
+    let mut job = watching(7);
+    for _ in 2..MAX_FAILED_ROUNDS {
+        apply(&mut job, Event::CiFailed { log: "fail".into() });
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(&mut job, Event::ChecksPassed);
+        apply(&mut job, Event::Published { number: 7 });
+    }
+    apply(&mut job, Event::CiFailed { log: "fail".into() });
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    fail_factory_step(&mut job);
+
+    apply(&mut job, Event::Retry);
+    apply(&mut job, Event::CiFailed { log: "last".into() });
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+}
+
+#[test]
+fn a_factory_failure_resumes_a_pending_ci_rerun() {
+    let mut job = watching(7);
+    apply(
+        &mut job,
+        Event::CiFailed {
+            log: "flaky".into(),
+        },
+    );
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::RerunCi {
+            reason: "network timeout".into(),
+        }),
+    );
+    let before = job.next_command();
+    assert!(matches!(before, Some(Command::RerunCi { .. })));
+    fail_factory_step(&mut job);
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.next_command(), before);
+}
+
+#[test]
+fn a_factory_failure_while_gathering_packaging_context_can_be_retried() {
+    let mut job = gathering();
+    fail_factory_step(&mut job);
+
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.stage(), &Stage::Packaging);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::GatherPackaging { number: 42 })
+    );
+}
+
 #[test]
 fn cancel_ends_the_job_and_later_events_are_rejected() {
     let mut job = Job::new("add a reboot button", Gates::default());

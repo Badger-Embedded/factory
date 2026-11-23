@@ -41,7 +41,8 @@ pub use github::{
 pub use mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
 pub use podman::PodmanExecutor;
 pub use projects::{
-    ImportError, Project, Projects, StageAgents, StageEfforts, StageModels, import_tomls,
+    ImportError, Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels,
+    import_tomls,
 };
 pub use proxy::{
     ProxyEvent, ProxyEventFn, RunTokens, StoreUpstreams, Upstream, Upstreams, proxy_app,
