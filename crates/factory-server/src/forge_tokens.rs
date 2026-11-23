@@ -5,7 +5,7 @@
 use factory_runner::{Access, Forge, ForgeAccount, LookupError};
 
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretStore};
-use crate::store::{Store, StoreError};
+use crate::store::{ProjectGuard, Store, StoreError};
 
 /// Why a token was not saved. No variant carries the token.
 #[derive(Debug)]
@@ -14,6 +14,9 @@ pub enum SaveError {
     Rejected,
     /// The account cannot see the repository, so the token was not stored.
     NotVisible(ForgeAccount),
+    /// A project was removed, or the login stopped being a collaborator,
+    /// while the save ran.
+    Gone,
     /// The account lookup could not run.
     Lookup(String),
     Secrets(SecretError),
@@ -67,18 +70,20 @@ pub struct RepoSave {
 
 /// As [`save`], and reads the account's access to `repo` first. A token whose
 /// account cannot see `repo` is not stored. A check that cannot run does not
-/// stop the save.
+/// stop the save. The write happens only while the project and collaborator in
+/// `guard` still exist.
 ///
 /// # Errors
 ///
-/// As [`save`], and [`SaveError::NotVisible`] when the repository is not
-/// visible to the account.
+/// As [`save`], [`SaveError::NotVisible`] when the repository is not visible
+/// to the account, and [`SaveError::Gone`] when the guard no longer holds.
 pub async fn save_for_repo(
     secrets: &dyn SecretStore,
     forge: &dyn Forge,
     owner: ForgeTokenOwner<'_>,
     token: &str,
     repo: &str,
+    guard: &ProjectGuard<'_>,
 ) -> Result<RepoSave, SaveError> {
     if !secrets.available() {
         return Err(SecretError::Unavailable.into());
@@ -92,7 +97,9 @@ pub async fn save_for_repo(
     if access == Some(Access::NotVisible) {
         return Err(SaveError::NotVisible(account));
     }
-    secrets.put_forge_token(owner, token, &account)?;
+    if !secrets.put_project_forge_token(owner, token, &account, guard)? {
+        return Err(SaveError::Gone);
+    }
     Ok(RepoSave { account, access })
 }
 

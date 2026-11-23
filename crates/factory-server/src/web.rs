@@ -31,8 +31,8 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectTotals,
-    Store, StoreError,
+    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, ProjectGuard,
+    ProjectTotals, Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -2199,6 +2199,8 @@ async fn save_project_forge_token(
     if token.is_empty() {
         return project_page(&state, &headers, &name, part, Some("Saved."), None);
     }
+    let login = user(&headers);
+    let removals = state.store.removals();
     let saved = forge_tokens::save_for_repo(
         state.secrets.as_ref(),
         state.forges.forge(kind).as_ref(),
@@ -2208,6 +2210,11 @@ async fn save_project_forge_token(
         },
         token,
         &project.repo,
+        &ProjectGuard {
+            project: &name,
+            login: &login,
+            removals,
+        },
     )
     .await;
     let display = kind.display_name();
@@ -2249,6 +2256,15 @@ async fn save_project_forge_token(
                 account.login, project.repo
             )),
         ),
+        Err(SaveError::Gone) => {
+            if !state.store.is_collaborator(&name, &login)? {
+                return Err(AppError::UnknownProject(name));
+            }
+            (
+                None,
+                Some("A project was removed while the token was checked. Nothing was saved. Save it again.".to_owned()),
+            )
+        }
         Err(SaveError::Secrets(err)) => return Err(err.into()),
         Err(SaveError::Store(err)) => return Err(err.into()),
     };
@@ -2289,7 +2305,9 @@ async fn clear_project_forge_token(
         ),
         Err(SaveError::Secrets(err)) => Err(err.into()),
         Err(SaveError::Store(err)) => Err(err.into()),
-        Err(SaveError::Rejected | SaveError::Lookup(_) | SaveError::NotVisible(_)) => {
+        Err(
+            SaveError::Rejected | SaveError::Lookup(_) | SaveError::NotVisible(_) | SaveError::Gone,
+        ) => {
             unreachable!("clearing makes no lookup")
         }
     }
@@ -2309,9 +2327,9 @@ async fn set_use_my_account(
     let on = form.on == "on";
     state.store.set_use_my_account(&name, &login, on)?;
     let notice = if on {
-        "Your jobs in this project run as your account."
+        "Saved. \"Use my account\" is on for you in this project. Jobs do not use it yet."
     } else {
-        "Your jobs in this project run as the project token."
+        "Saved. \"Use my account\" is off for you in this project. Jobs do not use it yet."
     };
     project_page(
         &state,
@@ -3051,7 +3069,9 @@ async fn save_forge_token(
         ),
         Err(SaveError::Secrets(err)) => return Err(err.into()),
         Err(SaveError::Store(err)) => return Err(err.into()),
-        Err(SaveError::NotVisible(_)) => unreachable!("a user token is saved with no repository"),
+        Err(SaveError::NotVisible(_) | SaveError::Gone) => {
+            unreachable!("a user token is saved with no repository or project")
+        }
     };
     forge_page(&state, &headers, kind, Some(&notice))
 }
@@ -3076,7 +3096,9 @@ async fn clear_forge_token(
         Ok(()) => forge_page(&state, &headers, kind, Some("Cleared.")),
         Err(SaveError::Secrets(err)) => Err(err.into()),
         Err(SaveError::Store(err)) => Err(err.into()),
-        Err(SaveError::Rejected | SaveError::Lookup(_) | SaveError::NotVisible(_)) => {
+        Err(
+            SaveError::Rejected | SaveError::Lookup(_) | SaveError::NotVisible(_) | SaveError::Gone,
+        ) => {
             unreachable!("clearing makes no lookup")
         }
     }

@@ -1708,12 +1708,10 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
     }
 }
 
-/// The notice on the board and the settings page of a project with no
-/// project token.
 fn missing_project_token_notice(project: &str) -> Markup {
     html! {
         div.card.missing-project-token {
-            "This project has no project token, so jobs without a personal account cannot run. "
+            "This project has no project token. Jobs do not use project tokens yet, but once they do, a job that does not run as a personal account cannot run without one. "
             a href={ "/settings/projects/" (crate::web::query_escape(project)) "#forge-account" } {
                 "Save a project token"
             }
@@ -1732,8 +1730,7 @@ fn project_forge_account_card(project: &str, card: &ForgeAccountCard) -> Markup 
             p.hint {
                 "This project is on " (name) ", repository "
                 (external_link(&card.kind.web_url(&card.repo), &card.repo, None, None))
-                ". Jobs run as the project token unless a collaborator turned on \"Use my account\" \
-                 and has a token of their own. Any collaborator can replace the project token. \
+                ". Jobs do not use these tokens yet. Any collaborator can replace the project token. \
                  Stored encrypted and never shown."
             }
             form.settings-form method="post" action={ (base) "/forge-token" } {
@@ -1764,6 +1761,9 @@ fn project_forge_account_card(project: &str, card: &ForgeAccountCard) -> Markup 
                     button.danger formaction={ (base) "/forge-token/clear" } formnovalidate { "Clear project token" }
                 }
             }
+        }
+        div.card #use-my-account {
+            h2 { "Use my account" }
             form.settings-form method="post" action={ (base) "/use-my-account" } {
                 input type="hidden" name="csrf" value=(card.csrf);
                 div.field {
@@ -1772,12 +1772,12 @@ fn project_forge_account_card(project: &str, card: &ForgeAccountCard) -> Markup 
                         " Use my account"
                     }
                     p.hint {
-                        "When on, the jobs you request run as your own " (name) " account. Off by default. "
+                        "Records that you want the jobs you request to run as your own " (name) " account once jobs use it. Off by default. "
                         "This switch is yours alone."
                     }
                     @if card.use_my_account && !card.has_user_token {
                         p.hint.bad {
-                            "You have no " (name) " token, so your jobs run as the project token. "
+                            "You have no " (name) " token, so this switch has nothing to run as. "
                             a href={ "/settings/forges/" (card.kind.as_str()) } { "Save your " (name) " token" }
                             "."
                         }

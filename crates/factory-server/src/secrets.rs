@@ -34,7 +34,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
 use factory_runner::{ForgeAccount, ForgeKind};
 
-use crate::store::{Store, StoreError};
+use crate::store::{ProjectGuard, Store, StoreError};
 
 /// The master key length in bytes, which is also the XChaCha20-Poly1305 key
 /// length.
@@ -281,6 +281,21 @@ pub trait SecretStore: Send + Sync {
         account: &ForgeAccount,
     ) -> Result<(), SecretError>;
 
+    /// As [`SecretStore::put_forge_token`] for a project token, and stores
+    /// nothing unless the project and collaborator in `guard` still exist.
+    /// Returns whether it stored.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn put_project_forge_token(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        value: &str,
+        account: &ForgeAccount,
+        guard: &ProjectGuard<'_>,
+    ) -> Result<bool, SecretError>;
+
     /// The forge token of `owner`, or `None` when none is stored.
     ///
     /// # Errors
@@ -489,6 +504,29 @@ impl SecretStore for LocalSecrets {
         Ok(())
     }
 
+    fn put_project_forge_token(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+        value: &str,
+        account: &ForgeAccount,
+        guard: &ProjectGuard<'_>,
+    ) -> Result<bool, SecretError> {
+        let stored = self.seal(&owner.aad(), value)?;
+        let (project, header) = owner.row();
+        Ok(self.store.put_project_forge_token(
+            SecretRef {
+                project: &project,
+                server: "",
+                header: &header,
+            },
+            LOCAL_BACKEND,
+            &stored,
+            owner,
+            account,
+            guard,
+        )?)
+    }
+
     fn forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<Option<String>, SecretError> {
         let (project, header) = owner.row();
         let at = SecretRef {
@@ -601,6 +639,16 @@ impl SecretStore for UnavailableSecrets {
         _value: &str,
         _account: &ForgeAccount,
     ) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn put_project_forge_token(
+        &self,
+        _owner: ForgeTokenOwner<'_>,
+        _value: &str,
+        _account: &ForgeAccount,
+        _guard: &ProjectGuard<'_>,
+    ) -> Result<bool, SecretError> {
         Err(SecretError::Unavailable)
     }
 

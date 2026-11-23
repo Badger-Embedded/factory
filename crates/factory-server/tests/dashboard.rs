@@ -11548,6 +11548,7 @@ if [ "$1 $2 $3 $4" = "api user --hostname github.com" ]; then
     tok-admin) echo '{"login":"admin-bot","id":44}'; exit 0 ;;
     tok-ghost) echo '{"login":"ghost-bot","id":55}'; exit 0 ;;
     tok-blind) echo '{"login":"blind-bot","id":66}'; exit 0 ;;
+    tok-slow) echo '{"login":"slow-bot","id":77}'; exit 0 ;;
     *) echo "gh: Bad credentials (HTTP 401)" >&2; exit 1 ;;
   esac
 fi
@@ -11557,6 +11558,11 @@ if [ "$1 $2 $3 $4" = "api repos/Badger-Embedded/maestro --hostname github.com" ]
     tok-reader) echo '{"permissions":{"admin":false,"maintain":false,"push":false}}'; exit 0 ;;
     tok-admin) echo '{"permissions":{"admin":true,"maintain":true,"push":true}}'; exit 0 ;;
     tok-ghost) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+    tok-slow)
+      here=$(dirname "$0")
+      touch "$here/started"
+      while [ ! -e "$here/go" ]; do sleep 0.02; done
+      echo '{"permissions":{"admin":false,"maintain":false,"push":true}}'; exit 0 ;;
     *) echo "gh: boom" >&2; exit 1 ;;
   esac
 fi
@@ -12000,6 +12006,80 @@ async fn removing_a_project_deletes_its_token_so_a_reused_name_has_none() {
             .is_none()
     );
     assert!(secrets.forge_token(project_owner()).unwrap().is_none());
+}
+
+/// Runs a project-token save of `tok-slow` and, while its access check waits,
+/// runs `meanwhile`. Returns the save's reply.
+async fn save_while(dashboard: &Dashboard, meanwhile: impl FnOnce()) -> Reply {
+    let started = dashboard.data.path().join("started");
+    let go = dashboard.data.path().join("go");
+    let save = project_post(dashboard, USER, "forge-token", "token=tok-slow");
+    let driver = async {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        meanwhile();
+        std::fs::write(&go, "").unwrap();
+    };
+    tokio::join!(save, driver).0
+}
+
+#[tokio::test]
+async fn a_save_that_finishes_after_the_project_was_removed_stores_nothing() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    let reply = save_while(&dashboard, || {
+        dashboard.store.remove_project("maestro").unwrap();
+        dashboard
+            .store
+            .create_project(
+                "maestro",
+                ForgeKind::GitHub,
+                "Badger-Embedded/maestro",
+                "main",
+                None,
+                Some(USER),
+            )
+            .unwrap();
+    })
+    .await;
+    assert!(reply.body.contains("Nothing was saved"));
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
+    let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
+    assert!(secrets.forge_token(project_owner()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_save_by_a_login_removed_meanwhile_stores_nothing() {
+    let dashboard = forge_token_dashboard(true);
+    dashboard
+        .store
+        .add_collaborator("maestro", DAVE, "test")
+        .unwrap();
+    let reply = save_while(&dashboard, || {
+        dashboard
+            .store
+            .remove_collaborator("maestro", USER)
+            .unwrap();
+    })
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert!(
+        dashboard
+            .store
+            .forge_account(project_owner())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

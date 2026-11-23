@@ -322,6 +322,14 @@ impl Maintenance {
     }
 }
 
+/// The project and login a token save started for, and the value of
+/// [`Store::removals`] when it started.
+pub struct ProjectGuard<'a> {
+    pub project: &'a str,
+    pub login: &'a str,
+    pub removals: u64,
+}
+
 /// One collaborator of a project: a login that may see and act on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collaborator {
@@ -413,6 +421,9 @@ pub struct Store {
     /// How many times the database has been opened, from `store_boots`.
     epoch: u64,
     reads: AtomicU64,
+    /// How many project removals this process has started. A token save that
+    /// began before a removal reads it to see that its project may be gone.
+    removals: AtomicU64,
 }
 
 /// The jobs as one read saw them, each with the id of its latest
@@ -551,8 +562,6 @@ impl Store {
         if has_review == 0 {
             conn.execute("ALTER TABLE project_models ADD COLUMN review TEXT", [])?;
         }
-        // `use_my_account` joined `project_collaborators` with the project
-        // forge token. A fresh database has it from SCHEMA. The default is off.
         let has_use_my_account: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('project_collaborators') WHERE name = 'use_my_account'",
             [],
@@ -653,6 +662,7 @@ impl Store {
             conn: Mutex::new(conn),
             epoch,
             reads: AtomicU64::new(0),
+            removals: AtomicU64::new(0),
         })
     }
 
@@ -2069,6 +2079,55 @@ impl Store {
         Ok(())
     }
 
+    /// How many project removals have started in this process.
+    #[must_use]
+    pub fn removals(&self) -> u64 {
+        self.removals.load(Ordering::SeqCst)
+    }
+
+    /// As [`Store::put_forge_token`] for a project token, and writes nothing
+    /// when a project was removed since `guard` was taken, or when the project
+    /// is gone or `guard.login` is no longer its collaborator. Returns whether
+    /// it wrote.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn put_project_forge_token(
+        &self,
+        at: SecretRef<'_>,
+        backend: &str,
+        value: &[u8],
+        owner: ForgeTokenOwner<'_>,
+        account: &ForgeAccount,
+        guard: &ProjectGuard<'_>,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let present: bool = tx.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM projects p
+                 JOIN project_collaborators c ON c.project = p.name
+                 WHERE p.name = ?1 AND c.login = ?2
+             )",
+            params![guard.project, guard.login],
+            |row| row.get(0),
+        )?;
+        if !present || self.removals() != guard.removals {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO secrets (project, server, header, backend, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (project, server, header)
+             DO UPDATE SET backend = excluded.backend, value = excluded.value",
+            params![at.project, at.server, at.header, backend, value],
+        )?;
+        write_forge_account(&tx, owner, account)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Removes the sealed forge token and its account in one transaction.
     ///
     /// # Errors
@@ -2278,6 +2337,7 @@ impl Store {
     /// Fails on a database error. Nothing is written when it fails.
     pub fn remove_project(&self, name: &str) -> Result<(), StoreError> {
         let mut conn = self.conn();
+        self.removals.fetch_add(1, Ordering::SeqCst);
         let tx = conn.transaction()?;
         let ids: Vec<i64> = {
             let mut stmt = tx.prepare("SELECT id FROM jobs WHERE project = ?1 ORDER BY id")?;

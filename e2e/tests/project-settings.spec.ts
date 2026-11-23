@@ -13,7 +13,6 @@
 //   "a changed form shows Unsaved changes. and leaving the page asks first"
 // - Collaborators: add one and remove one: "a collaborator can be added and removed"
 // - The maintenance settings save: "the maintenance settings save"
-// - The Forge account card: "the Forge account card saves a project token by its access and keeps the switch per login"
 // - Removing a project takes it off the picker:
 //   "removing a project takes it off the picker"
 // - Project MCP page:
@@ -255,20 +254,19 @@ test('the Forge account card saves a project token by its access and keeps the s
   await expect(page.getByText('has no project token')).toHaveCount(0);
 
   await page.goto(settingsPath(project));
-  const mine = card.getByLabel('Use my account');
+  const switchCard = page.locator('#use-my-account');
+  const mine = switchCard.getByLabel('Use my account');
   await expect(mine).not.toBeChecked();
-  // The sticky save bar and top bar cover these controls at every scroll position.
-  await mine.dispatchEvent('click');
-  await card.getByRole('button', { name: 'Save switch' }).dispatchEvent('click');
-  await expect(card.getByText('You have no GitHub token')).toBeVisible();
-  await expect(card.getByRole('link', { name: 'Save your GitHub token' })).toHaveAttribute(
+  await mine.check();
+  await switchCard.getByRole('button', { name: 'Save switch' }).click();
+  await expect(switchCard.getByText('You have no GitHub token')).toBeVisible();
+  await expect(switchCard.getByRole('link', { name: 'Save your GitHub token' })).toHaveAttribute(
     'href',
     '/settings/forges/github',
   );
-  await expect(card.getByLabel('Use my account')).toBeChecked();
+  await expect(switchCard.getByLabel('Use my account')).toBeChecked();
 
-  const clear = card.getByRole('button', { name: 'Clear project token' });
-  await clear.dispatchEvent('click');
+  await card.getByRole('button', { name: 'Clear project token' }).click();
   await expect(page.getByText('has no project token')).toBeVisible();
 });
 
