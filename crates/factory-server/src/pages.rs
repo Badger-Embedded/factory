@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, DELETED_PREREQUISITE, Gates, Job, PlanUsageSnapshot, RenovatePr,
-    RenovateWait, Stage, Task, Turn, UsageWindow, Verdict, Wait,
+    Ask, BranchSummary, Command, DELETED_PREREQUISITE, Gates, Job, PlanUsageSnapshot,
+    PrerequisiteState, RenovatePr, RenovateWait, Stage, Task, Turn, UsageWindow, Verdict, Wait,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -18,7 +18,7 @@ use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{
     CodexPrice, Collaborator, JobEvent, JobFile, JobRow, LogEntry, Maintenance, PackagingType,
-    ProjectTotals,
+    PrerequisiteView, ProjectTotals,
 };
 use crate::timeline::timeline;
 use crate::workers::Slot;
@@ -3208,6 +3208,7 @@ pub fn job(
     efforts: &StageEfforts,
     auto_merge: bool,
     gap_links: &[i64],
+    prerequisites: &[PrerequisiteView],
 ) -> Markup {
     let job = &row.job;
     let repo_url = Links::of(project);
@@ -3225,7 +3226,8 @@ pub fn job(
             }
             div.job-layout {
                 div.job-now {
-                    (status_region(false, id, &row.project, job, settings, auto_merge, gap_links))
+                    (status_region(false, id, &row.project, job, settings, auto_merge, gap_links, prerequisites))
+                    (queued_after_region(false, job, prerequisites))
                     p.meta { "Approval gates: " (gates_line(job.gates())) }
                 }
                 aside.job-side { (timeline_region(false, job, events, models, efforts)) }
@@ -3272,6 +3274,7 @@ pub fn job_fragment(
     efforts: &StageEfforts,
     auto_merge: bool,
     gap_links: &[i64],
+    prerequisites: &[PrerequisiteView],
 ) -> Markup {
     let job = &row.job;
     let repo_url = Links::of(project);
@@ -3279,7 +3282,8 @@ pub fn job_fragment(
         @if terminal(job) { (job_poll(true, row.id, job)) }
         (cost_badge(true, cost_usd, any_estimated(events)))
         (timeline_region(true, job, events, models, efforts))
-        (status_region(true, row.id, &row.project, job, settings, auto_merge, gap_links))
+        (status_region(true, row.id, &row.project, job, settings, auto_merge, gap_links, prerequisites))
+        (queued_after_region(true, job, prerequisites))
         (spec_region(true, job))
         (plan_region(true, job, repo_url))
         (reviews_region(true, job))
@@ -3347,6 +3351,10 @@ fn timeline_region(
 /// The status and its controls. A poll swaps this region, so the approval or
 /// answer form appears when the job enters a gate. `job-updates.js` skips the
 /// swap while a field here has focus, so a half-typed answer survives a poll.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the region takes each value the page read"
+)]
 fn status_region(
     oob: bool,
     id: i64,
@@ -3355,10 +3363,32 @@ fn status_region(
     settings: &Settings,
     auto_merge: bool,
     gap_links: &[i64],
+    prerequisites: &[PrerequisiteView],
 ) -> Markup {
     html! {
         div #job-status hx-swap-oob=[oob.then_some("true")] {
-            (status_card(id, project, job, settings, auto_merge, gap_links))
+            @let wait = prerequisite_wait(prerequisites);
+            @if *job.stage() == Stage::Requested && wait != Wait::Ready {
+                (waiting_card(id, job, &wait, prerequisites))
+            } @else {
+                (status_card(id, project, job, settings, auto_merge, gap_links, prerequisites))
+            }
+        }
+    }
+}
+
+fn queued_after_region(oob: bool, job: &Job, prerequisites: &[PrerequisiteView]) -> Markup {
+    html! {
+        div #job-queued-after hx-swap-oob=[oob.then_some("true")] {
+            @if *job.stage() != Stage::Requested && !prerequisites.is_empty() {
+                p.queued-after {
+                    "Queued after "
+                    @for (index, prerequisite) in prerequisites.iter().enumerate() {
+                        @if index > 0 { ", " }
+                        (prerequisite_link(prerequisite))
+                    }
+                }
+            }
         }
     }
 }
@@ -3980,7 +4010,9 @@ fn status_card(
     settings: &Settings,
     auto_merge: bool,
     gap_links: &[i64],
+    prerequisites: &[PrerequisiteView],
 ) -> Markup {
+    let wait = prerequisite_wait(prerequisites);
     match (job.stage(), job.turn()) {
         (_, Turn::User(Ask::Answers { questions })) => html! {
             form.card.needs-you method="post" action={ "/jobs/" (id) "/answers" } {
@@ -4044,8 +4076,8 @@ fn status_card(
             _,
         ) => html! {
             div.card.status {
-                (turn_badge(job, auto_merge, &Wait::Ready))
-                span.status-detail { (turn_detail(job, settings, auto_merge)) }
+                (turn_badge(job, auto_merge, &wait))
+                span.status-detail { (turn_detail(job, settings, auto_merge, &wait)) }
                 @if let Some(pr) = job.renovate_pr() {
                     (renovate_details(pr, settings, gap_links))
                 }
@@ -4075,10 +4107,95 @@ fn status_card(
         ) => failed_card(id, project, job, reason, *dismissed),
         _ => html! {
             div.card.status {
-                (turn_badge(job, auto_merge, &Wait::Ready))
-                span.status-detail { (turn_detail(job, settings, auto_merge)) }
+                (turn_badge(job, auto_merge, &wait))
+                span.status-detail { (turn_detail(job, settings, auto_merge, &wait)) }
             }
         },
+    }
+}
+
+fn prerequisite_wait(prerequisites: &[PrerequisiteView]) -> Wait {
+    Wait::fold(
+        prerequisites
+            .iter()
+            .map(|p| (p.id, p.state, prerequisite_state(p))),
+    )
+}
+
+fn prerequisite_state(prerequisite: &PrerequisiteView) -> String {
+    match (&prerequisite.job, prerequisite.state) {
+        (Some(job), _) => stage_label(job),
+        (None, PrerequisiteState::Met) => "merged".into(),
+        (None, _) => DELETED_PREREQUISITE.into(),
+    }
+}
+
+fn prerequisite_link(prerequisite: &PrerequisiteView) -> Markup {
+    html! {
+        @if prerequisite.job.is_some() {
+            a href={ "/jobs/" (prerequisite.id) } { "#" (prerequisite.id) }
+        } @else {
+            "#" (prerequisite.id)
+        }
+    }
+}
+
+fn waiting_card(id: i64, job: &Job, wait: &Wait, prerequisites: &[PrerequisiteView]) -> Markup {
+    let list = html! {
+        ul.prerequisites {
+            @for prerequisite in prerequisites {
+                li {
+                    (prerequisite_link(prerequisite))
+                    " "
+                    @if let Some(job) = &prerequisite.job {
+                        (first_line(job.request()))
+                    } @else {
+                        (first_line(&prerequisite.title))
+                    }
+                    " · "
+                    span.prerequisite-state { (prerequisite_state(prerequisite)) }
+                }
+            }
+        }
+    };
+    let blocked: Vec<i64> = prerequisites
+        .iter()
+        .filter(|p| p.state == PrerequisiteState::Blocked)
+        .map(|p| p.id)
+        .collect();
+    if matches!(wait, Wait::Blocked(_)) {
+        html! {
+            div.card.needs-you {
+                div.card-head {
+                    span.badge.you { "blocked" }
+                    h2 { "Waiting for jobs that cannot merge yet" }
+                }
+                p.status-detail {
+                    "The job will not start until "
+                    @for (index, blocked_id) in blocked.iter().enumerate() {
+                        @if index > 0 { ", " }
+                        "#" (blocked_id)
+                    }
+                    @if blocked.len() == 1 {
+                        " merges or is removed from the list."
+                    } @else {
+                        " merge or are removed from the list."
+                    }
+                }
+                (list)
+                div.row.actions {
+                    a.nav href={ "/jobs/" (id) "/edit" } { "Edit the list" }
+                }
+            }
+        }
+    } else {
+        html! {
+            div.card.status {
+                (turn_badge(job, false, wait))
+                span.status-detail { "Waiting for these jobs to merge." }
+                (list)
+            }
+        }
     }
 }
 
@@ -4221,7 +4338,7 @@ fn stage_label(job: &Job) -> String {
     }
 }
 
-fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
+fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool, wait: &Wait) -> String {
     match job.turn() {
         Turn::Agent(task) => format!("The agent is {}.", task_label(task)),
         Turn::Factory => match job.next_command() {
@@ -4272,7 +4389,10 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool) -> String {
                 | Command::RerunCi { .. }
                 | Command::RerunRenovate { .. },
             )
-            | None => "Waiting for a free worker.".into(),
+            | None => match wait {
+                Wait::Ready => "Waiting for a free worker.".into(),
+                Wait::Waiting(_) | Wait::Blocked(_) => "Waiting for other jobs to merge.".into(),
+            },
         },
         Turn::User(_) if collecting(job) => {
             "The factory is collecting the commits and the diff stat for your approval.".into()

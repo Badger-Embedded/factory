@@ -804,6 +804,148 @@ async fn a_request_blocked_by_its_prerequisite_needs_you() {
     assert_eq!(kinds, ["needs-you"]);
 }
 
+fn status_card_of(body: &str) -> &str {
+    let start = body.find("id=\"job-status\"").unwrap();
+    let rest = &body[start..];
+    &rest[..rest.find("id=\"job-spec\"").unwrap_or(rest.len())]
+}
+
+#[tokio::test]
+async fn the_status_card_lists_what_a_waiting_job_waits_for() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after(
+                "maestro",
+                "Needs both",
+                &[&first.to_string(), &second.to_string()],
+            )
+            .await,
+    );
+    dashboard.apply(first, Event::Start);
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let card = status_card_of(&page);
+    assert!(card.contains(">waiting</span>"), "{card}");
+    assert!(
+        card.contains(&format!("<a href=\"/jobs/{first}\">#{first}</a>")),
+        "{card}"
+    );
+    assert!(
+        card.contains("implementing") || card.contains("clarifying"),
+        "{card}"
+    );
+    assert!(card.contains(&format!("#{second}</a>")), "{card}");
+    assert!(card.contains("requested"), "{card}");
+    assert!(!card.contains("Waiting for a free worker."), "{card}");
+    assert!(!card.contains("will not start"), "{card}");
+
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await.body;
+    assert!(fragment.contains(">waiting</span>"), "{fragment}");
+    assert!(fragment.contains(&format!("#{second}</a>")), "{fragment}");
+
+    dashboard.apply(second, Event::Cancel);
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let card = status_card_of(&body);
+    assert!(
+        card.contains(&format!(
+            "will not start until #{second} merges or is removed from the list"
+        )),
+        "{card}"
+    );
+    assert!(card.contains(&format!("#{first}</a>")), "{card}");
+}
+
+#[tokio::test]
+async fn a_blocked_job_says_what_unblocks_it_and_links_to_the_edit_page() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Blocked one", &[&first.to_string()])
+            .await,
+    );
+    let waiting = dashboard.get(&format!("/jobs/{id}/fragment")).await.body;
+    assert!(!waiting.contains("will not start"), "{waiting}");
+
+    dashboard.apply(first, Event::Cancel);
+    for uri in [format!("/jobs/{id}"), format!("/jobs/{id}/fragment")] {
+        let body = dashboard.get(&uri).await.body;
+        let card = status_card_of(&body);
+        assert!(
+            card.contains("<span class=\"badge you\">blocked</span>"),
+            "{card}"
+        );
+        assert!(
+            card.contains(&format!(
+                "will not start until #{first} merges or is removed from the list"
+            )),
+            "{card}"
+        );
+        assert!(card.contains("cancelled"), "{card}");
+        assert!(
+            card.contains(&format!("href=\"/jobs/{id}/edit\"")),
+            "{card}"
+        );
+        assert!(!card.contains("Waiting for a free worker."), "{card}");
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_prerequisite_shows_as_deleted_before_it_merged() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Orphan", &[&first.to_string()])
+            .await,
+    );
+    dashboard
+        .store
+        .delete_job(first, Path::new("/nonexistent"))
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    let card = status_card_of(&body);
+    assert!(card.contains("deleted before it merged"), "{card}");
+    assert!(card.contains("Add a reboot button"), "{card}");
+    assert!(!card.contains(&format!("href=\"/jobs/{first}\"")), "{card}");
+    assert!(card.contains("will not start"), "{card}");
+}
+
+#[tokio::test]
+async fn a_started_job_still_shows_the_jobs_it_was_queued_after() {
+    let dashboard = dashboard();
+    let done = merged(&dashboard).await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "After a merge", &[&done.to_string()])
+            .await,
+    );
+    let plain = dashboard.new_job().await;
+    assert!(
+        !dashboard
+            .get(&format!("/jobs/{plain}"))
+            .await
+            .body
+            .contains("Queued after")
+    );
+
+    dashboard.apply(id, Event::Start);
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(
+        body.contains(&format!(
+            "Queued after <a href=\"/jobs/{done}\">#{done}</a>"
+        )),
+        "{body}"
+    );
+    assert!(!status_card_of(&body).contains("will not start"));
+    let fragment = dashboard.get(&format!("/jobs/{id}/fragment")).await.body;
+    assert!(fragment.contains("Queued after"), "{fragment}");
+}
+
 #[tokio::test]
 async fn the_composer_offers_the_projects_unfinished_jobs_to_start_after() {
     let dashboard = dashboard();
