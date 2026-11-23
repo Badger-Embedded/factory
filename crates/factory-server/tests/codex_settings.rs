@@ -16,10 +16,11 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use factory_runner::GitHub;
 use factory_server::{
-    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, LocalSecrets, LoginProcess, LoginSpawner,
-    LoginSpec, MASTER_KEY_LEN, McpChecker, PlanUsageCache, Projects, RepoChecker, RepoReport,
-    SecretStore, Store, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, LocalSecrets, LoginProcess,
+    LoginSpawner, LoginSpec, MASTER_KEY_LEN, McpChecker, PlanUsageCache, Projects, RepoChecker,
+    RepoReport, SecretStore, Store, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -231,7 +232,7 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
         Arc::new(Notify::new()),
         data.path().to_owned(),
         Arc::new(PlanUsageCache::new()),
-        Arc::new(NoRepos) as Arc<dyn RepoChecker>,
+        Forges::new(Arc::new(GitHub::default()), Arc::new(NoRepos)),
         Arc::new(WorkerSlots::new()),
         Arc::clone(&secrets),
         Arc::new(NoChecker) as Arc<dyn McpChecker>,

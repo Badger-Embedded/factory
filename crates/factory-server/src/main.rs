@@ -3,11 +3,11 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use factory_runner::{Git, GitHub, WorkerConfig};
+use factory_runner::{Account, ForgeKind, Git, GitHub, WorkerConfig};
 use factory_server::{
-    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, GhRepos, HttpMcpChecker, LocalSecrets,
-    LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin,
-    Projects, ProxyEvent, ProxyEventFn, RepoChecker, RunTokens, Scheduler, SecretStore, Store,
+    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, HttpMcpChecker,
+    LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor,
+    PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler, SecretStore, Store,
     StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app, import_tomls,
     master_key_from_env, parse_admins, proxy_app_with_roots,
 };
@@ -89,12 +89,14 @@ async fn start_mcp_proxy(
     Ok(run_tokens)
 }
 
-fn git_config() -> Git {
-    let default = Git::default();
-    Git {
+/// The factory-wide account, from `GH_TOKEN` and the commit identity
+/// variables.
+fn factory_account() -> Account {
+    let default = Account::default();
+    Account {
         token: gh_token(),
-        user_name: env::var("FACTORY_GIT_NAME").unwrap_or(default.user_name.clone()),
-        user_email: env::var("FACTORY_GIT_EMAIL").unwrap_or(default.user_email.clone()),
+        name: env::var("FACTORY_GIT_NAME").unwrap_or(default.name.clone()),
+        email: env::var("FACTORY_GIT_EMAIL").unwrap_or(default.email.clone()),
         ..default
     }
 }
@@ -235,6 +237,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
+    let forges = Forges::new(
+        Arc::new(GitHub {
+            gh: path_var("FACTORY_GH", "gh"),
+            ..GitHub::default()
+        }),
+        Arc::new(GhRepos {
+            gh: path_var("FACTORY_GH", "gh"),
+            token: gh_token(),
+        }),
+    );
+
     // Without podman workers no job takes a slot, so the board shows every
     // slot idle.
     let mut slots = Arc::new(WorkerSlots::new());
@@ -242,12 +255,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if env::var("FACTORY_WORKERS").as_deref() == Ok("podman") {
         let executor = PodmanExecutor {
             base: worker_base(worker_network.clone()),
-            git: git_config(),
-            github: GitHub {
-                gh: path_var("FACTORY_GH", "gh"),
-                token: gh_token(),
-                ..GitHub::default()
-            },
+            git: Git::default(),
+            forge: forges.forge(ForgeKind::GitHub),
+            factory_account: factory_account(),
             data_dir: data_dir.clone(),
             registry: Arc::clone(&agents),
             store: Arc::clone(&store),
@@ -273,13 +283,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tracing::info!("workers are off, set FACTORY_WORKERS=podman to run jobs");
     }
 
-    // The onboarding wizard runs its repository checks as the bot, with the
-    // same `gh` and token the factory uses for pull requests.
-    let github: Arc<dyn RepoChecker> = Arc::new(GhRepos {
-        gh: path_var("FACTORY_GH", "gh"),
-        token: gh_token(),
-    });
-
     // The per-project MCP connection check uses a real HTTP client that follows
     // no redirect and bounds the wait, the same way the proxy's client does.
     let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::with_roots(mcp_roots));
@@ -297,7 +300,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             wake,
             data_dir,
             plan_usage,
-            github,
+            forges,
             slots,
             secrets,
             checker,

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use factory_core::Event;
-use factory_runner::{Expect, Git, GitHub, WorkerConfig};
+use factory_runner::{Account, Expect, Git, GitHub, WorkerConfig};
 use factory_server::{
     AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, LocalSecrets, MASTER_KEY_LEN,
     PlanUsageCache, PodmanExecutor, SecretStore, Settings, Store,
@@ -36,9 +36,9 @@ fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) 
         // past the token gate fails there with a different reason.
         git: Git {
             git: PathBuf::from("/nonexistent/git"),
-            ..Git::default()
         },
-        github: GitHub::default(),
+        forge: Arc::new(GitHub::default()),
+        factory_account: Account::default(),
         data_dir,
         registry,
         store,
@@ -240,10 +240,10 @@ async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_move
         dir.path().to_owned(),
         Arc::new(Store::open_in_memory().unwrap()),
     );
-    podman.github = GitHub {
+    podman.forge = Arc::new(GitHub {
         gh,
         ..GitHub::default()
-    };
+    });
 
     podman.merge_renovate("o/r", 5, "checked1").await.unwrap();
 
@@ -293,10 +293,10 @@ fn gh_executor(
         dir.to_owned(),
         Arc::new(Store::open_in_memory().unwrap()),
     );
-    podman.github = GitHub {
+    podman.forge = Arc::new(GitHub {
         gh,
         ..GitHub::default()
-    };
+    });
     (podman, calls)
 }
 

@@ -5,6 +5,7 @@ mod codex;
 mod copilot;
 mod cost;
 mod device_login;
+mod forges;
 mod github;
 mod localtime;
 mod mcp;
@@ -30,6 +31,7 @@ pub use cost::{codex_cost, format_cost, merge_fraction};
 pub use device_login::{
     DeviceLogin, LoginProcess, LoginSpawner, LoginSpec, LoginView, PodmanLogin, ReadBackError,
 };
+pub use forges::Forges;
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
     check_repo,

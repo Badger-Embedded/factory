@@ -7,9 +7,9 @@ use std::time::SystemTime;
 
 use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateCi};
 use factory_runner::{
-    BranchSummary, Ci, Credential, Git, GitHub, Observation, PrState, RenovatePr, Rerun, RunReport,
-    SessionRun, WorkerConfig, WorkerRun, backend, observe, place_files, place_images,
-    remove_container, run, run_checks, show_files, show_images,
+    Account, BranchSummary, Ci, Credential, Forge, Git, Observation, PrState, Remote, RenovatePr,
+    Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend, observe, place_files,
+    place_images, remove_container, run, run_checks, show_files, show_images,
 };
 
 use crate::registry::AgentRegistry;
@@ -31,11 +31,13 @@ pub struct PodmanExecutor {
     /// The podman binary, secret and agents directory. The image and limits
     /// come from [`Settings`] on each run.
     pub base: WorkerConfig,
-    /// Prepares each job's checkout. It holds the GitHub token, which never
-    /// reaches the worker.
+    /// Prepares each job's checkout.
     pub git: Git,
-    /// Opens pull requests and reads their state with the same token.
-    pub github: GitHub,
+    /// Opens pull requests and reads their state.
+    pub forge: Arc<dyn Forge>,
+    /// The account every operation runs as. Its token never reaches the
+    /// worker.
+    pub factory_account: Account,
     pub data_dir: PathBuf,
     /// Resolves each run's agent to its credential, worker image and host config
     /// directory. The run reads the credential when it starts, so a token saved
@@ -237,7 +239,7 @@ impl Executor for PodmanExecutor {
             .git
             .prepare(
                 &workspace,
-                &request.repo,
+                &Remote::new(&*self.forge, &self.factory_account, &request.repo),
                 &request.base,
                 request.branch.as_deref(),
             )
@@ -352,8 +354,8 @@ impl Executor for PodmanExecutor {
 
     async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
         if let Some(number) = self
-            .github
-            .merged_pr(&request.repo, &request.branch)
+            .forge
+            .merged_pr(&self.factory_account, &request.repo, &request.branch)
             .await?
         {
             return Ok(Published::AlreadyMerged(number));
@@ -363,9 +365,16 @@ impl Executor for PodmanExecutor {
         if summary.commits.is_empty() {
             return Ok(Published::Empty);
         }
-        self.git.push(&workspace, &request.branch).await?;
-        self.github
+        self.git
+            .push(
+                &workspace,
+                &Remote::new(&*self.forge, &self.factory_account, &request.repo),
+                &request.branch,
+            )
+            .await?;
+        self.forge
             .open_pr(
+                &self.factory_account,
                 &request.repo,
                 &request.base,
                 &request.branch,
@@ -376,7 +385,10 @@ impl Executor for PodmanExecutor {
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
-        let status = self.github.status(&request.repo, request.number).await?;
+        let status = self
+            .forge
+            .status(&self.factory_account, &request.repo, request.number)
+            .await?;
         let observation = observe(&status, request.seen_until.as_deref());
         // The review stopped and waits for the user. Report only a merge or
         // close by someone else; take no other action and leave the watermark
@@ -403,7 +415,9 @@ impl Executor for PodmanExecutor {
                     None,
                 ),
                 ReadyAction::Merge => {
-                    self.github.merge(&request.repo, request.number).await?;
+                    self.forge
+                        .merge(&self.factory_account, &request.repo, request.number)
+                        .await?;
                     merged_by_factory = true;
                     (Some(Event::Merged), None)
                 }
@@ -418,7 +432,10 @@ impl Executor for PodmanExecutor {
                 None,
             ),
             Observation::CiFailed(checks) => {
-                let log = self.github.failure_report(&request.repo, &checks).await;
+                let log = self
+                    .forge
+                    .failure_report(&self.factory_account, &request.repo, &checks)
+                    .await;
                 (Some(Event::CiFailed { log }), None)
             }
             Observation::Comments { text, seen_until } => (
@@ -435,17 +452,22 @@ impl Executor for PodmanExecutor {
     }
 
     async fn rerun(&self, request: RerunRequest) -> Result<Rerun, String> {
-        self.github
-            .rerun_failed(&request.repo, request.number)
+        self.forge
+            .rerun_failed(&self.factory_account, &request.repo, request.number)
             .await
     }
 
     async fn renovate_prs(&self, repo: &str, base: &str) -> Result<Vec<RenovatePr>, String> {
-        self.github.renovate_prs(repo, base).await
+        self.forge
+            .renovate_prs(&self.factory_account, repo, base)
+            .await
     }
 
     async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
-        let status = self.github.status(&request.repo, request.number).await?;
+        let status = self
+            .forge
+            .status(&self.factory_account, &request.repo, request.number)
+            .await?;
         let ci = match status.state {
             PrState::Merged => {
                 let event = self
@@ -467,15 +489,18 @@ impl Executor for PodmanExecutor {
             Ci::NoChecks => RenovateCi::NoChecks,
             Ci::Pending => RenovateCi::Pending,
             Ci::Failed(checks) => RenovateCi::Failed {
-                log: self.github.failure_report(&request.repo, &checks).await,
+                log: self
+                    .forge
+                    .failure_report(&self.factory_account, &request.repo, &checks)
+                    .await,
             },
             Ci::Passed => {
                 let details = if request.verdict_head.as_deref() == Some(status.head.as_str()) {
                     None
                 } else {
                     let details = self
-                        .github
-                        .pr_details(&request.repo, request.number)
+                        .forge
+                        .pr_details(&self.factory_account, &request.repo, request.number)
                         .await?;
                     Some(Box::new(PrDiff {
                         diff: details.diff,
@@ -494,12 +519,18 @@ impl Executor for PodmanExecutor {
     }
 
     async fn comment(&self, repo: &str, number: u64, body: &str) -> Result<(), String> {
-        self.github.comment(repo, number, body).await
+        self.forge
+            .comment(&self.factory_account, repo, number, body)
+            .await
     }
 
     async fn merge_renovate(&self, repo: &str, number: u64, head: &str) -> Result<(), String> {
-        self.github.approve(repo, number, head, APPROVAL).await?;
-        self.github.merge_head(repo, number, head).await
+        self.forge
+            .approve(&self.factory_account, repo, number, head, APPROVAL)
+            .await?;
+        self.forge
+            .merge_head(&self.factory_account, repo, number, head)
+            .await
     }
 
     async fn renovate_merged(
@@ -514,7 +545,10 @@ impl Executor for PodmanExecutor {
                 manifest_changed: false,
             });
         };
-        let info = self.github.pr_info(repo, number).await?;
+        let info = self
+            .forge
+            .pr_info(&self.factory_account, repo, number)
+            .await?;
         Ok(Event::RenovateMerged {
             packaging: true,
             manifest_changed: info.files.iter().any(|file| manifest_files.contains(file)),
@@ -526,14 +560,14 @@ impl Executor for PodmanExecutor {
         request: PackagingRequest,
     ) -> Result<PackagingContext, String> {
         let details = self
-            .github
-            .pr_details(&request.repo, request.number)
+            .forge
+            .pr_details(&self.factory_account, &request.repo, request.number)
             .await?;
         let mut manifests = Vec::new();
         for path in &request.manifest_files {
             let text = self
-                .github
-                .file_at(&request.repo, path, &request.base)
+                .forge
+                .file_at(&self.factory_account, &request.repo, path, &request.base)
                 .await?;
             manifests.push(FileText {
                 path: path.clone(),
@@ -544,7 +578,7 @@ impl Executor for PodmanExecutor {
             .then(|| request.from.clone().zip(request.to.clone()))
             .flatten();
         let range = recorded
-            .or_else(|| compare_range(&details.body, &request.upstream))
+            .or_else(|| self.forge.compare_range(&details.body, &request.upstream))
             .or_else(|| manifest_range(&details.diff, &request.manifest_files));
         if range.is_none() && !request.build_config_files.is_empty() {
             return Err(format!(
@@ -557,8 +591,8 @@ impl Executor for PodmanExecutor {
         if let Some((from, to)) = &range {
             for path in &request.build_config_files {
                 let text = self
-                    .github
-                    .compare_patch(&request.upstream, from, to, path)
+                    .forge
+                    .compare_patch(&self.factory_account, &request.upstream, from, to, path)
                     .await?;
                 upstream.push(FileText {
                     path: path.clone(),
@@ -586,20 +620,6 @@ impl Executor for PodmanExecutor {
             tracing::warn!("removing {name}: {err}");
         }
     }
-}
-
-/// The refs of the first `github.com/{upstream}/compare/{from}...{to}` link in
-/// a Renovate description, which is how Renovate names the upstream range of
-/// an update.
-fn compare_range(body: &str, upstream: &str) -> Option<(String, String)> {
-    let marker = format!("github.com/{}/compare/", upstream.to_ascii_lowercase());
-    let start = body.to_ascii_lowercase().find(&marker)? + marker.len();
-    let link: String = body[start..]
-        .chars()
-        .take_while(|c| !c.is_whitespace() && !matches!(c, ')' | ']' | '>' | '"' | '\''))
-        .collect();
-    let (from, to) = link.split_once("...")?;
-    (!from.is_empty() && !to.is_empty()).then(|| (from.to_owned(), to.to_owned()))
 }
 
 /// Manifest keys that name the upstream source version.

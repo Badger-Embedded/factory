@@ -6,25 +6,26 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use factory_core::PrDescription;
+
+use crate::forge::{Account, BoxFuture, Forge};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const MAX_LOG: usize = 30_000;
-/// The largest diff [`GitHub::pr_details`] returns. A larger one is an error,
+/// The largest diff `pr_details` returns. A larger one is an error,
 /// because a review of a cut diff could approve changes it never saw.
 const MAX_DIFF: usize = 200_000;
 /// The most changed files GitHub's compare API lists.
 const COMPARE_FILE_LIMIT: usize = 300;
 
-/// Talks to GitHub through the `gh` CLI with the factory's token.
+/// Talks to GitHub through the `gh` CLI as the account each call names.
 #[derive(Debug, Clone)]
 pub struct GitHub {
     pub gh: PathBuf,
-    pub token: Option<String>,
     /// The factory's own login. Its comments are not review feedback.
     pub bot_login: String,
-    /// How many times [`GitHub::rerun_failed`] reads the pull request while
+    /// How many times `rerun_failed` reads the pull request while
     /// it waits for GitHub to stop reporting the old failure.
     pub settle_polls: u32,
     pub settle_interval: Duration,
@@ -34,7 +35,6 @@ impl Default for GitHub {
     fn default() -> Self {
         GitHub {
             gh: PathBuf::from("gh"),
-            token: None,
             bot_login: "moonthebot".into(),
             settle_polls: 10,
             settle_interval: Duration::from_secs(3),
@@ -49,7 +49,7 @@ pub enum PrState {
     Closed,
 }
 
-/// What [`GitHub::rerun_failed`] did.
+/// What `rerun_failed` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rerun {
     /// The IDs of the Actions runs it restarted.
@@ -477,9 +477,15 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when the call fails.
-    pub async fn merged_pr(&self, repo: &str, branch: &str) -> Result<Option<u64>, String> {
+    async fn merged_pr(
+        &self,
+        account: &Account,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<u64>, String> {
         let merged = self
             .run(
+                account,
                 &[
                     "pr",
                     "list",
@@ -511,8 +517,9 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when a call fails.
-    pub async fn open_pr(
+    async fn open_pr(
         &self,
+        account: &Account,
         repo: &str,
         base: &str,
         branch: &str,
@@ -520,6 +527,7 @@ impl GitHub {
     ) -> Result<u64, String> {
         let existing = self
             .run(
+                account,
                 &[
                     "pr",
                     "list",
@@ -539,7 +547,7 @@ impl GitHub {
             .await?;
         if let Ok(number) = existing.trim().parse::<u64>() {
             let number_text = number.to_string();
-            let was_failed = match self.status(repo, number).await {
+            let was_failed = match self.status(account, repo, number).await {
                 Ok(status) => matches!(status.ci, Ci::Failed(_)),
                 Err(err) => {
                     tracing::error!("reading the checks of pull request {number}: {err}");
@@ -547,6 +555,7 @@ impl GitHub {
                 }
             };
             self.run(
+                account,
                 &[
                     "pr",
                     "edit",
@@ -562,7 +571,7 @@ impl GitHub {
             )
             .await?;
             if was_failed {
-                match self.rerun_failed(repo, number).await {
+                match self.rerun_failed(account, repo, number).await {
                     Ok(Rerun::Started(_)) => {}
                     Ok(Rerun::NothingToRerun) => {
                         tracing::error!("pull request {number} has no failed run to rerun");
@@ -574,6 +583,7 @@ impl GitHub {
         }
         let url = self
             .run(
+                account,
                 &[
                     "pr",
                     "create",
@@ -609,10 +619,16 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when a call fails or its output does not parse.
-    pub async fn rerun_failed(&self, repo: &str, number: u64) -> Result<Rerun, String> {
+    async fn rerun_failed(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<Rerun, String> {
         let number_text = number.to_string();
         let head = self
             .run(
+                account,
                 &[
                     "pr",
                     "view",
@@ -629,6 +645,7 @@ impl GitHub {
             .await?;
         let runs = self
             .run(
+                account,
                 &[
                     "run",
                     "list",
@@ -656,13 +673,14 @@ impl GitHub {
         }
         for id in &failed {
             self.run(
+                account,
                 &["run", "rerun", &id.to_string(), "--repo", repo, "--failed"],
                 None,
             )
             .await?;
         }
         for _ in 0..self.settle_polls {
-            if !matches!(self.status(repo, number).await?.ci, Ci::Failed(_)) {
+            if !matches!(self.status(account, repo, number).await?.ci, Ci::Failed(_)) {
                 break;
             }
             tokio::time::sleep(self.settle_interval).await;
@@ -676,9 +694,10 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message, such as when a ruleset blocks the merge.
-    pub async fn merge(&self, repo: &str, number: u64) -> Result<(), String> {
+    async fn merge(&self, account: &Account, repo: &str, number: u64) -> Result<(), String> {
         let number_text = number.to_string();
         self.run(
+            account,
             &[
                 "pr",
                 "merge",
@@ -699,10 +718,16 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when the call fails or its output does not parse.
-    pub async fn renovate_prs(&self, repo: &str, base: &str) -> Result<Vec<RenovatePr>, String> {
+    async fn renovate_prs(
+        &self,
+        account: &Account,
+        repo: &str,
+        base: &str,
+    ) -> Result<Vec<RenovatePr>, String> {
         let base_field = format!("base={base}");
         let lines = self
             .run(
+                account,
                 &[
                     "api",
                     "--paginate",
@@ -730,9 +755,10 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when the call fails or its output does not parse.
-    pub async fn pr_info(&self, repo: &str, number: u64) -> Result<PrInfo, String> {
+    async fn pr_info(&self, account: &Account, repo: &str, number: u64) -> Result<PrInfo, String> {
         let view = self
             .run(
+                account,
                 &[
                     "pr",
                     "view",
@@ -761,10 +787,19 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when a call fails or its output does not parse.
-    pub async fn pr_details(&self, repo: &str, number: u64) -> Result<PrDetails, String> {
-        let info = self.pr_info(repo, number).await?;
+    async fn pr_details(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<PrDetails, String> {
+        let info = self.pr_info(account, repo, number).await?;
         let diff = self
-            .run(&["pr", "diff", &number.to_string(), "--repo", repo], None)
+            .run(
+                account,
+                &["pr", "diff", &number.to_string(), "--repo", repo],
+                None,
+            )
             .await?;
         if diff.len() > MAX_DIFF {
             return Err(format!(
@@ -786,9 +821,16 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when the call fails.
-    pub async fn comment(&self, repo: &str, number: u64, body: &str) -> Result<(), String> {
+    async fn comment(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), String> {
         let number_text = number.to_string();
         self.run(
+            account,
             &[
                 "pr",
                 "comment",
@@ -811,8 +853,9 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when the call fails.
-    pub async fn approve(
+    async fn approve(
         &self,
+        account: &Account,
         repo: &str,
         number: u64,
         head: &str,
@@ -821,6 +864,7 @@ impl GitHub {
         let path = format!("repos/{repo}/pulls/{number}/reviews");
         let commit = format!("commit_id={head}");
         self.run(
+            account,
             &[
                 "api",
                 "--method",
@@ -846,9 +890,16 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message, such as when the head moved.
-    pub async fn merge_head(&self, repo: &str, number: u64, head: &str) -> Result<(), String> {
+    async fn merge_head(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        head: &str,
+    ) -> Result<(), String> {
         let number_text = number.to_string();
         self.run(
+            account,
             &[
                 "pr",
                 "merge",
@@ -873,14 +924,16 @@ impl GitHub {
     ///
     /// Returns gh's message when the call fails for another reason, or when
     /// the path is not a file.
-    pub async fn file_at(
+    async fn file_at(
         &self,
+        account: &Account,
         repo: &str,
         path: &str,
         git_ref: &str,
     ) -> Result<Option<String>, String> {
         let out = match self
             .run(
+                account,
                 &[
                     "api",
                     "--method",
@@ -908,7 +961,7 @@ impl GitHub {
         match content.encoding.as_deref() {
             Some("base64") => {}
             // GitHub leaves the content empty for a file over 1 MB.
-            Some("none") => return self.raw_file(repo, path, git_ref).await,
+            Some("none") => return self.raw_file(account, repo, path, git_ref).await,
             other => {
                 return Err(format!(
                     "contents of {path} have the unknown encoding {}",
@@ -925,12 +978,14 @@ impl GitHub {
 
     async fn raw_file(
         &self,
+        account: &Account,
         repo: &str,
         path: &str,
         git_ref: &str,
     ) -> Result<Option<String>, String> {
         match self
             .run(
+                account,
                 &[
                     "api",
                     "--method",
@@ -960,8 +1015,9 @@ impl GitHub {
     /// gh's message when the call fails for another reason, when its
     /// output does not parse, or when the comparison lists the most files
     /// GitHub shows and `path` is not among them.
-    pub async fn compare_patch(
+    async fn compare_patch(
         &self,
+        account: &Account,
         repo: &str,
         from: &str,
         to: &str,
@@ -969,6 +1025,7 @@ impl GitHub {
     ) -> Result<Option<String>, String> {
         let out = match self
             .run(
+                account,
                 &["api", &format!("repos/{repo}/compare/{from}...{to}")],
                 None,
             )
@@ -997,10 +1054,11 @@ impl GitHub {
     /// # Errors
     ///
     /// Returns gh's message when a call fails or its output does not parse.
-    pub async fn status(&self, repo: &str, number: u64) -> Result<PrStatus, String> {
+    async fn status(&self, account: &Account, repo: &str, number: u64) -> Result<PrStatus, String> {
         let number_text = number.to_string();
         let view = self
             .run(
+                account,
                 &[
                     "pr",
                     "view",
@@ -1015,6 +1073,7 @@ impl GitHub {
             .await?;
         let inline = self
             .run(
+                account,
                 &[
                     "api",
                     "--paginate",
@@ -1030,7 +1089,12 @@ impl GitHub {
 
     /// The failed checks with the end of each GitHub Actions job's failed
     /// steps' log, for the agent to read.
-    pub async fn failure_report(&self, repo: &str, checks: &[FailedCheck]) -> String {
+    async fn failure_report(
+        &self,
+        account: &Account,
+        repo: &str,
+        checks: &[FailedCheck],
+    ) -> String {
         let mut report = String::new();
         for check in checks {
             let _ = writeln!(report, "Check {:?} failed.", check.name);
@@ -1039,6 +1103,7 @@ impl GitHub {
                 Some(job) => {
                     match self
                         .run(
+                            account,
                             &["run", "view", "--repo", repo, "--job", job, "--log-failed"],
                             None,
                         )
@@ -1061,7 +1126,12 @@ impl GitHub {
         report
     }
 
-    async fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
+    async fn run(
+        &self,
+        account: &Account,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Result<String, String> {
         let mut command = Command::new(&self.gh);
         command
             .args(args)
@@ -1074,7 +1144,7 @@ impl GitHub {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(token) = &self.token {
+        if let Some(token) = &account.token {
             command.env("GH_TOKEN", token);
         }
         let mut child = command
@@ -1098,6 +1168,171 @@ impl GitHub {
                 String::from_utf8_lossy(&output.stderr).trim()
             ))
         }
+    }
+}
+
+impl Forge for GitHub {
+    fn clone_url(&self, repo: &str) -> String {
+        format!("https://github.com/{repo}.git")
+    }
+
+    fn git_auth_header(&self, account: &Account) -> Option<String> {
+        let token = account.token.as_ref()?;
+        let basic = STANDARD.encode(format!("x-access-token:{token}"));
+        Some(format!("Authorization: Basic {basic}"))
+    }
+
+    fn compare_range(&self, body: &str, upstream: &str) -> Option<(String, String)> {
+        let marker = format!("github.com/{}/compare/", upstream.to_ascii_lowercase());
+        let start = body.to_ascii_lowercase().find(&marker)? + marker.len();
+        let link: String = body[start..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, ')' | ']' | '>' | '"' | '\''))
+            .collect();
+        let (from, to) = link.split_once("...")?;
+        (!from.is_empty() && !to.is_empty()).then(|| (from.to_owned(), to.to_owned()))
+    }
+
+    fn merged_pr<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        branch: &'a str,
+    ) -> BoxFuture<'a, Result<Option<u64>, String>> {
+        Box::pin(GitHub::merged_pr(self, account, repo, branch))
+    }
+
+    fn open_pr<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        base: &'a str,
+        branch: &'a str,
+        description: &'a PrDescription,
+    ) -> BoxFuture<'a, Result<u64, String>> {
+        Box::pin(GitHub::open_pr(
+            self,
+            account,
+            repo,
+            base,
+            branch,
+            description,
+        ))
+    }
+
+    fn rerun_failed<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Rerun, String>> {
+        Box::pin(GitHub::rerun_failed(self, account, repo, number))
+    }
+
+    fn merge<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(GitHub::merge(self, account, repo, number))
+    }
+
+    fn renovate_prs<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        base: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<RenovatePr>, String>> {
+        Box::pin(GitHub::renovate_prs(self, account, repo, base))
+    }
+
+    fn pr_info<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<PrInfo, String>> {
+        Box::pin(GitHub::pr_info(self, account, repo, number))
+    }
+
+    fn pr_details<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<PrDetails, String>> {
+        Box::pin(GitHub::pr_details(self, account, repo, number))
+    }
+
+    fn comment<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        body: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(GitHub::comment(self, account, repo, number, body))
+    }
+
+    fn approve<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        head: &'a str,
+        body: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(GitHub::approve(self, account, repo, number, head, body))
+    }
+
+    fn merge_head<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        head: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(GitHub::merge_head(self, account, repo, number, head))
+    }
+
+    fn file_at<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        path: &'a str,
+        git_ref: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, String>> {
+        Box::pin(GitHub::file_at(self, account, repo, path, git_ref))
+    }
+
+    fn compare_patch<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        from: &'a str,
+        to: &'a str,
+        path: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, String>> {
+        Box::pin(GitHub::compare_patch(self, account, repo, from, to, path))
+    }
+
+    fn status<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<PrStatus, String>> {
+        Box::pin(GitHub::status(self, account, repo, number))
+    }
+
+    fn failure_report<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        checks: &'a [FailedCheck],
+    ) -> BoxFuture<'a, String> {
+        Box::pin(GitHub::failure_report(self, account, repo, checks))
     }
 }
 
