@@ -184,7 +184,11 @@ fn admin_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/settings/workers", get(show_workers).post(save_workers))
         .route("/settings/gates", get(show_gates).post(save_gates))
-        .route("/settings/github", get(show_github).post(save_github))
+        .route(
+            "/settings/github",
+            get(redirect_polling_get).post(redirect_polling_post),
+        )
+        .route("/settings/polling", get(show_polling).post(save_polling))
         .route("/settings/renovate", get(show_renovate).post(save_renovate))
         .route("/settings/claude", get(redirect_claude))
         .route("/settings/agents/claude", get(show_claude))
@@ -1535,12 +1539,12 @@ fn gates_page(
     ))
 }
 
-fn github_page(
+fn polling_page(
     state: &AppState,
     headers: &HeaderMap,
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
-    Ok(pages::settings_github(
+    Ok(pages::settings_polling(
         &user(headers),
         &settings_nav(state, &user(headers))?,
         &state.store.settings()?,
@@ -1814,11 +1818,11 @@ async fn show_gates(State(state): State<AppState>, headers: HeaderMap) -> Result
     gates_page(&state, &headers, None)
 }
 
-async fn show_github(
+async fn show_polling(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
-    github_page(&state, &headers, None)
+    polling_page(&state, &headers, None)
 }
 
 async fn show_renovate(
@@ -1833,6 +1837,17 @@ async fn show_claude(
     headers: HeaderMap,
 ) -> Result<Markup, AppError> {
     claude_page(&state, &headers, None)
+}
+
+/// Sends the old GitHub settings URL to the polling page.
+async fn redirect_polling_get() -> Redirect {
+    Redirect::to("/settings/polling")
+}
+
+/// A 307 keeps the method and body, so a form opened before the move still
+/// saves.
+async fn redirect_polling_post() -> Redirect {
+    Redirect::temporary("/settings/polling")
 }
 
 /// Sends the old Claude account URL to the agent's page under Agents, so a
@@ -2609,7 +2624,7 @@ async fn save_gates(
     gates_page(&state, &headers, Some("Saved."))
 }
 
-async fn save_github(
+async fn save_polling(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<GithubForm>,
@@ -2625,7 +2640,7 @@ async fn save_github(
     };
     state.store.save_settings(&settings)?;
     state.wake.notify_one();
-    github_page(&state, &headers, Some("Saved."))
+    polling_page(&state, &headers, Some("Saved."))
 }
 
 #[derive(Deserialize)]

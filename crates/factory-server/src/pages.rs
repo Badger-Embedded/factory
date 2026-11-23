@@ -566,7 +566,7 @@ pub enum SettingsPage {
     Notifications,
     Workers,
     Gates,
-    Github,
+    Polling,
     Renovate,
     /// An agent's account page, named by the agent's id.
     Agent(String),
@@ -643,7 +643,7 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
                 p.settings-group { "Factory" }
                 (entry("/settings/workers".into(), "Workers", &SettingsPage::Workers))
                 (entry("/settings/gates".into(), "Default gates", &SettingsPage::Gates))
-                (entry("/settings/github".into(), "GitHub", &SettingsPage::Github))
+                (entry("/settings/polling".into(), "Pull request polling", &SettingsPage::Polling))
                 (entry("/settings/renovate".into(), "Renovate", &SettingsPage::Renovate))
                 p.settings-group { "Agents" }
                 @for agent in &nav.agents {
@@ -807,7 +807,7 @@ pub fn settings_gates(
     )
 }
 
-pub fn settings_github(
+pub fn settings_polling(
     user: &str,
     nav: &SettingsNav,
     settings: &Settings,
@@ -816,18 +816,18 @@ pub fn settings_github(
     settings_page(
         user,
         nav,
-        &SettingsPage::Github,
-        "GitHub",
+        &SettingsPage::Polling,
+        "Pull request polling",
         notice,
         &html! {
-            h1 { "GitHub" }
+            h1 { "Pull request polling" }
             p.meta { (RUNS_KEEP_VALUES) }
-            form.card.settings-form method="post" action="/settings/github" {
+            form.card.settings-form method="post" action="/settings/polling" {
                 div.field {
                     label for="poll_seconds" { "Seconds between looks at a pull request" }
                     input #poll_seconds type="number" name="poll_seconds" min="10" required
                         value=(settings.poll_seconds);
-                    p.hint { "Also the wait before retrying a failed push or GitHub call." }
+                    p.hint { "Also the wait before retrying a failed push or forge call." }
                 }
                 (save_bar("Save"))
             }

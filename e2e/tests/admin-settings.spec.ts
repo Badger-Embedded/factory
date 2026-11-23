@@ -70,14 +70,28 @@ test('Default gates saves and keeps its values', async ({ page }) => {
   await expect(gate(page, 'Approve before pushing')).toBeChecked({ checked: !before[2] });
 });
 
-test('GitHub saves and keeps its value', async ({ page }) => {
-  await page.goto('/settings/github');
+test('Pull request polling saves and keeps its value', async ({ page }) => {
+  await page.goto('/settings/polling');
   await page.getByLabel('Seconds between looks at a pull request').fill('77');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
 
-  await page.goto('/settings/github');
+  await page.goto('/settings/polling');
   await expect(page.getByLabel('Seconds between looks at a pull request')).toHaveValue('77');
+});
+
+test('a form that still posts to /settings/github saves the interval', async ({ page }) => {
+  await page.goto('/settings/polling');
+  await page.getByLabel('Seconds between looks at a pull request').fill('55');
+  await page.locator('form.settings-form').evaluate((form: HTMLFormElement) => {
+    form.action = '/settings/github';
+  });
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page).toHaveURL(/\/settings\/polling$/);
+  await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+  await page.goto('/settings/polling');
+  await expect(page.getByLabel('Seconds between looks at a pull request')).toHaveValue('55');
 });
 
 test('Renovate saves and keeps its values', async ({ page }) => {
@@ -233,7 +247,7 @@ test('a login that is not an admin is turned away from the factory-wide settings
   for (const path of [
     '/settings/workers',
     '/settings/gates',
-    '/settings/github',
+    '/settings/polling',
     '/settings/renovate',
     '/settings/agents/claude',
     '/settings/agents/codex',
