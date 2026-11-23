@@ -320,13 +320,62 @@ fn held_for(seconds: i64) -> String {
     }
 }
 
+struct StartAfterOption {
+    /// `after` posts a job number to add. `keep` posts the row of a current
+    /// prerequisite, since a deleted job's number may belong to a new job.
+    name: &'static str,
+    value: i64,
+    id: i64,
+    title: String,
+    checked: bool,
+    /// The job's state, shown for a job that is no longer eligible.
+    state: Option<String>,
+}
+
+impl StartAfterOption {
+    fn candidate(row: &JobRow) -> Self {
+        Self {
+            name: "after",
+            value: row.id,
+            id: row.id,
+            title: first_line(row.job.request()),
+            checked: false,
+            state: None,
+        }
+    }
+}
+
+/// The "Start after" picker. A checkbox per job posts a repeated field, so it
+/// works without JavaScript. It renders nothing when there is nothing to list.
+fn start_after(options: &[StartAfterOption]) -> Markup {
+    html! {
+        @if !options.is_empty() {
+            fieldset.start-after {
+                legend { "Start after" }
+                span.hint { "The request waits until these jobs are merged." }
+                @for option in options {
+                    label.start-after-job {
+                        input type="checkbox" name=(option.name) value=(option.value) checked[option.checked];
+                        span.id { "#" (option.id) }
+                        " " (option.title)
+                        @if let Some(state) = &option.state {
+                            " (" (state) ")"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The new-request form as a one-line bar. It grows, and shows the file
 /// picker, once it has focus or text, so it takes little room on a board
 /// that is opened more often to check on jobs than to file one.
 fn composer(project: &str, rows: &[&JobRow]) -> Markup {
-    let eligible: Vec<&&JobRow> = rows
+    let options: Vec<StartAfterOption> = rows
         .iter()
         .filter(|row| row.job.can_be_prerequisite())
+        .map(|row| StartAfterOption::candidate(row))
         .collect();
     html! {
         form.composer method="post" action="/jobs" enctype="multipart/form-data" {
@@ -347,19 +396,7 @@ fn composer(project: &str, rows: &[&JobRow]) -> Markup {
                     }
                 }
                 ul #pasted-images.pasted-images {}
-                @if !eligible.is_empty() {
-                    fieldset.start-after {
-                        legend { "Start after" }
-                        span.hint { "The request waits until these jobs are merged." }
-                        @for row in eligible {
-                            label.start-after-job {
-                                input type="checkbox" name="after" value=(row.id);
-                                span.id { "#" (row.id) }
-                                " " (first_line(row.job.request()))
-                            }
-                        }
-                    }
-                }
+                (start_after(&options))
             }
             script { (PreEscaped(PASTE_IMAGES)) }
         }
@@ -3730,15 +3767,50 @@ fn request_card(id: i64, job: &Job, images: &[String], files: &[JobFile]) -> Mar
 /// multipart, the way the new-request form posts. The textarea starts with the
 /// current text, each current image and file carries a Remove checkbox that
 /// posts its stored name, and `paste-images.js` drives the file input for new
-/// uploads. The form works without JavaScript; the checkboxes and file input
-/// post on their own.
+/// uploads. The "Start after" picker ticks the job's current `prerequisites`
+/// and lists the other eligible `candidates`. The form works without
+/// JavaScript; the checkboxes and file input post on their own.
 pub fn edit_request(
     user: &str,
     id: i64,
     job: &Job,
     images: &[String],
     files: &[JobFile],
+    prerequisites: &[PrerequisiteView],
+    candidates: &[JobRow],
 ) -> Markup {
+    let mut options: Vec<StartAfterOption> = prerequisites
+        .iter()
+        .map(|prerequisite| StartAfterOption {
+            name: "keep",
+            value: prerequisite.row,
+            id: prerequisite.id,
+            title: first_line(
+                prerequisite
+                    .job
+                    .as_ref()
+                    .map_or(prerequisite.title.as_str(), Job::request),
+            ),
+            checked: true,
+            state: match &prerequisite.job {
+                Some(current) => {
+                    (!current.can_be_prerequisite()).then(|| prerequisite_state(prerequisite))
+                }
+                None => Some(prerequisite_state(prerequisite)),
+            },
+        })
+        .collect();
+    let current: Vec<i64> = prerequisites
+        .iter()
+        .filter(|prerequisite| prerequisite.job.is_some())
+        .map(|prerequisite| prerequisite.id)
+        .collect();
+    options.extend(
+        candidates
+            .iter()
+            .filter(|row| !current.contains(&row.id))
+            .map(StartAfterOption::candidate),
+    );
     layout(
         user,
         &format!("Edit request · Job #{id}"),
@@ -3793,6 +3865,7 @@ pub fn edit_request(
                         }
                     }
                     ul #pasted-images.pasted-images {}
+                    (start_after(&options))
                     div.form-actions {
                         button.primary { "Save" }
                         a.nav href={ "/jobs/" (id) } { "Back to job" }

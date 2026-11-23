@@ -31,8 +31,8 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, PrerequisiteView,
-    ProjectGuard, ProjectTotals, Store, StoreError,
+    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, Packaging, PackagingType, PrerequisiteEdit,
+    PrerequisiteView, ProjectGuard, ProjectTotals, Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -852,6 +852,15 @@ async fn read_attachment(
     Ok(())
 }
 
+/// Reads a posted job number, such as a prerequisite of a request.
+async fn read_job_number(field: Field<'_>) -> Result<i64, AppError> {
+    let value = read_text(field).await?;
+    value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| AppError::BadRequest(format!("{value:?} is not a job number to wait for")))
+}
+
 async fn create_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -869,13 +878,7 @@ async fn create_job(
         match field.name() {
             Some("project") => project = Some(read_text(field).await?),
             Some("request") => request = Some(read_text(field).await?),
-            Some("after") => {
-                let value = read_text(field).await?;
-                let id = value.trim().parse::<i64>().map_err(|_| {
-                    AppError::BadRequest(format!("{value:?} is not a job number to wait for"))
-                })?;
-                after.push(id);
-            }
+            Some("after") => after.push(read_job_number(field).await?),
             Some("images") => read_attachment(field, &mut attachments).await?,
             _ => {}
         }
@@ -1213,7 +1216,18 @@ async fn show_edit(
     }
     let images = state.store.images(id)?;
     let files = state.store.files(id)?;
-    Ok(pages::edit_request(&user(&headers), id, &row.job, &images, &files).into_response())
+    let prerequisites = state.store.prerequisites(id)?;
+    let candidates = state.store.prerequisite_candidates(id)?;
+    Ok(pages::edit_request(
+        &user(&headers),
+        id,
+        &row.job,
+        &images,
+        &files,
+        &prerequisites,
+        &candidates,
+    )
+    .into_response())
 }
 
 /// Saves an edit to a queued request. It applies the New request form's rules
@@ -1230,6 +1244,8 @@ async fn save_edit(
     visible_job(&state, &headers, id)?;
     let mut request = None;
     let mut removes: Vec<String> = Vec::new();
+    let mut after = Vec::new();
+    let mut keep = Vec::new();
     let mut attachments = Vec::new();
     while let Some(field) = form
         .next_field()
@@ -1239,6 +1255,8 @@ async fn save_edit(
         match field.name() {
             Some("request") => request = Some(read_text(field).await?),
             Some("remove") => removes.push(read_text(field).await?),
+            Some("after") => after.push(read_job_number(field).await?),
+            Some("keep") => keep.push(read_job_number(field).await?),
             Some("images") => read_attachment(field, &mut attachments).await?,
             _ => {}
         }
@@ -1289,23 +1307,7 @@ async fn save_edit(
     // The final set reads the kept attachments' bytes, in their old order,
     // then the new uploads, so the staging write renumbers both from 1.
     let job_dir = state.data_dir.join("jobs").join(id.to_string());
-    let mut combined = Vec::new();
-    for name in &kept_images {
-        let bytes = read_stored(&job_dir.join("images").join(name))?;
-        combined.push(Attachment::Image {
-            extension: image_ext(name)?,
-            bytes,
-        });
-    }
-    for file in &kept_files {
-        let bytes = read_stored(&job_dir.join("files").join(&file.name))?;
-        combined.push(Attachment::File {
-            extension: file_ext(&file.name)?,
-            name: Some(file.original_name.clone()),
-            bytes,
-        });
-    }
-    combined.extend(attachments);
+    let combined = kept_then_new(&job_dir, &kept_images, &kept_files, attachments)?;
 
     let staging_dir = job_dir.join("staging");
     let _ = std::fs::remove_dir_all(&staging_dir);
@@ -1323,11 +1325,41 @@ async fn save_edit(
         &state.data_dir,
         &image_names,
         &new_files,
+        &PrerequisiteEdit {
+            keep: &keep,
+            after: &after,
+        },
     );
     let _ = std::fs::remove_dir_all(&staging_dir);
     result?;
     state.wake.notify_one();
     Ok(job_redirect(id))
+}
+
+fn kept_then_new(
+    job_dir: &std::path::Path,
+    kept_images: &[&String],
+    kept_files: &[&JobFile],
+    new: Vec<Attachment>,
+) -> Result<Vec<Attachment>, AppError> {
+    let mut combined = Vec::new();
+    for name in kept_images {
+        let bytes = read_stored(&job_dir.join("images").join(name))?;
+        combined.push(Attachment::Image {
+            extension: image_ext(name)?,
+            bytes,
+        });
+    }
+    for file in kept_files {
+        let bytes = read_stored(&job_dir.join("files").join(&file.name))?;
+        combined.push(Attachment::File {
+            extension: file_ext(&file.name)?,
+            name: Some(file.original_name.clone()),
+            bytes,
+        });
+    }
+    combined.extend(new);
+    Ok(combined)
 }
 
 /// Reads a stored attachment's bytes, mapping a read failure to a 500, since a

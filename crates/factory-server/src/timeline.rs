@@ -126,6 +126,10 @@ fn build(job: &Job, events: &[JobEvent]) -> Timeline {
 
 /// Adds to `step` what `event` says happened in it.
 fn note(step: &mut Step, event: &JobEvent) {
+    let changed = (event.event == "prerequisites").then(|| match &event.detail {
+        Some(detail) => format!("You changed the jobs this waits for: {detail}"),
+        None => "You changed the jobs this waits for".to_owned(),
+    });
     let text = match event.event.as_str() {
         "approve" => {
             step.approved = Some(event.at.clone());
@@ -168,6 +172,7 @@ fn note(step: &mut Step, event: &JobEvent) {
     for text in text
         .map(str::to_owned)
         .into_iter()
+        .chain(changed)
         .chain(failure)
         .chain(unavailable)
         .chain(blocked)

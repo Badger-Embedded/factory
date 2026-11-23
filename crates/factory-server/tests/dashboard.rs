@@ -492,6 +492,21 @@ impl Dashboard {
         removes: &[&str],
         images: &[(&str, &[u8])],
     ) -> Reply {
+        self.post_edit_waiting(id, request, removes, images, &[], &[])
+            .await
+    }
+
+    /// [`Dashboard::post_edit`] that also posts one `after` part per id in
+    /// `after` and one `keep` part per row id in `keep`.
+    async fn post_edit_waiting(
+        &self,
+        id: i64,
+        request: &str,
+        removes: &[&str],
+        images: &[(&str, &[u8])],
+        after: &[&str],
+        keep: &[&str],
+    ) -> Reply {
         let mut body = Vec::new();
         let mut part = |disposition: String, content: &[u8]| {
             body.extend_from_slice(format!("--{BOUNDARY}\r\n{disposition}\r\n\r\n").as_bytes());
@@ -507,6 +522,14 @@ impl Dashboard {
                 "Content-Disposition: form-data; name=\"remove\"".into(),
                 name.as_bytes(),
             );
+        }
+        for (name, ids) in [("after", after), ("keep", keep)] {
+            for value in ids {
+                part(
+                    format!("Content-Disposition: form-data; name=\"{name}\""),
+                    value.as_bytes(),
+                );
+            }
         }
         for (file_name, bytes) in images {
             part(
@@ -4380,6 +4403,386 @@ async fn the_timeline_notes_an_edit() {
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("You edited the request"));
+}
+
+/// The ids job `id` waits for, in the order it was told, deleted ones included.
+fn waits_for(dashboard: &Dashboard, id: i64) -> Vec<i64> {
+    dashboard
+        .store
+        .prerequisites(id)
+        .unwrap()
+        .iter()
+        .map(|prerequisite| prerequisite.id)
+        .collect()
+}
+
+/// The `job_prerequisites` row ids of job `id`, which the edit form posts as `keep`.
+fn rows_of(dashboard: &Dashboard, id: i64) -> Vec<String> {
+    dashboard
+        .store
+        .prerequisites(id)
+        .unwrap()
+        .iter()
+        .map(|prerequisite| prerequisite.row.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_edit_form_ticks_the_current_prerequisites_and_offers_the_rest() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    let done = merged(&dashboard).await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Waits", &[&first.to_string()])
+            .await,
+    );
+    let dependent = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Waits for the waiting job", &[&id.to_string()])
+            .await,
+    );
+
+    let page = dashboard.get(&format!("/jobs/{id}/edit")).await.body;
+    assert!(page.contains("<legend>Start after</legend>"), "{page}");
+    let row = &rows_of(&dashboard, id)[0];
+    assert!(
+        page.contains(&format!(
+            "<input type=\"checkbox\" name=\"keep\" value=\"{row}\" checked>"
+        )),
+        "{page}"
+    );
+    let offered = |job: i64| page.contains(&format!("name=\"after\" value=\"{job}\""));
+    assert!(offered(second), "{page}");
+    assert!(!offered(first), "{page}");
+    for hidden in [id, dependent, done] {
+        assert!(!offered(hidden), "job {hidden}: {page}");
+    }
+}
+
+#[tokio::test]
+async fn a_current_prerequisite_that_is_no_longer_eligible_stays_listed_with_its_state() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Waits", &[&first.to_string()])
+            .await,
+    );
+    dashboard.apply(first, Event::Cancel);
+
+    let page = dashboard.get(&format!("/jobs/{id}/edit")).await.body;
+    let row = &rows_of(&dashboard, id)[0];
+    assert!(
+        page.contains(&format!(
+            "name=\"keep\" value=\"{row}\" checked><span class=\"id\">#{first}</span> Add a reboot button (cancelled)"
+        )),
+        "{page}"
+    );
+}
+
+#[tokio::test]
+async fn clearing_the_prerequisites_lets_the_job_start() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Waits", &[&first.to_string()])
+            .await,
+    );
+    assert!(dashboard.store.start(id).unwrap().is_none());
+
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[], &[])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(waits_for(&dashboard, id), Vec::<i64>::new());
+    assert!(dashboard.store.start(id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_edit_can_switch_the_job_to_wait_for_another() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Waits", &[&first.to_string()])
+            .await,
+    );
+
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[&second.to_string()], &[])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(waits_for(&dashboard, id), [second]);
+    assert!(dashboard.store.start(id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_edit_naming_an_invalid_prerequisite_changes_nothing() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let a = dashboard.new_job().await;
+    let b = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Waits", &[&a.to_string()])
+            .await,
+    );
+    let other = dashboard.store.create("elsewhere", "bob", "other").unwrap();
+    let renovate = dashboard
+        .store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    let proposed = dashboard
+        .store
+        .create_gap_job("maestro", renovate, 7, "Add a flag")
+        .unwrap();
+
+    let own = b.to_string();
+    let other = other.to_string();
+    let unknown = "9999".to_owned();
+    let renovate = renovate.to_string();
+    let proposed = proposed.to_string();
+    let first = first.to_string();
+    let c = job_id_of(&dashboard.post_job_after("maestro", "Last", &[&own]).await);
+    for closing in [&own, &c.to_string()] {
+        let cycle = dashboard
+            .post_edit_waiting(a, "Add a reboot button", &[], &[], &[closing], &[])
+            .await;
+        assert_eq!(cycle.status, StatusCode::BAD_REQUEST, "{closing}");
+    }
+    for bad in [&own, &other, &unknown, &renovate, &proposed, "x"] {
+        let reply = dashboard
+            .post_edit_waiting(b, "Changed", &[], &[], &[&first, bad], &[])
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let unknown_reply = dashboard
+        .post_edit_waiting(b, "Changed", &[], &[], &[&unknown], &[])
+        .await;
+    let other_reply = dashboard
+        .post_edit_waiting(b, "Changed", &[], &[], &[&other], &[])
+        .await;
+    let message = |reply: &Reply, id: &str| {
+        let (_, rest) = reply.body.split_once("<p>").unwrap();
+        rest.split_once("</p>").unwrap().0.replace(id, "N")
+    };
+    assert_eq!(
+        message(&unknown_reply, &unknown),
+        message(&other_reply, &other)
+    );
+
+    assert_eq!(waits_for(&dashboard, b), [a]);
+    assert_eq!(waits_for(&dashboard, a), Vec::<i64>::new());
+    assert_eq!(dashboard.store.get(b).unwrap().job.request(), "Waits");
+}
+
+#[tokio::test]
+async fn an_edit_after_the_job_starts_leaves_the_prerequisites_alone() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let second = dashboard.new_job().await;
+    let done = merged(&dashboard).await;
+    let id = job_id_of(
+        &dashboard
+            .post_job_after("maestro", "Waits", &[&done.to_string()])
+            .await,
+    );
+    dashboard.apply(id, Event::Start);
+
+    let reply = dashboard
+        .post_edit_waiting(
+            id,
+            "Waits",
+            &[],
+            &[],
+            &[&first.to_string(), &second.to_string()],
+            &[],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(waits_for(&dashboard, id), [done]);
+}
+
+/// Job `id` waiting for a newest job that is then deleted, and a new job that
+/// reuses the deleted job's number. SQLite reuses only the highest id.
+async fn waiting_for_a_deleted_job(dashboard: &Dashboard) -> (i64, i64, i64) {
+    let id = dashboard.new_job().await;
+    let first = dashboard.new_job().await;
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[&first.to_string()], &[])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    dashboard
+        .store
+        .delete_job(first, Path::new("/nonexistent"))
+        .unwrap();
+    let reused = dashboard.new_job().await;
+    assert_eq!(reused, first);
+    (id, first, reused)
+}
+
+#[tokio::test]
+async fn an_edit_keeps_or_drops_a_deleted_prerequisite() {
+    let dashboard = dashboard();
+    let (id, first, reused) = waiting_for_a_deleted_job(&dashboard).await;
+
+    let page = dashboard.get(&format!("/jobs/{id}/edit")).await.body;
+    let rows = rows_of(&dashboard, id);
+    assert!(
+        page.contains(&format!(
+            "name=\"keep\" value=\"{}\" checked><span class=\"id\">#{first}</span> Add a reboot button (deleted before it merged)",
+            rows[0]
+        )),
+        "{page}"
+    );
+    assert!(page.contains(&format!("name=\"after\" value=\"{reused}\">")));
+
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[], &[&rows[0]])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(waits_for(&dashboard, id), [first]);
+    assert!(dashboard.store.start(id).unwrap().is_none());
+
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[], &["9999"])
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(rows_of(&dashboard, id), rows);
+
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[], &[])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(waits_for(&dashboard, id), Vec::<i64>::new());
+    assert!(dashboard.store.start(id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_stale_edit_form_does_not_swap_a_deleted_prerequisite_for_a_new_job() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let first = dashboard.new_job().await;
+    dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[&first.to_string()], &[])
+        .await;
+    let form = dashboard.get(&format!("/jobs/{id}/edit")).await.body;
+    let rows = rows_of(&dashboard, id);
+    assert!(form.contains(&format!("name=\"keep\" value=\"{}\" checked", rows[0])));
+
+    dashboard
+        .store
+        .delete_job(first, Path::new("/nonexistent"))
+        .unwrap();
+    let reused = dashboard.new_job().await;
+    assert_eq!(reused, first);
+
+    // The original form posts the row it showed, with the picker untouched.
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[], &[&rows[0]])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(rows_of(&dashboard, id), rows);
+    let kept = dashboard.store.prerequisites(id).unwrap();
+    assert!(kept[0].job.is_none());
+    dashboard.apply(reused, Event::Cancel);
+    assert!(dashboard.store.start(id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn deleted_prerequisites_with_the_same_number_are_kept_or_dropped_apart() {
+    let dashboard = dashboard();
+    let (id, first, reused) = waiting_for_a_deleted_job(&dashboard).await;
+    dashboard
+        .post_edit_waiting(
+            id,
+            "Waits",
+            &[],
+            &[],
+            &[&reused.to_string()],
+            &[&rows_of(&dashboard, id)[0]],
+        )
+        .await;
+    dashboard
+        .store
+        .delete_job(reused, Path::new("/nonexistent"))
+        .unwrap();
+    let rows = rows_of(&dashboard, id);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(waits_for(&dashboard, id), [first, first]);
+
+    let page = dashboard.get(&format!("/jobs/{id}/edit")).await.body;
+    for row in &rows {
+        assert!(
+            page.contains(&format!("name=\"keep\" value=\"{row}\" checked")),
+            "{page}"
+        );
+    }
+
+    let reply = dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[], &[&rows[1]])
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(rows_of(&dashboard, id), [rows[1].clone()]);
+}
+
+#[tokio::test]
+async fn a_prerequisite_deleted_after_it_merged_is_listed_as_merged() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let done = merged(&dashboard).await;
+    dashboard
+        .post_edit_waiting(id, "Waits", &[], &[], &[&done.to_string()], &[])
+        .await;
+    dashboard
+        .store
+        .delete_job(done, Path::new("/nonexistent"))
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}/edit")).await.body;
+    let row = &rows_of(&dashboard, id)[0];
+    let label = page
+        .split("name=\"keep\"")
+        .find(|part| part.starts_with(&format!(" value=\"{row}\"")))
+        .unwrap();
+    let label = label.split("</label>").next().unwrap();
+    assert!(label.contains("(merged)"), "{label}");
+    assert!(!label.contains("deleted before it merged"), "{label}");
+}
+
+#[tokio::test]
+async fn the_timeline_notes_a_change_to_the_prerequisites() {
+    let dashboard = dashboard();
+    let first = dashboard.new_job().await;
+    let id = dashboard.new_job().await;
+    dashboard
+        .post_edit_waiting(
+            id,
+            "Add a reboot button",
+            &[],
+            &[],
+            &[&first.to_string()],
+            &[],
+        )
+        .await;
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(
+        page.contains(&format!("You changed the jobs this waits for: #{first}")),
+        "{page}"
+    );
+
+    dashboard
+        .post_edit_waiting(id, "Add a reboot button", &[], &[], &[], &[])
+        .await;
+    let page = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(
+        page.contains("You changed the jobs this waits for: none"),
+        "{page}"
+    );
 }
 
 fn gate_form(gates: &str) -> String {

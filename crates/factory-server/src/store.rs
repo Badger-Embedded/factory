@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1494,7 +1494,7 @@ impl Store {
     pub fn prerequisites(&self, id: i64) -> Result<Vec<PrerequisiteView>, StoreError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT p.prerequisite, p.gone, p.title, j.job
+            "SELECT p.prerequisite, p.gone, p.title, j.job, p.id
              FROM job_prerequisites p
              LEFT JOIN jobs j ON p.gone IS NULL AND j.id = p.prerequisite
              WHERE p.job_id = ?1
@@ -1506,11 +1506,12 @@ impl Store {
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         let mut views = Vec::new();
         for row in rows {
-            let (prerequisite, gone, title, job) = row?;
+            let (prerequisite, gone, title, job, row_id) = row?;
             let job = job
                 .map(|json| serde_json::from_str::<Job>(&json))
                 .transpose()?;
@@ -1524,6 +1525,7 @@ impl Store {
                 None => title.unwrap_or_default(),
             };
             views.push(PrerequisiteView {
+                row: row_id,
                 id: prerequisite,
                 title,
                 state,
@@ -1695,15 +1697,16 @@ impl Store {
         Ok(tx.commit()?)
     }
 
-    /// Replaces the request text and attachment set of a still-queued job in
-    /// one transaction, so the scheduler's `Event::Start` cannot run in
+    /// Replaces the request text, attachment set and prerequisite set of a
+    /// still-queued job in one transaction, so the scheduler's `Event::Start` cannot run in
     /// between. The caller writes the new attachment set to the job's
     /// `staging/` directory first, numbered as `write_numbered_attachments`
     /// does, and passes the resulting `image_names` and `files`. Holding the
     /// connection lock, this checks the job is still `requested`, swaps the
     /// staged set in over the old one, replaces the `job_images` and
-    /// `job_files` rows, and applies [`Event::Edit`] so the `edit` history row
-    /// lands in the same transaction.
+    /// `job_files` rows, replaces the `job_prerequisites` rows with `prerequisites`
+    /// (a `prerequisites` history row when the set changed), and applies
+    /// [`Event::Edit`] so the `edit` history row lands in the same transaction.
     ///
     /// On success the old attachment set is deleted and the new one is live.
     ///
@@ -1712,6 +1715,9 @@ impl Store {
     /// Fails with [`StoreError::Rejected`] when the job already left
     /// `requested`, and then nothing changes: neither the store nor the files
     /// on disk. The staged set stays for the caller to discard. Fails with
+    /// [`StoreError::InvalidPrerequisite`] when an `after` id would be invalid
+    /// for a new job, is the job itself, or would form a cycle, or when a
+    /// `keep` row is not one of the job's; nothing changes then either. Fails with
     /// [`StoreError::Io`] on a file system error, and with [`StoreError::Db`]
     /// on a database error; either restores the old set and leaves the job
     /// unchanged.
@@ -1722,6 +1728,7 @@ impl Store {
         data_dir: &Path,
         image_names: &[String],
         files: &[JobFile],
+        prerequisites: &PrerequisiteEdit<'_>,
     ) -> Result<(), StoreError> {
         let event = Event::Edit { request };
         let mut conn = self.conn();
@@ -1733,9 +1740,10 @@ impl Store {
                 event,
             }));
         }
+        let change = Self::plan_prerequisites(&tx, id, &row.project, prerequisites)?;
         let job_dir = data_dir.join("jobs").join(id.to_string());
         let swap = DirSwap::swap_in(&job_dir)?;
-        let committed = Self::write_edit(&tx, id, &mut row, event, image_names, files)
+        let committed = Self::write_edit(&tx, id, &mut row, event, image_names, files, &change)
             .and_then(|()| tx.commit().map_err(StoreError::from));
         match committed {
             Ok(()) => {
@@ -1759,6 +1767,7 @@ impl Store {
         event: Event,
         image_names: &[String],
         files: &[JobFile],
+        change: &PrerequisiteChange,
     ) -> Result<(), StoreError> {
         tx.execute("DELETE FROM job_images WHERE job_id = ?1", [id])?;
         tx.execute("DELETE FROM job_files WHERE job_id = ?1", [id])?;
@@ -1774,7 +1783,143 @@ impl Store {
                 params![id, file.name, file.original_name],
             )?;
         }
+        if change.changed {
+            tx.execute(
+                "DELETE FROM job_prerequisites
+                 WHERE job_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2))",
+                params![id, serde_json::to_string(&change.keep)?],
+            )?;
+            for prerequisite in &change.added {
+                tx.execute(
+                    "INSERT INTO job_prerequisites (job_id, prerequisite) VALUES (?1, ?2)",
+                    params![id, prerequisite],
+                )?;
+            }
+            let detail = if change.names.is_empty() {
+                "none".to_owned()
+            } else {
+                change
+                    .names
+                    .iter()
+                    .map(|prerequisite| format!("#{prerequisite}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Self::record(tx, id, "prerequisites", &row.job, Some(&detail), None)?;
+        }
         Self::apply_in(tx, row, event)
+    }
+
+    /// Checks the posted prerequisites of queued job `id` and works out what
+    /// the replacement changes, without writing anything, so a rejection
+    /// leaves the files and rows alone.
+    fn plan_prerequisites(
+        tx: &Transaction<'_>,
+        id: i64,
+        project: &str,
+        edit: &PrerequisiteEdit<'_>,
+    ) -> Result<PrerequisiteChange, StoreError> {
+        let mut stmt = tx.prepare(
+            "SELECT id, prerequisite, gone IS NULL FROM job_prerequisites
+             WHERE job_id = ?1 ORDER BY id",
+        )?;
+        let stored: Vec<(i64, i64, bool)> = stmt
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut keep = edit.keep.to_vec();
+        keep.sort_unstable();
+        keep.dedup();
+        for &row in &keep {
+            if !stored.iter().any(|(stored_row, ..)| *stored_row == row) {
+                return Err(StoreError::InvalidPrerequisite(row));
+            }
+        }
+        let mut after = edit.after.to_vec();
+        after.sort_unstable();
+        after.dedup();
+        let dependents = Self::dependents_in(tx, id)?;
+        let mut added = Vec::new();
+        for &prerequisite in &after {
+            if prerequisite == id {
+                return Err(StoreError::InvalidPrerequisite(prerequisite));
+            }
+            match Self::load(tx, prerequisite) {
+                Ok(row) if row.project == project && row.job.accepts_as_prerequisite() => {}
+                Ok(_) | Err(StoreError::NotFound(_)) => {
+                    return Err(StoreError::InvalidPrerequisite(prerequisite));
+                }
+                Err(err) => return Err(err),
+            }
+            if dependents.contains(&prerequisite) {
+                return Err(StoreError::InvalidPrerequisite(prerequisite));
+            }
+            let existing = stored
+                .iter()
+                .find(|(_, number, live)| *live && *number == prerequisite);
+            match existing {
+                Some((row, ..)) => keep.push(*row),
+                None => added.push(prerequisite),
+            }
+        }
+        keep.sort_unstable();
+        keep.dedup();
+        let mut names: Vec<i64> = stored
+            .iter()
+            .filter(|(row, ..)| keep.contains(row))
+            .map(|(_, number, _)| *number)
+            .collect();
+        names.extend(&added);
+        let changed = !added.is_empty() || stored.iter().any(|(row, ..)| !keep.contains(row));
+        Ok(PrerequisiteChange {
+            keep,
+            added,
+            names,
+            changed,
+        })
+    }
+
+    /// The jobs that wait for job `id`, directly or through other jobs, over
+    /// live prerequisite rows.
+    fn dependents_in(conn: &Connection, id: i64) -> Result<HashSet<i64>, StoreError> {
+        let mut stmt = conn.prepare(
+            "SELECT job_id FROM job_prerequisites WHERE prerequisite = ?1 AND gone IS NULL",
+        )?;
+        let mut seen = HashSet::new();
+        let mut queue = vec![id];
+        while let Some(next) = queue.pop() {
+            let waiting: Vec<i64> = stmt
+                .query_map([next], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            for job in waiting {
+                if seen.insert(job) {
+                    queue.push(job);
+                }
+            }
+        }
+        Ok(seen)
+    }
+
+    /// The jobs queued job `id` may be told to wait for: the project's
+    /// eligible jobs, except `id` itself and the jobs that wait for it, which
+    /// would form a cycle.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on
+    /// a database error.
+    pub fn prerequisite_candidates(&self, id: i64) -> Result<Vec<JobRow>, StoreError> {
+        let project = self.get(id)?.project;
+        let dependents = Self::dependents_in(&self.conn(), id)?;
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|row| {
+                row.project == project
+                    && row.id != id
+                    && row.job.can_be_prerequisite()
+                    && !dependents.contains(&row.id)
+            })
+            .collect())
     }
 
     /// Adds `usd` to the running API cost of job `id` and to the totals of
@@ -4045,6 +4190,9 @@ impl Store {
 /// A prerequisite of a job as the job page shows it.
 #[derive(Debug, Clone)]
 pub struct PrerequisiteView {
+    /// The `job_prerequisites` row, which identifies the prerequisite where
+    /// `id` may name a different job after the original was deleted.
+    pub row: i64,
     pub id: i64,
     /// The first line of the request, as stored when the job was deleted.
     pub title: String,
@@ -4052,6 +4200,23 @@ pub struct PrerequisiteView {
     /// The prerequisite job, or `None` when it was deleted. A deleted one is
     /// met when it had merged and blocked otherwise.
     pub job: Option<Job>,
+}
+
+/// The prerequisite set an edit posts. `keep` names the `job_prerequisites`
+/// rows of the job to keep, live or deleted. A row id identifies a prerequisite
+/// where a job id cannot, because a deleted job's id may belong to a new job.
+/// `after` names jobs to add.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrerequisiteEdit<'a> {
+    pub keep: &'a [i64],
+    pub after: &'a [i64],
+}
+
+struct PrerequisiteChange {
+    keep: Vec<i64>,
+    added: Vec<i64>,
+    names: Vec<i64>,
+    changed: bool,
 }
 
 type PrerequisiteEntry = (i64, PrerequisiteState, String);
