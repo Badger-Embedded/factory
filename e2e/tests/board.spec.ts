@@ -14,6 +14,7 @@
 //   survives: "a job created after page load appears and keeps the typed request"
 // - An opened "Show N older" disclosure stays open across a poll:
 //   "an opened Show older disclosure stays open across a poll"
+import type { Page } from '@playwright/test';
 import { ADMIN, COLLABORATOR, OUTSIDER, SHARED_PROJECT, expect, test } from '../fixtures';
 
 // A 1x1 PNG, so the server's byte check accepts it as an image.
@@ -214,6 +215,19 @@ const seedFactoryLabel = (factory: { fixture: (...args: string[]) => string }) =
   return name;
 };
 
+const frames = (page: Page) =>
+  page.evaluate(async () => {
+    for (let i = 0; i < 3; i++) await new Promise((resolve) => requestAnimationFrame(resolve));
+  });
+
+// source-link.js measures from a ResizeObserver, so the layout settles a frame or two after the swap.
+const loadUsage = async (page: Page) => {
+  await page.evaluate(() =>
+    (window as any).htmx.ajax('GET', '/fragments/plan-usage', { target: '#usage', swap: 'innerHTML' }),
+  );
+  await frames(page);
+};
+
 test('the source link stays at the top right whether the usage strip fits beside the tiles or wraps', async ({ page, factory }) => {
   const project = seedFactoryLabel(factory);
   const windows = (names: string[]) =>
@@ -238,7 +252,8 @@ test('the source link stays at the top right whether the usage strip fits beside
     body = strip(names);
     await page.setViewportSize({ width, height: 800 });
     await page.goto(`/?project=${project}`);
-    await expect(page.locator('#usage .usage-window')).toHaveCount(names.length, { timeout: 15_000 });
+    await loadUsage(page);
+    await expect(page.locator('#usage .usage-window')).toHaveCount(names.length);
     await expect(page.locator('a.source-link')).toHaveText('Badger-Embedded/factory');
 
     const link = (await page.locator('a.source-link').boundingBox())!;
@@ -304,9 +319,11 @@ test('a long name or a wide label never overlaps a tile, the usage strip or the 
   for (const name of names) factory.fixture('project', '--name', name, '--login', ADMIN);
   for (const name of names) {
     await page.goto(`/?project=${name}`);
-    await expect(page.locator('#usage .plan-usage')).toBeVisible({ timeout: 15_000 });
+    await loadUsage(page);
+    await expect(page.locator('#usage .plan-usage')).toBeVisible();
     for (const width of [1280, 768, 480]) {
       await page.setViewportSize({ width, height: 800 });
+      await frames(page);
       const link = page.locator('a.source-link');
       await expect(link).toHaveText(`e2e/${name}`);
       const box = (await link.boundingBox())!;
