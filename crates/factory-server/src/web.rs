@@ -2028,8 +2028,6 @@ fn project_settings(
         .store
         .mcp_servers()?
         .into_iter()
-        // Runs do not carry a stdio server yet, so a project has no switch for it.
-        .filter(|server| server.as_remote().is_some())
         .map(|server| server_settings(state, name, server))
         .collect::<Result<Vec<_>, StoreError>>()?;
     let agents = state
@@ -2255,9 +2253,6 @@ fn save_posted_gates(store: &Store, project: &str, form: &ProjectForm) -> Result
 /// own page. A server that is off and stays off is not written.
 fn save_pipeline_mcp(state: &AppState, project: &str, form: &ProjectForm) -> Result<(), AppError> {
     for server in state.store.mcp_servers()? {
-        if server.as_remote().is_none() {
-            continue;
-        }
         let base = format!("mcp.{}", server.name);
         if !form.ticked(&format!("{base}.pipeline")) {
             continue;
@@ -3303,6 +3298,14 @@ fn server_settings(
     server: McpServer,
 ) -> Result<ServerSettings, StoreError> {
     let saved = state.store.project_mcp(project, &server.name)?;
+    let stdio = match server.as_stdio() {
+        Some((command, args)) => Some(pages::StdioSettings {
+            command: command.to_owned(),
+            args: args.to_vec(),
+            extra_args: state.store.project_mcp_args(project, &server.name)?,
+        }),
+        None => None,
+    };
     let declared = server.as_remote().map_or(&[][..], |(_, headers)| headers);
     let headers = declared
         .iter()
@@ -3324,6 +3327,7 @@ fn server_settings(
         enabled: saved.enabled,
         stages: saved.stages,
         headers,
+        stdio,
     })
 }
 
@@ -3339,7 +3343,6 @@ fn project_and_server(
     state
         .store
         .mcp_server(server)?
-        .filter(|server| server.as_remote().is_some())
         .ok_or_else(|| AppError::NotFound(format!("no MCP server named {server:?}")))
 }
 
@@ -3370,7 +3373,7 @@ async fn show_project_mcp(
 }
 
 /// Saves a project's settings for one server: whether it runs, its stages, its
-/// header values and its tools. Everything is checked before any write, so a
+/// header values and its tools, or for a stdio server its extra arguments. Everything is checked before any write, so a
 /// rejected submit changes nothing. An enabled server needs a stage, and a
 /// header value cannot be set while the secret store is unavailable.
 async fn save_project_mcp(
@@ -3380,6 +3383,16 @@ async fn save_project_mcp(
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Result<Markup, AppError> {
     let registered = project_and_server(&state, &headers, &project, &server)?;
+    // The extra arguments are a repeated field, which the map below would
+    // collapse, so they are read from the pairs in order.
+    let mut extra_args = Vec::new();
+    for (key, value) in &pairs {
+        match key.as_str() {
+            "arg" => extra_args.push(value.clone()),
+            "arg_escaped" => extra_args.push(unescape_arg(value)?),
+            _ => {}
+        }
+    }
     let form = ProjectForm(pairs.into_iter().collect());
     let base = format!("mcp.{}", registered.name);
     let settings = McpProjectSettings {
@@ -3395,6 +3408,11 @@ async fn save_project_mcp(
     if settings.enabled && !settings.stages.any() {
         return Err(McpError::NoStage(registered.name).into());
     }
+    let extra_args = if registered.as_stdio().is_some() {
+        Some(crate::mcp::validate_args(&extra_args)?)
+    } else {
+        None
+    };
     let value = |header: &str| {
         form.get(&format!("{base}.header.{header}"))
             .filter(|value| !value.is_empty())
@@ -3430,6 +3448,11 @@ async fn save_project_mcp(
     state
         .store
         .save_mcp_tool_states(&project, &registered.name, &tools)?;
+    if let Some(args) = &extra_args {
+        state
+            .store
+            .save_project_mcp_args(&project, &registered.name, args)?;
+    }
     for header in registered_headers {
         let at = SecretRef {
             project: &project,

@@ -10322,26 +10322,222 @@ async fn a_stdio_mcp_server_is_added_edited_and_deleted_through_the_settings_pag
     assert!(dashboard.store.mcp_server("playwright").unwrap().is_none());
 }
 
-#[tokio::test]
-async fn a_stdio_mcp_server_is_not_checked_and_has_no_project_page_yet() {
-    let dashboard = dashboard();
+fn add_playwright(dashboard: &Dashboard) {
     dashboard
         .store
         .create_mcp_server_with(
             "playwright",
             &factory_server::McpTransport::Stdio {
                 command: "npx".to_owned(),
-                args: Vec::new(),
+                args: vec!["-y".to_owned(), "@playwright/mcp@0.0.83".to_owned()],
             },
         )
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_stdio_mcp_server_is_not_checked() {
+    let dashboard = dashboard();
+    add_playwright(&dashboard);
     let check = dashboard
         .post("/settings/projects/maestro/mcp/playwright/check", "")
         .await;
     assert_eq!(check.status, StatusCode::BAD_REQUEST);
     assert_eq!(dashboard.checker.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_projects_page_for_a_stdio_server_has_extra_arguments_and_no_remote_parts() {
+    let dashboard = dashboard();
+    add_playwright(&dashboard);
+    let page = dashboard
+        .get("/settings/projects/maestro/mcp/playwright")
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("name=\"mcp.playwright.enabled\""));
+    for stage in ["clarify", "spec", "plan", "implement", "review"] {
+        assert!(
+            page.body
+                .contains(&format!("name=\"mcp.playwright.stage.{stage}\""))
+        );
+    }
+    assert!(page.body.contains("Extra arguments"));
+    assert!(page.body.contains("name=\"arg\""));
+    assert!(page.body.contains("@playwright/mcp@0.0.83"));
+    assert!(!page.body.contains("Refresh connection"));
+    assert!(!page.body.contains("mcp-tools"));
+    assert!(!page.body.contains(".header."));
     let project = dashboard.get("/settings/projects/maestro").await;
-    assert!(!project.body.contains("playwright"));
+    assert!(project.body.contains("playwright"));
+    assert!(project.body.contains("name=\"mcp.playwright.pipeline\""));
+}
+
+#[tokio::test]
+async fn a_remote_servers_project_page_has_no_extra_arguments() {
+    let dashboard = dashboard();
+    add_context7(&dashboard).await;
+    let page = dashboard
+        .get("/settings/projects/maestro/mcp/context7")
+        .await;
+    assert!(!page.body.contains("Extra arguments"));
+    assert!(!page.body.contains("name=\"arg\""));
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/mcp/context7",
+            "mcp.context7.enabled=on&mcp.context7.stage.spec=on&arg=--headless",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard
+            .store
+            .project_mcp_args("maestro", "context7")
+            .unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[tokio::test]
+async fn extra_arguments_are_saved_in_order_and_shown_in_the_command_line() {
+    let dashboard = dashboard();
+    add_playwright(&dashboard);
+    let uri = "/settings/projects/maestro/mcp/playwright";
+    let saved = dashboard
+        .post(
+            uri,
+            "mcp.playwright.enabled=on&mcp.playwright.stage.implement=on\
+             &arg=--headless&arg=&arg=--viewport-size%3D1280x720&arg=a+b",
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert_eq!(
+        dashboard
+            .store
+            .project_mcp_args("maestro", "playwright")
+            .unwrap(),
+        ["--headless", "--viewport-size=1280x720", "a b"]
+    );
+    let page = dashboard.get(uri).await.body;
+    assert!(
+        page.contains("npx -y @playwright/mcp@0.0.83 --headless --viewport-size=1280x720 'a b'")
+    );
+
+    // Off keeps the list.
+    dashboard.post(uri, "arg=--headless").await;
+    assert!(
+        !dashboard
+            .store
+            .project_mcp("maestro", "playwright")
+            .unwrap()
+            .enabled
+    );
+    assert_eq!(
+        dashboard
+            .store
+            .project_mcp_args("maestro", "playwright")
+            .unwrap(),
+        ["--headless"]
+    );
+}
+
+#[tokio::test]
+async fn bad_extra_arguments_are_a_bad_request_that_writes_nothing() {
+    let dashboard = dashboard();
+    add_playwright(&dashboard);
+    let uri = "/settings/projects/maestro/mcp/playwright";
+    dashboard
+        .post(
+            uri,
+            "mcp.playwright.enabled=on&mcp.playwright.stage.spec=on&arg=--keep",
+        )
+        .await;
+    let many: String = "&arg=a".repeat(65);
+    for extra in [
+        many.as_str(),
+        "&arg=%24%7BHOME%7D",
+        "&arg=a%00b",
+        "&arg_escaped=a%5Cx",
+    ] {
+        let reply = dashboard
+            .post(
+                uri,
+                &format!("mcp.playwright.enabled=on&mcp.playwright.stage.plan=on{extra}"),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{extra}");
+    }
+    let stored = dashboard
+        .store
+        .project_mcp("maestro", "playwright")
+        .unwrap();
+    assert!(stored.stages.spec && !stored.stages.plan);
+    assert_eq!(
+        dashboard
+            .store
+            .project_mcp_args("maestro", "playwright")
+            .unwrap(),
+        ["--keep"]
+    );
+}
+
+#[tokio::test]
+async fn a_pipeline_save_leaves_extra_arguments_alone() {
+    let dashboard = dashboard();
+    add_playwright(&dashboard);
+    dashboard
+        .post(
+            "/settings/projects/maestro/mcp/playwright",
+            "mcp.playwright.enabled=on&mcp.playwright.stage.spec=on&arg=--headless",
+        )
+        .await;
+    dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&gates=on\
+             &mcp.playwright.pipeline=on&mcp.playwright.stage.implement=on",
+        )
+        .await;
+    let stored = dashboard
+        .store
+        .project_mcp("maestro", "playwright")
+        .unwrap();
+    assert!(stored.enabled && stored.stages.implement && !stored.stages.spec);
+    assert_eq!(
+        dashboard
+            .store
+            .project_mcp_args("maestro", "playwright")
+            .unwrap(),
+        ["--headless"]
+    );
+}
+
+#[tokio::test]
+async fn a_collaborator_of_another_project_gets_404_on_a_stdio_servers_page() {
+    let dashboard = two_projects();
+    add_playwright(&dashboard);
+    dashboard
+        .store
+        .add_collaborator("tool", STRANGER, "test")
+        .unwrap();
+    let uri = "/settings/projects/maestro/mcp/playwright";
+    assert_eq!(
+        dashboard.get_as(STRANGER, uri).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        dashboard
+            .post_as(STRANGER, uri, "arg=--headless")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        dashboard
+            .store
+            .project_mcp_args("maestro", "playwright")
+            .unwrap(),
+        Vec::<String>::new()
+    );
 }
 
 #[tokio::test]

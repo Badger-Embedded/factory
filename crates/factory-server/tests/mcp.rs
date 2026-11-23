@@ -698,3 +698,116 @@ fn a_database_from_before_stdio_loads_every_server_as_remote() {
         .create_mcp_server_with("playwright", &stdio("npx", &[]))
         .unwrap();
 }
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn stdio_store() -> Arc<Store> {
+    let store = store();
+    store
+        .create_mcp_server_with(
+            "playwright",
+            &McpTransport::Stdio {
+                command: "npx".to_owned(),
+                args: strings(&["-y", "pkg"]),
+            },
+        )
+        .expect("create");
+    store
+}
+
+#[test]
+fn project_mcp_args_keep_order_and_default_to_empty() {
+    let store = stdio_store();
+    assert_eq!(
+        store.project_mcp_args("maestro", "playwright").unwrap(),
+        Vec::<String>::new()
+    );
+    let args = strings(&["--headless", "a b", "--x=1"]);
+    store
+        .save_project_mcp_args("maestro", "playwright", &args)
+        .unwrap();
+    assert_eq!(
+        store.project_mcp_args("maestro", "playwright").unwrap(),
+        args
+    );
+}
+
+#[test]
+fn saving_one_projects_args_leaves_other_projects_alone() {
+    let store = stdio_store();
+    store
+        .save_project_mcp_args("maestro", "playwright", &strings(&["--headless"]))
+        .unwrap();
+    store
+        .save_project_mcp_args("tool", "playwright", &strings(&["--caps=vision"]))
+        .unwrap();
+    store
+        .save_project_mcp_args("maestro", "playwright", &strings(&["--x=1"]))
+        .unwrap();
+    assert_eq!(
+        store.project_mcp_args("tool", "playwright").unwrap(),
+        ["--caps=vision"]
+    );
+}
+
+#[test]
+fn turning_a_server_off_keeps_the_args() {
+    let store = stdio_store();
+    let on = McpProjectSettings {
+        enabled: true,
+        stages: only("implement"),
+    };
+    store
+        .save_project_mcp("maestro", "playwright", &on)
+        .unwrap();
+    store
+        .save_project_mcp_args("maestro", "playwright", &strings(&["--headless"]))
+        .unwrap();
+    store
+        .save_project_mcp("maestro", "playwright", &McpProjectSettings::default())
+        .unwrap();
+    store
+        .save_project_mcp("maestro", "playwright", &on)
+        .unwrap();
+    assert_eq!(
+        store.project_mcp_args("maestro", "playwright").unwrap(),
+        ["--headless"]
+    );
+}
+
+#[test]
+fn deleting_a_server_or_removing_a_project_deletes_its_args() {
+    let store = stdio_store();
+    store
+        .create_project(
+            "maestro",
+            factory_runner::ForgeKind::GitHub,
+            "o/m",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    store
+        .save_project_mcp_args("maestro", "playwright", &strings(&["--a"]))
+        .unwrap();
+    store
+        .save_project_mcp_args("tool", "playwright", &strings(&["--b"]))
+        .unwrap();
+    store.remove_project("maestro").unwrap();
+    assert_eq!(
+        store.project_mcp_args("maestro", "playwright").unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        store.project_mcp_args("tool", "playwright").unwrap(),
+        ["--b"]
+    );
+    store.delete_mcp_server("playwright").unwrap();
+    assert_eq!(
+        store.project_mcp_args("tool", "playwright").unwrap(),
+        Vec::<String>::new()
+    );
+}
