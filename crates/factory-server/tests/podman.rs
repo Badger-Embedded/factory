@@ -34,7 +34,6 @@ fn forges(github: GitHub) -> Forges {
         Arc::new(github),
         Arc::new(GhRepos {
             gh: PathBuf::from("gh"),
-            token: None,
         }),
     )
 }

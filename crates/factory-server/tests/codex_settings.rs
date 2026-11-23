@@ -16,7 +16,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use factory_runner::GitHub;
+use factory_runner::{Account, GitHub};
 use factory_server::{
     AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, LocalSecrets, LoginProcess,
     LoginSpawner, LoginSpec, MASTER_KEY_LEN, McpChecker, PlanUsageCache, Projects, RepoChecker,
@@ -157,6 +157,7 @@ struct NoRepos;
 impl RepoChecker for NoRepos {
     fn check<'a>(
         &'a self,
+        _account: &'a Account,
         _repo: &'a str,
         _base: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {

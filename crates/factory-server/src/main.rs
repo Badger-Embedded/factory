@@ -244,7 +244,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }),
         Arc::new(GhRepos {
             gh: path_var("FACTORY_GH", "gh"),
-            token: gh_token(),
         }),
     );
 

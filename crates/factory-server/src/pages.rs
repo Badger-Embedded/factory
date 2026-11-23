@@ -2728,6 +2728,9 @@ pub struct OnboardView<'a> {
     pub models: &'a StageModels,
     pub auto_merge: bool,
     pub llm_review: bool,
+    /// The forge token page to link when the checks could not run for want of
+    /// a token.
+    pub token_page: Option<&'a str>,
 }
 
 /// The onboarding wizard. Step 1 is the project, step 2 the optional models and
@@ -2749,7 +2752,7 @@ pub fn onboard(
             @if let Some(notice) = notice {
                 div.card.saved { (notice) }
             }
-            p.meta { "The factory checks the repository as the bot before it creates anything. It creates no project while a required check fails." }
+            p.meta { "The factory checks the repository as your own GitHub account before it creates anything. It creates no project while a required check fails." }
             form.card method="post" action="/onboard" {
                 h2 { "Project" }
                 div.field {
@@ -2775,7 +2778,7 @@ pub fn onboard(
                     p.hint { (CHECKS_HINT) }
                 }
                 @if let Some(report) = report {
-                    (onboard_results(report))
+                    (onboard_results(report, view.token_page))
                 }
                 @if show_step2 {
                     h2 { "Optional settings" }
@@ -2822,7 +2825,7 @@ pub fn onboard(
 
 /// The checks panel under step 1: the required checks that failed, or a line
 /// that they passed, then any warnings, which do not block creation.
-fn onboard_results(report: &RepoReport) -> Markup {
+fn onboard_results(report: &RepoReport, token_page: Option<&str>) -> Markup {
     html! {
         div.checks {
             h3 { "Checks" }
@@ -2833,6 +2836,9 @@ fn onboard_results(report: &RepoReport) -> Markup {
                     @for error in &report.errors {
                         li { (error) }
                     }
+                }
+                @if let Some(page) = token_page {
+                    p { a href=(page) { "Open the token page" } }
                 }
             }
             @if !report.warnings.is_empty() {
