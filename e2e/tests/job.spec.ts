@@ -16,6 +16,9 @@
 // - Typed text in a form field survives that update, and the log keeps its
 //   scroll position: "a draft survives a state change while its field has focus",
 //   "the log keeps its scroll position when a poll swaps it"
+// - Each of the six content cards collapses to its header, the collapsed cards
+//   are remembered per job in localStorage, and they stay collapsed across a
+//   poll, a reload and a visit to the board and back.
 // - Times render in the browser's time zone on load and after a poll:
 //   "times render in the browser's time zone on load and after a poll"
 // - GitHub links open in a new tab and factory links do not:
@@ -298,4 +301,235 @@ test('GitHub links open in a new tab and factory links stay in the tab', async (
   for (const link of await internal.all()) {
     await expect(link).not.toHaveAttribute('target', '_blank');
   }
+});
+
+const SECTIONS: { section: string; heading: string }[] = [
+  { section: 'request', heading: 'Request' },
+  { section: 'spec', heading: 'Spec' },
+  { section: 'plan', heading: 'Plan' },
+  { section: 'reviews', heading: 'LLM review' },
+  { section: 'mcp-calls', heading: 'MCP tool calls' },
+  { section: 'log', heading: 'Log' },
+];
+
+// A reviewed job with an MCP call and log lines shows all six cards.
+function fullJob(factory: { fixture(...args: string[]): string }, project: string, lines = 3): string {
+  const id = newJob(factory, project, 'reviewed');
+  factory.fixture('mcp', '--job', id, '--server', 'github', '--tool', 'get_issue');
+  factory.fixture('log', '--job', id, '--text', 'line', '--count', String(lines));
+  return id;
+}
+
+const card = (page: Page, section: string) => page.locator(`[data-section="${section}"]`);
+const toggle = (page: Page, section: string) => card(page, section).locator('button.section-toggle');
+const body = (page: Page, section: string) => card(page, section).locator('.card-body');
+const stored = (page: Page, id: string) => page.evaluate((id) => localStorage.getItem(`factory.job-sections:${id}`), id);
+
+async function expectOnly(page: Page, collapsed: string[]) {
+  for (const { section } of SECTIONS) {
+    const closed = collapsed.includes(section);
+    await expect(toggle(page, section)).toHaveAttribute('aria-expanded', closed ? 'false' : 'true');
+    if (closed) await expect(body(page, section)).toBeHidden();
+    else await expect(body(page, section)).toBeVisible();
+  }
+}
+
+test('a card collapses and expands with a click', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  await page.goto(`/jobs/${id}`);
+  await expectOnly(page, []);
+  await expect(page.locator('#job-status [data-section], #job-timeline [data-section]')).toHaveCount(0);
+  await expect(page.locator('#job-status .section-toggle, #job-timeline .section-toggle')).toHaveCount(0);
+
+  for (const { section, heading } of SECTIONS) {
+    await toggle(page, section).click();
+    await expect(body(page, section)).toBeHidden();
+    await expect(card(page, section).getByRole('heading', { name: heading })).toBeVisible();
+    await toggle(page, section).click();
+    await expect(body(page, section)).toBeVisible();
+  }
+});
+
+test('a card toggles with Enter and Space', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  await page.goto(`/jobs/${id}`);
+
+  await toggle(page, 'spec').focus();
+  await page.keyboard.press('Enter');
+  await expect(toggle(page, 'spec')).toHaveAttribute('aria-expanded', 'false');
+  await expect(body(page, 'spec')).toBeHidden();
+  await page.keyboard.press('Enter');
+  await expect(toggle(page, 'spec')).toHaveAttribute('aria-expanded', 'true');
+  await page.evaluate(() => {
+    (window as unknown as { swaps: number }).swaps = 0;
+    document.body.addEventListener('htmx:oobAfterSwap', () => (window as unknown as { swaps: number }).swaps++);
+  });
+  factory.fixture('log', '--job', id, '--text', 'more', '--count', '1');
+  await expect.poll(() => page.evaluate(() => (window as unknown as { swaps: number }).swaps)).toBeGreaterThan(0);
+  await page.keyboard.press(' ');
+  await expect(toggle(page, 'spec')).toHaveAttribute('aria-expanded', 'false');
+  await page.keyboard.press(' ');
+  await expect(toggle(page, 'spec')).toHaveAttribute('aria-expanded', 'true');
+  await expect(body(page, 'spec')).toBeVisible();
+});
+
+test('a collapsed header keeps its counts', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project, 5);
+  await page.goto(`/jobs/${id}`);
+
+  await toggle(page, 'log').click();
+  await toggle(page, 'mcp-calls').click();
+  await expect(card(page, 'log').locator('.log-count')).toHaveText('5 lines');
+  await expect(card(page, 'mcp-calls').locator('.log-count')).toContainText('1 call');
+});
+
+test('the Edit link opens the edit page in a collapsed request card', async ({ page, factory, project }) => {
+  const id = newJob(factory, project, 'requested');
+  await page.goto(`/jobs/${id}`);
+  await page.getByRole('link', { name: 'Edit' }).click();
+  await expect(page).toHaveURL(new RegExp(`/jobs/${id}/edit$`));
+
+  await page.goto(`/jobs/${id}`);
+  await toggle(page, 'request').click();
+  await expect(body(page, 'request')).toBeHidden();
+  await page.getByRole('link', { name: 'Edit' }).click();
+  await expect(page).toHaveURL(new RegExp(`/jobs/${id}/edit$`));
+});
+
+test('collapsed cards stay collapsed across a poll', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  await page.goto(`/jobs/${id}`);
+  await page.evaluate(() => {
+    (window as unknown as { loadedOnce: boolean }).loadedOnce = true;
+  });
+  await toggle(page, 'log').click();
+  await toggle(page, 'spec').click();
+
+  factory.fixture('log', '--job', id, '--text', 'more', '--count', '4');
+  await expect(card(page, 'log').locator('.log-count')).toHaveText('7 lines');
+
+  await expectOnly(page, ['log', 'spec']);
+  expect(await page.evaluate(() => (window as unknown as { loadedOnce?: boolean }).loadedOnce)).toBe(true);
+});
+
+test('a collapsed card is never shown expanded after a swap', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  await page.goto(`/jobs/${id}`);
+  await toggle(page, 'log').click();
+  await toggle(page, 'spec').click();
+  await page.evaluate(() => {
+    const seen: string[] = [];
+    (window as unknown as { seen: string[] }).seen = seen;
+    document.body.addEventListener('htmx:oobAfterSwap', () => {
+      for (const section of ['log', 'spec']) {
+        const card = document.querySelector(`[data-section="${section}"]`);
+        const hidden = card?.querySelector('.card-body')?.hasAttribute('hidden');
+        const expanded = card?.querySelector('button.section-toggle')?.getAttribute('aria-expanded');
+        seen.push(`${section}:${hidden}:${expanded}`);
+      }
+    });
+  });
+
+  factory.fixture('log', '--job', id, '--text', 'more', '--count', '1');
+  await expect(card(page, 'log').locator('.log-count')).toHaveText('4 lines');
+
+  const seen = await page.evaluate(() => (window as unknown as { seen: string[] }).seen);
+  expect(seen.length).toBeGreaterThan(0);
+  for (const entry of seen) expect(entry).toMatch(/:true:false$/);
+});
+
+test('a collapsed card survives a reload and a visit to the board', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  await page.goto(`/jobs/${id}`);
+  await toggle(page, 'plan').click();
+
+  await page.reload();
+  await expectOnly(page, ['plan']);
+
+  await page.goto('/');
+  await page.goto(`/jobs/${id}`);
+  await expectOnly(page, ['plan']);
+
+  await toggle(page, 'plan').click();
+  await page.reload();
+  await expectOnly(page, []);
+});
+
+test('collapsing on one job leaves another job expanded', async ({ page, factory, project }) => {
+  const a = fullJob(factory, project);
+  const b = fullJob(factory, project);
+  await page.goto(`/jobs/${a}`);
+  await toggle(page, 'spec').click();
+
+  await page.goto(`/jobs/${b}`);
+  await expectOnly(page, []);
+  expect(await stored(page, b)).toBeNull();
+});
+
+test('expanding every card clears the stored entry', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  await page.goto(`/jobs/${id}`);
+  await toggle(page, 'spec').click();
+  await toggle(page, 'log').click();
+  expect(await stored(page, id)).toBe(JSON.stringify(['spec', 'log']));
+
+  await toggle(page, 'spec').click();
+  await toggle(page, 'log').click();
+  expect(await stored(page, id)).toBeNull();
+});
+
+test('a corrupt stored entry leaves every card expanded', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  const errors: Error[] = [];
+  page.on('pageerror', (error) => errors.push(error));
+  await page.addInitScript((key) => localStorage.setItem(key, '{not json'), `factory.job-sections:${id}`);
+  await page.goto(`/jobs/${id}`);
+
+  await expectOnly(page, []);
+  expect(errors).toEqual([]);
+});
+
+test('an opened MCP server group stays open across collapsing its card', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project);
+  factory.fixture('mcp', '--job', id, '--server', 'github', '--tool', 'list_issues');
+  await page.goto(`/jobs/${id}`);
+  const group = card(page, 'mcp-calls').locator('details.mcp-call-group');
+  await group.locator('summary').click();
+  await expect(group).toHaveJSProperty('open', true);
+
+  await toggle(page, 'mcp-calls').click();
+  factory.fixture('mcp', '--job', id, '--server', 'github', '--tool', 'create_issue');
+  await expect(card(page, 'mcp-calls').locator('.log-count')).toContainText('3 calls');
+  await toggle(page, 'mcp-calls').click();
+
+  await expect(group.locator('li.mcp-call')).toHaveCount(3);
+  await expect(group).toHaveJSProperty('open', true);
+});
+
+test('the log keeps its place while its card is collapsed', async ({ page, factory, project }) => {
+  const id = fullJob(factory, project, 80);
+  await page.goto(`/jobs/${id}`);
+  const log = page.locator('#job-log ol.log');
+  const fromBottom = () => log.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+  await expect.poll(fromBottom).toBeLessThan(4);
+
+  await log.evaluate((el) => {
+    el.scrollTop = 120;
+  });
+  await toggle(page, 'log').click();
+  factory.fixture('log', '--job', id, '--text', 'more', '--count', '1');
+  await expect(card(page, 'log').locator('.log-count')).toHaveText('81 lines');
+  await toggle(page, 'log').click();
+  await expect(log.locator('li')).toHaveCount(81);
+  await expect(log).toHaveJSProperty('scrollTop', 120);
+
+  await log.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await toggle(page, 'log').click();
+  factory.fixture('log', '--job', id, '--text', 'last', '--count', '1');
+  await expect(card(page, 'log').locator('.log-count')).toHaveText('82 lines');
+  await toggle(page, 'log').click();
+  await expect(log.locator('li')).toHaveCount(82);
+  await expect.poll(fromBottom).toBeLessThan(4);
 });

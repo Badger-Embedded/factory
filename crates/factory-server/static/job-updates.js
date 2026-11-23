@@ -6,6 +6,12 @@
   function logEl() {
     return document.querySelector("#job-log ol.log");
   }
+  // A collapsed Log card hides the list, and a hidden list reports zero for
+  // `scrollTop` and `scrollHeight`, so the remembered place is kept as is.
+  function hidden(el) {
+    var body = el.closest(".card-body");
+    return !!body && body.hidden;
+  }
   function atBottom(el) {
     return el.scrollHeight - el.scrollTop - el.clientHeight < 4;
   }
@@ -49,7 +55,7 @@
     // Remember the scroll place before the log is replaced.
     if (target.id === "job-log") {
       var el = logEl();
-      if (el) {
+      if (el && !hidden(el)) {
         pinned = atBottom(el);
         top = el.scrollTop;
       }
@@ -64,10 +70,24 @@
     }
   });
 
+  // `job-sections.js` announces a card collapsing, before it hides the card,
+  // and expanding, after it shows the card again.
+  document.body.addEventListener("factory:section-toggle", function (e) {
+    if (e.detail.section !== "log") return;
+    var el = logEl();
+    if (!el) return;
+    if (e.detail.open) {
+      place(el);
+    } else if (!hidden(el)) {
+      pinned = atBottom(el);
+      top = el.scrollTop;
+    }
+  });
+
   // Save the place for a manual reload or a move to another page.
   window.addEventListener("pagehide", function () {
     var el = logEl();
-    var state = el ? { bottom: atBottom(el), top: el.scrollTop } : { bottom: pinned, top: top };
+    var state = el && !hidden(el) ? { bottom: atBottom(el), top: el.scrollTop } : { bottom: pinned, top: top };
     try {
       sessionStorage.setItem(key, JSON.stringify(state));
     } catch (e) {}

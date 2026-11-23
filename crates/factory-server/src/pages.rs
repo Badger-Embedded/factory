@@ -49,6 +49,7 @@ const HEADER_NAME_PATTERN: &str = r"[A-Za-z0-9!#$%&'*+.^_`\|~\-]+";
 /// runs once on the job page, outside every swapped region, so a swap never
 /// re-runs or removes it.
 const JOB_UPDATES: &str = include_str!("../static/job-updates.js");
+const JOB_SECTIONS: &str = include_str!("../static/job-sections.js");
 const LOCAL_TIME: &str = include_str!("../static/local-time.js");
 /// Reopens a `<details>` a poll swap would close, keyed by its `data-key`. It
 /// runs once per page, outside every swapped region, and covers the board's
@@ -2923,7 +2924,7 @@ pub fn job(
                     p.meta { "Approval gates: " (gates_line(job.gates())) }
                 }
                 aside.job-side { (timeline_region(false, job, events, models, efforts)) }
-                div.job-main {
+                div.job-main data-job=(id) {
                     (request_card(id, job, images, files))
                     (spec_region(false, job))
                     (plan_region(false, job, repo_url))
@@ -2938,6 +2939,7 @@ pub fn job(
                 }
             }
             script { (PreEscaped(JOB_UPDATES)) }
+            script { (PreEscaped(JOB_SECTIONS)) }
             script { (PreEscaped(DETAILS_STATE)) }
             script { (PreEscaped(LOCAL_TIME)) }
         },
@@ -3115,20 +3117,18 @@ fn mcp_calls_card(job: &Job, events: &[JobEvent]) -> Markup {
     }
     html! {
         @if !rows.is_empty() {
-            div.card {
-                div.card-head {
-                    h2 { "MCP tool calls" }
-                    span.log-count {
-                        (rows.len()) " " (plural(rows.len(), "call"))
-                        @if refused > 0 { " · " (refused) " refused" }
-                    }
+            (section_card("mcp-calls", "MCP tool calls", &html! {
+                span.log-count {
+                    (rows.len()) " " (plural(rows.len(), "call"))
+                    @if refused > 0 { " · " (refused) " refused" }
                 }
+            }, &html! {
                 ol.mcp-calls {
                     @for (server, calls) in &groups {
                         li { (mcp_call_group(job, server, calls)) }
                     }
                 }
-            }
+            }))
         }
     }
 }
@@ -3332,15 +3332,33 @@ fn renovate_details(pr: &RenovatePr, settings: &Settings, gap_links: &[i64]) -> 
     }
 }
 
+/// The aside stays outside the toggle button, so a click on it does not
+/// collapse the card. The button has an id so htmx keeps focus on it across a
+/// poll swap. `data-section`, not `data-key`, keeps the card out of
+/// `details-state.js`.
+fn section_card(section: &str, heading: &str, aside: &Markup, body: &Markup) -> Markup {
+    html! {
+        div.card.section data-section=(section) {
+            div.card-head {
+                h2 {
+                    button.section-toggle type="button" id={ "toggle-" (section) } aria-expanded="true" aria-controls={ "section-" (section) } {
+                        (heading)
+                    }
+                }
+                (aside)
+            }
+            div.card-body id={ "section-" (section) } { (body) }
+        }
+    }
+}
+
 fn request_card(id: i64, job: &Job, images: &[String], files: &[JobFile]) -> Markup {
     html! {
-        div.card {
-            div.card-head {
-                h2 { "Request" }
-                @if *job.stage() == Stage::Requested {
-                    a.nav href={ "/jobs/" (id) "/edit" } { "Edit" }
-                }
+        (section_card("request", "Request", &html! {
+            @if *job.stage() == Stage::Requested {
+                a.nav href={ "/jobs/" (id) "/edit" } { "Edit" }
             }
+        }, &html! {
             pre.doc { (job.request()) }
             @if !images.is_empty() {
                 ul.request-images {
@@ -3365,7 +3383,7 @@ fn request_card(id: i64, job: &Job, images: &[String], files: &[JobFile]) -> Mar
                     }
                 }
             }
-        }
+        }))
     }
 }
 
@@ -3484,10 +3502,7 @@ fn file_icon(zip: bool) -> Markup {
 fn spec_card(job: &Job) -> Markup {
     html! {
         @if let Some(spec) = job.spec() {
-            div.card {
-                h2 { "Spec" }
-                pre.doc { (spec) }
-            }
+            (section_card("spec", "Spec", &html! {}, &html! { pre.doc { (spec) } }))
         }
     }
 }
@@ -3495,8 +3510,7 @@ fn spec_card(job: &Job) -> Markup {
 fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
     html! {
         @if !job.plan().is_empty() {
-            div.card {
-                h2 { "Plan" }
+            (section_card("plan", "Plan", &html! {}, &html! {
                 ol.plan {
                     @for (index, pr) in job.plan().iter().enumerate() {
                         li {
@@ -3520,7 +3534,7 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
                         }
                     }
                 }
-            }
+            }))
         }
     }
 }
@@ -3532,8 +3546,7 @@ fn plan_card(job: &Job, repo_url: Option<&str>) -> Markup {
 fn reviews_card(job: &Job) -> Markup {
     html! {
         @if !job.reviews().is_empty() {
-            div.card {
-                h2 { "LLM review" }
+            (section_card("reviews", "LLM review", &html! {}, &html! {
                 ol.reviews {
                     @for pass in job.reviews() {
                         li {
@@ -3549,7 +3562,7 @@ fn reviews_card(job: &Job) -> Markup {
                         }
                     }
                 }
-            }
+            }))
         }
     }
 }
@@ -3571,11 +3584,9 @@ fn verdict_label(verdict: Verdict) -> &'static str {
 fn log_card(logs: &[LogEntry]) -> Markup {
     html! {
         @if !logs.is_empty() {
-            div.card {
-                div.card-head {
-                    h2 { "Log" }
-                    span.log-count { (logs.len()) @if logs.len() == 1 { " line" } @else { " lines" } }
-                }
+            (section_card("log", "Log", &html! {
+                span.log-count { (logs.len()) @if logs.len() == 1 { " line" } @else { " lines" } }
+            }, &html! {
                 ol.log {
                     @for entry in logs {
                         li class={ "log-" (entry.kind) } {
@@ -3584,7 +3595,7 @@ fn log_card(logs: &[LogEntry]) -> Markup {
                         }
                     }
                 }
-            }
+            }))
         }
     }
 }
