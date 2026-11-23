@@ -276,9 +276,13 @@ pub enum RebaseState {
 }
 
 /// How a fix job ended, as the scheduler reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixOutcome {
-    Merged,
+    /// The fix merged while the Renovate pull request had head `head`. The
+    /// last head the job observed may be older or newer.
+    Merged {
+        head: String,
+    },
     Cancelled,
     /// A pull request of the fix job closed without merging.
     Closed,
@@ -408,13 +412,7 @@ impl RenovatePr {
         Ask::Renovate { reason, state }
     }
 
-    fn on_fix_ended(
-        &mut self,
-        turn: &Turn,
-        job: i64,
-        outcome: FixOutcome,
-        merged_head: Option<String>,
-    ) -> Turn {
+    fn on_fix_ended(&mut self, turn: &Turn, job: i64, outcome: FixOutcome) -> Turn {
         let earlier = match &self.fix {
             Some(FixLink {
                 job: linked,
@@ -427,10 +425,7 @@ impl RenovatePr {
         if busy {
             return turn.clone();
         }
-        if outcome == FixOutcome::Merged {
-            let head = merged_head
-                .or_else(|| self.head.clone())
-                .unwrap_or_default();
+        if let FixOutcome::Merged { head } = outcome {
             self.fix = Some(FixLink {
                 job,
                 state: FixState::Merged {
@@ -446,7 +441,9 @@ impl RenovatePr {
             FixOutcome::Cancelled => format!("Fix job #{job} was cancelled."),
             FixOutcome::Closed => format!("Fix job #{job} was closed without merging."),
             FixOutcome::Dismissed => format!("Fix job #{job} was dismissed after a failure."),
-            _ => format!("Fix job #{job} was deleted."),
+            FixOutcome::Deleted | FixOutcome::Merged { .. } => {
+                format!("Fix job #{job} was deleted.")
+            }
         };
         let restores = matches!(
             turn,
@@ -498,13 +495,14 @@ impl RenovatePr {
             return false;
         }
         let Some(FixLink {
-            state: FixState::Merged { rebase, .. },
+            state: FixState::Merged { head, rebase },
             ..
         }) = &mut self.fix
         else {
             return false;
         };
         *rebase = to;
+        self.head = Some(head.clone());
         self.pending = None;
         true
     }
@@ -1218,10 +1216,6 @@ pub enum Event {
     FixEnded {
         job: i64,
         outcome: FixOutcome,
-        /// For a merge, the head of the Renovate pull request when the fix
-        /// merged. It can differ from the last head the job observed, which
-        /// may be older or newer. `None` uses the last observed head.
-        head: Option<String>,
     },
     /// The factory ticked Renovate's rebase checkbox.
     RebaseRequested,
@@ -1920,7 +1914,7 @@ impl Job {
                 });
                 Turn::User(pr.fix_ask())
             }
-            (_, E::FixEnded { job, outcome, head }) => pr.on_fix_ended(&turn, job, outcome, head),
+            (_, E::FixEnded { job, outcome }) => pr.on_fix_ended(&turn, job, outcome),
             (Turn::Factory, E::RebaseRequested) if pr.rebased(RebaseState::Requested) => {
                 Turn::User(pr.fix_ask())
             }

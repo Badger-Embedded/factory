@@ -3154,14 +3154,7 @@ fn fixing_job() -> Job {
 }
 
 fn fix_ended(job: &mut Job, outcome: FixOutcome) {
-    apply(
-        job,
-        Event::FixEnded {
-            job: 7,
-            outcome,
-            head: None,
-        },
-    );
+    apply(job, Event::FixEnded { job: 7, outcome });
 }
 
 fn fix_merged_on(job: &mut Job, head: &str) {
@@ -3169,8 +3162,7 @@ fn fix_merged_on(job: &mut Job, head: &str) {
         job,
         Event::FixEnded {
             job: 7,
-            outcome: FixOutcome::Merged,
-            head: Some(head.into()),
+            outcome: FixOutcome::Merged { head: head.into() },
         },
     );
 }
@@ -3240,12 +3232,12 @@ fn a_fix_starts_once_and_the_job_waits_for_it() {
 #[test]
 fn a_merged_fix_queues_one_rebase_request() {
     let mut job = fixing_job();
-    fix_ended(&mut job, FixOutcome::Merged);
+    fix_merged_on(&mut job, "h1");
     assert_eq!(job.turn(), &Turn::Factory);
     assert_eq!(rebase_head(&job).as_deref(), Some("h1"));
 
     let before = job.clone();
-    fix_ended(&mut job, FixOutcome::Merged);
+    fix_merged_on(&mut job, "h1");
     assert_eq!(job, before);
 
     apply(&mut job, Event::RebaseRequested);
@@ -3256,7 +3248,7 @@ fn a_merged_fix_queues_one_rebase_request() {
     );
     assert_eq!(rebase_head(&job), None);
     let before = job.clone();
-    fix_ended(&mut job, FixOutcome::Merged);
+    fix_merged_on(&mut job, "h1");
     assert_eq!(job, before);
     assert!(!job.can_retry());
 }
@@ -3269,8 +3261,7 @@ fn another_fix_job_ending_changes_nothing() {
         &mut job,
         Event::FixEnded {
             job: 8,
-            outcome: FixOutcome::Merged,
-            head: None,
+            outcome: FixOutcome::Merged { head: "h1".into() },
         },
     );
     assert_eq!(job, before);
@@ -3326,7 +3317,7 @@ fn a_new_head_keeps_a_running_fix() {
         Some("CI still fails after 0 reruns on this head commit.")
     );
 
-    fix_ended(&mut job, FixOutcome::Merged);
+    fix_merged_on(&mut job, "h2");
     assert_eq!(rebase_head(&job).as_deref(), Some("h2"));
 }
 
@@ -3360,10 +3351,30 @@ fn a_fix_merged_on_a_head_not_yet_observed_asks_for_that_head() {
 }
 
 #[test]
+fn the_merge_time_head_is_the_baseline_after_the_rebase_result() {
+    let results = [
+        Event::RebaseRequested,
+        Event::RebaseFailed { reason: "x".into() },
+    ];
+    for result in results {
+        let mut job = fixing_job();
+        observe(&mut job, "h1", RenovateCi::Pending, LIMITS, false);
+        fix_merged_on(&mut job, "h2");
+        apply(&mut job, result);
+        let before = job.clone();
+        observe(&mut job, "h2", failed("log"), LIMITS, false);
+        assert_eq!(job, before);
+        observe(&mut job, "h3", failed("log"), LIMITS, false);
+        assert!(matches!(job.turn(), Turn::RerunCi { .. }));
+        assert_eq!(pr_of(&job).fix, None);
+    }
+}
+
+#[test]
 fn a_new_head_after_the_rebase_request_starts_triage_over() {
     let merged = || {
         let mut job = fixing_job();
-        fix_ended(&mut job, FixOutcome::Merged);
+        fix_merged_on(&mut job, "h1");
         apply(&mut job, Event::RebaseRequested);
         job
     };
@@ -3386,7 +3397,7 @@ fn a_new_head_after_the_rebase_request_starts_triage_over() {
 #[test]
 fn a_failed_rebase_request_asks_for_a_hand_rebase_and_a_new_head_restarts() {
     let mut job = fixing_job();
-    fix_ended(&mut job, FixOutcome::Merged);
+    fix_merged_on(&mut job, "h1");
     apply(
         &mut job,
         Event::RebaseFailed {
@@ -3418,7 +3429,7 @@ fn a_failed_rebase_request_asks_for_a_hand_rebase_and_a_new_head_restarts() {
 #[test]
 fn a_skipped_rebase_request_goes_back_to_triage() {
     let mut job = fixing_job();
-    fix_ended(&mut job, FixOutcome::Merged);
+    fix_merged_on(&mut job, "h1");
     apply(&mut job, Event::RebaseSkipped);
     assert_eq!(job.turn(), &Turn::Factory);
     assert_eq!(pr_of(&job).fix, None);
@@ -3436,7 +3447,7 @@ fn rebase_events_need_a_pending_request_and_an_observation_waits_for_it() {
     ] {
         assert!(job.clone().apply(event).is_err());
     }
-    fix_ended(&mut job, FixOutcome::Merged);
+    fix_merged_on(&mut job, "h1");
     let observed = Event::RenovateObserved {
         head: "h2".into(),
         ci: RenovateCi::Pending,
@@ -3458,12 +3469,12 @@ fn renovate_merged_or_closed_ends_the_job_while_a_fix_runs() {
         assert_eq!(running.stage(), &stage);
 
         let mut pending = fixing_job();
-        fix_ended(&mut pending, FixOutcome::Merged);
+        fix_merged_on(&mut pending, "h1");
         apply(&mut pending, event.clone());
         assert_eq!(pending.stage(), &stage);
 
         let mut waiting = fixing_job();
-        fix_ended(&mut waiting, FixOutcome::Merged);
+        fix_merged_on(&mut waiting, "h1");
         apply(&mut waiting, Event::RebaseRequested);
         apply(&mut waiting, event);
         assert_eq!(waiting.stage(), &stage);
