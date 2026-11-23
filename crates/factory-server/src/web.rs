@@ -2766,6 +2766,7 @@ async fn save_project_name(
     require_csrf(&state, &user(&headers), &form.csrf)?;
     // Onboarding holds this lock from its name check to its insert.
     let _one_onboarding_at_a_time = state.onboarding.lock().await;
+    visible_project(&state, &headers, &project)?;
     let problem = match display_name_value(&project, &form.display_name) {
         Ok(value) => match state
             .store
