@@ -354,8 +354,13 @@ pub struct PackagingRequest {
     pub account: AccountSource,
     /// The maintained repository as `owner/name`.
     pub repo: String,
-    /// The upstream repository as `owner/name`.
+    /// The upstream repository, in the form its forge uses.
     pub upstream: String,
+    /// The forge the upstream lives on.
+    pub upstream_forge: ForgeKind,
+    /// Gives the credential that reads the upstream: the upstream token, the
+    /// project token for an upstream on the project's forge, or no token.
+    pub upstream_account: AccountSource,
     /// The base branch, where the manifest files are read after the merge.
     pub base: String,
     pub number: u64,
@@ -936,6 +941,12 @@ impl<E: Executor> Scheduler<E> {
             account: resolved.source.clone(),
             repo: project.repo.clone(),
             upstream: packaging.upstream_repo,
+            upstream_forge: packaging.upstream_forge,
+            upstream_account: self.accounts.upstream_source(
+                &row.project,
+                project,
+                packaging.upstream_forge,
+            ),
             base: project.base.clone(),
             number,
             manifest_files: packaging.manifest_files,

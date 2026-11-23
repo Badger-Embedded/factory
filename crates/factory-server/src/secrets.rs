@@ -315,6 +315,17 @@ pub trait SecretStore: Send + Sync {
         owner: ForgeTokenOwner<'_>,
     ) -> Result<Option<(String, ForgeAccount)>, SecretError>;
 
+    /// As [`SecretStore::forge_token_with_account`], with the sealed bytes of
+    /// the row the token came from.
+    ///
+    /// # Errors
+    ///
+    /// As [`SecretStore::forge_token`].
+    fn forge_token_sealed(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<(String, ForgeAccount, Vec<u8>)>, SecretError>;
+
     /// Deletes the forge token of `owner` and its recorded account in one
     /// transaction. Clearing a token that is not there
     /// is fine, and it works with the store unavailable.
@@ -555,6 +566,15 @@ impl SecretStore for LocalSecrets {
         &self,
         owner: ForgeTokenOwner<'_>,
     ) -> Result<Option<(String, ForgeAccount)>, SecretError> {
+        Ok(self
+            .forge_token_sealed(owner)?
+            .map(|(token, account, _)| (token, account)))
+    }
+
+    fn forge_token_sealed(
+        &self,
+        owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<(String, ForgeAccount, Vec<u8>)>, SecretError> {
         let (project, header) = owner.row();
         let at = SecretRef {
             project: &project,
@@ -564,7 +584,8 @@ impl SecretStore for LocalSecrets {
         let Some((backend, stored, account)) = self.store.forge_token_snapshot(at, owner)? else {
             return Ok(None);
         };
-        Ok(Some((self.open(&backend, &stored, &owner.aad())?, account)))
+        let token = self.open(&backend, &stored, &owner.aad())?;
+        Ok(Some((token, account, stored)))
     }
 
     fn delete_forge_token(&self, owner: ForgeTokenOwner<'_>) -> Result<(), SecretError> {
@@ -687,6 +708,13 @@ impl SecretStore for UnavailableSecrets {
         &self,
         _owner: ForgeTokenOwner<'_>,
     ) -> Result<Option<(String, ForgeAccount)>, SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn forge_token_sealed(
+        &self,
+        _owner: ForgeTokenOwner<'_>,
+    ) -> Result<Option<(String, ForgeAccount, Vec<u8>)>, SecretError> {
         Err(SecretError::Unavailable)
     }
 

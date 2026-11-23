@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use factory_core::Event;
-use factory_runner::{Account, Expect, Forge, ForgeKind, Git, GitHub, WorkerConfig};
+use factory_runner::{Account, Expect, Forge, ForgeKind, Git, GitHub, GitLab, WorkerConfig};
 use factory_server::{
     AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
     LocalSecrets, MASTER_KEY_LEN, Operation, Owner, PlanUsageCache, PodmanExecutor, Rebase,
@@ -306,7 +306,7 @@ fn gh_executor(
     std::fs::write(
         &gh,
         format!(
-            "#!/bin/bash\necho \"$@\" >> '{}'\ncase \"$1 $2\" in\n\
+            "#!/bin/bash\necho \"[$GH_TOKEN] $@\" >> '{}'\ncase \"$1 $2\" in\n\
              \"pr view\") cat '{}';;\n\
              \"pr diff\") if [ -f '{diff}' ]; then cat '{diff}'; else head -c {diff_bytes} /dev/zero | tr '\\0' x; fi;;\n\
              \"api --method\") echo '{{\"content\":\"bmFtZQ==\",\"type\":\"file\",\"encoding\":\"base64\"}}';;\n\
@@ -354,6 +354,8 @@ fn packaging_request(
         account: AccountSource::fixed(test_account()),
         repo: "o/r".into(),
         upstream: "up/app".into(),
+        upstream_forge: ForgeKind::GitHub,
+        upstream_account: AccountSource::fixed(test_account()),
         base: "main".into(),
         number: 5,
         manifest_files: vec!["snap/snapcraft.yaml".into()],
@@ -362,6 +364,129 @@ fn packaging_request(
         from: range.map(|(from, _)| from.to_owned()),
         to: range.map(|(_, to)| to.to_owned()),
     }
+}
+
+#[tokio::test]
+async fn the_upstream_is_read_with_the_upstream_account_and_the_pull_request_with_the_project_account()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let (podman, calls) = gh_executor(dir.path(), &view("h1", COMPARE_BODY, &[]), 10);
+    let mut request = packaging_request(None, None);
+    request.account = AccountSource::fixed(Account {
+        token: Some("ghp_project".into()),
+        ..test_account()
+    });
+    request.upstream_account = AccountSource::fixed(Account {
+        token: Some("ghp_upstream".into()),
+        ..test_account()
+    });
+
+    podman.gather_packaging(request).await.unwrap();
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("[ghp_project] pr view"), "{calls}");
+    assert!(calls.contains("[ghp_project] api --method"), "{calls}");
+    assert!(
+        calls.contains("[ghp_upstream] api repos/up/app/compare/v1...v2"),
+        "{calls}"
+    );
+    assert!(!calls.contains("[ghp_project] api repos/up/app"), "{calls}");
+}
+
+#[tokio::test]
+async fn a_salsa_project_reads_its_merge_request_on_salsa_and_its_github_upstream_on_github() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let script = |name: &str, token: &str, body: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/bash\necho \"{name} [${token}] $@\" >> '{}'\n{body}\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let glab = script(
+        "glab",
+        "GITLAB_TOKEN",
+        r#"case "$4" in
+  */merge_requests/5/versions/1*) echo '{"state":"collected","head_commit_sha":"h1","real_size":"1","diffs":[{"old_path":"debian/control","new_path":"debian/control","diff":"@@ -1 +1 @@\n-a\n+b\n"}]}';;
+  */merge_requests/5/versions*) echo '[{"id":1,"head_commit_sha":"h1","created_at":"2024-01-01T00:00:00Z"}]';;
+  */merge_requests/5*) echo '{"iid":5,"title":"Update app","description":"Bumps app. [Compare Source](https://github.com/up/app/compare/v1...v2)","sha":"h1"}';;
+  */repository/files/*) echo manifest;;
+  *) echo "fake glab: unexpected: $*" >&2; exit 1;;
+esac"#,
+    );
+    let gh = script(
+        "gh",
+        "GH_TOKEN",
+        r#"case "$2" in
+  repos/up/app/compare/*) echo '{"files":[{"filename":"CMakeLists.txt","patch":"@@ new"}]}';;
+  *) echo "fake gh: unexpected: $*" >&2; exit 1;;
+esac"#,
+    );
+    let secrets: Arc<dyn SecretStore> = Arc::new(LocalSecrets::new(
+        &[7; MASTER_KEY_LEN],
+        Arc::new(Store::open_in_memory().unwrap()),
+    ));
+    let mut podman = executor(
+        registry(&secrets),
+        dir.path().to_owned(),
+        Arc::new(Store::open_in_memory().unwrap()),
+    );
+    podman.forges = forges(GitHub {
+        gh,
+        ..GitHub::default()
+    })
+    .with_salsa(Arc::new(GitLab {
+        glab,
+        ..GitLab::default()
+    }));
+    let mut request = packaging_request(None, None);
+    request.forge = ForgeKind::Salsa;
+    request.repo = "team/pkg".into();
+    request.manifest_files = vec!["debian/control".into()];
+    request.account = AccountSource::fixed(Account {
+        token: Some("glpat-project".into()),
+        ..test_account()
+    });
+    request.upstream_account = AccountSource::fixed(Account {
+        token: Some("ghp_upstream".into()),
+        ..test_account()
+    });
+
+    let context = podman.gather_packaging(request).await.unwrap();
+
+    assert_eq!(context.from.as_deref(), Some("v1"));
+    assert_eq!(
+        context.manifests[0].text.as_deref().map(str::trim),
+        Some("manifest")
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    for line in calls.lines() {
+        if line.starts_with("glab") {
+            assert!(line.starts_with("glab [glpat-project] api"), "{line}");
+            assert!(line.contains("--hostname salsa.debian.org"), "{line}");
+            assert!(!line.contains("up/app"), "{line}");
+        } else {
+            assert!(
+                line.starts_with("gh [ghp_upstream] api repos/up/app/compare/v1...v2"),
+                "{line}"
+            );
+        }
+    }
+    assert!(
+        calls.contains(
+            "glab [glpat-project] api --method GET projects/team%2Fpkg/merge_requests/5 "
+        )
+    );
+    assert!(calls.lines().any(|line| line.starts_with("gh ")), "{calls}");
 }
 
 const COMPARE_BODY: &str = "Bumps app. [Compare Source](https://github.com/up/app/compare/v1...v2)";

@@ -46,6 +46,8 @@ The factory has no account of its own. Each operation of a job runs as one of tw
 
 A project with no project token cannot run jobs that use it, and the board and the project page say so. A token the forge refuses fails the operation with a message that names the token and the page that replaces it. The account of a token should be a bot account: the factory ignores pull request comments from it, and GitHub does not let an account approve its own pull request. A job's commits carry the account's login and its noreply address.
 
+A packaging project can read its upstream repository on another forge than its own. The Maintenance card has an "Upstream forge" select and a "Check connection" button that shows which credential was used and whether the repository was readable. A job reads the upstream with the optional upstream token when one is stored, with the project token when the upstream is on the project's forge, and with no token otherwise. A public GitHub upstream needs no token, but unauthenticated reads are rate limited.
+
 The access each account needs on the repository:
 
 | Use | Access |
