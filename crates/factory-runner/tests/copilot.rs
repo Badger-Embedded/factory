@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use factory_core::{Agent, AgentResult, Event, PrDescription};
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, RunResult, SessionRun, WorkerConfig, WorkerRun, backend,
-    run,
+    AgentItem, Expect, LogLine, McpConfig, McpServerEntry, RunResult, SessionRun, WorkerConfig,
+    WorkerRun, backend, run,
 };
 
 const SESSION: &str = "d3c2f38c-6c9e-4528-9666-a9c3d7aff405";
@@ -158,7 +158,9 @@ fn the_mcp_token_passes_by_name_only_and_the_login_never_enters_the_arguments() 
     run.mcp = Some(McpConfig {
         proxy_url: "http://factory:8081".into(),
         token: "d34db33f-run-token".into(),
-        servers: vec!["context7".into(), "docs".into()],
+        servers: ["context7", "docs"]
+            .map(|name| McpServerEntry::Remote { name: name.into() })
+            .to_vec(),
     });
     let args = copilot_args(&run);
 

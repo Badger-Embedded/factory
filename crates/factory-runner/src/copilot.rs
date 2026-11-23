@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult};
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
-use crate::worker::{AGENTS_DIR, McpConfig, SessionRun, WorkerConfig, WorkerRun};
+use crate::worker::{AGENTS_DIR, McpConfig, McpServerEntry, SessionRun, WorkerConfig, WorkerRun};
 
 /// The Copilot config directory inside the worker, mounted from the job's
 /// `copilot` directory on the host and passed to Copilot as `COPILOT_HOME`. It
@@ -173,8 +173,8 @@ fn mcp_config(mcp: &McpConfig) -> String {
     let servers: serde_json::Map<String, Value> = mcp
         .servers
         .iter()
-        .map(|name| {
-            (
+        .map(|server| match server {
+            McpServerEntry::Remote { name } => (
                 name.clone(),
                 serde_json::json!({
                     "type": "http",
@@ -182,7 +182,7 @@ fn mcp_config(mcp: &McpConfig) -> String {
                     "headers": { "Authorization": format!("Bearer ${{{MCP_TOKEN_ENV}}}") },
                     "tools": ["*"],
                 }),
-            )
+            ),
         })
         .collect();
     serde_json::json!({ "mcpServers": servers }).to_string()

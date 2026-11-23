@@ -41,14 +41,17 @@ fn create_lists_and_gets_a_server() {
 
     assert_eq!(
         store.mcp_servers().expect("list"),
-        vec![McpServer {
-            name: "context7".to_owned(),
-            url: "https://mcp.context7.com/mcp".to_owned(),
-            headers: headers(&["Authorization"]),
-        }],
+        vec![McpServer::remote(
+            "context7",
+            "https://mcp.context7.com/mcp",
+            headers(&["Authorization"]),
+        )],
     );
     assert_eq!(
-        store.mcp_server("context7").expect("get").map(|s| s.url),
+        store
+            .mcp_server("context7")
+            .expect("get")
+            .map(|s| s.as_remote().unwrap().0.to_owned()),
         Some("https://mcp.context7.com/mcp".to_owned()),
     );
     assert!(store.mcp_server("absent").expect("get absent").is_none());
@@ -61,7 +64,7 @@ fn a_keyless_server_stores_no_headers() {
         .create_mcp_server("context7", "https://mcp.context7.com/mcp", &[])
         .expect("create keyless");
     let server = store.mcp_server("context7").expect("get").expect("present");
-    assert_eq!(server.headers, Vec::<String>::new());
+    assert_eq!(server.as_remote().unwrap().1, Vec::<String>::new());
 }
 
 #[test]
@@ -74,7 +77,10 @@ fn duplicate_names_are_rejected() {
     assert!(matches!(again, Err(McpError::DuplicateName(name)) if name == "context7"));
     // The first server is untouched.
     assert_eq!(
-        store.mcp_server("context7").expect("get").map(|s| s.url),
+        store
+            .mcp_server("context7")
+            .expect("get")
+            .map(|s| s.as_remote().unwrap().0.to_owned()),
         Some("https://mcp.context7.com/mcp".to_owned()),
     );
 }
@@ -165,7 +171,10 @@ fn duplicate_header_names_are_deduplicated() {
         )
         .expect("create");
     let server = store.mcp_server("context7").expect("get").expect("present");
-    assert_eq!(server.headers, headers(&["Authorization", "X-Api-Key"]));
+    assert_eq!(
+        server.as_remote().unwrap().1,
+        headers(&["Authorization", "X-Api-Key"])
+    );
 }
 
 #[test]
@@ -195,7 +204,10 @@ fn an_edit_validates_the_new_fields() {
     ));
     // The rejected edits left the server as it was.
     let server = store.mcp_server("context7").expect("get").expect("present");
-    assert_eq!(server.url, "https://mcp.context7.com/mcp");
+    assert_eq!(
+        server.as_remote().unwrap().0,
+        "https://mcp.context7.com/mcp"
+    );
 }
 
 #[test]

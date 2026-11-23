@@ -45,6 +45,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::mcp::McpTransport;
 use crate::secrets::{SecretRef, SecretStore};
 use crate::store::Store;
 
@@ -226,8 +227,12 @@ impl Upstreams for StoreUpstreams {
                 return None;
             }
         };
+        let McpTransport::Remote {
+            url,
+            headers: declared,
+        } = registered.transport;
         let mut headers = Vec::new();
-        for header in &registered.headers {
+        for header in &declared {
             let at = SecretRef {
                 project,
                 server,
@@ -253,7 +258,7 @@ impl Upstreams for StoreUpstreams {
             }
         };
         Some(Upstream {
-            url: registered.url,
+            url,
             headers,
             disabled_tools,
         })

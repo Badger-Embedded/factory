@@ -15,7 +15,9 @@ use factory_core::Agent;
 use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult};
 use crate::outcome::{Expect, event_from_result};
 use crate::stream::{StreamItem, parse_line};
-use crate::worker::{AGENTS_DIR, McpConfig, McpUnavailable, SessionRun, WorkerConfig, WorkerRun};
+use crate::worker::{
+    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, SessionRun, WorkerConfig, WorkerRun,
+};
 
 /// The Claude Code config directory inside the worker, mounted from the job's
 /// `claude` directory on the host. It keeps the session files `--resume` reads.
@@ -155,15 +157,15 @@ fn mcp_config(mcp: &McpConfig) -> String {
     let servers: serde_json::Map<String, serde_json::Value> = mcp
         .servers
         .iter()
-        .map(|name| {
-            (
+        .map(|server| match server {
+            McpServerEntry::Remote { name } => (
                 name.clone(),
                 serde_json::json!({
                     "type": "http",
                     "url": format!("{}/mcp/{name}", mcp.proxy_url),
                     "headers": { "Authorization": format!("Bearer {}", mcp.token) },
                 }),
-            )
+            ),
         })
         .collect();
     serde_json::json!({ "mcpServers": servers }).to_string()

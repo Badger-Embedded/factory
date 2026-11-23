@@ -12,7 +12,9 @@ use factory_core::{
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::mcp::{self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState};
+use crate::mcp::{
+    self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
+};
 use crate::projects::{
     Project, ProjectForge, ProjectLabel, StageAgents, StageEfforts, StageModels,
 };
@@ -4016,11 +4018,11 @@ impl Store {
         let mut servers = Vec::new();
         for row in rows {
             let (name, url, headers) = row?;
-            servers.push(McpServer {
+            servers.push(McpServer::remote(
                 name,
                 url,
-                headers: serde_json::from_str(&headers)?,
-            });
+                serde_json::from_str(&headers)?,
+            ));
         }
         Ok(servers)
     }
@@ -4042,11 +4044,11 @@ impl Store {
         let Some((url, headers)) = row else {
             return Ok(None);
         };
-        Ok(Some(McpServer {
-            name: name.to_owned(),
+        Ok(Some(McpServer::remote(
+            name,
             url,
-            headers: serde_json::from_str(&headers)?,
-        }))
+            serde_json::from_str(&headers)?,
+        )))
     }
 
     /// Registers an MCP server. The name, URL and header names are validated,
@@ -4185,7 +4187,8 @@ impl Store {
             return Err(McpError::NotFound(name.to_owned()));
         };
         let stored = self.mcp_secrets(name)?;
-        if !mcp::same_origin(&server.url, url) {
+        let McpTransport::Remote { url: current, .. } = &server.transport;
+        if !mcp::same_origin(current, url) {
             return Ok(stored);
         }
         Ok(stored
