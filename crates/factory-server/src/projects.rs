@@ -127,6 +127,25 @@ fn github() -> ProjectForge {
     ProjectForge::Known(ForgeKind::GitHub)
 }
 
+/// A project as a page shows it: `id` is the identifier that goes into URLs,
+/// form fields and the cookie, `shown` is the name a person reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectLabel {
+    pub id: String,
+    pub shown: String,
+}
+
+impl ProjectLabel {
+    /// A label that shows the identifier.
+    pub fn plain(id: impl Into<String>) -> Self {
+        let id = id.into();
+        Self {
+            shown: id.clone(),
+            id,
+        }
+    }
+}
+
 /// One target repository. The `projects` table holds `forge`, `repo`, `base`
 /// and the optional `checks`. A project's models and its auto-merge and LLM-review
 /// flags live in `project_models` and `project_settings`, so a project read

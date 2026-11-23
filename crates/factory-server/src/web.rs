@@ -25,7 +25,9 @@ use crate::forges::Forges;
 use crate::github::RepoReport;
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages};
 use crate::pages::{self, HeaderState, JobLinks, ProjectSettings, ServerSettings, Workers};
-use crate::projects::{Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels};
+use crate::projects::{
+    Project, ProjectForge, ProjectLabel, Projects, StageAgents, StageEfforts, StageModels,
+};
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
@@ -447,7 +449,7 @@ fn region_response(requested: Option<&str>, region: pages::Region) -> Response {
 /// The store data the board and its fragments render from. Loading it in one
 /// place keeps a fragment and the full page on the same data.
 struct BoardData {
-    names: Vec<String>,
+    names: Vec<ProjectLabel>,
     selected: Option<String>,
     jobs: Vec<JobRow>,
     costs: HashMap<i64, f64>,
@@ -472,21 +474,39 @@ impl BoardData {
     }
 }
 
+/// The projects `login` collaborates on, as pages label them, in name order.
+fn project_labels(state: &AppState, login: &str) -> Result<Vec<ProjectLabel>, StoreError> {
+    Ok(state
+        .store
+        .projects_for(login)?
+        .into_iter()
+        .map(ProjectLabel::plain)
+        .collect())
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the label will come from the store, which can fail"
+)]
+fn project_label(_state: &AppState, name: &str) -> Result<ProjectLabel, StoreError> {
+    Ok(ProjectLabel::plain(name))
+}
+
 fn load_board(
     state: &AppState,
     login: &str,
     project: Option<String>,
     cookie_project: Option<String>,
 ) -> Result<BoardData, AppError> {
-    let names = state.store.projects_for(login)?;
+    let names = project_labels(state, login)?;
     let selected = match project {
-        Some(name) if !names.iter().any(|known| known == &name) => {
+        Some(name) if !names.iter().any(|known| known.id == name) => {
             return Err(AppError::UnknownProject(name));
         }
         Some(name) => Some(name),
         None => cookie_project
-            .filter(|name| names.contains(name))
-            .or_else(|| names.first().cloned()),
+            .filter(|name| names.iter().any(|known| &known.id == name))
+            .or_else(|| names.first().map(|label| label.id.clone())),
     };
     let jobs = state.store.list()?;
     let costs = state.store.costs()?;
@@ -632,9 +652,9 @@ async fn plan_usage_fragment(
     headers: HeaderMap,
     Query(query): Query<IndexQuery>,
 ) -> Result<Response, AppError> {
-    let names = state.store.projects_for(&user(&headers))?;
+    let names = project_labels(&state, &user(&headers))?;
     if let Some(project) = &query.project
-        && !names.iter().any(|known| known == project)
+        && !names.iter().any(|known| &known.id == project)
     {
         return Err(AppError::UnknownProject(project.clone()));
     }
@@ -1109,9 +1129,11 @@ async fn show_job(
     let data = load_job(&state, &user(&headers), id)?;
     let images = state.store.images(id)?;
     let files = state.store.files(id)?;
+    let label = project_label(&state, &data.row.project)?;
     Ok(pages::job(
         &user(&headers),
         &data.row,
+        &label,
         data.project.as_ref(),
         &data.settings,
         &data.logs,
@@ -1137,8 +1159,10 @@ async fn job_fragment(
 ) -> Result<Markup, AppError> {
     visible_job(&state, &headers, id)?;
     let data = load_job(&state, &user(&headers), id)?;
+    let label = project_label(&state, &data.row.project)?;
     Ok(pages::job_fragment(
         &data.row,
+        &label,
         data.project.as_ref(),
         &data.settings,
         &data.logs,
@@ -1601,13 +1625,16 @@ async fn settings_home(
     headers: HeaderMap,
     Query(query): Query<NoticeQuery>,
 ) -> Result<Redirect, AppError> {
-    let names = state.store.projects_for(&user(&headers))?;
+    let names = project_labels(&state, &user(&headers))?;
     let tail = match &query.notice {
         Some(notice) => format!("?notice={}", query_escape(notice)),
         None => String::new(),
     };
     Ok(match names.first() {
-        Some(name) => Redirect::to(&format!("/settings/projects/{}{tail}", query_escape(name))),
+        Some(label) => Redirect::to(&format!(
+            "/settings/projects/{}{tail}",
+            query_escape(&label.id)
+        )),
         None => Redirect::to(&format!("/settings/notifications{tail}")),
     })
 }
@@ -1658,7 +1685,7 @@ struct NoticeQuery {
 fn settings_nav(state: &AppState, login: &str) -> Result<pages::SettingsNav, StoreError> {
     Ok(pages::SettingsNav {
         admin: state.admins.iter().any(|admin| admin == login),
-        projects: state.store.projects_for(login)?,
+        projects: project_labels(state, login)?,
         servers: state
             .store
             .mcp_servers()?
@@ -1846,12 +1873,10 @@ fn mcp_server_page_with(
     let Some(server) = state.store.mcp_server(name)? else {
         return Err(AppError::NotFound(format!("no MCP server named {name:?}")));
     };
-    let usage = state
-        .store
-        .projects_for(&user(headers))?
+    let usage = project_labels(state, &user(headers))?
         .into_iter()
         .map(|project| {
-            let settings = server_settings(state, &project, server.clone())?;
+            let settings = server_settings(state, &project.id, server.clone())?;
             Ok(pages::ServerUsage {
                 project,
                 enabled: settings.enabled,
@@ -1976,6 +2001,7 @@ fn project_settings(
     };
     Ok(ProjectSettings {
         name: name.to_owned(),
+        shown: project_label(state, name)?.shown,
         models: state.store.project_models(name, &project.models)?,
         efforts: state.store.project_efforts(name)?,
         agents,
@@ -2724,8 +2750,9 @@ async fn remove_project(
     Form(form): Form<RemoveProjectForm>,
 ) -> Result<Response, AppError> {
     visible_project(&state, &headers, &project)?;
-    if form.confirm != project {
-        let problem = format!("Nothing was removed. Type {project} to remove the project.");
+    let shown = project_label(&state, &project)?.shown;
+    if form.confirm != shown {
+        let problem = format!("Nothing was removed. Type {shown} to remove the project.");
         return Ok(project_page(
             &state,
             &headers,
@@ -2738,7 +2765,7 @@ async fn remove_project(
     }
     state.store.remove_project(&project)?;
     state.wake.notify_one();
-    let notice = format!("Removed project {project}.");
+    let notice = format!("Removed project {shown}.");
     Ok(Redirect::to(&format!("/settings?notice={}", query_escape(&notice))).into_response())
 }
 
@@ -2799,7 +2826,7 @@ fn project_mcp_page(
     Ok(pages::settings_project_mcp(
         &user(headers),
         &settings_nav(state, &user(headers))?,
-        project,
+        &project_label(state, project)?,
         &server_settings(state, project, registered)?,
         state.secrets.available(),
         notice,
@@ -2954,10 +2981,13 @@ async fn edit_mcp_server(
     let deletes = state.store.mcp_edit_deletes(&name, url, &form.headers)?;
     if !deletes.is_empty() && !form.confirm {
         let total = deletes.len();
-        let visible = state.store.projects_for(&user(&headers))?;
+        let visible = project_labels(&state, &user(&headers))?;
         let shown = deletes
             .into_iter()
-            .filter(|(project, _)| visible.iter().any(|name| name == project))
+            .filter_map(|(project, header)| {
+                let label = visible.iter().find(|label| label.id == project)?;
+                Some((label.clone(), header))
+            })
             .collect();
         let pending = pages::PendingEdit {
             url: url.to_owned(),
