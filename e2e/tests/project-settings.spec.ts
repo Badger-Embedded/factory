@@ -313,7 +313,7 @@ test('a Salsa project asks for its Renovate account and a GitHub project does no
   await expect(page.getByText('Saved. The token belongs to deb-bot.')).toBeVisible();
   await page.goto('/onboard');
   await page.getByLabel('Salsa').check();
-  await page.getByLabel('Repository').fill('e2e/sub/good');
+  await page.getByLabel('Repository').fill('e2e/sub/renovate');
   await page.getByLabel('Name', { exact: true }).fill(name);
   await page.getByRole('button', { name: 'Run checks' }).click();
   await page.getByRole('button', { name: 'Skip extras and create' }).click();

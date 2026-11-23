@@ -13,6 +13,8 @@ if [ "$1" = api ] && [ "$GITLAB_HOST" = salsa.debian.org ]; then
         echo "glab: 401 Unauthorized (HTTP 401)" >&2
         exit 1
       fi
+      # The Renovate settings test onboards its own project, apart from good.
+      set -- "$1" "$2" "$3" "${4//e2e%2Fsub%2Frenovate/e2e%2Fsub%2Fgood}"
       case "$4" in
         projects/e2e%2Fsub%2Fgood)
           echo '{"squash_option":"default_on","permissions":{"project_access":{"access_level":30},"group_access":null}}'

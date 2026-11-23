@@ -729,10 +729,8 @@ impl Store {
         })
     }
 
-    /// `forge` joined `projects` after the table shipped with `repo` unique on
-    /// its own. SQLite cannot change a constraint in place, so a table without
-    /// the column is rebuilt with every row on `github`. A fresh database
-    /// already has the column from SCHEMA, so this skips it.
+    /// `renovate_author` joined `project_maintenance` after the table shipped.
+    /// A fresh database already has the column from SCHEMA, so this skips it.
     fn migrate_renovate_author(conn: &Connection) -> Result<(), StoreError> {
         let has: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('project_maintenance') WHERE name = 'renovate_author'",
@@ -748,6 +746,10 @@ impl Store {
         Ok(())
     }
 
+    /// `forge` joined `projects` after the table shipped with `repo` unique on
+    /// its own. SQLite cannot change a constraint in place, so a table without
+    /// the column is rebuilt with every row on `github`. A fresh database
+    /// already has the column from SCHEMA, so this skips it.
     fn migrate_project_forge(conn: &Connection) -> Result<(), StoreError> {
         let has_forge: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'forge'",

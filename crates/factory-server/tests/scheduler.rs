@@ -5072,6 +5072,71 @@ async fn discovery_makes_one_job_per_renovate_pull_request() {
 }
 
 #[tokio::test]
+async fn salsa_discovery_skips_a_project_with_renovate_on_and_no_author() {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(|_| questions());
+    let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    secrets
+        .put_forge_token(
+            ForgeTokenOwner::Project {
+                project: "pkg",
+                forge: ForgeKind::Salsa,
+            },
+            "project-token",
+            &ForgeAccount {
+                login: "factory-bot".into(),
+                id: 1,
+            },
+        )
+        .unwrap();
+    store
+        .save_project_maintenance(
+            "pkg",
+            &factory_server::Maintenance {
+                renovate: true,
+                renovate_author: None,
+                packaging: None,
+            },
+        )
+        .unwrap();
+    executor.renovate_open.lock().unwrap().push((
+        "renovate-bot".into(),
+        "main".into(),
+        renovate_pr(7),
+    ));
+    let projects: Projects = [(
+        "pkg".to_owned(),
+        Project {
+            forge: ProjectForge::Known(ForgeKind::Salsa),
+            repo: "team/sub/pkg".into(),
+            base: "main".into(),
+            checks: None,
+            models: StageModels::default(),
+            auto_merge: false,
+            llm_review: false,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let forges = Forges::new(Arc::new(GitHub::default()), Arc::new(GhRepos::default()));
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        Accounts::new(Arc::clone(&store), secrets as Arc<dyn SecretStore>, forges),
+    );
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    assert!(executor.renovate_listed.lock().unwrap().is_empty());
+    assert_eq!(store.list().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn salsa_discovery_lists_by_the_renovate_account_and_github_by_none() {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let executor = FakeExecutor::new(|_| questions());

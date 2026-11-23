@@ -1073,6 +1073,19 @@ impl<E: Executor> Scheduler<E> {
                     continue;
                 }
             };
+            let author = (resolved.forge == ForgeKind::Salsa)
+                .then_some(maintenance.renovate_author.as_deref())
+                .flatten();
+            if resolved.forge == ForgeKind::Salsa && author.is_none() {
+                tracing::warn!(
+                    "skipping the Renovate discovery of {name}: set the Renovate account in its Maintenance settings"
+                );
+                self.discovered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name.clone(), Instant::now());
+                continue;
+            }
             let listed = self
                 .executor
                 .renovate_prs(
@@ -1080,9 +1093,7 @@ impl<E: Executor> Scheduler<E> {
                     &resolved.source,
                     &project.repo,
                     &project.base,
-                    (resolved.forge == ForgeKind::Salsa)
-                        .then_some(maintenance.renovate_author.as_deref())
-                        .flatten(),
+                    author,
                 )
                 .await;
             let prs = match listed {
