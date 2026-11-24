@@ -21,6 +21,15 @@
 //   - refresh the tool list: "MCP: a refresh lists the tools the server offers now"
 //   - filter the tools, All on and All off, and save tool toggles that persist:
 //     "MCP: filter the tools, use All on and All off, and keep the saved toggles"
+// - The settings sidebar scrolls on its own above 760px:
+//   - fills a short window and follows the window height without a reload:
+//     "the settings sidebar fills a short window and follows its height without a reload"
+//   - scrolls without moving the window and stays pinned:
+//     "the settings sidebar scrolls without moving the window and stays pinned"
+//   - shows the open project after a load: "the settings sidebar shows the open project after a load"
+//   - keyboard focus keeps its outline: "a tabbed link in the settings sidebar scrolls into view with its whole outline"
+//   - content height on a large window, plain row when narrow:
+//     "the settings sidebar keeps its content height on a large window and is a plain row when narrow"
 // - A login that is not a collaborator gets the 404 page for the project, its
 //   settings, its jobs and its MCP pages:
 //   "a login that is not a collaborator gets the 404 page"
@@ -761,4 +770,136 @@ test('a stdio MCP server takes extra arguments, keeps them when off and shows in
   await page.goto(path);
   await expect(page.getByRole('checkbox', { name: 'spec', exact: true })).toBeChecked();
   await expect(args.nth(1)).toHaveValue('--viewport-size=1280x720');
+});
+
+// The sidebar scrolls on its own above 760px. The shared factory gets enough
+// projects to overflow a 1280x500 window.
+let navSeeded = false;
+const seedNav = (factory: Factory) => {
+  if (navSeeded) return;
+  navSeeded = true;
+  for (let i = 0; i < 12; i++) factory.fixture('project', '--name', `nav${i}-${Date.now() % 100000}`, '--login', ADMIN);
+};
+const navBox = (page: Page) =>
+  page.locator('nav.settings-nav').evaluate((nav) => {
+    const r = nav.getBoundingClientRect();
+    return {
+      top: r.top,
+      bottom: r.bottom,
+      height: r.height,
+      scrollHeight: nav.scrollHeight,
+      clientHeight: nav.clientHeight,
+      scrollWidth: nav.scrollWidth,
+      clientWidth: nav.clientWidth,
+      scrollTop: nav.scrollTop,
+    };
+  });
+
+test('the settings sidebar fills a short window and follows its height without a reload', async ({ page, factory, project }) => {
+  seedNav(factory);
+  await page.setViewportSize({ width: 1280, height: 500 });
+  await page.goto(settingsPath(project));
+  // The page starts 16px lower than the pinned position until it scrolls.
+  await page.evaluate(() => window.scrollBy(0, 40));
+  const short = await navBox(page);
+  expect(short.top).toBeGreaterThanOrEqual(56);
+  expect(Math.abs(short.bottom - (500 - 16))).toBeLessThanOrEqual(1);
+  expect(short.scrollHeight).toBeGreaterThan(short.clientHeight);
+  expect(short.scrollWidth).toBeLessThanOrEqual(short.clientWidth);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await expect.poll(async () => (await navBox(page)).bottom).toBeLessThanOrEqual(800);
+  const tall = await navBox(page);
+  const fits = tall.scrollHeight === tall.clientHeight;
+  if (fits) expect(tall.height).toBeCloseTo(tall.scrollHeight + 2, 0);
+  else expect(Math.abs(tall.height - short.height - 300)).toBeLessThanOrEqual(2);
+});
+
+test('the settings sidebar scrolls without moving the window and stays pinned', async ({ page, factory, project }) => {
+  seedNav(factory);
+  await page.setViewportSize({ width: 1280, height: 500 });
+  await page.goto(settingsPath(project));
+  const add = page.getByRole('link', { name: 'Onboard a project' });
+  await page.locator('nav.settings-nav').hover();
+  await page.mouse.wheel(0, 5000);
+  await expect.poll(async () => (await navBox(page)).scrollTop).toBeGreaterThan(0);
+  await expect(add).toBeInViewport();
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  const after = await navBox(page);
+  expect(after.top).toBeGreaterThanOrEqual(56);
+  expect(after.bottom).toBeLessThanOrEqual(500);
+  await expect(add).toBeInViewport();
+});
+
+test('the settings sidebar shows the open project after a load', async ({ page, factory }) => {
+  seedNav(factory);
+  await page.setViewportSize({ width: 1280, height: 500 });
+  await page.goto('/settings/polling');
+  const href = await page
+    .locator('nav.settings-nav a[href^="/settings/projects/"]')
+    .last()
+    .getAttribute('href');
+  await page.goto(href!);
+  const inside = await page.evaluate(() => {
+    const nav = document.querySelector('nav.settings-nav')!.getBoundingClientRect();
+    const link = document.querySelector('nav.settings-nav [aria-current="page"]')!.getBoundingClientRect();
+    return { in: link.top >= nav.top && link.bottom <= nav.bottom, scrollY: window.scrollY };
+  });
+  expect(inside).toEqual({ in: true, scrollY: 0 });
+});
+
+test('a tabbed link in the settings sidebar scrolls into view with its whole outline', async ({ page, factory, project }) => {
+  seedNav(factory);
+  await page.setViewportSize({ width: 1280, height: 500 });
+  await page.goto('/settings/polling');
+  await page.locator('nav.settings-nav a').first().focus();
+  const add = page.getByRole('link', { name: 'Onboard a project' });
+  for (let i = 0; i < 60 && !(await add.evaluate((el) => el === document.activeElement)); i++) {
+    await page.keyboard.press('Tab');
+  }
+  await expect(add).toBeFocused();
+  const outline = await page.evaluate(() => {
+    const nav = document.querySelector('nav.settings-nav')!;
+    const link = document.activeElement!.getBoundingClientRect();
+    const box = nav.getBoundingClientRect();
+    const offset = parseFloat(getComputedStyle(document.activeElement!).outlineOffset);
+    const width = parseFloat(getComputedStyle(document.activeElement!).outlineWidth);
+    return {
+      scrolled: nav.scrollTop > 0,
+      top: link.top - Math.max(offset, 0) - width >= box.top,
+      bottom: link.bottom + Math.max(offset, 0) + width <= box.bottom,
+      left: link.left - Math.max(offset, 0) - width >= box.left,
+      right: link.right + Math.max(offset, 0) + width <= box.right,
+    };
+  });
+  expect(outline).toEqual({ scrolled: true, top: true, bottom: true, left: true, right: true });
+});
+
+test("the settings sidebar keeps its content height on a large window and is a plain row when narrow", async ({ browser }) => {
+  const { factory, stop } = await startFactory();
+  try {
+    const context = await browser.newContext({
+      baseURL: factory.url,
+      extraHTTPHeaders: { 'Tailscale-User-Login': ADMIN },
+      viewport: { width: 1920, height: 1400 },
+    });
+    const big = await context.newPage();
+    await big.goto('/settings/polling');
+    const fit = await navBox(big);
+    expect(fit.scrollHeight).toBe(fit.clientHeight);
+    expect(await big.locator('nav.settings-nav').evaluate((n) => n.scrollHeight <= n.clientHeight)).toBe(true);
+
+    await big.setViewportSize({ width: 700, height: 500 });
+    const narrow = await big.locator('nav.settings-nav').evaluate((n) => {
+      const s = getComputedStyle(n);
+      return { position: s.position, maxHeight: s.maxHeight, scrollsSideways: n.scrollWidth > n.clientWidth || s.overflowX === 'auto' };
+    });
+    expect(narrow).toEqual({ position: 'static', maxHeight: 'none', scrollsSideways: true });
+    await context.close();
+  } finally {
+    await stop();
+  }
 });

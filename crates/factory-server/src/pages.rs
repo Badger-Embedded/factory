@@ -37,6 +37,7 @@ const NOTIFICATIONS: &str = include_str!("../static/notifications.js");
 const PERMISSION_BAR: &str = include_str!("../static/permission-bar.js");
 const NOTIFICATION_PERMISSION: &str = include_str!("../static/notification-permission.js");
 const SETTINGS_FORM: &str = include_str!("../static/settings-form.js");
+const SETTINGS_NAV: &str = include_str!("../static/settings-nav.js");
 const MCP_TOOLS: &str = include_str!("../static/mcp-tools.js");
 const SETTINGS_PIPELINE: &str = include_str!("../static/settings-pipeline.js");
 
@@ -943,6 +944,7 @@ fn settings_page(
                     (body)
                 }
             }
+            script { (PreEscaped(SETTINGS_NAV)) }
             script { (PreEscaped(SETTINGS_FORM)) }
         },
     )

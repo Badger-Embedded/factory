@@ -11682,7 +11682,8 @@ async fn the_settings_sidebar_links_every_page_and_marks_the_open_one() {
         assert!(body.contains(&format!("href=\"{href}\"")), "{href}");
     }
     assert!(body.contains(r#"href="/settings/polling" aria-current="page""#));
-    assert_eq!(body.matches(r#"aria-current="page""#).count(), 1);
+    assert_eq!(body.matches(r#"" aria-current="page""#).count(), 1);
+    assert!(body.contains("querySelector(\".settings-nav\")"));
 
     // A server's page marks the MCP servers entry.
     let body = dashboard.get("/settings/mcp/context7").await.body;

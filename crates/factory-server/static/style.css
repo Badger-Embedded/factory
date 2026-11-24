@@ -956,8 +956,10 @@ form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
 .file-picker input:focus-visible + .file-button { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
 .file-picker .hint { margin: 0; }
 
-/* Settings: a sidebar of pages beside the open page. Below 760px the sidebar
-   becomes a row of links that scrolls sideways above the page. */
+/* Settings: a sidebar of pages beside the open page. Above 760px the sidebar
+   is as tall as its links up to the window height below the top bar, then
+   scrolls on its own. At 760px and narrower it becomes a row of links that
+   scrolls sideways above the page. */
 .settings { display: grid; grid-template-columns: 13rem minmax(0, 1fr); gap: var(--space-32); align-items: start; }
 .settings-nav {
   position: sticky;
@@ -991,6 +993,20 @@ form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
   overflow-wrap: anywhere;
 }
 .settings-link:hover { background: var(--sunken); }
+.settings-link:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+@media (min-width: 761px) {
+  /* The sticky sidebar stops at the bottom of the grid row. The padding makes
+     the row 32px taller so the sidebar stays under the top bar at the end of
+     the page, and the negative margin keeps the page height as it was. */
+  .settings { margin-bottom: calc(-1 * var(--space-32)); }
+  .settings-main { padding-bottom: var(--space-32); }
+  .settings-nav {
+    max-height: calc(100vh - var(--topbar-height) - var(--space-16) - var(--space-16));
+    overflow-y: auto;
+    overflow-x: hidden;
+    scroll-padding: var(--space-12) var(--space-8);
+  }
+}
 .settings-link[aria-current="page"] { background: var(--agent-bg); color: var(--agent); font-weight: var(--weight-semibold); }
 .settings-link.settings-add { color: var(--accent); }
 .settings-link.settings-disabled { color: var(--muted); cursor: default; }
