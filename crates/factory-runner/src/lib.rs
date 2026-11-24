@@ -12,6 +12,7 @@ mod codex;
 mod copilot;
 mod files;
 mod forge;
+mod forgejo;
 mod git;
 mod github;
 mod gitlab;
@@ -30,6 +31,7 @@ pub use forge::{
     Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, NOT_PERMITTED,
     REJECTED, rejected_by_forge,
 };
+pub use forgejo::{Forgejo, ForgejoVersion, client as forgejo_client, version as forgejo_version};
 pub use git::{Git, Remote, RemoteSource};
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, HeadCommit, Observation, PrDetails, PrInfo, PrState,

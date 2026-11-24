@@ -567,13 +567,17 @@ dependencies = [
 name = "factory-runner"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.23.1",
  "factory-core",
+ "hyper-util",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
 ]
