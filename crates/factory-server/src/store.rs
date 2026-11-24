@@ -12,6 +12,7 @@ use factory_core::{
 use factory_runner::{ForgeAccount, ForgeKind, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use crate::forgejo_instances::ForgejoInstance;
 use crate::mcp::{
     self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
 };
@@ -278,6 +279,12 @@ CREATE TABLE IF NOT EXISTS project_forge_accounts (
     account_login TEXT NOT NULL,
     account_id INTEGER NOT NULL,
     PRIMARY KEY (project, kind)
+);
+CREATE TABLE IF NOT EXISTS forgejo_instances (
+    name TEXT PRIMARY KEY,
+    base_url TEXT NOT NULL UNIQUE,
+    version TEXT NOT NULL,
+    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS gh_token_copies (
     project TEXT PRIMARY KEY
@@ -554,6 +561,8 @@ pub enum StoreError {
     /// another project, or cannot be waited for. The message is the same for
     /// each, so it leaks nothing about other projects.
     InvalidPrerequisite(i64),
+    /// A Forgejo instance was refused. The message says why.
+    Forgejo(String),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -591,6 +600,7 @@ impl fmt::Display for StoreError {
             StoreError::InvalidPrerequisite(id) => {
                 write!(f, "job #{id} is not a job this request can wait for")
             }
+            StoreError::Forgejo(message) => f.write_str(message),
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
             StoreError::Io(err) => write!(f, "file system: {err}"),
@@ -4144,6 +4154,168 @@ impl Store {
             "DELETE FROM secrets WHERE project = ?1 AND server = ?2 AND header = ?3",
             params![at.project, at.server, at.header],
         )?;
+        Ok(())
+    }
+
+    /// Every registered Forgejo instance, in name order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn forgejo_instances(&self) -> Result<Vec<ForgejoInstance>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, base_url, version, added_at FROM forgejo_instances ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ForgejoInstance {
+                name: row.get(0)?,
+                base_url: row.get(1)?,
+                version: row.get(2)?,
+                added_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The instance registered under `name`, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn forgejo_instance(&self, name: &str) -> Result<Option<ForgejoInstance>, StoreError> {
+        Ok(self
+            .forgejo_instances()?
+            .into_iter()
+            .find(|instance| instance.name == name))
+    }
+
+    /// Checks that an instance with this name and base URL could be added:
+    /// both are valid and neither is taken. Returns them in stored form.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Forgejo`] and a message when one is invalid or
+    /// taken, or on a database error.
+    pub fn check_new_forgejo_instance(
+        &self,
+        name: &str,
+        url: &str,
+    ) -> Result<(String, String), StoreError> {
+        let (name, url) = ForgejoInstance::validate(name, url).map_err(StoreError::Forgejo)?;
+        for existing in self.forgejo_instances()? {
+            if existing.name == name {
+                return Err(StoreError::Forgejo(format!(
+                    "An instance named {name:?} already exists."
+                )));
+            }
+            if existing.base_url == url {
+                return Err(StoreError::Forgejo(format!(
+                    "{url} is already registered as {:?}.",
+                    existing.name
+                )));
+            }
+        }
+        Ok((name, url))
+    }
+
+    /// Registers an instance and stores the `version` it reported.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::check_new_forgejo_instance`].
+    pub fn add_forgejo_instance(
+        &self,
+        name: &str,
+        url: &str,
+        version: &str,
+    ) -> Result<ForgejoInstance, StoreError> {
+        let (name, url) = self.check_new_forgejo_instance(name, url)?;
+        let inserted = self.conn().query_row(
+            "INSERT INTO forgejo_instances (name, base_url, version)
+             VALUES (?1, ?2, ?3) RETURNING added_at",
+            params![name, url, version],
+            |row| row.get(0),
+        );
+        // A concurrent add can pass the check above, so the table's unique
+        // constraints decide and the check names the one that failed.
+        let added_at = match inserted {
+            Ok(added_at) => added_at,
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                self.check_new_forgejo_instance(&name, &url)?;
+                return Err(StoreError::Forgejo(format!(
+                    "{name} or {url} is already registered."
+                )));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        Ok(ForgejoInstance {
+            name,
+            base_url: url,
+            version: version.to_owned(),
+            added_at,
+        })
+    }
+
+    /// Deletes an instance and every token stored for it: each login's token
+    /// and account, and each project's token and account. A token is bound to
+    /// the instance's name, so one left behind would be readable by an
+    /// instance added later under the same name.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Forgejo`] when no such instance exists or a
+    /// project uses it as its forge or its upstream forge. The message names
+    /// the projects. Fails on a database error.
+    pub fn delete_forgejo_instance(&self, name: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let registered: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM forgejo_instances WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        if registered == 0 {
+            return Err(StoreError::Forgejo(format!("No instance named {name:?}.")));
+        }
+        let users: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT name FROM projects WHERE forge = ?1
+                 UNION
+                 SELECT project FROM project_maintenance WHERE upstream_forge = ?1
+                 ORDER BY 1",
+            )?;
+            stmt.query_map([name], |row| row.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        if !users.is_empty() {
+            return Err(StoreError::Forgejo(format!(
+                "Nothing was deleted. {name} is used by {}.",
+                users.join(", ")
+            )));
+        }
+        let prefix = format!("forge-user:{name}:");
+        tx.execute(
+            "DELETE FROM secrets
+             WHERE project = '' AND server = '' AND substr(header, 1, length(?1)) = ?1",
+            [&prefix],
+        )?;
+        tx.execute("DELETE FROM user_forge_accounts WHERE forge = ?1", [name])?;
+        tx.execute(
+            "DELETE FROM secrets WHERE server = '' AND (project, header) IN (
+                 SELECT project, CASE kind WHEN 'upstream' THEN 'forge-upstream'
+                                           ELSE 'forge-project' END
+                 FROM project_forge_accounts WHERE forge = ?1)",
+            [name],
+        )?;
+        tx.execute(
+            "DELETE FROM project_forge_accounts WHERE forge = ?1",
+            [name],
+        )?;
+        tx.execute("DELETE FROM forgejo_instances WHERE name = ?1", [name])?;
+        tx.commit()?;
         Ok(())
     }
 

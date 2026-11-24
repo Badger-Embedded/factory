@@ -6,27 +6,27 @@ use std::sync::Arc;
 use factory_runner::{ForgeKind, Git, GitHub, GitLab, WorkerConfig};
 use factory_server::{
     Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, GlabRepos,
-    HttpMcpChecker, LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache,
-    PodmanExecutor, PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler,
-    SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app,
-    import_tomls, master_key_from_env, parse_admins, proxy_app_with_roots,
+    HttpForgejoProbe, HttpMcpChecker, LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings,
+    PlanUsageCache, PodmanExecutor, PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens,
+    Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots,
+    app_with_forgejo_probe, import_tomls, master_key_from_env, parse_admins, proxy_app_with_roots,
 };
 use tokio::sync::Notify;
 
-/// The extra root certificates from the PEM file `FACTORY_MCP_CA_FILE`, or none
-/// when it is unset or empty. The path is used exactly as set. A file that cannot be read or holds no valid
-/// certificate fails startup, so a typo does not leave a server untrusted.
-fn mcp_roots() -> Result<Vec<reqwest::Certificate>, Box<dyn Error>> {
-    let Some(path) = env::var_os("FACTORY_MCP_CA_FILE").filter(|path| !path.is_empty()) else {
+/// The extra root certificates from the PEM file the variable `var` names, or
+/// none when it is unset or empty. The path is used exactly as set. A file that
+/// cannot be read or holds no valid certificate fails startup, so a typo does
+/// not leave a server untrusted.
+fn ca_roots(var: &str) -> Result<Vec<reqwest::Certificate>, Box<dyn Error>> {
+    let Some(path) = env::var_os(var).filter(|path| !path.is_empty()) else {
         return Ok(Vec::new());
     };
     let shown = path.to_string_lossy();
-    let pem = std::fs::read(&path)
-        .map_err(|err| format!("FACTORY_MCP_CA_FILE {shown}: cannot read: {err}"))?;
+    let pem = std::fs::read(&path).map_err(|err| format!("{var} {shown}: cannot read: {err}"))?;
     let roots = reqwest::Certificate::from_pem_bundle(&pem)
-        .map_err(|err| format!("FACTORY_MCP_CA_FILE {shown}: invalid PEM: {err}"))?;
+        .map_err(|err| format!("{var} {shown}: invalid PEM: {err}"))?;
     if roots.is_empty() {
-        return Err(format!("FACTORY_MCP_CA_FILE {shown}: no certificate found").into());
+        return Err(format!("{var} {shown}: no certificate found").into());
     }
     Ok(roots)
 }
@@ -215,7 +215,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // credential never enters a worker. It listens on its own port, separate
     // from the dashboard, and honours per-run tokens held only in memory. No
     // token exists until a run issues one, so every request before that is 401.
-    let mcp_roots = mcp_roots()?;
+    let mcp_roots = ca_roots("FACTORY_MCP_CA_FILE")?;
+    let forgejo_probe = HttpForgejoProbe::new(&ca_roots("FACTORY_FORGEJO_CA_FILE")?);
     let run_tokens = start_mcp_proxy(
         &proxy_listen,
         Arc::clone(&store),
@@ -299,7 +300,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!("listening on http://{listen}, database {}", db.display());
     axum::serve(
         listener,
-        app(
+        app_with_forgejo_probe(
             store,
             projects,
             wake,
@@ -309,6 +310,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             slots,
             secrets,
             checker,
+            Arc::new(forgejo_probe),
             agents,
             device_login,
             copilot_login,

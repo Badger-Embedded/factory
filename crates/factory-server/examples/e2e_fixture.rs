@@ -15,8 +15,8 @@
 //!
 //! `job` and `renovate` print the new job's id. `tls` writes `ca.pem`, `cert.pem` and
 //! `key.pem` into `D`: a throwaway CA and a leaf certificate for `127.0.0.1`,
-//! so the stub MCP server can serve TLS and the factory can trust it through
-//! `FACTORY_MCP_CA_FILE`. It does not open the database.
+//! so the stub MCP and Forgejo servers can serve TLS and the factory can trust
+//! them through `FACTORY_MCP_CA_FILE` and `FACTORY_FORGEJO_CA_FILE`. It does not open the database.
 
 use std::collections::HashMap;
 use std::env;

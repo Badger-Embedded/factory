@@ -9,6 +9,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::check::{CheckOutcome, ToolList};
 use crate::cost::{format_cost, merge_fraction};
+use crate::forgejo_instances::ForgejoInstance;
 use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages, McpToolState, McpTransport};
 use factory_runner::{ForgeAccount, ForgeKind};
@@ -881,6 +882,7 @@ pub enum SettingsPage {
     Gates,
     Polling,
     Renovate,
+    Forgejo,
     /// An agent's account page, named by the agent's id.
     Agent(String),
     Mcp,
@@ -968,6 +970,7 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
                 (entry("/settings/gates".into(), "Default gates", &SettingsPage::Gates))
                 (entry("/settings/polling".into(), "Pull request polling", &SettingsPage::Polling))
                 (entry("/settings/renovate".into(), "Renovate", &SettingsPage::Renovate))
+                (entry("/settings/forgejo".into(), "Forgejo servers", &SettingsPage::Forgejo))
                 p.settings-group { "Agents" }
                 @for agent in &nav.agents {
                     @match (agent.available, &agent.url) {
@@ -1663,6 +1666,85 @@ pub fn settings_forge(
                 div.danger-zone {
                     button.danger formaction=(format!("{base}/token/clear")) formnovalidate { "Clear token" }
                 }
+            }
+        },
+    )
+}
+
+/// The admin page that lists the registered Forgejo servers and adds or
+/// deletes one. `typed` is the name and URL a refused add had, put back in the
+/// form. A name and a URL cannot be edited, because a stored token is bound to
+/// the name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per part of the page"
+)]
+pub fn settings_forgejo(
+    user: &str,
+    nav: &SettingsNav,
+    instances: &[ForgejoInstance],
+    csrf: &str,
+    typed: (&str, &str),
+    problem: Option<&str>,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Forgejo,
+        "Forgejo servers",
+        notice,
+        &html! {
+            h1 { "Forgejo servers" }
+            p.meta { "The Forgejo servers a factory admin has registered, such as a self-hosted server or Codeberg. Projects and tokens cannot use them yet, so registering a server changes nothing else." }
+            @if let Some(problem) = problem {
+                div.card.failed { (problem) }
+            }
+            div.card {
+                h2 { "Registered servers" }
+                @if instances.is_empty() {
+                    p.meta { "No servers yet." }
+                }
+                @for instance in instances {
+                    div.forgejo-row {
+                        div.server-row {
+                            span.server-name { (instance.name) }
+                            span.hint.server-url {
+                                (external_link(&instance.base_url, &instance.base_url, None, None))
+                                " · version " (instance.version)
+                            }
+                            form method="post" action={ "/settings/forgejo/" (crate::web::query_escape(&instance.name)) "/delete" } {
+                                input type="hidden" name="csrf" value=(csrf);
+                                button.danger { "Delete" }
+                            }
+                        }
+                        @for warning in instance.warnings() {
+                            p.hint.bad.forgejo-warning { (warning) }
+                        }
+                    }
+                }
+                p.hint { "A server cannot be edited. Delete it and add it again to change its URL. Deleting a server removes every token stored for it, and is refused while a project uses it." }
+            }
+            form.card method="post" action="/settings/forgejo" {
+                input type="hidden" name="csrf" value=(csrf);
+                h2 { "Add a server" }
+                div.field {
+                    label for="forgejo-new-name" { "Name" }
+                    // The pattern and maxlength mirror `ForgejoInstance::validate`.
+                    // `-` is escaped for the `v` flag, as in the MCP name field.
+                    input #forgejo-new-name type="text" name="name" required
+                        pattern=r"[a-z0-9\-]{1,32}" maxlength="32" value=(typed.0)
+                        title="1 to 32 characters of a-z, 0-9 and -"
+                        autocapitalize="none" autocomplete="off" spellcheck="false";
+                    p.hint { "1 to 32 characters of a-z, 0-9 and -, and not github or salsa. Stored tokens and projects refer to it, so it cannot change." }
+                }
+                div.field {
+                    label for="forgejo-new-url" { "URL" }
+                    input #forgejo-new-url.wide type="text" inputmode="url" name="url" required
+                        placeholder="https://codeberg.org" value=(typed.1);
+                    p.hint { "An https URL, with a port or a sub-path if the server has one, and no user name, query or fragment. The factory reads " code { "/api/v1/version" } " to check it." }
+                }
+                div.save-bar { button.primary { "Add server" } }
             }
         },
     )

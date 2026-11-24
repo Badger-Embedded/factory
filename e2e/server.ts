@@ -17,7 +17,7 @@ export const SHARED_PROJECT = 'maestro';
 export interface Factory {
   url: string;
   db: string;
-  /** Holds `ca.pem`, `cert.pem` and `key.pem`; the server trusts `ca.pem` for MCP servers. */
+  /** Holds `ca.pem`, `cert.pem` and `key.pem`; the server trusts `ca.pem` for MCP and Forgejo servers. */
   tls: string;
   /** Runs `e2e_fixture` against the server's database and returns its output. */
   fixture(...args: string[]): string;
@@ -83,6 +83,7 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     FACTORY_GLAB: path.join(__dirname, 'fakes', 'glab'),
     FACTORY_PODMAN: path.join(__dirname, 'fakes', 'podman'),
     FACTORY_MCP_CA_FILE: path.join(tls, 'ca.pem'),
+    FACTORY_FORGEJO_CA_FILE: path.join(tls, 'ca.pem'),
   };
   delete env.FACTORY_WORKERS;
   delete env.GH_TOKEN;

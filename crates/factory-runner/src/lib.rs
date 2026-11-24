@@ -31,7 +31,10 @@ pub use forge::{
     Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, NOT_PERMITTED,
     REJECTED, rejected_by_forge,
 };
-pub use forgejo::{Forgejo, ForgejoVersion, client as forgejo_client, version as forgejo_version};
+pub use forgejo::{
+    Forgejo, ForgejoVersion, client as forgejo_client,
+    reported_version as forgejo_reported_version, version as forgejo_version,
+};
 pub use git::{Git, Remote, RemoteSource};
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, HeadCommit, Observation, PrDetails, PrInfo, PrState,
