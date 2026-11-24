@@ -90,11 +90,12 @@ pub enum ProjectForge {
 }
 
 impl ProjectForge {
-    /// The forge of the stored name `name`, where `instance_url` is the base
-    /// URL of the registered Forgejo instance of that name, if there is one.
+    /// The forge of the stored name `name`, where `instance` is the base
+    /// URL and registration number of the registered Forgejo instance of that
+    /// name, if there is one.
     #[must_use]
-    pub fn resolve(name: &str, instance_url: Option<&str>) -> ProjectForge {
-        ForgeKind::resolve(name, instance_url)
+    pub fn resolve(name: &str, instance: Option<(&str, i64)>) -> ProjectForge {
+        ForgeKind::resolve(name, instance)
             .map_or_else(|| ProjectForge::Unknown(name.to_owned()), Self::Known)
     }
 

@@ -3063,12 +3063,11 @@ async fn save_project_maintenance(
         check,
     } = checks;
     let login = user(&headers);
-    let previous_upstream = state
-        .store
-        .project_maintenance_lenient(&project)?
-        .0
-        .packaging
-        .map(|packaging| packaging.upstream_forge);
+    let (stored, unknown_upstream) = state.store.project_maintenance_lenient(&project)?;
+    let previous_upstream = match unknown_upstream {
+        Some(_) => None,
+        None => stored.packaging.map(|packaging| packaging.upstream_forge),
+    };
     let credentials = snapshot_credentials(&project, &snapshots);
     let saved = state.store.save_project_maintenance_guarded(
         &ProjectGuard {
@@ -4437,7 +4436,7 @@ struct ForgeTokenForm {
     token: String,
     #[serde(default)]
     csrf: String,
-    /// The base URL of the Forgejo instance the page showed.
+    /// The registration number of the Forgejo instance the page showed.
     #[serde(default)]
     server: String,
 }
@@ -4445,11 +4444,12 @@ struct ForgeTokenForm {
 const STALE_INSTANCE: &str = "The Forgejo instance was deleted or registered again while this was checked. Nothing was saved. Reload the page.";
 const STALE_FORM: &str = "The Forgejo instance changed since this page loaded. Nothing was saved or sent. Reload the page.";
 
-/// Whether a form shown for `kind` names the address the instance has now. A
-/// token typed for one server must not reach another that took over the name.
+/// Whether a form shown for `kind` names the registration the instance has
+/// now. A token typed for one server must not reach another that took over
+/// the name, even at the same URL.
 fn shown_server(kind: &ForgeKind, shown: Option<&str>) -> bool {
     match kind {
-        ForgeKind::Forgejo(server) => shown == Some(server.base_url.as_str()),
+        ForgeKind::Forgejo(server) => shown == Some(server.registration.to_string().as_str()),
         ForgeKind::GitHub | ForgeKind::Salsa => true,
     }
 }

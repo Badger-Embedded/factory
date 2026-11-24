@@ -16102,7 +16102,8 @@ async fn forgejo_gated_stub(
             (StatusCode::UNAUTHORIZED, "{}".to_owned())
         }
     });
-    support::serve_tls(Router::new().route("/api/v1/user", user)).await
+    let unread = axum::routing::get(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+    support::serve_tls(Router::new().route("/api/v1/user", user).fallback(unread)).await
 }
 
 async fn forgejo_user_stub(prefix: &'static str) -> support::TlsServer {
@@ -16119,16 +16120,11 @@ fn forgejo_roots(stubs: &[&support::TlsServer]) -> Vec<reqwest::Certificate> {
 async fn forgejo_dashboard() -> Dashboard {
     let mine = forgejo_user_stub("mine").await;
     let other = forgejo_user_stub("other").await;
-    forgejo_dashboard_over(&mine, &other, &[])
+    forgejo_dashboard_over(&mine, &other)
 }
 
-/// As [`forgejo_dashboard`] over these stubs, and `spare` stubs the dashboard
-/// trusts for an instance added later.
-fn forgejo_dashboard_over(
-    mine: &support::TlsServer,
-    other: &support::TlsServer,
-    spare: &[&support::TlsServer],
-) -> Dashboard {
+/// As [`forgejo_dashboard`] over these stubs.
+fn forgejo_dashboard_over(mine: &support::TlsServer, other: &support::TlsServer) -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
         .add_forgejo_instance("mine", &mine.base, "17.0.2")
@@ -16151,8 +16147,7 @@ fn forgejo_dashboard_over(
         )
         .unwrap();
     let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
-    let mut stubs = vec![mine, other];
-    stubs.extend(spare);
+    let stubs = [mine, other];
     dashboard_build(
         store,
         Arc::new(FakeRepos::fit()),
@@ -16312,6 +16307,7 @@ async fn an_unregistered_forgejo_name_is_a_404_and_its_project_shows_the_problem
     let gone = ForgeKind::Forgejo(factory_runner::ForgejoServer {
         name: "gone".to_owned(),
         base_url: "https://gone.example.org".to_owned(),
+        registration: 1,
     });
     dashboard
         .store
@@ -16351,20 +16347,19 @@ async fn a_forgejo_project_links_its_repository_on_the_instance_in_a_new_tab() {
 }
 
 #[tokio::test]
-async fn a_token_form_opened_for_a_replaced_instance_is_refused_before_any_forge_call() {
+async fn a_token_form_opened_for_an_instance_registered_again_is_refused_before_any_forge_call() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let hits = Arc::new(AtomicUsize::new(0));
     let mine = forgejo_user_stub("mine").await;
-    let other = forgejo_user_stub("other").await;
-    let spare = forgejo_gated_stub("spare", Arc::clone(&hits), None).await;
-    let dashboard = forgejo_dashboard_over(&mine, &other, &[&spare]);
+    let other = forgejo_gated_stub("other", Arc::clone(&hits), None).await;
+    let dashboard = forgejo_dashboard_over(&mine, &other);
     let (csrf, shown) = forgejo_form_fields(&dashboard, DAVE, "other").await;
 
     dashboard.store.delete_forgejo_instance("other").unwrap();
     dashboard
         .store
-        .add_forgejo_instance("other", &spare.base, "17.0.2")
+        .add_forgejo_instance("other", &other.base, "17.0.2")
         .unwrap();
 
     for action in ["token", "token/clear"] {
@@ -16401,8 +16396,7 @@ async fn a_token_check_that_outlives_its_instance_stores_nothing() {
         Some((Arc::clone(&arrived), Arc::clone(&release))),
     )
     .await;
-    let spare = forgejo_user_stub("spare").await;
-    let dashboard = forgejo_dashboard_over(&mine, &other, &[&spare]);
+    let dashboard = forgejo_dashboard_over(&mine, &other);
     let (csrf, shown) = forgejo_form_fields(&dashboard, DAVE, "other").await;
 
     let save = forgejo_post_with(
@@ -16419,7 +16413,7 @@ async fn a_token_check_that_outlives_its_instance_stores_nothing() {
         dashboard.store.delete_forgejo_instance("other").unwrap();
         dashboard
             .store
-            .add_forgejo_instance("other", &spare.base, "17.0.2")
+            .add_forgejo_instance("other", &other.base, "17.0.2")
             .unwrap();
         release.notify_one();
     };
@@ -16444,14 +16438,13 @@ async fn maintenance_csrf(dashboard: &Dashboard) -> String {
 }
 
 #[tokio::test]
-async fn an_upstream_token_form_opened_for_a_replaced_instance_is_refused() {
+async fn an_upstream_token_form_opened_for_an_instance_registered_again_is_refused() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let hits = Arc::new(AtomicUsize::new(0));
     let mine = forgejo_user_stub("mine").await;
-    let other = forgejo_user_stub("other").await;
-    let spare = forgejo_gated_stub("spare", Arc::clone(&hits), None).await;
-    let dashboard = forgejo_dashboard_over(&mine, &other, &[&spare]);
+    let other = forgejo_gated_stub("other", Arc::clone(&hits), None).await;
+    let dashboard = forgejo_dashboard_over(&mine, &other);
     dashboard
         .store
         .add_collaborator("maestro", USER, "test")
@@ -16461,11 +16454,11 @@ async fn an_upstream_token_form_opened_for_a_replaced_instance_is_refused() {
         .forgejo_instance("other")
         .unwrap()
         .unwrap()
-        .base_url;
+        .registration;
     dashboard.store.delete_forgejo_instance("other").unwrap();
     dashboard
         .store
-        .add_forgejo_instance("other", &spare.base, "17.0.2")
+        .add_forgejo_instance("other", &other.base, "17.0.2")
         .unwrap();
 
     let csrf = maintenance_csrf(&dashboard).await;
@@ -16535,6 +16528,7 @@ async fn a_project_whose_stored_upstream_forge_is_gone_stays_editable() {
     let gone = ForgeKind::Forgejo(factory_runner::ForgejoServer {
         name: "gone".to_owned(),
         base_url: "https://gone.example.org".to_owned(),
+        registration: 1,
     });
     dashboard
         .store
@@ -16573,4 +16567,61 @@ async fn a_project_whose_stored_upstream_forge_is_gone_stays_editable() {
             .is_none()
     );
     assert!(!saved.body.contains("is no longer registered, so"));
+}
+
+#[tokio::test]
+async fn repairing_a_gone_upstream_keeps_the_github_upstream_token() {
+    let dashboard = dashboard_with_project_token();
+    let upstream = ForgeTokenOwner::Upstream {
+        project: "maestro",
+        forge: &ForgeKind::GitHub,
+    };
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .put_forge_token(
+            upstream,
+            "tok-github",
+            &ForgeAccount {
+                login: "gh-bot".into(),
+                id: 3,
+            },
+        )
+        .unwrap();
+    let gone = ForgeKind::Forgejo(factory_runner::ForgejoServer {
+        name: "gone".to_owned(),
+        base_url: "https://gone.example.org".to_owned(),
+        registration: 1,
+    });
+    dashboard
+        .store
+        .save_project_maintenance(
+            "maestro",
+            &factory_server::Maintenance {
+                renovate: true,
+                renovate_author: None,
+                packaging: Some(factory_server::Packaging {
+                    kind: factory_server::PackagingType::Deb,
+                    manifest_files: vec!["debian/control".to_owned()],
+                    build_config_files: Vec::new(),
+                    upstream_repo: "o/tool".to_owned(),
+                    upstream_forge: gone,
+                }),
+            },
+        )
+        .unwrap();
+    let saved = dashboard
+        .post(
+            "/settings/projects/maestro/maintenance",
+            "renovate=on&packaging=on&packaging_type=deb&manifest_files=debian%2Fcontrol\
+             &upstream_repo=team%2Ftool&upstream_forge=salsa",
+        )
+        .await;
+
+    let kept = dashboard.store.project_maintenance("maestro").unwrap();
+    assert_eq!(
+        kept.packaging.map(|p| p.upstream_forge.as_str().to_owned()),
+        Some("salsa".to_owned()),
+        "{}",
+        saved.body
+    );
+    assert!(dashboard.store.forge_account(upstream).unwrap().is_some());
 }

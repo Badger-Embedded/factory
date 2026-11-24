@@ -6475,6 +6475,7 @@ async fn a_renovate_job_with_an_unregistered_upstream_fails_and_the_pass_goes_on
                     upstream_forge: ForgeKind::Forgejo(factory_runner::ForgejoServer {
                         name: "gone".into(),
                         base_url: "https://gone.example.org".into(),
+                        registration: 1,
                     }),
                 }),
             },

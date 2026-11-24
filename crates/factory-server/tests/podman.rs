@@ -1352,6 +1352,7 @@ async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account
     let kind = ForgeKind::Forgejo(factory_runner::ForgejoServer {
         name: "mine".into(),
         base_url: stub.base.clone(),
+        registration: 1,
     });
     let mut podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
     podman.forges = podman

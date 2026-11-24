@@ -148,6 +148,7 @@ fn old_versions_warn_about_what_they_cannot_do() {
         base_url: "https://git.example.org".into(),
         version: version.into(),
         added_at: String::new(),
+        registration: 1,
     };
     assert_eq!(
         instance("17.0.0-121-39320c0+gitea-1.22.0").warnings(),
@@ -370,6 +371,11 @@ fn a_project_and_its_upstream_resolve_against_the_registry() {
 
 #[test]
 fn a_write_for_a_deleted_or_replaced_instance_stores_nothing() {
+    replaced_instance_stores_nothing("https://two.example.org");
+    replaced_instance_stores_nothing("https://one.example.org");
+}
+
+fn replaced_instance_stores_nothing(again: &str) {
     use factory_runner::ForgeAccount;
     use factory_server::{
         ForgeTokenOwner, Maintenance, MaintenanceSave, Packaging, PackagingType, ProjectGuard,
@@ -392,9 +398,7 @@ fn a_write_for_a_deleted_or_replaced_instance_stores_nothing() {
         .unwrap();
     let (_, instance) = store.project_with_instance("web").unwrap().unwrap();
     store.delete_forgejo_instance("mine").unwrap();
-    store
-        .add_forgejo_instance("mine", "https://two.example.org", "17.0.2")
-        .unwrap();
+    store.add_forgejo_instance("mine", again, "17.0.2").unwrap();
 
     let account = ForgeAccount {
         login: "bot".to_owned(),

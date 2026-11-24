@@ -25,6 +25,9 @@ pub struct ForgejoServer {
     pub name: String,
     /// `https://host[:port][/sub-path]`, with no trailing slash.
     pub base_url: String,
+    /// The number of the registration, which changes when the instance is
+    /// deleted and added again.
+    pub registration: i64,
 }
 
 /// The kind of forge a project lives on.
@@ -126,15 +129,16 @@ impl ForgeKind {
         }
     }
 
-    /// The kind named `name`, where `instance_url` is the base URL of the
-    /// registered Forgejo instance of that name, if there is one.
+    /// The kind named `name`, where `instance` is the base URL of the
+    /// registered Forgejo instance of that name, if there is one, and its registration number.
     #[must_use]
-    pub fn resolve(name: &str, instance_url: Option<&str>) -> Option<ForgeKind> {
+    pub fn resolve(name: &str, instance: Option<(&str, i64)>) -> Option<ForgeKind> {
         ForgeKind::parse(name).or_else(|| {
-            instance_url.map(|base_url| {
+            instance.map(|(base_url, registration)| {
                 ForgeKind::Forgejo(ForgejoServer {
                     name: name.to_owned(),
                     base_url: base_url.to_owned(),
+                    registration,
                 })
             })
         })

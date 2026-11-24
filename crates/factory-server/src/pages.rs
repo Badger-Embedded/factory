@@ -1637,7 +1637,7 @@ pub fn settings_forge(
             form.card.settings-form method="post" action=(format!("{base}/token")) {
                 input type="hidden" name="csrf" value=(csrf);
                 @if let ForgeKind::Forgejo(server) = kind {
-                    input type="hidden" name="server" value=(server.base_url);
+                    input type="hidden" name="server" value=(server.registration);
                 }
                 h2 { "Your " (name) " token" }
                 p.hint {
@@ -2224,7 +2224,7 @@ fn upstream_token_field(
     html! {
         div.field.upstream-token id=(id) {
             @if let ForgeKind::Forgejo(server) = forge {
-                input type="hidden" name={ "server_" (forge.as_str()) } value=(server.base_url);
+                input type="hidden" name={ "server_" (forge.as_str()) } value=(server.registration);
             }
             label for={ (id) "-field" } { (forge.display_name()) " upstream token" }
             input id={ (id) "-field" } .wide type="password" name={ "token_" (forge.as_str()) }
