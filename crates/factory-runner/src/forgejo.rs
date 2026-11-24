@@ -582,6 +582,33 @@ impl Forgejo {
         version(&self.base_url, &self.client).await
     }
 
+    /// A JSON read of `path` under the repository `repo`, such as
+    /// `branches/main`, as `account`. It is `None` when the server answers
+    /// 404, and any other failure is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `repo` is not `owner/name`, the request fails,
+    /// or the answer is not JSON.
+    pub async fn read_repo_json(
+        &self,
+        account: &Account,
+        repo: &str,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Option<Value>, String> {
+        let full = format!("{}/{}", repo_path(repo)?, encode_path(path));
+        let full = full.trim_end_matches('/');
+        match self
+            .json_value(account, Method::GET, full, query, None)
+            .await
+        {
+            Ok(value) => Ok(Some(value)),
+            Err(err) if err.status == Some(404) => Ok(None),
+            Err(err) => Err(err.text),
+        }
+    }
+
     fn host(&self) -> String {
         Url::parse(&self.base_url)
             .ok()

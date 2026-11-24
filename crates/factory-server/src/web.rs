@@ -4442,6 +4442,10 @@ struct ForgeTokenForm {
 }
 
 const STALE_INSTANCE: &str = "The Forgejo instance was deleted or registered again while this was checked. Nothing was saved. Reload the page.";
+const STALE_ONBOARD: &str = "The Forgejo instance was deleted or registered again while the checks ran. No project was created. Reload the page.";
+const CHOOSE_FORGE: &str =
+    "Choose a forge. The registered instances may have changed since this page loaded.";
+const STALE_ONBOARD_FORM: &str = "The Forgejo instance changed since this page loaded. No check ran and no project was created. Reload the page.";
 const STALE_FORM: &str = "The Forgejo instance changed since this page loaded. Nothing was saved or sent. Reload the page.";
 
 /// Whether a form shown for `kind` names the registration the instance has
@@ -4674,6 +4678,10 @@ struct OnboardForm {
     /// The button that was pressed: `check`, `create` or `skip`.
     #[serde(default)]
     action: String,
+    /// The other fields, among them `server_<forge>`, the registration number
+    /// of each Forgejo instance the page showed.
+    #[serde(flatten)]
+    fields: HashMap<String, String>,
 }
 
 async fn show_onboard(
@@ -4683,7 +4691,7 @@ async fn show_onboard(
 ) -> Result<Markup, AppError> {
     let view = pages::OnboardView {
         forges: state.forges()?,
-        forge: ForgeKind::GitHub,
+        forge: Some(ForgeKind::GitHub),
         name: "",
         repo: "",
         base: DEFAULT_BASE,
@@ -4699,6 +4707,26 @@ async fn show_onboard(
         None,
         query.notice.as_deref(),
     ))
+}
+
+fn onboard_refusal(
+    forge: Option<&ForgeKind>,
+    forge_field: &str,
+    fields: &HashMap<String, String>,
+) -> Option<(String, bool)> {
+    match forge {
+        None => Some((
+            format!("The forge {forge_field:?} is not one the factory supports."),
+            false,
+        )),
+        Some(_) if forge_field.is_empty() && fields.contains_key("choose_forge") => {
+            Some((CHOOSE_FORGE.to_owned(), true))
+        }
+        Some(kind) if !shown_server(kind, shown_for(fields, kind)) => {
+            Some((STALE_ONBOARD_FORM.to_owned(), true))
+        }
+        Some(_) => None,
+    }
 }
 
 /// Runs the checks, and on `create` or `skip` with no error, onboards the
@@ -4738,31 +4766,21 @@ async fn submit_onboard(
     let auto_merge = form.auto_merge.is_some();
     let llm_review = form.llm_review.is_some();
 
-    if parsed_forge.is_none() {
-        let report = RepoReport {
-            errors: vec![format!(
-                "The forge {forge_field:?} is not one the factory supports."
-            )],
-            warnings: Vec::new(),
-        };
-        let view = pages::OnboardView {
-            forges: state.forges()?,
-            forge,
-            name,
-            repo,
-            base: base_field,
-            checks,
-            models: &models,
-            auto_merge,
-            llm_review,
-            token_page: None,
-        };
-        return Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response());
+    let refusal = onboard_refusal(parsed_forge.as_ref(), forge_field, &form.fields);
+    if let Some((message, reselect)) = refusal {
+        let selected = (!reselect).then_some(forge);
+        return redraw_onboard(&state, &headers, &form, &models, selected, message);
     }
 
     let _one_onboarding_at_a_time = state.onboarding.lock().await;
-    let (mut report, token_page) =
-        onboard_report(&state, &headers, effective_name, &forge, repo, base).await?;
+    let reported = onboard_report(&state, &headers, effective_name, &forge, repo, base).await?;
+    // The same snapshot validates the registration and draws the result. A
+    // `check` action never reaches the guarded insert.
+    let forges = state.forges()?;
+    let (mut report, token_page) = match reported {
+        Some(reported) if forges.contains(&forge) => reported,
+        _ => return stale_onboard(&state, &headers, &form, &models),
+    };
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         clear_leftover_jobs(&state, effective_name, &mut report).await?;
@@ -4794,13 +4812,16 @@ async fn submit_onboard(
             Err(err @ (StoreError::DuplicateName(_) | StoreError::DuplicateRepo(..))) => {
                 report.errors.push(err.to_string());
             }
+            Err(StoreError::InstanceChanged(_)) => {
+                return stale_onboard(&state, &headers, &form, &models);
+            }
             Err(err) => return Err(err.into()),
         }
     }
 
     let view = pages::OnboardView {
-        forges: state.forges()?,
-        forge: forge.clone(),
+        forges,
+        forge: Some(forge.clone()),
         name,
         repo,
         base: base_field,
@@ -4811,6 +4832,42 @@ async fn submit_onboard(
         token_page: token_page.as_deref(),
     };
     Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response())
+}
+
+fn stale_onboard(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: &OnboardForm,
+    models: &StageModels,
+) -> Result<Response, AppError> {
+    redraw_onboard(state, headers, form, models, None, STALE_ONBOARD.to_owned())
+}
+
+fn redraw_onboard(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: &OnboardForm,
+    models: &StageModels,
+    forge: Option<ForgeKind>,
+    error: String,
+) -> Result<Response, AppError> {
+    let report = RepoReport {
+        errors: vec![error],
+        warnings: Vec::new(),
+    };
+    let view = pages::OnboardView {
+        forges: state.forges()?,
+        forge,
+        name: form.name.trim(),
+        repo: form.repo.trim(),
+        base: form.base.trim(),
+        checks: form.checks.trim(),
+        models,
+        auto_merge: form.auto_merge.is_some(),
+        llm_review: form.llm_review.is_some(),
+        token_page: None,
+    };
+    Ok(pages::onboard(&user(headers), &view, Some(&report), None).into_response())
 }
 
 fn save_onboard_options(
@@ -4875,6 +4932,7 @@ fn valid_name(name: &str) -> bool {
 enum Onboarder {
     Account(Account),
     Blocked(String),
+    Stale,
 }
 
 fn onboarder_account(
@@ -4898,6 +4956,7 @@ fn onboarder_account(
         Err(SecretError::Unavailable) => Ok(Onboarder::Blocked(format!(
             "The secret store is unavailable, so your {name} token cannot be read and the repository checks cannot run as your account."
         ))),
+        Err(SecretError::Store(StoreError::InstanceChanged(_))) => Ok(Onboarder::Stale),
         Err(err) => Err(err.into()),
     }
 }
@@ -4912,9 +4971,10 @@ async fn onboard_report(
     forge: &ForgeKind,
     repo: &str,
     base: &str,
-) -> Result<(RepoReport, Option<String>), AppError> {
+) -> Result<Option<(RepoReport, Option<String>)>, AppError> {
     let mut token_page = None;
     let mut report = match onboarder_account(state, headers, forge)? {
+        Onboarder::Stale => return Ok(None),
         Onboarder::Account(account) => match state
             .forges
             .checker(forge)
@@ -4958,7 +5018,7 @@ async fn onboard_report(
             forge.display_name()
         ));
     }
-    Ok((report, token_page))
+    Ok(Some((report, token_page)))
 }
 
 async fn cancel(
