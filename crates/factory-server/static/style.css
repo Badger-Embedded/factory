@@ -833,7 +833,7 @@ kbd {
   z-index: 20;
   display: flex;
   flex-direction: column;
-  width: min(580px, calc(100vw - 2 * var(--space-16)));
+  width: min(740px, calc(100vw - 2 * var(--space-16)));
   max-height: calc(100vh - var(--topbar-height) - var(--space-16));
   padding: var(--space-4);
   background: var(--surface);

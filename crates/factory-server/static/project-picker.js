@@ -86,29 +86,41 @@
     }
   }
 
+  function moveHighlight(step) {
+    const shown = visibleRows();
+    if (shown.length === 0) return;
+    const at = shown.findIndex(function (row) { return row.classList.contains("active"); });
+    highlight(shown[Math.min(Math.max(at + step, 0), shown.length - 1)]);
+  }
+
+  function openHighlighted() {
+    const row = visibleRows().find(function (other) { return other.classList.contains("active"); });
+    const link = row ? row.querySelector("a") : null;
+    if (link) window.location.href = link.href;
+  }
+
   search.addEventListener("input", function () { applyFilter(false); });
   search.addEventListener("keydown", function (event) {
     if (event.isComposing || event.keyCode === 229) return;
-    const shown = visibleRows();
-    const at = shown.findIndex(function (row) { return row.classList.contains("active"); });
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
-      if (shown.length === 0) return;
-      const step = event.key === "ArrowDown" ? 1 : -1;
-      highlight(shown[Math.min(Math.max(at + step, 0), shown.length - 1)]);
+      moveHighlight(event.key === "ArrowDown" ? 1 : -1);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      const link = at >= 0 ? shown[at].querySelector("a") : null;
-      if (link) window.location.href = link.href;
+      openHighlighted();
     }
   });
+
+  let normalMode = false;
 
   picker.addEventListener("toggle", function () {
     summary.setAttribute("aria-expanded", picker.open ? "true" : "false");
     if (picker.open) {
       applyFilter(true);
-      search.focus();
+      if (!normalMode) search.focus();
+      normalMode = false;
     } else {
+      normalMode = false;
       search.value = "";
       applyFilter(false);
     }
@@ -128,14 +140,40 @@
       const key = event.key.toLowerCase();
       if (key === "p" && !event.shiftKey) {
         event.preventDefault();
-        picker.open = true;
-        search.focus();
+        if (!picker.open) {
+          normalMode = true;
+          picker.open = true;
+          applyFilter(true);
+        }
         return;
       }
       if (key === "n") {
         event.preventDefault();
         jump(event.shiftKey ? -1 : 1);
         return;
+      }
+      if (picker.open) {
+        const plain = !event.shiftKey;
+        if ((key === "j" && plain) || event.key === "ArrowDown") {
+          event.preventDefault();
+          moveHighlight(1);
+          return;
+        }
+        if ((key === "k" && plain) || event.key === "ArrowUp") {
+          event.preventDefault();
+          moveHighlight(-1);
+          return;
+        }
+        if (key === "i" && plain) {
+          event.preventDefault();
+          search.focus();
+          return;
+        }
+        if (event.key === "Enter" && !(target instanceof Element && target.closest("#picker-list a"))) {
+          event.preventDefault();
+          openHighlighted();
+          return;
+        }
       }
     }
     if (event.key === "Escape" && picker.open) {
@@ -178,6 +216,11 @@
       }
       focusedHref = null;
     }
+  });
+  document.body.addEventListener("htmx:afterSettle", function (event) {
+    const target = event.detail.target;
+    if (!target || target.id !== "picker-list") return;
+    applyFilter(true);
   });
   document.body.addEventListener("htmx:responseError", function (event) {
     const target = event.detail.target;

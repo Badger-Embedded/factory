@@ -4302,7 +4302,10 @@ async fn the_picker_shows_its_keys_as_kbd_caps() {
         .select(&sel("kbd"))
         .map(|k| k.text().collect::<String>())
         .collect();
-    assert_eq!(caps, ["↑", "↓", "Enter", "Esc", "N", "Shift", "N"]);
+    assert_eq!(
+        caps,
+        ["↑", "↓", "J", "K", "Enter", "Esc", "I", "N", "Shift", "N"]
+    );
     assert!(
         footer.value().attr("hidden").is_some(),
         "hidden until the script runs"
