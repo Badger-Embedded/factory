@@ -16991,6 +16991,9 @@ async fn an_unexpected_workflow_listing_is_a_check_error() {
         json!({"type": "file"}),
         json!({"name": "workflows", "type": "dir"}),
         json!([{"name": 3, "type": "file"}]),
+        json!([{}]),
+        json!([{"name": "ci.yml"}]),
+        json!([{"type": "file"}]),
     ];
     for listing in malformed {
         let case = ForgejoCase {
@@ -17037,8 +17040,6 @@ async fn a_stale_forgejo_onboarding_form_runs_no_check_and_creates_nothing() {
     );
 }
 
-/// A stale redraw preselects no forge, requires a choice, and refuses a post
-/// that still names none, so the next submit cannot fall back to GitHub.
 fn assert_no_forge_selected(body: &str) {
     let radios: Vec<&str> = body
         .split("<input type=\"radio\" name=\"forge\"")

@@ -4373,21 +4373,6 @@ impl Store {
             .find(|instance| instance.name == name))
     }
 
-    /// Whether `forge` is still registered as it was read: always true for a
-    /// fixed forge, and for an instance only while its name and registration
-    /// number match.
-    ///
-    /// # Errors
-    ///
-    /// Fails on a database error.
-    pub fn forge_is_current(&self, forge: &ForgeKind) -> Result<bool, StoreError> {
-        match require_registered(&self.conn(), forge) {
-            Ok(()) => Ok(true),
-            Err(StoreError::InstanceChanged(_)) => Ok(false),
-            Err(err) => Err(err),
-        }
-    }
-
     /// Checks that an instance with this name and base URL could be added:
     /// both are valid and neither is taken. Returns them in stored form.
     ///

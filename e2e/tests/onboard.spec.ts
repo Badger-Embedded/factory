@@ -257,3 +257,53 @@ test('onboarding on a Forgejo instance follows its guidance, warnings and errors
     await stop();
   }
 });
+
+test('a stale onboarding form needs a fresh forge selection before it continues', async ({ browser }) => {
+  const { factory, stop }: { factory: Factory; stop: () => Promise<void> } = await startFactory();
+  const stub = await startForgejoStub(factory);
+  try {
+    const open = async (login: string) => {
+      const context = await browser.newContext({
+        baseURL: factory.url,
+        extraHTTPHeaders: { 'Tailscale-User-Login': login },
+      });
+      return context.newPage();
+    };
+    const admin = await open(ADMIN);
+    const register = async () => {
+      await admin.goto('/settings/forgejo');
+      await admin.getByLabel('Name', { exact: true }).fill('mine');
+      await admin.getByLabel('URL', { exact: true }).fill(stub.url);
+      await admin.getByRole('button', { name: 'Add server' }).click();
+      await expect(admin.getByText(`Added mine at ${stub.url}.`)).toBeVisible();
+    };
+    await register();
+
+    const page = await open('stale-onboarder@e2e.test');
+    await page.goto('/onboard');
+    await page.getByLabel('mine', { exact: true }).check();
+    await page.getByLabel('Repository').fill('team/proj');
+
+    await admin.locator('.forgejo-row', { hasText: 'mine' }).getByRole('button', { name: 'Delete' }).click();
+    await expect(admin.getByText('Deleted mine')).toBeVisible();
+    await register();
+
+    await page.getByRole('button', { name: 'Run checks' }).click();
+    await expect(page.locator('ul.check-errors')).toContainText('changed since this page loaded');
+    for (const radio of await page.getByRole('radio').all()) {
+      await expect(radio).not.toBeChecked();
+      await expect(radio).toHaveAttribute('required', '');
+    }
+
+    await page.getByLabel('Repository').press('Enter');
+    await expect(page.locator('ul.check-errors')).toContainText('changed since this page loaded');
+
+    await page.getByLabel('mine', { exact: true }).check();
+    await page.getByRole('button', { name: 'Run checks' }).click();
+    await expect(page.locator('ul.check-errors')).toContainText('You have no mine token stored');
+    await expect(page.getByLabel('mine', { exact: true })).toBeChecked();
+  } finally {
+    await stub.stop();
+    await stop();
+  }
+});

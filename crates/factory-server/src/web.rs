@@ -4774,10 +4774,11 @@ async fn submit_onboard(
 
     let _one_onboarding_at_a_time = state.onboarding.lock().await;
     let reported = onboard_report(&state, &headers, effective_name, &forge, repo, base).await?;
-    // A deleted or replaced instance can leave the checks green, and a
+    // The same snapshot validates the registration and draws the result. A
     // `check` action never reaches the guarded insert.
+    let forges = state.forges()?;
     let (mut report, token_page) = match reported {
-        Some(reported) if state.store.forge_is_current(&forge)? => reported,
+        Some(reported) if forges.contains(&forge) => reported,
         _ => return stale_onboard(&state, &headers, &form, &models),
     };
 
@@ -4819,7 +4820,7 @@ async fn submit_onboard(
     }
 
     let view = pages::OnboardView {
-        forges: state.forges()?,
+        forges,
         forge: Some(forge.clone()),
         name,
         repo,
@@ -4833,8 +4834,6 @@ async fn submit_onboard(
     Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response())
 }
 
-/// Redraws the wizard with every selection cleared and a blocking error, for
-/// an instance that was deleted or registered again after the form was read.
 fn stale_onboard(
     state: &AppState,
     headers: &HeaderMap,

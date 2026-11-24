@@ -51,9 +51,8 @@ struct BranchJson {
 
 #[derive(Deserialize)]
 struct EntryJson {
-    #[serde(default)]
     name: String,
-    #[serde(default, rename = "type")]
+    #[serde(rename = "type")]
     kind: String,
 }
 
