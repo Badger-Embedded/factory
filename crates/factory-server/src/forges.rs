@@ -49,7 +49,7 @@ impl Forges {
 
     /// The forge that runs a job's pull request and git operations.
     #[must_use]
-    pub fn forge(&self, kind: ForgeKind) -> Arc<dyn Forge> {
+    pub fn forge(&self, kind: &ForgeKind) -> Arc<dyn Forge> {
         match kind {
             ForgeKind::GitHub => Arc::clone(&self.github),
             ForgeKind::Salsa => Arc::clone(&self.salsa),
@@ -58,7 +58,7 @@ impl Forges {
 
     /// The repository checks the onboarding wizard runs.
     #[must_use]
-    pub fn checker(&self, kind: ForgeKind) -> Arc<dyn RepoChecker> {
+    pub fn checker(&self, kind: &ForgeKind) -> Arc<dyn RepoChecker> {
         match kind {
             ForgeKind::GitHub => Arc::clone(&self.github_checker),
             ForgeKind::Salsa => Arc::clone(&self.salsa_checker),

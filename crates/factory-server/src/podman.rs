@@ -209,7 +209,7 @@ impl PodmanExecutor {
         request: &AgentRequest,
         workspace: &Path,
     ) -> Result<(), String> {
-        let forge = self.forges.forge(request.forge);
+        let forge = self.forges.forge(&request.forge);
         let owner = Mutex::new(None);
         let remote = || {
             let operation = request.account.resolve()?;
@@ -385,7 +385,7 @@ impl Executor for PodmanExecutor {
     }
 
     async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
-        let forge = self.forges.forge(request.forge);
+        let forge = self.forges.forge(&request.forge);
         let lookup = request.account.resolve()?;
         if let Some(number) = blame(
             &lookup.owner,
@@ -445,7 +445,7 @@ impl Executor for PodmanExecutor {
     }
 
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
-        let forge = self.forges.forge(request.forge);
+        let forge = self.forges.forge(&request.forge);
         let reader = request.account.resolve()?;
         let status = blame(
             &reader.owner,
@@ -532,7 +532,7 @@ impl Executor for PodmanExecutor {
         if request.renovate {
             require_write(
                 &operation,
-                self.forges.forge(request.forge).as_ref(),
+                self.forges.forge(&request.forge).as_ref(),
                 &request.repo,
             )
             .await?;
@@ -540,7 +540,7 @@ impl Executor for PodmanExecutor {
         blame(
             &operation.owner,
             self.forges
-                .forge(request.forge)
+                .forge(&request.forge)
                 .rerun_failed(&operation.account, &request.repo, request.number)
                 .await,
         )
@@ -548,7 +548,7 @@ impl Executor for PodmanExecutor {
 
     async fn renovate_prs(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         base: &str,
@@ -565,7 +565,7 @@ impl Executor for PodmanExecutor {
     }
 
     async fn watch_renovate(&self, request: RenovateWatchRequest) -> Result<Option<Event>, String> {
-        let forge = self.forges.forge(request.forge);
+        let forge = self.forges.forge(&request.forge);
         let reader = request.account.resolve()?;
         let status = blame(
             &reader.owner,
@@ -582,7 +582,7 @@ impl Executor for PodmanExecutor {
             PrState::Merged => {
                 let event = self
                     .renovate_merged(
-                        request.forge,
+                        &request.forge,
                         &request.account,
                         &request.repo,
                         request.number,
@@ -662,7 +662,7 @@ impl Executor for PodmanExecutor {
 
     async fn comment(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -680,7 +680,7 @@ impl Executor for PodmanExecutor {
 
     async fn merge_renovate(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -705,7 +705,7 @@ impl Executor for PodmanExecutor {
 
     async fn request_rebase(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -729,7 +729,7 @@ impl Executor for PodmanExecutor {
 
     async fn merged_at(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -746,7 +746,7 @@ impl Executor for PodmanExecutor {
 
     async fn renovate_head(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -763,7 +763,7 @@ impl Executor for PodmanExecutor {
 
     async fn renovate_merged(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -793,7 +793,7 @@ impl Executor for PodmanExecutor {
         &self,
         request: PackagingRequest,
     ) -> Result<PackagingContext, String> {
-        let forge = self.forges.forge(request.forge);
+        let forge = self.forges.forge(&request.forge);
         let reader = request.account.resolve()?;
         let details = blame(
             &reader.owner,
@@ -821,7 +821,7 @@ impl Executor for PodmanExecutor {
         let range = recorded
             .or_else(|| {
                 self.forges
-                    .forge(request.upstream_forge)
+                    .forge(&request.upstream_forge)
                     .compare_range(&details.body, &request.upstream)
             })
             .or_else(|| manifest_range(&details.diff, &request.manifest_files));
@@ -839,7 +839,7 @@ impl Executor for PodmanExecutor {
                 let text = blame(
                     &reader.owner,
                     self.forges
-                        .forge(request.upstream_forge)
+                        .forge(&request.upstream_forge)
                         .compare_patch(&reader.account, &request.upstream, from, to, path)
                         .await,
                 )?;

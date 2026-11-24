@@ -89,7 +89,7 @@ impl Fixture {
         self.store
             .create_project(
                 name,
-                ForgeKind::GitHub,
+                &ForgeKind::GitHub,
                 &format!("Badger-Embedded/{name}"),
                 "main",
                 None,
@@ -119,7 +119,7 @@ impl Fixture {
 fn owner(name: &str) -> ForgeTokenOwner<'_> {
     ForgeTokenOwner::Project {
         project: name,
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     }
 }
 

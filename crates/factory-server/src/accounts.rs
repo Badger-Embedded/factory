@@ -285,14 +285,15 @@ impl Accounts {
         &self,
         project_name: &str,
         project: &Project,
-        upstream: ForgeKind,
+        upstream: &ForgeKind,
     ) -> AccountSource {
         let accounts = self.clone();
         let (name, project) = (project_name.to_owned(), project.clone());
+        let upstream = upstream.clone();
         AccountSource::new(move || {
-            let read = accounts.upstream(&name, &project, upstream)?;
+            let read = accounts.upstream(&name, &project, &upstream)?;
             Ok(Operation {
-                forge: upstream,
+                forge: upstream.clone(),
                 account: read.account,
                 owner: read.owner,
                 ignore: Vec::new(),
@@ -313,7 +314,7 @@ impl Accounts {
         &self,
         project_name: &str,
         project: &Project,
-        upstream: ForgeKind,
+        upstream: &ForgeKind,
     ) -> Result<UpstreamRead, ResolveError> {
         let forge = self.forges.forge(upstream);
         let own = ForgeTokenOwner::Upstream {
@@ -323,7 +324,7 @@ impl Accounts {
         let mut rows = Vec::new();
         let upstream_row = |sealed| TokenRow {
             upstream: true,
-            forge: upstream,
+            forge: upstream.clone(),
             sealed,
         };
         if self.store.forge_account(own)?.is_some() {
@@ -351,7 +352,7 @@ impl Accounts {
             };
             let project_row = |sealed| TokenRow {
                 upstream: false,
-                forge: kind,
+                forge: kind.clone(),
                 sealed,
             };
             if self.store.forge_account(owner)?.is_some() {
@@ -407,7 +408,7 @@ impl Accounts {
 
         let requester = Owner::Requester {
             login: requested_by.to_owned(),
-            forge: kind,
+            forge: kind.clone(),
         };
         let personal = if requested_by != FACTORY_REQUESTER
             && self.store.is_collaborator(project_name, requested_by)?
@@ -442,7 +443,7 @@ impl Accounts {
             ignore.push(login);
         }
         Ok(Operation {
-            forge: kind,
+            forge: kind.clone(),
             account,
             owner,
             ignore,

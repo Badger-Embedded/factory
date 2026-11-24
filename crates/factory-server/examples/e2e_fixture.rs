@@ -211,7 +211,7 @@ fn create_job(
 fn seed(store: &Store) -> Result<()> {
     store.create_project(
         SHARED_PROJECT,
-        ForgeKind::GitHub,
+        &ForgeKind::GitHub,
         "e2e/maestro",
         "main",
         Some("just test"),
@@ -329,7 +329,7 @@ fn main() -> Result<()> {
             let repo = one("repo").map_or_else(|_| format!("e2e/{name}"), Clone::clone);
             store.create_project(
                 name,
-                ForgeKind::GitHub,
+                &ForgeKind::GitHub,
                 &repo,
                 "main",
                 None,

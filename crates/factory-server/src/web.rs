@@ -76,6 +76,18 @@ struct AppState {
     csrf: Arc<CsrfKey>,
 }
 
+impl AppState {
+    #[allow(clippy::unused_self, reason = "the forge registry will read the state")]
+    fn known_forge(&self, name: &str) -> Option<ForgeKind> {
+        ForgeKind::parse(name)
+    }
+
+    #[allow(clippy::unused_self, reason = "the forge registry will read the state")]
+    fn forges(&self) -> Vec<ForgeKind> {
+        ForgeKind::ALL.to_vec()
+    }
+}
+
 /// The dashboard. Every change it makes to a job notifies `wake`, so the
 /// job loop looks at the job right away. Uploaded images go under
 /// `<data_dir>/jobs/<id>/images/`. The index page reads `plan_usage` from the
@@ -1732,6 +1744,7 @@ fn settings_nav(state: &AppState, login: &str) -> Result<pages::SettingsNav, Sto
     Ok(pages::SettingsNav {
         admin: state.admins.iter().any(|admin| admin == login),
         projects: project_labels(state, login)?,
+        forges: state.forges(),
         servers: state
             .store
             .mcp_servers()?
@@ -2056,7 +2069,7 @@ fn project_settings(
         .collect();
     let forge_account = match project.forge.kind() {
         Some(kind) => Some(pages::ForgeAccountCard {
-            kind,
+            kind: kind.clone(),
             repo: project.repo.clone(),
             project_account: state.store.forge_account(ForgeTokenOwner::Project {
                 project: name,
@@ -2089,14 +2102,16 @@ fn project_settings(
         forge_problem: project.forge.problem(),
         forge_account,
         upstream: pages::UpstreamCard {
-            accounts: ForgeKind::ALL
+            accounts: state
+                .forges()
                 .into_iter()
                 .map(|forge| {
                     let owner = ForgeTokenOwner::Upstream {
                         project: name,
-                        forge,
+                        forge: &forge,
                     };
-                    Ok((forge, state.store.forge_account(owner)?))
+                    let account = state.store.forge_account(owner)?;
+                    Ok((forge, account))
                 })
                 .collect::<Result<_, StoreError>>()?,
             secrets_available: state.secrets.available(),
@@ -2420,7 +2435,7 @@ struct UseMyAccountForm {
 
 /// The kind of the project's forge, or a bad request for a project on an
 /// unknown forge, which has no token to keep.
-fn project_forge_kind(project: &Project) -> Result<ForgeKind, AppError> {
+fn project_forge_kind(project: &Project) -> Result<&ForgeKind, AppError> {
     project
         .forge
         .kind()
@@ -2621,26 +2636,28 @@ fn path_lines(text: &str) -> Vec<String> {
 }
 
 fn maintenance_from_form(
+    state: &AppState,
     form: &MaintenanceForm,
-    forge: Option<ForgeKind>,
+    forge: Option<&ForgeKind>,
 ) -> (Maintenance, Option<String>) {
     let kind = if form.packaging_type.is_empty() {
         Some(PackagingType::default())
     } else {
         PackagingType::parse(&form.packaging_type)
     };
+    let own_forge = forge.cloned().unwrap_or(ForgeKind::GitHub);
     let upstream_forge = match form.upstream_forge.as_str() {
-        "" => Some(forge.unwrap_or(ForgeKind::GitHub)),
-        name => ForgeKind::parse(name),
+        "" => Some(own_forge.clone()),
+        name => state.known_forge(name),
     };
     let packaging = form.packaging.is_some().then(|| Packaging {
         kind: kind.unwrap_or_default(),
         manifest_files: path_lines(&form.manifest_files),
         build_config_files: path_lines(&form.build_config_files),
         upstream_repo: form.upstream_repo.trim().to_owned(),
-        upstream_forge: upstream_forge.unwrap_or(forge.unwrap_or(ForgeKind::GitHub)),
+        upstream_forge: upstream_forge.clone().unwrap_or(own_forge),
     });
-    let salsa = forge == Some(ForgeKind::Salsa);
+    let salsa = forge == Some(&ForgeKind::Salsa);
     let author = form.renovate_author.trim();
     let maintenance = Maintenance {
         renovate: form.renovate.is_some(),
@@ -2688,13 +2705,13 @@ async fn save_checks(
                 notice = format!("{notice} {warning}");
                 snapshots.push(TokenRow {
                     upstream: false,
-                    forge: project_forge,
+                    forge: project_forge.clone(),
                     sealed: Some(sealed),
                 });
             }
             RenovateCheck::Passed { sealed } => snapshots.push(TokenRow {
                 upstream: false,
-                forge: project_forge,
+                forge: project_forge.clone(),
                 sealed: Some(sealed),
             }),
         }
@@ -2740,7 +2757,7 @@ async fn save_project_maintenance(
         return Err(AppError::UnknownProject(project));
     };
     let part = pages::PipelinePart::parse(None);
-    let (maintenance, refusal) = maintenance_from_form(&form, record.forge.kind());
+    let (maintenance, refusal) = maintenance_from_form(&state, &form, record.forge.kind());
     if let Some(problem) = refusal {
         return project_page_with(
             &state,
@@ -2784,12 +2801,12 @@ async fn save_project_maintenance(
             let owner = if snapshot.upstream {
                 ForgeTokenOwner::Upstream {
                     project: &project,
-                    forge: snapshot.forge,
+                    forge: &snapshot.forge,
                 }
             } else {
                 ForgeTokenOwner::Project {
                     project: &project,
-                    forge: snapshot.forge,
+                    forge: &snapshot.forge,
                 }
             };
             (owner, snapshot.sealed.as_deref())
@@ -2806,7 +2823,7 @@ async fn save_project_maintenance(
     )?;
     let problem = match saved {
         MaintenanceSave::Saved => {
-            drop_stale_upstream_token(&state, &project, previous_upstream, &maintenance)?;
+            drop_stale_upstream_token(&state, &project, previous_upstream.as_ref(), &maintenance)?;
             return project_page_full(
                 &state,
                 &headers,
@@ -2840,18 +2857,22 @@ async fn save_project_maintenance(
 fn drop_stale_upstream_token(
     state: &AppState,
     project: &str,
-    before: Option<ForgeKind>,
+    before: Option<&ForgeKind>,
     saved: &Maintenance,
 ) -> Result<(), AppError> {
     match (before, &saved.packaging) {
-        (Some(before), Some(packaging)) if before != packaging.upstream_forge => {
+        (Some(before), Some(packaging)) if *before != packaging.upstream_forge => {
             clear_upstream_token(state, project, before)
         }
         _ => Ok(()),
     }
 }
 
-fn clear_upstream_token(state: &AppState, project: &str, forge: ForgeKind) -> Result<(), AppError> {
+fn clear_upstream_token(
+    state: &AppState,
+    project: &str,
+    forge: &ForgeKind,
+) -> Result<(), AppError> {
     match forge_tokens::clear(
         state.secrets.as_ref(),
         ForgeTokenOwner::Upstream { project, forge },
@@ -2872,7 +2893,7 @@ async fn check_upstream(
     project: &Project,
     packaging: &Packaging,
 ) -> (pages::UpstreamCheckView, Vec<TokenRow>) {
-    let forge = packaging.upstream_forge;
+    let forge = &packaging.upstream_forge;
     let repo = &packaging.upstream_repo;
     let display = forge.display_name();
     let accounts = Accounts::new(
@@ -2912,7 +2933,7 @@ async fn check_upstream(
         ),
         Ok(_) => {
             let mut text = format!("Checked with {used}: {repo} is readable on {display}.");
-            if forge == ForgeKind::GitHub && read.credential == UpstreamCredential::None {
+            if *forge == ForgeKind::GitHub && read.credential == UpstreamCredential::None {
                 text.push_str(" GitHub rate limits reads with no token, and an upstream token lifts the limit.");
             }
             (Some(true), text)
@@ -2947,7 +2968,7 @@ async fn check_project_upstream(
 ) -> Result<Markup, AppError> {
     let record = visible_project(&state, &headers, &project)?;
     let part = pages::PipelinePart::parse(None);
-    let (maintenance, refusal) = maintenance_from_form(&form, record.forge.kind());
+    let (maintenance, refusal) = maintenance_from_form(&state, &form, record.forge.kind());
     let Some(packaging) = maintenance.packaging.clone() else {
         return project_page_with(
             &state,
@@ -2998,9 +3019,9 @@ async fn save_upstream_token(
     let project = visible_project(&state, &headers, &name)?;
     let login = user(&headers);
     require_csrf(&state, &login, &form.csrf)?;
-    let kind = token_forge(&query)?;
+    let kind = token_forge(&state, &query)?;
     let part = pages::PipelinePart::parse(None);
-    let (draft, _) = maintenance_from_form(&form.draft(), project.forge.kind());
+    let (draft, _) = maintenance_from_form(&state, &form.draft(), project.forge.kind());
     let redraw = |notice: Option<&str>, problem: Option<&str>| {
         project_page_full(
             &state,
@@ -3019,7 +3040,7 @@ async fn save_upstream_token(
             Some("The master key is missing, so the token was not saved."),
         );
     }
-    let token = form.token(kind).trim();
+    let token = form.token(&kind).trim();
     if token.is_empty() {
         return redraw(Some("Saved."), None);
     }
@@ -3029,10 +3050,10 @@ async fn save_upstream_token(
     let display = kind.display_name();
     let saved = forge_tokens::save_guarded(
         state.secrets.as_ref(),
-        state.forges.forge(kind).as_ref(),
+        state.forges.forge(&kind).as_ref(),
         ForgeTokenOwner::Upstream {
             project: &name,
-            forge: kind,
+            forge: &kind,
         },
         token,
         &ProjectGuard {
@@ -3084,9 +3105,9 @@ async fn clear_upstream_token_route(
 ) -> Result<Markup, AppError> {
     let project = visible_project(&state, &headers, &name)?;
     require_csrf(&state, &user(&headers), &form.csrf)?;
-    let kind = token_forge(&query)?;
-    let (draft, _) = maintenance_from_form(&form.draft(), project.forge.kind());
-    clear_upstream_token(&state, &name, kind)?;
+    let kind = token_forge(&state, &query)?;
+    let (draft, _) = maintenance_from_form(&state, &form.draft(), project.forge.kind());
+    clear_upstream_token(&state, &name, &kind)?;
     project_page_full(
         &state,
         &headers,
@@ -3998,14 +4019,16 @@ fn require_csrf(state: &AppState, login: &str, token: &str) -> Result<(), AppErr
     }
 }
 
-fn forge_kind(name: &str) -> Result<ForgeKind, AppError> {
-    ForgeKind::parse(name).ok_or_else(|| AppError::NotFound(format!("no forge {name}")))
+fn forge_kind(state: &AppState, name: &str) -> Result<ForgeKind, AppError> {
+    state
+        .known_forge(name)
+        .ok_or_else(|| AppError::NotFound(format!("no forge {name}")))
 }
 
 fn forge_page(
     state: &AppState,
     headers: &HeaderMap,
-    kind: ForgeKind,
+    kind: &ForgeKind,
     notice: Option<&str>,
 ) -> Result<Markup, AppError> {
     let login = user(headers);
@@ -4029,7 +4052,7 @@ async fn show_forge(
     headers: HeaderMap,
     Path(forge): Path<String>,
 ) -> Result<Markup, AppError> {
-    forge_page(&state, &headers, forge_kind(&forge)?, None)
+    forge_page(&state, &headers, &forge_kind(&state, &forge)?, None)
 }
 
 async fn save_forge_token(
@@ -4038,28 +4061,28 @@ async fn save_forge_token(
     Path(forge): Path<String>,
     Form(form): Form<ForgeTokenForm>,
 ) -> Result<Markup, AppError> {
-    let kind = forge_kind(&forge)?;
+    let kind = forge_kind(&state, &forge)?;
     require_csrf(&state, &user(&headers), &form.csrf)?;
     if !state.secrets.available() {
         return forge_page(
             &state,
             &headers,
-            kind,
+            &kind,
             Some("The master key is missing, so the token was not saved."),
         );
     }
     let token = form.token.trim();
     if token.is_empty() {
-        return forge_page(&state, &headers, kind, Some("Saved."));
+        return forge_page(&state, &headers, &kind, Some("Saved."));
     }
     let login = user(&headers);
     let owner = ForgeTokenOwner::User {
         login: &login,
-        forge: kind,
+        forge: &kind,
     };
     let saved = forge_tokens::save(
         state.secrets.as_ref(),
-        state.forges.forge(kind).as_ref(),
+        state.forges.forge(&kind).as_ref(),
         owner,
         token,
     )
@@ -4080,7 +4103,7 @@ async fn save_forge_token(
             unreachable!("a user token is saved with no repository or project")
         }
     };
-    forge_page(&state, &headers, kind, Some(&notice))
+    forge_page(&state, &headers, &kind, Some(&notice))
 }
 
 async fn clear_forge_token(
@@ -4089,18 +4112,18 @@ async fn clear_forge_token(
     Path(forge): Path<String>,
     Form(form): Form<ForgeClearForm>,
 ) -> Result<Markup, AppError> {
-    let kind = forge_kind(&forge)?;
+    let kind = forge_kind(&state, &forge)?;
     require_csrf(&state, &user(&headers), &form.csrf)?;
     let login = user(&headers);
     let cleared = forge_tokens::clear(
         state.secrets.as_ref(),
         ForgeTokenOwner::User {
             login: &login,
-            forge: kind,
+            forge: &kind,
         },
     );
     match cleared {
-        Ok(()) => forge_page(&state, &headers, kind, Some("Cleared.")),
+        Ok(()) => forge_page(&state, &headers, &kind, Some("Cleared.")),
         Err(SaveError::Secrets(err)) => Err(err.into()),
         Err(SaveError::Store(err)) => Err(err.into()),
         Err(
@@ -4159,13 +4182,14 @@ struct TokenForgeQuery {
     forge: String,
 }
 
-fn token_forge(query: &TokenForgeQuery) -> Result<ForgeKind, AppError> {
-    ForgeKind::parse(&query.forge)
+fn token_forge(state: &AppState, query: &TokenForgeQuery) -> Result<ForgeKind, AppError> {
+    state
+        .known_forge(&query.forge)
         .ok_or_else(|| AppError::BadRequest(format!("{:?} is not a forge", query.forge)))
 }
 
 impl UpstreamTokenForm {
-    fn token(&self, forge: ForgeKind) -> &str {
+    fn token(&self, forge: &ForgeKind) -> &str {
         match forge {
             ForgeKind::GitHub => &self.token_github,
             ForgeKind::Salsa => &self.token_salsa,
@@ -4345,8 +4369,13 @@ struct OnboardForm {
     action: String,
 }
 
-async fn show_onboard(headers: HeaderMap, Query(query): Query<NoticeQuery>) -> Markup {
+async fn show_onboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NoticeQuery>,
+) -> Markup {
     let view = pages::OnboardView {
+        forges: state.forges(),
         forge: ForgeKind::GitHub,
         name: "",
         repo: "",
@@ -4373,9 +4402,9 @@ async fn submit_onboard(
     let parsed_forge = if forge_field.is_empty() {
         Some(ForgeKind::GitHub)
     } else {
-        ForgeKind::parse(forge_field)
+        state.known_forge(forge_field)
     };
-    let forge = parsed_forge.unwrap_or(ForgeKind::GitHub);
+    let forge = parsed_forge.clone().unwrap_or(ForgeKind::GitHub);
     let name = form.name.trim();
     let repo = form.repo.trim();
     let base_field = form.base.trim();
@@ -4405,6 +4434,7 @@ async fn submit_onboard(
             warnings: Vec::new(),
         };
         let view = pages::OnboardView {
+            forges: state.forges(),
             forge,
             name,
             repo,
@@ -4420,7 +4450,7 @@ async fn submit_onboard(
 
     let _one_onboarding_at_a_time = state.onboarding.lock().await;
     let (mut report, token_page) =
-        onboard_report(&state, &headers, effective_name, forge, repo, base).await?;
+        onboard_report(&state, &headers, effective_name, &forge, repo, base).await?;
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         clear_leftover_jobs(&state, effective_name, &mut report).await?;
@@ -4429,7 +4459,7 @@ async fn submit_onboard(
         let checks = (!checks.is_empty()).then_some(checks);
         match state.store.create_project_as(
             effective_name,
-            forge,
+            &forge,
             repo,
             base,
             checks,
@@ -4457,7 +4487,8 @@ async fn submit_onboard(
     }
 
     let view = pages::OnboardView {
-        forge,
+        forges: state.forges(),
+        forge: forge.clone(),
         name,
         repo,
         base: base_field,
@@ -4537,7 +4568,7 @@ enum Onboarder {
 fn onboarder_account(
     state: &AppState,
     headers: &HeaderMap,
-    forge: ForgeKind,
+    forge: &ForgeKind,
 ) -> Result<Onboarder, AppError> {
     let login = user(headers);
     let owner = ForgeTokenOwner::User {
@@ -4566,7 +4597,7 @@ async fn onboard_report(
     state: &AppState,
     headers: &HeaderMap,
     name: &str,
-    forge: ForgeKind,
+    forge: &ForgeKind,
     repo: &str,
     base: &str,
 ) -> Result<(RepoReport, Option<String>), AppError> {
@@ -4608,7 +4639,7 @@ async fn onboard_report(
         .projects
         .list()?
         .iter()
-        .any(|(_, p)| p.forge == ProjectForge::Known(forge) && p.repo == repo)
+        .any(|(_, p)| p.forge == ProjectForge::Known(forge.clone()) && p.repo == repo)
     {
         report.errors.push(format!(
             "The {} repository {repo} is already onboarded.",

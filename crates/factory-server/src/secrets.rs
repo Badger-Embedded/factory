@@ -63,17 +63,26 @@ pub struct SecretRef<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeTokenOwner<'a> {
     /// The token a login stores for itself on the forge's settings page.
-    User { login: &'a str, forge: ForgeKind },
+    User {
+        login: &'a str,
+        forge: &'a ForgeKind,
+    },
     /// The token a project's jobs run as when no personal account applies.
-    Project { project: &'a str, forge: ForgeKind },
+    Project {
+        project: &'a str,
+        forge: &'a ForgeKind,
+    },
     /// The optional token that reads a packaging upstream.
-    Upstream { project: &'a str, forge: ForgeKind },
+    Upstream {
+        project: &'a str,
+        forge: &'a ForgeKind,
+    },
 }
 
-impl ForgeTokenOwner<'_> {
+impl<'a> ForgeTokenOwner<'a> {
     /// The owner kind, the key and the forge, the three parts the associated
     /// data binds.
-    fn parts(&self) -> (&'static str, &str, &'static str) {
+    fn parts(&self) -> (&'static str, &'a str, &'a str) {
         match *self {
             ForgeTokenOwner::User { login, forge } => ("user", login, forge.as_str()),
             ForgeTokenOwner::Project { project, forge } => ("project", project, forge.as_str()),

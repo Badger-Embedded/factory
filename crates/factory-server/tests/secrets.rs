@@ -728,19 +728,19 @@ fn forge_tokens_round_trip_per_owner_and_hold_no_plaintext() {
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
     let alice = ForgeTokenOwner::User {
         login: "alice",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     let bob = ForgeTokenOwner::User {
         login: "bob",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     let project = ForgeTokenOwner::Project {
         project: "maestro",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     let upstream = ForgeTokenOwner::Upstream {
         project: "maestro",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
 
     for (owner, token) in [
@@ -782,19 +782,19 @@ fn a_forge_token_ciphertext_moved_to_another_row_fails_to_decrypt() {
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
     let alice = ForgeTokenOwner::User {
         login: "alice",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     let bob = ForgeTokenOwner::User {
         login: "bob",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     let project = ForgeTokenOwner::Project {
         project: "maestro",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     let upstream = ForgeTokenOwner::Upstream {
         project: "maestro",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     for (from, to) in [
         (alice, bob),
@@ -822,7 +822,7 @@ fn a_forge_token_ciphertext_swapped_with_an_mcp_header_or_reserved_row_fails() {
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
     let alice = ForgeTokenOwner::User {
         login: "alice",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     let header = at("maestro", "context7", "Authorization");
     secrets
@@ -862,7 +862,7 @@ fn an_unavailable_store_refuses_forge_tokens_but_still_deletes_them() {
     let local = LocalSecrets::new(&key(1), Arc::clone(&store));
     let alice = ForgeTokenOwner::User {
         login: "alice",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     local.put_forge_token(alice, "tok", &account()).unwrap();
 
@@ -887,7 +887,7 @@ fn a_failed_account_write_rolls_the_forge_token_back() {
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
     let alice = ForgeTokenOwner::User {
         login: "alice",
-        forge: GITHUB,
+        forge: &GITHUB,
     };
     secrets
         .put_forge_token(alice, "tok-old", &account())
