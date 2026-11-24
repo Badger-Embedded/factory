@@ -1383,6 +1383,35 @@ async fn unresolved_mergeability_is_neither_a_conflict_nor_ready() {
 }
 
 #[tokio::test]
+async fn a_missing_mergeable_with_green_checks_is_not_ready() {
+    for absent in [true, false] {
+        let stub = serve(move |seen| match seen.path.as_str() {
+            "/repos/owner/name/pulls/3" => {
+                let mut pull = pull("abc");
+                if absent {
+                    pull.as_object_mut().unwrap().remove("mergeable");
+                } else {
+                    pull["mergeable"] = Value::Null;
+                }
+                ok(&pull)
+            }
+            "/repos/owner/name/commits/abc/status" => {
+                page(seen, &json!({"statuses": [context("a", "success", "")]}))
+            }
+            _ => quiet(seen),
+        })
+        .await;
+        let status = stub
+            .forge
+            .status(&account(&stub.forge), REPO, 3, &[])
+            .await
+            .unwrap();
+        assert_eq!(status.ci, Ci::Pending, "absent {absent}");
+        assert!(!status.conflicting);
+    }
+}
+
+#[tokio::test]
 async fn rerun_failed_reruns_every_failed_job_of_a_large_run() {
     let stub = serve(|seen| match (seen.method.as_str(), seen.path.as_str()) {
         ("GET", "/repos/owner/name/pulls/3") => ok(&pull("abc")),

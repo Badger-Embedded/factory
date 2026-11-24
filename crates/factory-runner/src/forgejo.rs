@@ -997,7 +997,7 @@ impl Forgejo {
             PrState::Closed
         };
         let mut ci = self.ci(account, repo, &pull.head.sha).await?;
-        let unresolved = pull.state == "open" && (pull.mergeable == Some(false) || pull.draft);
+        let unresolved = pull.state == "open" && (pull.mergeable != Some(true) || pull.draft);
         if unresolved && matches!(ci, Ci::Passed | Ci::NoChecks) {
             ci = Ci::Pending;
         }
