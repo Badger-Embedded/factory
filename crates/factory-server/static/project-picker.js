@@ -116,10 +116,8 @@
   picker.addEventListener("toggle", function () {
     summary.setAttribute("aria-expanded", picker.open ? "true" : "false");
     if (picker.open) {
-      if (!normalMode) {
-        applyFilter(false);
-        search.focus();
-      }
+      applyFilter(true);
+      if (!normalMode) search.focus();
       normalMode = false;
     } else {
       normalMode = false;
@@ -210,7 +208,7 @@
     if (detached) clearCurrent(list);
     const row = list.querySelector('a[aria-current="page"] .picker-name');
     if (row) current.textContent = row.textContent;
-    applyFilter(true);
+    applyFilter(picker.open);
     dimHints();
     if (focusedHref !== null) {
       for (const link of list.querySelectorAll("a")) {
@@ -222,7 +220,7 @@
   document.body.addEventListener("htmx:afterSettle", function (event) {
     const target = event.detail.target;
     if (!target || target.id !== "picker-list") return;
-    applyFilter(true);
+    applyFilter(picker.open);
   });
   document.body.addEventListener("htmx:responseError", function (event) {
     const target = event.detail.target;
@@ -245,7 +243,7 @@
           badge.replaceWith(freshBadge);
         }
         htmx.process(fresh);
-        applyFilter(true);
+        applyFilter(picker.open);
         dimHints();
       });
   });

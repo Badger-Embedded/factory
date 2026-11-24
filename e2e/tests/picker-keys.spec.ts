@@ -115,6 +115,24 @@ test.describe('with a desktop pointer', () => {
     await expect(page).toHaveURL(new RegExp(`[?&]project=${ids.c}$`));
   });
 
+  test('a highlight moved before the delayed toggle event survives it', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    const moved = await page.evaluate(async () => {
+      const picker = document.getElementById('project-picker') as HTMLDetailsElement;
+      picker.open = true;
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      const before = document.querySelector('#picker-list li.active')?.getAttribute('data-id');
+      await new Promise((resolve) => picker.addEventListener('toggle', resolve, { once: true }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { before, after: document.querySelector('#picker-list li.active')?.getAttribute('data-id') };
+    });
+    expect(moved.before).toBe(ids.b);
+    expect(moved.after).toBe(ids.b);
+  });
+
   test('a poll keeps normal mode, the highlight and an unfocused box', async ({ page, factory }, testInfo) => {
     const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
