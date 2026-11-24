@@ -3440,7 +3440,10 @@ fn check_outcome_line(outcome: &CheckOutcome) -> Markup {
 pub struct OnboardView<'a> {
     /// The forges the selector lists, in the order the pages show them.
     pub forges: Vec<ForgeKind>,
-    pub forge: ForgeKind,
+    /// The forge to preselect. `None` after a redraw that found the form
+    /// stale: the operator must choose again, so a changed instance is never
+    /// picked by default.
+    pub forge: Option<ForgeKind>,
     /// The project name as typed. Empty means the repository name is used.
     pub name: &'a str,
     pub repo: &'a str,
@@ -3480,25 +3483,17 @@ pub fn onboard(
                         input type="hidden" name={ "server_" (kind.as_str()) } value=(server.registration);
                     }
                 }
-                h2 { "Project" }
-                div.field {
-                    label { "Forge" }
-                    @for kind in &view.forges {
-                        label.check {
-                            input type="radio" name="forge" value=(kind.as_str())
-                                data-placeholder=(repo_placeholder(kind))
-                                checked[*kind == view.forge];
-                            " " (kind.display_name())
-                        }
-                    }
-                    p.hint { "Where the repository lives. The checks run as your own token for this forge." }
+                @if view.forge.is_none() {
+                    input type="hidden" name="choose_forge" value="1";
                 }
+                h2 { "Project" }
+                (forge_radios(view))
                 div.field {
                     label for="repo" { "Repository" }
                     input #repo.wide type="text" name="repo" required
-                        placeholder=(repo_placeholder(&view.forge)) value=(view.repo);
+                        placeholder=(view.forge.as_ref().map_or("owner/name", repo_placeholder)) value=(view.repo);
                     @for kind in &view.forges {
-                        p.hint data-forge=(kind.as_str()) hidden[*kind != view.forge] {
+                        p.hint data-forge=(kind.as_str()) hidden[view.forge.as_ref() != Some(kind)] {
                             (repo_hint(kind))
                         }
                     }
@@ -3564,6 +3559,24 @@ pub fn onboard(
             script { (PreEscaped(ONBOARD_FORGE)) }
         },
     )
+}
+
+fn forge_radios(view: &OnboardView<'_>) -> Markup {
+    html! {
+        div.field {
+            label { "Forge" }
+            @for kind in &view.forges {
+                label.check {
+                    input type="radio" name="forge" value=(kind.as_str())
+                        data-placeholder=(repo_placeholder(kind))
+                        checked[view.forge.as_ref() == Some(kind)]
+                        required[view.forge.is_none()];
+                    " " (kind.display_name())
+                }
+            }
+            p.hint { "Where the repository lives. The checks run as your own token for this forge." }
+        }
+    }
 }
 
 fn repo_hint(forge: &ForgeKind) -> String {

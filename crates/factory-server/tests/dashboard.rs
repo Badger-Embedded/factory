@@ -16980,6 +16980,33 @@ async fn a_repository_with_a_workflow_path_that_is_a_file_or_missing_warns_witho
 }
 
 #[tokio::test]
+async fn an_unexpected_workflow_listing_is_a_check_error() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let malformed = [
+        json!(null),
+        json!(7),
+        json!("file"),
+        json!({"name": "workflows"}),
+        json!({"type": "file"}),
+        json!({"name": "workflows", "type": "dir"}),
+        json!([{"name": 3, "type": "file"}]),
+    ];
+    for listing in malformed {
+        let case = ForgejoCase {
+            forgejo_workflows: Some(listing.clone()),
+            ..ForgejoCase::fit()
+        };
+        let body = onboarding.check(case, "team%2Fproj").await;
+        assert!(
+            body.contains("returned unexpected output"),
+            "{listing}: {body}"
+        );
+        assert!(!body.contains("All required checks passed."), "{listing}");
+    }
+}
+
+#[tokio::test]
 async fn a_stale_forgejo_onboarding_form_runs_no_check_and_creates_nothing() {
     let onboarding = forgejo_onboarding().await;
     onboarding.store_token().await;
@@ -16994,6 +17021,7 @@ async fn a_stale_forgejo_onboarding_form_runs_no_check_and_creates_nothing() {
             .await
             .body;
         assert!(body.contains("changed since this page loaded"), "{body}");
+        assert_no_forge_selected(&body);
     }
     assert_eq!(
         onboarding.hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -17009,8 +17037,45 @@ async fn a_stale_forgejo_onboarding_form_runs_no_check_and_creates_nothing() {
     );
 }
 
+/// A stale redraw preselects no forge, requires a choice, and refuses a post
+/// that still names none, so the next submit cannot fall back to GitHub.
+fn assert_no_forge_selected(body: &str) {
+    let radios: Vec<&str> = body
+        .split("<input type=\"radio\" name=\"forge\"")
+        .skip(1)
+        .map(|rest| rest.split('>').next().unwrap())
+        .collect();
+    assert!(radios.len() >= 3, "{body}");
+    for radio in radios {
+        assert!(!radio.contains("checked"), "{radio}");
+        assert!(radio.contains("required"), "{radio}");
+    }
+    assert!(body.contains("name=\"choose_forge\""), "{body}");
+}
+
 #[tokio::test]
-async fn an_instance_deleted_or_replaced_during_the_checks_creates_no_project() {
+async fn an_empty_forge_after_a_stale_redraw_is_refused_not_read_as_github() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let before = onboarding.hits.load(std::sync::atomic::Ordering::SeqCst);
+    let body = onboarding
+        .dashboard
+        .post(
+            "/onboard",
+            "forge=&choose_forge=1&repo=team%2Fproj&name=proj&action=skip",
+        )
+        .await
+        .body;
+    assert!(body.contains("Choose a forge."), "{body}");
+    assert_no_forge_selected(&body);
+    assert_eq!(
+        onboarding.hits.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+}
+
+#[tokio::test]
+async fn an_instance_changed_while_a_submit_waits_for_the_token_read_is_a_wizard_error() {
     let onboarding = forgejo_onboarding().await;
     onboarding.dashboard.store.remove_project("forged").unwrap();
     onboarding.store_token().await;
@@ -17026,7 +17091,69 @@ async fn an_instance_deleted_or_replaced_during_the_checks_creates_no_project() 
         let release = Arc::new(Notify::new());
         *onboarding.gate.lock().unwrap() = Some((Arc::clone(&arrived), Arc::clone(&release)));
         let form = format!(
-            "forge=mine&{}&repo=team%2Fproj&action=skip",
+            "forge=mine&{}&repo=team%2Fproj&name=proj&action=check",
+            onboarding.shown()
+        );
+        let holder = onboarding.dashboard.post("/onboard", &form);
+        let waiter = async {
+            arrived.notified().await;
+            // The second submit passes the form check, then waits for the
+            // onboarding lock the first holds.
+            let second = onboarding.dashboard.post("/onboard", &form);
+            let change = async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let store = &onboarding.dashboard.store;
+                store.delete_forgejo_instance("mine").unwrap();
+                if replace {
+                    store.add_forgejo_instance("mine", &url, "17.0.2").unwrap();
+                }
+                release.notify_one();
+            };
+            tokio::join!(second, change).0
+        };
+        let (_, second) = tokio::join!(holder, waiter);
+        *onboarding.gate.lock().unwrap() = None;
+        assert_eq!(second.status, StatusCode::OK);
+        assert!(
+            second.body.contains("deleted or registered again"),
+            "{}",
+            second.body
+        );
+        assert_no_forge_selected(&second.body);
+        if !replace {
+            onboarding
+                .dashboard
+                .store
+                .add_forgejo_instance("mine", &url, "17.0.2")
+                .unwrap();
+            onboarding.store_token().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_instance_deleted_or_replaced_during_the_checks_creates_no_project() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.dashboard.store.remove_project("forged").unwrap();
+    onboarding.store_token().await;
+    let url = onboarding
+        .dashboard
+        .store
+        .forgejo_instance("mine")
+        .unwrap()
+        .unwrap()
+        .base_url;
+    for (replace, action) in [
+        (false, "skip"),
+        (true, "skip"),
+        (false, "check"),
+        (true, "check"),
+    ] {
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *onboarding.gate.lock().unwrap() = Some((Arc::clone(&arrived), Arc::clone(&release)));
+        let form = format!(
+            "forge=mine&{}&repo=team%2Fproj&action={action}",
             onboarding.shown()
         );
         let submit = onboarding.dashboard.post("/onboard", &form);
@@ -17053,6 +17180,8 @@ async fn an_instance_deleted_or_replaced_during_the_checks_creates_no_project() 
             "{}",
             reply.body
         );
+        assert!(!reply.body.contains("All required checks passed."));
+        assert_no_forge_selected(&reply.body);
         assert!(
             onboarding
                 .dashboard
@@ -17067,7 +17196,7 @@ async fn an_instance_deleted_or_replaced_during_the_checks_creates_no_project() 
                 .store
                 .add_forgejo_instance("mine", &url, "17.0.2")
                 .unwrap();
-            onboarding.store_token().await;
         }
+        onboarding.store_token().await;
     }
 }

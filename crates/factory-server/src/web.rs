@@ -4443,6 +4443,8 @@ struct ForgeTokenForm {
 
 const STALE_INSTANCE: &str = "The Forgejo instance was deleted or registered again while this was checked. Nothing was saved. Reload the page.";
 const STALE_ONBOARD: &str = "The Forgejo instance was deleted or registered again while the checks ran. No project was created. Reload the page.";
+const CHOOSE_FORGE: &str =
+    "Choose a forge. The registered instances may have changed since this page loaded.";
 const STALE_ONBOARD_FORM: &str = "The Forgejo instance changed since this page loaded. No check ran and no project was created. Reload the page.";
 const STALE_FORM: &str = "The Forgejo instance changed since this page loaded. Nothing was saved or sent. Reload the page.";
 
@@ -4689,7 +4691,7 @@ async fn show_onboard(
 ) -> Result<Markup, AppError> {
     let view = pages::OnboardView {
         forges: state.forges()?,
-        forge: ForgeKind::GitHub,
+        forge: Some(ForgeKind::GitHub),
         name: "",
         repo: "",
         base: DEFAULT_BASE,
@@ -4707,29 +4709,30 @@ async fn show_onboard(
     ))
 }
 
-/// Runs the checks, and on `create` or `skip` with no error, onboards the
-/// project and redirects to its board. The checks run again here, not only in
-/// the earlier `check` step, so a project is never created while a required
-/// check fails and a rejection writes no row.
-/// Why the wizard refuses the posted forge before any forge call: it is not
-/// one the factory supports, or it is a Forgejo instance that changed since
-/// the page was drawn.
 fn onboard_refusal(
     forge: Option<&ForgeKind>,
     forge_field: &str,
     fields: &HashMap<String, String>,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     match forge {
-        None => Some(format!(
-            "The forge {forge_field:?} is not one the factory supports."
+        None => Some((
+            format!("The forge {forge_field:?} is not one the factory supports."),
+            false,
         )),
+        Some(_) if forge_field.is_empty() && fields.contains_key("choose_forge") => {
+            Some((CHOOSE_FORGE.to_owned(), true))
+        }
         Some(kind) if !shown_server(kind, shown_for(fields, kind)) => {
-            Some(STALE_ONBOARD_FORM.to_owned())
+            Some((STALE_ONBOARD_FORM.to_owned(), true))
         }
         Some(_) => None,
     }
 }
 
+/// Runs the checks, and on `create` or `skip` with no error, onboards the
+/// project and redirects to its board. The checks run again here, not only in
+/// the earlier `check` step, so a project is never created while a required
+/// check fails and a rejection writes no row.
 async fn submit_onboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4764,29 +4767,19 @@ async fn submit_onboard(
     let llm_review = form.llm_review.is_some();
 
     let refusal = onboard_refusal(parsed_forge.as_ref(), forge_field, &form.fields);
-    if let Some(message) = refusal {
-        let report = RepoReport {
-            errors: vec![message],
-            warnings: Vec::new(),
-        };
-        let view = pages::OnboardView {
-            forges: state.forges()?,
-            forge,
-            name,
-            repo,
-            base: base_field,
-            checks,
-            models: &models,
-            auto_merge,
-            llm_review,
-            token_page: None,
-        };
-        return Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response());
+    if let Some((message, reselect)) = refusal {
+        let selected = (!reselect).then_some(forge);
+        return redraw_onboard(&state, &headers, &form, &models, selected, message);
     }
 
     let _one_onboarding_at_a_time = state.onboarding.lock().await;
-    let (mut report, token_page) =
-        onboard_report(&state, &headers, effective_name, &forge, repo, base).await?;
+    let reported = onboard_report(&state, &headers, effective_name, &forge, repo, base).await?;
+    // A deleted or replaced instance can leave the checks green, and a
+    // `check` action never reaches the guarded insert.
+    let (mut report, token_page) = match reported {
+        Some(reported) if state.store.forge_is_current(&forge)? => reported,
+        _ => return stale_onboard(&state, &headers, &form, &models),
+    };
 
     if matches!(form.action.as_str(), "create" | "skip") && report.errors.is_empty() {
         clear_leftover_jobs(&state, effective_name, &mut report).await?;
@@ -4818,14 +4811,16 @@ async fn submit_onboard(
             Err(err @ (StoreError::DuplicateName(_) | StoreError::DuplicateRepo(..))) => {
                 report.errors.push(err.to_string());
             }
-            Err(StoreError::InstanceChanged(_)) => report.errors.push(STALE_ONBOARD.to_owned()),
+            Err(StoreError::InstanceChanged(_)) => {
+                return stale_onboard(&state, &headers, &form, &models);
+            }
             Err(err) => return Err(err.into()),
         }
     }
 
     let view = pages::OnboardView {
         forges: state.forges()?,
-        forge: forge.clone(),
+        forge: Some(forge.clone()),
         name,
         repo,
         base: base_field,
@@ -4836,6 +4831,44 @@ async fn submit_onboard(
         token_page: token_page.as_deref(),
     };
     Ok(pages::onboard(&user(&headers), &view, Some(&report), None).into_response())
+}
+
+/// Redraws the wizard with every selection cleared and a blocking error, for
+/// an instance that was deleted or registered again after the form was read.
+fn stale_onboard(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: &OnboardForm,
+    models: &StageModels,
+) -> Result<Response, AppError> {
+    redraw_onboard(state, headers, form, models, None, STALE_ONBOARD.to_owned())
+}
+
+fn redraw_onboard(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: &OnboardForm,
+    models: &StageModels,
+    forge: Option<ForgeKind>,
+    error: String,
+) -> Result<Response, AppError> {
+    let report = RepoReport {
+        errors: vec![error],
+        warnings: Vec::new(),
+    };
+    let view = pages::OnboardView {
+        forges: state.forges()?,
+        forge,
+        name: form.name.trim(),
+        repo: form.repo.trim(),
+        base: form.base.trim(),
+        checks: form.checks.trim(),
+        models,
+        auto_merge: form.auto_merge.is_some(),
+        llm_review: form.llm_review.is_some(),
+        token_page: None,
+    };
+    Ok(pages::onboard(&user(headers), &view, Some(&report), None).into_response())
 }
 
 fn save_onboard_options(
@@ -4900,6 +4933,7 @@ fn valid_name(name: &str) -> bool {
 enum Onboarder {
     Account(Account),
     Blocked(String),
+    Stale,
 }
 
 fn onboarder_account(
@@ -4923,6 +4957,7 @@ fn onboarder_account(
         Err(SecretError::Unavailable) => Ok(Onboarder::Blocked(format!(
             "The secret store is unavailable, so your {name} token cannot be read and the repository checks cannot run as your account."
         ))),
+        Err(SecretError::Store(StoreError::InstanceChanged(_))) => Ok(Onboarder::Stale),
         Err(err) => Err(err.into()),
     }
 }
@@ -4937,9 +4972,10 @@ async fn onboard_report(
     forge: &ForgeKind,
     repo: &str,
     base: &str,
-) -> Result<(RepoReport, Option<String>), AppError> {
+) -> Result<Option<(RepoReport, Option<String>)>, AppError> {
     let mut token_page = None;
     let mut report = match onboarder_account(state, headers, forge)? {
+        Onboarder::Stale => return Ok(None),
         Onboarder::Account(account) => match state
             .forges
             .checker(forge)
@@ -4983,7 +5019,7 @@ async fn onboard_report(
             forge.display_name()
         ));
     }
-    Ok((report, token_page))
+    Ok(Some((report, token_page)))
 }
 
 async fn cancel(

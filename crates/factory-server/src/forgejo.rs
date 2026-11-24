@@ -61,6 +61,17 @@ fn parse<T: for<'de> Deserialize<'de>>(value: serde_json::Value, what: &str) -> 
     serde_json::from_value(value).map_err(|_| format!("{what} returned unexpected output"))
 }
 
+/// The object Forgejo returns for a path that is a file, symlink or submodule.
+fn is_non_directory(listing: &serde_json::Value) -> bool {
+    listing
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| matches!(kind, "file" | "symlink" | "submodule"))
+        && listing
+            .get("name")
+            .is_some_and(serde_json::Value::is_string)
+}
+
 impl ForgejoRepos {
     async fn has_workflow(
         &self,
@@ -76,7 +87,7 @@ impl ForgejoRepos {
             else {
                 continue;
             };
-            if !listing.is_array() {
+            if is_non_directory(&listing) {
                 continue;
             }
             let entries: Vec<EntryJson> = parse(listing, &format!("the {dir} listing"))?;
