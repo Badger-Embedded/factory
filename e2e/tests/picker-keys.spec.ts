@@ -21,7 +21,7 @@ const button = (page: Page) => page.getByRole('button', { name: 'Project', exact
 test.describe('with a desktop pointer', () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test('p opens the panel with the search box focused and Esc returns focus to the button', async ({ page, factory }, testInfo) => {
+  test('p opens the panel in normal mode and Esc returns focus to the button', async ({ page, factory }, testInfo) => {
     const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: 'spec' });
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
     await page.goto(`/?project=${ids.a}`);
@@ -97,6 +97,22 @@ test.describe('with a desktop pointer', () => {
     await page.keyboard.press('i');
     await expect(page.locator('.picker-panel')).toBeHidden();
     expect(page.url()).toBe(url);
+  });
+
+  test('p highlights the first row after a poll reordered the list while the panel was closed', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    await page.keyboard.press('p');
+    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', ids.a);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.picker-panel')).toBeHidden();
+    factory.fixture('job', '--project', ids.c, '--stage', 'spec', '--request', 'A spec job');
+    await expect(page.locator('#picker-list li').first()).toHaveAttribute('data-id', ids.c, { timeout: 15_000 });
+    await page.keyboard.press('p');
+    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', ids.c);
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(new RegExp(`[?&]project=${ids.c}$`));
   });
 
   test('a poll keeps normal mode, the highlight and an unfocused box', async ({ page, factory }, testInfo) => {

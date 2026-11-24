@@ -116,8 +116,10 @@
   picker.addEventListener("toggle", function () {
     summary.setAttribute("aria-expanded", picker.open ? "true" : "false");
     if (picker.open) {
-      applyFilter(true);
-      if (!normalMode) search.focus();
+      if (!normalMode) {
+        applyFilter(false);
+        search.focus();
+      }
       normalMode = false;
     } else {
       normalMode = false;
@@ -143,7 +145,7 @@
         if (!picker.open) {
           normalMode = true;
           picker.open = true;
-          applyFilter(true);
+          applyFilter(false);
         }
         return;
       }
