@@ -2838,7 +2838,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Fails on a database error.
+    /// Fails on a database error, and with [`StoreError::InstanceChanged`]
+    /// when the instance `owner` names is no longer the registration it holds.
     pub fn forge_token_snapshot(
         &self,
         at: SecretRef<'_>,
@@ -2846,6 +2847,7 @@ impl Store {
     ) -> Result<Option<(String, Vec<u8>, ForgeAccount)>, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        require_registered(&tx, owner.forge())?;
         let sealed = tx
             .query_row(
                 "SELECT backend, value FROM secrets

@@ -2831,13 +2831,13 @@ struct MaintenanceForm {
     upstream_forge: String,
     #[serde(default)]
     renovate_author: String,
-    /// The other fields, among them `server_<forge>`, the base URL of each
-    /// Forgejo instance the card showed.
+    /// The other fields, among them `server_<forge>`, the registration number of
+    /// each Forgejo instance the card showed.
     #[serde(flatten)]
     fields: HashMap<String, String>,
 }
 
-/// The base URL the form showed for `forge`, for a Forgejo instance.
+/// The registration number the form showed for `forge`, for a Forgejo instance.
 fn shown_for<'a>(fields: &'a HashMap<String, String>, forge: &ForgeKind) -> Option<&'a str> {
     fields
         .get(&format!("server_{}", forge.as_str()))

@@ -459,6 +459,95 @@ fn replaced_instance_stores_nothing(again: &str) {
 }
 
 #[test]
+fn a_stale_registration_cannot_read_the_token_of_its_replacement() {
+    use factory_runner::ForgeAccount;
+    use factory_server::ForgeTokenOwner;
+
+    let (_dir, store) = store();
+    store
+        .add_forgejo_instance("mine", "https://one.example.org", "17.0.2")
+        .unwrap();
+    let old = store.resolve_forge("mine").unwrap().unwrap();
+    store.delete_forgejo_instance("mine").unwrap();
+    store
+        .add_forgejo_instance("mine", "https://one.example.org", "17.0.2")
+        .unwrap();
+    let new = store.resolve_forge("mine").unwrap().unwrap();
+
+    let account = ForgeAccount {
+        login: "bot".to_owned(),
+        id: 5,
+    };
+    let (row, header) = ("", "forge-user:mine:dave");
+    let owner = |forge| ForgeTokenOwner::User {
+        login: "dave",
+        forge,
+    };
+    store
+        .put_forge_token(
+            secret(row, header),
+            "local",
+            b"sealed",
+            owner(&new),
+            &account,
+        )
+        .unwrap();
+
+    let stale = store.forge_token_snapshot(secret(row, header), owner(&old));
+    assert!(matches!(stale, Err(StoreError::InstanceChanged(name)) if name == "mine"));
+    let current = store
+        .forge_token_snapshot(secret(row, header), owner(&new))
+        .unwrap();
+    assert!(current.is_some());
+}
+
+#[test]
+fn registration_numbers_survive_an_upgrade_and_reopen_and_are_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE forgejo_instances (
+                name TEXT PRIMARY KEY,
+                base_url TEXT NOT NULL UNIQUE,
+                version TEXT NOT NULL,
+                added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO forgejo_instances (name, base_url, version)
+                VALUES ('a', 'https://a.example.org', '17.0.2'),
+                       ('b', 'https://b.example.org', '17.0.2');",
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let numbers = |store: &Store| {
+        store
+            .forgejo_instances()
+            .unwrap()
+            .into_iter()
+            .map(|instance| (instance.name, instance.registration))
+            .collect::<Vec<_>>()
+    };
+    let upgraded = numbers(&store);
+    assert_eq!(upgraded.len(), 2);
+    assert_ne!(upgraded[0].1, upgraded[1].1);
+    assert!(upgraded.iter().all(|(_, number)| *number > 0));
+    drop(store);
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(numbers(&store), upgraded);
+
+    let highest = upgraded.iter().map(|(_, number)| *number).max().unwrap();
+    store.delete_forgejo_instance("b").unwrap();
+    let added = store
+        .add_forgejo_instance("c", "https://c.example.org", "17.0.2")
+        .unwrap();
+    assert!(added.registration > highest);
+}
+
+#[test]
 fn a_stored_upstream_that_is_no_longer_registered_reads_leniently_for_settings() {
     let (dir, store) = store();
     store
