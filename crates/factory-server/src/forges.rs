@@ -4,13 +4,12 @@
 //! runs needs no restart.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use factory_runner::{Account, Forge, ForgeKind, Forgejo, ForgejoServer, GitLab, forgejo_client};
+use factory_runner::{Forge, ForgeKind, Forgejo, ForgejoServer, GitLab, forgejo_client};
 
-use crate::github::{RepoChecker, RepoReport};
+use crate::forgejo::ForgejoRepos;
+use crate::github::RepoChecker;
 use crate::gitlab::GlabRepos;
 
 /// The implementations of each forge kind: the one the jobs use for pull
@@ -24,21 +23,6 @@ pub struct Forges {
     salsa_checker: Arc<dyn RepoChecker>,
     forgejo_roots: Vec<reqwest::Certificate>,
     forgejo: Arc<Mutex<HashMap<ForgejoServer, Arc<Forgejo>>>>,
-}
-
-/// The repository checks of a Forgejo instance, which the onboarding wizard
-/// does not run yet.
-struct ForgejoChecks;
-
-impl RepoChecker for ForgejoChecks {
-    fn check<'a>(
-        &'a self,
-        _account: &'a Account,
-        _repo: &'a str,
-        _base: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
-        Box::pin(async { Err("Onboarding a Forgejo repository is not available yet.".to_owned()) })
-    }
 }
 
 impl Forges {
@@ -93,14 +77,14 @@ impl Forges {
         match kind {
             ForgeKind::GitHub => Arc::clone(&self.github),
             ForgeKind::Salsa => Arc::clone(&self.salsa),
-            ForgeKind::Forgejo(server) => self.forgejo_forge(server),
+            ForgeKind::Forgejo(server) => self.forgejo_forge(server) as Arc<dyn Forge>,
         }
     }
 
-    fn forgejo_forge(&self, server: &ForgejoServer) -> Arc<dyn Forge> {
+    fn forgejo_forge(&self, server: &ForgejoServer) -> Arc<Forgejo> {
         let mut cache = self.forgejo.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(forge) = cache.get(server) {
-            return Arc::clone(forge) as Arc<dyn Forge>;
+            return Arc::clone(forge);
         }
         let forge = Arc::new(
             Forgejo::new(&server.base_url, &self.forgejo_roots)
@@ -116,7 +100,10 @@ impl Forges {
         match kind {
             ForgeKind::GitHub => Arc::clone(&self.github_checker),
             ForgeKind::Salsa => Arc::clone(&self.salsa_checker),
-            ForgeKind::Forgejo(_) => Arc::new(ForgejoChecks),
+            ForgeKind::Forgejo(server) => Arc::new(ForgejoRepos {
+                forgejo: self.forgejo_forge(server),
+                kind: kind.clone(),
+            }),
         }
     }
 }

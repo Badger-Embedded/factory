@@ -4442,6 +4442,8 @@ struct ForgeTokenForm {
 }
 
 const STALE_INSTANCE: &str = "The Forgejo instance was deleted or registered again while this was checked. Nothing was saved. Reload the page.";
+const STALE_ONBOARD: &str = "The Forgejo instance was deleted or registered again while the checks ran. No project was created. Reload the page.";
+const STALE_ONBOARD_FORM: &str = "The Forgejo instance changed since this page loaded. No check ran and no project was created. Reload the page.";
 const STALE_FORM: &str = "The Forgejo instance changed since this page loaded. Nothing was saved or sent. Reload the page.";
 
 /// Whether a form shown for `kind` names the registration the instance has
@@ -4674,6 +4676,10 @@ struct OnboardForm {
     /// The button that was pressed: `check`, `create` or `skip`.
     #[serde(default)]
     action: String,
+    /// The other fields, among them `server_<forge>`, the registration number
+    /// of each Forgejo instance the page showed.
+    #[serde(flatten)]
+    fields: HashMap<String, String>,
 }
 
 async fn show_onboard(
@@ -4705,6 +4711,25 @@ async fn show_onboard(
 /// project and redirects to its board. The checks run again here, not only in
 /// the earlier `check` step, so a project is never created while a required
 /// check fails and a rejection writes no row.
+/// Why the wizard refuses the posted forge before any forge call: it is not
+/// one the factory supports, or it is a Forgejo instance that changed since
+/// the page was drawn.
+fn onboard_refusal(
+    forge: Option<&ForgeKind>,
+    forge_field: &str,
+    fields: &HashMap<String, String>,
+) -> Option<String> {
+    match forge {
+        None => Some(format!(
+            "The forge {forge_field:?} is not one the factory supports."
+        )),
+        Some(kind) if !shown_server(kind, shown_for(fields, kind)) => {
+            Some(STALE_ONBOARD_FORM.to_owned())
+        }
+        Some(_) => None,
+    }
+}
+
 async fn submit_onboard(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4738,11 +4763,10 @@ async fn submit_onboard(
     let auto_merge = form.auto_merge.is_some();
     let llm_review = form.llm_review.is_some();
 
-    if parsed_forge.is_none() {
+    let refusal = onboard_refusal(parsed_forge.as_ref(), forge_field, &form.fields);
+    if let Some(message) = refusal {
         let report = RepoReport {
-            errors: vec![format!(
-                "The forge {forge_field:?} is not one the factory supports."
-            )],
+            errors: vec![message],
             warnings: Vec::new(),
         };
         let view = pages::OnboardView {
@@ -4794,6 +4818,7 @@ async fn submit_onboard(
             Err(err @ (StoreError::DuplicateName(_) | StoreError::DuplicateRepo(..))) => {
                 report.errors.push(err.to_string());
             }
+            Err(StoreError::InstanceChanged(_)) => report.errors.push(STALE_ONBOARD.to_owned()),
             Err(err) => return Err(err.into()),
         }
     }

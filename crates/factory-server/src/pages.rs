@@ -3475,6 +3475,11 @@ pub fn onboard(
             }
             p.meta { "The factory checks the repository as your own account on the selected forge before it creates anything. It creates no project while a required check fails." }
             form.card method="post" action="/onboard" {
+                @for kind in &view.forges {
+                    @if let ForgeKind::Forgejo(server) = kind {
+                        input type="hidden" name={ "server_" (kind.as_str()) } value=(server.registration);
+                    }
+                }
                 h2 { "Project" }
                 div.field {
                     label { "Forge" }
@@ -3492,8 +3497,11 @@ pub fn onboard(
                     label for="repo" { "Repository" }
                     input #repo.wide type="text" name="repo" required
                         placeholder=(repo_placeholder(&view.forge)) value=(view.repo);
-                    p.hint data-forge="github" { "On GitHub, owner/name, such as Badger-Embedded/maestro." }
-                    p.hint data-forge="salsa" { "On Salsa, the full project path, such as python-team/packages/foo." }
+                    @for kind in &view.forges {
+                        p.hint data-forge=(kind.as_str()) hidden[*kind != view.forge] {
+                            (repo_hint(kind))
+                        }
+                    }
                 }
                 div.field {
                     label for="name" { "Name" }
@@ -3556,6 +3564,18 @@ pub fn onboard(
             script { (PreEscaped(ONBOARD_FORGE)) }
         },
     )
+}
+
+fn repo_hint(forge: &ForgeKind) -> String {
+    match forge {
+        ForgeKind::GitHub => "On GitHub, owner/name, such as Badger-Embedded/maestro.".to_owned(),
+        ForgeKind::Salsa => {
+            "On Salsa, the full project path, such as python-team/packages/foo.".to_owned()
+        }
+        ForgeKind::Forgejo(server) => {
+            format!("On {}, owner/name, such as alice/project.", server.name)
+        }
+    }
 }
 
 fn repo_placeholder(forge: &ForgeKind) -> &'static str {

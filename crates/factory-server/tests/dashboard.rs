@@ -16625,3 +16625,449 @@ async fn repairing_a_gone_upstream_keeps_the_github_upstream_token() {
     );
     assert!(dashboard.store.forge_account(upstream).unwrap().is_some());
 }
+
+/// What the onboarding stub of the Forgejo instance `mine` answers for the
+/// repository `team/proj`. A `None` field is answered with 404.
+#[derive(Clone)]
+struct ForgejoCase {
+    repo: Option<serde_json::Value>,
+    branch: Option<serde_json::Value>,
+    forgejo_workflows: Option<serde_json::Value>,
+    github_workflows: Option<serde_json::Value>,
+}
+
+impl ForgejoCase {
+    fn fit() -> ForgejoCase {
+        ForgejoCase {
+            repo: Some(json!({
+                "permissions": {"admin": false, "push": true, "pull": true},
+                "allow_squash_merge": true,
+                "has_pull_requests": true,
+                "has_actions": true,
+            })),
+            branch: Some(json!({"protected": true, "user_can_merge": true})),
+            forgejo_workflows: Some(json!([{"name": "ci.yaml", "type": "file"}])),
+            github_workflows: None,
+        }
+    }
+
+    fn repo_with(mut self, field: &str, value: serde_json::Value) -> ForgejoCase {
+        self.repo.as_mut().unwrap()[field] = value;
+        self
+    }
+}
+
+type Gate = Arc<std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>>;
+
+struct ForgejoOnboarding {
+    dashboard: Dashboard,
+    case: Arc<std::sync::Mutex<ForgejoCase>>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+    /// While set, the stub signals the first and then waits for the second
+    /// before it answers a repository read.
+    gate: Gate,
+}
+
+async fn forgejo_onboarding() -> ForgejoOnboarding {
+    let case = Arc::new(std::sync::Mutex::new(ForgejoCase::fit()));
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = Gate::default();
+    let handler = {
+        let (case, hits, gate) = (Arc::clone(&case), Arc::clone(&hits), Arc::clone(&gate));
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+            let (case, hits, gate) = (Arc::clone(&case), Arc::clone(&hits), Arc::clone(&gate));
+            async move {
+                let held = if uri.path() == "/api/v1/repos/team/proj" {
+                    gate.lock().unwrap().clone()
+                } else {
+                    None
+                };
+                if let Some((arrived, release)) = held {
+                    arrived.notify_one();
+                    release.notified().await;
+                }
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let sent = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok());
+                if sent != Some("token tok-ok") {
+                    return (StatusCode::UNAUTHORIZED, "{}".to_owned());
+                }
+                let case = case.lock().unwrap().clone();
+                let answer = match uri.path() {
+                    "/api/v1/user" => Some(json!({"login": "mine-bot", "id": 5})),
+                    "/api/v1/repos/team/proj" => case.repo,
+                    "/api/v1/repos/team/proj/branches/main" => case.branch,
+                    "/api/v1/repos/team/proj/contents/.forgejo/workflows" => case.forgejo_workflows,
+                    "/api/v1/repos/team/proj/contents/.github/workflows" => case.github_workflows,
+                    _ => None,
+                };
+                match answer {
+                    Some(answer) => (StatusCode::OK, answer.to_string()),
+                    None => (StatusCode::NOT_FOUND, "{}".to_owned()),
+                }
+            }
+        }
+    };
+    let stub = support::serve_tls(Router::new().fallback(handler)).await;
+    let other = forgejo_user_stub("other").await;
+    let dashboard = forgejo_dashboard_over(&stub, &other);
+    ForgejoOnboarding {
+        dashboard,
+        case,
+        hits,
+        gate,
+    }
+}
+
+impl ForgejoOnboarding {
+    /// The form fields that carry the registration of `mine`, as its page does.
+    fn shown(&self) -> String {
+        let Some(ForgeKind::Forgejo(server)) = self.dashboard.store.resolve_forge("mine").unwrap()
+        else {
+            panic!("mine is registered");
+        };
+        format!("server_mine={}", server.registration)
+    }
+
+    async fn store_token(&self) {
+        forgejo_post(&self.dashboard, USER, "mine", "token", "token=tok-ok").await;
+    }
+
+    async fn check(&self, case: ForgejoCase, repo: &str) -> String {
+        *self.case.lock().unwrap() = case;
+        self.dashboard
+            .post(
+                "/onboard",
+                &format!(
+                    "forge=mine&{}&repo={repo}&name=proj&action=check",
+                    self.shown()
+                ),
+            )
+            .await
+            .body
+    }
+}
+
+#[tokio::test]
+async fn onboarding_on_a_forgejo_instance_blocks_on_each_failed_check() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let cases = [
+        (ForgejoCase::fit(), "team", "is not in owner/name form"),
+        (
+            ForgejoCase {
+                repo: None,
+                ..ForgejoCase::fit()
+            },
+            "team%2Fproj",
+            "does not exist or is not visible to mine-bot",
+        ),
+        (
+            ForgejoCase::fit().repo_with("permissions", json!({"push": false, "pull": true})),
+            "team%2Fproj",
+            "mine-bot has no push access to team/proj",
+        ),
+        (
+            ForgejoCase {
+                branch: None,
+                ..ForgejoCase::fit()
+            },
+            "team%2Fproj",
+            "The base branch &quot;main&quot; does not exist",
+        ),
+        (
+            ForgejoCase::fit().repo_with("allow_squash_merge", json!(false)),
+            "team%2Fproj",
+            "does not allow squash merges",
+        ),
+        (
+            ForgejoCase::fit().repo_with("has_pull_requests", json!(false)),
+            "team%2Fproj",
+            "has pull requests turned off",
+        ),
+    ];
+    for (case, repo, expected) in cases {
+        let body = onboarding.check(case, repo).await;
+        assert!(body.contains(expected), "{expected}: {body}");
+        assert!(!body.contains("Skip extras and create"), "{expected}");
+    }
+}
+
+#[tokio::test]
+async fn onboarding_on_a_forgejo_instance_warns_without_blocking() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let cases = [
+        (
+            ForgejoCase::fit().repo_with(
+                "permissions",
+                json!({"admin": true, "push": true, "pull": true}),
+            ),
+            "mine-bot has Admin access",
+        ),
+        (
+            ForgejoCase {
+                branch: Some(json!({"protected": false, "user_can_merge": true})),
+                ..ForgejoCase::fit()
+            },
+            "has no protection",
+        ),
+        (
+            ForgejoCase {
+                branch: Some(json!({"protected": true, "user_can_merge": false})),
+                ..ForgejoCase::fit()
+            },
+            "does not let mine-bot merge",
+        ),
+        (
+            ForgejoCase::fit().repo_with("has_actions", json!(false)),
+            "has no CI workflow",
+        ),
+        (
+            ForgejoCase {
+                forgejo_workflows: None,
+                ..ForgejoCase::fit()
+            },
+            "has no CI workflow",
+        ),
+        (
+            ForgejoCase {
+                forgejo_workflows: Some(json!([{"name": "README.md", "type": "file"}])),
+                ..ForgejoCase::fit()
+            },
+            "has no CI workflow",
+        ),
+    ];
+    for (case, expected) in cases {
+        let body = onboarding.check(case, "team%2Fproj").await;
+        assert!(body.contains(expected), "{expected}: {body}");
+        assert!(body.contains("All required checks passed."), "{expected}");
+        assert!(body.contains("Skip extras and create"), "{expected}");
+    }
+
+    let github_only = ForgejoCase {
+        forgejo_workflows: None,
+        github_workflows: Some(json!([{"name": "ci.yml", "type": "file"}])),
+        ..ForgejoCase::fit()
+    };
+    let body = onboarding.check(github_only, "team%2Fproj").await;
+    assert!(!body.contains("check-warnings"), "{body}");
+}
+
+#[tokio::test]
+async fn a_fit_forgejo_repository_onboards_once_under_its_instance() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let form = format!(
+        "forge=mine&{}&repo=team%2Fproj&action=skip",
+        onboarding.shown()
+    );
+    let reply = onboarding.dashboard.post("/onboard", &form).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let project = onboarding.dashboard.store.project("proj").unwrap().unwrap();
+    let ProjectForge::Known(kind) = project.forge else {
+        panic!("the forge is known");
+    };
+    assert_eq!(kind.as_str(), "mine");
+
+    let again = onboarding
+        .dashboard
+        .post(
+            "/onboard",
+            &format!(
+                "forge=mine&{}&repo=team%2Fproj&name=again&action=skip",
+                onboarding.shown()
+            ),
+        )
+        .await;
+    assert!(
+        again
+            .body
+            .contains("The mine repository team/proj is already onboarded.")
+    );
+}
+
+#[tokio::test]
+async fn forgejo_onboarding_without_a_token_links_the_token_page_and_calls_nothing() {
+    let onboarding = forgejo_onboarding().await;
+    let before = onboarding.hits.load(std::sync::atomic::Ordering::SeqCst);
+    let body = onboarding.check(ForgejoCase::fit(), "team%2Fproj").await;
+    assert!(body.contains("You have no mine token stored"));
+    assert!(body.contains("href=\"/settings/forges/mine\""));
+    assert_eq!(
+        onboarding.hits.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+}
+
+#[tokio::test]
+async fn the_onboarding_page_shows_the_hint_of_the_selected_forge_without_script() {
+    let onboarding = forgejo_onboarding().await;
+    let body = onboarding.dashboard.get("/onboard").await.body;
+    assert!(body.contains("value=\"mine\""));
+    let doc = scraper::Html::parse_document(&body);
+    let visible: Vec<_> = doc
+        .select(&scraper::Selector::parse("p.hint[data-forge]:not([hidden])").unwrap())
+        .map(|hint| hint.value().attr("data-forge").unwrap().to_owned())
+        .collect();
+    assert_eq!(visible, ["github"]);
+    let mine = doc
+        .select(&scraper::Selector::parse("p.hint[data-forge=mine]").unwrap())
+        .count();
+    assert_eq!(mine, 1);
+
+    let posted = onboarding
+        .dashboard
+        .post(
+            "/onboard",
+            &format!("forge=mine&{}&repo=&action=check", onboarding.shown()),
+        )
+        .await
+        .body;
+    let doc = scraper::Html::parse_document(&posted);
+    let visible: Vec<_> = doc
+        .select(&scraper::Selector::parse("p.hint[data-forge]:not([hidden])").unwrap())
+        .map(|hint| hint.value().attr("data-forge").unwrap().to_owned())
+        .collect();
+    assert_eq!(visible, ["mine"]);
+}
+
+#[tokio::test]
+async fn forgejo_onboarding_rejects_dot_segments_before_any_forge_call() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let before = onboarding.hits.load(std::sync::atomic::Ordering::SeqCst);
+    for repo in ["team%2F..", "..%2Fproj", "team%2F.", ".%2Fproj"] {
+        let body = onboarding.check(ForgejoCase::fit(), repo).await;
+        assert!(body.contains("is not in owner/name form"), "{repo}: {body}");
+    }
+    assert_eq!(
+        onboarding.hits.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+}
+
+#[tokio::test]
+async fn a_repository_with_a_workflow_path_that_is_a_file_or_missing_warns_without_blocking() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let cases = [
+        ForgejoCase {
+            forgejo_workflows: Some(json!({"name": ".forgejo/workflows", "type": "file"})),
+            ..ForgejoCase::fit()
+        },
+        ForgejoCase {
+            forgejo_workflows: None,
+            github_workflows: Some(json!({"name": "workflows", "type": "symlink"})),
+            ..ForgejoCase::fit()
+        },
+    ];
+    for case in cases {
+        let body = onboarding.check(case, "team%2Fproj").await;
+        assert!(body.contains("has no CI workflow"), "{body}");
+        assert!(body.contains("All required checks passed."), "{body}");
+        assert!(!body.contains("could not run"), "{body}");
+    }
+
+    let file_then_directory = ForgejoCase {
+        forgejo_workflows: Some(json!({"name": ".forgejo/workflows", "type": "file"})),
+        github_workflows: Some(json!([{"name": "ci.yml", "type": "file"}])),
+        ..ForgejoCase::fit()
+    };
+    let body = onboarding.check(file_then_directory, "team%2Fproj").await;
+    assert!(!body.contains("has no CI workflow"), "{body}");
+}
+
+#[tokio::test]
+async fn a_stale_forgejo_onboarding_form_runs_no_check_and_creates_nothing() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.store_token().await;
+    let before = onboarding.hits.load(std::sync::atomic::Ordering::SeqCst);
+    for fields in ["", "&server_mine=999999"] {
+        let body = onboarding
+            .dashboard
+            .post(
+                "/onboard",
+                &format!("forge=mine{fields}&repo=team%2Fproj&action=skip"),
+            )
+            .await
+            .body;
+        assert!(body.contains("changed since this page loaded"), "{body}");
+    }
+    assert_eq!(
+        onboarding.hits.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    assert!(
+        onboarding
+            .dashboard
+            .store
+            .project("proj")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_instance_deleted_or_replaced_during_the_checks_creates_no_project() {
+    let onboarding = forgejo_onboarding().await;
+    onboarding.dashboard.store.remove_project("forged").unwrap();
+    onboarding.store_token().await;
+    let url = onboarding
+        .dashboard
+        .store
+        .forgejo_instance("mine")
+        .unwrap()
+        .unwrap()
+        .base_url;
+    for replace in [false, true] {
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *onboarding.gate.lock().unwrap() = Some((Arc::clone(&arrived), Arc::clone(&release)));
+        let form = format!(
+            "forge=mine&{}&repo=team%2Fproj&action=skip",
+            onboarding.shown()
+        );
+        let submit = onboarding.dashboard.post("/onboard", &form);
+        let change = async {
+            arrived.notified().await;
+            onboarding
+                .dashboard
+                .store
+                .delete_forgejo_instance("mine")
+                .unwrap();
+            if replace {
+                onboarding
+                    .dashboard
+                    .store
+                    .add_forgejo_instance("mine", &url, "17.0.2")
+                    .unwrap();
+            }
+            release.notify_one();
+        };
+        let (reply, ()) = tokio::join!(submit, change);
+        *onboarding.gate.lock().unwrap() = None;
+        assert!(
+            reply.body.contains("deleted or registered again"),
+            "{}",
+            reply.body
+        );
+        assert!(
+            onboarding
+                .dashboard
+                .store
+                .project("proj")
+                .unwrap()
+                .is_none()
+        );
+        if !replace {
+            onboarding
+                .dashboard
+                .store
+                .add_forgejo_instance("mine", &url, "17.0.2")
+                .unwrap();
+            onboarding.store_token().await;
+        }
+    }
+}

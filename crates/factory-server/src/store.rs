@@ -1044,7 +1044,7 @@ impl Store {
         checks: Option<&str>,
         by: Option<&str>,
     ) -> Result<(), StoreError> {
-        self.create_project_as(name, forge, repo, base, checks, by, false)
+        self.insert_project(name, forge, repo, base, checks, by, false, false)
     }
 
     /// As [`Store::create_project`], with `use_my_account` as the first
@@ -1054,7 +1054,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// As [`Store::create_project`].
+    /// As [`Store::create_project`], and with [`StoreError::InstanceChanged`]
+    /// when `forge` is a Forgejo instance that was deleted or registered again.
     #[allow(clippy::too_many_arguments)]
     pub fn create_project_as(
         &self,
@@ -1066,8 +1067,26 @@ impl Store {
         by: Option<&str>,
         use_my_account: bool,
     ) -> Result<(), StoreError> {
+        self.insert_project(name, forge, repo, base, checks, by, use_my_account, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_project(
+        &self,
+        name: &str,
+        forge: &ForgeKind,
+        repo: &str,
+        base: &str,
+        checks: Option<&str>,
+        by: Option<&str>,
+        use_my_account: bool,
+        require_instance: bool,
+    ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if require_instance {
+            require_registered(&tx, forge)?;
+        }
         let name_taken = tx
             .query_row(
                 "SELECT 1 FROM projects WHERE name = ?1 OR display_name = ?1",

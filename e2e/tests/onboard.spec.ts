@@ -6,7 +6,8 @@
 // - A repository whose check fails shows the failure and creates no project:
 //   "a repository whose check fails shows the failure and creates no project"
 import type { Page } from '@playwright/test';
-import { expect, test } from '../fixtures';
+import { ADMIN, expect, startFactory, test, type Factory } from '../fixtures';
+import { startForgejoStub, type ForgejoStub } from '../forgejo-stub';
 
 let counter = 0;
 
@@ -158,4 +159,101 @@ test('the repository guidance follows the selected forge before submitting', asy
 
   await page.getByLabel('GitHub').check();
   await expect(repo).toHaveAttribute('placeholder', 'owner/name');
+});
+
+const REPO = { permissions: { admin: false, push: true, pull: true }, allow_squash_merge: true, has_pull_requests: true, has_actions: true };
+
+function forgejoRepo(stub: ForgejoStub, repo: () => object | undefined, protectedBranch: () => boolean) {
+  stub.route((request, url) => {
+    const path = url.pathname.replace('/api/v1', '');
+    if (path === '/user') {
+      return request.headers.authorization === 'token tok-e2e-forgejo'
+        ? { body: { login: 'forgejo-bot', id: 9 } }
+        : { status: 401, body: { message: 'bad token' } };
+    }
+    if (request.headers.authorization !== 'token tok-e2e-forgejo') return undefined;
+    if (path === '/repos/team/proj') {
+      const body = repo();
+      return body ? { body } : { status: 404, body: { message: 'not found' } };
+    }
+    if (path === '/repos/team/proj/branches/main') {
+      return { body: { protected: protectedBranch(), user_can_merge: true } };
+    }
+    if (path === '/repos/team/proj/contents/.forgejo/workflows') {
+      return { body: [{ name: 'ci.yaml', type: 'file' }] };
+    }
+    return undefined;
+  });
+}
+
+test('onboarding on a Forgejo instance follows its guidance, warnings and errors', async ({ browser }) => {
+  const { factory, stop }: { factory: Factory; stop: () => Promise<void> } = await startFactory();
+  const stub = await startForgejoStub(factory);
+  try {
+    let repo: object | undefined = REPO;
+    let protectedBranch = false;
+    forgejoRepo(stub, () => repo, () => protectedBranch);
+
+    const open = async (login: string) => {
+      const context = await browser.newContext({
+        baseURL: factory.url,
+        extraHTTPHeaders: { 'Tailscale-User-Login': login },
+      });
+      return context.newPage();
+    };
+    const admin = await open(ADMIN);
+    await admin.goto('/settings/forgejo');
+    await admin.getByLabel('Name', { exact: true }).fill('mine');
+    await admin.getByLabel('URL', { exact: true }).fill(stub.url);
+    await admin.getByRole('button', { name: 'Add server' }).click();
+    await expect(admin.getByText(`Added mine at ${stub.url}.`)).toBeVisible();
+
+    const page = await open('forgejo-onboarder@e2e.test');
+    await page.goto('/onboard');
+    const repoField = page.getByLabel('Repository');
+    await page.getByLabel('mine', { exact: true }).check();
+    await expect(repoField).toHaveAttribute('placeholder', 'owner/name');
+    await expect(page.getByText('On mine, owner/name')).toBeVisible();
+    await expect(page.getByText('On GitHub, owner/name')).toBeHidden();
+
+    await repoField.fill('team/proj');
+    await page.getByRole('button', { name: 'Run checks' }).click();
+    await expect(page.locator('ul.check-errors')).toContainText('You have no mine token stored');
+    expect(stub.seen().filter((line) => line.includes('/repos/'))).toEqual([]);
+    await page.getByRole('link', { name: 'Open the token page' }).click();
+    await expect(page).toHaveURL(/\/settings\/forges\/mine$/);
+    await page.getByLabel('Token').fill('tok-e2e-forgejo');
+    await page.getByRole('button', { name: 'Save token' }).click();
+    await expect(page.getByText('Saved. The token belongs to forgejo-bot.')).toBeVisible();
+
+    await page.goto('/onboard');
+    await page.getByLabel('mine', { exact: true }).check();
+    await repoField.fill('team/proj');
+    await page.getByRole('button', { name: 'Run checks' }).click();
+    await expect(page.getByLabel('mine', { exact: true })).toBeChecked();
+    await expect(page.getByText('On mine, owner/name')).toBeVisible();
+    await expect(page.getByText('All required checks passed.')).toBeVisible();
+    await expect(page.locator('ul.check-warnings')).toContainText('has no protection');
+
+    repo = { ...REPO, allow_squash_merge: false };
+    await page.getByRole('button', { name: 'Re-run checks' }).click();
+    await expect(page.locator('ul.check-errors')).toContainText('does not allow squash merges');
+    await expect(page.getByRole('button', { name: 'Skip extras and create' })).toHaveCount(0);
+
+    repo = REPO;
+    protectedBranch = true;
+    await page.getByRole('button', { name: 'Run checks' }).click();
+    await expect(page.locator('ul.check-warnings')).toHaveCount(0);
+    await page.getByLabel('Name', { exact: true }).fill('forgejo-proj');
+    await page.getByRole('button', { name: 'Skip extras and create' }).click();
+    await expect(page).toHaveURL(/\/\?project=forgejo-proj$/);
+    await page.goto('/settings/projects/forgejo-proj');
+    await expect(page.getByRole('link', { name: 'team/proj', exact: true })).toHaveAttribute(
+      'href',
+      `${stub.url}/team/proj`,
+    );
+  } finally {
+    await stub.stop();
+    await stop();
+  }
 });
