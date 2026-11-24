@@ -90,10 +90,12 @@ pub enum ProjectForge {
 }
 
 impl ProjectForge {
-    /// The forge of the stored kind name `name`.
+    /// The forge of the stored name `name`, where `instance_url` is the base
+    /// URL of the registered Forgejo instance of that name, if there is one.
     #[must_use]
-    pub fn from_name(name: &str) -> ProjectForge {
-        ForgeKind::parse(name).map_or_else(|| ProjectForge::Unknown(name.to_owned()), Self::Known)
+    pub fn resolve(name: &str, instance_url: Option<&str>) -> ProjectForge {
+        ForgeKind::resolve(name, instance_url)
+            .map_or_else(|| ProjectForge::Unknown(name.to_owned()), Self::Known)
     }
 
     /// The kind, or `None` for an unknown name.

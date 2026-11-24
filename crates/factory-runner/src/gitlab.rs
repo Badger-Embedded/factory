@@ -89,7 +89,7 @@ impl Default for GitLab {
     fn default() -> Self {
         GitLab {
             glab: PathBuf::from("glab"),
-            host: ForgeKind::Salsa.host().to_owned(),
+            host: ForgeKind::Salsa.host(),
             settle_polls: 10,
             settle_interval: Duration::from_secs(3),
         }

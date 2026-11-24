@@ -9,7 +9,7 @@ use factory_core::{
     FixOutcome, FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session,
     Stage, Turn, Wait,
 };
-use factory_runner::{ForgeAccount, ForgeKind, LogLine};
+use factory_runner::{ForgeAccount, ForgeKind, ForgejoServer, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::forgejo_instances::ForgejoInstance;
@@ -382,7 +382,9 @@ impl Maintenance {
             .valid_repo(&packaging.upstream_repo)
         {
             return Err(match packaging.upstream_forge {
-                ForgeKind::GitHub => "The upstream repository must look like owner/name.",
+                ForgeKind::GitHub | ForgeKind::Forgejo(_) => {
+                    "The upstream repository must look like owner/name."
+                }
                 ForgeKind::Salsa => {
                     "The upstream repository must be a Salsa project path such as group/name."
                 }
@@ -561,6 +563,9 @@ pub enum StoreError {
     /// another project, or cannot be waited for. The message is the same for
     /// each, so it leaks nothing about other projects.
     InvalidPrerequisite(i64),
+    /// A project's upstream forge names no fixed kind and no registered
+    /// instance. Nothing reads such an upstream, as it would be another server.
+    UnknownUpstreamForge(String),
     /// A Forgejo instance was refused. The message says why.
     Forgejo(String),
     Db(rusqlite::Error),
@@ -587,6 +592,10 @@ impl fmt::Display for StoreError {
                     "project {project:?} is on a forge the factory does not support"
                 )
             }
+            StoreError::UnknownUpstreamForge(name) => write!(
+                f,
+                "the upstream forge {name:?} is neither GitHub, Salsa nor a registered Forgejo instance"
+            ),
             StoreError::InvalidEffort(effort) => {
                 write!(f, "{effort:?} is not an allowed effort level")
             }
@@ -938,8 +947,11 @@ impl Store {
     /// Fails on a database error.
     pub fn list_projects(&self) -> Result<Vec<(String, Project)>, StoreError> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT name, forge, repo, base, checks FROM projects ORDER BY name")?;
+        let mut stmt = conn.prepare(
+            "SELECT name, forge, repo, base, checks,
+                    (SELECT base_url FROM forgejo_instances WHERE name = projects.forge)
+             FROM projects ORDER BY name",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, project_row(row)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -955,7 +967,9 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT forge, repo, base, checks FROM projects WHERE name = ?1",
+                "SELECT forge, repo, base, checks,
+                        (SELECT base_url FROM forgejo_instances WHERE name = projects.forge)
+                 FROM projects WHERE name = ?1",
                 [name],
                 project_row_without_name,
             )
@@ -2867,7 +2881,9 @@ impl Store {
         let tx = conn.transaction()?;
         let project = tx
             .query_row(
-                "SELECT forge, repo, base, checks FROM projects WHERE name = ?1",
+                "SELECT forge, repo, base, checks,
+                        (SELECT base_url FROM forgejo_instances WHERE name = projects.forge)
+                 FROM projects WHERE name = ?1",
                 [name],
                 project_row_without_name,
             )
@@ -3631,7 +3647,11 @@ impl Store {
                 "SELECT renovate, packaging, packaging_type, manifest_files,
                         build_config_files, upstream_repo, renovate_author,
                         COALESCE(upstream_forge,
-                                 (SELECT forge FROM projects WHERE name = ?1))
+                                 (SELECT forge FROM projects WHERE name = ?1)),
+                        (SELECT base_url FROM forgejo_instances
+                         WHERE name = COALESCE(upstream_forge,
+                                 (SELECT forge FROM projects WHERE name = ?1))),
+                        upstream_forge IS NOT NULL
                  FROM project_maintenance WHERE project = ?1",
                 [project],
                 |row| {
@@ -3644,6 +3664,8 @@ impl Store {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, bool>(9)?,
                     ))
                 },
             )
@@ -3657,6 +3679,8 @@ impl Store {
             upstream,
             renovate_author,
             upstream_forge,
+            upstream_url,
+            upstream_chosen,
         )) = row
         else {
             return Ok(Maintenance::default());
@@ -3670,10 +3694,19 @@ impl Store {
                 manifest_files: serde_json::from_str(&manifest)?,
                 build_config_files: serde_json::from_str(&build)?,
                 upstream_repo: upstream.unwrap_or_default(),
-                upstream_forge: upstream_forge
-                    .as_deref()
-                    .and_then(ForgeKind::parse)
-                    .unwrap_or(ForgeKind::GitHub),
+                // A project that chose no upstream forge reads as its own, and
+                // when that is unknown its jobs fail on that, so GitHub here
+                // only keeps its settings page readable.
+                upstream_forge: match upstream_forge.as_deref() {
+                    None => ForgeKind::GitHub,
+                    Some(name) => match ForgeKind::resolve(name, upstream_url.as_deref()) {
+                        Some(kind) => kind,
+                        None if upstream_chosen => {
+                            return Err(StoreError::UnknownUpstreamForge(name.to_owned()));
+                        }
+                        None => ForgeKind::GitHub,
+                    },
+                },
             })
         } else {
             None
@@ -4176,6 +4209,41 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The forge named `name`: GitHub, Salsa or a registered Forgejo
+    /// instance. `None` for any other name.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn resolve_forge(&self, name: &str) -> Result<Option<ForgeKind>, StoreError> {
+        if let Some(kind) = ForgeKind::parse(name) {
+            return Ok(Some(kind));
+        }
+        Ok(self.forgejo_instance(name)?.map(|instance| {
+            ForgeKind::Forgejo(ForgejoServer {
+                name: instance.name,
+                base_url: instance.base_url,
+            })
+        }))
+    }
+
+    /// Every forge a project can live on: GitHub, Salsa, then each
+    /// registered Forgejo instance by name.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn forge_kinds(&self) -> Result<Vec<ForgeKind>, StoreError> {
+        let mut kinds = ForgeKind::FIXED.to_vec();
+        kinds.extend(self.forgejo_instances()?.into_iter().map(|instance| {
+            ForgeKind::Forgejo(ForgejoServer {
+                name: instance.name,
+                base_url: instance.base_url,
+            })
+        }));
+        Ok(kinds)
     }
 
     /// The instance registered under `name`, or `None`.
@@ -4997,7 +5065,10 @@ fn session_key(session: Session) -> String {
 
 fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
-        forge: ProjectForge::from_name(&row.get::<_, String>(1)?),
+        forge: ProjectForge::resolve(
+            &row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(5)?.as_deref(),
+        ),
         repo: row.get(2)?,
         base: row.get(3)?,
         checks: row.get(4)?,
@@ -5010,7 +5081,10 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 /// A `projects` row with no `name` column, as `project` selects.
 fn project_row_without_name(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
-        forge: ProjectForge::from_name(&row.get::<_, String>(0)?),
+        forge: ProjectForge::resolve(
+            &row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(4)?.as_deref(),
+        ),
         repo: row.get(1)?,
         base: row.get(2)?,
         checks: row.get(3)?,

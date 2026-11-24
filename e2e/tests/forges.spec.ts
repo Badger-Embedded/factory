@@ -1,4 +1,12 @@
-import { expect, startFactory, test as base, type Factory, COLLABORATOR } from '../fixtures';
+import {
+  ADMIN,
+  COLLABORATOR,
+  expect,
+  startFactory,
+  test as base,
+  type Factory,
+} from '../fixtures';
+import { startForgejoStub } from '../forgejo-stub';
 
 const test = base.extend<{ own: Factory }>({
   own: async ({}, use) => {
@@ -124,4 +132,54 @@ test('forms posted from another origin change nothing', async ({ page, own }) =>
 
   await page.goto(PAGE);
   await expect(page.locator('.forge-account')).toHaveText('alice-bot');
+});
+
+test('a token for a registered Forgejo server is checked against it and saved', async ({
+  page,
+  own,
+}) => {
+  const stub = await startForgejoStub(own);
+  try {
+    stub.route((request, url) => {
+      if (!url.pathname.endsWith('/api/v1/user')) return undefined;
+      return request.headers.authorization === 'token tok-e2e-forgejo'
+        ? { body: { login: 'forgejo-bot', id: 9 } }
+        : { status: 401, body: { message: 'bad token' } };
+    });
+
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': ADMIN });
+    await page.goto('/settings/forgejo');
+    await page.getByLabel('Name', { exact: true }).fill('mine');
+    await page.getByLabel('URL', { exact: true }).fill(stub.url);
+    await page.getByRole('button', { name: 'Add server' }).click();
+    await expect(page.getByText(`Added mine at ${stub.url}.`)).toBeVisible();
+
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': COLLABORATOR });
+    await page.goto('/settings/notifications');
+    await page.getByRole('link', { name: 'mine', exact: true }).click();
+    await expect(page).toHaveURL(/\/settings\/forges\/mine$/);
+    await expect(page.getByRole('link', { name: 'mine', exact: true })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    await expect(page.locator('.forgejo-scopes')).toContainText('read:user');
+    await expect(page.locator('.forgejo-scopes')).toContainText('write:repository');
+    await expect(page.locator('.forgejo-scopes')).toContainText('write:issue');
+
+    await page.getByLabel('Token').fill('tok-e2e-wrong');
+    await page.getByRole('button', { name: 'Save token' }).click();
+    await expect(page.getByText('mine rejected the token. Nothing was saved.')).toBeVisible();
+    expect(await page.content()).not.toContain('tok-e2e-wrong');
+    await expect(page.getByText('No token is stored.').first()).toBeVisible();
+
+    await page.getByLabel('Token').fill('tok-e2e-forgejo');
+    await page.getByRole('button', { name: 'Save token' }).click();
+    await expect(page.getByText('Saved. The token belongs to forgejo-bot.')).toBeVisible();
+    expect(await page.content()).not.toContain('tok-e2e-forgejo');
+
+    const unknown = await page.goto('/settings/forges/nowhere');
+    expect(unknown?.status()).toBe(404);
+  } finally {
+    await stub.stop();
+  }
 });

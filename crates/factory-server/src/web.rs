@@ -79,14 +79,12 @@ struct AppState {
 }
 
 impl AppState {
-    #[allow(clippy::unused_self, reason = "the forge registry will read the state")]
-    fn known_forge(&self, name: &str) -> Option<ForgeKind> {
-        ForgeKind::parse(name)
+    fn known_forge(&self, name: &str) -> Result<Option<ForgeKind>, StoreError> {
+        self.store.resolve_forge(name)
     }
 
-    #[allow(clippy::unused_self, reason = "the forge registry will read the state")]
-    fn forges(&self) -> Vec<ForgeKind> {
-        ForgeKind::ALL.to_vec()
+    fn forges(&self) -> Result<Vec<ForgeKind>, StoreError> {
+        self.store.forge_kinds()
     }
 }
 
@@ -1795,7 +1793,7 @@ fn settings_nav(state: &AppState, login: &str) -> Result<pages::SettingsNav, Sto
     Ok(pages::SettingsNav {
         admin: state.admins.iter().any(|admin| admin == login),
         projects: project_labels(state, login)?,
-        forges: state.forges(),
+        forges: state.forges()?,
         servers: state
             .store
             .mcp_servers()?
@@ -2154,7 +2152,7 @@ fn project_settings(
         forge_account,
         upstream: pages::UpstreamCard {
             accounts: state
-                .forges()
+                .forges()?
                 .into_iter()
                 .map(|forge| {
                     let owner = ForgeTokenOwner::Upstream {
@@ -2850,7 +2848,7 @@ fn maintenance_from_form(
     let own_forge = forge.cloned().unwrap_or(ForgeKind::GitHub);
     let upstream_forge = match form.upstream_forge.as_str() {
         "" => Some(own_forge.clone()),
-        name => state.known_forge(name),
+        name => state.known_forge(name).ok().flatten(),
     };
     let packaging = form.packaging.is_some().then(|| Packaging {
         kind: kind.unwrap_or_default(),
@@ -4223,7 +4221,7 @@ fn require_csrf(state: &AppState, login: &str, token: &str) -> Result<(), AppErr
 
 fn forge_kind(state: &AppState, name: &str) -> Result<ForgeKind, AppError> {
     state
-        .known_forge(name)
+        .known_forge(name)?
         .ok_or_else(|| AppError::NotFound(format!("no forge {name}")))
 }
 
@@ -4357,10 +4355,6 @@ struct ForgeTokenForm {
 #[derive(Deserialize)]
 struct UpstreamTokenForm {
     #[serde(default)]
-    token_github: String,
-    #[serde(default)]
-    token_salsa: String,
-    #[serde(default)]
     csrf: String,
     renovate: Option<String>,
     packaging: Option<String>,
@@ -4376,6 +4370,9 @@ struct UpstreamTokenForm {
     upstream_forge: String,
     #[serde(default)]
     renovate_author: String,
+    /// The `token_<forge>` fields, one per forge.
+    #[serde(flatten)]
+    tokens: HashMap<String, String>,
 }
 
 /// The forge a token button names in its `formaction`.
@@ -4386,16 +4383,15 @@ struct TokenForgeQuery {
 
 fn token_forge(state: &AppState, query: &TokenForgeQuery) -> Result<ForgeKind, AppError> {
     state
-        .known_forge(&query.forge)
+        .known_forge(&query.forge)?
         .ok_or_else(|| AppError::BadRequest(format!("{:?} is not a forge", query.forge)))
 }
 
 impl UpstreamTokenForm {
     fn token(&self, forge: &ForgeKind) -> &str {
-        match forge {
-            ForgeKind::GitHub => &self.token_github,
-            ForgeKind::Salsa => &self.token_salsa,
-        }
+        self.tokens
+            .get(&format!("token_{}", forge.as_str()))
+            .map_or("", String::as_str)
     }
 
     fn draft(&self) -> MaintenanceForm {
@@ -4575,9 +4571,9 @@ async fn show_onboard(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<NoticeQuery>,
-) -> Markup {
+) -> Result<Markup, AppError> {
     let view = pages::OnboardView {
-        forges: state.forges(),
+        forges: state.forges()?,
         forge: ForgeKind::GitHub,
         name: "",
         repo: "",
@@ -4588,7 +4584,12 @@ async fn show_onboard(
         llm_review: false,
         token_page: None,
     };
-    pages::onboard(&user(&headers), &view, None, query.notice.as_deref())
+    Ok(pages::onboard(
+        &user(&headers),
+        &view,
+        None,
+        query.notice.as_deref(),
+    ))
 }
 
 /// Runs the checks, and on `create` or `skip` with no error, onboards the
@@ -4604,7 +4605,7 @@ async fn submit_onboard(
     let parsed_forge = if forge_field.is_empty() {
         Some(ForgeKind::GitHub)
     } else {
-        state.known_forge(forge_field)
+        state.known_forge(forge_field)?
     };
     let forge = parsed_forge.clone().unwrap_or(ForgeKind::GitHub);
     let name = form.name.trim();
@@ -4636,7 +4637,7 @@ async fn submit_onboard(
             warnings: Vec::new(),
         };
         let view = pages::OnboardView {
-            forges: state.forges(),
+            forges: state.forges()?,
             forge,
             name,
             repo,
@@ -4689,7 +4690,7 @@ async fn submit_onboard(
     }
 
     let view = pages::OnboardView {
-        forges: state.forges(),
+        forges: state.forges()?,
         forge: forge.clone(),
         name,
         repo,

@@ -291,3 +291,79 @@ fn a_delete_removes_the_tokens_of_that_instance_and_no_others() {
         .unwrap();
     assert_eq!(project_accounts, 1);
 }
+
+#[test]
+fn a_project_and_its_upstream_resolve_against_the_registry() {
+    let (dir, store) = store();
+    store
+        .add_forgejo_instance("mine", "https://git.example.org/sub", "17.0.2")
+        .unwrap();
+    let conn = raw(&dir);
+    conn.execute_batch(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('web', 'mine', 'o/web', 'main');
+         INSERT INTO projects (name, forge, repo, base) VALUES ('gone', 'old', 'o/gone', 'main');
+         INSERT INTO project_maintenance (project, renovate, packaging, manifest_files, build_config_files, upstream_repo)
+         VALUES ('web', 1, 1, '[\"a\"]', '[]', 'o/up');
+         INSERT INTO project_maintenance (project, renovate, packaging, manifest_files, build_config_files, upstream_repo)
+         VALUES ('gone', 1, 1, '[\"a\"]', '[]', 'o/up');",
+    )
+    .unwrap();
+
+    let web = store.project("web").unwrap().unwrap();
+    let kind = web.forge.kind().expect("registered");
+    assert_eq!(kind.as_str(), "mine");
+    assert_eq!(kind.web_url("o/web"), "https://git.example.org/sub/o/web");
+    assert_eq!(
+        kind.pr_url("o/web", 4),
+        "https://git.example.org/sub/o/web/pulls/4"
+    );
+    assert_eq!(kind.host(), "git.example.org");
+    assert_eq!(
+        store
+            .project_maintenance("web")
+            .unwrap()
+            .packaging
+            .unwrap()
+            .upstream_forge,
+        *kind
+    );
+    assert_eq!(store.list_projects().unwrap().len(), 2);
+    assert!(
+        store
+            .project("gone")
+            .unwrap()
+            .unwrap()
+            .forge
+            .kind()
+            .is_none()
+    );
+    assert!(
+        store
+            .project_maintenance("gone")
+            .unwrap()
+            .packaging
+            .is_some()
+    );
+
+    conn.execute(
+        "UPDATE project_maintenance SET upstream_forge = 'old' WHERE project = 'web'",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        store.project_maintenance("web"),
+        Err(StoreError::UnknownUpstreamForge(name)) if name == "old"
+    ));
+    assert_eq!(
+        store.resolve_forge("github").unwrap().unwrap().as_str(),
+        "github"
+    );
+    assert!(store.resolve_forge("old").unwrap().is_none());
+    let names: Vec<String> = store
+        .forge_kinds()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .collect();
+    assert_eq!(names, ["github", "salsa", "mine"]);
+}

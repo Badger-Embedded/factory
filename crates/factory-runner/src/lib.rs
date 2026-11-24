@@ -28,8 +28,8 @@ pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
 pub use files::{PlacedFile, place_files, show_files};
 pub use forge::{
-    Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, NOT_PERMITTED,
-    REJECTED, rejected_by_forge,
+    Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, ForgejoServer, LookupError,
+    NOT_PERMITTED, REJECTED, rejected_by_forge,
 };
 pub use forgejo::{
     Forgejo, ForgejoVersion, client as forgejo_client,

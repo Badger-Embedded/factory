@@ -70,7 +70,7 @@ fn salsa_is_a_forge_kind_with_its_own_urls_and_repository_form() {
     assert_eq!(ForgeKind::Salsa.as_str(), "salsa");
     assert_eq!(ForgeKind::Salsa.display_name(), "Salsa");
     assert_eq!(ForgeKind::Salsa.host(), "salsa.debian.org");
-    assert!(ForgeKind::ALL.contains(&ForgeKind::Salsa));
+    assert!(ForgeKind::FIXED.contains(&ForgeKind::Salsa));
     assert_eq!(
         ForgeKind::Salsa.web_url("team/sub/pkg"),
         "https://salsa.debian.org/team/sub/pkg"

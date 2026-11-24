@@ -1,11 +1,16 @@
 //! The forge selection: one place maps a [`ForgeKind`] to the code that talks
-//! to that forge, so a new forge adds a variant and an arm here.
+//! to that forge. GitHub and Salsa are built once. A Forgejo forge is built
+//! from the instance in the kind, so an instance registered while the service
+//! runs needs no restart.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use factory_runner::{Forge, ForgeKind, GitLab};
+use factory_runner::{Account, Forge, ForgeKind, Forgejo, ForgejoServer, GitLab, forgejo_client};
 
-use crate::github::RepoChecker;
+use crate::github::{RepoChecker, RepoReport};
 use crate::gitlab::GlabRepos;
 
 /// The implementations of each forge kind: the one the jobs use for pull
@@ -17,6 +22,23 @@ pub struct Forges {
     github_checker: Arc<dyn RepoChecker>,
     salsa: Arc<dyn Forge>,
     salsa_checker: Arc<dyn RepoChecker>,
+    forgejo_roots: Vec<reqwest::Certificate>,
+    forgejo: Arc<Mutex<HashMap<ForgejoServer, Arc<Forgejo>>>>,
+}
+
+/// The repository checks of a Forgejo instance, which the onboarding wizard
+/// does not run yet.
+struct ForgejoChecks;
+
+impl RepoChecker for ForgejoChecks {
+    fn check<'a>(
+        &'a self,
+        _account: &'a Account,
+        _repo: &'a str,
+        _base: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RepoReport, String>> + Send + 'a>> {
+        Box::pin(async { Err("Onboarding a Forgejo repository is not available yet.".to_owned()) })
+    }
 }
 
 impl Forges {
@@ -29,7 +51,25 @@ impl Forges {
             salsa_checker: Arc::new(GlabRepos {
                 gitlab: GitLab::default(),
             }),
+            forgejo_roots: Vec::new(),
+            forgejo: Arc::default(),
         }
+    }
+
+    /// The same selection trusting `roots` in addition to the system roots
+    /// when it talks to a Forgejo server. Tests use it to reach a local
+    /// server.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no HTTP client can be built with `roots`.
+    pub fn with_forgejo_roots(
+        mut self,
+        roots: Vec<reqwest::Certificate>,
+    ) -> Result<Forges, String> {
+        forgejo_client(&roots)?;
+        self.forgejo_roots = roots;
+        Ok(self)
     }
 
     /// The same selection with `salsa` as the forge of Salsa projects.
@@ -53,7 +93,23 @@ impl Forges {
         match kind {
             ForgeKind::GitHub => Arc::clone(&self.github),
             ForgeKind::Salsa => Arc::clone(&self.salsa),
+            ForgeKind::Forgejo(server) => self.forgejo_forge(server),
         }
+    }
+
+    /// The Forgejo forge of `server`, built on first use and kept for its name
+    /// and URL.
+    fn forgejo_forge(&self, server: &ForgejoServer) -> Arc<dyn Forge> {
+        let mut cache = self.forgejo.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(forge) = cache.get(server) {
+            return Arc::clone(forge) as Arc<dyn Forge>;
+        }
+        let forge = Arc::new(
+            Forgejo::new(&server.base_url, &self.forgejo_roots)
+                .expect("the roots were checked when they were set"),
+        );
+        cache.insert(server.clone(), Arc::clone(&forge));
+        forge
     }
 
     /// The repository checks the onboarding wizard runs.
@@ -62,6 +118,7 @@ impl Forges {
         match kind {
             ForgeKind::GitHub => Arc::clone(&self.github_checker),
             ForgeKind::Salsa => Arc::clone(&self.salsa_checker),
+            ForgeKind::Forgejo(_) => Arc::new(ForgejoChecks),
         }
     }
 }

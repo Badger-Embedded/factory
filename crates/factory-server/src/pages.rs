@@ -1640,6 +1640,13 @@ pub fn settings_forge(
                      comments from that account, so use a bot account rather than your own. \
                      Stored encrypted and never shown."
                 }
+                @if let ForgeKind::Forgejo(server) = kind {
+                    p.hint.forgejo-scopes {
+                        "A personal access token for " (server.base_url) " with the scopes "
+                        code { "read:user" } ", " code { "write:repository" } " and "
+                        code { "write:issue" } "."
+                    }
+                }
                 @if !secrets_available {
                     p.hint.bad { "The master key is missing, so a token cannot be saved here. Clear still works." }
                 }
@@ -3540,7 +3547,7 @@ pub fn onboard(
 
 fn repo_placeholder(forge: &ForgeKind) -> &'static str {
     match forge {
-        ForgeKind::GitHub => "owner/name",
+        ForgeKind::GitHub | ForgeKind::Forgejo(_) => "owner/name",
         ForgeKind::Salsa => "group/subgroup/project",
     }
 }

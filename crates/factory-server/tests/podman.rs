@@ -1318,3 +1318,108 @@ async fn a_push_between_the_status_and_the_diff_polls_again() {
     let event = podman.watch_renovate(renovate_watch(false)).await.unwrap();
     assert_eq!(event, None);
 }
+
+/// A Forgejo that lists no closed pull request and creates number 9. It logs
+/// the method, path and `Authorization` header of each request.
+async fn forgejo_stub(seen: Arc<Mutex<Vec<String>>>) -> support::TlsServer {
+    use axum::http::{HeaderMap, Method, Uri, header};
+
+    let handler = move |method: Method, uri: Uri, headers: HeaderMap| {
+        let seen = Arc::clone(&seen);
+        async move {
+            let auth = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            seen.lock()
+                .unwrap()
+                .push(format!("{method} {} | {auth}", uri.path()));
+            if method == Method::POST {
+                r#"{"number":9}"#.to_owned()
+            } else {
+                "[]".to_owned()
+            }
+        }
+    };
+    support::serve_tls(axum::Router::new().fallback(handler)).await
+}
+
+#[tokio::test]
+async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account() {
+    let tools = Tools::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = forgejo_stub(Arc::clone(&seen)).await;
+    let kind = ForgeKind::Forgejo(factory_runner::ForgejoServer {
+        name: "mine".into(),
+        base_url: stub.base.clone(),
+    });
+    let mut podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    podman.forges = podman
+        .forges
+        .with_forgejo_roots(vec![
+            reqwest::Certificate::from_pem(stub.ca_pem.as_bytes()).unwrap(),
+        ])
+        .unwrap();
+    let forgejo = factory_runner::Forgejo::new(&stub.base, &[]).unwrap();
+    let mine = forgejo.account(
+        "fj-token".into(),
+        &factory_runner::ForgeAccount {
+            login: "forge-bot".into(),
+            id: 3,
+        },
+    );
+    let expected = forgejo.git_auth_header(&mine).unwrap();
+    assert_eq!(mine.email, "forge-bot@noreply.127.0.0.1");
+
+    let mut run = request();
+    run.forge = kind.clone();
+    run.account = AccountSource::fixed(mine.clone());
+    run.repo = "team/forged".into();
+    run.branch = Some("factory/job-7-pr-1".into());
+    podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    let published = podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: kind,
+            account: AccountSource::fixed(mine),
+            repo: "team/forged".into(),
+            base: "main".into(),
+            branch: "factory/job-7-pr-1".into(),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            pushed: factory_server::PushLog::new(|_| {}),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(published, factory_server::Published::Open(9)));
+
+    let calls = tools.calls();
+    for verb in ["clone", "push"] {
+        let call = calls
+            .lines()
+            .find(|call| call.starts_with("git ") && call.contains(&format!(" {verb} ")))
+            .unwrap_or_else(|| panic!("no git {verb} in {calls}"));
+        assert!(call.ends_with(&format!("| {expected}")), "{call}");
+    }
+    assert!(
+        calls.contains(&format!("{}/team/forged.git", stub.base)),
+        "{calls}"
+    );
+    assert!(!calls.contains("fj-token"), "{calls}");
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|call| call == "POST /api/v1/repos/team/forged/pulls | token fj-token"),
+        "{seen:?}"
+    );
+}

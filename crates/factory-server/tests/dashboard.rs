@@ -259,11 +259,24 @@ fn dashboard_with_gh(
     admins: Vec<String>,
     gh: impl FnOnce(&Path) -> GitHub,
 ) -> Dashboard {
-    dashboard_build(store, github, None, |_| None, secrets, admins, gh)
+    dashboard_build(
+        store,
+        github,
+        None,
+        |_| None,
+        secrets,
+        admins,
+        gh,
+        Vec::new(),
+    )
 }
 
 /// As [`dashboard_with_gh`], with the Salsa onboarding checks answered by
 /// `salsa` when given.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one fake the dashboard is built from"
+)]
 fn dashboard_build(
     store: Arc<Store>,
     github: Arc<dyn RepoChecker>,
@@ -272,6 +285,7 @@ fn dashboard_build(
     secrets: Arc<dyn SecretStore>,
     admins: Vec<String>,
     gh: impl FnOnce(&Path) -> GitHub,
+    forgejo_roots: Vec<reqwest::Certificate>,
 ) -> Dashboard {
     for (name, _) in store.list_projects().unwrap() {
         store.add_collaborator(&name, USER, "test").unwrap();
@@ -305,7 +319,9 @@ fn dashboard_build(
             data.path().to_owned(),
             Arc::clone(&usage),
             {
-                let forges = Forges::new(Arc::new(gh(data.path())), github);
+                let forges = Forges::new(Arc::new(gh(data.path())), github)
+                    .with_forgejo_roots(forgejo_roots)
+                    .unwrap();
                 let forges = match salsa_forge(data.path()) {
                     Some(forge) => forges.with_salsa(forge),
                     None => forges,
@@ -9765,6 +9781,7 @@ fn salsa_dashboard(github: Arc<FakeRepos>, salsa: Arc<FakeSalsa>) -> (Arc<Store>
         secrets,
         admins,
         |_| GitHub::default(),
+        Vec::new(),
     );
     (store, dashboard)
 }
@@ -9867,6 +9884,7 @@ async fn a_salsa_project_without_a_salsa_token_links_the_salsa_page() {
         secrets,
         admins,
         |_| GitHub::default(),
+        Vec::new(),
     );
 
     let reply = dashboard
@@ -14265,6 +14283,7 @@ exit 1
         secrets,
         vec!["boss@example.com".to_owned()],
         gh,
+        Vec::new(),
     )
 }
 
@@ -16054,4 +16073,231 @@ async fn stub_api() -> (String, ()) {
         }
     });
     (base, ())
+}
+
+/// A Forgejo stub over TLS that knows one token, `tok-ok`, which belongs to
+/// `<prefix>-bot`, and answers 401 to any other.
+async fn forgejo_user_stub(prefix: &'static str) -> support::TlsServer {
+    let user = axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+        let sent = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        if sent == Some("token tok-ok") {
+            (
+                StatusCode::OK,
+                json!({"login": format!("{prefix}-bot"), "id": 5}).to_string(),
+            )
+        } else {
+            (StatusCode::UNAUTHORIZED, "{}".to_owned())
+        }
+    });
+    support::serve_tls(Router::new().route("/api/v1/user", user)).await
+}
+
+fn forgejo_roots(stubs: &[&support::TlsServer]) -> Vec<reqwest::Certificate> {
+    stubs
+        .iter()
+        .map(|stub| reqwest::Certificate::from_pem(stub.ca_pem.as_bytes()).unwrap())
+        .collect()
+}
+
+/// A dashboard with the Forgejo instances `mine` and `other` registered at the
+/// stubs, a Forgejo project on `mine` and a GitHub project.
+async fn forgejo_dashboard() -> Dashboard {
+    let mine = forgejo_user_stub("mine").await;
+    let other = forgejo_user_stub("other").await;
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .add_forgejo_instance("mine", &mine.base, "17.0.2")
+        .unwrap();
+    store
+        .add_forgejo_instance("other", &other.base, "17.0.2")
+        .unwrap();
+    let kind = store.resolve_forge("mine").unwrap().unwrap();
+    store
+        .create_project("forged", &kind, "team/forged", "main", None, Some("alice"))
+        .unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    dashboard_build(
+        store,
+        Arc::new(FakeRepos::fit()),
+        None,
+        |_| None,
+        secrets,
+        vec![USER.to_owned()],
+        |_| GitHub::default(),
+        forgejo_roots(&[&mine, &other]),
+    )
+}
+
+async fn forgejo_post(
+    dashboard: &Dashboard,
+    login: &str,
+    instance: &str,
+    action: &str,
+    form: &str,
+) -> Reply {
+    let page = dashboard
+        .get_as(login, &format!("/settings/forges/{instance}"))
+        .await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let csrf = doc
+        .select(&scraper::Selector::parse("input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the form carries a csrf token")
+        .to_owned();
+    dashboard
+        .post_as(
+            login,
+            &format!("/settings/forges/{instance}/{action}"),
+            &format!("{form}&csrf={csrf}"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_forgejo_instance_has_a_token_page_that_names_the_scopes_and_the_sidebar_lists_it() {
+    let dashboard = forgejo_dashboard().await;
+    let page = dashboard.get_as(DAVE, "/settings/forges/mine").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("No token is stored."));
+    for scope in ["read:user", "write:repository", "write:issue"] {
+        assert!(page.body.contains(scope), "{scope}");
+    }
+    assert!(page.body.contains("href=\"/settings/forges/other\""));
+
+    let github = dashboard.get_as(DAVE, "/settings/forges/github").await;
+    assert!(!github.body.contains("write:repository"));
+}
+
+#[tokio::test]
+async fn a_forgejo_token_is_checked_against_its_instance_and_stored_with_its_login() {
+    let dashboard = forgejo_dashboard().await;
+    let mine: &'static ForgeKind = Box::leak(Box::new(
+        dashboard.store.resolve_forge("mine").unwrap().unwrap(),
+    ));
+    let owner = || ForgeTokenOwner::User {
+        login: DAVE,
+        forge: mine,
+    };
+
+    let rejected = forgejo_post(&dashboard, DAVE, "mine", "token", "token=tok-bad").await;
+    assert!(rejected.body.contains("mine rejected the token"));
+    assert!(!rejected.body.contains("tok-bad"));
+    assert!(dashboard.store.forge_account(owner()).unwrap().is_none());
+
+    let saved = forgejo_post(&dashboard, DAVE, "mine", "token", "token=tok-ok").await;
+    assert!(saved.body.contains("mine-bot"));
+    assert!(!saved.body.contains("tok-ok"));
+    let account = dashboard.store.forge_account(owner()).unwrap().unwrap();
+    assert_eq!(account.login, "mine-bot");
+
+    forgejo_post(&dashboard, DAVE, "mine", "token", "token=").await;
+    assert!(dashboard.store.forge_account(owner()).unwrap().is_some());
+
+    let cleared = forgejo_post(&dashboard, DAVE, "mine", "token/clear", "").await;
+    assert!(cleared.body.contains("No token is stored."));
+    assert!(dashboard.store.forge_account(owner()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn two_forgejo_instances_keep_their_own_token_of_one_login() {
+    let dashboard = forgejo_dashboard().await;
+    forgejo_post(&dashboard, DAVE, "mine", "token", "token=tok-ok").await;
+    forgejo_post(&dashboard, DAVE, "other", "token", "token=tok-ok").await;
+
+    let mine = dashboard.get_as(DAVE, "/settings/forges/mine").await.body;
+    let other = dashboard.get_as(DAVE, "/settings/forges/other").await.body;
+    assert!(mine.contains("mine-bot") && !mine.contains("other-bot"));
+    assert!(other.contains("other-bot") && !other.contains("mine-bot"));
+
+    forgejo_post(&dashboard, DAVE, "mine", "token/clear", "").await;
+    let other = dashboard.get_as(DAVE, "/settings/forges/other").await.body;
+    assert!(other.contains("other-bot"));
+}
+
+#[tokio::test]
+async fn a_deleted_and_re_added_instance_has_no_token() {
+    let dashboard = forgejo_dashboard().await;
+    forgejo_post(&dashboard, DAVE, "other", "token", "token=tok-ok").await;
+    let url = dashboard
+        .store
+        .forgejo_instance("other")
+        .unwrap()
+        .unwrap()
+        .base_url;
+
+    dashboard.store.delete_forgejo_instance("other").unwrap();
+    assert_eq!(
+        dashboard
+            .get_as(DAVE, "/settings/forges/other")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    dashboard
+        .store
+        .add_forgejo_instance("other", &url, "17.0.2")
+        .unwrap();
+    let page = dashboard.get_as(DAVE, "/settings/forges/other").await.body;
+    assert!(page.contains("No token is stored."));
+}
+
+#[tokio::test]
+async fn an_unregistered_forgejo_name_is_a_404_and_its_project_shows_the_problem() {
+    let dashboard = forgejo_dashboard().await;
+    assert_eq!(
+        dashboard.get_as(DAVE, "/settings/forges/gone").await.status,
+        StatusCode::NOT_FOUND
+    );
+    let gone = ForgeKind::Forgejo(factory_runner::ForgejoServer {
+        name: "gone".to_owned(),
+        base_url: "https://gone.example.org".to_owned(),
+    });
+    dashboard
+        .store
+        .create_project("lost", &gone, "team/lost", "main", None, Some("alice"))
+        .unwrap();
+    dashboard
+        .store
+        .add_collaborator("lost", USER, "test")
+        .unwrap();
+
+    let settings = dashboard.get("/settings/projects/lost").await;
+    assert_eq!(settings.status, StatusCode::OK);
+    assert!(settings.body.contains("does not support"));
+    let board = dashboard.get("/?project=lost").await;
+    assert!(board.body.contains("gone"));
+    assert!(!board.body.contains("source-link"));
+    let healthy = dashboard.get("/?project=forged").await;
+    assert_eq!(healthy.status, StatusCode::OK);
+    assert!(!healthy.body.contains("does not support"));
+}
+
+#[tokio::test]
+async fn a_forgejo_project_links_its_repository_on_the_instance_in_a_new_tab() {
+    let dashboard = forgejo_dashboard().await;
+    let base = dashboard
+        .store
+        .forgejo_instance("mine")
+        .unwrap()
+        .unwrap()
+        .base_url;
+    let board = dashboard.get("/?project=forged").await;
+    assert!(board.body.contains(&format!("href=\"{base}/team/forged\"")));
+    assert!(support::check_link_targets(&board.body) >= 1);
+    let settings = dashboard.get("/settings/projects/forged").await;
+    assert!(settings.body.contains(&format!("{base}/team/forged")));
+    assert!(settings.body.contains("Forge account"));
 }

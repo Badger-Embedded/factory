@@ -1087,7 +1087,14 @@ impl<E: Executor> Scheduler<E> {
     /// that fails is logged and tried again on the next pass.
     async fn discover_renovate(&self) -> Result<(), StoreError> {
         for (name, project) in self.projects.list()? {
-            let maintenance = self.store.project_maintenance(&name)?;
+            let maintenance = match self.store.project_maintenance(&name) {
+                Ok(maintenance) => maintenance,
+                Err(err @ StoreError::UnknownUpstreamForge(_)) => {
+                    tracing::warn!("skipping the Renovate discovery of {name}: {err}");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             if !maintenance.renovate {
                 continue;
             }
