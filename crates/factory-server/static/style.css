@@ -991,6 +991,18 @@ form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
   overflow-wrap: anywhere;
 }
 .settings-link:hover { background: var(--sunken); }
+@media (min-width: 761px) {
+  .settings-link:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+  .settings { margin-bottom: calc(-1 * var(--space-32)); }
+  .settings-main { padding-bottom: var(--space-32); }
+  .settings-nav {
+    max-height: calc(100vh - var(--topbar-height) - var(--space-16) - var(--space-16));
+    overflow-y: auto;
+    overflow-x: hidden;
+    scroll-padding: var(--space-12) var(--space-8);
+  }
+  .settings-nav.settings-nav-full { margin-top: calc(-1 * var(--space-16)); }
+}
 .settings-link[aria-current="page"] { background: var(--agent-bg); color: var(--agent); font-weight: var(--weight-semibold); }
 .settings-link.settings-add { color: var(--accent); }
 .settings-link.settings-disabled { color: var(--muted); cursor: default; }
