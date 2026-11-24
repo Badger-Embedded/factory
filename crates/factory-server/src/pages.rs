@@ -2129,13 +2129,13 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
                 }
                 p.hint { "Off by default. Packaging projects need it on: the packaging analysis runs after a merged Renovate pull request." }
             }
-            @if project.forge_account.as_ref().is_some_and(|card| card.kind == ForgeKind::Salsa) {
+            @if project.forge_account.as_ref().is_some_and(|card| !card.kind.has_fixed_renovate_account()) {
                 div.field {
                     label for="renovate_author" { "Renovate account" }
                     input #renovate_author type="text" name="renovate_author" autocomplete="off"
                         autocapitalize="none" spellcheck="false" placeholder="renovate-bot"
                         value=(maintenance.renovate_author.as_deref().unwrap_or(""));
-                    p.hint { "Required with Renovate pull requests on. Salsa has no fixed Renovate account: self-hosted Renovate opens merge requests as the user that owns its token. Give that Salsa username." }
+                    p.hint { "Required with Renovate pull requests on. Only GitHub has a fixed Renovate account. Self-hosted Renovate opens its requests as the user that owns its token. Give that " (project.forge_account.as_ref().map_or("", |card| card.kind.display_name())) " username." }
                 }
             }
             div.field {

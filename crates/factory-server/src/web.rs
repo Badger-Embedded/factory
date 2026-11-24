@@ -2901,21 +2901,30 @@ fn maintenance_from_form(
         upstream_repo: form.upstream_repo.trim().to_owned(),
         upstream_forge: upstream_forge.clone().unwrap_or(own_forge),
     });
-    let salsa = forge == Some(&ForgeKind::Salsa);
+    let account_name = forge.filter(|kind| !kind.has_fixed_renovate_account());
+    let needs_author = account_name.is_some();
     let author = form.renovate_author.trim();
     let maintenance = Maintenance {
         renovate: form.renovate.is_some(),
-        renovate_author: (salsa && !author.is_empty()).then(|| author.to_owned()),
+        renovate_author: (needs_author && !author.is_empty()).then(|| author.to_owned()),
         packaging,
     };
     let refusal = match (&maintenance.packaging, kind) {
-        (_, _) if salsa && maintenance.renovate && author.is_empty() => Some(
-            "Give the Renovate account: the Salsa username Renovate opens its merge requests as."
-                .to_owned(),
-        ),
-        (_, _) if salsa && !renovate_account_well_formed(author) => Some(
-            "The Renovate account must be a Salsa username, with no spaces or slashes.".to_owned(),
-        ),
+        (_, _) if needs_author && maintenance.renovate && author.is_empty() => {
+            let noun = if forge == Some(&ForgeKind::Salsa) {
+                "merge"
+            } else {
+                "pull"
+            };
+            Some(format!(
+                "Give the Renovate account: the {} username Renovate opens its {noun} requests as.",
+                account_name.map_or("", ForgeKind::display_name)
+            ))
+        }
+        (_, _) if needs_author && !renovate_account_well_formed(author) => Some(format!(
+            "The Renovate account must be a {} username, with no spaces or slashes.",
+            account_name.map_or("", ForgeKind::display_name)
+        )),
         (Some(_), None) => Some("The packaging type must be snap, deb or other.".to_owned()),
         (Some(_), _) if upstream_forge.is_none() => unusable.clone(),
         _ => maintenance.check().err(),

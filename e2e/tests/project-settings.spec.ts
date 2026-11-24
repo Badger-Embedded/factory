@@ -25,6 +25,7 @@
 //   settings, its jobs and its MCP pages:
 //   "a login that is not a collaborator gets the 404 page"
 import type { Page } from '@playwright/test';
+import { startForgejoStub } from '../forgejo-stub';
 import { startMcpStub, STUB_TOOLS, type McpStub } from '../mcp-stub';
 import {
   ADMIN,
@@ -450,6 +451,106 @@ test('a Salsa project asks for its Renovate account and a GitHub project does no
   await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
   await page.goto(settingsPath(name));
   await expect(card.getByLabel('Renovate account')).toHaveValue('renovate-bot');
+});
+
+test('a Forgejo project asks for its Renovate account and checks its upstream on the instance', async ({
+  browser,
+}) => {
+  const { factory, stop } = await startFactory();
+  const stub = await startForgejoStub(factory);
+  try {
+    const mine = 'token tok-e2e-forgejo';
+    stub.route((request, url) => {
+      const path = url.pathname.replace('/api/v1', '');
+      const known = request.headers.authorization === mine;
+      if (path === '/user') {
+        return known
+          ? { body: { login: 'forgejo-bot', id: 9 } }
+          : { status: 401, body: { message: 'bad token' } };
+      }
+      if (path === '/repos/up/tool') return { body: { permissions: { pull: true } } };
+      if (!known) return undefined;
+      if (path === '/repos/team/proj') {
+        return {
+          body: {
+            permissions: { admin: false, push: true, pull: true },
+            allow_squash_merge: true,
+            has_pull_requests: true,
+            has_actions: true,
+          },
+        };
+      }
+      if (path === '/repos/team/proj/branches/main') {
+        return { body: { protected: true, user_can_merge: true } };
+      }
+      if (path === '/repos/team/proj/contents/.forgejo/workflows') {
+        return { body: [{ name: 'ci.yaml', type: 'file' }] };
+      }
+      return undefined;
+    });
+    const context = await browser.newContext({
+      baseURL: factory.url,
+      extraHTTPHeaders: { 'Tailscale-User-Login': ADMIN },
+    });
+    const page = await context.newPage();
+    await page.goto('/settings/forgejo');
+    await page.getByLabel('Name', { exact: true }).fill('mine');
+    await page.getByLabel('URL', { exact: true }).fill(stub.url);
+    await page.getByRole('button', { name: 'Add server' }).click();
+    await expect(page.getByText(`Added mine at ${stub.url}.`)).toBeVisible();
+
+    await page.goto('/settings/forges/mine');
+    await page.getByLabel('Token').fill('tok-e2e-forgejo');
+    await page.getByRole('button', { name: 'Save token' }).click();
+    await expect(page.getByText('Saved. The token belongs to forgejo-bot.')).toBeVisible();
+    await page.goto('/onboard');
+    await page.getByLabel('mine', { exact: true }).check();
+    await page.getByLabel('Repository').fill('team/proj');
+    await page.getByLabel('Name', { exact: true }).fill('fj-maintenance');
+    await page.getByRole('button', { name: 'Run checks' }).click();
+    await page.getByRole('button', { name: 'Skip extras and create' }).click();
+
+    await page.goto(settingsPath('fj-maintenance'));
+    await saveProjectToken(page, 'tok-e2e-forgejo');
+    await expect(page.getByText('Saved. The project token belongs to forgejo-bot.')).toBeVisible();
+    const card = page.locator('form.settings-form').filter({ hasText: 'Maintenance' });
+    await card.getByLabel('Renovate pull requests').check();
+    await card.getByRole('button', { name: 'Save maintenance' }).click();
+    await expect(page.getByText('Give the Renovate account')).toBeVisible();
+
+    await card.getByLabel('Renovate account').fill('renovate-bot');
+    await card.getByLabel('Packaging project').check();
+    await card.getByRole('button', { name: 'Save maintenance' }).click();
+    await expect(page.getByText('Give at least one manifest file.')).toBeVisible();
+
+    await card.getByLabel('Type').selectOption('deb');
+    await card.getByLabel('Manifest files').fill('debian/control');
+    const upstream = card.getByLabel('Upstream forge');
+    await expect(upstream.locator('option')).toHaveText(['GitHub', 'Salsa', 'mine']);
+    await expect(upstream).toHaveValue('mine');
+    await expect(card.getByLabel('mine upstream token')).toBeVisible();
+    await card.getByLabel('Upstream repository').fill('up/missing');
+    await card.getByRole('button', { name: 'Check connection' }).click();
+    await expect(page.locator('.upstream-check-result')).toContainText(
+      'up/missing could not be read on mine',
+    );
+
+    await card.getByLabel('Upstream repository').fill('up/tool');
+    await card.getByRole('button', { name: 'Check connection' }).click();
+    await expect(page.locator('.upstream-check-result')).toContainText(
+      'Checked with the project token of forgejo-bot: up/tool is readable on mine.',
+    );
+    await card.getByRole('button', { name: 'Save maintenance' }).click();
+    await expect(page.getByText('Saved.', { exact: true })).toBeVisible();
+
+    await page.goto(settingsPath('fj-maintenance'));
+    await expect(card.getByLabel('Renovate account')).toHaveValue('renovate-bot');
+    await expect(card.getByLabel('Upstream repository')).toHaveValue('up/tool');
+    await expect(card.getByLabel('Upstream forge')).toHaveValue('mine');
+  } finally {
+    await stub.stop();
+    await stop();
+  }
 });
 
 test('the Forge account card saves a project token by its access and keeps the switch per login', async ({

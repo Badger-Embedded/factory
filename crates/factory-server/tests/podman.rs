@@ -490,6 +490,169 @@ esac"#,
     assert!(calls.lines().any(|line| line.starts_with("gh ")), "{calls}");
 }
 
+/// A Forgejo that serves `up/app` at tags `v1` and `v2`, and pull request 5 of
+/// `team/pkg` with `body`. It logs each request's path, query and
+/// `Authorization` header.
+async fn forgejo_packaging_stub(body: String, seen: Arc<Mutex<Vec<String>>>) -> support::TlsServer {
+    use axum::http::{HeaderMap, Uri, header};
+
+    let handler = move |uri: Uri, headers: HeaderMap| {
+        let seen = Arc::clone(&seen);
+        let body = body.clone();
+        async move {
+            let auth = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            seen.lock().unwrap().push(format!(
+                "{}?{} | {auth}",
+                uri.path(),
+                uri.query().unwrap_or("")
+            ));
+            match (uri.path(), uri.query().unwrap_or("")) {
+                ("/api/v1/repos/up/app/raw/CMakeLists.txt", "ref=v1") => "a\n".to_owned(),
+                ("/api/v1/repos/up/app/raw/CMakeLists.txt", "ref=v2") => "b\n".to_owned(),
+                ("/api/v1/repos/team/pkg/pulls/5", _) => serde_json::json!({
+                    "number": 5, "title": "Update app", "body": body,
+                    "head": {"sha": "h1"}, "base": {"ref": "main"},
+                })
+                .to_string(),
+                ("/api/v1/repos/team/pkg/pulls/5/files", query) if query.contains("page=1") => {
+                    r#"[{"filename":"debian/control"}]"#.to_owned()
+                }
+                ("/api/v1/repos/team/pkg/pulls/5/files", _) => "[]".to_owned(),
+                ("/api/v1/repos/team/pkg/pulls/5.diff", _) => "diff --git a/x b/x\n".to_owned(),
+                ("/api/v1/repos/team/pkg/raw/debian/control", _) => "manifest\n".to_owned(),
+                _ => String::new(),
+            }
+        }
+    };
+    support::serve_tls(axum::Router::new().fallback(handler)).await
+}
+
+fn forgejo_kind(stub: &support::TlsServer) -> ForgeKind {
+    ForgeKind::Forgejo(factory_runner::ForgejoServer {
+        name: "mine".into(),
+        base_url: stub.base.clone(),
+        registration: 1,
+    })
+}
+
+fn forgejo_account(stub: &support::TlsServer, token: &str) -> Account {
+    factory_runner::Forgejo::new(&stub.base, &[])
+        .unwrap()
+        .account(
+            token.into(),
+            &factory_runner::ForgeAccount {
+                login: "forge-bot".into(),
+                id: 3,
+            },
+        )
+}
+
+fn trust(forges: Forges, stub: &support::TlsServer) -> Forges {
+    forges
+        .with_forgejo_roots(vec![
+            reqwest::Certificate::from_pem(stub.ca_pem.as_bytes()).unwrap(),
+        ])
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_github_project_reads_the_patch_of_a_forgejo_upstream_from_the_compare_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = forgejo_packaging_stub(String::new(), Arc::clone(&seen)).await;
+    let body = format!("Bumps app. [Compare]({}/up/app/compare/v1...v2)", stub.base);
+    let (mut podman, calls) = gh_executor(dir.path(), &view("h1", &body, &[]), 10);
+    podman.forges = trust(podman.forges, &stub);
+    let mut request = packaging_request(None, None);
+    request.upstream_forge = forgejo_kind(&stub);
+    request.upstream_account = AccountSource::fixed(forgejo_account(&stub, "fj-upstream"));
+
+    let context = podman.gather_packaging(request).await.unwrap();
+
+    assert_eq!(context.from.as_deref(), Some("v1"));
+    assert_eq!(context.to.as_deref(), Some("v2"));
+    let patch = context.upstream[0].text.as_deref().unwrap();
+    assert!(patch.contains("-a") && patch.contains("+b"), "{patch}");
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|call| call.starts_with("/api/v1/repos/up/app/raw/CMakeLists.txt?ref=v1")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|call| call.contains("| Basic ") || call.ends_with("| token fj-upstream")),
+        "{seen:?}"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert!(!calls.contains("up/app/compare"), "{calls}");
+}
+
+#[tokio::test]
+async fn a_forgejo_project_reads_its_pull_request_on_forgejo_and_its_salsa_upstream_on_salsa() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let glab = dir.path().join("glab");
+    std::fs::write(
+        &glab,
+        format!(
+            "#!/bin/bash\necho \"[$GITLAB_TOKEN] $@\" >> '{}'\n\
+             case \"$4\" in\n\
+             projects/up%2Fapp/repository/compare*) echo '{{\"diffs\":[{{\"new_path\":\"CMakeLists.txt\",\"diff\":\"@@ new\"}}]}}';;\n\
+             *) echo \"fake glab: unexpected: $*\" >&2; exit 1;;\nesac\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&glab, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let body = "Bumps app. [Compare](https://salsa.debian.org/up/app/-/compare/v1...v2)";
+    let stub = forgejo_packaging_stub(body.to_owned(), Arc::clone(&seen)).await;
+    let secrets: Arc<dyn SecretStore> = Arc::new(LocalSecrets::new(
+        &[7; MASTER_KEY_LEN],
+        Arc::new(Store::open_in_memory().unwrap()),
+    ));
+    let mut podman = executor(
+        registry(&secrets),
+        dir.path().to_owned(),
+        Arc::new(Store::open_in_memory().unwrap()),
+    );
+    podman.forges = trust(forges(GitHub::default()), &stub).with_salsa(Arc::new(GitLab {
+        glab,
+        ..GitLab::default()
+    }));
+    let mut request = packaging_request(None, None);
+    request.forge = forgejo_kind(&stub);
+    request.repo = "team/pkg".into();
+    request.manifest_files = vec!["debian/control".into()];
+    request.account = AccountSource::fixed(forgejo_account(&stub, "fj-project"));
+    request.upstream_forge = ForgeKind::Salsa;
+    request.upstream_account = AccountSource::fixed(Account {
+        token: Some("glpat-upstream".into()),
+        ..test_account()
+    });
+
+    let context = podman.gather_packaging(request).await.unwrap();
+
+    assert_eq!(context.from.as_deref(), Some("v1"));
+    assert_eq!(
+        context.manifests[0].text.as_deref().map(str::trim),
+        Some("manifest")
+    );
+    assert_eq!(context.upstream[0].text.as_deref(), Some("@@ new"));
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("[glpat-upstream] api"), "{calls}");
+    assert!(!calls.contains("fj-project"), "{calls}");
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|call| !call.contains("up/app")), "{seen:?}");
+}
+
 const COMPARE_BODY: &str = "Bumps app. [Compare Source](https://github.com/up/app/compare/v1...v2)";
 
 #[tokio::test]

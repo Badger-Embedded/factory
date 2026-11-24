@@ -17201,3 +17201,282 @@ async fn an_instance_deleted_or_replaced_during_the_checks_creates_no_project() 
         onboarding.store_token().await;
     }
 }
+
+/// A Forgejo stub over TLS that serves `repos` as `(owner/name, push)` and
+/// answers 404 to every other repository, 403 to `denied` and 502 to `flaky`.
+async fn forgejo_repo_stub(repos: &'static [(&'static str, bool)]) -> support::TlsServer {
+    let repo = axum::routing::get(
+        move |axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>| async move {
+            let path = format!("{owner}/{name}");
+            if name == "denied" {
+                return (StatusCode::FORBIDDEN, "{}".to_owned());
+            }
+            if name == "flaky" {
+                return (StatusCode::BAD_GATEWAY, "HTTP 403".to_owned());
+            }
+            match repos.iter().find(|(known, _)| *known == path) {
+                Some((_, push)) => (
+                    StatusCode::OK,
+                    json!({"permissions": {"admin": false, "push": push, "pull": true}})
+                        .to_string(),
+                ),
+                None => (StatusCode::NOT_FOUND, "{}".to_owned()),
+            }
+        },
+    );
+    support::serve_tls(Router::new().route("/api/v1/repos/{owner}/{name}", repo)).await
+}
+
+/// A dashboard with `forged` on instance `mine`, which holds the project
+/// token Renovate needs, and an instance `other`.
+async fn forgejo_maintenance_dashboard() -> Dashboard {
+    static MINE: &[(&str, bool)] = &[("team/forged", true), ("team/tool", true)];
+    static OTHER: &[(&str, bool)] = &[("o/tool", false)];
+    let mine = forgejo_repo_stub(MINE).await;
+    let other = forgejo_repo_stub(OTHER).await;
+    let dashboard = forgejo_dashboard_over(&mine, &other);
+    dashboard
+        .store
+        .add_collaborator("forged", USER, "test")
+        .unwrap();
+    let kind = dashboard.store.resolve_forge("mine").unwrap().unwrap();
+    LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone())
+        .put_forge_token(
+            ForgeTokenOwner::Project {
+                project: "forged",
+                forge: &kind,
+            },
+            "tok-mine",
+            &ForgeAccount {
+                login: "mine-bot".into(),
+                id: 5,
+            },
+        )
+        .unwrap();
+    dashboard
+}
+
+/// The `server_<name>` fields the Maintenance card posts for its instances.
+fn forgejo_server_fields(dashboard: &Dashboard) -> String {
+    let mut fields = String::new();
+    for name in ["mine", "other"] {
+        let server = dashboard.store.forgejo_instance(name).unwrap().unwrap();
+        write!(fields, "&server_{name}={}", server.registration).unwrap();
+    }
+    fields
+}
+
+#[tokio::test]
+async fn a_forgejo_project_needs_its_renovate_account_like_a_salsa_one() {
+    let dashboard = forgejo_maintenance_dashboard().await;
+    let page = dashboard.get("/settings/projects/forged").await.body;
+    assert!(page.contains("name=\"renovate_author\""));
+
+    let reply = dashboard
+        .post("/settings/projects/forged/maintenance", "renovate=on")
+        .await;
+    assert!(reply.body.contains("Give the Renovate account"));
+    assert!(reply.body.contains("the mine username"));
+    let reply = dashboard
+        .post(
+            "/settings/projects/forged/maintenance",
+            "renovate=on&renovate_author=a%2Fb",
+        )
+        .await;
+    assert!(reply.body.contains("must be a mine username"));
+    assert!(
+        !dashboard
+            .store
+            .project_maintenance("forged")
+            .unwrap()
+            .renovate
+    );
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/forged/maintenance",
+            "renovate=on&renovate_author=+renovate-bot+",
+        )
+        .await;
+    assert!(reply.body.contains("Saved."), "{}", reply.body);
+    let saved = dashboard.store.project_maintenance("forged").unwrap();
+    assert!(saved.renovate);
+    assert_eq!(saved.renovate_author.as_deref(), Some("renovate-bot"));
+}
+
+#[tokio::test]
+async fn an_upstream_on_a_forgejo_instance_saves_when_the_check_reads_it() {
+    let dashboard = forgejo_maintenance_dashboard().await;
+    let servers = forgejo_server_fields(&dashboard);
+    let form = |repo: &str, forge: &str| {
+        format!(
+            "renovate=on&renovate_author=renovate-bot&packaging=on&packaging_type=deb\
+             &manifest_files=debian%2Fcontrol&upstream_repo={repo}&upstream_forge={forge}{servers}"
+        )
+    };
+
+    let url = "/settings/projects/forged/maintenance";
+    let checked = dashboard
+        .post(&format!("{url}/check"), &form("o%2Ftool", "other"))
+        .await;
+    assert!(
+        checked
+            .body
+            .contains("Checked with no token: o/tool is readable on other."),
+        "{}",
+        checked.body
+    );
+    let refused = dashboard.post(url, &form("o%2Fprivate", "other")).await;
+    assert!(
+        refused
+            .body
+            .contains("o/private could not be read on other. Save an upstream token")
+    );
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("forged")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+
+    let own = dashboard
+        .post(&format!("{url}/check"), &form("team%2Ftool", "mine"))
+        .await;
+    assert!(
+        own.body
+            .contains("Checked with the project token of mine-bot: team/tool is readable on mine."),
+        "{}",
+        own.body
+    );
+
+    let saved = dashboard.post(url, &form("o%2Ftool", "other")).await;
+    assert!(saved.body.contains("Saved."), "{}", saved.body);
+    let packaging = dashboard
+        .store
+        .project_maintenance("forged")
+        .unwrap()
+        .packaging
+        .unwrap();
+    assert_eq!(packaging.upstream_forge.as_str(), "other");
+    assert_eq!(packaging.upstream_repo, "o/tool");
+
+    let page = dashboard.get("/settings/projects/forged").await.body;
+    for name in ["mine", "other"] {
+        assert!(page.contains(&format!("name=\"token_{name}\"")), "{name}");
+        assert!(
+            page.contains(&format!("upstream-token?forge={name}\"")),
+            "{name}"
+        );
+    }
+    assert!(page.contains("<option value=\"other\" selected"));
+}
+
+#[tokio::test]
+async fn a_forgejo_upstream_that_answers_403_refuses_the_save_and_stores_nothing() {
+    let dashboard = forgejo_maintenance_dashboard().await;
+    let servers = forgejo_server_fields(&dashboard);
+    let form = format!(
+        "renovate=on&renovate_author=renovate-bot&packaging=on&packaging_type=deb\
+         &manifest_files=debian%2Fcontrol&upstream_repo=o%2Fdenied&upstream_forge=other{servers}"
+    );
+    let url = "/settings/projects/forged/maintenance";
+    let checked = dashboard.post(&format!("{url}/check"), &form).await;
+    assert!(
+        checked
+            .body
+            .contains("o/denied could not be read on other. Save an upstream token"),
+        "{}",
+        checked.body
+    );
+    let refused = dashboard.post(url, &form).await;
+    assert!(
+        refused.body.contains("Nothing was saved."),
+        "{}",
+        refused.body
+    );
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("forged")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_forgejo_upstream_that_answers_502_still_saves_and_says_it_was_not_checked() {
+    let dashboard = forgejo_maintenance_dashboard().await;
+    let servers = forgejo_server_fields(&dashboard);
+    let form = format!(
+        "renovate=on&renovate_author=renovate-bot&packaging=on&packaging_type=deb\
+         &manifest_files=debian%2Fcontrol&upstream_repo=o%2Fflaky&upstream_forge=other{servers}"
+    );
+    let saved = dashboard
+        .post("/settings/projects/forged/maintenance", &form)
+        .await;
+    assert!(
+        saved.body.contains("The upstream was not checked"),
+        "{}",
+        saved.body
+    );
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("forged")
+            .unwrap()
+            .packaging
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_upstream_token_forge_is_a_400_before_any_forge_call() {
+    let dashboard = forgejo_maintenance_dashboard().await;
+    let page = dashboard.get("/settings/projects/forged").await;
+    let csrf = scraper::Html::parse_document(&page.body)
+        .select(
+            &scraper::Selector::parse("form[action$=\"/maintenance\"] input[name=csrf]").unwrap(),
+        )
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the maintenance form carries a csrf token")
+        .to_owned();
+    for action in ["", "/clear"] {
+        let reply = dashboard
+            .post(
+                &format!("/settings/projects/forged/upstream-token{action}?forge=nope"),
+                &format!("token_nope=x&csrf={csrf}"),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{action}");
+    }
+}
+
+#[tokio::test]
+async fn a_github_project_can_name_a_forgejo_upstream() {
+    let dashboard = forgejo_maintenance_dashboard().await;
+    dashboard
+        .store
+        .add_collaborator("maestro", USER, "test")
+        .unwrap();
+    let servers = forgejo_server_fields(&dashboard);
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro/maintenance/check",
+            &format!(
+                "renovate=on&packaging=on&packaging_type=deb&manifest_files=debian%2Fcontrol\
+                 &upstream_repo=o%2Ftool&upstream_forge=other{servers}"
+            ),
+        )
+        .await;
+    assert!(
+        reply
+            .body
+            .contains("Checked with no token: o/tool is readable on other."),
+        "{}",
+        reply.body
+    );
+}
