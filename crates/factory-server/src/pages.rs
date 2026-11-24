@@ -657,9 +657,10 @@ fn project_selector(
                 (picker(attention, selected, false))
                 p.picker-empty hidden { "No project matches." }
                 div.picker-keys hidden {
-                    span.picker-hint { kbd { "↑" } " " kbd { "↓" } " move" }
+                    span.picker-hint { kbd { "↑" } " " kbd { "↓" } " " kbd { "J" } " " kbd { "K" } " move" }
                     span.picker-hint { kbd { "Enter" } " open" }
                     span.picker-hint { kbd { "Esc" } " close" }
+                    span.picker-hint { kbd { "I" } " search" }
                     span.picker-hint.picker-hint-n { kbd { "N" } " next that needs you" }
                     span.picker-hint.picker-hint-n { kbd { "Shift" } " " kbd { "N" } " previous" }
                 }

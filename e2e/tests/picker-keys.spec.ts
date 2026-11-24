@@ -21,17 +21,131 @@ const button = (page: Page) => page.getByRole('button', { name: 'Project', exact
 test.describe('with a desktop pointer', () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
-  test('p opens the panel with the search box focused and Esc returns focus to the button', async ({ page, factory }, testInfo) => {
+  test('p opens the panel in normal mode and Esc returns focus to the button', async ({ page, factory }, testInfo) => {
     const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: 'spec' });
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
     await page.goto(`/?project=${ids.a}`);
     await page.keyboard.press('p');
     await expect(page.locator('.picker-panel')).toBeVisible();
-    await expect(page.getByLabel('Find a project')).toBeFocused();
+    await expect(page.getByLabel('Find a project')).not.toBeFocused();
     await expect(page.getByLabel('Find a project')).toHaveValue('');
+    await expect(page.locator('#picker-list li').first()).toHaveClass(/active/);
     await page.keyboard.press('Escape');
     await expect(page.locator('.picker-panel')).toBeHidden();
     await expect(button(page)).toBeFocused();
+    await page.keyboard.press('p');
+    await page.keyboard.press('i');
+    await expect(page.getByLabel('Find a project')).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.picker-panel')).toBeHidden();
+    await expect(button(page)).toBeFocused();
+  });
+
+  test('j and k move the highlight in normal mode and stop at the ends', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    const rows = page.locator('#picker-list li');
+    const url = page.url();
+    await page.keyboard.press('p');
+    await page.keyboard.press('k');
+    await expect(rows.nth(0)).toHaveClass(/active/);
+    await page.keyboard.press('j');
+    await page.keyboard.press('j');
+    await page.keyboard.press('k');
+    await expect(rows.nth(1)).toHaveClass(/active/);
+    await expect(page.getByLabel('Find a project')).toHaveValue('');
+    await page.keyboard.press('j');
+    await page.keyboard.press('j');
+    await expect(rows.nth(2)).toHaveClass(/active/);
+    expect(page.url()).toBe(url);
+  });
+
+  test('ArrowDown and Enter in normal mode open the second row', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    await page.keyboard.press('p');
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('#picker-list li').nth(1)).toHaveClass(/active/);
+    const id = await page.locator('#picker-list li').nth(1).getAttribute('data-id');
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(new RegExp(`[?&]project=${id}$`));
+  });
+
+  test('i focuses the search box and j k then type into the filter', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    await page.keyboard.press('p');
+    await page.keyboard.press('i');
+    const box = page.getByLabel('Find a project');
+    await expect(box).toBeFocused();
+    await expect(box).toHaveValue('');
+    await page.keyboard.type('jk');
+    await expect(box).toHaveValue('jk');
+    await expect(page.locator('#picker-list li:not([hidden])')).toHaveCount(0);
+  });
+
+  test('j, k and i do nothing with the panel closed', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    const url = page.url();
+    await page.keyboard.press('j');
+    await page.keyboard.press('k');
+    await page.keyboard.press('i');
+    await expect(page.locator('.picker-panel')).toBeHidden();
+    expect(page.url()).toBe(url);
+  });
+
+  test('p highlights the first row after a poll reordered the list while the panel was closed', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    await page.keyboard.press('p');
+    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', ids.a);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.picker-panel')).toBeHidden();
+    factory.fixture('job', '--project', ids.c, '--stage', 'spec', '--request', 'A spec job');
+    await expect(page.locator('#picker-list li').first()).toHaveAttribute('data-id', ids.c, { timeout: 15_000 });
+    await page.keyboard.press('p');
+    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', ids.c);
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(new RegExp(`[?&]project=${ids.c}$`));
+  });
+
+  test('a highlight moved before the delayed toggle event survives it', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    const moved = await page.evaluate(async () => {
+      const picker = document.getElementById('project-picker') as HTMLDetailsElement;
+      picker.open = true;
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      const before = document.querySelector('#picker-list li.active')?.getAttribute('data-id');
+      await new Promise((resolve) => picker.addEventListener('toggle', resolve, { once: true }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { before, after: document.querySelector('#picker-list li.active')?.getAttribute('data-id') };
+    });
+    expect(moved.before).toBe(ids.b);
+    expect(moved.after).toBe(ids.b);
+  });
+
+  test('a poll keeps normal mode, the highlight and an unfocused box', async ({ page, factory }, testInfo) => {
+    const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    await page.goto(`/?project=${ids.a}`);
+    await page.keyboard.press('p');
+    await page.keyboard.press('j');
+    const active = page.locator('#picker-list li.active');
+    const id = await active.getAttribute('data-id');
+    factory.fixture('job', '--project', ids.c, '--stage', 'spec', '--request', 'A spec job');
+    await expect(page.locator(`#picker-list li[data-id="${ids.c}"]`)).toHaveAttribute('data-attention', /you|failed/, { timeout: 15_000 });
+    await expect(page.locator('.picker-panel')).toBeVisible();
+    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', id!);
+    await expect(page.getByLabel('Find a project')).not.toBeFocused();
   });
 
   test('n and Shift+N jump between projects that need attention and wrap around', async ({ page, factory }, testInfo) => {
@@ -59,8 +173,8 @@ test.describe('with a desktop pointer', () => {
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
     await page.goto(`/?project=${ids.a}`);
     await page.locator('#request').click();
-    await page.keyboard.type('pnPN');
-    await expect(page.locator('#request')).toHaveValue('pnPN');
+    await page.keyboard.type('pnPNjkip');
+    await expect(page.locator('#request')).toHaveValue('pnPNjkip');
     await expect(page.locator('.picker-panel')).toBeHidden();
     await expect(page).toHaveURL(new RegExp(`[?&]project=${ids.a}$`));
   });
@@ -76,8 +190,8 @@ test.describe('with a desktop pointer', () => {
 
     await button(page).click();
     const footer = page.locator('.picker-keys');
-    await expect(footer.locator('kbd')).toHaveText(['↑', '↓', 'Enter', 'Esc', 'N', 'Shift', 'N']);
-    for (const text of ['move', 'open', 'close', 'next that needs you', 'previous']) {
+    await expect(footer.locator('kbd')).toHaveText(['↑', '↓', 'J', 'K', 'Enter', 'Esc', 'I', 'N', 'Shift', 'N']);
+    for (const text of ['move', 'open', 'close', 'search', 'next that needs you', 'previous']) {
       await expect(footer).toContainText(text);
     }
     const style = await footer.locator('kbd').first().evaluate((el) => {
