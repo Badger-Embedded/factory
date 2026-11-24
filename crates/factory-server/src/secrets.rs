@@ -90,6 +90,15 @@ impl<'a> ForgeTokenOwner<'a> {
         }
     }
 
+    /// The forge the token belongs to.
+    pub(crate) fn forge(&self) -> &'a ForgeKind {
+        match *self {
+            ForgeTokenOwner::User { forge, .. }
+            | ForgeTokenOwner::Project { forge, .. }
+            | ForgeTokenOwner::Upstream { forge, .. } => forge,
+        }
+    }
+
     /// The `project` and `header` of the row. The `server` is empty, which no
     /// MCP server name can be, so deleting an MCP server never matches a
     /// forge token row.

@@ -779,6 +779,10 @@ pub struct ProjectSettings {
     pub maintenance: Maintenance,
     /// Set when the project's forge is not one the factory supports.
     pub forge_problem: Option<String>,
+    /// Set when the stored upstream forge is neither a fixed forge nor a
+    /// registered Forgejo instance. The card then reads as GitHub, and a save
+    /// picks the forge again.
+    pub upstream_problem: Option<String>,
     /// The Forge account card. `None` when the project's forge is unknown.
     pub forge_account: Option<ForgeAccountCard>,
     /// The packaging upstream's token and the last connection check.
@@ -1632,6 +1636,9 @@ pub fn settings_forge(
             h1 { (name) }
             form.card.settings-form method="post" action=(format!("{base}/token")) {
                 input type="hidden" name="csrf" value=(csrf);
+                @if let ForgeKind::Forgejo(server) = kind {
+                    input type="hidden" name="server" value=(server.base_url);
+                }
                 h2 { "Your " (name) " token" }
                 p.hint {
                     "The factory uses this token for the onboarding checks and for jobs in \
@@ -1703,7 +1710,7 @@ pub fn settings_forgejo(
         notice,
         &html! {
             h1 { "Forgejo servers" }
-            p.meta { "The Forgejo servers a factory admin has registered, such as a self-hosted server or Codeberg. Projects and tokens cannot use them yet, so registering a server changes nothing else." }
+            p.meta { "The Forgejo servers a factory admin has registered, such as a self-hosted server or Codeberg. A project, a token page and the upstream forge of a packaging project refer to a server by its name." }
             @if let Some(problem) = problem {
                 div.card.failed { (problem) }
             }
@@ -2112,6 +2119,9 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
             action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/maintenance" } {
             h2 { "Maintenance" }
             input type="hidden" name="csrf" value=(project.checks_csrf);
+            @if let Some(problem) = &project.upstream_problem {
+                p.hint.bad.upstream-problem { (problem) }
+            }
             div.field {
                 label.check {
                     input type="checkbox" name="renovate" value="on" checked[maintenance.renovate];
@@ -2213,6 +2223,9 @@ fn upstream_token_field(
     let id = format!("upstream-token-{}", forge.as_str());
     html! {
         div.field.upstream-token id=(id) {
+            @if let ForgeKind::Forgejo(server) = forge {
+                input type="hidden" name={ "server_" (forge.as_str()) } value=(server.base_url);
+            }
             label for={ (id) "-field" } { (forge.display_name()) " upstream token" }
             input id={ (id) "-field" } .wide type="password" name={ "token_" (forge.as_str()) }
                 autocomplete="off" spellcheck="false"

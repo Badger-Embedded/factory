@@ -16076,9 +16076,20 @@ async fn stub_api() -> (String, ()) {
 }
 
 /// A Forgejo stub over TLS that knows one token, `tok-ok`, which belongs to
-/// `<prefix>-bot`, and answers 401 to any other.
-async fn forgejo_user_stub(prefix: &'static str) -> support::TlsServer {
+/// `<prefix>-bot`, and answers 401 to any other. It counts each request, and
+/// with a gate it signals `arrived` and then waits for `release` before it
+/// answers.
+async fn forgejo_gated_stub(
+    prefix: &'static str,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Option<(Arc<Notify>, Arc<Notify>)>,
+) -> support::TlsServer {
     let user = axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some((arrived, release)) = gate {
+            arrived.notify_one();
+            release.notified().await;
+        }
         let sent = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
@@ -16094,6 +16105,10 @@ async fn forgejo_user_stub(prefix: &'static str) -> support::TlsServer {
     support::serve_tls(Router::new().route("/api/v1/user", user)).await
 }
 
+async fn forgejo_user_stub(prefix: &'static str) -> support::TlsServer {
+    forgejo_gated_stub(prefix, Arc::default(), None).await
+}
+
 fn forgejo_roots(stubs: &[&support::TlsServer]) -> Vec<reqwest::Certificate> {
     stubs
         .iter()
@@ -16101,11 +16116,19 @@ fn forgejo_roots(stubs: &[&support::TlsServer]) -> Vec<reqwest::Certificate> {
         .collect()
 }
 
-/// A dashboard with the Forgejo instances `mine` and `other` registered at the
-/// stubs, a Forgejo project on `mine` and a GitHub project.
 async fn forgejo_dashboard() -> Dashboard {
     let mine = forgejo_user_stub("mine").await;
     let other = forgejo_user_stub("other").await;
+    forgejo_dashboard_over(&mine, &other, &[])
+}
+
+/// As [`forgejo_dashboard`] over these stubs, and `spare` stubs the dashboard
+/// trusts for an instance added later.
+fn forgejo_dashboard_over(
+    mine: &support::TlsServer,
+    other: &support::TlsServer,
+    spare: &[&support::TlsServer],
+) -> Dashboard {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store
         .add_forgejo_instance("mine", &mine.base, "17.0.2")
@@ -16128,6 +16151,8 @@ async fn forgejo_dashboard() -> Dashboard {
         )
         .unwrap();
     let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    let mut stubs = vec![mine, other];
+    stubs.extend(spare);
     dashboard_build(
         store,
         Arc::new(FakeRepos::fit()),
@@ -16136,8 +16161,28 @@ async fn forgejo_dashboard() -> Dashboard {
         secrets,
         vec![USER.to_owned()],
         |_| GitHub::default(),
-        forgejo_roots(&[&mine, &other]),
+        forgejo_roots(&stubs),
     )
+}
+
+/// The csrf token and the server URL the token page of `instance` carries.
+async fn forgejo_form_fields(
+    dashboard: &Dashboard,
+    login: &str,
+    instance: &str,
+) -> (String, String) {
+    let page = dashboard
+        .get_as(login, &format!("/settings/forges/{instance}"))
+        .await;
+    let doc = scraper::Html::parse_document(&page.body);
+    let field = |name: &str| {
+        doc.select(&scraper::Selector::parse(&format!("input[name={name}]")).unwrap())
+            .next()
+            .and_then(|input| input.value().attr("value"))
+            .unwrap_or_else(|| panic!("the form carries {name}"))
+            .to_owned()
+    };
+    (field("csrf"), field("server"))
 }
 
 async fn forgejo_post(
@@ -16147,21 +16192,24 @@ async fn forgejo_post(
     action: &str,
     form: &str,
 ) -> Reply {
-    let page = dashboard
-        .get_as(login, &format!("/settings/forges/{instance}"))
-        .await;
-    let doc = scraper::Html::parse_document(&page.body);
-    let csrf = doc
-        .select(&scraper::Selector::parse("input[name=csrf]").unwrap())
-        .next()
-        .and_then(|input| input.value().attr("value"))
-        .expect("the form carries a csrf token")
-        .to_owned();
+    let (csrf, server) = forgejo_form_fields(dashboard, login, instance).await;
+    forgejo_post_with(dashboard, login, instance, action, form, &csrf, &server).await
+}
+
+async fn forgejo_post_with(
+    dashboard: &Dashboard,
+    login: &str,
+    instance: &str,
+    action: &str,
+    form: &str,
+    csrf: &str,
+    server: &str,
+) -> Reply {
     dashboard
         .post_as(
             login,
             &format!("/settings/forges/{instance}/{action}"),
-            &format!("{form}&csrf={csrf}"),
+            &format!("{form}&csrf={csrf}&server={server}"),
         )
         .await
 }
@@ -16300,4 +16348,229 @@ async fn a_forgejo_project_links_its_repository_on_the_instance_in_a_new_tab() {
     let settings = dashboard.get("/settings/projects/forged").await;
     assert!(settings.body.contains(&format!("{base}/team/forged")));
     assert!(settings.body.contains("Forge account"));
+}
+
+#[tokio::test]
+async fn a_token_form_opened_for_a_replaced_instance_is_refused_before_any_forge_call() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let mine = forgejo_user_stub("mine").await;
+    let other = forgejo_user_stub("other").await;
+    let spare = forgejo_gated_stub("spare", Arc::clone(&hits), None).await;
+    let dashboard = forgejo_dashboard_over(&mine, &other, &[&spare]);
+    let (csrf, shown) = forgejo_form_fields(&dashboard, DAVE, "other").await;
+
+    dashboard.store.delete_forgejo_instance("other").unwrap();
+    dashboard
+        .store
+        .add_forgejo_instance("other", &spare.base, "17.0.2")
+        .unwrap();
+
+    for action in ["token", "token/clear"] {
+        let reply = forgejo_post_with(
+            &dashboard,
+            DAVE,
+            "other",
+            action,
+            "token=tok-ok",
+            &csrf,
+            &shown,
+        )
+        .await;
+        assert!(
+            reply.body.contains("changed since this page loaded"),
+            "{action}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let page = dashboard.get_as(DAVE, "/settings/forges/other").await.body;
+    assert!(page.contains("No token is stored."));
+}
+
+#[tokio::test]
+async fn a_token_check_that_outlives_its_instance_stores_nothing() {
+    use std::sync::atomic::AtomicUsize;
+
+    let arrived = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mine = forgejo_user_stub("mine").await;
+    let other = forgejo_gated_stub(
+        "other",
+        Arc::new(AtomicUsize::new(0)),
+        Some((Arc::clone(&arrived), Arc::clone(&release))),
+    )
+    .await;
+    let spare = forgejo_user_stub("spare").await;
+    let dashboard = forgejo_dashboard_over(&mine, &other, &[&spare]);
+    let (csrf, shown) = forgejo_form_fields(&dashboard, DAVE, "other").await;
+
+    let save = forgejo_post_with(
+        &dashboard,
+        DAVE,
+        "other",
+        "token",
+        "token=tok-ok",
+        &csrf,
+        &shown,
+    );
+    let replace = async {
+        arrived.notified().await;
+        dashboard.store.delete_forgejo_instance("other").unwrap();
+        dashboard
+            .store
+            .add_forgejo_instance("other", &spare.base, "17.0.2")
+            .unwrap();
+        release.notify_one();
+    };
+    let (reply, ()) = tokio::join!(save, replace);
+
+    assert!(reply.body.contains("deleted or registered again"));
+    assert!(!reply.body.contains("other-bot"));
+    let page = dashboard.get_as(DAVE, "/settings/forges/other").await.body;
+    assert!(page.contains("No token is stored."));
+}
+
+async fn maintenance_csrf(dashboard: &Dashboard) -> String {
+    let page = dashboard.get("/settings/projects/maestro").await;
+    let doc = scraper::Html::parse_document(&page.body);
+    doc.select(
+        &scraper::Selector::parse("form[action$=\"/maintenance\"] input[name=csrf]").unwrap(),
+    )
+    .next()
+    .and_then(|input| input.value().attr("value"))
+    .expect("the maintenance form carries a csrf token")
+    .to_owned()
+}
+
+#[tokio::test]
+async fn an_upstream_token_form_opened_for_a_replaced_instance_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let mine = forgejo_user_stub("mine").await;
+    let other = forgejo_user_stub("other").await;
+    let spare = forgejo_gated_stub("spare", Arc::clone(&hits), None).await;
+    let dashboard = forgejo_dashboard_over(&mine, &other, &[&spare]);
+    dashboard
+        .store
+        .add_collaborator("maestro", USER, "test")
+        .unwrap();
+    let shown = dashboard
+        .store
+        .forgejo_instance("other")
+        .unwrap()
+        .unwrap()
+        .base_url;
+    dashboard.store.delete_forgejo_instance("other").unwrap();
+    dashboard
+        .store
+        .add_forgejo_instance("other", &spare.base, "17.0.2")
+        .unwrap();
+
+    let csrf = maintenance_csrf(&dashboard).await;
+    let form = format!(
+        "renovate=on&packaging=on&packaging_type=deb&manifest_files=debian%2Fcontrol\
+         &upstream_repo=o%2Ftool&upstream_forge=other&server_other={shown}&token_other=tok-ok&csrf={csrf}"
+    );
+    for action in ["", "/clear"] {
+        let reply = dashboard
+            .post(
+                &format!("/settings/projects/maestro/upstream-token{action}?forge=other"),
+                &form,
+            )
+            .await;
+        assert!(
+            reply.body.contains("changed since this page loaded"),
+            "{action}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_unregistered_upstream_forge_is_refused_before_any_forge_call() {
+    let dashboard = forgejo_dashboard().await;
+    dashboard
+        .store
+        .add_collaborator("maestro", USER, "test")
+        .unwrap();
+    let form = "renovate=on&packaging=on&packaging_type=deb&manifest_files=debian%2Fcontrol\
+                &upstream_repo=o%2Ftool&upstream_forge=nope";
+
+    let check = dashboard
+        .post("/settings/projects/maestro/maintenance/check", form)
+        .await;
+    assert!(
+        check
+            .body
+            .contains("is not registered. Pick another upstream forge.")
+    );
+    assert!(!check.body.contains("Checked with"));
+
+    let save = dashboard
+        .post("/settings/projects/maestro/maintenance", form)
+        .await;
+    assert!(
+        save.body
+            .contains("is not registered. Pick another upstream forge.")
+    );
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_project_whose_stored_upstream_forge_is_gone_stays_editable() {
+    let dashboard = forgejo_dashboard().await;
+    dashboard
+        .store
+        .add_collaborator("maestro", USER, "test")
+        .unwrap();
+    let gone = ForgeKind::Forgejo(factory_runner::ForgejoServer {
+        name: "gone".to_owned(),
+        base_url: "https://gone.example.org".to_owned(),
+    });
+    dashboard
+        .store
+        .save_project_maintenance(
+            "maestro",
+            &factory_server::Maintenance {
+                renovate: true,
+                renovate_author: None,
+                packaging: Some(factory_server::Packaging {
+                    kind: factory_server::PackagingType::Deb,
+                    manifest_files: vec!["debian/control".to_owned()],
+                    build_config_files: Vec::new(),
+                    upstream_repo: "o/tool".to_owned(),
+                    upstream_forge: gone,
+                }),
+            },
+        )
+        .unwrap();
+
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body
+            .contains("is no longer registered, so the upstream is shown as GitHub")
+    );
+    let saved = dashboard
+        .post("/settings/projects/maestro/maintenance", "x=1")
+        .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    assert!(
+        dashboard
+            .store
+            .project_maintenance("maestro")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+    assert!(!saved.body.contains("is no longer registered, so"));
 }

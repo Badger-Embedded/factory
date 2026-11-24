@@ -367,3 +367,117 @@ fn a_project_and_its_upstream_resolve_against_the_registry() {
         .collect();
     assert_eq!(names, ["github", "salsa", "mine"]);
 }
+
+#[test]
+fn a_write_for_a_deleted_or_replaced_instance_stores_nothing() {
+    use factory_runner::ForgeAccount;
+    use factory_server::{
+        ForgeTokenOwner, Maintenance, MaintenanceSave, Packaging, PackagingType, ProjectGuard,
+    };
+
+    let (_dir, store) = store();
+    store
+        .add_forgejo_instance("mine", "https://one.example.org", "17.0.2")
+        .unwrap();
+    let old = store.resolve_forge("mine").unwrap().unwrap();
+    store
+        .create_project(
+            "web",
+            &factory_runner::ForgeKind::GitHub,
+            "o/web",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let (_, instance) = store.project_with_instance("web").unwrap().unwrap();
+    store.delete_forgejo_instance("mine").unwrap();
+    store
+        .add_forgejo_instance("mine", "https://two.example.org", "17.0.2")
+        .unwrap();
+
+    let account = ForgeAccount {
+        login: "bot".to_owned(),
+        id: 5,
+    };
+    let owner = ForgeTokenOwner::User {
+        login: "dave",
+        forge: &old,
+    };
+    let (row, header) = ("", "forge-user:mine:dave");
+    let put = store.put_forge_token(secret(row, header), "local", b"sealed", owner, &account);
+    assert!(matches!(put, Err(StoreError::InstanceChanged(name)) if name == "mine"));
+    assert!(store.forge_account(owner).unwrap().is_none());
+    assert!(store.get_secret(secret(row, header)).unwrap().is_none());
+
+    let guard = ProjectGuard {
+        project: "web",
+        login: "alice",
+        instance,
+    };
+    let upstream = ForgeTokenOwner::Upstream {
+        project: "web",
+        forge: &old,
+    };
+    let put = store.put_project_forge_token(
+        secret("web", "forge-upstream"),
+        "local",
+        b"sealed",
+        upstream,
+        &account,
+        &guard,
+    );
+    assert!(matches!(put, Err(StoreError::InstanceChanged(_))));
+    assert!(store.forge_account(upstream).unwrap().is_none());
+
+    let maintenance = Maintenance {
+        renovate: false,
+        renovate_author: None,
+        packaging: Some(Packaging {
+            kind: PackagingType::Other,
+            manifest_files: vec!["a".to_owned()],
+            build_config_files: Vec::new(),
+            upstream_repo: "o/up".to_owned(),
+            upstream_forge: old,
+        }),
+    };
+    let saved = store
+        .save_project_maintenance_guarded(&guard, &maintenance, &[])
+        .unwrap();
+    assert_eq!(saved, MaintenanceSave::InstanceChanged);
+    assert!(
+        store
+            .project_maintenance("web")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+}
+
+#[test]
+fn a_stored_upstream_that_is_no_longer_registered_reads_leniently_for_settings() {
+    let (dir, store) = store();
+    store
+        .create_project(
+            "web",
+            &factory_runner::ForgeKind::GitHub,
+            "o/web",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    raw(&dir)
+        .execute_batch(
+            "INSERT INTO project_maintenance (project, renovate, packaging, manifest_files, build_config_files, upstream_repo, upstream_forge)
+             VALUES ('web', 1, 1, '[\"a\"]', '[]', 'o/up', 'old')",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.project_maintenance("web"),
+        Err(StoreError::UnknownUpstreamForge(_))
+    ));
+    let (maintenance, unknown) = store.project_maintenance_lenient("web").unwrap();
+    assert_eq!(unknown.as_deref(), Some("old"));
+    assert!(maintenance.packaging.is_some());
+}

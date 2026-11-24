@@ -21,13 +21,19 @@ pub enum SaveError {
     Gone,
     /// The account lookup could not run.
     Lookup(String),
+    /// The Forgejo instance was deleted, or registered again at another
+    /// address, while the save ran.
+    InstanceChanged,
     Secrets(SecretError),
     Store(StoreError),
 }
 
 impl From<SecretError> for SaveError {
     fn from(err: SecretError) -> Self {
-        SaveError::Secrets(err)
+        match err {
+            SecretError::Store(StoreError::InstanceChanged(_)) => SaveError::InstanceChanged,
+            err => SaveError::Secrets(err),
+        }
     }
 }
 

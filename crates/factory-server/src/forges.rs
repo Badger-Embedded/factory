@@ -97,8 +97,6 @@ impl Forges {
         }
     }
 
-    /// The Forgejo forge of `server`, built on first use and kept for its name
-    /// and URL.
     fn forgejo_forge(&self, server: &ForgejoServer) -> Arc<dyn Forge> {
         let mut cache = self.forgejo.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(forge) = cache.get(server) {

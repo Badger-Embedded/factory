@@ -568,6 +568,9 @@ pub enum StoreError {
     UnknownUpstreamForge(String),
     /// A Forgejo instance was refused. The message says why.
     Forgejo(String),
+    /// A write named a Forgejo instance that was deleted, or registered again
+    /// at another address, after the write's checks began.
+    InstanceChanged(String),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -610,6 +613,10 @@ impl fmt::Display for StoreError {
                 write!(f, "job #{id} is not a job this request can wait for")
             }
             StoreError::Forgejo(message) => f.write_str(message),
+            StoreError::InstanceChanged(name) => write!(
+                f,
+                "the Forgejo instance {name:?} was deleted or registered again while the write was checked"
+            ),
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
             StoreError::Io(err) => write!(f, "file system: {err}"),
@@ -2856,6 +2863,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        require_registered(&tx, owner.forge())?;
         tx.execute(
             "INSERT INTO secrets (project, server, header, backend, value)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2934,6 +2942,7 @@ impl Store {
         if !present {
             return Ok(false);
         }
+        require_registered(&tx, owner.forge())?;
         tx.execute(
             "INSERT INTO secrets (project, server, header, backend, value)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -3641,6 +3650,28 @@ impl Store {
     ///
     /// Fails on a database error or a stored list that does not parse.
     pub fn project_maintenance(&self, project: &str) -> Result<Maintenance, StoreError> {
+        match self.read_maintenance(project)? {
+            (_, Some(name)) => Err(StoreError::UnknownUpstreamForge(name)),
+            (maintenance, None) => Ok(maintenance),
+        }
+    }
+
+    /// As [`Store::project_maintenance`], for a page that must stay editable
+    /// when the stored upstream forge is unknown. The settings then read as
+    /// the GitHub upstream, and the name of the unknown forge comes back
+    /// beside them.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored list that does not parse.
+    pub fn project_maintenance_lenient(
+        &self,
+        project: &str,
+    ) -> Result<(Maintenance, Option<String>), StoreError> {
+        self.read_maintenance(project)
+    }
+
+    fn read_maintenance(&self, project: &str) -> Result<(Maintenance, Option<String>), StoreError> {
         let row = self
             .conn()
             .query_row(
@@ -3683,8 +3714,9 @@ impl Store {
             upstream_chosen,
         )) = row
         else {
-            return Ok(Maintenance::default());
+            return Ok((Maintenance::default(), None));
         };
+        let mut unknown = None;
         let packaging = if packaging {
             Some(Packaging {
                 kind: kind
@@ -3699,23 +3731,25 @@ impl Store {
                 // only keeps its settings page readable.
                 upstream_forge: match upstream_forge.as_deref() {
                     None => ForgeKind::GitHub,
-                    Some(name) => match ForgeKind::resolve(name, upstream_url.as_deref()) {
-                        Some(kind) => kind,
-                        None if upstream_chosen => {
-                            return Err(StoreError::UnknownUpstreamForge(name.to_owned()));
-                        }
-                        None => ForgeKind::GitHub,
-                    },
+                    Some(name) => {
+                        ForgeKind::resolve(name, upstream_url.as_deref()).unwrap_or_else(|| {
+                            unknown = upstream_chosen.then(|| name.to_owned());
+                            ForgeKind::GitHub
+                        })
+                    }
                 },
             })
         } else {
             None
         };
-        Ok(Maintenance {
-            renovate,
-            renovate_author,
-            packaging,
-        })
+        Ok((
+            Maintenance {
+                renovate,
+                renovate_author,
+                packaging,
+            },
+            unknown,
+        ))
     }
 
     /// Writes the whole maintenance row of `project`. It does not validate;
@@ -3760,6 +3794,16 @@ impl Store {
         )?;
         if !present {
             return Ok(MaintenanceSave::Gone);
+        }
+        let upstream = maintenance.packaging.as_ref().map(|p| &p.upstream_forge);
+        let forges = credentials
+            .iter()
+            .map(|(owner, _)| owner.forge())
+            .chain(upstream);
+        for forge in forges {
+            if require_registered(&tx, forge).is_err() {
+                return Ok(MaintenanceSave::InstanceChanged);
+            }
         }
         for (owner, sealed) in credentials {
             let (project, header) = owner.row();
@@ -5123,6 +5167,24 @@ fn project_token_kind(owner: ForgeTokenOwner<'_>) -> &'static str {
     }
 }
 
+/// Fails with [`StoreError::InstanceChanged`] unless `forge` is a fixed forge
+/// or a Forgejo instance registered under this name and base URL.
+fn require_registered(conn: &Connection, forge: &ForgeKind) -> Result<(), StoreError> {
+    let ForgeKind::Forgejo(server) = forge else {
+        return Ok(());
+    };
+    let registered: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM forgejo_instances WHERE name = ?1 AND base_url = ?2)",
+        params![server.name, server.base_url],
+        |row| row.get(0),
+    )?;
+    if registered {
+        Ok(())
+    } else {
+        Err(StoreError::InstanceChanged(server.name.clone()))
+    }
+}
+
 /// Saving or clearing a project token ends the startup copy of `GH_TOKEN` for
 /// that project, in the transaction that changes the token.
 fn mark_project_token_handled(
@@ -5202,6 +5264,9 @@ pub enum MaintenanceSave {
     Gone,
     /// A token that was checked is no longer the stored one.
     TokenChanged,
+    /// A Forgejo instance the save uses was deleted, or registered again at
+    /// another address, while the save was checked.
+    InstanceChanged,
 }
 
 fn write_maintenance(
