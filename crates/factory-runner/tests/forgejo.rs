@@ -48,13 +48,35 @@ fn rep(status: u16, body: &str) -> Rep {
     }
 }
 
-/// A listing answer: `items` on page 1 and nothing after, like a server that
-/// has read them all.
 fn page(seen: &Seen, items: &Value) -> Rep {
     if seen.query.split('&').any(|pair| pair == "page=1") || !seen.query.contains("page=") {
-        ok(items)
+        return ok(items);
+    }
+    ok(&match items {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    let value = if value.is_array() {
+                        json!([])
+                    } else {
+                        value.clone()
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        _ => json!([]),
+    })
+}
+
+/// The answer for a listing the test does not care about: no statuses for the
+/// status path, no items for any other.
+fn quiet(seen: &Seen) -> Rep {
+    if seen.path.ends_with("/status") {
+        page(seen, &json!({"statuses": []}))
     } else {
-        ok(&json!([]))
+        page(seen, &json!([]))
     }
 }
 
@@ -159,8 +181,8 @@ fn pull(head: &str) -> Value {
         "mergeable": true,
         "html_url": "https://forge.test/owner/name/pulls/3",
         "user": {"login": "renovate-bot"},
-        "head": {"sha": head, "ref": "feature"},
-        "base": {"ref": "main"},
+        "head": {"sha": head, "ref": "feature", "label": "feature", "repo_id": 5},
+        "base": {"ref": "main", "label": "main", "repo_id": 5},
     })
 }
 
@@ -465,6 +487,7 @@ async fn statuses_map_to_the_ci_state() {
         (vec![("a", "success"), ("b", "success")], Ci::Passed),
         (vec![("a", "success"), ("b", "skipped")], Ci::Passed),
         (vec![("a", "success"), ("b", "warning")], Ci::Passed),
+        (vec![("a", "warning")], Ci::NoChecks),
         (vec![("a", "skipped")], Ci::NoChecks),
         (vec![], Ci::NoChecks),
     ];
@@ -497,7 +520,7 @@ async fn a_pull_request_in_each_state_reads_as_that_state() {
                 pull["merged"] = json!(merged);
                 ok(&pull)
             } else {
-                page(seen, &json!({"statuses": []}))
+                quiet(seen)
             }
         })
         .await;
@@ -522,7 +545,7 @@ async fn a_pull_request_that_is_still_being_checked_is_not_conflicting() {
             pull["mergeable"] = json!(*count > 1);
             ok(&pull)
         } else {
-            page(seen, &json!({"statuses": []}))
+            quiet(seen)
         }
     })
     .await;
@@ -539,7 +562,7 @@ async fn a_pull_request_that_is_still_being_checked_is_not_conflicting() {
             pull["mergeable"] = json!(false);
             ok(&pull)
         } else {
-            page(seen, &json!({"statuses": []}))
+            quiet(seen)
         }
     })
     .await;
@@ -578,7 +601,7 @@ fn comments_stub() -> impl Fn(&Seen) -> Rep + Send + Sync {
         "/repos/owner/name/pulls/3/reviews/3/comments" => ok(&json!([
             {"body": "ignored", "created_at": "2026-11-23T20:33:00Z", "path": "src/d.rs", "position": 1, "user": {"login": "project-bot"}},
         ])),
-        _ => page(seen, &json!({"statuses": []})),
+        _ => quiet(seen),
     }
 }
 
@@ -659,7 +682,10 @@ fn rerun_stub(jobs_status: &'static str) -> impl Fn(&Seen) -> Rep + Send + Sync 
             {"id": 501, "name": "test", "status": "success", "attempt": 1},
         ])),
         ("POST", "/repos/owner/name/actions/jobs/500/rerun") => rep(204, ""),
-        _ => page(seen, &json!({"statuses": []})),
+        ("GET", "/repos/owner/name/actions/runs/42/jobs") => ok(&json!([
+            {"id": 600, "name": "docs", "status": "success", "attempt": 1},
+        ])),
+        _ => quiet(seen),
     }
 }
 
@@ -678,6 +704,67 @@ async fn rerun_failed_reruns_each_failed_job() {
         1
     );
     assert!(stub.seen().iter().all(|seen| !seen.path.contains("/501/")));
+}
+
+#[tokio::test]
+async fn rerun_failed_reads_the_jobs_again_after_a_rerun_requeues_its_dependents() {
+    // Job 501 needs job 500, and the run is still active because of job 502.
+    let jobs = Arc::new(Mutex::new(vec![
+        (500, "failure"),
+        (501, "failure"),
+        (502, "running"),
+    ]));
+    let state = jobs.clone();
+    let stub = serve(move |seen| {
+        let mut jobs = state.lock().unwrap();
+        match (seen.method.as_str(), seen.path.as_str()) {
+            ("GET", "/repos/owner/name/pulls/3") => ok(&pull("abc")),
+            ("GET", "/repos/owner/name/actions/runs") => page(
+                seen,
+                &json!({"workflow_runs": [{"id": 41, "index_in_repo": 7, "status": "running"}]}),
+            ),
+            ("GET", "/repos/owner/name/actions/runs/41/jobs") => ok(&json!(
+                jobs.iter()
+                    .map(|(id, status)| json!({"id": id, "status": status}))
+                    .collect::<Vec<_>>()
+            )),
+            ("POST", path) => {
+                let id: u64 = path
+                    .trim_start_matches("/repos/owner/name/actions/jobs/")
+                    .trim_end_matches("/rerun")
+                    .parse()
+                    .unwrap();
+                let Some(job) = jobs.iter().position(|(job, _)| *job == id) else {
+                    return rep(404, "");
+                };
+                if jobs[job].1 != "failure" {
+                    return rep(400, r#"{"message":"job is active"}"#);
+                }
+                for (job, status) in jobs.iter_mut() {
+                    if *job >= id && *status == "failure" {
+                        *status = "waiting";
+                    }
+                }
+                rep(204, "")
+            }
+            _ => quiet(seen),
+        }
+    })
+    .await;
+    let rerun = stub
+        .forge
+        .rerun_failed(&account(&stub.forge), REPO, 3)
+        .await
+        .unwrap();
+    assert_eq!(rerun, Rerun::Started(vec![41]));
+    assert_eq!(
+        stub.seen()
+            .iter()
+            .filter(|seen| seen.method == "POST")
+            .map(|seen| seen.path.clone())
+            .collect::<Vec<_>>(),
+        ["/repos/owner/name/actions/jobs/500/rerun"]
+    );
 }
 
 #[tokio::test]
@@ -724,7 +811,7 @@ async fn rerun_failed_waits_until_the_old_failure_is_gone() {
     let stub = serve(move |seen| {
         if seen.path == "/repos/owner/name/commits/abc/status" {
             if seen.query.contains("page=2") {
-                return page(seen, &json!([]));
+                return page(seen, &json!({"statuses": []}));
             }
             let mut count = counter.lock().unwrap();
             *count += 1;
@@ -778,6 +865,52 @@ async fn failure_report_ends_with_the_tail_of_the_job_log() {
     );
     assert!(report.trim_end().ends_with("END OF LOG"));
     assert!(report.len() < 31_000, "{}", report.len());
+}
+
+#[tokio::test]
+async fn failure_report_finds_the_job_under_a_mount_path_or_an_owner_called_actions() {
+    for (prefix, repo) in [("/actions", "owner/name"), ("", "actions/name")] {
+        let api = format!("/repos/{repo}");
+        let stub = stub_at(prefix, move |seen| {
+            let jobs_url = format!(
+                "https://{}{prefix}/{repo}/actions/runs/7/jobs/0/attempt/1",
+                seen.host
+            );
+            match seen.path.strip_prefix(&api).unwrap_or(&seen.path) {
+                "/pulls/3" => ok(&pull("abc")),
+                "/commits/abc/status" => page(
+                    seen,
+                    &json!({"statuses": [context(
+                        "lint",
+                        "failure",
+                        &format!("{repo}/actions/runs/7/jobs/0"),
+                    )]}),
+                ),
+                "/actions/runs" => page(
+                    seen,
+                    &json!({"workflow_runs": [{"id": 41, "index_in_repo": 7}]}),
+                ),
+                "/actions/runs/41/jobs" => ok(&json!([{"id": 500, "html_url": jobs_url}])),
+                "/actions/jobs/500/logs" => rep(200, "the log"),
+                _ => quiet(seen),
+            }
+        })
+        .await;
+        let account = account(&stub.forge);
+        let Ci::Failed(checks) = stub.forge.status(&account, repo, 3, &[]).await.unwrap().ci else {
+            panic!("expected a failed check");
+        };
+        assert_eq!(
+            checks[0].url.as_deref(),
+            Some(&*format!("{}/{repo}/actions/runs/7/jobs/0", stub.base))
+        );
+        let report = stub
+            .forge
+            .failure_report(&account, repo, &checks)
+            .await
+            .unwrap();
+        assert!(report.contains("the log"), "{prefix} {repo}: {report}");
+    }
 }
 
 #[tokio::test]
@@ -937,7 +1070,7 @@ async fn open_pr_creates_the_pull_request_or_updates_the_open_one() {
         ("GET", "/repos/owner/name/pulls") => {
             let mut other = pull("zzz");
             other["number"] = json!(2);
-            other["head"]["ref"] = json!("other");
+            other["head"]["label"] = json!("other");
             page(seen, &json!([null, other, pull("abc")]))
         }
         ("PATCH", "/repos/owner/name/pulls/3") => rep(201, "{}"),
@@ -991,6 +1124,55 @@ async fn merged_pr_finds_the_merged_pull_request_of_a_branch() {
         None
     );
     assert!(stub.seen()[0].query.contains("state=closed"));
+}
+
+#[tokio::test]
+async fn a_pull_request_is_matched_by_branch_label_and_repository_not_by_ref() {
+    let stub = serve(|seen| {
+        let mut fork = pull("f");
+        fork["number"] = json!(1);
+        fork["state"] = json!("closed");
+        fork["merged"] = json!(true);
+        fork["head"]["repo_id"] = json!(9);
+        let mut deleted = pull("b");
+        deleted["number"] = json!(2);
+        deleted["state"] = json!("closed");
+        deleted["merged"] = json!(true);
+        deleted["head"]["ref"] = json!("refs/pull/2/head");
+        page(seen, &json!([fork, deleted]))
+    })
+    .await;
+    let me = account(&stub.forge);
+    assert_eq!(
+        stub.forge.merged_pr(&me, REPO, "feature").await.unwrap(),
+        Some(2)
+    );
+
+    let stub = serve(|seen| match (seen.method.as_str(), seen.path.as_str()) {
+        ("POST", _) => rep(409, "{}"),
+        ("GET", "/repos/owner/name/pulls") => {
+            let mut fork = pull("f");
+            fork["number"] = json!(1);
+            fork["head"]["repo_id"] = json!(9);
+            page(seen, &json!([fork]))
+        }
+        _ => rep(404, ""),
+    })
+    .await;
+    let description = PrDescription {
+        title: "t".to_owned(),
+        body: "b".to_owned(),
+    };
+    let err = stub
+        .forge
+        .open_pr(&account(&stub.forge), REPO, "main", "feature", &description)
+        .await
+        .unwrap_err();
+    assert!(err.contains("not open"), "{err}");
+    assert!(
+        stub.requests("PATCH", "/repos/owner/name/pulls/1")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1107,6 +1289,145 @@ async fn pr_details_reads_the_files_and_the_whole_diff() {
     .await;
     let err = big.forge.pr_details(&account, REPO, 3).await.unwrap_err();
     assert!(err.contains("larger than"), "{err}");
+}
+
+#[tokio::test]
+async fn a_head_that_moves_during_the_diff_read_is_read_again() {
+    let reads = Arc::new(Mutex::new(0));
+    let counter = reads.clone();
+    let stub = serve(move |seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => {
+            let mut count = counter.lock().unwrap();
+            *count += 1;
+            // Reads 1 and 2 bracket the first snapshot, 3 and 4 the second.
+            ok(&pull(if *count == 1 { "old" } else { "new" }))
+        }
+        "/repos/owner/name/pulls/3/files" => page(seen, &json!([{"filename": "a"}])),
+        "/repos/owner/name/pulls/3.diff" => rep(200, "diff"),
+        _ => rep(404, ""),
+    })
+    .await;
+    let details = stub
+        .forge
+        .pr_details(&account(&stub.forge), REPO, 3)
+        .await
+        .unwrap();
+    assert_eq!(details.head, "new");
+
+    let always = Arc::new(Mutex::new(0));
+    let counter = always.clone();
+    let stub = serve(move |seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => {
+            let mut count = counter.lock().unwrap();
+            *count += 1;
+            ok(&pull(&format!("h{count}")))
+        }
+        _ => quiet(seen),
+    })
+    .await;
+    let err = stub
+        .forge
+        .pr_details(&account(&stub.forge), REPO, 3)
+        .await
+        .unwrap_err();
+    assert!(err.contains("kept moving"), "{err}");
+}
+
+#[tokio::test]
+async fn a_draft_or_an_unresolved_check_does_not_make_a_pull_request_conflicting() {
+    for (draft, statuses) in [
+        (true, json!([])),
+        (false, json!([context("lint", "pending", "")])),
+        (false, json!([context("lint", "failure", "")])),
+    ] {
+        let stub = serve(move |seen| match seen.path.as_str() {
+            "/repos/owner/name/pulls/3" => {
+                let mut pull = pull("abc");
+                pull["mergeable"] = json!(false);
+                pull["draft"] = json!(draft);
+                ok(&pull)
+            }
+            "/repos/owner/name/commits/abc/status" => {
+                page(seen, &json!({"statuses": statuses.clone()}))
+            }
+            _ => quiet(seen),
+        })
+        .await;
+        let status = stub
+            .forge
+            .status(&account(&stub.forge), REPO, 3, &[])
+            .await
+            .unwrap();
+        assert!(!status.conflicting, "draft {draft}");
+    }
+}
+
+#[tokio::test]
+async fn a_listing_that_is_malformed_or_never_ends_is_an_error() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => ok(&pull("abc")),
+        "/repos/owner/name/commits/abc/status" => ok(&json!({"state": "success"})),
+        _ => quiet(seen),
+    })
+    .await;
+    let err = stub
+        .forge
+        .status(&account(&stub.forge), REPO, 3, &[])
+        .await
+        .unwrap_err();
+    assert!(err.contains("holds no list"), "{err}");
+
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => ok(&pull("abc")),
+        "/repos/owner/name/pulls/3/files" => ok(&json!({"message": "oops"})),
+        _ => quiet(seen),
+    })
+    .await;
+    let err = stub
+        .forge
+        .pr_info(&account(&stub.forge), REPO, 3)
+        .await
+        .unwrap_err();
+    assert!(err.contains("holds no list"), "{err}");
+
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => ok(&pull("abc")),
+        "/repos/owner/name/pulls/3/files" => ok(&json!([{"filename": "a"}])),
+        _ => quiet(seen),
+    })
+    .await;
+    let err = stub
+        .forge
+        .pr_info(&account(&stub.forge), REPO, 3)
+        .await
+        .unwrap_err();
+    assert!(err.contains("more than"), "{err}");
+}
+
+#[tokio::test]
+async fn a_malformed_answer_does_not_echo_the_token() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => ok(&json!({"number": TOKEN})),
+        _ => rep(404, ""),
+    })
+    .await;
+    let account = account(&stub.forge);
+    let err = stub.forge.status(&account, REPO, 3, &[]).await.unwrap_err();
+    assert!(err.contains("unexpected answer"), "{err}");
+    assert!(!err.contains(TOKEN), "{err}");
+
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => ok(&pull("abc")),
+        _ => ok(&json!({"workflow_runs": [{"id": TOKEN}]})),
+    })
+    .await;
+    let err = stub
+        .forge
+        .rerun_failed(&account, REPO, 3)
+        .await
+        .unwrap_err();
+    assert!(err.contains("unexpected answer"), "{err}");
+    assert!(!err.contains(TOKEN), "{err}");
 }
 
 #[tokio::test]
@@ -1231,6 +1552,26 @@ async fn compare_patch_is_a_unified_diff_of_the_file_at_both_refs() {
         .unwrap()
         .unwrap();
     assert_eq!(patch, "@@ -1,1 +0,0 @@\n-x");
+
+    let newline = serve(file_stub(Some("a\nb"), Some("a\nb\n"))).await;
+    let patch = newline
+        .forge
+        .compare_patch(&account(&newline.forge), REPO, "v1", "v2", "dir/Cargo.toml")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        patch,
+        "@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b"
+    );
+    let crlf = serve(file_stub(Some("a\r\nb\r\n"), Some("a\nb\n"))).await;
+    let patch = crlf
+        .forge
+        .compare_patch(&account(&crlf.forge), REPO, "v1", "v2", "dir/Cargo.toml")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(patch.contains("-a\r\n-b\r\n+a\n+b"), "{patch:?}");
 }
 
 #[tokio::test]

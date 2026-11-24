@@ -24,6 +24,11 @@ const PAGE_SIZE: usize = 50;
 const MAX_PAGES: usize = 50;
 /// How often `status` reads a pull request again that reports it cannot merge.
 const CONFLICT_RECHECKS: u32 = 3;
+/// How often `pr_info` and `pr_details` read a pull request again after its
+/// head moved during the read.
+const SNAPSHOT_TRIES: usize = 3;
+/// The most jobs of one run that `rerun_failed` reruns.
+const MAX_RERUNS_PER_RUN: usize = 50;
 /// The largest number of lines on each side for which `compare_patch` finds a
 /// minimal diff. Larger files are shown as replaced.
 const DIFF_CELLS: usize = 4_000_000;
@@ -179,6 +184,10 @@ struct RefJson {
     sha: String,
     #[serde(default, rename = "ref")]
     name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    repo_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +201,8 @@ struct PullJson {
     #[serde(default)]
     merged: bool,
     mergeable: Option<bool>,
+    #[serde(default)]
+    draft: bool,
     merged_at: Option<String>,
     #[serde(default)]
     html_url: String,
@@ -217,8 +228,6 @@ struct RunJson {
     id: u64,
     #[serde(default)]
     index_in_repo: u64,
-    #[serde(default)]
-    status: String,
 }
 
 #[derive(Deserialize)]
@@ -421,10 +430,9 @@ fn line_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
 /// file header, like the patch of a GitHub compare. `None` when no line
 /// differs.
 fn unified_diff(old: &str, new: &str) -> Option<String> {
-    let a: Vec<&str> = old.lines().collect();
-    let b: Vec<&str> = new.lines().collect();
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
     let ops = line_ops(&a, &b);
-    // The line of `a` and of `b` that each op reaches.
     let mut at = Vec::with_capacity(ops.len());
     let (mut i, mut j) = (0, 0);
     for op in &ops {
@@ -468,33 +476,43 @@ fn unified_diff(old: &str, new: &str) -> Option<String> {
         );
         for k in start..end {
             let (i, j) = at[k];
-            match ops[k] {
-                Op::Same => {
-                    let _ = writeln!(out, " {}", a[i]);
-                }
-                Op::Del => {
-                    let _ = writeln!(out, "-{}", a[i]);
-                }
-                Op::Ins => {
-                    let _ = writeln!(out, "+{}", b[j]);
-                }
+            let (mark, line) = match ops[k] {
+                Op::Same => (' ', a[i]),
+                Op::Del => ('-', a[i]),
+                Op::Ins => ('+', b[j]),
+            };
+            out.push(mark);
+            out.push_str(line);
+            if !line.ends_with('\n') {
+                out.push_str("\n\\ No newline at end of file\n");
             }
         }
         group = last + 1;
     }
-    (!out.is_empty()).then(|| out.trim_end_matches('\n').to_owned())
+    (!out.is_empty()).then(|| out.strip_suffix('\n').unwrap_or(&out).to_owned())
 }
 
 /// The job a Forgejo Actions URL names: the run's index in the repository and
-/// the job's index in the run. The URL must be on `base`.
-fn actions_job_ref(base: &Url, url: &str) -> Option<(u64, u64)> {
+/// the job's index in the run. The URL must be on the instance `base` and
+/// name `repo`, so a mount path called `actions` or a repository owned by
+/// `actions` is not mistaken for the Actions route that follows them.
+fn actions_job_ref(base: &Url, repo: &str, url: &str) -> Option<(u64, u64)> {
     let url = base.join(url).ok()?;
     if url.origin() != base.origin() {
         return None;
     }
     let mut segments = url.path_segments()?;
-    segments.find(|segment| *segment == "actions")?;
-    if segments.next()? != "runs" {
+    for expected in base.path_segments()?.filter(|s| !s.is_empty()) {
+        if segments.next()? != expected {
+            return None;
+        }
+    }
+    for expected in repo.split('/') {
+        if !segments.next()?.eq_ignore_ascii_case(expected) {
+            return None;
+        }
+    }
+    if segments.next()? != "actions" || segments.next()? != "runs" {
         return None;
     }
     let run = segments.next()?.parse().ok()?;
@@ -504,11 +522,25 @@ fn actions_job_ref(base: &Url, url: &str) -> Option<(u64, u64)> {
     Some((run, segments.next()?.parse().ok()?))
 }
 
+fn moved(number: u64) -> String {
+    format!("the head of pull request {number} kept moving while it was read")
+}
+
 /// `url` without a trailing `/attempt/N`.
 fn without_attempt(url: &str) -> &str {
     match url.rsplit_once("/attempt/") {
         Some((head, number)) if number.bytes().all(|b| b.is_ascii_digit()) => head,
         _ => url,
+    }
+}
+
+impl PullJson {
+    /// Whether the pull request comes from `branch` of the repository itself.
+    /// `head.ref` turns into `refs/pull/N/head` once the branch is deleted, so
+    /// the label names the branch, and the repository id tells a fork's
+    /// branch of the same name apart.
+    fn is_from(&self, branch: &str) -> bool {
+        self.head.label == branch && self.head.repo_id == self.base.repo_id
     }
 }
 
@@ -544,8 +576,10 @@ impl Forgejo {
             .unwrap_or_default()
     }
 
+    /// The base URL as a directory, so a relative link keeps the mount path.
     fn base(&self) -> Result<Url, String> {
-        Url::parse(&self.base_url).map_err(|err| format!("the Forgejo URL is invalid: {err}"))
+        Url::parse(&format!("{}/", self.base_url))
+            .map_err(|err| format!("the Forgejo URL is invalid: {err}"))
     }
 
     fn error(token: Option<&str>, what: &str, status: Option<u16>, detail: &str) -> ApiError {
@@ -660,7 +694,7 @@ impl Forgejo {
             .await?;
         serde_json::from_value(value).map_err(|err| {
             Self::error(
-                None,
+                account.token.as_deref(),
                 &format!("GET {path}"),
                 None,
                 &format!("unexpected answer: {err}"),
@@ -669,7 +703,9 @@ impl Forgejo {
     }
 
     /// Every item of a listing, read page by page. Null items are skipped.
-    /// `key` names the field that holds the list when the answer is an object.
+    /// `key` names the field that holds the list when the answer is an
+    /// object. A null list is empty. Any other shape, or more pages than
+    /// `MAX_PAGES`, is an error, so a listing is never silently partial.
     async fn list<T: DeserializeOwned>(
         &self,
         account: &Account,
@@ -677,6 +713,8 @@ impl Forgejo {
         query: &[(&str, &str)],
         key: Option<&str>,
     ) -> Result<Vec<T>, ApiError> {
+        let what = format!("GET {path}");
+        let token = account.token.as_deref();
         let mut items = Vec::new();
         for page in 1..=MAX_PAGES {
             let mut full = query.to_vec();
@@ -687,25 +725,38 @@ impl Forgejo {
             let value = self
                 .json_value(account, Method::GET, path, &full, None)
                 .await?;
-            let Value::Array(page_items) = key.map_or(value.clone(), |key| value[key].clone())
-            else {
-                break;
+            let list = match key {
+                Some(key) => value.get(key),
+                None => Some(&value),
+            };
+            let page_items = match list {
+                Some(Value::Array(page_items)) => page_items.clone(),
+                Some(Value::Null) => Vec::new(),
+                _ => {
+                    let place = key.map_or(String::new(), |key| format!(" in {key:?}"));
+                    return Err(Self::error(
+                        None,
+                        &what,
+                        None,
+                        &format!("the answer holds no list{place}"),
+                    ));
+                }
             };
             if page_items.is_empty() {
-                break;
+                return Ok(items);
             }
             for item in page_items.into_iter().filter(|item| !item.is_null()) {
                 items.push(serde_json::from_value(item).map_err(|err| {
-                    Self::error(
-                        None,
-                        &format!("GET {path}"),
-                        None,
-                        &format!("unexpected answer: {err}"),
-                    )
+                    Self::error(token, &what, None, &format!("unexpected answer: {err}"))
                 })?);
             }
         }
-        Ok(items)
+        Err(Self::error(
+            None,
+            &what,
+            None,
+            &format!("the listing has more than {MAX_PAGES} pages"),
+        ))
     }
 
     /// The body of a successful GET as text, cut as the caller needs. It
@@ -782,7 +833,7 @@ impl Forgejo {
     }
 
     /// The checks of `sha`: the combined commit status, one status per
-    /// context. `warning` counts as a pass.
+    /// context. A `warning` neither fails nor passes.
     async fn ci(&self, account: &Account, repo: &str, sha: &str) -> Result<Ci, ApiError> {
         if sha.is_empty() {
             return Ok(Ci::NoChecks);
@@ -811,7 +862,7 @@ impl Forgejo {
                     });
                 }
                 "pending" => pending = true,
-                "success" | "warning" => passed = true,
+                "success" => passed = true,
                 _ => {}
             }
         }
@@ -928,9 +979,11 @@ impl Forgejo {
         ignore: &[String],
     ) -> Result<PrStatus, ApiError> {
         let mut pull = self.pull(account, repo, number).await?;
-        // The server reports mergeable false while it still works the state
-        // out, so a pull request counts as conflicting only after it keeps
-        // saying so.
+        // `mergeable` is false for a conflict, but also while the server
+        // works the state out, for a draft and after a failed calculation.
+        // Re-reading settles the first case. The others cannot be told from
+        // a conflict, so only a settled, non-draft pull request without an
+        // unresolved check counts as conflicting.
         let mut rechecks = 0;
         while pull.state == "open" && pull.mergeable == Some(false) && rechecks < CONFLICT_RECHECKS
         {
@@ -947,9 +1000,12 @@ impl Forgejo {
         };
         let ci = self.ci(account, repo, &pull.head.sha).await?;
         let comments = self.comments(account, repo, number, ignore).await?;
+        let conflicting = pull.mergeable == Some(false)
+            && !pull.draft
+            && !matches!(ci, Ci::Pending | Ci::Failed(_));
         Ok(PrStatus {
             state,
-            conflicting: pull.mergeable == Some(false),
+            conflicting,
             ci,
             comments,
             head: pull.head.sha,
@@ -980,22 +1036,33 @@ impl Forgejo {
             Err(err) => return Err(err.text),
         };
         let mut started = Vec::new();
-        for run in runs.iter().filter(|run| run.status == "failure") {
-            let jobs: Vec<JobJson> = match self
-                .get(
-                    account,
-                    &format!("{repo_path}/actions/runs/{}/jobs", run.id),
-                    &[],
-                )
-                .await
-            {
-                Ok(jobs) => jobs,
-                Err(err) if matches!(err.status, Some(404 | 405)) => {
-                    return Ok(self.no_rerun(&err));
-                }
-                Err(err) => return Err(err.text),
-            };
-            for job in jobs.iter().filter(|job| job.status == "failure") {
+        for run in &runs {
+            // A job rerun requeues the jobs that depend on it, so the jobs
+            // are read again before each rerun. A completed job can be
+            // rerun while its run is still active.
+            let mut tried: Vec<u64> = Vec::new();
+            while tried.len() < MAX_RERUNS_PER_RUN {
+                let jobs: Vec<JobJson> = match self
+                    .get(
+                        account,
+                        &format!("{repo_path}/actions/runs/{}/jobs", run.id),
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(jobs) => jobs,
+                    Err(err) if matches!(err.status, Some(404 | 405)) => {
+                        return Ok(self.no_rerun(&err));
+                    }
+                    Err(err) => return Err(err.text),
+                };
+                let Some(job) = jobs
+                    .iter()
+                    .find(|job| job.status == "failure" && !tried.contains(&job.id))
+                else {
+                    break;
+                };
+                tried.push(job.id);
                 match self
                     .call(
                         account,
@@ -1160,7 +1227,7 @@ impl Forgejo {
                 report.push_str("It is not a Forgejo Actions job, so it has no log here.\n\n");
                 continue;
             };
-            let Some((run_index, _)) = actions_job_ref(&base, url) else {
+            let Some((run_index, _)) = actions_job_ref(&base, repo, url) else {
                 let _ = writeln!(
                     report,
                     "It is not a Forgejo Actions job, so it has no log here.\nDetails: {url}\n"
@@ -1190,11 +1257,9 @@ impl Forgejo {
                     };
                     slot.insert(jobs);
                 }
-                let wanted = without_attempt(url);
+                let wanted = base.join(without_attempt(url)).ok();
                 let job = jobs_by_run[&run_index].iter().find(|job| {
-                    let candidate = without_attempt(&job.html_url);
-                    base.join(candidate)
-                        .is_ok_and(|candidate| candidate.as_str() == wanted)
+                    wanted.is_some() && base.join(without_attempt(&job.html_url)).ok() == wanted
                 });
                 let Some(job) = job else {
                     return Err(Self::error(
@@ -1376,7 +1441,7 @@ impl Forge for Forgejo {
                 .await?;
             Ok(closed
                 .iter()
-                .find(|pull| pull.merged && pull.head.name == branch)
+                .find(|pull| pull.merged && pull.is_from(branch))
                 .map(|pull| pull.number))
         })
     }
@@ -1415,7 +1480,7 @@ impl Forge for Forgejo {
                 .await?;
             let existing = open
                 .iter()
-                .find(|pull| pull.head.name == branch && pull.base.name == base)
+                .find(|pull| pull.is_from(branch) && pull.base.name == base)
                 .ok_or_else(|| format!("{branch} has a pull request that is not open"))?;
             self.call(
                 account,
@@ -1493,14 +1558,19 @@ impl Forge for Forgejo {
         number: u64,
     ) -> BoxFuture<'a, Result<PrInfo, String>> {
         Box::pin(async move {
-            let pull = self.pull(account, repo, number).await?;
-            let files = self.pull_files(account, repo, number).await?;
-            Ok(PrInfo {
-                title: pull.title,
-                body: pull.body.unwrap_or_default(),
-                head: pull.head.sha,
-                files,
-            })
+            for _ in 0..SNAPSHOT_TRIES {
+                let pull = self.pull(account, repo, number).await?;
+                let files = self.pull_files(account, repo, number).await?;
+                if self.pull(account, repo, number).await?.head.sha == pull.head.sha {
+                    return Ok(PrInfo {
+                        title: pull.title,
+                        body: pull.body.unwrap_or_default(),
+                        head: pull.head.sha,
+                        files,
+                    });
+                }
+            }
+            Err(moved(number))
         })
     }
 
@@ -1532,31 +1602,38 @@ impl Forge for Forgejo {
         number: u64,
     ) -> BoxFuture<'a, Result<PrDetails, String>> {
         Box::pin(async move {
-            let pull = self.pull(account, repo, number).await?;
-            let files = self.pull_files(account, repo, number).await?;
-            let diff = self
-                .text(
-                    account,
-                    &format!("{}/pulls/{number}.diff", repo_path(repo)?),
-                    &[],
-                    MAX_DIFF,
-                    false,
-                )
-                .await
-                .map_err(|err| {
-                    if err.text.ends_with("the answer is too large") {
-                        format!("the diff of pull request {number} is larger than {MAX_DIFF} bytes")
-                    } else {
-                        err.text
-                    }
-                })?;
-            Ok(PrDetails {
-                title: pull.title,
-                body: pull.body.unwrap_or_default(),
-                head: pull.head.sha,
-                files,
-                diff,
-            })
+            for _ in 0..SNAPSHOT_TRIES {
+                let pull = self.pull(account, repo, number).await?;
+                let files = self.pull_files(account, repo, number).await?;
+                let diff = self
+                    .text(
+                        account,
+                        &format!("{}/pulls/{number}.diff", repo_path(repo)?),
+                        &[],
+                        MAX_DIFF,
+                        false,
+                    )
+                    .await
+                    .map_err(|err| {
+                        if err.text.ends_with("the answer is too large") {
+                            format!(
+                                "the diff of pull request {number} is larger than {MAX_DIFF} bytes"
+                            )
+                        } else {
+                            err.text
+                        }
+                    })?;
+                if self.pull(account, repo, number).await?.head.sha == pull.head.sha {
+                    return Ok(PrDetails {
+                        title: pull.title,
+                        body: pull.body.unwrap_or_default(),
+                        head: pull.head.sha,
+                        files,
+                        diff,
+                    });
+                }
+            }
+            Err(moved(number))
         })
     }
 
