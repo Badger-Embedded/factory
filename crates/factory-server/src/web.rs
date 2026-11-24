@@ -22,6 +22,7 @@ use crate::copilot::validate_copilot_token;
 use crate::csrf::CsrfKey;
 use crate::device_login::DeviceLogin;
 use crate::forge_tokens::{self, SaveError};
+use crate::forgejo_instances::{ForgejoProbe, HttpForgejoProbe};
 use crate::forges::Forges;
 use crate::github::RepoReport;
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTransport};
@@ -68,6 +69,7 @@ struct AppState {
     slots: Arc<WorkerSlots>,
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
+    forgejo_probe: Arc<dyn ForgejoProbe>,
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
     onboarding: Arc<tokio::sync::Mutex<()>>,
@@ -118,6 +120,46 @@ pub fn app(
     copilot_login: Arc<DeviceLogin>,
     admins: Vec<String>,
 ) -> Router {
+    app_with_forgejo_probe(
+        store,
+        projects,
+        wake,
+        data_dir,
+        plan_usage,
+        forges,
+        slots,
+        secrets,
+        checker,
+        Arc::new(HttpForgejoProbe::new(&[])),
+        registry,
+        device_login,
+        copilot_login,
+        admins,
+    )
+}
+
+/// As [`app`], reading the version of a Forgejo server through `forgejo_probe`
+/// when an admin registers one.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dashboard wires each long-lived dependency the handlers share"
+)]
+pub fn app_with_forgejo_probe(
+    store: Arc<Store>,
+    projects: Arc<Projects>,
+    wake: Arc<Notify>,
+    data_dir: PathBuf,
+    plan_usage: Arc<PlanUsageCache>,
+    forges: Forges,
+    slots: Arc<WorkerSlots>,
+    secrets: Arc<dyn SecretStore>,
+    checker: Arc<dyn McpChecker>,
+    forgejo_probe: Arc<dyn ForgejoProbe>,
+    registry: Arc<AgentRegistry>,
+    device_login: Arc<DeviceLogin>,
+    copilot_login: Arc<DeviceLogin>,
+    admins: Vec<String>,
+) -> Router {
     let state = AppState {
         store,
         projects,
@@ -128,6 +170,7 @@ pub fn app(
         slots,
         secrets,
         checker,
+        forgejo_probe,
         registry,
         device_login,
         onboarding: Arc::new(tokio::sync::Mutex::new(())),
@@ -249,6 +292,14 @@ fn admin_routes(state: AppState) -> Router<AppState> {
         .route(
             "/settings/agents/codex/prices/delete",
             post(delete_codex_price),
+        )
+        .route(
+            "/settings/forgejo",
+            get(show_forgejo).post(add_forgejo_instance),
+        )
+        .route(
+            "/settings/forgejo/{name}/delete",
+            post(delete_forgejo_instance),
         )
         .route("/settings/mcp", get(show_mcp).post(add_mcp_server))
         .route(
@@ -2170,6 +2221,157 @@ async fn redirect_polling_post() -> Redirect {
 /// bookmark or a link made before the move still lands on the token card.
 async fn redirect_claude() -> Redirect {
     Redirect::to("/settings/agents/claude")
+}
+
+/// What the Forgejo page shows beyond the registry: the form's previous
+/// input and a problem or notice from the last submit.
+#[derive(Default)]
+struct ForgejoView<'a> {
+    name: &'a str,
+    url: &'a str,
+    problem: Option<&'a str>,
+    notice: Option<&'a str>,
+}
+
+fn forgejo_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    view: &ForgejoView<'_>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    Ok(pages::settings_forgejo(
+        &login,
+        &settings_nav(state, &login)?,
+        &state.store.forgejo_instances()?,
+        &state.csrf.issue(&login),
+        (view.name, view.url),
+        view.problem,
+        view.notice,
+    ))
+}
+
+fn forgejo_refused(
+    state: &AppState,
+    headers: &HeaderMap,
+    view: &ForgejoView<'_>,
+) -> Result<Response, AppError> {
+    Ok((StatusCode::BAD_REQUEST, forgejo_page(state, headers, view)?).into_response())
+}
+
+async fn show_forgejo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    forgejo_page(&state, &headers, &ForgejoView::default())
+}
+
+#[derive(Deserialize)]
+struct ForgejoForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    url: String,
+}
+
+/// Registers a Forgejo server after reading its version. A refused name or
+/// URL, or a server that does not answer as Forgejo, redraws the page with
+/// the reason and stores nothing.
+async fn add_forgejo_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ForgejoForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let (typed_name, typed_url) = (form.name.trim(), form.url.trim());
+    let refused = |problem: &str| {
+        forgejo_refused(
+            &state,
+            &headers,
+            &ForgejoView {
+                name: typed_name,
+                url: "",
+                problem: Some(problem),
+                notice: None,
+            },
+        )
+    };
+    let (name, url) = match state
+        .store
+        .check_new_forgejo_instance(typed_name, typed_url)
+    {
+        Ok(checked) => checked,
+        Err(StoreError::Forgejo(problem)) => return refused(&problem),
+        Err(err) => return Err(err.into()),
+    };
+    let (version, _) = match state.forgejo_probe.version(&url).await {
+        Ok(version) => version,
+        Err(err) => {
+            return refused(&format!(
+                "Nothing was added. {url} did not answer as a Forgejo server: {err}"
+            ));
+        }
+    };
+    match state.store.add_forgejo_instance(&name, &url, &version) {
+        Ok(instance) => {
+            let notice = format!("Added {} at {}.", instance.name, instance.base_url);
+            Ok(forgejo_page(
+                &state,
+                &headers,
+                &ForgejoView {
+                    notice: Some(&notice),
+                    ..ForgejoView::default()
+                },
+            )?
+            .into_response())
+        }
+        Err(StoreError::Forgejo(problem)) => refused(&problem),
+        Err(err) => Err(err.into()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CsrfOnlyForm {
+    #[serde(default)]
+    csrf: String,
+}
+
+/// Deletes an instance and its tokens. An instance a project uses stays, and
+/// the page names the projects.
+async fn delete_forgejo_instance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<CsrfOnlyForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    if state.store.forgejo_instance(&name)?.is_none() {
+        return Err(AppError::NotFound(format!("no Forgejo instance {name:?}")));
+    }
+    match state.store.delete_forgejo_instance(&name) {
+        Ok(()) => {
+            let notice = format!("Deleted {name} and the tokens stored for it.");
+            Ok(forgejo_page(
+                &state,
+                &headers,
+                &ForgejoView {
+                    notice: Some(&notice),
+                    ..ForgejoView::default()
+                },
+            )?
+            .into_response())
+        }
+        Err(StoreError::Forgejo(problem)) => forgejo_refused(
+            &state,
+            &headers,
+            &ForgejoView {
+                problem: Some(&problem),
+                ..ForgejoView::default()
+            },
+        ),
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn show_mcp(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {

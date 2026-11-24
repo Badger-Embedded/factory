@@ -110,6 +110,20 @@ pub fn client(roots: &[reqwest::Certificate]) -> Result<reqwest::Client, String>
 /// Returns a message when the server does not answer, or answers with
 /// something that is not a Forgejo version.
 pub async fn version(base_url: &str, client: &reqwest::Client) -> Result<ForgejoVersion, String> {
+    reported_version(base_url, client)
+        .await
+        .map(|(_, version)| version)
+}
+
+/// Like [`version`], and also returns the text the server reported.
+///
+/// # Errors
+///
+/// As [`version`].
+pub async fn reported_version(
+    base_url: &str,
+    client: &reqwest::Client,
+) -> Result<(String, ForgejoVersion), String> {
     #[derive(Deserialize)]
     struct Answer {
         version: String,
@@ -130,7 +144,8 @@ pub async fn version(base_url: &str, client: &reqwest::Client) -> Result<Forgejo
         .map_err(|err| format!("GET {url} failed: {err}"))?;
     let answer: Answer = serde_json::from_str(&text)
         .map_err(|_| format!("GET {url} did not answer with a version"))?;
-    ForgejoVersion::parse(&answer.version)
+    let parsed = ForgejoVersion::parse(&answer.version)?;
+    Ok((answer.version, parsed))
 }
 
 /// Talks to a Forgejo server over its HTTP API as the account each call

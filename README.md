@@ -28,6 +28,7 @@ Run the browser tests with `nix develop -c just e2e`. They start their own serve
 | `FACTORY_GH` | `gh` | The GitHub CLI |
 | `FACTORY_GLAB` | `glab` | The GitLab CLI, used for Salsa projects |
 | `FACTORY_MCP_CA_FILE` | unset | PEM file of extra root certificates that the MCP connection check and the MCP proxy trust next to the built-in roots, for a server whose certificate is not from a public CA. The factory stops at startup if the file cannot be read. |
+| `FACTORY_FORGEJO_CA_FILE` | unset | Test only. PEM file of extra root certificates that the Forgejo version check trusts next to the built-in roots. The browser tests use it for their stub server. A real Forgejo server needs a certificate from a public CA. The factory stops at startup if the file cannot be read. |
 
 The worker limit, image, memory and CPUs are settings stored in the database. The job loop reads them on every pass.
 
@@ -57,6 +58,12 @@ The access each account needs on the repository:
 | Renovate triage: rerun failed CI, approve and merge | Write |
 
 With only Read, Renovate triage still works: it skips the reruns and goes straight to the failure analysis, comments, and leaves a safe pull request as ready to merge even with auto-merge on. Granting Write takes effect on the next head commit, with no restart.
+
+## Forgejo servers
+
+A factory admin registers each Forgejo server, such as a self-hosted one or Codeberg, on Forgejo servers in the Factory group of the settings sidebar (`/settings/forgejo`). Enter a name of 1 to 32 characters of `a-z`, `0-9` and `-`, and the server's `https` URL, with its port or sub-path if it has one. The factory reads `/api/v1/version` and refuses a server that does not answer as Forgejo. A version below 17 cannot rerun failed CI, and a version below 16 cannot serve failed job logs. The page warns about each. A name and a URL cannot be edited, because stored tokens belong to the name. Delete the server and add it again to change them. Delete is refused while a project uses the server, and it removes every token stored for it.
+
+A project cannot use a registered server yet. Tokens for a server will need the scopes `read:user`, `write:repository` and `write:issue`.
 
 ## Deploy to moon
 

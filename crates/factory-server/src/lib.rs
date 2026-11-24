@@ -8,6 +8,7 @@ mod cost;
 pub mod csrf;
 mod device_login;
 pub mod forge_tokens;
+mod forgejo_instances;
 mod forges;
 mod github;
 mod gitlab;
@@ -40,6 +41,7 @@ pub use cost::{codex_cost, format_cost, merge_fraction};
 pub use device_login::{
     DeviceLogin, LoginProcess, LoginSpawner, LoginSpec, LoginView, PodmanLogin, ReadBackError,
 };
+pub use forgejo_instances::{ForgejoInstance, ForgejoProbe, HttpForgejoProbe, version_warnings};
 pub use forges::Forges;
 pub use github::{
     BranchInfo, GhRepos, GitHubRepos, Permission, Protection, RepoChecker, RepoInfo, RepoReport,
@@ -78,5 +80,7 @@ pub use store::{
 };
 pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;
-pub use web::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, USER_HEADER, app, parse_admins};
+pub use web::{
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, USER_HEADER, app, app_with_forgejo_probe, parse_admins,
+};
 pub use workers::{Slot, TaskId, WorkerSlots};
