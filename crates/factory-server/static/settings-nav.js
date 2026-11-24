@@ -1,6 +1,16 @@
 (function () {
   var nav = document.querySelector(".settings-nav");
-  var current = nav && nav.querySelector('[aria-current="page"]');
+  if (!nav) return;
+
+  // Only an overflowing sidebar moves up to the pinned position, so a sidebar
+  // that fits stays level with the page beside it.
+  function lift() {
+    nav.classList.toggle("settings-nav-full", nav.scrollHeight > nav.clientHeight);
+  }
+  lift();
+  window.addEventListener("resize", lift);
+
+  var current = nav.querySelector('[aria-current="page"]');
   if (!current || nav.scrollHeight <= nav.clientHeight) return;
   var navBox = nav.getBoundingClientRect();
   var box = current.getBoundingClientRect();

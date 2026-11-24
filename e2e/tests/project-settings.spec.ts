@@ -891,6 +891,8 @@ test("the settings sidebar keeps its content height on a large window and is a p
     await big.goto('/settings/polling');
     const fit = await navBox(big);
     expect(fit.scrollHeight).toBe(fit.clientHeight);
+    const mainTop = await big.locator('.settings-main').evaluate((m) => m.getBoundingClientRect().top);
+    expect(fit.top).toBe(mainTop);
     expect(await big.locator('nav.settings-nav').evaluate((n) => n.scrollHeight <= n.clientHeight)).toBe(true);
 
     await big.setViewportSize({ width: 700, height: 500 });
