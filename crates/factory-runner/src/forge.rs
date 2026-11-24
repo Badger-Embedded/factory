@@ -64,6 +64,14 @@ impl ForgeKind {
         }
     }
 
+    /// Whether Renovate opens its pull requests as one account for every
+    /// project. Only GitHub has one. Any other forge needs the account named
+    /// in the project's Maintenance settings.
+    #[must_use]
+    pub fn has_fixed_renovate_account(&self) -> bool {
+        matches!(self, ForgeKind::GitHub)
+    }
+
     /// The host the kind's projects live on.
     #[must_use]
     pub fn host(&self) -> String {

@@ -1150,10 +1150,11 @@ impl<E: Executor> Scheduler<E> {
                     continue;
                 }
             };
-            let author = (resolved.forge == ForgeKind::Salsa)
+            let needs_author = !resolved.forge.has_fixed_renovate_account();
+            let author = needs_author
                 .then_some(maintenance.renovate_author.as_deref())
                 .flatten();
-            if resolved.forge == ForgeKind::Salsa && author.is_none() {
+            if needs_author && author.is_none() {
                 tracing::warn!(
                     "skipping the Renovate discovery of {name}: set the Renovate account in its Maintenance settings"
                 );

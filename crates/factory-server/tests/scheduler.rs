@@ -5542,6 +5542,105 @@ async fn salsa_discovery_lists_by_the_renovate_account_and_github_by_none() {
     );
 }
 
+/// A Forgejo project `pkg` with Renovate on, the author given, and pull
+/// requests open from `renovate-bot` and `renovate[bot]`.
+fn forgejo_discovery(
+    author: Option<&str>,
+) -> (Arc<Store>, Arc<FakeExecutor>, Arc<Scheduler<FakeExecutor>>) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let executor = FakeExecutor::new(|_| questions());
+    let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    store
+        .add_forgejo_instance("mine", "https://forge.example.org", "17.0.2")
+        .unwrap();
+    let kind = store.resolve_forge("mine").unwrap().unwrap();
+    secrets
+        .put_forge_token(
+            ForgeTokenOwner::Project {
+                project: "pkg",
+                forge: &kind,
+            },
+            "project-token",
+            &ForgeAccount {
+                login: "factory-bot".into(),
+                id: 1,
+            },
+        )
+        .unwrap();
+    store
+        .save_project_maintenance(
+            "pkg",
+            &factory_server::Maintenance {
+                renovate: true,
+                renovate_author: author.map(str::to_owned),
+                packaging: None,
+            },
+        )
+        .unwrap();
+    enable_renovate(&store);
+    {
+        let mut open = executor.renovate_open.lock().unwrap();
+        open.push(("renovate-bot".into(), "main".into(), renovate_pr(7)));
+        open.push(("renovate[bot]".into(), "main".into(), renovate_pr(8)));
+        open.push(("renovate-bot".into(), "dev".into(), renovate_pr(9)));
+    }
+    let projects: Projects = [(
+        "pkg".to_owned(),
+        Project {
+            forge: ProjectForge::Known(kind),
+            repo: "team/pkg".into(),
+            base: "main".into(),
+            checks: None,
+            models: StageModels::default(),
+            auto_merge: false,
+            llm_review: false,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let forges = Forges::new(Arc::new(GitHub::default()), Arc::new(GhRepos::default()));
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        mcp_runtime(&store).0,
+        Accounts::new(Arc::clone(&store), secrets as Arc<dyn SecretStore>, forges),
+    );
+    (store, executor, scheduler)
+}
+
+#[tokio::test]
+async fn forgejo_discovery_lists_by_the_renovate_account_against_the_base() {
+    let (store, executor, scheduler) = forgejo_discovery(Some("renovate-bot"));
+
+    step(&scheduler).await;
+
+    assert_eq!(
+        *executor.renovate_authors.lock().unwrap(),
+        vec![Some("renovate-bot".to_owned())]
+    );
+    let numbers: Vec<_> = store
+        .list()
+        .unwrap()
+        .iter()
+        .map(|row| row.job.renovate_pr().unwrap().number)
+        .collect();
+    assert_eq!(numbers, vec![7]);
+}
+
+#[tokio::test]
+async fn forgejo_discovery_skips_a_project_with_renovate_on_and_no_author() {
+    let (store, executor, scheduler) = forgejo_discovery(None);
+
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    assert!(executor.renovate_listed.lock().unwrap().is_empty());
+    assert_eq!(store.list().unwrap().len(), 0);
+}
+
 #[tokio::test]
 async fn discovery_skips_a_project_with_no_project_token() {
     let (store, executor, scheduler) = setup(|_| questions());

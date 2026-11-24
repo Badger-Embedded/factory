@@ -1397,7 +1397,7 @@ impl Forge for Forgejo {
                 Ok(repository) if repository.permissions.admin => Ok(Access::Admin),
                 Ok(repository) if repository.permissions.push => Ok(Access::Write),
                 Ok(_) => Ok(Access::Read),
-                Err(err) if err.status == Some(404) => Ok(Access::NotVisible),
+                Err(err) if matches!(err.status, Some(403 | 404)) => Ok(Access::NotVisible),
                 Err(err) => Err(err.text),
             }
         })
