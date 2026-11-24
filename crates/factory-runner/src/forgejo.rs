@@ -27,8 +27,6 @@ const CONFLICT_RECHECKS: u32 = 3;
 /// How often `pr_info` and `pr_details` read a pull request again after its
 /// head moved during the read.
 const SNAPSHOT_TRIES: usize = 3;
-/// The most jobs of one run that `rerun_failed` reruns.
-const MAX_RERUNS_PER_RUN: usize = 50;
 /// The largest number of lines on each side for which `compare_patch` finds a
 /// minimal diff. Larger files are shown as replaced.
 const DIFF_CELLS: usize = 4_000_000;
@@ -980,10 +978,10 @@ impl Forgejo {
     ) -> Result<PrStatus, ApiError> {
         let mut pull = self.pull(account, repo, number).await?;
         // `mergeable` is false for a conflict, but also while the server
-        // works the state out, for a draft and after a failed calculation.
-        // Re-reading settles the first case. The others cannot be told from
-        // a conflict, so only a settled, non-draft pull request without an
-        // unresolved check counts as conflicting.
+        // works the state out, for a draft and after a failed calculation,
+        // and the API cannot tell them apart. The pull request is never
+        // reported as conflicting. While mergeability is unresolved it is
+        // reported as pending instead, so it is not taken for ready.
         let mut rechecks = 0;
         while pull.state == "open" && pull.mergeable == Some(false) && rechecks < CONFLICT_RECHECKS
         {
@@ -998,14 +996,15 @@ impl Forgejo {
         } else {
             PrState::Closed
         };
-        let ci = self.ci(account, repo, &pull.head.sha).await?;
+        let mut ci = self.ci(account, repo, &pull.head.sha).await?;
+        let unresolved = pull.state == "open" && (pull.mergeable == Some(false) || pull.draft);
+        if unresolved && matches!(ci, Ci::Passed | Ci::NoChecks) {
+            ci = Ci::Pending;
+        }
         let comments = self.comments(account, repo, number, ignore).await?;
-        let conflicting = pull.mergeable == Some(false)
-            && !pull.draft
-            && !matches!(ci, Ci::Pending | Ci::Failed(_));
         Ok(PrStatus {
             state,
-            conflicting,
+            conflicting: false,
             ci,
             comments,
             head: pull.head.sha,
@@ -1041,7 +1040,7 @@ impl Forgejo {
             // are read again before each rerun. A completed job can be
             // rerun while its run is still active.
             let mut tried: Vec<u64> = Vec::new();
-            while tried.len() < MAX_RERUNS_PER_RUN {
+            loop {
                 let jobs: Vec<JobJson> = match self
                     .get(
                         account,

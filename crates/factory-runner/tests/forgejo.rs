@@ -70,8 +70,6 @@ fn page(seen: &Seen, items: &Value) -> Rep {
     })
 }
 
-/// The answer for a listing the test does not care about: no statuses for the
-/// status path, no items for any other.
 fn quiet(seen: &Seen) -> Rep {
     if seen.path.ends_with("/status") {
         page(seen, &json!({"statuses": []}))
@@ -555,23 +553,7 @@ async fn a_pull_request_that_is_still_being_checked_is_not_conflicting() {
         .await
         .unwrap();
     assert!(!status.conflicting);
-
-    let conflicted = serve(|seen| {
-        if seen.path == "/repos/owner/name/pulls/3" {
-            let mut pull = pull("abc");
-            pull["mergeable"] = json!(false);
-            ok(&pull)
-        } else {
-            quiet(seen)
-        }
-    })
-    .await;
-    let status = conflicted
-        .forge
-        .status(&account(&conflicted.forge), REPO, 3, &[])
-        .await
-        .unwrap();
-    assert!(status.conflicting);
+    assert_eq!(status.ci, Ci::NoChecks);
 }
 
 fn comments_stub() -> impl Fn(&Seen) -> Rep + Send + Sync {
@@ -1299,7 +1281,6 @@ async fn a_head_that_moves_during_the_diff_read_is_read_again() {
         "/repos/owner/name/pulls/3" => {
             let mut count = counter.lock().unwrap();
             *count += 1;
-            // Reads 1 and 2 bracket the first snapshot, 3 and 4 the second.
             ok(&pull(if *count == 1 { "old" } else { "new" }))
         }
         "/repos/owner/name/pulls/3/files" => page(seen, &json!([{"filename": "a"}])),
@@ -1334,16 +1315,39 @@ async fn a_head_that_moves_during_the_diff_read_is_read_again() {
 }
 
 #[tokio::test]
-async fn a_draft_or_an_unresolved_check_does_not_make_a_pull_request_conflicting() {
-    for (draft, statuses) in [
-        (true, json!([])),
-        (false, json!([context("lint", "pending", "")])),
-        (false, json!([context("lint", "failure", "")])),
-    ] {
+async fn unresolved_mergeability_is_neither_a_conflict_nor_ready() {
+    let cases = [
+        (false, false, json!([]), Ci::Pending),
+        (
+            false,
+            false,
+            json!([context("a", "success", "")]),
+            Ci::Pending,
+        ),
+        (
+            true,
+            false,
+            json!([context("a", "success", "")]),
+            Ci::Pending,
+        ),
+        (
+            true,
+            true,
+            json!([context("a", "success", "")]),
+            Ci::Pending,
+        ),
+        (
+            false,
+            false,
+            json!([context("a", "pending", "")]),
+            Ci::Pending,
+        ),
+    ];
+    for (draft, mergeable, statuses, expected) in cases {
         let stub = serve(move |seen| match seen.path.as_str() {
             "/repos/owner/name/pulls/3" => {
                 let mut pull = pull("abc");
-                pull["mergeable"] = json!(false);
+                pull["mergeable"] = json!(mergeable);
                 pull["draft"] = json!(draft);
                 ok(&pull)
             }
@@ -1359,7 +1363,50 @@ async fn a_draft_or_an_unresolved_check_does_not_make_a_pull_request_conflicting
             .await
             .unwrap();
         assert!(!status.conflicting, "draft {draft}");
+        assert_eq!(status.ci, expected, "draft {draft} mergeable {mergeable}");
     }
+
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3" => ok(&pull("abc")),
+        "/repos/owner/name/commits/abc/status" => {
+            page(seen, &json!({"statuses": [context("a", "failure", "")]}))
+        }
+        _ => quiet(seen),
+    })
+    .await;
+    let status = stub
+        .forge
+        .status(&account(&stub.forge), REPO, 3, &[])
+        .await
+        .unwrap();
+    assert!(matches!(status.ci, Ci::Failed(_)));
+}
+
+#[tokio::test]
+async fn rerun_failed_reruns_every_failed_job_of_a_large_run() {
+    let stub = serve(|seen| match (seen.method.as_str(), seen.path.as_str()) {
+        ("GET", "/repos/owner/name/pulls/3") => ok(&pull("abc")),
+        ("GET", "/repos/owner/name/actions/runs") => page(
+            seen,
+            &json!({"workflow_runs": [{"id": 41, "index_in_repo": 7}]}),
+        ),
+        ("GET", "/repos/owner/name/actions/runs/41/jobs") => ok(&json!(
+            (1..=60)
+                .map(|id| json!({"id": id, "status": "failure"}))
+                .collect::<Vec<_>>()
+        )),
+        ("POST", _) => rep(204, ""),
+        _ => quiet(seen),
+    })
+    .await;
+    let rerun = stub
+        .forge
+        .rerun_failed(&account(&stub.forge), REPO, 3)
+        .await
+        .unwrap();
+    assert_eq!(rerun, Rerun::Started(vec![41]));
+    let posts = stub.seen().iter().filter(|s| s.method == "POST").count();
+    assert_eq!(posts, 60);
 }
 
 #[tokio::test]
