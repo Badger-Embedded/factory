@@ -466,7 +466,7 @@ pub trait Executor: Send + Sync + 'static {
     /// the login Renovate runs as on a forge with no fixed Renovate account.
     fn renovate_prs(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         base: &str,
@@ -483,7 +483,7 @@ pub trait Executor: Send + Sync + 'static {
     /// Posts `body` as a comment on the pull request.
     fn comment(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -494,7 +494,7 @@ pub trait Executor: Send + Sync + 'static {
     /// `head`, and only that head.
     fn merge_renovate(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -504,7 +504,7 @@ pub trait Executor: Send + Sync + 'static {
     /// Reads the head commit of the pull request and when it became the head.
     fn renovate_head(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -513,7 +513,7 @@ pub trait Executor: Send + Sync + 'static {
     /// When the pull request merged, or `None` while it is not merged.
     fn merged_at(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -524,7 +524,7 @@ pub trait Executor: Send + Sync + 'static {
     /// one read.
     fn request_rebase(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -536,7 +536,7 @@ pub trait Executor: Send + Sync + 'static {
     /// pull request changed one of them.
     fn renovate_merged(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -690,7 +690,7 @@ fn rerun_request(
 ) -> RerunRequest {
     RerunRequest {
         job_id,
-        forge: resolved.forge,
+        forge: resolved.forge.clone(),
         account: resolved.source.clone(),
         repo: project.repo.clone(),
         number,
@@ -878,7 +878,7 @@ impl<E: Executor> Scheduler<E> {
             } => {
                 let request = RenovateWatchRequest {
                     job_id: id,
-                    forge: resolved.forge,
+                    forge: resolved.forge.clone(),
                     account: resolved.source.clone(),
                     repo: project.repo.clone(),
                     number,
@@ -968,15 +968,15 @@ impl<E: Executor> Scheduler<E> {
         };
         let verdict = job.renovate_pr().and_then(|pr| pr.verdict.as_ref());
         let request = PackagingRequest {
-            forge: resolved.forge,
+            forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
             upstream: packaging.upstream_repo,
-            upstream_forge: packaging.upstream_forge,
+            upstream_forge: packaging.upstream_forge.clone(),
             upstream_account: self.accounts.upstream_source(
                 &row.project,
                 project,
-                packaging.upstream_forge,
+                &packaging.upstream_forge,
             ),
             base: project.base.clone(),
             number,
@@ -1131,7 +1131,7 @@ impl<E: Executor> Scheduler<E> {
             let listed = self
                 .executor
                 .renovate_prs(
-                    resolved.forge,
+                    &resolved.forge,
                     &resolved.source,
                     &project.repo,
                     &project.base,
@@ -1354,7 +1354,7 @@ impl<E: Executor> Scheduler<E> {
             .unwrap_or_default();
         let request = AgentRequest {
             job_id: row.id,
-            forge: resolved.forge,
+            forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
@@ -1607,7 +1607,7 @@ impl<E: Executor> Scheduler<E> {
         };
         let request = PublishRequest {
             job_id,
-            forge: resolved.forge,
+            forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
@@ -1681,7 +1681,7 @@ impl<E: Executor> Scheduler<E> {
         };
         let request = WatchRequest {
             job_id: row.id,
-            forge: resolved.forge,
+            forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
             base: project.base.clone(),
@@ -2012,7 +2012,7 @@ impl<E: Executor> Scheduler<E> {
         for number in fix.job.plan().iter().filter_map(|pr| pr.number) {
             let at = self
                 .executor
-                .merged_at(request.forge, &request.account, &request.repo, number)
+                .merged_at(&request.forge, &request.account, &request.repo, number)
                 .await?;
             merged_at = merged_at.max(at);
         }
@@ -2020,7 +2020,7 @@ impl<E: Executor> Scheduler<E> {
         let head = self
             .executor
             .renovate_head(
-                request.forge,
+                &request.forge,
                 &request.account,
                 &request.repo,
                 request.number,
@@ -2098,7 +2098,7 @@ impl<E: Executor> Scheduler<E> {
         }
         let event = match self
             .executor
-            .request_rebase(resolved.forge, &resolved.source, repo, number, head)
+            .request_rebase(&resolved.forge, &resolved.source, repo, number, head)
             .await
         {
             Ok(Rebase::Requested) => {
@@ -2143,7 +2143,7 @@ impl<E: Executor> Scheduler<E> {
     ) {
         match self
             .executor
-            .comment(resolved.forge, &resolved.source, repo, number, body)
+            .comment(&resolved.forge, &resolved.source, repo, number, body)
             .await
         {
             Ok(()) => {
@@ -2170,7 +2170,7 @@ impl<E: Executor> Scheduler<E> {
     ) {
         match self
             .executor
-            .merge_renovate(resolved.forge, &resolved.source, repo, number, head)
+            .merge_renovate(&resolved.forge, &resolved.source, repo, number, head)
             .await
         {
             Ok(()) => {
@@ -2188,7 +2188,7 @@ impl<E: Executor> Scheduler<E> {
                 match self
                     .executor
                     .renovate_merged(
-                        resolved.forge,
+                        &resolved.forge,
                         &resolved.source,
                         repo,
                         number,

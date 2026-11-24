@@ -197,12 +197,12 @@ pub async fn copy_gh_token(
     };
     let mut looked_up: Option<Result<ForgeAccount, String>> = None;
     for (name, project) in projects {
-        if project.forge.kind() != Some(ForgeKind::GitHub) {
+        if project.forge.kind() != Some(&ForgeKind::GitHub) {
             continue;
         }
         let owner = ForgeTokenOwner::Project {
             project: &name,
-            forge: ForgeKind::GitHub,
+            forge: &ForgeKind::GitHub,
         };
         match store.gh_token_copy_done(&name) {
             Ok(false) => {}

@@ -98,9 +98,9 @@ impl ProjectForge {
 
     /// The kind, or `None` for an unknown name.
     #[must_use]
-    pub fn kind(&self) -> Option<ForgeKind> {
+    pub fn kind(&self) -> Option<&ForgeKind> {
         match self {
-            ProjectForge::Known(kind) => Some(*kind),
+            ProjectForge::Known(kind) => Some(kind),
             ProjectForge::Unknown(_) => None,
         }
     }
@@ -347,7 +347,7 @@ pub fn import_tomls(store: &Store, dir: &Path) -> Result<(), ImportError> {
     for (name, (_, project)) in &found {
         store.create_project(
             name,
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             &project.repo,
             &project.base,
             project.checks.as_deref(),

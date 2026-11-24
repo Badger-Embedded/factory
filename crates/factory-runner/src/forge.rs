@@ -19,7 +19,7 @@ use crate::github::{
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The kind of forge a project lives on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ForgeKind {
     GitHub,
     Salsa,
@@ -28,7 +28,7 @@ pub enum ForgeKind {
 impl ForgeKind {
     /// The name stored for the kind.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             ForgeKind::GitHub => "github",
             ForgeKind::Salsa => "salsa",
@@ -40,7 +40,7 @@ impl ForgeKind {
 
     /// The name pages show for the kind.
     #[must_use]
-    pub fn display_name(self) -> &'static str {
+    pub fn display_name(&self) -> &str {
         match self {
             ForgeKind::GitHub => "GitHub",
             ForgeKind::Salsa => "Salsa",
@@ -49,7 +49,7 @@ impl ForgeKind {
 
     /// The host the kind's projects live on.
     #[must_use]
-    pub fn host(self) -> &'static str {
+    pub fn host(&self) -> &str {
         match self {
             ForgeKind::GitHub => "github.com",
             ForgeKind::Salsa => "salsa.debian.org",
@@ -58,13 +58,13 @@ impl ForgeKind {
 
     /// The web page of the repository `repo`.
     #[must_use]
-    pub fn web_url(self, repo: &str) -> String {
+    pub fn web_url(&self, repo: &str) -> String {
         format!("https://{}/{repo}", self.host())
     }
 
     /// The web page of pull request `number` of the repository `repo`.
     #[must_use]
-    pub fn pr_url(self, repo: &str, number: u64) -> String {
+    pub fn pr_url(&self, repo: &str, number: u64) -> String {
         match self {
             ForgeKind::GitHub => format!("{}/pull/{number}", self.web_url(repo)),
             ForgeKind::Salsa => format!("{}/-/merge_requests/{number}", self.web_url(repo)),
@@ -76,7 +76,7 @@ impl ForgeKind {
     /// Each segment is non-empty and holds only letters, digits, `-`, `_` and
     /// `.`, and is not `.` or `..`.
     #[must_use]
-    pub fn valid_repo(self, repo: &str) -> bool {
+    pub fn valid_repo(&self, repo: &str) -> bool {
         let segments: Vec<&str> = repo.split('/').collect();
         let count_ok = match self {
             ForgeKind::GitHub => segments.len() == 2,

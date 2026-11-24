@@ -907,6 +907,8 @@ pub struct SettingsNav {
     pub projects: Vec<ProjectLabel>,
     /// Registered MCP server names, in the registry's order.
     pub servers: Vec<String>,
+    /// The forges the sidebar lists, in the order the pages show them.
+    pub forges: Vec<ForgeKind>,
     /// The registered agents, in the registry's order.
     pub agents: Vec<AgentNav>,
 }
@@ -953,11 +955,11 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
             p.settings-group { "You" }
             (entry("/settings/notifications".into(), "Notifications", &SettingsPage::Notifications))
             p.settings-group { "Forges" }
-            @for kind in ForgeKind::ALL {
+            @for kind in &nav.forges {
                 (entry(
                     format!("/settings/forges/{}", kind.as_str()),
                     kind.display_name(),
-                    &SettingsPage::Forge(kind),
+                    &SettingsPage::Forge(kind.clone()),
                 ))
             }
             @if nav.admin {
@@ -1609,7 +1611,7 @@ fn codex_auth_card(stored: bool, secrets_available: bool) -> Markup {
 pub fn settings_forge(
     user: &str,
     nav: &SettingsNav,
-    kind: ForgeKind,
+    kind: &ForgeKind,
     account: Option<&ForgeAccount>,
     secrets_available: bool,
     csrf: &str,
@@ -1620,7 +1622,7 @@ pub fn settings_forge(
     settings_page(
         user,
         nav,
-        &SettingsPage::Forge(kind),
+        &SettingsPage::Forge(kind.clone()),
         name,
         notice,
         &html! {
@@ -1810,7 +1812,7 @@ fn external_link(
 /// the links to it. A project on an unknown forge has none.
 #[derive(Clone, Copy)]
 struct Links<'a> {
-    forge: ForgeKind,
+    forge: &'a ForgeKind,
     repo: &'a str,
 }
 
@@ -2079,8 +2081,8 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
                 div.field {
                     label for="upstream_forge" { "Upstream forge" }
                     select #upstream_forge name="upstream_forge" {
-                        @for kind in ForgeKind::ALL {
-                            option value=(kind.as_str()) selected[kind == packaging.upstream_forge] { (kind.display_name()) }
+                        @for (kind, _) in &project.upstream.accounts {
+                            option value=(kind.as_str()) selected[*kind == packaging.upstream_forge] { (kind.display_name()) }
                         }
                     }
                     p.hint { "Where the upstream repository lives. It defaults to the project's own forge." }
@@ -2096,7 +2098,7 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
                     }
                 }
                 @for (forge, account) in &project.upstream.accounts {
-                    (upstream_token_field(project, *forge, account.as_ref()))
+                    (upstream_token_field(project, forge, account.as_ref()))
                 }
             }
             (save_bar("Save maintenance"))
@@ -2111,7 +2113,7 @@ fn project_maintenance_card(project: &ProjectSettings) -> Markup {
 /// can hold a token before it is saved.
 fn upstream_token_field(
     project: &ProjectSettings,
-    forge: ForgeKind,
+    forge: &ForgeKind,
     account: Option<&ForgeAccount>,
 ) -> Markup {
     let base = format!(
@@ -3334,6 +3336,8 @@ fn check_outcome_line(outcome: &CheckOutcome) -> Markup {
 /// The values the onboarding form holds on a redraw, so a failed submit keeps
 /// what the operator typed.
 pub struct OnboardView<'a> {
+    /// The forges the selector lists, in the order the pages show them.
+    pub forges: Vec<ForgeKind>,
     pub forge: ForgeKind,
     /// The project name as typed. Empty means the repository name is used.
     pub name: &'a str,
@@ -3372,11 +3376,11 @@ pub fn onboard(
                 h2 { "Project" }
                 div.field {
                     label { "Forge" }
-                    @for kind in ForgeKind::ALL {
+                    @for kind in &view.forges {
                         label.check {
                             input type="radio" name="forge" value=(kind.as_str())
                                 data-placeholder=(repo_placeholder(kind))
-                                checked[kind == view.forge];
+                                checked[*kind == view.forge];
                             " " (kind.display_name())
                         }
                     }
@@ -3385,7 +3389,7 @@ pub fn onboard(
                 div.field {
                     label for="repo" { "Repository" }
                     input #repo.wide type="text" name="repo" required
-                        placeholder=(repo_placeholder(view.forge)) value=(view.repo);
+                        placeholder=(repo_placeholder(&view.forge)) value=(view.repo);
                     p.hint data-forge="github" { "On GitHub, owner/name, such as Badger-Embedded/maestro." }
                     p.hint data-forge="salsa" { "On Salsa, the full project path, such as python-team/packages/foo." }
                 }
@@ -3452,7 +3456,7 @@ pub fn onboard(
     )
 }
 
-fn repo_placeholder(forge: ForgeKind) -> &'static str {
+fn repo_placeholder(forge: &ForgeKind) -> &'static str {
     match forge {
         ForgeKind::GitHub => "owner/name",
         ForgeKind::Salsa => "group/subgroup/project",

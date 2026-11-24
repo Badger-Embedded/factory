@@ -783,7 +783,7 @@ fn deleting_a_server_or_removing_a_project_deletes_its_args() {
     store
         .create_project(
             "maestro",
-            factory_runner::ForgeKind::GitHub,
+            &factory_runner::ForgeKind::GitHub,
             "o/m",
             "main",
             None,

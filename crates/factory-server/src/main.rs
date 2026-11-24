@@ -246,7 +246,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         factory_server::forge_tokens::copy_gh_token(
             &store,
             secrets.as_ref(),
-            forges.forge(ForgeKind::GitHub).as_ref(),
+            forges.forge(&ForgeKind::GitHub).as_ref(),
             &token,
             factory_server::forge_tokens::LOOKUP_TIMEOUT,
         )

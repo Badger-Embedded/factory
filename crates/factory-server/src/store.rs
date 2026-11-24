@@ -970,7 +970,7 @@ impl Store {
     pub fn create_project(
         &self,
         name: &str,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         repo: &str,
         base: &str,
         checks: Option<&str>,
@@ -991,7 +991,7 @@ impl Store {
     pub fn create_project_as(
         &self,
         name: &str,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         repo: &str,
         base: &str,
         checks: Option<&str>,
@@ -1020,7 +1020,7 @@ impl Store {
             .optional()?
             .is_some();
         if repo_taken {
-            return Err(StoreError::DuplicateRepo(forge, repo.to_owned()));
+            return Err(StoreError::DuplicateRepo(forge.clone(), repo.to_owned()));
         }
         tx.execute(
             "INSERT INTO projects (name, forge, repo, base, checks) VALUES (?1, ?2, ?3, ?4, ?5)",

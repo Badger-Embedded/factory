@@ -208,7 +208,7 @@ fn dashboard_for(repo: &str) -> Dashboard {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             repo,
             "main",
             None,
@@ -712,7 +712,7 @@ async fn a_deleted_prerequisite_is_plain_text_on_the_board_and_a_reused_id_is_no
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -1324,7 +1324,7 @@ async fn the_job_header_wraps_created_at_in_a_time_element() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -1835,7 +1835,7 @@ fn create_project_rejects_a_duplicate_name() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/one",
             "main",
             None,
@@ -1843,7 +1843,7 @@ fn create_project_rejects_a_duplicate_name() {
         )
         .unwrap();
     assert!(matches!(
-        store.create_project("maestro", ForgeKind::GitHub, "o/two", "main", None, Some("alice")),
+        store.create_project("maestro", &ForgeKind::GitHub, "o/two", "main", None, Some("alice")),
         Err(StoreError::DuplicateName(name)) if name == "maestro"
     ));
     // The rejected call wrote nothing.
@@ -1857,7 +1857,7 @@ fn create_project_rejects_a_duplicate_repo() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/repo",
             "main",
             None,
@@ -1865,7 +1865,7 @@ fn create_project_rejects_a_duplicate_repo() {
         )
         .unwrap();
     assert!(matches!(
-        store.create_project("tool", ForgeKind::GitHub, "o/repo", "main", None, Some("alice")),
+        store.create_project("tool", &ForgeKind::GitHub, "o/repo", "main", None, Some("alice")),
         Err(StoreError::DuplicateRepo(_, repo)) if repo == "o/repo"
     ));
     assert_eq!(store.list_projects().unwrap().len(), 1);
@@ -1883,7 +1883,7 @@ async fn a_project_onboarded_at_runtime_is_visible_without_a_restart() {
     store
         .create_project(
             "widgets",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "acme/widgets",
             "main",
             None,
@@ -2236,7 +2236,7 @@ async fn storage_and_retention_stay_in_utc() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -3447,7 +3447,7 @@ fn a_repository_is_unique_by_forge_and_path() {
     let path = dir.path().join("factory.db");
     let store = Store::open(&path).unwrap();
     store
-        .create_project("one", ForgeKind::GitHub, "o/repo", "main", None, None)
+        .create_project("one", &ForgeKind::GitHub, "o/repo", "main", None, None)
         .unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute(
@@ -3474,7 +3474,7 @@ async fn a_project_on_an_unknown_forge_is_an_error_for_that_project_only() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/maestro",
             "main",
             None,
@@ -3508,7 +3508,7 @@ fn two_projects() -> Dashboard {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/maestro",
             "main",
             None,
@@ -3518,7 +3518,7 @@ fn two_projects() -> Dashboard {
     store
         .create_project(
             "tool",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/tool",
             "main",
             None,
@@ -3633,7 +3633,7 @@ async fn a_stale_or_foreign_cookie_falls_back_to_the_first_project() {
         .store
         .create_project(
             "secret",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/secret",
             "main",
             None,
@@ -3694,7 +3694,7 @@ async fn an_unusual_project_name_round_trips_through_the_cookie() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/maestro",
             "main",
             None,
@@ -3704,7 +3704,7 @@ async fn an_unusual_project_name_round_trips_through_the_cookie() {
     store
         .create_project(
             name,
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/odd",
             "main",
             None,
@@ -3834,7 +3834,7 @@ async fn the_settings_sidebar_lists_only_the_logins_own_projects() {
         .store
         .create_project(
             "stray",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/stray",
             "main",
             None,
@@ -4475,7 +4475,7 @@ fn four_projects() -> Dashboard {
         store
             .create_project(
                 name,
-                ForgeKind::GitHub,
+                &ForgeKind::GitHub,
                 &format!("o/{name}"),
                 "main",
                 None,
@@ -5659,7 +5659,7 @@ fn onboarding_copies_the_default_gates_and_later_defaults_leave_the_project_alon
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -5686,7 +5686,7 @@ fn the_gates_migration_copies_the_global_gates_into_each_project_once() {
     let store = Store::open(&path).unwrap();
     for (name, repo) in [("maestro", "o/maestro"), ("factory", "o/factory")] {
         store
-            .create_project(name, ForgeKind::GitHub, repo, "main", None, Some("alice"))
+            .create_project(name, &ForgeKind::GitHub, repo, "main", None, Some("alice"))
             .unwrap();
     }
     // A database from before per-project gates has projects but no gate rows.
@@ -5727,7 +5727,7 @@ fn onboarding_makes_the_onboarding_login_the_only_collaborator() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/maestro",
             "main",
             None,
@@ -5752,7 +5752,7 @@ fn adding_and_removing_collaborators_tracks_who_added_them() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/maestro",
             "main",
             None,
@@ -5797,7 +5797,7 @@ fn the_collaborator_migration_seeds_each_project_from_its_requesters_once() {
         store
             .create_project(
                 name,
-                ForgeKind::GitHub,
+                &ForgeKind::GitHub,
                 repo,
                 "main",
                 None,
@@ -7432,7 +7432,7 @@ async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alo
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -7442,7 +7442,7 @@ async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alo
     store
         .create_project(
             "tool",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/tool",
             "main",
             None,
@@ -7893,7 +7893,7 @@ async fn saving_the_form_persists_the_agents() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -8548,7 +8548,7 @@ async fn a_job_from_before_the_history_shows_its_steps_without_times() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -9579,10 +9579,10 @@ fn empty_dashboard(github: Arc<dyn RepoChecker>) -> (Arc<Store>, Dashboard) {
 /// Stores a GitHub token for `login`, sealed with the key the test
 /// dashboards use, so the onboarding checks have an account to run as.
 fn seed_user_token(store: &Arc<Store>, login: &str) {
-    seed_forge_user_token(store, login, ForgeKind::GitHub);
+    seed_forge_user_token(store, login, &ForgeKind::GitHub);
 }
 
-fn seed_forge_user_token(store: &Arc<Store>, login: &str, forge: ForgeKind) {
+fn seed_forge_user_token(store: &Arc<Store>, login: &str, forge: &ForgeKind) {
     let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(store));
     secrets
         .put_forge_token(
@@ -9754,7 +9754,7 @@ impl RepoChecker for FakeSalsa {
 fn salsa_dashboard(github: Arc<FakeRepos>, salsa: Arc<FakeSalsa>) -> (Arc<Store>, Dashboard) {
     let store = Arc::new(Store::open_in_memory().unwrap());
     seed_user_token(&store, USER);
-    seed_forge_user_token(&store, USER, ForgeKind::Salsa);
+    seed_forge_user_token(&store, USER, &ForgeKind::Salsa);
     let secrets = Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
     let admins = [USER, STRANGER, MAESTRO_ONLY].map(str::to_owned).to_vec();
     let dashboard = dashboard_build(
@@ -9937,7 +9937,7 @@ async fn the_onboarded_project_turns_the_switch_on_and_has_no_project_token() {
     assert!(store.use_my_account("widgets", USER).unwrap());
     let project = ForgeTokenOwner::Project {
         project: "widgets",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
     assert!(store.forge_account(project).unwrap().is_none());
     let board = dashboard.get("/?project=widgets").await;
@@ -10131,7 +10131,7 @@ async fn a_duplicate_name_is_rejected_with_no_row() {
     store
         .create_project(
             "widgets",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "acme/old",
             "main",
             None,
@@ -10153,7 +10153,7 @@ async fn a_duplicate_repo_is_rejected_with_no_row() {
     store
         .create_project(
             "other",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "acme/widgets",
             "main",
             None,
@@ -10975,7 +10975,7 @@ async fn without_a_master_key_the_page_reports_secrets_off_and_refuses_a_value()
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -11123,7 +11123,7 @@ async fn without_a_master_key_the_claude_token_field_is_disabled_with_a_message(
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -12386,7 +12386,7 @@ fn file_dashboard() -> (Dashboard, tempfile::TempDir, std::path::PathBuf) {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -12434,7 +12434,7 @@ fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
         .set_forge_account(
             ForgeTokenOwner::Project {
                 project,
-                forge: ForgeKind::GitHub,
+                forge: &ForgeKind::GitHub,
             },
             &ForgeAccount {
                 login: "bot".into(),
@@ -12693,7 +12693,7 @@ async fn concurrent_onboarding_of_one_name_cannot_delete_the_new_projects_jobs()
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "acme/old",
             "main",
             None,
@@ -12770,7 +12770,7 @@ fn admin_dashboard(admins: &[&str]) -> Dashboard {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -13247,7 +13247,7 @@ fn a_job_that_changes_between_the_two_reads_keeps_its_state_and_event_together()
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -13333,7 +13333,7 @@ fn seed_project_token(dashboard: &Dashboard, token: &str, login: &str, id: u64) 
         .put_forge_token(
             ForgeTokenOwner::Project {
                 project: "maestro",
-                forge: ForgeKind::GitHub,
+                forge: &ForgeKind::GitHub,
             },
             token,
             &ForgeAccount {
@@ -13375,7 +13375,7 @@ async fn a_project_made_before_the_table_existed_reads_off() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/maestro",
             "main",
             None,
@@ -13670,7 +13670,7 @@ async fn a_renovate_save_that_finishes_after_the_project_was_recreated_stores_no
             .store
             .create_project(
                 "maestro",
-                ForgeKind::GitHub,
+                &ForgeKind::GitHub,
                 "Badger-Embedded/maestro",
                 "main",
                 None,
@@ -14183,7 +14183,7 @@ fn forge_token_dashboard_at(secrets_available: bool, api_base: String) -> Dashbo
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -14291,7 +14291,7 @@ async fn a_non_admin_saves_and_clears_their_forge_token_and_the_page_never_shows
     forge_post(&dashboard, "carol@example.com", "token", "token=").await;
     let owner = ForgeTokenOwner::User {
         login: "carol@example.com",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
     assert!(dashboard.store.forge_account(owner).unwrap().is_some());
 
@@ -14312,7 +14312,7 @@ async fn a_forge_token_the_forge_rejects_is_not_stored_and_not_echoed() {
     assert!(!rejected.body.contains("tok-wrong-secret"));
     let owner = ForgeTokenOwner::User {
         login: USER,
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
     assert!(dashboard.store.forge_account(owner).unwrap().is_none());
     let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
@@ -14350,7 +14350,7 @@ async fn without_a_master_key_the_forge_page_disables_the_field_and_still_clears
     assert!(!empty.body.contains("Saved."));
     let owner = ForgeTokenOwner::User {
         login: "carol@example.com",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
     assert!(dashboard.store.forge_account(owner).unwrap().is_none());
 
@@ -14415,7 +14415,7 @@ async fn project_post(dashboard: &Dashboard, login: &str, action: &str, form: &s
 fn project_owner() -> ForgeTokenOwner<'static> {
     ForgeTokenOwner::Project {
         project: "maestro",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     }
 }
 
@@ -14670,7 +14670,7 @@ async fn removing_a_project_deletes_its_token_so_a_reused_name_has_none() {
         .store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -14716,7 +14716,7 @@ async fn a_save_that_finishes_after_the_project_was_removed_stores_nothing() {
             .store
             .create_project(
                 "maestro",
-                ForgeKind::GitHub,
+                &ForgeKind::GitHub,
                 "Badger-Embedded/maestro",
                 "main",
                 None,
@@ -14745,7 +14745,7 @@ async fn removing_another_project_meanwhile_does_not_stop_a_save() {
         .store
         .create_project(
             "other",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/other",
             "main",
             None,
@@ -14799,7 +14799,7 @@ async fn forge_token_requests_without_a_valid_form_token_change_nothing() {
     let dashboard = forge_token_dashboard(true);
     let owner = ForgeTokenOwner::User {
         login: "carol@example.com",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
     let secrets = LocalSecrets::new(&[7; MASTER_KEY_LEN], dashboard.store.clone());
     let other = dashboard.get_as("dave@example.com", FORGE_PAGE).await.body;
@@ -15100,7 +15100,7 @@ fn seed_non_default_settings(dashboard: &Dashboard) {
     store
         .create_project(
             "other",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/other",
             "main",
             Some("make"),
@@ -15132,7 +15132,7 @@ fn seed_non_default_settings(dashboard: &Dashboard) {
         .unwrap();
     let project_token = ForgeTokenOwner::Project {
         project: "maestro",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
     store
         .set_forge_account(
@@ -15161,7 +15161,7 @@ async fn the_checks_card_and_the_other_settings_forms_leave_each_other_alone() {
     let store = &dashboard.store;
     let project_token = ForgeTokenOwner::Project {
         project: "maestro",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
 
     let snapshot = || {
@@ -15229,7 +15229,7 @@ fn the_checks_command_round_trips_through_the_store() {
         store
             .create_project(
                 name,
-                ForgeKind::GitHub,
+                &ForgeKind::GitHub,
                 &format!("o/{name}"),
                 "main",
                 Some("make"),
@@ -15272,10 +15272,10 @@ async fn name_post(dashboard: &Dashboard, login: &str, value: &str) -> Reply {
 fn the_store_reads_and_writes_a_display_name() {
     let store = Store::open_in_memory().unwrap();
     store
-        .create_project("b", ForgeKind::GitHub, "o/b", "main", None, Some("alice"))
+        .create_project("b", &ForgeKind::GitHub, "o/b", "main", None, Some("alice"))
         .unwrap();
     store
-        .create_project("a", ForgeKind::GitHub, "o/a", "main", None, Some("alice"))
+        .create_project("a", &ForgeKind::GitHub, "o/a", "main", None, Some("alice"))
         .unwrap();
     assert_eq!(store.project_shown_name("b").unwrap(), "b");
     store.save_project_display_name("b", Some("Alpha")).unwrap();
@@ -15349,7 +15349,7 @@ async fn a_bad_display_name_is_refused_and_changes_nothing() {
         .store
         .create_project(
             "tool",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/tool",
             "main",
             None,
@@ -15424,7 +15424,7 @@ async fn onboarding_refuses_an_identifier_equal_to_a_display_name() {
     store
         .create_project(
             "widgets",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "acme/old",
             "main",
             None,
@@ -15466,7 +15466,7 @@ async fn removal_asks_for_the_shown_name_and_a_reonboarded_project_has_none() {
         .store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/new",
             "main",
             None,
@@ -15516,7 +15516,7 @@ async fn a_refused_onboarding_keeps_the_retained_jobs_of_the_name() {
         .store
         .create_project(
             "widgets",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "acme/widgets",
             "main",
             None,
@@ -15543,7 +15543,7 @@ async fn a_display_name_save_waits_for_a_running_onboarding() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "acme/maestro",
             "main",
             None,
@@ -15792,7 +15792,7 @@ async fn post_while(
 fn upstream_owner() -> ForgeTokenOwner<'static> {
     ForgeTokenOwner::Upstream {
         project: "maestro",
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     }
 }
 
@@ -15812,7 +15812,7 @@ async fn an_upstream_token_saved_after_the_project_was_recreated_stores_nothing(
                 .store
                 .create_project(
                     "maestro",
-                    ForgeKind::GitHub,
+                    &ForgeKind::GitHub,
                     "Badger-Embedded/maestro",
                     "main",
                     None,
@@ -15950,7 +15950,7 @@ async fn a_maintenance_save_ignores_an_upstream_token_stored_for_the_other_forge
         .put_forge_token(
             ForgeTokenOwner::Upstream {
                 project: "maestro",
-                forge: ForgeKind::Salsa,
+                forge: &ForgeKind::Salsa,
             },
             "tok-salsa",
             &ForgeAccount {
@@ -15995,7 +15995,7 @@ async fn an_upstream_token_button_acts_on_the_forge_it_names_and_an_unknown_forg
     let csrf = upstream_csrf(&dashboard).await;
     let salsa = ForgeTokenOwner::Upstream {
         project: "maestro",
-        forge: ForgeKind::Salsa,
+        forge: &ForgeKind::Salsa,
     };
 
     // The form still says GitHub, with packaging off, and names Salsa.

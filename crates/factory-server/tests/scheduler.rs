@@ -312,7 +312,7 @@ impl Executor for FakeExecutor {
     #[allow(clippy::unused_async_trait_impl)]
     async fn renovate_prs(
         &self,
-        _forge: ForgeKind,
+        _forge: &ForgeKind,
         _account: &AccountSource,
         repo: &str,
         base: &str,
@@ -350,7 +350,7 @@ impl Executor for FakeExecutor {
             RenovateNow::Nothing => None,
             RenovateNow::Merged => Some(
                 self.renovate_merged(
-                    request.forge,
+                    &request.forge,
                     &request.account,
                     &request.repo,
                     request.number,
@@ -385,7 +385,7 @@ impl Executor for FakeExecutor {
 
     async fn comment(
         &self,
-        _forge: ForgeKind,
+        _forge: &ForgeKind,
         _account: &AccountSource,
         _repo: &str,
         number: u64,
@@ -401,7 +401,7 @@ impl Executor for FakeExecutor {
 
     async fn renovate_merged(
         &self,
-        _forge: ForgeKind,
+        _forge: &ForgeKind,
         _account: &AccountSource,
         _repo: &str,
         _number: u64,
@@ -467,7 +467,7 @@ impl Executor for FakeExecutor {
 
     async fn merge_renovate(
         &self,
-        forge: ForgeKind,
+        forge: &ForgeKind,
         account: &AccountSource,
         repo: &str,
         number: u64,
@@ -496,7 +496,7 @@ impl Executor for FakeExecutor {
     #[allow(clippy::unused_async_trait_impl)]
     async fn merged_at(
         &self,
-        _forge: ForgeKind,
+        _forge: &ForgeKind,
         _account: &AccountSource,
         _repo: &str,
         _number: u64,
@@ -516,7 +516,7 @@ impl Executor for FakeExecutor {
     #[allow(clippy::unused_async_trait_impl)]
     async fn renovate_head(
         &self,
-        _forge: ForgeKind,
+        _forge: &ForgeKind,
         _account: &AccountSource,
         _repo: &str,
         _number: u64,
@@ -535,7 +535,7 @@ impl Executor for FakeExecutor {
 
     async fn request_rebase(
         &self,
-        _forge: ForgeKind,
+        _forge: &ForgeKind,
         _account: &AccountSource,
         _repo: &str,
         number: u64,
@@ -575,7 +575,7 @@ fn accounts(store: &Arc<Store>) -> Accounts {
     for project in ["maestro", "factory", "fine"] {
         let owner = ForgeTokenOwner::Project {
             project,
-            forge: ForgeKind::GitHub,
+            forge: &ForgeKind::GitHub,
         };
         let account = ForgeAccount {
             login: "factory-bot".into(),
@@ -1092,7 +1092,7 @@ async fn a_project_onboarded_while_running_is_picked_up() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             Some("just lint"),
@@ -2128,7 +2128,7 @@ async fn an_edited_checks_command_applies_to_a_job_created_before_the_edit() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/maestro",
             "main",
             Some("just lint"),
@@ -4989,7 +4989,7 @@ fn an_edit_of_the_prerequisites_either_lands_before_the_start_or_is_refused() {
     store
         .create_project(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -5387,7 +5387,7 @@ async fn salsa_discovery_skips_a_project_with_renovate_on_and_no_author() {
         .put_forge_token(
             ForgeTokenOwner::Project {
                 project: "pkg",
-                forge: ForgeKind::Salsa,
+                forge: &ForgeKind::Salsa,
             },
             "project-token",
             &ForgeAccount {
@@ -5452,7 +5452,7 @@ async fn salsa_discovery_lists_by_the_renovate_account_and_github_by_none() {
         .put_forge_token(
             ForgeTokenOwner::Project {
                 project: "pkg",
-                forge: ForgeKind::Salsa,
+                forge: &ForgeKind::Salsa,
             },
             "project-token",
             &ForgeAccount {
@@ -5514,7 +5514,7 @@ async fn salsa_discovery_lists_by_the_renovate_account_and_github_by_none() {
         .put_forge_token(
             ForgeTokenOwner::Project {
                 project: "maestro",
-                forge: ForgeKind::GitHub,
+                forge: &ForgeKind::GitHub,
             },
             "project-token",
             &ForgeAccount {
@@ -5554,7 +5554,7 @@ async fn discovery_skips_a_project_with_no_project_token() {
     user_secrets(&store)
         .delete_forge_token(ForgeTokenOwner::Project {
             project: "maestro",
-            forge: ForgeKind::GitHub,
+            forge: &ForgeKind::GitHub,
         })
         .unwrap();
 
@@ -6711,7 +6711,7 @@ fn user_secrets(store: &Arc<Store>) -> LocalSecrets {
 fn save_user_token(store: &Arc<Store>, login: &str, token: &str) {
     let owner = ForgeTokenOwner::User {
         login,
-        forge: ForgeKind::GitHub,
+        forge: &ForgeKind::GitHub,
     };
     let account = ForgeAccount {
         login: format!("{login}-bot"),
@@ -6727,7 +6727,7 @@ fn onboard_maestro(store: &Store, switch: bool) {
     store
         .create_project_as(
             "maestro",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "Badger-Embedded/maestro",
             "main",
             None,
@@ -6786,7 +6786,7 @@ fn the_requesters_token_runs_the_job_only_with_the_switch_on_and_a_token() {
     user_secrets(&store)
         .delete_forge_token(ForgeTokenOwner::User {
             login: "alice",
-            forge: ForgeKind::GitHub,
+            forge: &ForgeKind::GitHub,
         })
         .unwrap();
     assert_eq!(resolve("alice").account, project_account());
@@ -6872,7 +6872,7 @@ async fn a_job_with_no_project_token_fails_with_where_to_save_one_and_calls_no_f
     secrets
         .delete_forge_token(ForgeTokenOwner::Project {
             project: "maestro",
-            forge: ForgeKind::GitHub,
+            forge: &ForgeKind::GitHub,
         })
         .unwrap();
     let id = store.create("maestro", "alice", "x").unwrap();
@@ -7032,7 +7032,7 @@ async fn a_missing_project_token_on_a_factory_step_fails_the_job() {
     user_secrets(&store)
         .delete_forge_token(ForgeTokenOwner::Project {
             project: "maestro",
-            forge: ForgeKind::GitHub,
+            forge: &ForgeKind::GitHub,
         })
         .unwrap();
 
@@ -7253,7 +7253,7 @@ fn the_upstream_credential_is_the_upstream_token_then_the_project_token_then_non
         .put_forge_token(
             ForgeTokenOwner::Project {
                 project: "pkg",
-                forge: ForgeKind::Salsa,
+                forge: &ForgeKind::Salsa,
             },
             "salsa-project-token",
             &found("pkg-bot"),
@@ -7262,13 +7262,13 @@ fn the_upstream_credential_is_the_upstream_token_then_the_project_token_then_non
 
     // A GitHub upstream of a Salsa project: the project token does not work there.
     let read = accounts
-        .upstream("pkg", &salsa_project, ForgeKind::GitHub)
+        .upstream("pkg", &salsa_project, &ForgeKind::GitHub)
         .unwrap();
     assert_eq!(read.account.token, None);
     assert_eq!(read.credential, UpstreamCredential::None);
 
     let read = accounts
-        .upstream("pkg", &salsa_project, ForgeKind::Salsa)
+        .upstream("pkg", &salsa_project, &ForgeKind::Salsa)
         .unwrap();
     assert_eq!(read.account.token.as_deref(), Some("salsa-project-token"));
     assert_eq!(
@@ -7280,14 +7280,14 @@ fn the_upstream_credential_is_the_upstream_token_then_the_project_token_then_non
         .put_forge_token(
             ForgeTokenOwner::Upstream {
                 project: "pkg",
-                forge: ForgeKind::GitHub,
+                forge: &ForgeKind::GitHub,
             },
             "ghp_upstream",
             &found("reader"),
         )
         .unwrap();
     let read = accounts
-        .upstream("pkg", &salsa_project, ForgeKind::GitHub)
+        .upstream("pkg", &salsa_project, &ForgeKind::GitHub)
         .unwrap();
     assert_eq!(read.account.token.as_deref(), Some("ghp_upstream"));
     assert_eq!(read.account.login, "reader");

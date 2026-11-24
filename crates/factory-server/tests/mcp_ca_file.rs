@@ -65,7 +65,7 @@ async fn the_dashboard_check_trusts_the_ca_in_the_file() {
     store
         .create_project(
             "demo",
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             "o/demo",
             "main",
             None,

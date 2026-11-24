@@ -275,7 +275,7 @@ async fn the_real_approval_names_the_checked_head_when_the_pull_request_has_move
 
     podman
         .merge_renovate(
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             &AccountSource::fixed(test_account()),
             "o/r",
             5,
@@ -500,7 +500,7 @@ async fn a_merge_that_touches_no_manifest_never_downloads_its_diff() {
 
     let event = podman
         .renovate_merged(
-            ForgeKind::GitHub,
+            &ForgeKind::GitHub,
             &AccountSource::fixed(test_account()),
             "o/r",
             5,
@@ -707,13 +707,13 @@ async fn a_rebase_request_ticks_the_checkbox_only_while_the_head_is_the_one_that
     let account = AccountSource::fixed(account_with_token("bot", 1, "ghp_bot"));
 
     let moved = podman
-        .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h0")
+        .request_rebase(&ForgeKind::GitHub, &account, "o/r", 5, "h0")
         .await;
     assert_eq!(moved, Ok(Rebase::HeadMoved));
     assert!(!std::fs::read_to_string(&calls).unwrap().contains("PATCH"));
 
     let requested = podman
-        .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .request_rebase(&ForgeKind::GitHub, &account, "o/r", 5, "h1")
         .await;
     assert_eq!(requested, Ok(Rebase::Requested));
     assert!(std::fs::read_to_string(&calls).unwrap().contains("PATCH"));
@@ -721,7 +721,7 @@ async fn a_rebase_request_ticks_the_checkbox_only_while_the_head_is_the_one_that
     let dir = tempfile::tempdir().unwrap();
     let (podman, _) = gh_executor(dir.path(), &view("h1", "no checkbox", &[]), 0);
     let missing = podman
-        .request_rebase(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .request_rebase(&ForgeKind::GitHub, &account, "o/r", 5, "h1")
         .await;
     assert_eq!(missing, Ok(Rebase::NoCheckbox));
 }
@@ -871,7 +871,7 @@ async fn each_call_uses_the_account_of_its_own_request() {
     for token in ["ghp_first", "ghp_second"] {
         podman
             .forges
-            .forge(ForgeKind::GitHub)
+            .forge(&ForgeKind::GitHub)
             .merged_pr(&account_with_token("bot", 1, token), "o/r", "b")
             .await
             .unwrap();
@@ -1098,7 +1098,7 @@ async fn a_refused_token_names_its_owner_where_the_command_ran() {
         })
     });
     let err = podman
-        .comment(ForgeKind::GitHub, &source, "o/r", 5, "hi")
+        .comment(&ForgeKind::GitHub, &source, "o/r", 5, "hi")
         .await
         .unwrap_err();
     assert_eq!(
@@ -1248,7 +1248,7 @@ async fn a_rerun_and_a_merge_check_the_access_of_the_account_they_resolve() {
             .starts_with(factory_runner::NOT_PERMITTED)
     );
     let merge = podman
-        .merge_renovate(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .merge_renovate(&ForgeKind::GitHub, &account, "o/r", 5, "h1")
         .await;
     assert!(
         merge
@@ -1272,7 +1272,7 @@ async fn a_rerun_and_a_merge_check_the_access_of_the_account_they_resolve() {
         assert!(!err.starts_with(factory_runner::NOT_PERMITTED), "{err}");
     }
     let merge = podman
-        .merge_renovate(ForgeKind::GitHub, &account, "o/r", 5, "h1")
+        .merge_renovate(&ForgeKind::GitHub, &account, "o/r", 5, "h1")
         .await;
     if let Err(err) = merge {
         assert!(!err.starts_with(factory_runner::NOT_PERMITTED), "{err}");
