@@ -6458,6 +6458,43 @@ async fn a_cancelled_or_deleted_fix_returns_the_job_to_stopped() {
 }
 
 #[tokio::test]
+async fn a_renovate_job_with_an_unregistered_upstream_fails_and_the_pass_goes_on() {
+    let (store, _executor, scheduler, id) = renovate_setup(|_| questions());
+    let later = store.create("maestro", "alice", "x").unwrap();
+    store
+        .save_project_maintenance(
+            "maestro",
+            &factory_server::Maintenance {
+                renovate: true,
+                renovate_author: None,
+                packaging: Some(factory_server::Packaging {
+                    kind: factory_server::PackagingType::Deb,
+                    manifest_files: vec!["debian/control".into()],
+                    build_config_files: Vec::new(),
+                    upstream_repo: "o/tool".into(),
+                    upstream_forge: ForgeKind::Forgejo(factory_runner::ForgejoServer {
+                        name: "gone".into(),
+                        base_url: "https://gone.example.org".into(),
+                        registration: 1,
+                    }),
+                }),
+            },
+        )
+        .unwrap();
+
+    step(&scheduler).await;
+
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Failed { reason, .. } if reason.contains("gone")
+    ));
+    assert!(!matches!(
+        store.get(later).unwrap().job.stage(),
+        Stage::Failed { .. }
+    ));
+}
+
+#[tokio::test]
 async fn a_failed_fix_keeps_the_renovate_job_waiting() {
     let (store, _executor, scheduler, id, fix) = fix_started().await;
     store.apply(fix, Event::Start).unwrap();

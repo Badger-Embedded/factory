@@ -9,7 +9,7 @@ use factory_core::{
     FixOutcome, FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session,
     Stage, Turn, Wait,
 };
-use factory_runner::{ForgeAccount, ForgeKind, LogLine};
+use factory_runner::{ForgeAccount, ForgeKind, ForgejoServer, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::forgejo_instances::ForgejoInstance;
@@ -284,7 +284,11 @@ CREATE TABLE IF NOT EXISTS forgejo_instances (
     name TEXT PRIMARY KEY,
     base_url TEXT NOT NULL UNIQUE,
     version TEXT NOT NULL,
-    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    registration INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS forgejo_registrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT
 );
 CREATE TABLE IF NOT EXISTS gh_token_copies (
     project TEXT PRIMARY KEY
@@ -382,7 +386,9 @@ impl Maintenance {
             .valid_repo(&packaging.upstream_repo)
         {
             return Err(match packaging.upstream_forge {
-                ForgeKind::GitHub => "The upstream repository must look like owner/name.",
+                ForgeKind::GitHub | ForgeKind::Forgejo(_) => {
+                    "The upstream repository must look like owner/name."
+                }
                 ForgeKind::Salsa => {
                     "The upstream repository must be a Salsa project path such as group/name."
                 }
@@ -561,8 +567,14 @@ pub enum StoreError {
     /// another project, or cannot be waited for. The message is the same for
     /// each, so it leaks nothing about other projects.
     InvalidPrerequisite(i64),
+    /// A project's upstream forge names no fixed kind and no registered
+    /// instance. Nothing reads such an upstream, as it would be another server.
+    UnknownUpstreamForge(String),
     /// A Forgejo instance was refused. The message says why.
     Forgejo(String),
+    /// A write named a Forgejo instance that was deleted, or registered again
+    /// at another address, after the write's checks began.
+    InstanceChanged(String),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -587,6 +599,10 @@ impl fmt::Display for StoreError {
                     "project {project:?} is on a forge the factory does not support"
                 )
             }
+            StoreError::UnknownUpstreamForge(name) => write!(
+                f,
+                "the upstream forge {name:?} is neither GitHub, Salsa nor a registered Forgejo instance"
+            ),
             StoreError::InvalidEffort(effort) => {
                 write!(f, "{effort:?} is not an allowed effort level")
             }
@@ -601,6 +617,10 @@ impl fmt::Display for StoreError {
                 write!(f, "job #{id} is not a job this request can wait for")
             }
             StoreError::Forgejo(message) => f.write_str(message),
+            StoreError::InstanceChanged(name) => write!(
+                f,
+                "the Forgejo instance {name:?} was deleted or registered again while the write was checked"
+            ),
             StoreError::Db(err) => write!(f, "database: {err}"),
             StoreError::Json(err) => write!(f, "stored job does not parse: {err}"),
             StoreError::Io(err) => write!(f, "file system: {err}"),
@@ -739,8 +759,39 @@ impl Store {
         Ok(())
     }
 
+    /// `registration` joined `forgejo_instances` after it shipped. Every
+    /// instance without one gets a fresh number.
+    fn migrate_forgejo_registration(conn: &Connection) -> Result<(), StoreError> {
+        let has_column: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('forgejo_instances') WHERE name = 'registration'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_column == 0 {
+            conn.execute(
+                "ALTER TABLE forgejo_instances ADD COLUMN registration INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let unnumbered: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT name FROM forgejo_instances WHERE registration = 0")?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        for name in unnumbered {
+            conn.execute("INSERT INTO forgejo_registrations DEFAULT VALUES", [])?;
+            conn.execute(
+                "UPDATE forgejo_instances SET registration = last_insert_rowid() WHERE name = ?1",
+                [name],
+            )?;
+        }
+        Ok(())
+    }
+
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA)?;
+        Self::migrate_forgejo_registration(&conn)?;
         Self::migrate_project_forge(&conn)?;
         Self::migrate_renovate_author(&conn)?;
         Self::migrate_upstream_forge(&conn)?;
@@ -938,8 +989,12 @@ impl Store {
     /// Fails on a database error.
     pub fn list_projects(&self) -> Result<Vec<(String, Project)>, StoreError> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT name, forge, repo, base, checks FROM projects ORDER BY name")?;
+        let mut stmt = conn.prepare(
+            "SELECT name, forge, repo, base, checks,
+                    (SELECT base_url FROM forgejo_instances WHERE name = projects.forge),
+                    (SELECT registration FROM forgejo_instances WHERE name = projects.forge)
+             FROM projects ORDER BY name",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, project_row(row)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -955,7 +1010,10 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT forge, repo, base, checks FROM projects WHERE name = ?1",
+                "SELECT forge, repo, base, checks,
+                        (SELECT base_url FROM forgejo_instances WHERE name = projects.forge),
+                        (SELECT registration FROM forgejo_instances WHERE name = projects.forge)
+                 FROM projects WHERE name = ?1",
                 [name],
                 project_row_without_name,
             )
@@ -2780,7 +2838,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Fails on a database error.
+    /// Fails on a database error, and with [`StoreError::InstanceChanged`]
+    /// when the instance `owner` names is no longer the registration it holds.
     pub fn forge_token_snapshot(
         &self,
         at: SecretRef<'_>,
@@ -2788,6 +2847,7 @@ impl Store {
     ) -> Result<Option<(String, Vec<u8>, ForgeAccount)>, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        require_registered(&tx, owner.forge())?;
         let sealed = tx
             .query_row(
                 "SELECT backend, value FROM secrets
@@ -2842,6 +2902,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        require_registered(&tx, owner.forge())?;
         tx.execute(
             "INSERT INTO secrets (project, server, header, backend, value)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2867,7 +2928,10 @@ impl Store {
         let tx = conn.transaction()?;
         let project = tx
             .query_row(
-                "SELECT forge, repo, base, checks FROM projects WHERE name = ?1",
+                "SELECT forge, repo, base, checks,
+                        (SELECT base_url FROM forgejo_instances WHERE name = projects.forge),
+                        (SELECT registration FROM forgejo_instances WHERE name = projects.forge)
+                 FROM projects WHERE name = ?1",
                 [name],
                 project_row_without_name,
             )
@@ -2918,6 +2982,7 @@ impl Store {
         if !present {
             return Ok(false);
         }
+        require_registered(&tx, owner.forge())?;
         tx.execute(
             "INSERT INTO secrets (project, server, header, backend, value)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -3625,13 +3690,42 @@ impl Store {
     ///
     /// Fails on a database error or a stored list that does not parse.
     pub fn project_maintenance(&self, project: &str) -> Result<Maintenance, StoreError> {
+        match self.read_maintenance(project)? {
+            (_, Some(name)) => Err(StoreError::UnknownUpstreamForge(name)),
+            (maintenance, None) => Ok(maintenance),
+        }
+    }
+
+    /// As [`Store::project_maintenance`], for a page that must stay editable
+    /// when the stored upstream forge is unknown. The settings then read as
+    /// the GitHub upstream, and the name of the unknown forge comes back
+    /// beside them.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored list that does not parse.
+    pub fn project_maintenance_lenient(
+        &self,
+        project: &str,
+    ) -> Result<(Maintenance, Option<String>), StoreError> {
+        self.read_maintenance(project)
+    }
+
+    fn read_maintenance(&self, project: &str) -> Result<(Maintenance, Option<String>), StoreError> {
         let row = self
             .conn()
             .query_row(
                 "SELECT renovate, packaging, packaging_type, manifest_files,
                         build_config_files, upstream_repo, renovate_author,
                         COALESCE(upstream_forge,
-                                 (SELECT forge FROM projects WHERE name = ?1))
+                                 (SELECT forge FROM projects WHERE name = ?1)),
+                        (SELECT base_url FROM forgejo_instances
+                         WHERE name = COALESCE(upstream_forge,
+                                 (SELECT forge FROM projects WHERE name = ?1))),
+                        (SELECT registration FROM forgejo_instances
+                         WHERE name = COALESCE(upstream_forge,
+                                 (SELECT forge FROM projects WHERE name = ?1))),
+                        upstream_forge IS NOT NULL
                  FROM project_maintenance WHERE project = ?1",
                 [project],
                 |row| {
@@ -3644,6 +3738,8 @@ impl Store {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
+                        registered(row, 8)?,
+                        row.get::<_, bool>(10)?,
                     ))
                 },
             )
@@ -3657,10 +3753,13 @@ impl Store {
             upstream,
             renovate_author,
             upstream_forge,
+            upstream_instance,
+            upstream_chosen,
         )) = row
         else {
-            return Ok(Maintenance::default());
+            return Ok((Maintenance::default(), None));
         };
+        let mut unknown = None;
         let packaging = if packaging {
             Some(Packaging {
                 kind: kind
@@ -3670,19 +3769,34 @@ impl Store {
                 manifest_files: serde_json::from_str(&manifest)?,
                 build_config_files: serde_json::from_str(&build)?,
                 upstream_repo: upstream.unwrap_or_default(),
-                upstream_forge: upstream_forge
-                    .as_deref()
-                    .and_then(ForgeKind::parse)
-                    .unwrap_or(ForgeKind::GitHub),
+                // A project that chose no upstream forge reads as its own, and
+                // when that is unknown its jobs fail on that, so GitHub here
+                // only keeps its settings page readable.
+                upstream_forge: match upstream_forge.as_deref() {
+                    None => ForgeKind::GitHub,
+                    Some(name) => ForgeKind::resolve(
+                        name,
+                        upstream_instance
+                            .as_ref()
+                            .map(|(url, id)| (url.as_str(), *id)),
+                    )
+                    .unwrap_or_else(|| {
+                        unknown = upstream_chosen.then(|| name.to_owned());
+                        ForgeKind::GitHub
+                    }),
+                },
             })
         } else {
             None
         };
-        Ok(Maintenance {
-            renovate,
-            renovate_author,
-            packaging,
-        })
+        Ok((
+            Maintenance {
+                renovate,
+                renovate_author,
+                packaging,
+            },
+            unknown,
+        ))
     }
 
     /// Writes the whole maintenance row of `project`. It does not validate;
@@ -3727,6 +3841,18 @@ impl Store {
         )?;
         if !present {
             return Ok(MaintenanceSave::Gone);
+        }
+        let upstream = maintenance.packaging.as_ref().map(|p| &p.upstream_forge);
+        let forges = credentials
+            .iter()
+            .map(|(owner, _)| owner.forge())
+            .chain(upstream);
+        for forge in forges {
+            match require_registered(&tx, forge) {
+                Ok(()) => {}
+                Err(StoreError::InstanceChanged(_)) => return Ok(MaintenanceSave::InstanceChanged),
+                Err(err) => return Err(err),
+            }
         }
         for (owner, sealed) in credentials {
             let (project, header) = owner.row();
@@ -4165,7 +4291,7 @@ impl Store {
     pub fn forgejo_instances(&self) -> Result<Vec<ForgejoInstance>, StoreError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT name, base_url, version, added_at FROM forgejo_instances ORDER BY name",
+            "SELECT name, base_url, version, added_at, registration FROM forgejo_instances ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ForgejoInstance {
@@ -4173,9 +4299,47 @@ impl Store {
                 base_url: row.get(1)?,
                 version: row.get(2)?,
                 added_at: row.get(3)?,
+                registration: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The forge named `name`: GitHub, Salsa or a registered Forgejo
+    /// instance. `None` for any other name.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn resolve_forge(&self, name: &str) -> Result<Option<ForgeKind>, StoreError> {
+        if let Some(kind) = ForgeKind::parse(name) {
+            return Ok(Some(kind));
+        }
+        Ok(self.forgejo_instance(name)?.map(|instance| {
+            ForgeKind::Forgejo(ForgejoServer {
+                name: instance.name,
+                base_url: instance.base_url,
+                registration: instance.registration,
+            })
+        }))
+    }
+
+    /// Every forge a project can live on: GitHub, Salsa, then each
+    /// registered Forgejo instance by name.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn forge_kinds(&self) -> Result<Vec<ForgeKind>, StoreError> {
+        let mut kinds = ForgeKind::FIXED.to_vec();
+        kinds.extend(self.forgejo_instances()?.into_iter().map(|instance| {
+            ForgeKind::Forgejo(ForgejoServer {
+                name: instance.name,
+                base_url: instance.base_url,
+                registration: instance.registration,
+            })
+        }));
+        Ok(kinds)
     }
 
     /// The instance registered under `name`, or `None`.
@@ -4231,16 +4395,23 @@ impl Store {
         version: &str,
     ) -> Result<ForgejoInstance, StoreError> {
         let (name, url) = self.check_new_forgejo_instance(name, url)?;
-        let inserted = self.conn().query_row(
-            "INSERT INTO forgejo_instances (name, base_url, version)
-             VALUES (?1, ?2, ?3) RETURNING added_at",
-            params![name, url, version],
-            |row| row.get(0),
-        );
+        let inserted = {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            tx.execute("INSERT INTO forgejo_registrations DEFAULT VALUES", [])?;
+            let registration = tx.last_insert_rowid();
+            tx.query_row(
+                "INSERT INTO forgejo_instances (name, base_url, version, registration)
+                 VALUES (?1, ?2, ?3, ?4) RETURNING added_at",
+                params![name, url, version, registration],
+                |row| row.get::<_, String>(0),
+            )
+            .and_then(|added_at| tx.commit().map(|()| (added_at, registration)))
+        };
         // A concurrent add can pass the check above, so the table's unique
         // constraints decide and the check names the one that failed.
-        let added_at = match inserted {
-            Ok(added_at) => added_at,
+        let (added_at, registration) = match inserted {
+            Ok(done) => done,
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
@@ -4256,6 +4427,7 @@ impl Store {
             base_url: url,
             version: version.to_owned(),
             added_at,
+            registration,
         })
     }
 
@@ -4995,9 +5167,22 @@ fn session_key(session: Session) -> String {
     }
 }
 
+/// The base URL and registration number in columns `at` and `at + 1`, `None`
+/// for a name with no registered instance.
+fn registered(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Option<(String, i64)>> {
+    let url: Option<String> = row.get(at)?;
+    let registration: Option<i64> = row.get(at + 1)?;
+    Ok(url.zip(registration))
+}
+
 fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
-        forge: ProjectForge::from_name(&row.get::<_, String>(1)?),
+        forge: ProjectForge::resolve(
+            &row.get::<_, String>(1)?,
+            registered(row, 5)?
+                .as_ref()
+                .map(|(url, id)| (url.as_str(), *id)),
+        ),
         repo: row.get(2)?,
         base: row.get(3)?,
         checks: row.get(4)?,
@@ -5010,7 +5195,12 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 /// A `projects` row with no `name` column, as `project` selects.
 fn project_row_without_name(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
-        forge: ProjectForge::from_name(&row.get::<_, String>(0)?),
+        forge: ProjectForge::resolve(
+            &row.get::<_, String>(0)?,
+            registered(row, 4)?
+                .as_ref()
+                .map(|(url, id)| (url.as_str(), *id)),
+        ),
         repo: row.get(1)?,
         base: row.get(2)?,
         checks: row.get(3)?,
@@ -5046,6 +5236,24 @@ fn project_token_kind(owner: ForgeTokenOwner<'_>) -> &'static str {
     match owner {
         ForgeTokenOwner::Upstream { .. } => "upstream",
         _ => "project",
+    }
+}
+
+/// Fails with [`StoreError::InstanceChanged`] unless `forge` is a fixed forge
+/// or a Forgejo instance whose current registration is this one.
+fn require_registered(conn: &Connection, forge: &ForgeKind) -> Result<(), StoreError> {
+    let ForgeKind::Forgejo(server) = forge else {
+        return Ok(());
+    };
+    let registered: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM forgejo_instances WHERE name = ?1 AND registration = ?2)",
+        params![server.name, server.registration],
+        |row| row.get(0),
+    )?;
+    if registered {
+        Ok(())
+    } else {
+        Err(StoreError::InstanceChanged(server.name.clone()))
     }
 }
 
@@ -5128,6 +5336,9 @@ pub enum MaintenanceSave {
     Gone,
     /// A token that was checked is no longer the stored one.
     TokenChanged,
+    /// A Forgejo instance the save uses was deleted, or registered again at
+    /// another address, while the save was checked.
+    InstanceChanged,
 }
 
 fn write_maintenance(

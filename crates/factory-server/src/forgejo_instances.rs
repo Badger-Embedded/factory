@@ -20,6 +20,9 @@ pub struct ForgejoInstance {
     /// `17.0.2+gitea-1.22.0`.
     pub version: String,
     pub added_at: String,
+    /// Changes on every add, so an instance deleted and added again under
+    /// the same name and URL is a new registration.
+    pub registration: i64,
 }
 
 impl ForgejoInstance {

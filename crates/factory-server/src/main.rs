@@ -228,7 +228,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let salsa = GitLab {
         glab: path_var("FACTORY_GLAB", "glab"),
-        host: ForgeKind::Salsa.host().into(),
+        host: ForgeKind::Salsa.host(),
         ..GitLab::default()
     };
     let forges = Forges::new(
@@ -241,7 +241,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }),
     )
     .with_salsa(Arc::new(salsa.clone()))
-    .with_salsa_checker(Arc::new(GlabRepos { gitlab: salsa }));
+    .with_salsa_checker(Arc::new(GlabRepos { gitlab: salsa }))
+    .with_forgejo_roots(ca_roots("FACTORY_FORGEJO_CA_FILE")?)?;
 
     if let Some(token) = gh_token() {
         factory_server::forge_tokens::copy_gh_token(

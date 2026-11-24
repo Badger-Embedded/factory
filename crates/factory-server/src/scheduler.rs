@@ -876,6 +876,9 @@ impl<E: Executor> Scheduler<E> {
                 verdict_head,
                 watch_only,
             } => {
+                if !self.upstream_known(row)? {
+                    return Ok(());
+                }
                 let request = RenovateWatchRequest {
                     job_id: id,
                     forge: resolved.forge.clone(),
@@ -911,6 +914,9 @@ impl<E: Executor> Scheduler<E> {
                 });
             }
             Command::MergeRenovate { number, head } => {
+                if !self.upstream_known(row)? {
+                    return Ok(());
+                }
                 let repo = project.repo.clone();
                 let manifest_files = self.manifest_files(&row.project)?;
                 let scheduler = Arc::clone(self);
@@ -939,6 +945,9 @@ impl<E: Executor> Scheduler<E> {
                 });
             }
             Command::GatherPackaging { number } => {
+                if !self.upstream_known(row)? {
+                    return Ok(());
+                }
                 self.start_gathering(row, job, project, &resolved, settings, number)?;
             }
             _ => {}
@@ -1035,6 +1044,25 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
+    /// Whether the project's upstream forge is registered. When it is not, the
+    /// job fails with that reason and the other jobs run on, as for a project
+    /// on an unknown forge.
+    fn upstream_known(&self, row: &JobRow) -> Result<bool, StoreError> {
+        match self.store.project_maintenance(&row.project) {
+            Ok(_) => Ok(true),
+            Err(err @ StoreError::UnknownUpstreamForge(_)) => {
+                self.store.apply(
+                    row.id,
+                    Event::FactoryFailed {
+                        reason: err.to_string(),
+                    },
+                )?;
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn manifest_files(&self, project: &str) -> Result<Option<Vec<String>>, StoreError> {
         Ok(self
             .store
@@ -1087,7 +1115,14 @@ impl<E: Executor> Scheduler<E> {
     /// that fails is logged and tried again on the next pass.
     async fn discover_renovate(&self) -> Result<(), StoreError> {
         for (name, project) in self.projects.list()? {
-            let maintenance = self.store.project_maintenance(&name)?;
+            let maintenance = match self.store.project_maintenance(&name) {
+                Ok(maintenance) => maintenance,
+                Err(err @ StoreError::UnknownUpstreamForge(_)) => {
+                    tracing::warn!("skipping the Renovate discovery of {name}: {err}");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             if !maintenance.renovate {
                 continue;
             }

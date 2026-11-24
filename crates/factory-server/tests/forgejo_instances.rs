@@ -148,6 +148,7 @@ fn old_versions_warn_about_what_they_cannot_do() {
         base_url: "https://git.example.org".into(),
         version: version.into(),
         added_at: String::new(),
+        registration: 1,
     };
     assert_eq!(
         instance("17.0.0-121-39320c0+gitea-1.22.0").warnings(),
@@ -290,4 +291,286 @@ fn a_delete_removes_the_tokens_of_that_instance_and_no_others() {
         })
         .unwrap();
     assert_eq!(project_accounts, 1);
+}
+
+#[test]
+fn a_project_and_its_upstream_resolve_against_the_registry() {
+    let (dir, store) = store();
+    store
+        .add_forgejo_instance("mine", "https://git.example.org/sub", "17.0.2")
+        .unwrap();
+    let conn = raw(&dir);
+    conn.execute_batch(
+        "INSERT INTO projects (name, forge, repo, base) VALUES ('web', 'mine', 'o/web', 'main');
+         INSERT INTO projects (name, forge, repo, base) VALUES ('gone', 'old', 'o/gone', 'main');
+         INSERT INTO project_maintenance (project, renovate, packaging, manifest_files, build_config_files, upstream_repo)
+         VALUES ('web', 1, 1, '[\"a\"]', '[]', 'o/up');
+         INSERT INTO project_maintenance (project, renovate, packaging, manifest_files, build_config_files, upstream_repo)
+         VALUES ('gone', 1, 1, '[\"a\"]', '[]', 'o/up');",
+    )
+    .unwrap();
+
+    let web = store.project("web").unwrap().unwrap();
+    let kind = web.forge.kind().expect("registered");
+    assert_eq!(kind.as_str(), "mine");
+    assert_eq!(kind.web_url("o/web"), "https://git.example.org/sub/o/web");
+    assert_eq!(
+        kind.pr_url("o/web", 4),
+        "https://git.example.org/sub/o/web/pulls/4"
+    );
+    assert_eq!(kind.host(), "git.example.org");
+    assert_eq!(
+        store
+            .project_maintenance("web")
+            .unwrap()
+            .packaging
+            .unwrap()
+            .upstream_forge,
+        *kind
+    );
+    assert_eq!(store.list_projects().unwrap().len(), 2);
+    assert!(
+        store
+            .project("gone")
+            .unwrap()
+            .unwrap()
+            .forge
+            .kind()
+            .is_none()
+    );
+    assert!(
+        store
+            .project_maintenance("gone")
+            .unwrap()
+            .packaging
+            .is_some()
+    );
+
+    conn.execute(
+        "UPDATE project_maintenance SET upstream_forge = 'old' WHERE project = 'web'",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        store.project_maintenance("web"),
+        Err(StoreError::UnknownUpstreamForge(name)) if name == "old"
+    ));
+    assert_eq!(
+        store.resolve_forge("github").unwrap().unwrap().as_str(),
+        "github"
+    );
+    assert!(store.resolve_forge("old").unwrap().is_none());
+    let names: Vec<String> = store
+        .forge_kinds()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .collect();
+    assert_eq!(names, ["github", "salsa", "mine"]);
+}
+
+#[test]
+fn a_write_for_a_deleted_or_replaced_instance_stores_nothing() {
+    replaced_instance_stores_nothing("https://two.example.org");
+    replaced_instance_stores_nothing("https://one.example.org");
+}
+
+fn replaced_instance_stores_nothing(again: &str) {
+    use factory_runner::ForgeAccount;
+    use factory_server::{
+        ForgeTokenOwner, Maintenance, MaintenanceSave, Packaging, PackagingType, ProjectGuard,
+    };
+
+    let (_dir, store) = store();
+    store
+        .add_forgejo_instance("mine", "https://one.example.org", "17.0.2")
+        .unwrap();
+    let old = store.resolve_forge("mine").unwrap().unwrap();
+    store
+        .create_project(
+            "web",
+            &factory_runner::ForgeKind::GitHub,
+            "o/web",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let (_, instance) = store.project_with_instance("web").unwrap().unwrap();
+    store.delete_forgejo_instance("mine").unwrap();
+    store.add_forgejo_instance("mine", again, "17.0.2").unwrap();
+
+    let account = ForgeAccount {
+        login: "bot".to_owned(),
+        id: 5,
+    };
+    let owner = ForgeTokenOwner::User {
+        login: "dave",
+        forge: &old,
+    };
+    let (row, header) = ("", "forge-user:mine:dave");
+    let put = store.put_forge_token(secret(row, header), "local", b"sealed", owner, &account);
+    assert!(matches!(put, Err(StoreError::InstanceChanged(name)) if name == "mine"));
+    assert!(store.forge_account(owner).unwrap().is_none());
+    assert!(store.get_secret(secret(row, header)).unwrap().is_none());
+
+    let guard = ProjectGuard {
+        project: "web",
+        login: "alice",
+        instance,
+    };
+    let upstream = ForgeTokenOwner::Upstream {
+        project: "web",
+        forge: &old,
+    };
+    let put = store.put_project_forge_token(
+        secret("web", "forge-upstream"),
+        "local",
+        b"sealed",
+        upstream,
+        &account,
+        &guard,
+    );
+    assert!(matches!(put, Err(StoreError::InstanceChanged(_))));
+    assert!(store.forge_account(upstream).unwrap().is_none());
+
+    let maintenance = Maintenance {
+        renovate: false,
+        renovate_author: None,
+        packaging: Some(Packaging {
+            kind: PackagingType::Other,
+            manifest_files: vec!["a".to_owned()],
+            build_config_files: Vec::new(),
+            upstream_repo: "o/up".to_owned(),
+            upstream_forge: old,
+        }),
+    };
+    let saved = store
+        .save_project_maintenance_guarded(&guard, &maintenance, &[])
+        .unwrap();
+    assert_eq!(saved, MaintenanceSave::InstanceChanged);
+    assert!(
+        store
+            .project_maintenance("web")
+            .unwrap()
+            .packaging
+            .is_none()
+    );
+}
+
+#[test]
+fn a_stale_registration_cannot_read_the_token_of_its_replacement() {
+    use factory_runner::ForgeAccount;
+    use factory_server::ForgeTokenOwner;
+
+    let (_dir, store) = store();
+    store
+        .add_forgejo_instance("mine", "https://one.example.org", "17.0.2")
+        .unwrap();
+    let old = store.resolve_forge("mine").unwrap().unwrap();
+    store.delete_forgejo_instance("mine").unwrap();
+    store
+        .add_forgejo_instance("mine", "https://one.example.org", "17.0.2")
+        .unwrap();
+    let new = store.resolve_forge("mine").unwrap().unwrap();
+
+    let account = ForgeAccount {
+        login: "bot".to_owned(),
+        id: 5,
+    };
+    let (row, header) = ("", "forge-user:mine:dave");
+    let owner = |forge| ForgeTokenOwner::User {
+        login: "dave",
+        forge,
+    };
+    store
+        .put_forge_token(
+            secret(row, header),
+            "local",
+            b"sealed",
+            owner(&new),
+            &account,
+        )
+        .unwrap();
+
+    let stale = store.forge_token_snapshot(secret(row, header), owner(&old));
+    assert!(matches!(stale, Err(StoreError::InstanceChanged(name)) if name == "mine"));
+    let current = store
+        .forge_token_snapshot(secret(row, header), owner(&new))
+        .unwrap();
+    assert!(current.is_some());
+}
+
+#[test]
+fn registration_numbers_survive_an_upgrade_and_reopen_and_are_not_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE forgejo_instances (
+                name TEXT PRIMARY KEY,
+                base_url TEXT NOT NULL UNIQUE,
+                version TEXT NOT NULL,
+                added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO forgejo_instances (name, base_url, version)
+                VALUES ('a', 'https://a.example.org', '17.0.2'),
+                       ('b', 'https://b.example.org', '17.0.2');",
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    let numbers = |store: &Store| {
+        store
+            .forgejo_instances()
+            .unwrap()
+            .into_iter()
+            .map(|instance| (instance.name, instance.registration))
+            .collect::<Vec<_>>()
+    };
+    let upgraded = numbers(&store);
+    assert_eq!(upgraded.len(), 2);
+    assert_ne!(upgraded[0].1, upgraded[1].1);
+    assert!(upgraded.iter().all(|(_, number)| *number > 0));
+    drop(store);
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(numbers(&store), upgraded);
+
+    let highest = upgraded.iter().map(|(_, number)| *number).max().unwrap();
+    store.delete_forgejo_instance("b").unwrap();
+    let added = store
+        .add_forgejo_instance("c", "https://c.example.org", "17.0.2")
+        .unwrap();
+    assert!(added.registration > highest);
+}
+
+#[test]
+fn a_stored_upstream_that_is_no_longer_registered_reads_leniently_for_settings() {
+    let (dir, store) = store();
+    store
+        .create_project(
+            "web",
+            &factory_runner::ForgeKind::GitHub,
+            "o/web",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    raw(&dir)
+        .execute_batch(
+            "INSERT INTO project_maintenance (project, renovate, packaging, manifest_files, build_config_files, upstream_repo, upstream_forge)
+             VALUES ('web', 1, 1, '[\"a\"]', '[]', 'o/up', 'old')",
+        )
+        .unwrap();
+    assert!(matches!(
+        store.project_maintenance("web"),
+        Err(StoreError::UnknownUpstreamForge(_))
+    ));
+    let (maintenance, unknown) = store.project_maintenance_lenient("web").unwrap();
+    assert_eq!(unknown.as_deref(), Some("old"));
+    assert!(maintenance.packaging.is_some());
 }

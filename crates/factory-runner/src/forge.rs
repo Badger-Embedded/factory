@@ -18,25 +18,41 @@ use crate::github::{
 /// A boxed future, so the trait stays object safe without a macro crate.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// A registered Forgejo instance: the name projects and tokens store, and
+/// the address of its server.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForgejoServer {
+    pub name: String,
+    /// `https://host[:port][/sub-path]`, with no trailing slash.
+    pub base_url: String,
+    /// The number of the registration, which changes when the instance is
+    /// deleted and added again.
+    pub registration: i64,
+}
+
 /// The kind of forge a project lives on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ForgeKind {
     GitHub,
     Salsa,
+    Forgejo(ForgejoServer),
 }
 
 impl ForgeKind {
-    /// The name stored for the kind.
+    /// The name stored for the kind. A Forgejo instance is stored under its
+    /// registered name.
     #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
             ForgeKind::GitHub => "github",
             ForgeKind::Salsa => "salsa",
+            ForgeKind::Forgejo(server) => &server.name,
         }
     }
 
-    /// Every kind, in the order the pages list them.
-    pub const ALL: [ForgeKind; 2] = [ForgeKind::GitHub, ForgeKind::Salsa];
+    /// The kinds whose address is fixed in code, in the order the pages list
+    /// them. The Forgejo instances follow, from the registry.
+    pub const FIXED: [ForgeKind; 2] = [ForgeKind::GitHub, ForgeKind::Salsa];
 
     /// The name pages show for the kind.
     #[must_use]
@@ -44,22 +60,30 @@ impl ForgeKind {
         match self {
             ForgeKind::GitHub => "GitHub",
             ForgeKind::Salsa => "Salsa",
+            ForgeKind::Forgejo(server) => &server.name,
         }
     }
 
     /// The host the kind's projects live on.
     #[must_use]
-    pub fn host(&self) -> &str {
+    pub fn host(&self) -> String {
         match self {
-            ForgeKind::GitHub => "github.com",
-            ForgeKind::Salsa => "salsa.debian.org",
+            ForgeKind::GitHub => "github.com".to_owned(),
+            ForgeKind::Salsa => "salsa.debian.org".to_owned(),
+            ForgeKind::Forgejo(server) => reqwest::Url::parse(&server.base_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default(),
         }
     }
 
     /// The web page of the repository `repo`.
     #[must_use]
     pub fn web_url(&self, repo: &str) -> String {
-        format!("https://{}/{repo}", self.host())
+        match self {
+            ForgeKind::Forgejo(server) => format!("{}/{repo}", server.base_url),
+            _ => format!("https://{}/{repo}", self.host()),
+        }
     }
 
     /// The web page of pull request `number` of the repository `repo`.
@@ -68,18 +92,19 @@ impl ForgeKind {
         match self {
             ForgeKind::GitHub => format!("{}/pull/{number}", self.web_url(repo)),
             ForgeKind::Salsa => format!("{}/-/merge_requests/{number}", self.web_url(repo)),
+            ForgeKind::Forgejo(_) => format!("{}/pulls/{number}", self.web_url(repo)),
         }
     }
 
     /// Whether `repo` has the form the kind's repositories have: `owner/name`
-    /// on GitHub, and the full project path of two or more segments on Salsa.
-    /// Each segment is non-empty and holds only letters, digits, `-`, `_` and
-    /// `.`, and is not `.` or `..`.
+    /// on GitHub and Forgejo, and the full project path of two or more
+    /// segments on Salsa. Each segment is non-empty and holds only letters,
+    /// digits, `-`, `_` and `.`, and is not `.` or `..`.
     #[must_use]
     pub fn valid_repo(&self, repo: &str) -> bool {
         let segments: Vec<&str> = repo.split('/').collect();
         let count_ok = match self {
-            ForgeKind::GitHub => segments.len() == 2,
+            ForgeKind::GitHub | ForgeKind::Forgejo(_) => segments.len() == 2,
             ForgeKind::Salsa => segments.len() >= 2,
         };
         count_ok
@@ -93,7 +118,8 @@ impl ForgeKind {
             })
     }
 
-    /// The kind named `name`, or `None` for an unknown name.
+    /// The kind with a fixed address named `name`, or `None` for any other
+    /// name, including a Forgejo instance, which only the registry resolves.
     #[must_use]
     pub fn parse(name: &str) -> Option<ForgeKind> {
         match name {
@@ -101,6 +127,21 @@ impl ForgeKind {
             "salsa" => Some(ForgeKind::Salsa),
             _ => None,
         }
+    }
+
+    /// The kind named `name`, where `instance` is the base URL of the
+    /// registered Forgejo instance of that name, if there is one, and its registration number.
+    #[must_use]
+    pub fn resolve(name: &str, instance: Option<(&str, i64)>) -> Option<ForgeKind> {
+        ForgeKind::parse(name).or_else(|| {
+            instance.map(|(base_url, registration)| {
+                ForgeKind::Forgejo(ForgejoServer {
+                    name: name.to_owned(),
+                    base_url: base_url.to_owned(),
+                    registration,
+                })
+            })
+        })
     }
 }
 
