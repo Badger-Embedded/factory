@@ -190,7 +190,7 @@ impl AgentBackend for ClaudeAgent {
         let mut items = self.parse(expect, line);
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim())
             && value.get("type").and_then(serde_json::Value::as_str) == Some("result")
-            && let Some(usage) = value.get("usage")
+            && let Some(usage) = value.get("usage").filter(|usage| usage.is_object())
         {
             let count = |key: &str| {
                 usage
@@ -198,6 +198,12 @@ impl AgentBackend for ClaudeAgent {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0)
             };
+            let counted = ["input_tokens", "cache_read_input_tokens", "output_tokens"]
+                .iter()
+                .any(|key| usage.get(*key).is_some_and(serde_json::Value::is_u64));
+            if !counted {
+                return items;
+            }
             items.push(AgentItem::UsageTotal(TokenUsage {
                 input_tokens: count("input_tokens"),
                 cached_input_tokens: count("cache_read_input_tokens"),

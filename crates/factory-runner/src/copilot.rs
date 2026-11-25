@@ -427,17 +427,20 @@ fn parse_result(expect: Expect, value: &Value) -> Vec<AgentItem> {
 /// The token counts of a checkpoint, which are running totals for the session.
 fn checkpoint_usage(data: Option<&Value>) -> Option<TokenUsage> {
     let data = data?;
-    let tokens = |key: &str| {
+    let count = |key: &str| {
         data.pointer(&format!(
             "/accountingSnapshot/tokenDetails/{key}/tokenCount"
         ))
         .and_then(Value::as_u64)
-        .unwrap_or(0)
     };
+    let (input, cached, output) = (count("input"), count("cache_read"), count("output"));
+    if input.is_none() && cached.is_none() && output.is_none() {
+        return None;
+    }
     Some(TokenUsage {
-        input_tokens: tokens("input"),
-        cached_input_tokens: tokens("cache_read"),
-        output_tokens: tokens("output"),
+        input_tokens: input.unwrap_or(0),
+        cached_input_tokens: cached.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
         reasoning_output_tokens: 0,
     })
 }

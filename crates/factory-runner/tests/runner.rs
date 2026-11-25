@@ -339,6 +339,39 @@ fn a_local_claude_result_reports_its_token_counts() {
         Some((120, 45))
     );
     assert_eq!(total(claude.parse(Expect::Spec, line)), None);
+
+    let null =
+        r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","usage":null}"#;
+    assert_eq!(total(claude.parse_local(Expect::Spec, null)), None);
+}
+
+#[tokio::test]
+async fn a_local_key_that_matches_a_protocol_marker_or_holds_a_quote_still_parses() {
+    const RESULT_LINE: &str = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s","errors":["stopped"],"usage":{"input_tokens":7,"output_tokens":3}}"#;
+    for key in ["result", "a\"b"] {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("stdout");
+        let escaped = key.replace('"', "\\\"");
+        fs::write(
+            &stdout,
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"saw {escaped}\"}}]}}}}\n{RESULT_LINE}\n"
+            ),
+        )
+        .unwrap();
+        let config = WorkerConfig {
+            podman: fake_podman(dir.path(), &stdout, "", 0),
+            ..WorkerConfig::default()
+        };
+        let worker = local_claude_run(dir.path(), Some(key));
+
+        let mut log = Vec::new();
+        let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+
+        let shown = format!("{log:?}");
+        assert!(shown.contains("saw [redacted]"), "{key}: {shown}");
+        assert_eq!(report.token_usage.unwrap().input_tokens, 7, "{key}");
+    }
 }
 
 #[test]

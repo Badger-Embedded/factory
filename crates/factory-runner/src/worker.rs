@@ -447,13 +447,13 @@ pub async fn run(
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let line = redactor.apply(&line);
             let items = if run.local.is_some() {
                 backend.parse_local(run.expect, &line)
             } else {
                 backend.parse(run.expect, &line)
             };
             for item in items {
+                let item = redactor.item(item);
                 // A Local run says nothing about the subscription's plan usage,
                 // whatever the CLI reports.
                 if run.local.is_some() && matches!(item, AgentItem::PlanUsage(_)) {
@@ -486,31 +486,71 @@ pub async fn run(
     collected.into_report(run.expect, credential, status, &stderr)
 }
 
-/// Replaces a Local run's key in worker output, so a tool or a provider error
-/// that echoes it never reaches the job log or a failure reason.
+/// Replaces a Local run's key in the text the run publishes, so a tool or a
+/// provider error that echoes it never reaches the job log or a failure reason.
+/// Stdout is parsed as the CLI wrote it and redacted after decoding, so a key
+/// that equals a protocol marker cannot break the parse.
 struct Redactor {
-    secrets: Vec<String>,
+    key: Option<String>,
 }
 
 impl Redactor {
     fn new(key: Option<&str>) -> Self {
-        let mut secrets = Vec::new();
-        if let Some(key) = key.filter(|key| !key.is_empty()) {
-            secrets.push(key.to_owned());
-            // The key as it reads inside a JSON string.
-            let escaped = serde_json::to_string(key).unwrap_or_default();
-            let escaped = escaped.trim_matches('"');
-            if escaped != key {
-                secrets.push(escaped.to_owned());
-            }
+        Redactor {
+            key: key.filter(|key| !key.is_empty()).map(str::to_owned),
         }
-        Redactor { secrets }
     }
 
     fn apply(&self, text: &str) -> String {
-        self.secrets.iter().fold(text.to_owned(), |text, secret| {
-            text.replace(secret, "[redacted]")
-        })
+        match &self.key {
+            Some(key) => text.replace(key.as_str(), "[redacted]"),
+            None => text.to_owned(),
+        }
+    }
+
+    fn item(&self, item: AgentItem) -> AgentItem {
+        if self.key.is_none() {
+            return item;
+        }
+        match item {
+            AgentItem::Log(line) => AgentItem::Log(match line {
+                LogLine::Text(text) => LogLine::Text(self.apply(&text)),
+                LogLine::Tool { name, summary } => LogLine::Tool {
+                    name: self.apply(&name),
+                    summary: self.apply(&summary),
+                },
+                LogLine::Other(text) => LogLine::Other(self.apply(&text)),
+            }),
+            AgentItem::Unavailable(McpUnavailable { server, reason }) => {
+                AgentItem::Unavailable(McpUnavailable {
+                    server: self.apply(&server),
+                    reason: self.apply(&reason),
+                })
+            }
+            AgentItem::Result(mut result) => {
+                result.event = self.event(result.event);
+                AgentItem::Result(result)
+            }
+            AgentItem::Failure(event) => AgentItem::Failure(self.event(event)),
+            other => other,
+        }
+    }
+
+    fn event(&self, event: Event) -> Event {
+        let Ok(mut value) = serde_json::to_value(&event) else {
+            return event;
+        };
+        self.value(&mut value);
+        serde_json::from_value(value).unwrap_or(event)
+    }
+
+    fn value(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => *text = self.apply(text),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| self.value(v)),
+            serde_json::Value::Object(map) => map.values_mut().for_each(|v| self.value(v)),
+            _ => {}
+        }
     }
 }
 

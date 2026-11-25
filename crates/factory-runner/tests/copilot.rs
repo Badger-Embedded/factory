@@ -1003,7 +1003,12 @@ async fn a_local_copilot_run_reports_the_last_checkpoint_not_their_sum() {
     let stdout = dir.path().join("stdout");
     fs::write(
         &stdout,
-        format!("{}\n{}\n", checkpoint(100, 10), checkpoint(250, 30)),
+        format!(
+            "{}\n{}\n{}\n",
+            checkpoint(100, 10),
+            checkpoint(250, 30),
+            r#"{"type":"session.usage_checkpoint","data":{"totalPremiumRequests":0}}"#
+        ),
     )
     .unwrap();
     let podman = support::executable(

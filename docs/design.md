@@ -313,8 +313,8 @@ A Local run uses the backend of the CLI the factory is set to. `WorkerRun.local`
 - passes no `CLAUDE_CODE_OAUTH_TOKEN`, no `COPILOT_GITHUB_TOKEN` and writes or reads no `auth.json`, and does not report plan usage, whatever the CLI emits;
 - uses `Agent::Local`'s effort levels (`low` to `xhigh`, default `medium`) where its CLI's own agent would use its levels;
 - writes Copilot's "not counted in the job cost" note nowhere, because the server writes the Local cost line;
-- replaces the key with `[redacted]` in the worker's stdout and stderr before any log line or failure reason is built;
-- returns its token counts as a cumulative total (`AgentItem::UsageTotal`), from Claude's result line or Copilot's last usage checkpoint, which are running totals and are not summed;
+- replaces the key with `[redacted]` in the stderr and in the decoded text of each parsed stdout item, after the stream is parsed, so a key equal to a protocol marker or holding a quote cannot break the parse and no session id is rewritten;
+- returns its token counts as a cumulative total (`AgentItem::UsageTotal`), from Claude's result line or Copilot's last usage checkpoint, which are running totals and are not summed. A line with no token counts, such as a `null` usage, reports no total and leaves an earlier one;
 - takes its config directory from `local_host_config_dir` (`local-claude`, `local-codex`, `local-copilot`), so it shares no session file or written config with a subscription run of the same CLI in the same job.
 
 ### Verified against the server
