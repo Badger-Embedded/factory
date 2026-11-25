@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_usd REAL,
     model TEXT,
     effort TEXT,
+    local_cli TEXT,
     PRIMARY KEY (job_id, session)
 );
 CREATE TABLE IF NOT EXISTS logs (
@@ -597,6 +598,9 @@ pub enum StoreError {
     /// An agent id that no available agent carries was submitted for a stage.
     /// It is not stored.
     InvalidAgent(String),
+    /// A stage was submitted on the Local agent with no model. The value is the
+    /// stage's name. It is not stored.
+    MissingLocalModel(&'static str),
     /// A request tried to remove the sole remaining collaborator of a project.
     /// The project would then be visible to nobody, so removal is refused.
     LastCollaborator,
@@ -648,6 +652,11 @@ impl fmt::Display for StoreError {
             StoreError::InvalidAgent(agent) => {
                 write!(f, "{agent:?} is not an available agent")
             }
+            StoreError::MissingLocalModel(stage) => write!(
+                f,
+                "The {stage} stage runs on Local, which needs a model. \
+                 The local server picks the model from its id."
+            ),
             StoreError::LastCollaborator => write!(
                 f,
                 "A project needs at least one collaborator. Remove the project instead."
@@ -910,7 +919,10 @@ impl Store {
         if has_session_cost == 0 {
             conn.execute("ALTER TABLE sessions ADD COLUMN cost_usd REAL", [])?;
         }
-        for column in ["model", "effort"] {
+        // `local_cli` records the CLI a Local session started on, so a run that
+        // resumes it keeps that CLI after the setting changes. It stays NULL for
+        // every session that is not Local.
+        for column in ["model", "effort", "local_cli"] {
             let has: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
                 [column],
@@ -2536,13 +2548,23 @@ impl Store {
     ///
     /// Fails on a database error.
     pub fn cost_usd(&self, id: i64) -> Result<f64, StoreError> {
-        let usd = self
+        Ok(self.recorded_cost(id)?.unwrap_or(0.0))
+    }
+
+    /// The API cost of job `id` in USD, or `None` when the job has no cost row.
+    /// A Local run writes a row of $0, so `Some(0.0)` tells a job that ran on
+    /// Local apart from one that has no cost at all.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn recorded_cost(&self, id: i64) -> Result<Option<f64>, StoreError> {
+        Ok(self
             .conn()
             .query_row("SELECT usd FROM job_costs WHERE job_id = ?1", [id], |row| {
                 row.get(0)
             })
-            .optional()?;
-        Ok(usd.unwrap_or(0.0))
+            .optional()?)
     }
 
     /// The API cost in USD of every job that has a `job_costs` row, by job id.
@@ -3649,6 +3671,34 @@ impl Store {
         Ok(())
     }
 
+    /// Checks that every stage on the Local agent has a model, without writing,
+    /// because the local server picks the model from the id in the request. The
+    /// save handler calls this before any write, like [`Store::check_efforts`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::MissingLocalModel`] for the first stage on Local
+    /// whose model is empty.
+    pub fn check_local_models(
+        models: &StageModels,
+        agents: &StageAgents,
+    ) -> Result<(), StoreError> {
+        for (stage, model, agent) in [
+            ("clarify", &models.clarify, &agents.clarify),
+            ("spec", &models.spec, &agents.spec),
+            ("plan", &models.plan, &agents.plan),
+            ("implement", &models.implement, &agents.implement),
+            ("review", &models.review, &agents.review),
+        ] {
+            if agent == Agent::Local.id()
+                && model.as_deref().is_none_or(|model| model.trim().is_empty())
+            {
+                return Err(StoreError::MissingLocalModel(stage));
+            }
+        }
+        Ok(())
+    }
+
     /// Saves `project`'s effort for all five stages, writing only this
     /// project's row. Each level must be one its stage's agent accepts, see
     /// [`Store::check_efforts`]; a value outside the agent's set is rejected and
@@ -4229,6 +4279,50 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    /// The CLI `session` of job `job_id` started on when it runs on the Local
+    /// agent, or `None` for a session that has not recorded one.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn session_local_cli(
+        &self,
+        job_id: i64,
+        session: Session,
+    ) -> Result<Option<Cli>, StoreError> {
+        let id: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT local_cli FROM sessions WHERE job_id = ?1 AND session = ?2",
+                params![job_id, session_key(session)],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(id.and_then(|id| Cli::from_id(&id)))
+    }
+
+    /// Records `cli` as the CLI `session` of job `job_id` started on. A session
+    /// that already recorded one keeps it, so only the first Local run of a
+    /// session decides.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn record_session_local_cli(
+        &self,
+        job_id: i64,
+        session: Session,
+        cli: Cli,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE sessions SET local_cli = ?3
+             WHERE job_id = ?1 AND session = ?2 AND local_cli IS NULL",
+            params![job_id, session_key(session), cli.id()],
+        )?;
+        Ok(())
     }
 
     /// Records the model and effort a run of `session` of job `job_id` starts

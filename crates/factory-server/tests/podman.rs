@@ -10,13 +10,16 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use factory_core::Event;
-use factory_runner::{Account, Expect, Forge, ForgeKind, Git, GitHub, GitLab, WorkerConfig};
+use factory_core::{Agent, Cli, Event};
+use factory_runner::{
+    Account, Expect, Forge, ForgeKind, Git, GitHub, GitLab, LocalTarget, WorkerConfig,
+};
 use factory_server::{
     AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
-    LocalSecrets, MASTER_KEY_LEN, Operation, Owner, PlanUsageCache, PodmanExecutor, Rebase,
-    SecretStore, Settings, Store,
+    LocalKeyOwner, LocalRequest, LocalSecrets, MASTER_KEY_LEN, Operation, Owner, PlanUsageCache,
+    PodmanExecutor, Rebase, SecretStore, Settings, Store,
 };
 
 mod support;
@@ -83,6 +86,25 @@ fn request() -> AgentRequest {
         effort: None,
         mcp: None,
         packages: Vec::new(),
+        local: None,
+    }
+}
+
+fn local_request(cli: Cli) -> AgentRequest {
+    AgentRequest {
+        agent: Agent::Local,
+        model: Some("gemma".into()),
+        local: Some(LocalRequest {
+            target: LocalTarget {
+                cli,
+                base_url: "http://gfx1201:9931".into(),
+                key: None,
+                load_timeout: Duration::from_secs(600),
+            },
+            key_from: LocalKeyOwner::None,
+            setting_cli: cli,
+        }),
+        ..request()
     }
 }
 
@@ -1586,4 +1608,43 @@ async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account
             .any(|call| call == "POST /api/v1/repos/team/forged/pulls | token fj-token"),
         "{seen:?}"
     );
+}
+
+#[tokio::test]
+async fn a_local_run_needs_no_subscription_login_and_keeps_its_own_config_directory() {
+    for (cli, local_dir, own_dir) in [
+        (Cli::ClaudeCode, "local-claude", "claude"),
+        (Cli::Codex, "local-codex", "codex"),
+        (Cli::Copilot, "local-copilot", "copilot"),
+    ] {
+        let store = Arc::new(Store::open_in_memory().expect("open store"));
+        let secrets: Arc<dyn SecretStore> =
+            Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = executor(
+            registry(&secrets),
+            data_dir.path().to_path_buf(),
+            Arc::clone(&store),
+        );
+
+        // No Claude token, Codex login or Copilot token is stored. The run still
+        // gets past the credential gate and fails at the checkout, since git is
+        // a missing binary here, before any container starts.
+        let report = executor
+            .run_agent(
+                &Settings::default(),
+                local_request(cli),
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            )
+            .await;
+
+        assert!(
+            reason(report).starts_with("could not prepare the checkout"),
+            "{cli:?}"
+        );
+        let job_dir = data_dir.path().join("jobs").join("7");
+        assert!(job_dir.join(local_dir).is_dir(), "{cli:?}");
+        assert!(!job_dir.join(own_dir).exists(), "{cli:?}");
+    }
 }

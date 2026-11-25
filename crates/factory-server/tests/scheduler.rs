@@ -7498,6 +7498,501 @@ async fn worker_packages_reach_only_their_projects_agent_and_checks_runs() {
     );
 }
 
+const LOCAL_URL: &str = "http://gfx1201:9931";
+
+/// Like [`setup`], with a working secret store, so the scheduler can read the
+/// Local API keys a test stores. The Local settings point at [`LOCAL_URL`] on
+/// Codex, and the clarify stage runs on Local with a model.
+fn setup_local(
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    Arc<LocalSecrets>,
+) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
+    let executor = FakeExecutor::new(respond);
+    let projects: Projects = [(
+        "maestro".to_owned(),
+        Project {
+            forge: ProjectForge::Known(ForgeKind::GitHub),
+            repo: "Badger-Embedded/maestro".into(),
+            base: "main".into(),
+            checks: Some("just lint".into()),
+            models: factory_server::StageModels::default(),
+            auto_merge: false,
+            llm_review: false,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let runtime = McpRuntime {
+        tokens: Arc::new(RunTokens::new()),
+        secrets: Arc::clone(&secrets) as Arc<dyn SecretStore>,
+        proxy_url: "http://factory:8081".into(),
+        warnings: Arc::new(McpWarnings::new(Arc::clone(&store))),
+    };
+    let scheduler = Scheduler::new(
+        Arc::clone(&store),
+        Arc::new(projects),
+        Arc::clone(&executor),
+        Arc::new(Notify::new()),
+        PathBuf::new(),
+        runtime,
+        accounts(&store),
+    );
+    store
+        .save_local_settings(Some(LOCAL_URL), factory_core::Cli::Codex, 10)
+        .unwrap();
+    store
+        .save_project_agents("maestro", &local_stage("clarify"))
+        .unwrap();
+    store
+        .save_project_models(
+            "maestro",
+            &StageModels {
+                clarify: Some("gemma".into()),
+                spec: Some("gemma".into()),
+                ..StageModels::default()
+            },
+        )
+        .unwrap();
+    store
+        .save_project_efforts("maestro", &StageEfforts::default(), &local_stage("clarify"))
+        .unwrap();
+    (store, executor, scheduler, secrets)
+}
+
+/// Agents with `stage` on Local and every other stage on the default.
+fn local_stage(stage: &str) -> StageAgents {
+    let mut agents = StageAgents::default();
+    match stage {
+        "clarify" => agents.clarify = "local".into(),
+        "spec" => agents.spec = "local".into(),
+        other => panic!("no test for the {other} stage"),
+    }
+    agents
+}
+
+fn local_of(request: &AgentRequest) -> &factory_server::LocalRequest {
+    request.local.as_ref().expect("a Local request")
+}
+
+fn failure_reason(store: &Store, id: i64) -> String {
+    match store.get(id).unwrap().job.stage() {
+        Stage::Failed { reason, .. } => reason.clone(),
+        other => panic!("expected a failed job, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_local_run_uses_the_requesters_key_else_the_factory_key() {
+    let (store, executor, scheduler, secrets) = setup_local(|_| questions());
+    secrets.set_local_key("factory-key").unwrap();
+    secrets.set_user_local_key("alice", "alice-key").unwrap();
+    executor.release(3);
+    for requester in ["alice", "bob", FACTORY_REQUESTER] {
+        store.create("maestro", requester, "Add a button").unwrap();
+        step(&scheduler).await;
+    }
+
+    let requests = executor.requests();
+    let key = |index: usize| local_of(&requests[index]).target.key.clone();
+    assert_eq!(key(0).as_deref(), Some("alice-key"));
+    assert_eq!(
+        local_of(&requests[0]).key_from,
+        factory_server::LocalKeyOwner::Login("alice".into())
+    );
+    assert_eq!(key(1).as_deref(), Some("factory-key"));
+    assert_eq!(
+        local_of(&requests[1]).key_from,
+        factory_server::LocalKeyOwner::Factory
+    );
+    // A job the factory requested never uses a personal key, even when the
+    // factory's own login stored one.
+    assert_eq!(key(2).as_deref(), Some("factory-key"));
+}
+
+#[tokio::test]
+async fn a_factory_requested_local_run_ignores_a_personal_key_of_that_name() {
+    let (store, executor, scheduler, secrets) = setup_local(|_| questions());
+    secrets
+        .set_user_local_key(FACTORY_REQUESTER, "personal")
+        .unwrap();
+    executor.release(1);
+    store
+        .create("maestro", FACTORY_REQUESTER, "Update a dependency")
+        .unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(local_of(&executor.requests()[0]).target.key, None);
+}
+
+#[tokio::test]
+async fn a_local_run_with_no_key_anywhere_sends_none() {
+    let (store, executor, scheduler, secrets) = setup_local(|_| questions());
+    secrets.set_user_local_key("alice", "alice-key").unwrap();
+    executor.release(1);
+    let id = store.create("maestro", "bob", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let request = &executor.requests()[0];
+    assert_eq!(local_of(request).target.key, None);
+    assert_eq!(
+        local_of(request).key_from,
+        factory_server::LocalKeyOwner::None
+    );
+    let log = log_texts(&store, id);
+    assert!(log.contains(&format!("Local run on Codex at {LOCAL_URL} with no key.")));
+}
+
+fn log_texts(store: &Store, id: i64) -> Vec<String> {
+    store
+        .logs(id, 100)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_retry_by_another_login_keeps_the_requesters_key() {
+    let failures = Arc::new(Mutex::new(1));
+    let remaining = Arc::clone(&failures);
+    let (store, executor, scheduler, secrets) = setup_local(move |_| {
+        let mut left = remaining.lock().unwrap();
+        if *left > 0 {
+            *left -= 1;
+            Event::AgentFailed {
+                reason: "the server rejected the key".into(),
+            }
+        } else {
+            questions()
+        }
+    });
+    secrets.set_local_key("factory-key").unwrap();
+    secrets.set_user_local_key("alice", "alice-key").unwrap();
+    secrets.set_user_local_key("bob", "bob-key").unwrap();
+    executor.release(2);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    // Bob presses Retry. The job stays alice's, so alice's key applies.
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(local_of(request).target.key.as_deref(), Some("alice-key"));
+    }
+}
+
+#[tokio::test]
+async fn a_key_that_cannot_be_read_fails_the_run_without_falling_back() {
+    let (store, executor, scheduler, secrets) = setup_local(|_| questions());
+    secrets.set_local_key("factory-key").unwrap();
+    store
+        .put_secret(
+            SecretRef {
+                project: "",
+                server: "",
+                header: "local-key-user:alice",
+            },
+            "local",
+            b"not-a-ciphertext",
+        )
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(executor.requests().len(), 0);
+    let reason = failure_reason(&store, id);
+    assert!(reason.contains("The Local API key of alice cannot be read"));
+    assert!(!reason.contains("factory-key"));
+}
+
+#[tokio::test]
+async fn a_local_run_with_no_server_fails_before_any_run() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .save_local_settings(None, factory_core::Cli::Codex, 10)
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(executor.requests().len(), 0);
+    assert_eq!(failure_reason(&store, id), "no local server is set");
+}
+
+#[tokio::test]
+async fn a_local_run_with_no_model_fails_before_any_run() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .save_project_models("maestro", &StageModels::default())
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(executor.requests().len(), 0);
+    assert_eq!(
+        failure_reason(&store, id),
+        "no model is set for the Local agent"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_local_run_can_be_retried_once_the_server_is_set() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .save_local_settings(None, factory_core::Cli::Codex, 10)
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    store
+        .save_local_settings(Some(LOCAL_URL), factory_core::Cli::Codex, 10)
+        .unwrap();
+    store.apply(id, Event::Retry).unwrap();
+    executor.release(1);
+    step(&scheduler).await;
+
+    assert_eq!(executor.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_local_run_carries_the_settings_and_a_prompt_for_its_cli() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .save_local_settings(Some(LOCAL_URL), factory_core::Cli::ClaudeCode, 7)
+        .unwrap();
+    executor.release(1);
+    store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let request = &executor.requests()[0];
+    assert_eq!(request.agent, Agent::Local);
+    assert_eq!(model_of(request), "gemma");
+    assert_eq!(effort_of(request), "medium");
+    let local = local_of(request);
+    assert_eq!(local.target.cli, factory_core::Cli::ClaudeCode);
+    assert_eq!(local.target.base_url, LOCAL_URL);
+    assert_eq!(local.target.load_timeout, Duration::from_mins(7));
+    assert!(!request.prompt.contains("\"properties\""));
+}
+
+#[tokio::test]
+async fn a_local_run_opens_its_log_with_the_cli_the_server_and_whose_key() {
+    let (store, executor, scheduler, secrets) = setup_local(|_| questions());
+    secrets.set_user_local_key("alice", "alice-key").unwrap();
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let log = log_texts(&store, id);
+    let at = log
+        .iter()
+        .position(|text| text.starts_with("Local run on"))
+        .expect("the Local run line");
+    assert_eq!(
+        log[at],
+        format!("Local run on Codex at {LOCAL_URL} with the Local API key of alice.")
+    );
+    assert!(log[at + 1].starts_with("Agent run started"));
+    assert!(log.iter().all(|text| !text.contains("alice-key")));
+}
+
+#[tokio::test]
+async fn a_local_session_resumes_on_its_cli_and_a_new_one_uses_the_setting() {
+    let (store, executor, scheduler, _) = setup_local(|request| {
+        if request.prompt.contains("answered") {
+            Event::Agent(AgentResult::Clarified)
+        } else {
+            questions()
+        }
+    });
+    executor.release(6);
+    let first = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    store
+        .save_local_settings(Some(LOCAL_URL), factory_core::Cli::Copilot, 10)
+        .unwrap();
+    store
+        .apply(first, Event::Answer(vec!["rpi5".into()]))
+        .unwrap();
+    step(&scheduler).await;
+    store.create("maestro", "alice", "Another button").unwrap();
+    step(&scheduler).await;
+
+    let requests: Vec<_> = executor
+        .requests()
+        .into_iter()
+        .filter(|request| request.agent == Agent::Local)
+        .collect();
+    assert_eq!(local_of(&requests[0]).target.cli, factory_core::Cli::Codex);
+    assert_eq!(local_of(&requests[1]).target.cli, factory_core::Cli::Codex);
+    assert_eq!(
+        local_of(&requests[1]).setting_cli,
+        factory_core::Cli::Copilot
+    );
+    assert_eq!(
+        local_of(&requests[2]).target.cli,
+        factory_core::Cli::Copilot
+    );
+    let notes: Vec<String> = log_texts(&store, first)
+        .into_iter()
+        .filter(|text| text.contains("stays on Codex"))
+        .collect();
+    assert_eq!(
+        notes,
+        ["This session started on Codex, so it stays on Codex. \
+             The Local settings name Copilot now, which new sessions use."]
+    );
+}
+
+#[tokio::test]
+async fn a_local_codex_prompt_carries_the_schema_and_a_subscription_codex_prompt_does_not() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                clarify: "codex".into(),
+                spec: "local".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    executor.release(2);
+    step(&scheduler).await;
+    let codex = executor.requests().pop().unwrap();
+    assert_eq!(codex.agent, Agent::Local);
+
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                clarify: "codex".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    executor.release(1);
+    store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    let subscription = executor.requests().pop().unwrap();
+
+    assert_eq!(subscription.agent, Agent::Codex);
+    assert!(subscription.local.is_none());
+    assert!(codex.prompt.contains("\"properties\""));
+    assert!(!subscription.prompt.contains("\"properties\""));
+}
+
+#[tokio::test]
+async fn a_local_run_adds_nothing_to_the_cost_whatever_the_cli_reports() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store.set_codex_price(&codex_price("gemma")).unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    // The first run reports a dollar figure, as Claude Code does; the second
+    // reports tokens, as Codex does, for a model that has a price row.
+    executor.costs.lock().unwrap().push_back(Some(4.2));
+    executor.release(1);
+    step(&scheduler).await;
+
+    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
+    assert_eq!(store.recorded_cost(id).unwrap(), Some(0.0));
+    assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
+    assert!(!store.has_estimated_cost(id).unwrap());
+    let finished = finished_lines(&store, id);
+    assert_eq!(finished, ["Local run finished, recorded at $0."]);
+
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    executor
+        .token_usages
+        .lock()
+        .unwrap()
+        .push_back(codex_usage());
+    executor.release(1);
+    step(&scheduler).await;
+
+    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
+    assert!(!store.has_estimated_cost(id).unwrap());
+    let finished = finished_lines(&store, id);
+    assert_eq!(finished.len(), 2);
+    assert_eq!(
+        finished[1],
+        "Local run finished, recorded at $0. 1000 input tokens, 500 output tokens."
+    );
+    // A Local run is no session cost, so the dollar figure is not stored.
+    assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
+}
+
+#[tokio::test]
+async fn a_job_with_a_claude_stage_and_a_local_stage_shows_the_claude_cost_alone() {
+    let (store, executor, scheduler, _) = setup_local(|request| match request.expect {
+        Expect::Clarify => Event::Agent(AgentResult::Clarified),
+        _ => questions(),
+    });
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                spec: "local".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    executor.costs.lock().unwrap().push_back(Some(1.25));
+    executor.costs.lock().unwrap().push_back(Some(9.0));
+    executor.release(2);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    let agents: Vec<Agent> = executor.requests().iter().map(|r| r.agent).collect();
+    assert_eq!(agents, [Agent::Claude, Agent::Local]);
+    assert!((store.cost_usd(id).unwrap() - 1.25).abs() < 1e-9);
+    assert!((store.project_totals("maestro").unwrap().usd - 1.25).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn a_session_started_on_claude_stays_on_claude_after_its_stage_moves_to_local() {
+    let (store, executor, scheduler, _) = setup_local(|request| {
+        if request.prompt.contains("answered") {
+            Event::Agent(AgentResult::Clarified)
+        } else {
+            questions()
+        }
+    });
+    store
+        .save_project_agents("maestro", &StageAgents::default())
+        .unwrap();
+    executor.release(2);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    store
+        .save_project_agents("maestro", &local_stage("clarify"))
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests[1].agent, Agent::Claude);
+    assert!(requests[1].local.is_none());
+    assert!(
+        log_texts(&store, id)
+            .iter()
+            .any(|text| text.starts_with("This session started on Claude"))
+    );
+}
+
 #[tokio::test]
 async fn a_change_to_the_worker_packages_reaches_the_next_run() {
     let (store, executor, scheduler) = setup_two_projects(|_| questions());

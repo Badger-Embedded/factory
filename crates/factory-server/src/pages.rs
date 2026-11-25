@@ -3947,7 +3947,7 @@ fn job_rows(
                             span.stage { (detail) }
                         }
                         span.requester title=(row.requested_by) { (row.requested_by) }
-                        span.cost { (cost_label(costs.get(&row.id).copied().unwrap_or(0.0))) }
+                        span.cost { (cost_label(costs.get(&row.id).copied())) }
                     }
                     (row_actions(row, lane))
                 }
@@ -4099,11 +4099,13 @@ fn gate_name(job: &Job) -> Option<&'static str> {
     }
 }
 
-fn cost_label(usd: f64) -> String {
-    if usd > 0.0 {
-        format_cost(usd)
-    } else {
-        "–".to_owned()
+/// The cost as the pill shows it. A job with no cost row, such as one that only
+/// ran Copilot, reads "–"; a Local run writes a row of $0, so a job that only
+/// ran on Local reads `$0.00`.
+fn cost_label(usd: Option<f64>) -> String {
+    match usd {
+        Some(usd) => format_cost(usd),
+        None => "–".to_owned(),
     }
 }
 
@@ -4129,7 +4131,7 @@ pub fn job(
     events: &[JobEvent],
     images: &[String],
     files: &[JobFile],
-    cost_usd: f64,
+    cost_usd: Option<f64>,
     models: &StageModels,
     efforts: &StageEfforts,
     auto_merge: bool,
@@ -4196,7 +4198,7 @@ pub fn job_fragment(
     settings: &Settings,
     logs: &[LogEntry],
     events: &[JobEvent],
-    cost_usd: f64,
+    cost_usd: Option<f64>,
     models: &StageModels,
     efforts: &StageEfforts,
     auto_merge: bool,
@@ -4247,8 +4249,8 @@ fn job_poll(oob: bool, id: i64, job: &Job) -> Markup {
 /// stays put while the figure changes. When any of the job's cost rows is an
 /// estimate, such as a Codex run's cost from the price table, the figure carries
 /// a `≈` and a title that says it includes an estimate.
-fn cost_badge(oob: bool, cost_usd: f64, estimated: bool) -> Markup {
-    let estimated = estimated && cost_usd > 0.0;
+fn cost_badge(oob: bool, cost_usd: Option<f64>, estimated: bool) -> Markup {
+    let estimated = estimated && cost_usd.is_some_and(|usd| usd > 0.0);
     html! {
         span #job-cost.badge.cost
             hx-swap-oob=[oob.then_some("true")]
@@ -4527,7 +4529,7 @@ fn job_header(
     label: &ProjectLabel,
     links: &JobLinks,
     repo_url: Option<Links<'_>>,
-    cost_usd: f64,
+    cost_usd: Option<f64>,
     estimated: bool,
 ) -> Markup {
     let job = &row.job;

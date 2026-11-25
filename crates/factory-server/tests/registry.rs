@@ -181,7 +181,7 @@ fn the_local_entry_points_at_its_page_and_offers_no_models_yet() {
         .find(|entry| entry.id() == "local")
         .expect("local entry");
     assert_eq!(entry.display_name(), "Local");
-    assert!(!entry.available());
+    assert!(entry.available());
     assert_eq!(entry.settings_url(), Some("/settings/agents/local"));
     assert_eq!(entry.model_suggestions(), [] as [&str; 0]);
     assert_eq!(entry.host_config_dir(), None);
