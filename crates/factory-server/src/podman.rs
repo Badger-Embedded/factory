@@ -9,8 +9,8 @@ use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateAcc
 use factory_runner::{
     Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, NOT_PERMITTED,
     Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun,
-    WorkerConfig, WorkerRun, backend, observe, place_files, place_images, remove_container, run,
-    run_checks, show_files, show_images,
+    WorkerConfig, WorkerRun, backend_for, observe, place_files, place_images, remove_container,
+    run, run_checks, show_files, show_images,
 };
 
 use crate::accounts::{AccountSource, Operation, blame, credential_reason};
@@ -253,7 +253,7 @@ impl Executor for PodmanExecutor {
             Ok(token) => token,
             Err(reason) => return failed(reason),
         };
-        let backend = backend(agent).expect("the run's agent has a worker backend");
+        let backend = backend_for(agent.cli()).expect("the run's CLI has a worker backend");
         let image = entry
             .image(settings)
             .expect("the run's agent has a worker image");

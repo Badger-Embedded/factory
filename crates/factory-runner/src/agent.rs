@@ -12,7 +12,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use factory_core::{Agent, Event, PlanUsage};
+use factory_core::{Agent, Cli, Event, PlanUsage};
 
 use crate::claude::ClaudeAgent;
 use crate::codex::CodexAgent;
@@ -189,15 +189,21 @@ pub struct RunResult {
     pub cost_usd: Option<f64>,
 }
 
-/// The backend for `agent`: [`ClaudeAgent`], [`CodexAgent`] or
-/// [`CopilotAgent`]. It returns [`Option`] so an agent registered before its
-/// backend lands can report `None`; every agent has one today.
+/// The backend for `agent`, which is the backend of the CLI that drives it.
 #[must_use]
 pub fn backend(agent: Agent) -> Option<&'static dyn AgentBackend> {
-    match agent {
-        Agent::Claude => Some(&ClaudeAgent),
-        Agent::Codex => Some(&CodexAgent),
-        Agent::Copilot => Some(&CopilotAgent),
+    backend_for(agent.cli())
+}
+
+/// The backend for `cli`: [`ClaudeAgent`], [`CodexAgent`] or [`CopilotAgent`].
+/// It returns [`Option`] so a CLI registered before its backend lands can
+/// report `None`; every CLI has one today.
+#[must_use]
+pub fn backend_for(cli: Cli) -> Option<&'static dyn AgentBackend> {
+    match cli {
+        Cli::ClaudeCode => Some(&ClaudeAgent),
+        Cli::Codex => Some(&CodexAgent),
+        Cli::Copilot => Some(&CopilotAgent),
     }
 }
 

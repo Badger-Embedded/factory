@@ -2,14 +2,12 @@ use std::fmt::Write;
 
 use factory_core::{Agent, Answered, FileText, Job, PackagingContext, PlannedPr, Task, Verdict};
 
-use crate::agent::{PromptStyle, backend};
+use crate::agent::{PromptStyle, backend_for};
 use crate::outcome::Expect;
 
-/// The per-harness wording for `agent`, taken from its backend, so this module
-/// names no harness.
 fn style(agent: Agent) -> PromptStyle {
-    backend(agent)
-        .expect("the run's agent has a worker backend")
+    backend_for(agent.cli())
+        .expect("the run's CLI has a worker backend")
         .prompt_style()
 }
 

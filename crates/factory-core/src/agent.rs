@@ -26,6 +26,59 @@ pub enum Agent {
     Copilot,
 }
 
+/// A command-line tool that runs an agent in a worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Cli {
+    /// The `claude` CLI.
+    ClaudeCode,
+    /// The `codex exec` CLI.
+    Codex,
+    /// The `copilot` CLI.
+    Copilot,
+}
+
+impl Cli {
+    /// Every CLI, in the order the dashboard lists them.
+    pub const ALL: [Cli; 3] = [Cli::ClaudeCode, Cli::Codex, Cli::Copilot];
+
+    /// The stable id the server stores and parses.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Cli::ClaudeCode => "claude",
+            Cli::Codex => "codex",
+            Cli::Copilot => "copilot",
+        }
+    }
+
+    /// The name the dashboard shows.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Cli::ClaudeCode => "Claude Code",
+            Cli::Codex => "Codex",
+            Cli::Copilot => "Copilot",
+        }
+    }
+
+    /// The CLI with this id, or `None` when no CLI has it.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Cli> {
+        Cli::ALL.into_iter().find(|cli| cli.id() == id)
+    }
+
+    /// The file a target repository keeps its instructions in for this CLI.
+    /// Claude Code reads `CLAUDE.md`; Codex and Copilot read `AGENTS.md`, the
+    /// shared standard, and Copilot also reads `CLAUDE.md`.
+    #[must_use]
+    pub fn rules_doc(self) -> &'static str {
+        match self {
+            Cli::ClaudeCode => "CLAUDE.md",
+            Cli::Codex | Cli::Copilot => "AGENTS.md",
+        }
+    }
+}
+
 /// The agent a stage runs on when a project saves none.
 pub const DEFAULT_AGENT: Agent = Agent::Claude;
 
@@ -87,9 +140,16 @@ impl Agent {
     /// both `AGENTS.md` and `CLAUDE.md`, and the prompt names `AGENTS.md`.
     #[must_use]
     pub fn rules_doc(self) -> &'static str {
+        self.cli().rules_doc()
+    }
+
+    /// The CLI that drives this agent in a worker.
+    #[must_use]
+    pub fn cli(self) -> Cli {
         match self {
-            Agent::Claude => "CLAUDE.md",
-            Agent::Codex | Agent::Copilot => "AGENTS.md",
+            Agent::Claude => Cli::ClaudeCode,
+            Agent::Codex => Cli::Codex,
+            Agent::Copilot => Cli::Copilot,
         }
     }
 

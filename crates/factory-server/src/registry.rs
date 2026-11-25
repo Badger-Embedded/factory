@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use factory_core::Agent;
-use factory_runner::backend;
+use factory_runner::backend_for;
 
 use crate::codex::CodexLogin;
 use crate::secrets::{ClaudeToken, SecretStore};
@@ -176,7 +176,7 @@ impl AgentEntry<'_> {
     /// the agent's session files live, or `None` for an agent with no backend.
     #[must_use]
     pub fn host_config_dir(&self) -> Option<&'static str> {
-        backend(self.agent).map(factory_runner::AgentBackend::host_config_dir)
+        backend_for(self.agent.cli()).map(factory_runner::AgentBackend::host_config_dir)
     }
 
     /// The credential a run passes to the worker, or the reason the run cannot

@@ -10,7 +10,7 @@ mod job;
 mod names;
 mod usage;
 
-pub use agent::{Agent, DEFAULT_AGENT, UnknownAgent};
+pub use agent::{Agent, Cli, DEFAULT_AGENT, UnknownAgent};
 pub use job::{
     AgentResult, Answered, Ask, BranchSummary, Command, CommentKind, DELETED_PREREQUISITE,
     DiffVerdict, Event, ExistingGap, FileText, FixLink, FixOutcome, FixState, Gap, Gates, Job,

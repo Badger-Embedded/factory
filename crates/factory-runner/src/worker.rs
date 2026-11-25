@@ -7,7 +7,7 @@ use factory_core::{Agent, Event, PlanUsage};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::agent::{AgentItem, Credential, RunResult, TokenUsage, backend};
+use crate::agent::{AgentItem, Credential, RunResult, TokenUsage, backend_for};
 use crate::outcome::{Expect, failed_event};
 use crate::packages;
 use crate::stream::LogLine;
@@ -240,7 +240,7 @@ pub struct McpUnavailable {
 /// only for an agent that can run, so this is an unreachable invariant.
 #[must_use]
 pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
-    let backend = backend(run.agent).expect("the run's agent has a worker backend");
+    let backend = backend_for(run.agent.cli()).expect("the run's CLI has a worker backend");
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |arg: &str| args.push(arg.into());
     for arg in [
@@ -329,7 +329,7 @@ pub async fn run(
         credential: None,
         token_usage: None,
     };
-    let Some(backend) = backend(run.agent) else {
+    let Some(backend) = backend_for(run.agent.cli()) else {
         return failed(format!(
             "the {} agent has no worker backend",
             run.agent.display_name()

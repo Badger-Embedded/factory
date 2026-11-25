@@ -11,6 +11,7 @@ mod claude;
 mod codex;
 mod copilot;
 mod files;
+mod final_json;
 mod forge;
 mod forgejo;
 mod git;
@@ -23,7 +24,7 @@ mod prompt;
 mod stream;
 mod worker;
 
-pub use agent::{AgentBackend, AgentItem, Credential, RunResult, TokenUsage, backend};
+pub use agent::{AgentBackend, AgentItem, Credential, RunResult, TokenUsage, backend, backend_for};
 pub use checks::{checks_args, run_checks};
 pub use factory_core::BranchSummary;
 pub use files::{PlacedFile, place_files, show_files};
