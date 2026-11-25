@@ -434,7 +434,7 @@ pub async fn run(
         }
     };
 
-    started();
+    let mut started = Some(started);
     let mut stderr = child.stderr.take().map(BufReader::new);
     let stderr_task = tokio::spawn(async move {
         let mut text = String::new();
@@ -449,6 +449,9 @@ pub async fn run(
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(started) = started.take() {
+                started();
+            }
             let items = if run.local.is_some() {
                 backend.parse_local(run.expect, &line)
             } else {

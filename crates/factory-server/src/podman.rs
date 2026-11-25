@@ -85,8 +85,9 @@ fn failed(reason: String) -> RunReport {
 }
 
 impl PodmanExecutor {
-    /// The session starts on its CLI once podman has spawned the worker, after
-    /// every step that can still fail the launch.
+    /// The session starts on its CLI once the worker has printed its first line,
+    /// so a podman that fails to start the container records
+    /// nothing.
     fn record_local_cli(&self, job_id: i64, local: Option<&crate::LocalRequest>) {
         if let Some(local) = local
             && let Err(err) =

@@ -23,9 +23,6 @@
 //   "times render in the browser's time zone on load and after a poll"
 // - GitHub links open in a new tab and factory links do not:
 //   "GitHub links open in a new tab and factory links stay in the tab"
-// - A recorded Local run shows $0.00 on the job page and the board, and a
-//   subscription run with a zero cost shows a dash: "a recorded Local run shows
-//   $0.00 and a subscription run with no cost shows a dash"
 import type { Page } from '@playwright/test';
 import { ADMIN, expect, test } from '../fixtures';
 

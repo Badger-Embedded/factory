@@ -1692,8 +1692,19 @@ async fn a_local_session_records_no_cli_when_podman_cannot_start() {
 }
 
 #[tokio::test]
-async fn a_local_session_records_its_cli_once_podman_has_started_the_worker() {
-    let (recorded, _, _) = local_launch("#!/bin/bash\nexit 0\n", Cli::Copilot).await;
+async fn a_local_session_records_no_cli_when_podman_cannot_start_the_container() {
+    let (recorded, _, _) = local_launch(
+        "#!/bin/bash\necho 'image not found' >&2\nexit 125\n",
+        Cli::Copilot,
+    )
+    .await;
+
+    assert_eq!(recorded, None);
+}
+
+#[tokio::test]
+async fn a_local_session_records_its_cli_once_the_worker_has_started() {
+    let (recorded, _, _) = local_launch("#!/bin/bash\necho '{}'\nexit 0\n", Cli::Copilot).await;
 
     assert_eq!(recorded, Some(Cli::Copilot));
 }
