@@ -341,15 +341,15 @@ With Local selected, the stage panel's chips, datalist and hint come from the st
 
 ### Runs on moon
 
-Criterion 27 is not met. No cold-start Local implement run has been done for any CLI. Codex and Copilot have not run at all, and the deployed CLI versions are unrecorded.
+Criterion 27 is closed on the requester's word. The requester ran the Local jobs on moon themselves and reported that they worked, and told the implementer to close the criterion. No job links, CLI versions or timings for those runs were given, so none are recorded here, and the procedure below stays as the way to repeat them.
 
-Job 98 is a Claude Code smoke test of a clarifying stage, not an implement run:
+What is recorded is job 98, a Claude Code smoke test of a clarifying stage:
 
 | CLI | Job | Stage | Model-load wait | First worker output after the load |
 | --- | --- | --- | --- | --- |
 | Claude Code | `https://moon.rex-mimosa.ts.net/jobs/98` | clarifying, `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`, medium | 76 s (waiting line at 22:27:57, answer at 22:29:09) | 22:29:24, a Bash call |
 
-The 22:27:52 "Agent run started" line precedes the wait, so it is not the worker start. The Bash call at 22:29:24 shows the worker running after the load. The CLI did not time out in 76 s, longer than the 30 to 45 s seen in development. The model read the repository, answered a question about the Local model and returned structured output. The log records $0 with 64459 input and 7292 output tokens.
+The 22:27:52 "Agent run started" line precedes the wait, so it is not the worker start. The Bash call at 22:29:24 shows the worker running after the load. The CLI did not time out in 76 s, longer than the 30 to 45 s seen in development. The log records $0 with 64459 input and 7292 output tokens.
 
 Procedure for the operator:
 
