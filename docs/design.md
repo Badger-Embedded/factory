@@ -343,6 +343,16 @@ With Local selected, the stage panel's chips, datalist and hint come from the st
 
 Not yet done: the three runs against `http://gfx1201:9931` on moon (one request job per CLI on a project whose implement stage is Local, with the model unloaded first) need a deployed factory and the model server, which the implementing environment could not reach. Record the results and the CLI versions in the worker image here when they are done.
 
+Procedure for the operator:
+
+1. In the factory's Local settings, set the server to `http://gfx1201:9931`, fetch the model list, and set the CLI to Claude Code. Note the CLI versions in the deployed worker image (`claude --version`, `codex --version`, `copilot --version`).
+2. Create a project whose implement stage is Local, with the model `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`.
+3. Unload the model: `curl -X POST http://gfx1201:9931/models/unload`.
+4. Submit a request that asks for one small file. Watch the job log and note the "Waiting for the local server to load" line and the seconds waited, the time the worker started, and the model's output and the commit it made.
+5. Repeat steps 3 and 4 with the CLI set to Codex, then to Copilot.
+
+Record in the PR's Verification section and here, per CLI: the CLI version, the model-load wait, the worker start and the model's output.
+
 ### Request timeouts
 
 The server answers the first request for a model only after it loads the model, and each CLI has its own request timeout. A Local run raises the CLI's setting to at least the model load timeout where the pinned CLI has one:
