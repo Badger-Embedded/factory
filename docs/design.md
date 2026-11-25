@@ -341,7 +341,13 @@ With Local selected, the stage panel's chips, datalist and hint come from the st
 
 ### Runs on moon
 
-Not yet done: the three runs against `http://gfx1201:9931` on moon (one request job per CLI on a project whose implement stage is Local, with the model unloaded first) need a deployed factory and the model server, which the implementing environment could not reach. Record the results and the CLI versions in the worker image here when they are done.
+Done for Claude Code only, by an operator on moon; Codex and Copilot are still pending, and so is the CLI version in the worker image for all three.
+
+| CLI | Job | Stage | Worker start | Model-load wait | Output |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | `https://moon.rex-mimosa.ts.net/jobs/98` | clarifying, not implement, `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`, medium | 22:27:52, "Agent run started" | 76 s (waiting line at 22:27:57, answer at 22:29:09) | The model read the repository with Bash and Read, answered that the factory passes the Local model to the CLIs with `--model`, and returned structured output. The log records the run at $0 with 64459 input and 7292 output tokens. |
+
+The wait of 76 s is longer than the 30 to 45 s seen in development, and the CLI did not time out. The run was a clarifying stage, so it does not show an implement stage creating a file. The CLI version was not reported.
 
 Procedure for the operator:
 
