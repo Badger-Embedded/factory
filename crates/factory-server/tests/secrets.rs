@@ -601,6 +601,45 @@ fn local_key_round_trips_and_clears_without_the_master_key() {
 }
 
 #[test]
+fn user_local_keys_are_per_login_and_bound_to_their_row() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    secrets
+        .set_user_local_key("alice", "sk-alice")
+        .expect("set");
+    secrets.set_user_local_key("bob", "sk-bob").expect("set");
+    assert_eq!(
+        secrets.user_local_key("alice").unwrap().as_deref(),
+        Some("sk-alice")
+    );
+    assert!(secrets.user_local_key("carol").unwrap().is_none());
+    assert!(secrets.local_key().unwrap().is_none());
+
+    let (backend, bytes) = store
+        .get_secret(at("", "", "local-key-user:alice"))
+        .unwrap()
+        .expect("row");
+    assert!(!contains(&bytes, b"sk-alice"));
+    store
+        .put_secret(at("", "", "local-key-user:bob"), &backend, &bytes)
+        .unwrap();
+    assert!(secrets.user_local_key("bob").is_err());
+
+    let unavailable = UnavailableSecrets::new(Arc::clone(&store));
+    assert!(matches!(
+        unavailable.user_local_key("alice"),
+        Err(SecretError::Unavailable)
+    ));
+    assert!(matches!(
+        unavailable.set_user_local_key("alice", "x"),
+        Err(SecretError::Unavailable)
+    ));
+    unavailable.clear_user_local_key("alice").expect("clear");
+    assert!(secrets.user_local_key("alice").unwrap().is_none());
+    assert!(secrets.user_local_key("bob").is_err());
+}
+
+#[test]
 fn copilot_token_row_holds_no_plaintext() {
     let store = store();
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));

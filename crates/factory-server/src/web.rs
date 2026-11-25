@@ -262,8 +262,15 @@ pub fn app_with_forgejo_probe(
             "/settings/projects/{project}/mcp/{server}/check",
             post(check_mcp_server),
         )
+        .merge(local_key_routes())
         .merge(admin_routes(state.clone()))
         .with_state(state)
+}
+
+fn local_key_routes() -> Router<AppState> {
+    Router::new()
+        .route("/settings/local", get(show_local_key).post(save_local_key))
+        .route("/settings/local/clear", post(clear_user_local_key))
 }
 
 fn admin_routes(state: AppState) -> Router<AppState> {
@@ -4282,6 +4289,96 @@ fn local_page(
         },
         notice,
     ))
+}
+
+fn local_key_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    let settings = state.store.local_settings()?;
+    let (key_set, unreadable) = match state.secrets.user_local_key(&login) {
+        Ok(key) => (key.is_some(), false),
+        Err(SecretError::Store(err)) => return Err(err.into()),
+        Err(_) => (true, true),
+    };
+    let notice = match notice {
+        None if unreadable => Some(KEY_UNREADABLE),
+        other => other,
+    };
+    Ok(pages::settings_local_key(
+        &login,
+        &settings_nav(state, &login)?,
+        settings.url.as_deref().map(|url| (url, settings.cli)),
+        key_set,
+        state.secrets.available(),
+        &state.csrf.issue(&login),
+        notice,
+    ))
+}
+
+async fn show_local_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    local_key_page(&state, &headers, None)
+}
+
+#[derive(Deserialize)]
+struct LocalKeyForm {
+    #[serde(default)]
+    csrf: String,
+    /// The server URL the page showed, empty when it showed none.
+    #[serde(default)]
+    server: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// Stores the login's own Local API key. An empty field keeps the stored key.
+async fn save_local_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalKeyForm>,
+) -> Result<Markup, AppError> {
+    let login = user(&headers);
+    require_csrf(&state, &login, &form.csrf)?;
+    if !state.secrets.available() {
+        return local_key_page(
+            &state,
+            &headers,
+            Some("The master key is missing, so the key was not saved."),
+        );
+    }
+    let key = form.key.trim();
+    let _one_local_change_at_a_time = state.local_lock.lock().await;
+    let current = state.store.local_settings()?.url.unwrap_or_default();
+    if !key.is_empty() && form.server != current {
+        return local_key_page(
+            &state,
+            &headers,
+            Some(
+                "The server changed while the page was open, so the key was not saved. Check the server below and save again.",
+            ),
+        );
+    }
+    if !key.is_empty() {
+        state.secrets.set_user_local_key(&login, key)?;
+    }
+    local_key_page(&state, &headers, Some("Saved."))
+}
+
+/// Removes the login's key. It works without the master key.
+async fn clear_user_local_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalCsrfForm>,
+) -> Result<Markup, AppError> {
+    let login = user(&headers);
+    require_csrf(&state, &login, &form.csrf)?;
+    state.secrets.clear_user_local_key(&login)?;
+    local_key_page(&state, &headers, Some("Cleared."))
 }
 
 const KEY_UNREADABLE: &str = "The stored key cannot be read. Save it again or clear it.";

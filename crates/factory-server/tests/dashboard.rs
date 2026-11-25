@@ -11730,7 +11730,7 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
     assert!(body.contains("Copilot"));
     assert!(body.contains(r#"href="/settings/agents/copilot""#));
 
-    let local = body.find("Local").unwrap();
+    let local = body.find(">Local</a>").unwrap();
     assert!(body.find("Copilot").unwrap() < local);
     assert!(body.contains(r#"href="/settings/agents/local""#));
 
