@@ -1,8 +1,8 @@
 //! The agents a stage can run on.
 //!
-//! The factory runs every stage with an agent. Claude Code and Codex run.
-//! Copilot can be selected for a stage, but it has no backend or stored login,
-//! so a Copilot run fails before it starts.
+//! The factory runs every stage with an agent. Claude Code, Codex and Copilot
+//! run. Local runs one of those CLIs against an OpenAI-compatible server and
+//! cannot be selected yet.
 //! Each agent has a stable id that the server stores per stage, a display name
 //! for the dashboard, and a flag for whether a stage can select it. A stage
 //! with no saved agent runs on [`DEFAULT_AGENT`].
@@ -24,6 +24,9 @@ pub enum Agent {
     Codex,
     /// GitHub Copilot, run with the `copilot` CLI in a worker.
     Copilot,
+    /// A model on a local OpenAI-compatible server. The CLI that drives it is a
+    /// runtime setting, so the agent has no fixed [`Cli`].
+    Local,
 }
 
 /// A command-line tool that runs an agent in a worker.
@@ -95,9 +98,13 @@ const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 /// From the pinned Copilot CLI, which lists the same levels as Claude.
 const COPILOT_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
+/// The effort levels the Local agent accepts, lowest first: the levels all
+/// three CLIs take.
+const LOCAL_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+
 impl Agent {
     /// Every agent, in the order the dashboard lists them.
-    pub const ALL: [Agent; 3] = [Agent::Claude, Agent::Codex, Agent::Copilot];
+    pub const ALL: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Local];
 
     /// The stable id the server stores and parses. It never changes, because a
     /// rename would orphan every stored stage and session that names it.
@@ -107,6 +114,7 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Copilot => "copilot",
+            Agent::Local => "local",
         }
     }
 
@@ -117,12 +125,12 @@ impl Agent {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",
             Agent::Copilot => "Copilot",
+            Agent::Local => "Local",
         }
     }
 
-    /// Whether a stage can select the agent. Claude and Codex also have a
-    /// backend and a credential, so a run on them executes. A Copilot run has
-    /// neither, so Copilot is selectable but a run on it fails before it starts.
+    /// Whether a stage can select the agent. Local has no run path yet, so the
+    /// dashboard lists it as not available.
     #[must_use]
     #[allow(clippy::match_same_arms)]
     pub fn available(self) -> bool {
@@ -130,26 +138,20 @@ impl Agent {
             Agent::Claude => true,
             Agent::Codex => true,
             Agent::Copilot => true,
+            Agent::Local => false,
         }
     }
 
-    /// The file a target repository keeps its instructions in for this agent.
-    /// Claude reads `CLAUDE.md`; Codex and Copilot read `AGENTS.md`, the shared
-    /// standard. A prompt that tells the agent to follow the repository's rules
-    /// names this file, so each agent is pointed at one it reads. Copilot reads
-    /// both `AGENTS.md` and `CLAUDE.md`, and the prompt names `AGENTS.md`.
+    /// The CLI that drives this agent in a worker, or `None` for Local, whose
+    /// CLI is a setting. A caller that needs the rules file uses
+    /// [`Cli::rules_doc`] on the CLI of the run.
     #[must_use]
-    pub fn rules_doc(self) -> &'static str {
-        self.cli().rules_doc()
-    }
-
-    /// The CLI that drives this agent in a worker.
-    #[must_use]
-    pub fn cli(self) -> Cli {
+    pub fn cli(self) -> Option<Cli> {
         match self {
-            Agent::Claude => Cli::ClaudeCode,
-            Agent::Codex => Cli::Codex,
-            Agent::Copilot => Cli::Copilot,
+            Agent::Claude => Some(Cli::ClaudeCode),
+            Agent::Codex => Some(Cli::Codex),
+            Agent::Copilot => Some(Cli::Copilot),
+            Agent::Local => None,
         }
     }
 
@@ -163,6 +165,7 @@ impl Agent {
             Agent::Claude => &CLAUDE_EFFORTS,
             Agent::Codex => &CODEX_EFFORTS,
             Agent::Copilot => &COPILOT_EFFORTS,
+            Agent::Local => &LOCAL_EFFORTS,
         }
     }
 
@@ -176,6 +179,7 @@ impl Agent {
             Agent::Claude => "medium",
             Agent::Codex => "medium",
             Agent::Copilot => "medium",
+            Agent::Local => "medium",
         }
     }
 

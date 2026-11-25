@@ -6,7 +6,9 @@ use crate::agent::{PromptStyle, backend_for};
 use crate::outcome::Expect;
 
 fn style(agent: Agent) -> PromptStyle {
-    backend_for(agent.cli())
+    agent
+        .cli()
+        .and_then(backend_for)
         .expect("the run's CLI has a worker backend")
         .prompt_style()
 }

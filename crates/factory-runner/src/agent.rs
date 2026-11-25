@@ -192,7 +192,7 @@ pub struct RunResult {
 /// The backend for `agent`, which is the backend of the CLI that drives it.
 #[must_use]
 pub fn backend(agent: Agent) -> Option<&'static dyn AgentBackend> {
-    backend_for(agent.cli())
+    agent.cli().and_then(backend_for)
 }
 
 /// The backend for `cli`: [`ClaudeAgent`], [`CodexAgent`] or [`CopilotAgent`].

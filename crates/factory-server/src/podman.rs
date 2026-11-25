@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
-use factory_core::{Agent, Event, FileText, PackagingContext, PrDiff, RenovateAccess, RenovateCi};
+use factory_core::{
+    Agent, Cli, Event, FileText, PackagingContext, PrDiff, RenovateAccess, RenovateCi,
+};
 use factory_runner::{
     Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, NOT_PERMITTED,
     Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun,
@@ -138,7 +140,7 @@ impl PodmanExecutor {
     /// run goes on; only Codex reads `AGENTS.md`, so it is a no-op for Claude.
     fn warn_missing_agents_md(&self, agent: Agent, workspace: &Path, job_id: i64) {
         if agent == Agent::Codex
-            && !workspace.join(agent.rules_doc()).exists()
+            && !workspace.join(Cli::Codex.rules_doc()).exists()
             && let Err(err) = self.store.append_factory_log(
                 job_id,
                 "This repository has no AGENTS.md, so Codex runs without its instructions.",
@@ -253,7 +255,10 @@ impl Executor for PodmanExecutor {
             Ok(token) => token,
             Err(reason) => return failed(reason),
         };
-        let backend = backend_for(agent.cli()).expect("the run's CLI has a worker backend");
+        let backend = agent
+            .cli()
+            .and_then(backend_for)
+            .expect("the run's CLI has a worker backend");
         let image = entry
             .image(settings)
             .expect("the run's agent has a worker image");

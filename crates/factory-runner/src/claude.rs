@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
-use factory_core::Agent;
+use factory_core::{Agent, Cli};
 
 use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, write_replacing};
 use crate::outcome::{Expect, event_from_result};
@@ -50,7 +50,7 @@ impl AgentBackend for ClaudeAgent {
 
     fn prompt_style(&self) -> PromptStyle {
         PromptStyle {
-            rules_doc: Agent::Claude.rules_doc(),
+            rules_doc: Cli::ClaudeCode.rules_doc(),
             review_method: REVIEW_METHOD,
             schema_in_prompt: None,
         }

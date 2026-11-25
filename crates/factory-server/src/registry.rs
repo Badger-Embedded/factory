@@ -133,6 +133,7 @@ impl AgentEntry<'_> {
             Agent::Claude => Some("/settings/agents/claude"),
             Agent::Codex => Some("/settings/agents/codex"),
             Agent::Copilot => Some("/settings/agents/copilot"),
+            Agent::Local => Some("/settings/agents/local"),
         }
     }
 
@@ -144,6 +145,7 @@ impl AgentEntry<'_> {
             Agent::Claude => &CLAUDE_MODELS,
             Agent::Codex => &CODEX_MODELS,
             Agent::Copilot => &COPILOT_MODELS,
+            Agent::Local => &[],
         }
     }
 
@@ -168,7 +170,9 @@ impl AgentEntry<'_> {
         match self.agent {
             // One worker image carries the agents that have a backend, so they
             // run in the `worker_image` setting edited on the Workers page.
-            Agent::Claude | Agent::Codex | Agent::Copilot => Some(settings.worker_image.clone()),
+            Agent::Claude | Agent::Codex | Agent::Copilot | Agent::Local => {
+                Some(settings.worker_image.clone())
+            }
         }
     }
 
@@ -176,7 +180,10 @@ impl AgentEntry<'_> {
     /// the agent's session files live, or `None` for an agent with no backend.
     #[must_use]
     pub fn host_config_dir(&self) -> Option<&'static str> {
-        backend_for(self.agent.cli()).map(factory_runner::AgentBackend::host_config_dir)
+        self.agent
+            .cli()
+            .and_then(backend_for)
+            .map(factory_runner::AgentBackend::host_config_dir)
     }
 
     /// The credential a run passes to the worker, or the reason the run cannot
@@ -199,6 +206,7 @@ impl AgentEntry<'_> {
                 .ok_or_else(|| "no Claude token is set".to_owned()),
             Agent::Codex => self.registry.codex_login.credential(),
             Agent::Copilot => self.copilot_token(),
+            Agent::Local => Err("the Local agent is not available yet".to_owned()),
         }
     }
 

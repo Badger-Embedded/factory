@@ -339,6 +339,15 @@ test.describe('without JavaScript', () => {
   });
 });
 
+test('the sidebar lists Local after Copilot without a link', async ({ page }) => {
+  await page.goto('/settings/polling');
+  const nav = page.locator('nav.settings-nav');
+  await expect(nav.locator('.settings-disabled', { hasText: 'Local' })).toHaveText(
+    'LocalNot available yet',
+  );
+  await expect(nav.getByRole('link', { name: 'Local', exact: true })).toHaveCount(0);
+});
+
 test('a login that is not an admin is turned away from the factory-wide settings', async ({
   page,
 }) => {

@@ -70,6 +70,16 @@ test('selecting a stage, a gate or merge shows its panel and updates the address
   await expect(panel(page, 'clarify')).toBeHidden();
 });
 
+test('Local is listed in every stage but cannot be selected yet', async ({ page, project }) => {
+  await page.goto(settingsPath(project, '?stage=spec'));
+  for (const stage of ['clarify', 'spec', 'plan', 'implement', 'review']) {
+    const local = page.locator(`input[name="${stage}_agent"][value="local"]`);
+    await expect(local).toHaveCount(1);
+    await expect(local).toBeDisabled();
+  }
+  await expect(panel(page, 'spec').getByText('Not available yet')).toBeVisible();
+});
+
 test("changing a stage's agent redraws its model and effort choices", async ({ page, project }) => {
   await page.goto(settingsPath(project, '?stage=spec'));
   const spec = panel(page, 'spec');

@@ -18,7 +18,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use factory_core::Agent;
+use factory_core::{Agent, Cli};
 use serde_json::Value;
 
 use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, write_replacing};
@@ -80,7 +80,7 @@ impl AgentBackend for CopilotAgent {
 
     fn prompt_style(&self) -> PromptStyle {
         PromptStyle {
-            rules_doc: Agent::Copilot.rules_doc(),
+            rules_doc: Cli::Copilot.rules_doc(),
             review_method: REVIEW_METHOD,
             schema_in_prompt: Some(SCHEMA_IN_PROMPT),
         }
