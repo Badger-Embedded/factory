@@ -465,7 +465,7 @@ pub async fn run(
     }
 
     let status = child.wait().await;
-    let stderr = redactor.apply(&stderr_task.await.unwrap_or_default());
+    let stderr = redactor.apply_raw(&stderr_task.await.unwrap_or_default());
     // A file credential, such as Codex's `auth.json`, read back after the run so
     // the executor can keep a login the agent refreshed. The file may be gone,
     // which reads as `None`.
@@ -492,12 +492,20 @@ pub async fn run(
 /// that equals a protocol marker cannot break the parse.
 struct Redactor {
     key: Option<String>,
+    /// The key as it reads inside a JSON string, when that differs.
+    escaped: Option<String>,
 }
 
 impl Redactor {
     fn new(key: Option<&str>) -> Self {
+        let key = key.filter(|key| !key.is_empty());
+        let escaped = key
+            .and_then(|key| serde_json::to_string(key).ok())
+            .map(|json| json.trim_matches('"').to_owned())
+            .filter(|escaped| Some(escaped.as_str()) != key);
         Redactor {
-            key: key.filter(|key| !key.is_empty()).map(str::to_owned),
+            key: key.map(str::to_owned),
+            escaped,
         }
     }
 
@@ -505,6 +513,15 @@ impl Redactor {
         match &self.key {
             Some(key) => text.replace(key.as_str(), "[redacted]"),
             None => text.to_owned(),
+        }
+    }
+
+    /// Raw output, where the key may appear JSON-escaped.
+    fn apply_raw(&self, text: &str) -> String {
+        let text = self.apply(text);
+        match &self.escaped {
+            Some(escaped) => text.replace(escaped.as_str(), "[redacted]"),
+            None => text,
         }
     }
 
