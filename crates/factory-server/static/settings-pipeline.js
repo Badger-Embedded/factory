@@ -7,20 +7,139 @@
 // its panel open, and the buttons stay hidden.
 (function () {
   document.documentElement.classList.add("pipeline-js");
+  function wireAgentFields(form) {
+    // Each agent id maps to { efforts: [...], default: "..." }, so the effort
+    // radios can be redrawn when a stage's agent switches.
+    var AGENT_EFFORTS = JSON.parse(form.dataset.agentEfforts || "{}");
+
+    var AGENT_MODELS = JSON.parse(form.dataset.agentModels || "{}");
+
+    // The effort levels of the agent a stage is set to, lowest first.
+    function effortsFor(stage) {
+      var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+      var spec = agent && AGENT_EFFORTS[agent.value];
+      return spec ? spec.efforts : [];
+    }
+
+    function setModelLabel(stage) {
+      var label = form.querySelector('[data-model-label="' + stage + '"]');
+      var input = form.querySelector('[data-model-input="' + stage + '"]');
+      if (!label || !input) return;
+      var review = stage === "review" && !form.querySelector('[name="llm_review"]').checked;
+      var model = input.value.trim();
+      var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+      var spec = agent && AGENT_MODELS[agent.value];
+      var blank = spec && spec.required ? "Model required" : "CLI default";
+      label.textContent = review ? "Off" : model || blank;
+      label.classList.toggle("dflt", review || model === "");
+      form.querySelector('[data-part="' + stage + '"]').classList.toggle("off", review);
+    }
+
+    function setEffortLabel(stage, level) {
+      var pips = form.querySelectorAll('[data-effort-label="' + stage + '"] i');
+      var index = effortsFor(stage).indexOf(level);
+      pips.forEach(function (pip, i) {
+        pip.classList.toggle("on", i <= index);
+      });
+    }
+
+    // Redraws a stage's effort radios for the agent it is now set to. The saved
+    // level stays selected when the new agent offers it, otherwise the new agent's
+    // default is selected. The node's pips follow through setEffortLabel.
+    function redrawEfforts(stage) {
+      var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+      var spec = agent && AGENT_EFFORTS[agent.value];
+      var seg = form.querySelector('[data-effort-seg="' + stage + '"]');
+      if (!spec || !seg) return;
+      var picked = seg.querySelector("input:checked");
+      var current = picked ? picked.value : null;
+      var selected = spec.efforts.indexOf(current) >= 0 ? current : spec.default;
+      seg.textContent = "";
+      spec.efforts.forEach(function (level) {
+        var label = document.createElement("label");
+        var input = document.createElement("input");
+        input.type = "radio";
+        input.name = stage + "_effort";
+        input.value = level;
+        input.checked = level === selected;
+        var span = document.createElement("span");
+        span.textContent = level;
+        label.appendChild(input);
+        label.appendChild(span);
+        seg.appendChild(label);
+      });
+      setEffortLabel(stage, selected);
+    }
+
+    function redrawModels(stage) {
+      var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+      var spec = agent && AGENT_MODELS[agent.value];
+      var chips = form.querySelector('[data-model-chips="' + stage + '"]');
+      var input = form.querySelector('[data-model-input="' + stage + '"]');
+      if (!spec || !chips || !input) return;
+      var previous = AGENT_MODELS[chips.dataset.agent];
+      var datalist = form.querySelector("#" + input.getAttribute("list"));
+      var hint = form.querySelector('[data-model-hint="' + stage + '"]');
+      chips.dataset.agent = agent.value;
+      chips.textContent = "";
+      (spec.required ? [] : [""]).concat(spec.models).forEach(function (model) {
+        var chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "chip";
+        chip.dataset.model = model;
+        chip.dataset.modelFor = stage;
+        chip.textContent = model || "CLI default";
+        chips.appendChild(chip);
+      });
+      if (datalist) {
+        datalist.textContent = "";
+        spec.models.forEach(function (model) {
+          var option = document.createElement("option");
+          option.value = model;
+          datalist.appendChild(option);
+        });
+      }
+      if (hint) {
+        hint.textContent = spec.hint;
+      }
+      input.placeholder = spec.required ? "Model ID" : "CLI default";
+      var value = input.value.trim();
+      setModelLabel(stage);
+      if (value !== "" && previous && previous.models.indexOf(value) >= 0) {
+        input.value = "";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }
+
+    form.addEventListener("click", function (event) {
+      var chip = event.target.closest("[data-model-for]");
+      if (!chip) return;
+      var input = form.querySelector('[data-model-input="' + chip.dataset.modelFor + '"]');
+      input.value = chip.dataset.model;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    form.addEventListener("input", function (event) {
+      if (event.target.dataset.modelInput) setModelLabel(event.target.dataset.modelInput);
+    });
+
+    form.addEventListener("change", function (event) {
+      var target = event.target;
+      if (target.type === "radio" && target.name.endsWith("_effort")) {
+        setEffortLabel(target.name.slice(0, -"_effort".length), target.value);
+      } else if (target.type === "radio" && target.name.endsWith("_agent")) {
+        var agentStage = target.name.slice(0, -"_agent".length);
+        redrawEfforts(agentStage);
+        redrawModels(agentStage);
+      }
+    });
+
+    return { setModelLabel: setModelLabel };
+  }
+
   var form = document.querySelector(".pipeline-form");
   if (!form) return;
-  // Each agent id maps to { efforts: [...], default: "..." }, so the effort
-  // radios can be redrawn when a stage's agent switches.
-  var AGENT_EFFORTS = JSON.parse(form.dataset.agentEfforts || "{}");
-
-  var AGENT_MODELS = JSON.parse(form.dataset.agentModels || "{}");
-
-  // The effort levels of the agent a stage is set to, lowest first.
-  function effortsFor(stage) {
-    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
-    var spec = agent && AGENT_EFFORTS[agent.value];
-    return spec ? spec.efforts : [];
-  }
+  var agentFields = wireAgentFields(form);
 
   function select(part) {
     form.querySelectorAll("[data-part]").forEach(function (node) {
@@ -34,96 +153,6 @@
     url.searchParams.set("stage", part);
     form.action = url.pathname + url.search;
     history.replaceState(null, "", url.pathname + url.search);
-  }
-
-  function setModelLabel(stage) {
-    var label = form.querySelector('[data-model-label="' + stage + '"]');
-    var input = form.querySelector('[data-model-input="' + stage + '"]');
-    if (!label || !input) return;
-    var review = stage === "review" && !form.querySelector('[name="llm_review"]').checked;
-    var model = input.value.trim();
-    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
-    var spec = agent && AGENT_MODELS[agent.value];
-    var blank = spec && spec.required ? "Model required" : "CLI default";
-    label.textContent = review ? "Off" : model || blank;
-    label.classList.toggle("dflt", review || model === "");
-    form.querySelector('[data-part="' + stage + '"]').classList.toggle("off", review);
-  }
-
-  function setEffortLabel(stage, level) {
-    var pips = form.querySelectorAll('[data-effort-label="' + stage + '"] i');
-    var index = effortsFor(stage).indexOf(level);
-    pips.forEach(function (pip, i) {
-      pip.classList.toggle("on", i <= index);
-    });
-  }
-
-  // Redraws a stage's effort radios for the agent it is now set to. The saved
-  // level stays selected when the new agent offers it, otherwise the new agent's
-  // default is selected. The node's pips follow through setEffortLabel.
-  function redrawEfforts(stage) {
-    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
-    var spec = agent && AGENT_EFFORTS[agent.value];
-    var seg = form.querySelector('[data-effort-seg="' + stage + '"]');
-    if (!spec || !seg) return;
-    var picked = seg.querySelector("input:checked");
-    var current = picked ? picked.value : null;
-    var selected = spec.efforts.indexOf(current) >= 0 ? current : spec.default;
-    seg.textContent = "";
-    spec.efforts.forEach(function (level) {
-      var label = document.createElement("label");
-      var input = document.createElement("input");
-      input.type = "radio";
-      input.name = stage + "_effort";
-      input.value = level;
-      input.checked = level === selected;
-      var span = document.createElement("span");
-      span.textContent = level;
-      label.appendChild(input);
-      label.appendChild(span);
-      seg.appendChild(label);
-    });
-    setEffortLabel(stage, selected);
-  }
-
-  function redrawModels(stage) {
-    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
-    var spec = agent && AGENT_MODELS[agent.value];
-    var chips = form.querySelector('[data-model-chips="' + stage + '"]');
-    var input = form.querySelector('[data-model-input="' + stage + '"]');
-    if (!spec || !chips || !input) return;
-    var previous = AGENT_MODELS[chips.dataset.agent];
-    var datalist = form.querySelector("#" + input.getAttribute("list"));
-    var hint = form.querySelector('[data-model-hint="' + stage + '"]');
-    chips.dataset.agent = agent.value;
-    chips.textContent = "";
-    (spec.required ? [] : [""]).concat(spec.models).forEach(function (model) {
-      var chip = document.createElement("button");
-      chip.type = "button";
-      chip.className = "chip";
-      chip.dataset.model = model;
-      chip.dataset.modelFor = stage;
-      chip.textContent = model || "CLI default";
-      chips.appendChild(chip);
-    });
-    if (datalist) {
-      datalist.textContent = "";
-      spec.models.forEach(function (model) {
-        var option = document.createElement("option");
-        option.value = model;
-        datalist.appendChild(option);
-      });
-    }
-    if (hint) {
-      hint.textContent = spec.hint;
-    }
-    input.placeholder = spec.required ? "Model ID" : "CLI default";
-    var value = input.value.trim();
-    setModelLabel(stage);
-    if (value !== "" && previous && previous.models.indexOf(value) >= 0) {
-      input.value = "";
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    }
   }
 
   function setGateNode(box) {
@@ -142,13 +171,6 @@
       select(node.dataset.part);
       return;
     }
-    var chip = event.target.closest("[data-model-for]");
-    if (chip) {
-      var input = form.querySelector('[data-model-input="' + chip.dataset.modelFor + '"]');
-      input.value = chip.dataset.model;
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      return;
-    }
     var reset = event.target.closest("[data-gate-reset]");
     if (reset) {
       var box = form.querySelector('[data-gate="' + reset.dataset.gateReset + '"]');
@@ -160,22 +182,12 @@
     }
   });
 
-  form.addEventListener("input", function (event) {
-    if (event.target.dataset.modelInput) setModelLabel(event.target.dataset.modelInput);
-  });
-
   form.addEventListener("change", function (event) {
     var target = event.target;
-    if (target.type === "radio" && target.name.endsWith("_effort")) {
-      setEffortLabel(target.name.slice(0, -"_effort".length), target.value);
-    } else if (target.type === "radio" && target.name.endsWith("_agent")) {
-      var agentStage = target.name.slice(0, -"_agent".length);
-      redrawEfforts(agentStage);
-      redrawModels(agentStage);
-    } else if (target.dataset.gate) {
+    if (target.dataset.gate) {
       setGateNode(target);
     } else if (target.name === "llm_review") {
-      setModelLabel("review");
+      agentFields.setModelLabel("review");
     } else if (target.name === "auto_merge") {
       form.querySelector("[data-merge-label]").textContent = target.checked
         ? "Automatic"
