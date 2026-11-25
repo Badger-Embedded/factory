@@ -15,13 +15,14 @@ use factory_runner::{
 };
 use factory_server::{
     AccountSource, Accounts, AgentRegistry, AgentRequest, ChecksRequest, ClaudeToken, CodexLogin,
-    CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GhRepos, JobFile,
-    LocalSecrets, LogSink, MASTER_KEY_LEN, McpProjectSettings, McpRuntime, McpStages, McpTransport,
-    McpWarnings, Owner, PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project, ProjectForge,
-    Projects, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest,
-    RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts,
-    StageModels, Store, SummaryRequest, UnavailableSecrets, UpstreamCredential, WatchReport,
-    WatchRequest, WorkerSlots, credential_failure, format_cost, ready_action, watch_only_event,
+    CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GhRepos,
+    HttpLocalServerProbe, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN, McpProjectSettings,
+    McpRuntime, McpStages, McpTransport, McpWarnings, Owner, PlanUsageCache, PodmanExecutor,
+    PrerequisiteEdit, Project, ProjectForge, Projects, PublishRequest, Published, ReadyAction,
+    Rebase, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore,
+    SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store, SummaryRequest,
+    UnavailableSecrets, UpstreamCredential, WatchReport, WatchRequest, WorkerSlots,
+    credential_failure, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -7312,6 +7313,7 @@ fn fake_gh(dir: &std::path::Path) -> (Arc<PodmanExecutor>, PathBuf) {
         )),
         store,
         plan_usage: Arc::new(PlanUsageCache::new()),
+        local_probe: Arc::new(HttpLocalServerProbe::new()),
     };
     (Arc::new(podman), calls)
 }

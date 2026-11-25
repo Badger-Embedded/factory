@@ -18,8 +18,9 @@ use factory_runner::{
 };
 use factory_server::{
     AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
-    LocalKeyOwner, LocalRequest, LocalSecrets, MASTER_KEY_LEN, Operation, Owner, PlanUsageCache,
-    PodmanExecutor, Rebase, SecretStore, Settings, Store,
+    LoadFuture, LocalKeyOwner, LocalRequest, LocalSecrets, LocalServerProbe, MASTER_KEY_LEN,
+    ModelsFuture, Operation, Owner, PlanUsageCache, PodmanExecutor, Rebase, SecretStore, Settings,
+    Store,
 };
 
 mod support;
@@ -53,6 +54,25 @@ fn forges(github: GitHub) -> Forges {
     )
 }
 
+/// A server that has every model loaded, so a Local run goes on to its worker.
+struct LoadedModel;
+
+impl LocalServerProbe for LoadedModel {
+    fn models<'a>(&'a self, _: &'a str, _: Option<&'a str>) -> ModelsFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn load<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: Duration,
+    ) -> LoadFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) -> PodmanExecutor {
     PodmanExecutor {
         base: WorkerConfig::default(),
@@ -66,6 +86,7 @@ fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) 
         registry,
         store,
         plan_usage: Arc::new(PlanUsageCache::new()),
+        local_probe: Arc::new(LoadedModel),
     }
 }
 
