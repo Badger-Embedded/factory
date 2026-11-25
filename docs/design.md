@@ -345,13 +345,15 @@ Not yet done: the three runs against `http://gfx1201:9931` on moon (one request 
 
 Procedure for the operator:
 
-1. In the factory's Local settings, set the server to `http://gfx1201:9931`, fetch the model list, and set the CLI to Claude Code. Note the CLI versions in the deployed worker image (`claude --version`, `codex --version`, `copilot --version`).
-2. Create a project whose implement stage is Local, with the model `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`.
-3. Unload the model: `curl -X POST http://gfx1201:9931/models/unload`.
-4. Submit a request that asks for one small file. Watch the job log and note the "Waiting for the local server to load" line and the seconds waited, the time the worker started, and the model's output and the commit it made.
-5. Repeat steps 3 and 4 with the CLI set to Codex, then to Copilot.
+1. In the factory's Local settings, set the server to `http://gfx1201:9931` and fetch the model list. Note the CLI versions in the deployed worker image (`claude --version`, `codex --version`, `copilot --version`).
+2. Create a test project with auto-merge off and its implement stage set to Local with the model `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`.
+3. For each CLI in turn (Claude Code, Codex, then Copilot), save the CLI in Settings → Agents → Local and run a fresh request that asks for one small file.
+4. Unload the model immediately before the implement stage starts, so the first request has to load it. With a plan approval gate, unload it before approving the plan, not before submitting the request. The command surfaces errors:
+   `curl --fail-with-body -H 'Content-Type: application/json' -d '{"model":"unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M"}' http://gfx1201:9931/models/unload`
+   Confirm the unload took effect before the stage starts, for example by checking that the server lists the model as unloaded.
+5. Watch the job log. A commit or merge is not required.
 
-Record in the PR's Verification section and here, per CLI: the CLI version, the model-load wait, the worker start and the model's output.
+Record in the PR's Verification section and here, per CLI: the job link, the CLI version, the model-load wait (the "Waiting for the local server to load" line and the seconds waited), the worker start, and a short excerpt of the model's output.
 
 ### Request timeouts
 
