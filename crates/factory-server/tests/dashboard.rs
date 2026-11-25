@@ -1656,10 +1656,33 @@ async fn a_job_without_cost_shows_a_dash() {
 }
 
 #[tokio::test]
+async fn a_zero_cost_of_a_subscription_run_still_shows_a_dash() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 0.0, false).unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\" id=\"job-cost\">–</span>")
+    );
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("<span class=\"cost\">–</span>"));
+}
+
+#[tokio::test]
 async fn a_job_that_only_ran_on_local_shows_zero_dollars_with_no_estimate_mark() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     dashboard.store.add_cost(id, 0.0, false).unwrap();
+    dashboard
+        .store
+        .session_uuid(id, Session::Planning, Agent::Local)
+        .unwrap();
+    dashboard
+        .store
+        .record_session_local_cli(id, Session::Planning, Cli::Codex)
+        .unwrap();
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(

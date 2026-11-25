@@ -103,6 +103,7 @@ fn local_request(cli: Cli) -> AgentRequest {
             },
             key_from: LocalKeyOwner::None,
             setting_cli: cli,
+            session: factory_core::Session::Planning,
         }),
         ..request()
     }

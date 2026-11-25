@@ -526,6 +526,11 @@ pub struct ProjectTotals {
     pub jobs_merged: i64,
 }
 
+/// Selects the `job_costs` rows to show as a cost: a positive total, or a zero
+/// total of a job that ran a worker on Local. Another zero row reads as no cost.
+const SHOWN_COST: &str = "(c.usd > 0 OR EXISTS (
+    SELECT 1 FROM sessions s WHERE s.job_id = c.job_id AND s.local_cli IS NOT NULL))";
+
 /// One model's Codex prices, in USD per million tokens. The factory estimates a
 /// Codex run's cost from the row for the model it ran, since Codex reports token
 /// counts and no dollar figure. An operator keeps the table on the Codex
@@ -2552,8 +2557,8 @@ impl Store {
     }
 
     /// The API cost of job `id` in USD, or `None` when the job has no cost row.
-    /// A Local run writes a row of $0, so `Some(0.0)` tells a job that ran on
-    /// Local apart from one that has no cost at all.
+    /// A zero row counts only for a job that started a Local worker, so it
+    /// shows `$0.00`. Any other zero row reads as no cost.
     ///
     /// # Errors
     ///
@@ -2561,9 +2566,11 @@ impl Store {
     pub fn recorded_cost(&self, id: i64) -> Result<Option<f64>, StoreError> {
         Ok(self
             .conn()
-            .query_row("SELECT usd FROM job_costs WHERE job_id = ?1", [id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                &format!("SELECT usd FROM job_costs c WHERE job_id = ?1 AND {SHOWN_COST}"),
+                [id],
+                |row| row.get(0),
+            )
             .optional()?)
     }
 
@@ -2574,7 +2581,9 @@ impl Store {
     /// Fails on a database error.
     pub fn costs(&self) -> Result<HashMap<i64, f64>, StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT job_id, usd FROM job_costs")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT job_id, usd FROM job_costs c WHERE {SHOWN_COST}"
+        ))?;
         let costs = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;

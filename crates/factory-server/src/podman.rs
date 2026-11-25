@@ -273,7 +273,8 @@ impl Executor for PodmanExecutor {
     ) -> RunReport {
         let agent = request.agent;
         let entry = self.registry.entry(agent);
-        let local = request.local.clone().map(|local| local.target);
+        let request_local = request.local.clone();
+        let local = request_local.clone().map(|local| local.target);
         let (mut token, cli) = match credential_and_cli(&entry, agent, local.as_ref()) {
             Ok(found) => found,
             Err(reason) => return failed(reason),
@@ -353,6 +354,15 @@ impl Executor for PodmanExecutor {
             local,
         };
         let is_local = worker.local.is_some();
+        // The session starts on this CLI only now, after the checkout and the
+        // credential steps that can still fail the run.
+        if let Some(local) = &request_local
+            && let Err(err) =
+                self.store
+                    .record_session_local_cli(request.job_id, local.session, local.target.cli)
+        {
+            return failed(format!("could not record the session's CLI: {err}"));
+        }
         let report = run(
             &config,
             &worker,

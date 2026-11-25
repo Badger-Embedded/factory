@@ -142,6 +142,9 @@ pub struct LocalRequest {
     /// The CLI the Local settings name now. It differs from `target.cli` when
     /// the run resumes a session that started on another CLI.
     pub setting_cli: Cli,
+    /// The session the run belongs to. The executor records the CLI on it
+    /// once the worker starts.
+    pub session: Session,
 }
 
 /// Whose API key a Local run uses.
@@ -1367,6 +1370,7 @@ impl<E: Executor> Scheduler<E> {
         let agents = self.store.project_agents(&row.project)?;
         let stage = stage_agent(&agents, expect);
         let (session_id, agent) = self.store.session_uuid(row.id, session, stage)?;
+        let mut stage_note = None;
         let (model, effort) = if agent == stage {
             let models = self.store.project_models(&row.project, &project.models)?;
             let model = match expect {
@@ -1399,22 +1403,20 @@ impl<E: Executor> Scheduler<E> {
                 .as_ref()
                 .and_then(|last| last.effort.clone())
                 .unwrap_or_else(|| agent.default_effort().to_owned());
-            self.store.append_factory_log(
-                row.id,
-                &format!(
-                    "This session started on {from}, so it stays on {from} with its earlier model. \
-                     The {stage_name} stage is now set to {to}, which new sessions use.",
-                    from = agent.display_name(),
-                    to = stage.display_name(),
-                    stage_name = stage_name(expect),
-                ),
-            )?;
+            stage_note = Some(format!(
+                "This session started on {from}, so it stays on {from} with its earlier model. \
+                 The {stage_name} stage is now set to {to}, which new sessions use.",
+                from = agent.display_name(),
+                to = stage.display_name(),
+                stage_name = stage_name(expect),
+            ));
             (last.and_then(|last| last.model), effort)
         };
         let local = if agent == Agent::Local {
             match self.local_request(row, session, model.as_deref())? {
                 Ok(local) => Some(local),
                 Err(reason) => {
+                    self.open_run_log(row.id, None, stage_note.as_deref())?;
                     self.store.apply(row.id, Event::AgentFailed { reason })?;
                     return Ok(None);
                 }
@@ -1422,6 +1424,7 @@ impl<E: Executor> Scheduler<E> {
         } else {
             None
         };
+        self.open_run_log(row.id, local.as_ref(), stage_note.as_deref())?;
         let agent_session = self.store.agent_session(row.id, session)?;
         let selection = self.mcp_config(row.id, &row.project, expect)?;
         let mcp_servers: Vec<String> = selection
@@ -1464,7 +1467,7 @@ impl<E: Executor> Scheduler<E> {
     /// The Local settings for a run of `session`, read afresh so a change
     /// applies from the next run, or the reason the run cannot start. It checks
     /// the server and the model before any checkout or container. A session
-    /// resumes on the CLI it started on, and a fresh one records the CLI the
+    /// resumes on the CLI it started on, and a fresh one uses the CLI the
     /// settings name now.
     fn local_request(
         &self,
@@ -1487,7 +1490,6 @@ impl<E: Executor> Scheduler<E> {
             .store
             .session_local_cli(row.id, session)?
             .unwrap_or(settings.cli);
-        self.store.record_session_local_cli(row.id, session, cli)?;
         Ok(Ok(LocalRequest {
             target: LocalTarget {
                 cli,
@@ -1497,6 +1499,7 @@ impl<E: Executor> Scheduler<E> {
             },
             key_from,
             setting_cli: settings.cli,
+            session,
         }))
     }
 
@@ -1898,9 +1901,6 @@ impl<E: Executor> Scheduler<E> {
             .agent_session
             .clone()
             .unwrap_or_else(|| request.session_id.clone());
-        if let Some(local) = &request.local {
-            self.note_local_run(job_id, local);
-        }
         self.note(
             job_id,
             &format!("Agent run started in session {session_label}."),
@@ -1957,6 +1957,23 @@ impl<E: Executor> Scheduler<E> {
         }
         self.record_run_cost(job_id, &cost_session, agent, model.as_deref(), &report);
         self.apply(job_id, report.event);
+    }
+
+    /// Writes the notices that precede a run's own output, the Local run line
+    /// first.
+    fn open_run_log(
+        &self,
+        job_id: i64,
+        local: Option<&LocalRequest>,
+        stage_note: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if let Some(local) = local {
+            self.note_local_run(job_id, local);
+        }
+        if let Some(note) = stage_note {
+            self.store.append_factory_log(job_id, note)?;
+        }
+        Ok(())
     }
 
     /// Writes the line that opens a Local run: the CLI, the server and whose key

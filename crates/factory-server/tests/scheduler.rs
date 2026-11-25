@@ -97,6 +97,11 @@ struct FakeExecutor {
     /// A podman executor over a fake gh. When set, the Renovate watch, rerun
     /// and merge go through it, so the real access checks run.
     cli: Mutex<Option<Arc<PodmanExecutor>>>,
+    /// The store a Local run records its CLI in once its worker starts, as the
+    /// podman executor does.
+    local_store: Mutex<Option<Arc<Store>>>,
+    /// How many next Local runs fail before the worker starts.
+    prestart_failures: Mutex<usize>,
 }
 
 /// The state the fake reports for the Renovate pull request.
@@ -151,6 +156,8 @@ impl FakeExecutor {
             pr_files: Mutex::new(Vec::new()),
             gathered: Mutex::new(Vec::new()),
             resolved_range: Mutex::new(None),
+            local_store: Mutex::new(None),
+            prestart_failures: Mutex::new(0),
             cli: Mutex::new(None),
         })
     }
@@ -203,6 +210,31 @@ impl Executor for FakeExecutor {
     ) -> RunReport {
         self.requests.lock().unwrap().push(request.clone());
         self.gate.acquire().await.unwrap().forget();
+        if let Some(local) = &request.local {
+            let failing = {
+                let mut left = self.prestart_failures.lock().unwrap();
+                let failing = *left > 0;
+                *left = left.saturating_sub(1);
+                failing
+            };
+            if failing {
+                return RunReport {
+                    event: Event::AgentFailed {
+                        reason: "could not prepare the checkout".into(),
+                    },
+                    session_id: None,
+                    cost_usd: None,
+                    mcp_unavailable: Vec::new(),
+                    credential: None,
+                    token_usage: None,
+                };
+            }
+            if let Some(store) = self.local_store.lock().unwrap().as_ref() {
+                store
+                    .record_session_local_cli(request.job_id, local.session, local.target.cli)
+                    .unwrap();
+            }
+        }
         // Stream back the agent's own session id, if the test queued one, before
         // the run ends, the way a Codex run reports its thread id mid-run.
         if let Some(id) = self.sessions.lock().unwrap().pop_front() {
@@ -7514,6 +7546,7 @@ fn setup_local(
     let store = Arc::new(Store::open_in_memory().unwrap());
     let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
     let executor = FakeExecutor::new(respond);
+    *executor.local_store.lock().unwrap() = Some(Arc::clone(&store));
     let projects: Projects = [(
         "maestro".to_owned(),
         Project {
@@ -7849,6 +7882,71 @@ async fn a_local_session_resumes_on_its_cli_and_a_new_one_uses_the_setting() {
         ["This session started on Codex, so it stays on Codex. \
              The Local settings name Copilot now, which new sessions use."]
     );
+}
+
+#[tokio::test]
+async fn a_failure_before_the_worker_starts_leaves_the_session_without_a_cli() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    *executor.prestart_failures.lock().unwrap() = 1;
+    executor.release(2);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    assert_eq!(
+        store
+            .session_local_cli(id, factory_core::Session::Planning)
+            .unwrap(),
+        None
+    );
+
+    store
+        .save_local_settings(Some(LOCAL_URL), factory_core::Cli::Copilot, 10)
+        .unwrap();
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(
+        local_of(&requests[1]).target.cli,
+        factory_core::Cli::Copilot
+    );
+    assert!(
+        !log_texts(&store, id)
+            .iter()
+            .any(|text| text.contains("stays on"))
+    );
+    assert_eq!(
+        store
+            .session_local_cli(id, factory_core::Session::Planning)
+            .unwrap(),
+        Some(factory_core::Cli::Copilot)
+    );
+}
+
+#[tokio::test]
+async fn the_local_run_line_opens_the_run_before_any_notice() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    executor.release(3);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    store
+        .save_project_agents("maestro", &StageAgents::default())
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+
+    let log = log_texts(&store, id);
+    let runs: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| text.starts_with("Local run on"))
+        .map(|(at, _)| at)
+        .collect();
+    let notice = log
+        .iter()
+        .rposition(|text| text.contains("stays on Local"))
+        .expect("the stage notice");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1] + 1, notice);
 }
 
 #[tokio::test]
