@@ -267,6 +267,41 @@ async fn without_a_master_key_a_key_is_refused_and_clear_works() {
 }
 
 #[tokio::test]
+async fn without_a_master_key_a_keyless_server_is_still_fetched() {
+    let harness = harness_unavailable();
+    let stub = stub().await;
+    let reply = save(&harness, &stub.url, "", "codex", "10").await;
+    assert!(reply.body.contains("The server lists 2 models."));
+    assert!(!reply.body.contains("cannot be read"));
+    assert_eq!(*stub.auth.lock().unwrap(), [None]);
+}
+
+#[tokio::test]
+async fn without_a_master_key_a_stored_key_row_is_unreadable_and_not_sent() {
+    let harness = harness_unavailable();
+    let stub = stub().await;
+    save(&harness, &stub.url, "", "codex", "10").await;
+    harness
+        .store
+        .put_secret(
+            factory_server::SecretRef {
+                project: "",
+                server: "",
+                header: "local-key",
+            },
+            "local",
+            b"sealed",
+        )
+        .unwrap();
+    let page = harness.get(PAGE).await;
+    assert!(page.body.contains("A key is stored."));
+    assert!(page.body.contains("The stored key cannot be read"));
+    let reply = post_token(&harness, "/settings/agents/local/refresh").await;
+    assert!(reply.body.contains("The earlier list stays."));
+    assert_eq!(stub.auth.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn a_save_stores_the_models_the_server_lists() {
     let harness = harness();
     let stub = stub().await;

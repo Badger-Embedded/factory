@@ -4250,13 +4250,9 @@ fn local_page(
     let login = user(headers);
     let settings = state.store.local_settings()?;
     let models = state.store.local_models()?;
-    let (key_stored, key_unreadable) = if state.secrets.available() {
-        match state.secrets.local_key() {
-            Ok(key) => (key.is_some(), false),
-            Err(_) => (true, true),
-        }
-    } else {
-        (false, false)
+    let (key_stored, key_unreadable) = match state.secrets.local_key() {
+        Ok(key) => (key.is_some(), false),
+        Err(_) => (true, true),
     };
     let notice = match notice {
         None if key_unreadable => Some(KEY_UNREADABLE),

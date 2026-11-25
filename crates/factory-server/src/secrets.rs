@@ -752,7 +752,10 @@ impl SecretStore for UnavailableSecrets {
     }
 
     fn local_key(&self) -> Result<Option<String>, SecretError> {
-        Err(SecretError::Unavailable)
+        match self.store.get_secret(LOCAL_KEY_REF)? {
+            None => Ok(None),
+            Some(_) => Err(SecretError::Unavailable),
+        }
     }
 
     fn set_local_key(&self, _value: &str) -> Result<(), SecretError> {
