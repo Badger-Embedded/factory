@@ -4352,6 +4352,7 @@ async fn save_local_key(
         );
     }
     let key = form.key.trim();
+    let _one_local_change_at_a_time = state.local_lock.lock().await;
     let current = state.store.local_settings()?.url.unwrap_or_default();
     if !key.is_empty() && form.server != current {
         return local_key_page(
