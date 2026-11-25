@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use factory_core::{Agent, Command, DEFAULT_AGENT, Event, Gates, Stage, Wait};
+use factory_core::{Agent, Cli, Command, DEFAULT_AGENT, Event, Gates, Stage, Wait};
 use factory_runner::{Access, Account, Expect, ForgeAccount, ForgeKind};
 use maud::{Markup, html};
 use serde::Deserialize;
@@ -25,6 +25,7 @@ use crate::forge_tokens::{self, SaveError};
 use crate::forgejo_instances::{ForgejoProbe, HttpForgejoProbe};
 use crate::forges::Forges;
 use crate::github::RepoReport;
+use crate::local_server::{HttpLocalServerProbe, LocalServerProbe, normalize_server_url};
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTransport};
 use crate::pages::{self, HeaderState, JobLinks, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{
@@ -35,8 +36,9 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, Maintenance, MaintenanceSave, Packaging, PackagingType,
-    PrerequisiteEdit, PrerequisiteView, ProjectGuard, ProjectTotals, Store, StoreError,
+    FACTORY_REQUESTER, JobFile, JobRow, MAX_LOCAL_LOAD_MINUTES, Maintenance, MaintenanceSave,
+    Packaging, PackagingType, PrerequisiteEdit, PrerequisiteView, ProjectGuard, ProjectTotals,
+    Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -70,6 +72,8 @@ struct AppState {
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
     forgejo_probe: Arc<dyn ForgejoProbe>,
+    local_probe: Arc<dyn LocalServerProbe>,
+    local_lock: Arc<tokio::sync::Mutex<()>>,
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
     onboarding: Arc<tokio::sync::Mutex<()>>,
@@ -129,6 +133,7 @@ pub fn app(
         secrets,
         checker,
         Arc::new(HttpForgejoProbe::new(&[])),
+        Arc::new(HttpLocalServerProbe::new()),
         registry,
         device_login,
         copilot_login,
@@ -137,7 +142,8 @@ pub fn app(
 }
 
 /// As [`app`], reading the version of a Forgejo server through `forgejo_probe`
-/// when an admin registers one.
+/// when an admin registers one, and the models of the Local server through
+/// `local_probe`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the dashboard wires each long-lived dependency the handlers share"
@@ -153,6 +159,7 @@ pub fn app_with_forgejo_probe(
     secrets: Arc<dyn SecretStore>,
     checker: Arc<dyn McpChecker>,
     forgejo_probe: Arc<dyn ForgejoProbe>,
+    local_probe: Arc<dyn LocalServerProbe>,
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
     copilot_login: Arc<DeviceLogin>,
@@ -169,6 +176,8 @@ pub fn app_with_forgejo_probe(
         secrets,
         checker,
         forgejo_probe,
+        local_probe,
+        local_lock: Arc::new(tokio::sync::Mutex::new(())),
         registry,
         device_login,
         onboarding: Arc::new(tokio::sync::Mutex::new(())),
@@ -268,6 +277,9 @@ fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/settings/polling", get(show_polling).post(save_polling))
         .route("/settings/renovate", get(show_renovate).post(save_renovate))
         .route("/settings/claude", get(redirect_claude))
+        .route("/settings/agents/local", get(show_local).post(save_local))
+        .route("/settings/agents/local/clear-key", post(clear_local_key))
+        .route("/settings/agents/local/refresh", post(refresh_local_models))
         .route("/settings/agents/claude", get(show_claude))
         .route("/settings/agents/claude/token", post(save_claude_token))
         .route(
@@ -1807,7 +1819,6 @@ fn settings_nav(state: &AppState, login: &str) -> Result<pages::SettingsNav, Sto
                 id: entry.id().to_owned(),
                 name: entry.display_name().to_owned(),
                 url: entry.settings_url().map(str::to_owned),
-                available: entry.available(),
             })
             .collect(),
     })
@@ -4222,6 +4233,195 @@ async fn clear_claude_token(
 ) -> Result<Markup, AppError> {
     state.secrets.clear_claude_token()?;
     claude_page(&state, &headers, Some("Cleared."))
+}
+
+struct LocalDraft<'a> {
+    url: &'a str,
+    cli: Cli,
+    load_timeout: &'a str,
+}
+
+fn local_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    draft: Option<&LocalDraft<'_>>,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    let settings = state.store.local_settings()?;
+    let models = state.store.local_models()?;
+    let (key_stored, key_unreadable) = match state.secrets.local_key() {
+        Ok(key) => (key.is_some(), false),
+        Err(_) => (true, true),
+    };
+    let notice = match notice {
+        None if key_unreadable => Some(KEY_UNREADABLE),
+        other => other,
+    };
+    let stored_timeout = settings.load_timeout_minutes.to_string();
+    let (url, cli, load_timeout) = match draft {
+        Some(draft) => (draft.url, draft.cli, draft.load_timeout),
+        None => (
+            settings.url.as_deref().unwrap_or(""),
+            settings.cli,
+            stored_timeout.as_str(),
+        ),
+    };
+    Ok(pages::settings_local_agent(
+        &login,
+        &settings_nav(state, &login)?,
+        &pages::LocalAgentView {
+            settings: &settings,
+            models: &models,
+            key_stored,
+            secrets_available: state.secrets.available(),
+            url,
+            cli,
+            load_timeout,
+            csrf: &state.csrf.issue(&login),
+        },
+        notice,
+    ))
+}
+
+const KEY_UNREADABLE: &str = "The stored key cannot be read. Save it again or clear it.";
+
+async fn show_local(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {
+    local_page(&state, &headers, None, None)
+}
+
+#[derive(Deserialize)]
+struct LocalForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    cli: String,
+    #[serde(default)]
+    load_timeout: String,
+}
+
+/// Reads the model list from the stored server with the factory key, when one
+/// is stored, and replaces the stored list on success. The notice says what
+/// happened; a failure keeps the earlier list.
+async fn fetch_local_models(state: &AppState) -> Result<String, AppError> {
+    let Some(url) = state.store.local_settings()?.url else {
+        return Ok("No server is set, so no models were fetched.".to_owned());
+    };
+    let Ok(key) = state.secrets.local_key() else {
+        return Ok(format!(
+            "The model list was not updated: {KEY_UNREADABLE} The earlier list stays."
+        ));
+    };
+    match state.local_probe.models(&url, key.as_deref()).await {
+        Ok(ids)
+            if key
+                .as_deref()
+                .is_some_and(|key| ids.iter().any(|id| id.contains(key))) =>
+        {
+            Ok(
+                "The model list was not updated: the server returned the key as a model id. \
+                The earlier list stays."
+                    .to_owned(),
+            )
+        }
+        Ok(ids) => {
+            state.store.replace_local_models(&ids, now_secs())?;
+            Ok(format!("The server lists {} models.", ids.len()))
+        }
+        Err(err) => Ok(format!(
+            "The model list was not updated: {err}. The earlier list stays."
+        )),
+    }
+}
+
+async fn save_local(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let _one_local_change_at_a_time = state.local_lock.lock().await;
+    let cli = Cli::from_id(&form.cli);
+    let draft = LocalDraft {
+        url: &form.url,
+        cli: cli.unwrap_or(Cli::Codex),
+        load_timeout: &form.load_timeout,
+    };
+    let refused = |problem: &str| -> Result<Response, AppError> {
+        Ok((
+            StatusCode::BAD_REQUEST,
+            local_page(&state, &headers, Some(&draft), Some(problem))?,
+        )
+            .into_response())
+    };
+    let Some(cli) = cli else {
+        return refused("Choose one of the CLIs.");
+    };
+    let minutes = match form.load_timeout.trim().parse::<u32>() {
+        Ok(minutes) if (1..=MAX_LOCAL_LOAD_MINUTES).contains(&minutes) => minutes,
+        _ => {
+            return refused(&format!(
+                "The model load timeout must be a whole number of minutes, 1 to {MAX_LOCAL_LOAD_MINUTES}."
+            ));
+        }
+    };
+    let url = match form.url.trim() {
+        "" => None,
+        text => match normalize_server_url(text) {
+            Ok(url) => Some(url),
+            Err(problem) => return refused(&problem),
+        },
+    };
+    let key = form.key.trim();
+    if !key.is_empty() && !state.secrets.available() {
+        return refused("The master key is missing, so a key cannot be saved here.");
+    }
+    state
+        .store
+        .save_local_settings(url.as_deref(), cli, minutes)?;
+    if !key.is_empty() {
+        state.secrets.set_local_key(key)?;
+    }
+    let notice = if url.is_some() {
+        format!("Saved. {}", fetch_local_models(&state).await?)
+    } else {
+        "Saved.".to_owned()
+    };
+    Ok(local_page(&state, &headers, None, Some(&notice))?.into_response())
+}
+
+#[derive(Deserialize)]
+struct LocalCsrfForm {
+    #[serde(default)]
+    csrf: String,
+}
+
+async fn refresh_local_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalCsrfForm>,
+) -> Result<Markup, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let _one_local_change_at_a_time = state.local_lock.lock().await;
+    let notice = fetch_local_models(&state).await?;
+    local_page(&state, &headers, None, Some(&notice))
+}
+
+/// Removes the factory key. It works without the master key, so a key stranded
+/// by a lost key can still be removed.
+async fn clear_local_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalCsrfForm>,
+) -> Result<Markup, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let _one_local_change_at_a_time = state.local_lock.lock().await;
+    state.secrets.clear_local_key()?;
+    local_page(&state, &headers, None, Some("Cleared."))
 }
 
 async fn show_codex(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {

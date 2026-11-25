@@ -15,10 +15,15 @@
 // - Copilot: set a token and clear it: "Copilot sets and clears the token";
 //   start a device login and cancel it:
 //   "Copilot device login shows the code and can be cancelled"
+// - Local: save a server, the CLI and a key, list the models the stub server
+//   serves, refresh them and remove the key: "Local stores the server, a key and
+//   the model list"
 // - MCP servers: add a server, edit it, add and remove header-name rows, and
 //   delete the server: "MCP servers: add, edit with header rows, and delete"
 // - A login that is not an admin gets "This page is for factory admins.":
 //   "a login that is not an admin is turned away from the factory-wide settings"
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import type { Page } from '@playwright/test';
 import { expect, startFactory, test as base, type Factory, COLLABORATOR } from '../fixtures';
 
@@ -202,6 +207,60 @@ test('Copilot sets and clears the token', async ({ page }) => {
   await expect(page.getByText('No token is stored.').first()).toBeVisible();
 });
 
+test('Local stores the server, a key and the model list', async ({ page }) => {
+  const seen: Array<string | undefined> = [];
+  const models = ['gemma-4-26B'];
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: models.map((id) => ({ id })) }));
+  });
+  await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    await page.goto('/settings/agents/local');
+    await expect(page.getByLabel('CLI')).toHaveValue('codex');
+    await expect(page.getByLabel('Model load timeout (minutes)')).toHaveValue('10');
+    await expect(page.getByText('No models are stored.')).toBeVisible();
+
+    await page.getByLabel('Server URL').fill(`${url}/v1/`);
+    await page.getByLabel('Factory API key (optional)').fill('sk-e2e-local');
+    await page.getByLabel('CLI').selectOption('claude');
+    await page.getByLabel('Model load timeout (minutes)').fill('20');
+    await page.getByRole('button', { name: 'Save' }).click();
+    await expect(page.getByText('Saved. The server lists 1 models.')).toBeVisible();
+    await expect(page.locator('#local-models').getByText('gemma-4-26B')).toBeVisible();
+    expect(seen).toEqual(['Bearer sk-e2e-local']);
+
+    await page.goto('/settings/agents/local');
+    await expect(page.getByLabel('Server URL')).toHaveValue(url);
+    await expect(page.getByLabel('CLI')).toHaveValue('claude');
+    await expect(page.getByLabel('Model load timeout (minutes)')).toHaveValue('20');
+    await expect(page.getByLabel('Factory API key (optional)')).toHaveAttribute(
+      'placeholder',
+      'set',
+    );
+
+    models.push('Llama-3.2-1B');
+    await page.getByRole('button', { name: 'Refresh models' }).click();
+    await expect(page.getByText('The server lists 2 models.')).toBeVisible();
+    await expect(page.locator('#local-models').getByText('Llama-3.2-1B')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Remove key' }).click();
+    await expect(page.getByText('Cleared.', { exact: true })).toBeVisible();
+    await expect(page.getByText('No key is stored.')).toBeVisible();
+
+    await page.getByLabel('Model load timeout (minutes)').fill('61');
+    await page.getByLabel('Model load timeout (minutes)').evaluate((el) => {
+      (el as HTMLInputElement).removeAttribute('max');
+    });
+    await page.getByRole('button', { name: 'Save' }).click();
+    await expect(page.locator('.saved')).toContainText('1 to 60');
+  } finally {
+    server.close();
+  }
+});
+
 test('MCP servers: add, edit with header rows, and delete', async ({ page }) => {
   await page.goto('/settings/mcp');
   await expect(page.getByText('No servers yet.')).toBeVisible();
@@ -339,15 +398,6 @@ test.describe('without JavaScript', () => {
   });
 });
 
-test('the sidebar lists Local after Copilot without a link', async ({ page }) => {
-  await page.goto('/settings/polling');
-  const nav = page.locator('nav.settings-nav');
-  await expect(nav.locator('.settings-disabled', { hasText: 'Local' })).toHaveText(
-    'LocalNot available yet',
-  );
-  await expect(nav.getByRole('link', { name: 'Local', exact: true })).toHaveCount(0);
-});
-
 test('a login that is not an admin is turned away from the factory-wide settings', async ({
   page,
 }) => {
@@ -360,6 +410,7 @@ test('a login that is not an admin is turned away from the factory-wide settings
     '/settings/agents/claude',
     '/settings/agents/codex',
     '/settings/agents/copilot',
+    '/settings/agents/local',
     '/settings/mcp',
   ]) {
     const response = await page.goto(path);

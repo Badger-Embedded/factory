@@ -407,6 +407,7 @@ fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
     let claude = at("", "", "claude-token");
     let codex = at("", "", "codex-auth");
     let copilot = at("", "", "copilot-token");
+    let local = at("", "", "local-key");
 
     secrets
         .put(header, "Bearer sk-header")
@@ -420,6 +421,7 @@ fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
     secrets
         .set_copilot_token("gho_copilottoken")
         .expect("set copilot token");
+    secrets.set_local_key("sk-local").expect("set local key");
 
     let raw = |reference| {
         store
@@ -432,6 +434,7 @@ fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
         ("claude", claude),
         ("codex", codex),
         ("copilot", copilot),
+        ("local", local),
     ];
     for (source_name, source) in rows {
         let (backend, bytes) = raw(source);
@@ -447,6 +450,7 @@ fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
                 "claude" => secrets.claude_token(),
                 "codex" => secrets.codex_auth(),
                 "copilot" => secrets.copilot_token(),
+                "local" => secrets.local_key(),
                 _ => unreachable!(),
             };
             assert!(
@@ -460,6 +464,7 @@ fn a_ciphertext_moved_between_the_reserved_and_header_rows_fails() {
                 "claude" => secrets.set_claude_token("sk-ant-oat01-token"),
                 "codex" => secrets.set_codex_auth(&auth_json("access-token", "refresh-token")),
                 "copilot" => secrets.set_copilot_token("gho_copilottoken"),
+                "local" => secrets.set_local_key("sk-local"),
                 _ => unreachable!(),
             };
             restore.expect("restore the destination row");
@@ -562,6 +567,37 @@ fn copilot_token_round_trips() {
     assert!(secrets.copilot_token().expect("read cleared").is_none());
 
     secrets.clear_copilot_token().expect("clear again");
+}
+
+#[test]
+fn local_key_round_trips_and_clears_without_the_master_key() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+
+    assert!(secrets.local_key().expect("read empty").is_none());
+    secrets.set_local_key("sk-first").expect("set");
+    secrets.set_local_key("sk-second").expect("replace");
+    assert_eq!(
+        secrets.local_key().expect("read").as_deref(),
+        Some("sk-second"),
+    );
+    let (_, raw) = store
+        .get_secret(at("", "", "local-key"))
+        .expect("raw row")
+        .expect("row exists");
+    assert!(!contains(&raw, b"sk-second"));
+
+    let unavailable = UnavailableSecrets::new(Arc::clone(&store));
+    assert!(matches!(
+        unavailable.local_key(),
+        Err(SecretError::Unavailable)
+    ));
+    assert!(matches!(
+        unavailable.set_local_key("sk-x"),
+        Err(SecretError::Unavailable),
+    ));
+    unavailable.clear_local_key().expect("clear");
+    assert!(secrets.local_key().expect("read cleared").is_none());
 }
 
 #[test]

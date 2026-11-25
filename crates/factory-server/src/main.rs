@@ -6,10 +6,11 @@ use std::sync::Arc;
 use factory_runner::{ForgeKind, Git, GitHub, GitLab, WorkerConfig};
 use factory_server::{
     Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, GlabRepos,
-    HttpForgejoProbe, HttpMcpChecker, LocalSecrets, LoginSpec, McpChecker, McpRuntime, McpWarnings,
-    PlanUsageCache, PodmanExecutor, PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens,
-    Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots,
-    app_with_forgejo_probe, import_tomls, master_key_from_env, parse_admins, proxy_app_with_roots,
+    HttpForgejoProbe, HttpLocalServerProbe, HttpMcpChecker, LocalSecrets, LoginSpec, McpChecker,
+    McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin, Projects, ProxyEvent,
+    ProxyEventFn, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets,
+    Upstreams, WorkerSlots, app_with_forgejo_probe, import_tomls, master_key_from_env,
+    parse_admins, proxy_app_with_roots,
 };
 use tokio::sync::Notify;
 
@@ -312,6 +313,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             secrets,
             checker,
             Arc::new(forgejo_probe),
+            Arc::new(HttpLocalServerProbe::new()),
             agents,
             device_login,
             copilot_login,

@@ -897,14 +897,12 @@ pub enum SettingsPage {
 }
 
 /// One agent in the sidebar's Agents group, as the registry reports it: the id
-/// the open page marks itself with, the display name, the account page URL (none
-/// for an agent with no page, which the sidebar lists without a link), and
-/// whether the agent can run. A disabled entry shows "Not available yet".
+/// the open page marks itself with, the display name and the account page URL (none
+/// for an agent with no page, which the sidebar lists as "Not available yet").
 pub struct AgentNav {
     pub id: String,
     pub name: String,
     pub url: Option<String>,
-    pub available: bool,
 }
 
 /// What the settings sidebar lists besides its fixed entries.
@@ -980,9 +978,9 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
                 (entry("/settings/forgejo".into(), "Forgejo servers", &SettingsPage::Forgejo))
                 p.settings-group { "Agents" }
                 @for agent in &nav.agents {
-                    @match (agent.available, &agent.url) {
-                        (true, Some(url)) => (entry(url.clone(), &agent.name, &SettingsPage::Agent(agent.id.clone()))),
-                        _ => span.settings-link.settings-disabled {
+                    @match &agent.url {
+                        Some(url) => (entry(url.clone(), &agent.name, &SettingsPage::Agent(agent.id.clone()))),
+                        None => span.settings-link.settings-disabled {
                             (agent.name)
                             span.settings-note { "Not available yet" }
                         },
@@ -1201,6 +1199,108 @@ pub fn settings_renovate(
                     p.hint { "Reruns one head commit gets before the factory comments and stops. Not less than the automatic reruns." }
                 }
                 (save_bar("Save"))
+            }
+        },
+    )
+}
+
+/// What the Local agent page shows: the stored settings and model list, whether
+/// a factory key is stored, and the form values a refused save submitted.
+pub struct LocalAgentView<'a> {
+    pub settings: &'a crate::LocalSettings,
+    pub models: &'a [String],
+    pub key_stored: bool,
+    pub secrets_available: bool,
+    /// The URL field's value: the stored URL, or what a refused save submitted.
+    pub url: &'a str,
+    pub cli: factory_core::Cli,
+    pub load_timeout: &'a str,
+    pub csrf: &'a str,
+}
+
+pub fn settings_local_agent(
+    user: &str,
+    nav: &SettingsNav,
+    view: &LocalAgentView<'_>,
+    notice: Option<&str>,
+) -> Markup {
+    let csrf = view.csrf;
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Agent("local".to_owned()),
+        "Local",
+        notice,
+        &html! {
+            h1 { "Local" }
+            p.meta {
+                "Runs a stage on a model served by an OpenAI-compatible server, such as a llama.cpp \
+                 server. One CLI drives every Local run. A change applies from the next run."
+            }
+            form.card.settings-form method="post" action="/settings/agents/local" {
+                input type="hidden" name="csrf" value=(csrf);
+                div.field {
+                    label for="local-url" { "Server URL" }
+                    input #local-url.wide type="text" name="url" spellcheck="false"
+                        placeholder="http://host:port" value=(view.url);
+                    p.hint { "An http or https address with an optional port. A trailing slash or /v1 is dropped." }
+                }
+                div.field {
+                    label for="local-key" { "Factory API key (optional)" }
+                    input #local-key.wide type="password" name="key"
+                        autocomplete="off" spellcheck="false"
+                        placeholder=(if view.key_stored { "set" } else { "not set" })
+                        disabled[!view.secrets_available];
+                    p.hint {
+                        @if view.key_stored { "A key is stored. " } @else { "No key is stored. " }
+                        "Type a new key to replace it. An empty field keeps it. Stored encrypted and never shown. \
+                         A job whose requester stored a key of their own uses that one. "
+                        "The key reaches the worker, and the agent that runs there can read it."
+                    }
+                    @if !view.secrets_available {
+                        p.hint.bad { "The master key is missing, so a key cannot be saved here. Remove still works." }
+                    }
+                }
+                div.field {
+                    label for="local-cli" { "CLI" }
+                    select #local-cli name="cli" {
+                        @for cli in factory_core::Cli::ALL {
+                            option value=(cli.id()) selected[cli == view.cli] { (cli.display_name()) }
+                        }
+                    }
+                    p.hint { "The CLI that drives the model in the worker. A session keeps the CLI it started on." }
+                }
+                div.field {
+                    label for="local-timeout" { "Model load timeout (minutes)" }
+                    input #local-timeout type="number" name="load_timeout" min="1"
+                        max=(crate::store::MAX_LOCAL_LOAD_MINUTES) step="1" required
+                        value=(view.load_timeout);
+                    p.hint { "How long a run waits for the server to load the model, 1 to 60 minutes." }
+                }
+                div.save-bar {
+                    span.save-bar-note { "No unsaved changes." }
+                    button.primary { "Save" }
+                }
+                div.danger-zone {
+                    button.danger formaction="/settings/agents/local/clear-key" formnovalidate { "Remove key" }
+                }
+            }
+            div.card #local-models {
+                h2 { "Models" }
+                @if view.models.is_empty() {
+                    p.meta { "No models are stored." }
+                } @else {
+                    ul.local-models {
+                        @for id in view.models { li { code { (id) } } }
+                    }
+                }
+                @if let Some(at) = view.settings.models_fetched_at {
+                    p.meta { "Fetched " (crate::localtime::unix(at)) "." }
+                }
+                form method="post" action="/settings/agents/local/refresh" {
+                    input type="hidden" name="csrf" value=(csrf);
+                    button { "Refresh models" }
+                }
             }
         },
     )
