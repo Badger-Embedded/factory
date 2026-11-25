@@ -7566,6 +7566,58 @@ async fn a_list_stored_for_another_server_is_not_labelled_as_the_current_one() {
     assert!(!page.body.contains("Models served by http://new:2"));
 }
 
+#[test]
+fn a_list_stored_before_models_url_has_no_known_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE local_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT,
+                cli TEXT NOT NULL DEFAULT 'codex',
+                load_timeout_minutes INTEGER NOT NULL DEFAULT 10,
+                models_fetched_at INTEGER,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO local_settings (id, url, models_fetched_at)
+                VALUES (1, 'http://b:2', 5);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let settings = store.local_settings().unwrap();
+    assert_eq!(settings.url.as_deref(), Some("http://b:2"));
+    assert_eq!(settings.models_url, None);
+    store.replace_local_models(&["m".to_owned()], 6).unwrap();
+    assert_eq!(
+        store.local_settings().unwrap().models_url.as_deref(),
+        Some("http://b:2")
+    );
+}
+
+#[tokio::test]
+async fn a_list_of_unknown_source_says_so_in_the_hint() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .replace_local_models(&["gemma-4-26B".to_owned()], 1)
+        .unwrap();
+    dashboard
+        .store
+        .save_local_settings(Some("http://new:2"), factory_core::Cli::Codex, 10)
+        .unwrap();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("local", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert!(page.body.contains("a server the factory did not record"));
+    assert!(!page.body.contains("Models served by"));
+}
+
 #[tokio::test]
 async fn a_blank_local_stage_reads_model_required_on_its_node() {
     let dashboard = dashboard();

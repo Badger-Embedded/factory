@@ -373,6 +373,16 @@ async fn a_failed_fetch_keeps_the_settings_and_the_earlier_list() {
         Some(url.as_str())
     );
     assert_eq!(harness.store.local_models().unwrap().len(), 2);
+    assert_eq!(
+        harness
+            .store
+            .local_settings()
+            .unwrap()
+            .models_url
+            .as_deref(),
+        Some(stub.url.as_str()),
+        "the list still names the server it came from",
+    );
 }
 
 #[tokio::test]

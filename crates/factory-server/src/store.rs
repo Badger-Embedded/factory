@@ -324,7 +324,7 @@ pub struct LocalSettings {
     pub load_timeout_minutes: u32,
     /// When the stored model list was fetched, in Unix seconds.
     pub models_fetched_at: Option<i64>,
-    /// The server URL the stored model list came from.
+    /// The server URL the stored model list came from, `None` when unknown.
     pub models_url: Option<String>,
 }
 
@@ -816,8 +816,9 @@ impl Store {
         Ok(())
     }
 
-    /// `models_url` joined `local_settings` after it shipped. A stored list
-    /// is taken to come from the stored URL.
+    /// `models_url` joined `local_settings` after it shipped. A list stored
+    /// before then has no known source, so the column stays empty until the
+    /// next successful fetch.
     fn migrate_local_models_url(conn: &Connection) -> Result<(), StoreError> {
         let has_column: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('local_settings') WHERE name = 'models_url'",
@@ -826,7 +827,6 @@ impl Store {
         )?;
         if has_column == 0 {
             conn.execute("ALTER TABLE local_settings ADD COLUMN models_url TEXT", [])?;
-            conn.execute("UPDATE local_settings SET models_url = url", [])?;
         }
         Ok(())
     }

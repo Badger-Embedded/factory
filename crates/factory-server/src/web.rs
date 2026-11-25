@@ -2133,10 +2133,14 @@ fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError
                     (Some(url), false) if models_url.as_ref() == Some(url) => {
                         format!("Models served by {url}. A Local stage needs a model.")
                     }
-                    (Some(url), false) => format!(
-                        "Models from {}, the server before {url}. Refresh the list on the Local settings page.",
-                        models_url.as_deref().unwrap_or("an earlier server"),
-                    ),
+                    (Some(url), false) => match &models_url {
+                        Some(old) => format!(
+                            "Models from {old}, the server before {url}. Refresh the list on the Local settings page."
+                        ),
+                        None => format!(
+                            "Models from a server the factory did not record, which may not be {url}. Refresh the list on the Local settings page."
+                        ),
+                    },
                 }
             } else {
                 format!(
