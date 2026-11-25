@@ -2101,6 +2101,67 @@ impl StageQuery {
     }
 }
 
+/// The agents the stage panel offers, with the models and the model hint of each.
+/// Local's models are the ones stored from its server.
+fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError> {
+    let local = state.store.local_settings()?;
+    let local_url = local.url;
+    let models_url = local.models_url;
+    let local_models = state.store.local_models()?;
+    Ok(state
+        .registry
+        .entries()
+        .map(|entry| {
+            let local = entry.id() == Agent::Local.id();
+            let models: Vec<String> = if local {
+                local_models.clone()
+            } else {
+                entry
+                    .model_suggestions()
+                    .iter()
+                    .map(|&model| model.to_owned())
+                    .collect()
+            };
+            let model_hint = if local {
+                match (&local_url, models.is_empty()) {
+                    (None, _) => {
+                        "No local server is set. A Local stage needs a model ID.".to_owned()
+                    }
+                    (Some(url), true) => {
+                        format!("No model list is stored for {url}. Type the model ID.")
+                    }
+                    (Some(url), false) if models_url.as_ref() == Some(url) => {
+                        format!("Models served by {url}. A Local stage needs a model.")
+                    }
+                    (Some(url), false) => format!(
+                        "Models from {}, the server before {url}. Refresh the list on the Local settings page.",
+                        models_url.as_deref().unwrap_or("an earlier server"),
+                    ),
+                }
+            } else {
+                format!(
+                    "An alias or any model ID. Empty runs the model the installed {} CLI picks.",
+                    entry.id()
+                )
+            };
+            pages::AgentChoice {
+                id: entry.id().to_owned(),
+                display_name: entry.display_name().to_owned(),
+                available: entry.available(),
+                efforts: entry
+                    .efforts()
+                    .iter()
+                    .map(|&level| level.to_owned())
+                    .collect(),
+                default_effort: entry.default_effort().to_owned(),
+                models,
+                model_hint,
+                model_required: local,
+            }
+        })
+        .collect())
+}
+
 /// Everything a project's settings page shows: its models, efforts, flags and
 /// gates, and its settings for each registered MCP server.
 fn project_settings(
@@ -2115,26 +2176,7 @@ fn project_settings(
         .into_iter()
         .map(|server| server_settings(state, name, server))
         .collect::<Result<Vec<_>, StoreError>>()?;
-    let agents = state
-        .registry
-        .entries()
-        .map(|entry| pages::AgentChoice {
-            id: entry.id().to_owned(),
-            display_name: entry.display_name().to_owned(),
-            available: entry.available(),
-            efforts: entry
-                .efforts()
-                .iter()
-                .map(|&level| level.to_owned())
-                .collect(),
-            default_effort: entry.default_effort().to_owned(),
-            models: entry
-                .model_suggestions()
-                .iter()
-                .map(|&model| model.to_owned())
-                .collect(),
-        })
-        .collect();
+    let agents = agent_choices(state)?;
     let (maintenance, unknown_upstream) = state.store.project_maintenance_lenient(name)?;
     let forge_account = match project.forge.kind() {
         Some(kind) => Some(pages::ForgeAccountCard {

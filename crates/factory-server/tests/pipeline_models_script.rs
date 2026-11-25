@@ -63,10 +63,16 @@ global.window = { location: { href: "http://x/" } };
 global.history = { replaceState() {} };
 
 const AGENTS = {
-  claude: { models: ["fable", "opus"], cli: "claude" },
-  copilot: { models: ["claude-sonnet-5.5", "gpt-6.2-sol"], cli: "copilot" },
+  claude: { models: ["fable", "opus"], hint: "An alias or any model ID. Empty runs the model the installed claude CLI picks.", required: false },
+  copilot: { models: ["claude-sonnet-5.5", "gpt-6.2-sol"], hint: "An alias or any model ID. Empty runs the model the installed copilot CLI picks.", required: false },
+  local: { models: ["gemma-4-26B", "Llama-3.2-1B"], hint: "Models served by http://gfx1201:9931. A Local stage needs a model.", required: true },
 };
-const form = new El("form", { class: "pipeline-form", "data-agent-models": JSON.stringify(AGENTS), "data-agent-efforts": "{}" });
+const EFFORTS = {
+  claude: { efforts: ["low", "medium", "high", "xhigh", "max"], default: "high" },
+  copilot: { efforts: ["low", "medium", "high", "xhigh"], default: "medium" },
+  local: { efforts: ["low", "medium", "high", "xhigh"], default: "medium" },
+};
+const form = new El("form", { class: "pipeline-form", "data-agent-models": JSON.stringify(AGENTS), "data-agent-efforts": JSON.stringify(EFFORTS) });
 function stage(name, agent, model) {
   const radios = {};
   for (const id of Object.keys(AGENTS)) {
@@ -74,15 +80,22 @@ function stage(name, agent, model) {
     r.checked = id === agent;
     radios[id] = r;
   }
+  const seg = form.appendChild(new El("div", { "data-effort-seg": name }));
+  for (const level of EFFORTS[agent].efforts) {
+    const label = seg.appendChild(new El("label"));
+    const r = label.appendChild(new El("input", { type: "radio", name: name + "_effort", value: level }));
+    r.checked = level === "high";
+  }
   const chips = form.appendChild(new El("div", { "data-model-chips": name, "data-agent": agent }));
   for (const m of [""].concat(AGENTS[agent].models)) chips.appendChild(new El("button", { "data-model": m, "data-model-for": name }));
   const input = form.appendChild(new El("input", { type: "text", name, list: "list-" + name, value: model, "data-model-input": name }));
   const list = form.appendChild(new El("datalist", { id: "list-" + name }));
   const hint = form.appendChild(new El("p", { "data-model-hint": name }));
   hint.textContent = "old";
-  return { radios, chips, input, list, hint };
+  return { radios, seg, chips, input, list, hint };
 }
-form.querySelectorAll = El.prototype.querySelectorAll;
+const baseQuery = El.prototype.querySelectorAll;
+form.querySelectorAll = function (sel) { return sel.endsWith(" i") ? [] : baseQuery.call(this, sel); };
 doc.querySelector = (sel) => (form.matches(sel) ? form : null);
 global.inputs = [];
 form.addEventListener("input", (e) => global.inputs.push(e.target.name));
@@ -97,6 +110,9 @@ function state(s) {
     labels: s.chips.children.map((c) => c.textContent),
     list: s.list.children.map((o) => o.value),
     hint: s.hint.textContent,
+    placeholder: s.input.placeholder,
+    efforts: s.seg.children.map((l) => l.children[0].value),
+    effort: (s.seg.children.find((l) => l.children[0].checked) || { children: [{}] }).children[0].value,
   };
 }
 const load = () => new Function(fs.readFileSync(process.argv[1], "utf8"))();
@@ -177,5 +193,42 @@ console.log(JSON.stringify({ after: state(implement) }));
     assert_eq!(
         out["after"]["chips"],
         serde_json::json!(["", "fable", "opus"])
+    );
+}
+
+#[test]
+fn switching_to_local_shows_the_server_models_and_its_efforts_and_switching_back_restores_them() {
+    let out = run(r#"
+const implement = stage("implement", "claude", "fable");
+load();
+pick(implement, "local");
+const local = state(implement);
+implement.input.value = "gemma-4-26B";
+pick(implement, "claude");
+console.log(JSON.stringify({ local, back: state(implement) }));
+"#);
+    let local = &out["local"];
+    assert_eq!(
+        local["chips"],
+        serde_json::json!(["gemma-4-26B", "Llama-3.2-1B"])
+    );
+    assert_eq!(local["list"], local["chips"]);
+    assert_eq!(
+        local["hint"],
+        "Models served by http://gfx1201:9931. A Local stage needs a model."
+    );
+    assert_eq!(local["placeholder"], "Model ID");
+    assert_eq!(
+        local["efforts"],
+        serde_json::json!(["low", "medium", "high", "xhigh"])
+    );
+    assert_eq!(local["effort"], "high");
+    let back = &out["back"];
+    assert_eq!(back["model"], "");
+    assert_eq!(back["chips"], serde_json::json!(["", "fable", "opus"]));
+    assert_eq!(back["placeholder"], "CLI default");
+    assert_eq!(
+        back["efforts"],
+        serde_json::json!(["low", "medium", "high", "xhigh", "max"])
     );
 }

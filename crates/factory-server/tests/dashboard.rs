@@ -7483,6 +7483,126 @@ async fn each_stage_panel_offers_its_saved_agents_models_and_cli_hint() {
 }
 
 #[tokio::test]
+async fn a_local_stage_offers_the_stored_models_and_names_the_server() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_local_settings(Some("http://gfx1201:9931"), factory_core::Cli::Codex, 10)
+        .unwrap();
+    dashboard
+        .store
+        .replace_local_models(&["gemma-4-26B".to_owned(), "Llama-3.2-1B".to_owned()], 1)
+        .unwrap();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("local", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    let start = page.body.find("data-panel=\"clarify\"").unwrap();
+    let rest = &page.body[start..];
+    let panel = &rest[..rest.find("data-model-hint").unwrap() + 200];
+    assert!(panel.contains("data-model=\"gemma-4-26B\""));
+    assert!(panel.contains("data-model=\"Llama-3.2-1B\""));
+    assert!(!panel.contains("data-model=\"\""), "no CLI default chip");
+    assert!(panel.contains("<option value=\"Llama-3.2-1B\">"));
+    assert!(panel.contains("Models served by http://gfx1201:9931."));
+    assert!(page.body.contains("&quot;local&quot;"));
+}
+
+#[tokio::test]
+async fn a_local_stage_without_a_stored_list_offers_no_chips() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_local_settings(Some("http://gfx1201:9931"), factory_core::Cli::Codex, 10)
+        .unwrap();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("local", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    let start = page.body.find("data-panel=\"clarify\"").unwrap();
+    let rest = &page.body[start..];
+    let panel = &rest[..rest.find("data-model-hint").unwrap() + 200];
+    assert!(!panel.contains("data-model-for="));
+    assert!(!panel.contains("<option"));
+    assert!(panel.contains("No model list is stored for http://gfx1201:9931."));
+}
+
+#[tokio::test]
+async fn a_list_stored_for_another_server_is_not_labelled_as_the_current_one() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_local_settings(Some("http://old:1"), factory_core::Cli::Codex, 10)
+        .unwrap();
+    dashboard
+        .store
+        .replace_local_models(&["gemma-4-26B".to_owned()], 1)
+        .unwrap();
+    dashboard
+        .store
+        .save_local_settings(Some("http://new:2"), factory_core::Cli::Codex, 10)
+        .unwrap();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("local", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert!(page.body.contains("data-model=\"gemma-4-26B\""));
+    assert!(
+        page.body
+            .contains("Models from http://old:1, the server before http://new:2.")
+    );
+    assert!(!page.body.contains("Models served by http://new:2"));
+}
+
+#[tokio::test]
+async fn a_blank_local_stage_reads_model_required_on_its_node() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("local", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert!(
+        page.body
+            .contains("data-model-label=\"clarify\">Model required<")
+    );
+    assert!(page.body.contains("data-model-label=\"spec\">CLI default<"));
+}
+
+#[tokio::test]
+async fn a_collaborator_who_is_not_an_admin_can_pick_local_in_every_stage() {
+    let dashboard = admin_dashboard(&["boss@example.com"]);
+    dashboard
+        .store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+    let page = dashboard
+        .get_as("bob@example.com", "/settings/projects/maestro")
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(
+        page.body.matches("value=\"local\"").count(),
+        5,
+        "one Local radio per stage",
+    );
+}
+
+#[tokio::test]
 async fn saving_the_form_persists_model_and_effort_and_leaves_other_projects_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("factory.db");

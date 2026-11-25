@@ -847,6 +847,11 @@ pub struct AgentChoice {
     /// one of its own.
     pub default_effort: String,
     pub models: Vec<String>,
+    /// The hint under the model field.
+    pub model_hint: String,
+    /// Whether a stage on this agent needs a model, so the panel offers no
+    /// "CLI default" chip.
+    pub model_required: bool,
 }
 
 /// One server's block inside a project's form: whether the project runs it, the
@@ -3139,7 +3144,11 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) 
             .map(|choice| {
                 (
                     choice.id.clone(),
-                    serde_json::json!({ "models": choice.models, "cli": choice.id }),
+                    serde_json::json!({
+                        "models": choice.models,
+                        "hint": choice.model_hint,
+                        "required": choice.model_required,
+                    }),
                 )
             })
             .collect(),
@@ -3199,7 +3208,12 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) 
 
 fn stage_node(project: &ProjectSettings, stage: &str, selected: bool, href: &str) -> Markup {
     let off = stage == "review" && !project.llm_review;
-    let model = stage_model(&project.models, stage);
+    let model = stage_model(&project.models, stage).filter(|model| !model.is_empty());
+    let required = project
+        .agents
+        .iter()
+        .find(|choice| choice.id == stage_agent(&project.agent_selection, stage))
+        .is_some_and(|choice| choice.model_required);
     let effort = stage_effort(&project.efforts, stage);
     let efforts = stage_efforts(project, stage);
     let level = efforts
@@ -3211,7 +3225,8 @@ fn stage_node(project: &ProjectSettings, stage: &str, selected: bool, href: &str
             aria-current=[selected.then_some("step")] {
             span.pipe-name { (stage) }
             span.pipe-model.dflt[model.is_none() || off] data-model-label=(stage) {
-                @if off { "Off" } @else { (model.unwrap_or("CLI default")) }
+                @if off { "Off" } @else if let Some(model) = model { (model) }
+                @else if required { "Model required" } @else { "CLI default" }
             }
             span.pipe-effort data-effort-label=(stage) title={ "effort " (effort) } {
                 @for (index, _) in efforts.iter().enumerate() {
@@ -3250,11 +3265,17 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bo
     let model = stage_model(&project.models, stage).unwrap_or_default();
     let effort = stage_effort(&project.efforts, stage);
     let agent = stage_agent(&project.agent_selection, stage);
-    let suggestions: &[String] = project
-        .agents
-        .iter()
-        .find(|choice| choice.id == agent)
-        .map_or(&[], |choice| &choice.models);
+    let choice = project.agents.iter().find(|choice| choice.id == agent);
+    let suggestions: &[String] = choice.map_or(&[], |choice| &choice.models);
+    let model_required = choice.is_some_and(|choice| choice.model_required);
+    let model_hint = choice.map_or_else(
+        || {
+            format!(
+                "An alias or any model ID. Empty runs the model the installed {agent} CLI picks."
+            )
+        },
+        |choice| choice.model_hint.clone(),
+    );
     html! {
         div.pipe-panel data-panel=(stage) hidden[!selected] {
             h2 { (stage[..1].to_uppercase()) (stage[1..]) " stage" }
@@ -3286,17 +3307,19 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bo
             div.field {
                 label for={ (name) "-" (stage) } { "Model" }
                 div.model-chips data-model-chips=(stage) data-agent=(agent) {
-                    button.chip type="button" data-model="" data-model-for=(stage) { "CLI default" }
+                    @if !model_required {
+                        button.chip type="button" data-model="" data-model-for=(stage) { "CLI default" }
+                    }
                     @for suggestion in suggestions {
                         button.chip type="button" data-model=(suggestion) data-model-for=(stage) { (suggestion) }
                     }
                 }
                 input id={ (name) "-" (stage) } type="text" name=(stage) list={ "model-suggestions-" (stage) }
-                    placeholder="CLI default" value=(model) data-model-input=(stage);
+                    placeholder=(if model_required { "Model ID" } else { "CLI default" }) value=(model) data-model-input=(stage);
                 datalist id={ "model-suggestions-" (stage) } {
                     @for suggestion in suggestions { option value=(suggestion) {} }
                 }
-                p.hint data-model-hint=(stage) { "An alias or any model ID. Empty runs the model the installed " (agent) " CLI picks." }
+                p.hint data-model-hint=(stage) { (model_hint) }
             }
             div.field {
                 span.label { "Effort" }

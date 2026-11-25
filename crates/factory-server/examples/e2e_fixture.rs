@@ -209,6 +209,12 @@ fn create_job(
     Ok(id)
 }
 
+fn seed_local(store: &Store, url: &str, models: Option<&Vec<String>>) -> Result<()> {
+    store.save_local_settings(Some(url), Cli::Codex, 10)?;
+    store.replace_local_models(models.map_or(&[][..], Vec::as_slice), 0)?;
+    Ok(())
+}
+
 fn seed(store: &Store) -> Result<()> {
     store.create_project(
         SHARED_PROJECT,
@@ -338,6 +344,7 @@ fn main() -> Result<()> {
     let store = Store::open(&db)?;
     match command.as_str() {
         "seed" => seed(&store)?,
+        "local-models" => seed_local(&store, one("url")?, flags.get("model"))?,
         "project" => {
             let name = one("name")?;
             let logins = flags.get("login").ok_or("missing --login")?;

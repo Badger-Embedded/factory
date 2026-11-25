@@ -300,6 +300,7 @@ CREATE TABLE IF NOT EXISTS local_settings (
     cli TEXT NOT NULL DEFAULT 'codex',
     load_timeout_minutes INTEGER NOT NULL DEFAULT 10,
     models_fetched_at INTEGER,
+    models_url TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS local_models (
@@ -323,6 +324,8 @@ pub struct LocalSettings {
     pub load_timeout_minutes: u32,
     /// When the stored model list was fetched, in Unix seconds.
     pub models_fetched_at: Option<i64>,
+    /// The server URL the stored model list came from.
+    pub models_url: Option<String>,
 }
 
 impl Default for LocalSettings {
@@ -332,6 +335,7 @@ impl Default for LocalSettings {
             cli: Cli::Codex,
             load_timeout_minutes: 10,
             models_fetched_at: None,
+            models_url: None,
         }
     }
 }
@@ -812,6 +816,21 @@ impl Store {
         Ok(())
     }
 
+    /// `models_url` joined `local_settings` after it shipped. A stored list
+    /// is taken to come from the stored URL.
+    fn migrate_local_models_url(conn: &Connection) -> Result<(), StoreError> {
+        let has_column: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('local_settings') WHERE name = 'models_url'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_column == 0 {
+            conn.execute("ALTER TABLE local_settings ADD COLUMN models_url TEXT", [])?;
+            conn.execute("UPDATE local_settings SET models_url = url", [])?;
+        }
+        Ok(())
+    }
+
     /// `registration` joined `forgejo_instances` after it shipped. Every
     /// instance without one gets a fresh number.
     fn migrate_forgejo_registration(conn: &Connection) -> Result<(), StoreError> {
@@ -845,6 +864,7 @@ impl Store {
     fn init(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA)?;
         Self::migrate_forgejo_registration(&conn)?;
+        Self::migrate_local_models_url(&conn)?;
         Self::migrate_project_forge(&conn)?;
         Self::migrate_renovate_author(&conn)?;
         Self::migrate_upstream_forge(&conn)?;
@@ -2641,7 +2661,7 @@ impl Store {
         let row = self
             .conn()
             .query_row(
-                "SELECT url, cli, load_timeout_minutes, models_fetched_at
+                "SELECT url, cli, load_timeout_minutes, models_fetched_at, models_url
                  FROM local_settings WHERE id = 1",
                 [],
                 |row| {
@@ -2650,20 +2670,21 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, u32>(2)?,
                         row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(
-            row.map_or_else(LocalSettings::default, |(url, cli, minutes, fetched)| {
-                LocalSettings {
-                    url,
-                    cli: Cli::from_id(&cli).unwrap_or(Cli::Codex),
-                    load_timeout_minutes: minutes,
-                    models_fetched_at: fetched,
-                }
-            }),
-        )
+        Ok(row.map_or_else(
+            LocalSettings::default,
+            |(url, cli, minutes, fetched, models_url)| LocalSettings {
+                url,
+                cli: Cli::from_id(&cli).unwrap_or(Cli::Codex),
+                load_timeout_minutes: minutes,
+                models_fetched_at: fetched,
+                models_url,
+            },
+        ))
     }
 
     /// Stores the Local server, the CLI and the model load timeout. The URL is
@@ -2727,7 +2748,7 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO local_settings (id, models_fetched_at) VALUES (1, ?1)
-             ON CONFLICT (id) DO UPDATE SET models_fetched_at = ?1",
+             ON CONFLICT (id) DO UPDATE SET models_fetched_at = ?1, models_url = url",
             [fetched_at],
         )?;
         tx.commit()?;
