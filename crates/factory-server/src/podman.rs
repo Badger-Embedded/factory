@@ -328,6 +328,7 @@ impl Executor for PodmanExecutor {
             effort: request.effort,
             mcp: request.mcp,
             packages: request.packages,
+            local: None,
         };
         let report = run(
             &config,

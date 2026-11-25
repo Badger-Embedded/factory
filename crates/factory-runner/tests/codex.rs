@@ -7,11 +7,12 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use factory_core::{Agent, AgentResult, Event};
+use factory_core::{Agent, AgentResult, Cli, Event};
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, RunResult, SessionRun,
-    TokenUsage, WorkerConfig, WorkerRun, backend, run,
+    AgentItem, Expect, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry, RunResult,
+    SessionRun, TokenUsage, WorkerConfig, WorkerRun, backend, run,
 };
 use serde_json::Value;
 
@@ -34,6 +35,7 @@ fn codex_run(dir: &Path, session: SessionRun) -> WorkerRun {
         effort: None,
         mcp: None,
         packages: Vec::new(),
+        local: None,
     }
 }
 
@@ -345,6 +347,7 @@ fn a_claude_run_is_unchanged_by_the_codex_backend() {
             }],
         }),
         packages: Vec::new(),
+        local: None,
     };
     let args = strings(&factory_runner::podman_args(&WorkerConfig::default(), &run));
 
@@ -735,4 +738,161 @@ fn a_symlink_in_the_codex_config_dir_is_replaced_not_followed() {
             .unwrap()
             .contains("playwright-mcp")
     );
+}
+
+const LOCAL_KEY: &str = "sk-local-0123456789";
+
+fn local_codex_run(dir: &Path, key: Option<&str>) -> WorkerRun {
+    let mut run = codex_run(dir, SessionRun::Start(THREAD.into()));
+    run.agent = Agent::Local;
+    run.token = String::new();
+    run.model = Some("unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M".into());
+    run.local = Some(LocalTarget {
+        cli: Cli::Codex,
+        base_url: "http://gfx1201:9931".into(),
+        key: key.map(str::to_owned),
+        load_timeout: Duration::from_mins(10),
+    });
+    run
+}
+
+#[test]
+fn a_local_codex_run_points_at_the_server_with_no_subscription_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = codex_args(&local_codex_run(dir.path(), None));
+
+    let provider = args
+        .iter()
+        .find(|arg| arg.starts_with("model_providers.local="))
+        .unwrap();
+    assert!(provider.contains(r#"name = "Local""#));
+    assert!(provider.contains(r#"base_url = "http://gfx1201:9931/v1""#));
+    assert!(provider.contains(r#"wire_api = "responses""#));
+    assert!(!provider.contains("env_key"));
+    assert!(args.contains(&"model_provider=local".to_owned()));
+    assert_eq!(
+        value_after(&args, "--model"),
+        "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M"
+    );
+    assert!(args.contains(&"model_reasoning_effort=medium".to_owned()));
+    assert!(!args.contains(&"--output-schema".to_owned()));
+    assert_eq!(env_names(&args), ["CODEX_HOME=/codex"]);
+}
+
+#[test]
+fn a_local_codex_key_goes_by_name_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = local_codex_run(dir.path(), Some(LOCAL_KEY));
+    let args = codex_args(&run);
+
+    assert!(
+        args.iter()
+            .any(|arg| arg.starts_with("model_providers.local=")
+                && arg.contains(r#"env_key = "FACTORY_LOCAL_API_KEY""#))
+    );
+    assert!(env_names(&args).contains(&"FACTORY_LOCAL_API_KEY"));
+    assert!(args.iter().all(|arg| !arg.contains(LOCAL_KEY)));
+    assert_eq!(
+        backend(Agent::Codex).unwrap().secret_env(&run),
+        [("FACTORY_LOCAL_API_KEY", LOCAL_KEY)]
+    );
+}
+
+#[test]
+fn a_local_codex_run_writes_no_login_setting_and_no_output_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("codex")).unwrap();
+    backend(Agent::Codex)
+        .unwrap()
+        .prepare(&local_codex_run(dir.path(), None))
+        .unwrap();
+
+    let config = fs::read_to_string(dir.path().join("codex/config.toml")).unwrap();
+    assert!(!config.contains("cli_auth_credentials_store"));
+    assert!(!dir.path().join("codex/output-schema.json").exists());
+    assert!(!dir.path().join("codex/auth.json").exists());
+}
+
+#[test]
+fn only_a_local_codex_prompt_carries_the_schema() {
+    let task = factory_core::Task::WriteSpec;
+    let chatgpt = factory_runner::prompt(&task, Expect::Spec, Agent::Codex);
+    let local = factory_runner::prompt(
+        &task,
+        Expect::Spec,
+        factory_runner::PromptTarget::Local(Cli::Codex),
+    );
+
+    assert!(!chatgpt.contains("This agent has no structured-output mode"));
+    assert!(local.contains("This agent has no structured-output mode"));
+    assert!(local.contains("\"spec\""));
+    let chatgpt_run = codex_args(&codex_run(
+        tempfile::tempdir().unwrap().path(),
+        SessionRun::Start(THREAD.into()),
+    ));
+    assert!(chatgpt_run.contains(&"--output-schema".to_owned()));
+}
+
+#[test]
+fn a_local_codex_final_message_may_end_with_a_fenced_block() {
+    let codex = backend(Agent::Codex).unwrap();
+    let message = |text: &str| {
+        serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":text}})
+            .to_string()
+    };
+    let spec = AgentResult::Spec("Goal.".into());
+    let bare = r#"{"outcome":"spec","questions":null,"spec":"Goal."}"#;
+    let fenced = format!("Done.\n\n```json\n{bare}\n```");
+
+    for text in [bare.to_owned(), fenced.clone()] {
+        let result = codex
+            .parse_local(Expect::Spec, &message(&text))
+            .into_iter()
+            .find_map(|item| match item {
+                AgentItem::Result(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(result.event, Event::Agent(spec.clone()));
+    }
+    // A ChatGPT run still reads the message as bare JSON.
+    let result = codex
+        .parse(Expect::Spec, &message(&fenced))
+        .into_iter()
+        .find_map(|item| match item {
+            AgentItem::Result(result) => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    assert!(matches!(result.event, Event::AgentFailed { .. }));
+}
+
+#[tokio::test]
+async fn a_local_codex_run_reads_no_auth_json_back_and_sets_the_key_in_podman_only() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("codex")).unwrap();
+    let env_file = dir.path().join("env");
+    let stdout = fixture("codex-spec-run.jsonl");
+    let podman = support::executable(
+        dir.path(),
+        "podman",
+        &format!(
+            "#!/bin/bash\nprintf '%s' \"$FACTORY_LOCAL_API_KEY\" > '{}'\nprintf '%s' x > '{}/codex/auth.json'\ncat '{}'\n",
+            env_file.display(),
+            dir.path().display(),
+            stdout.display(),
+        ),
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let run_def = local_codex_run(dir.path(), Some(LOCAL_KEY));
+
+    let mut log = Vec::new();
+    let report = run(&config, &run_def, |line| log.push(line), |_| {}, |_| {}).await;
+
+    assert_eq!(fs::read_to_string(env_file).unwrap(), LOCAL_KEY);
+    assert_eq!(report.credential, None);
+    assert!(!format!("{log:?}").contains(LOCAL_KEY));
 }

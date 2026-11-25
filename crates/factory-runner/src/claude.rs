@@ -12,7 +12,9 @@ use std::path::Path;
 
 use factory_core::{Agent, Cli};
 
-use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, RunResult, write_replacing};
+use crate::agent::{
+    AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage, write_replacing,
+};
 use crate::outcome::{Expect, event_from_result};
 use crate::stream::{StreamItem, parse_line};
 use crate::worker::{
@@ -24,6 +26,17 @@ use crate::worker::{
 /// `claude` directory on the host. It keeps the session files `--resume` reads.
 const CONFIG_DIR: &str = "/claude";
 const MCP_CONFIG_FILE: &str = "factory-mcp.json";
+
+/// The variable Claude Code reads a Local server's key from. A run with no key
+/// passes [`LOCAL_PLACEHOLDER_KEY`] by value instead, so the CLI does not ask
+/// for a login.
+const LOCAL_KEY_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+const LOCAL_PLACEHOLDER_KEY: &str = "local";
+
+/// Claude Code's own request timeout, 600000 ms unless set. A Local run raises
+/// it to at least the model load timeout, because the server answers the first
+/// request only after it loads the model.
+const DEFAULT_API_TIMEOUT_MS: u128 = 600_000;
 
 /// Settings for every Claude run. Claude Code adds a `Co-Authored-By` trailer
 /// to commits and a footer to pull request descriptions unless `attribution`
@@ -66,6 +79,43 @@ impl AgentBackend for ClaudeAgent {
 
     fn host_config_dir(&self) -> &'static str {
         "claude"
+    }
+
+    fn local_host_config_dir(&self) -> &'static str {
+        "local-claude"
+    }
+
+    fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
+        match run.local.as_ref().and_then(|local| local.key.as_deref()) {
+            Some(key) => vec![(LOCAL_KEY_ENV, key)],
+            None => Vec::new(),
+        }
+    }
+
+    fn local_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
+        let Some(local) = run.local.as_ref() else {
+            return Vec::new();
+        };
+        let model = run.model.clone().unwrap_or_default();
+        let load_ms = local.load_timeout.as_millis();
+        let mut env = vec![
+            ("ANTHROPIC_BASE_URL", local.base_url.clone()),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.clone()),
+            ("ANTHROPIC_SMALL_FAST_MODEL", model),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_owned()),
+            (
+                "API_TIMEOUT_MS",
+                load_ms.max(DEFAULT_API_TIMEOUT_MS).to_string(),
+            ),
+            (
+                "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS",
+                load_ms.max(DEFAULT_API_TIMEOUT_MS).to_string(),
+            ),
+        ];
+        if local.key.is_none() {
+            env.push((LOCAL_KEY_ENV, LOCAL_PLACEHOLDER_KEY.to_owned()));
+        }
+        env
     }
 
     fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
@@ -114,12 +164,13 @@ impl AgentBackend for ClaudeAgent {
             claude.push(model.into());
         }
         claude.push("--effort".into());
-        claude.push(
-            run.effort
-                .as_deref()
-                .unwrap_or_else(|| Agent::Claude.default_effort())
-                .into(),
-        );
+        let default_effort = if run.local.is_some() {
+            Agent::Local
+        } else {
+            Agent::Claude
+        }
+        .default_effort();
+        claude.push(run.effort.as_deref().unwrap_or(default_effort).into());
         // One `http` entry per active MCP server, pointed at the proxy with the
         // run token. A run with no active server adds nothing, so its arguments
         // match a run from before MCP. A run with a stdio server reads the config
@@ -133,6 +184,28 @@ impl AgentBackend for ClaudeAgent {
             }
         }
         claude.into_iter().map(OsString::from).collect()
+    }
+
+    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+        let mut items = self.parse(expect, line);
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim())
+            && value.get("type").and_then(serde_json::Value::as_str) == Some("result")
+            && let Some(usage) = value.get("usage")
+        {
+            let count = |key: &str| {
+                usage
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            items.push(AgentItem::UsageTotal(TokenUsage {
+                input_tokens: count("input_tokens"),
+                cached_input_tokens: count("cache_read_input_tokens"),
+                output_tokens: count("output_tokens"),
+                reasoning_output_tokens: 0,
+            }));
+        }
+        items
     }
 
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem> {

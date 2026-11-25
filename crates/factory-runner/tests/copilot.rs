@@ -9,11 +9,12 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use factory_core::{Agent, AgentResult, Event, PrDescription};
+use factory_core::{Agent, AgentResult, Cli, Event, PrDescription};
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, McpUnavailable, RunResult,
-    SessionRun, WorkerConfig, WorkerRun, backend, run,
+    AgentItem, Expect, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry, McpUnavailable,
+    RunResult, SessionRun, WorkerConfig, WorkerRun, backend, run,
 };
 
 const SESSION: &str = "d3c2f38c-6c9e-4528-9666-a9c3d7aff405";
@@ -36,6 +37,7 @@ fn copilot_run(dir: &Path, session: SessionRun) -> WorkerRun {
         effort: None,
         mcp: None,
         packages: Vec::new(),
+        local: None,
     }
 }
 
@@ -904,4 +906,134 @@ fn a_symlink_in_the_copilot_config_dir_is_replaced_not_followed() {
             .unwrap()
             .contains("playwright-mcp")
     );
+}
+
+const LOCAL_KEY: &str = "sk-local-0123456789";
+
+fn local_copilot_run(dir: &Path, key: Option<&str>) -> WorkerRun {
+    let mut run = copilot_run(dir, SessionRun::Start(SESSION.into()));
+    run.agent = Agent::Local;
+    run.token = String::new();
+    run.model = Some("unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M".into());
+    run.local = Some(LocalTarget {
+        cli: Cli::Copilot,
+        base_url: "http://gfx1201:9931".into(),
+        key: key.map(str::to_owned),
+        load_timeout: Duration::from_mins(10),
+    });
+    run
+}
+
+#[test]
+fn a_local_copilot_run_points_at_the_server_with_no_github_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = copilot_args(&local_copilot_run(dir.path(), None));
+    let env = env_names(&args);
+
+    for expected in [
+        "COPILOT_OFFLINE=true",
+        "COPILOT_PROVIDER_BASE_URL=http://gfx1201:9931/v1",
+        "COPILOT_PROVIDER_TYPE=openai",
+    ] {
+        assert!(env.contains(&expected), "missing {expected} in {env:?}");
+    }
+    assert!(!env.contains(&"COPILOT_GITHUB_TOKEN"));
+    assert!(!env.contains(&"COPILOT_PROVIDER_API_KEY"));
+    assert_eq!(
+        value_after(&args, "--model"),
+        "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M"
+    );
+    assert_eq!(value_after(&args, "--effort"), "medium");
+}
+
+#[test]
+fn a_local_copilot_key_goes_by_name_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = local_copilot_run(dir.path(), Some(LOCAL_KEY));
+    let args = copilot_args(&run);
+
+    assert!(env_names(&args).contains(&"COPILOT_PROVIDER_API_KEY"));
+    assert!(args.iter().all(|arg| !arg.contains(LOCAL_KEY)));
+    assert_eq!(
+        backend(Agent::Copilot).unwrap().secret_env(&run),
+        [("COPILOT_PROVIDER_API_KEY", LOCAL_KEY)]
+    );
+}
+
+#[tokio::test]
+async fn a_local_copilot_run_logs_no_cost_note_and_sets_no_github_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = fixture("copilot-success.jsonl");
+    let env_file = dir.path().join("env");
+    let podman = support::executable(
+        dir.path(),
+        "podman",
+        &format!(
+            "#!/bin/bash\nprintf '%s|%s' \"$COPILOT_GITHUB_TOKEN\" \"$COPILOT_PROVIDER_API_KEY\" > '{}'\ncat '{}'\n",
+            env_file.display(),
+            stdout.display(),
+        ),
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+    let mut worker = local_copilot_run(dir.path(), Some(LOCAL_KEY));
+    worker.token = TOKEN.into();
+
+    let mut log = Vec::new();
+    run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+
+    assert_eq!(
+        fs::read_to_string(env_file).unwrap(),
+        format!("|{LOCAL_KEY}")
+    );
+    assert!(!format!("{log:?}").contains("not counted in the job cost"));
+    assert!(!format!("{log:?}").contains(LOCAL_KEY));
+}
+
+#[tokio::test]
+async fn a_local_copilot_run_reports_the_last_checkpoint_not_their_sum() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = |input: u32, output: u32| {
+        format!(
+            r#"{{"type":"session.usage_checkpoint","data":{{"totalPremiumRequests":0,"accountingSnapshot":{{"tokenDetails":{{"input":{{"tokenCount":{input}}},"cache_read":{{"tokenCount":0}},"cache_write":{{"tokenCount":0}},"output":{{"tokenCount":{output}}}}}}}}}}}"#
+        )
+    };
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!("{}\n{}\n", checkpoint(100, 10), checkpoint(250, 30)),
+    )
+    .unwrap();
+    let podman = support::executable(
+        dir.path(),
+        "podman",
+        &format!("#!/bin/bash\ncat '{}'\n", stdout.display()),
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+
+    let local = run(
+        &config,
+        &local_copilot_run(dir.path(), None),
+        |_| {},
+        |_| {},
+        |_| {},
+    )
+    .await;
+    let usage = local.token_usage.unwrap();
+    assert_eq!((usage.input_tokens, usage.output_tokens), (250, 30));
+
+    let subscription = run(
+        &config,
+        &copilot_run(dir.path(), SessionRun::Start(SESSION.into())),
+        |_| {},
+        |_| {},
+        |_| {},
+    )
+    .await;
+    assert_eq!(subscription.token_usage, None);
 }

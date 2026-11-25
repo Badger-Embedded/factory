@@ -5,9 +5,8 @@
 //! sits behind [`AgentBackend`]: the command after the image, the credential
 //! and config-directory environment variables, the session-resume check, and
 //! the parser that turns the agent's stdout into the items the worker consumes.
-//! Claude Code is the one agent that runs today, in [`claude`](crate::claude).
-//! Codex stands in the registry with no backend yet, so [`backend`] returns
-//! `None` for it.
+//! Claude Code, Codex and Copilot each have a backend. A Local run uses the
+//! backend of the CLI the factory is set to, see [`LocalTarget`](crate::worker::LocalTarget).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -111,6 +110,33 @@ pub trait AgentBackend: Sync {
         Vec::new()
     }
 
+    /// The non-secret environment a Local run passes by value, such as the
+    /// server URL. The default is none, which is what a run on the agent's own
+    /// login passes. The key never goes here; [`secret_env`](Self::secret_env)
+    /// carries it by name.
+    fn local_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
+        let _ = run;
+        Vec::new()
+    }
+
+    /// The wording a Local run's prompt carries. It is the backend's own unless
+    /// the Local run needs something else, such as Codex asking for the schema
+    /// in the prompt because it passes no `--output-schema`.
+    fn local_prompt_style(&self) -> PromptStyle {
+        self.prompt_style()
+    }
+
+    /// The config directory's name under the job directory for a Local run. It
+    /// differs from [`host_config_dir`](Self::host_config_dir), so a Local run
+    /// shares no session file or written config with a subscription run of the
+    /// same CLI in the same job.
+    fn local_host_config_dir(&self) -> &'static str;
+
+    /// Parses one stdout line of a Local run. The default is [`parse`](Self::parse).
+    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+        self.parse(expect, line)
+    }
+
     /// The command and its arguments after the image: the whole agent
     /// invocation the worker runs.
     fn command(&self, config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString>;
@@ -146,6 +172,10 @@ pub enum AgentItem {
     /// The token usage of one completed turn, which the run sums over every
     /// turn. Codex reports this; Claude reports a cost instead.
     Usage(TokenUsage),
+    /// The run's token usage as one cumulative total. It replaces what the run
+    /// holds, where [`Usage`](AgentItem::Usage) adds a turn. A Local run on
+    /// Copilot reports this, because its usage checkpoints are running totals.
+    UsageTotal(TokenUsage),
     /// The run's final result, resolved from the agent's structured output.
     Result(RunResult),
     /// The agent failed a turn or hit a fatal stream error without a final

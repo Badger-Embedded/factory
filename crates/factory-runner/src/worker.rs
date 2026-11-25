@@ -2,8 +2,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
-use factory_core::{Agent, Event, PlanUsage};
+use factory_core::{Agent, Cli, Event, PlanUsage};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
@@ -196,6 +197,48 @@ pub struct WorkerRun {
     /// The project's nixpkgs packages. A non-empty list runs the agent inside
     /// `nix shell` with them on `PATH`; an empty one changes nothing.
     pub packages: Vec<String>,
+    /// The local server this run talks to instead of an agent's subscription.
+    /// `None` runs the agent on its own login. With a target the run starts
+    /// `local.cli`, carries no subscription credential and reads no credential
+    /// file back.
+    pub local: Option<LocalTarget>,
+}
+
+impl WorkerRun {
+    /// The CLI that runs this stage: the Local target's, else the agent's own.
+    #[must_use]
+    pub fn cli(&self) -> Option<Cli> {
+        self.local
+            .as_ref()
+            .map(|local| local.cli)
+            .or_else(|| self.agent.cli())
+    }
+}
+
+/// The OpenAI-compatible server a Local run uses and the CLI that drives it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalTarget {
+    /// The CLI that runs the model.
+    pub cli: Cli,
+    /// The server's base URL, with no trailing slash and no `/v1`.
+    pub base_url: String,
+    /// The API key the run resolved, when there is one. It reaches the worker
+    /// only as `--env <name>` with the value in podman's own environment.
+    pub key: Option<String>,
+    /// How long the server may take to load a model. The run raises the CLI's
+    /// request timeout to at least this.
+    pub load_timeout: Duration,
+}
+
+impl std::fmt::Debug for LocalTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalTarget")
+            .field("cli", &self.cli)
+            .field("base_url", &self.base_url)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .field("load_timeout", &self.load_timeout)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,7 +284,6 @@ pub struct McpUnavailable {
 #[must_use]
 pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     let backend = run
-        .agent
         .cli()
         .and_then(backend_for)
         .expect("the run's CLI has a worker backend");
@@ -267,9 +309,15 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     // file credential, such as Codex's `auth.json`, is in the mounted config
     // directory instead, so it needs no `--env`. The config directory env
     // points the agent at its mounted config directory.
-    if let Credential::Env(name) = backend.credential() {
+    if run.local.is_none()
+        && let Credential::Env(name) = backend.credential()
+    {
         args.push("--env".into());
         args.push(name.into());
+    }
+    for (name, value) in backend.local_env(run) {
+        args.push("--env".into());
+        args.push(format!("{name}={value}").into());
     }
     args.push("--env".into());
     args.push(format!("{}={}", backend.config_dir_env(), backend.config_dir()).into());
@@ -333,7 +381,7 @@ pub async fn run(
         credential: None,
         token_usage: None,
     };
-    let Some(backend) = run.agent.cli().and_then(backend_for) else {
+    let Some(backend) = run.cli().and_then(backend_for) else {
         return failed(format!(
             "the {} agent has no worker backend",
             run.agent.display_name()
@@ -347,8 +395,12 @@ pub async fn run(
             run.agent.id()
         ));
     }
-    for line in backend.start_log() {
-        log(line);
+    // A Local run has no subscription, so a backend's note about its cost
+    // does not apply; the factory writes the Local cost line itself.
+    if run.local.is_none() {
+        for line in backend.start_log() {
+            log(line);
+        }
     }
     let mut command = Command::new(&config.podman);
     command.args(podman_args(config, run));
@@ -356,7 +408,9 @@ pub async fn run(
     // environment and the `--env <name>` pass-through, not as an argument, so it
     // is absent from the process list. A file credential is in the mounted
     // config directory, so nothing is set here for it.
-    if let Credential::Env(name) = backend.credential() {
+    if run.local.is_none()
+        && let Credential::Env(name) = backend.credential()
+    {
         command.env(name, &run.token);
     }
     // Each other secret, such as Codex's MCP run token, the same way.
@@ -388,24 +442,38 @@ pub async fn run(
         text
     });
 
+    let redactor = Redactor::new(run.local.as_ref().and_then(|local| local.key.as_deref()));
     let mut collected = Collected::default();
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            for item in backend.parse(run.expect, &line) {
+            let line = redactor.apply(&line);
+            let items = if run.local.is_some() {
+                backend.parse_local(run.expect, &line)
+            } else {
+                backend.parse(run.expect, &line)
+            };
+            for item in items {
+                // A Local run says nothing about the subscription's plan usage,
+                // whatever the CLI reports.
+                if run.local.is_some() && matches!(item, AgentItem::PlanUsage(_)) {
+                    continue;
+                }
                 collected.absorb(item, &mut log, &mut usage, &mut session);
             }
         }
     }
 
     let status = child.wait().await;
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr = redactor.apply(&stderr_task.await.unwrap_or_default());
     // A file credential, such as Codex's `auth.json`, read back after the run so
     // the executor can keep a login the agent refreshed. The file may be gone,
     // which reads as `None`.
     let credential = match backend.credential() {
-        Credential::File(name) => fs::read_to_string(run.config_dir.join(name)).ok(),
-        Credential::Env(_) => None,
+        Credential::File(name) if run.local.is_none() => {
+            fs::read_to_string(run.config_dir.join(name)).ok()
+        }
+        _ => None,
     };
     if !run.packages.is_empty()
         && collected.result.is_none()
@@ -416,6 +484,34 @@ pub async fn run(
         return failed(packages::failure(&run.packages, &tail(&stderr)));
     }
     collected.into_report(run.expect, credential, status, &stderr)
+}
+
+/// Replaces a Local run's key in worker output, so a tool or a provider error
+/// that echoes it never reaches the job log or a failure reason.
+struct Redactor {
+    secrets: Vec<String>,
+}
+
+impl Redactor {
+    fn new(key: Option<&str>) -> Self {
+        let mut secrets = Vec::new();
+        if let Some(key) = key.filter(|key| !key.is_empty()) {
+            secrets.push(key.to_owned());
+            // The key as it reads inside a JSON string.
+            let escaped = serde_json::to_string(key).unwrap_or_default();
+            let escaped = escaped.trim_matches('"');
+            if escaped != key {
+                secrets.push(escaped.to_owned());
+            }
+        }
+        Redactor { secrets }
+    }
+
+    fn apply(&self, text: &str) -> String {
+        self.secrets.iter().fold(text.to_owned(), |text, secret| {
+            text.replace(secret, "[redacted]")
+        })
+    }
 }
 
 /// What one run's stdout gives, gathered as the lines arrive.
@@ -455,6 +551,7 @@ impl Collected {
                 session(&id);
                 self.agent_session = Some(id);
             }
+            AgentItem::UsageTotal(total) => self.token_usage = Some(total),
             AgentItem::Usage(turn) => {
                 self.token_usage = Some(self.token_usage.unwrap_or_default().plus(turn));
             }
