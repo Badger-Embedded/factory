@@ -882,6 +882,8 @@ pub struct HeaderState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsPage {
     Notifications,
+    /// The login's own Local API key.
+    LocalKey,
     /// A forge's page for the login's own token.
     Forge(ForgeKind),
     Workers,
@@ -961,6 +963,7 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
         nav.settings-nav aria-label="Settings" {
             p.settings-group { "You" }
             (entry("/settings/notifications".into(), "Notifications", &SettingsPage::Notifications))
+            (entry("/settings/local".into(), "Local API key", &SettingsPage::LocalKey))
             p.settings-group { "Forges" }
             @for kind in &nav.forges {
                 (entry(
@@ -1782,6 +1785,68 @@ pub fn settings_forge(
                 }
                 div.danger-zone {
                     button.danger formaction=(format!("{base}/token/clear")) formnovalidate { "Clear token" }
+                }
+            }
+        },
+    )
+}
+
+/// The login's own Local API key page. The server URL and the CLI show as
+/// text, so the login knows which server the key is for. The key is never
+/// rendered: the field has no value, an empty save keeps it and Clear removes
+/// it. The page says nothing about the factory key.
+pub fn settings_local_key(
+    user: &str,
+    nav: &SettingsNav,
+    server: Option<(&str, factory_core::Cli)>,
+    key_set: bool,
+    secrets_available: bool,
+    csrf: &str,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::LocalKey,
+        "Local API key",
+        notice,
+        &html! {
+            h1 { "Local API key" }
+            form.card.settings-form method="post" action="/settings/local" {
+                input type="hidden" name="csrf" value=(csrf);
+                input type="hidden" name="server" value=(server.map_or("", |(url, _)| url));
+                h2 { "Your key for the local server" }
+                p.hint {
+                    "The factory sends this key to the local server for jobs you requested. \
+                     The key reaches the worker, and the agent \
+                     that runs there can read it. Stored encrypted and never shown."
+                }
+                @if let Some((url, cli)) = server {
+                    p #local-server { "Server: " code { (url) } }
+                    p #local-cli { "CLI: " (cli.display_name()) }
+                } @else {
+                    p #local-server { "no local server is set" }
+                }
+                @if !secrets_available {
+                    p.hint.bad { "The master key is missing, so a key cannot be saved here. Clear still works." }
+                }
+                div.field {
+                    label for="local-user-key" { "Key" }
+                    input #local-user-key.wide type="password" name="key"
+                        autocomplete="off" spellcheck="false"
+                        placeholder=(if key_set { "set" } else { "not set" })
+                        disabled[!secrets_available];
+                    p.hint {
+                        @if key_set { "A key is stored. " } @else { "No key is stored. " }
+                        "Paste a new one to replace it. An empty field keeps it."
+                    }
+                }
+                div.save-bar {
+                    span.save-bar-note { "No unsaved changes." }
+                    button.primary disabled[!secrets_available] { "Save key" }
+                }
+                div.danger-zone {
+                    button.danger formaction="/settings/local/clear" formnovalidate { "Clear key" }
                 }
             }
         },
