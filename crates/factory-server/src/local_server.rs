@@ -68,7 +68,25 @@ impl std::fmt::Display for ModelsError {
 pub type ModelsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<String>, ModelsError>> + Send + 'a>>;
 
-/// Reads the models a local server serves. A trait so tests can answer without
+/// Why the model could not be loaded. The text never holds the API key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    /// The connection failed.
+    Connect,
+    /// The server did not answer within the limit.
+    Timeout,
+    /// The server answered with this HTTP status and, when its body held one,
+    /// this error message.
+    Status {
+        status: u16,
+        message: Option<String>,
+    },
+}
+
+/// The answer of a model load request.
+pub type LoadFuture<'a> = Pin<Box<dyn Future<Output = Result<(), LoadError>> + Send + 'a>>;
+
+/// Reads the models a local server serves, and loads one. A trait so tests can answer without
 /// a network.
 pub trait LocalServerProbe: Send + Sync {
     /// Lists the model ids at `<base_url>/v1/models`, sending `key` as a bearer
@@ -78,6 +96,22 @@ pub trait LocalServerProbe: Send + Sync {
     ///
     /// Returns why the list could not be read.
     fn models<'a>(&'a self, base_url: &'a str, key: Option<&'a str>) -> ModelsFuture<'a>;
+
+    /// Sends one `max_tokens: 1` chat completion for `model` to
+    /// `<base_url>/v1/chat/completions`. The server answers once it has loaded
+    /// the model, so the answer is the proof that a worker can start. Waits at
+    /// most `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the model did not answer with a success status.
+    fn load<'a>(
+        &'a self,
+        base_url: &'a str,
+        model: &'a str,
+        key: Option<&'a str>,
+        timeout: Duration,
+    ) -> LoadFuture<'a>;
 }
 
 /// The production [`LocalServerProbe`]. It follows no redirect, so the key never
@@ -134,6 +168,96 @@ impl LocalServerProbe for HttpLocalServerProbe {
             parse_models(&body)
         })
     }
+
+    fn load<'a>(
+        &'a self,
+        base_url: &'a str,
+        model: &'a str,
+        key: Option<&'a str>,
+        timeout: Duration,
+    ) -> LoadFuture<'a> {
+        Box::pin(async move {
+            let client = self.client.as_ref().ok_or(LoadError::Connect)?;
+            let mut request = client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .timeout(timeout)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(
+                    serde_json::json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                    })
+                    .to_string(),
+                );
+            if let Some(key) = key {
+                request = request.bearer_auth(key);
+            }
+            let response = request.send().await.map_err(|err| {
+                if err.is_timeout() {
+                    LoadError::Timeout
+                } else {
+                    LoadError::Connect
+                }
+            })?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            // The page for a rejected key needs only the status, so a server
+            // that stalls the body of a 401 or 403 must not hold the run.
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(LoadError::Status {
+                    status: status.as_u16(),
+                    message: None,
+                });
+            }
+            let body = read_bounded(response).await;
+            Err(LoadError::Status {
+                status: status.as_u16(),
+                message: error_message(&body, key),
+            })
+        })
+    }
+}
+
+const ERROR_BODY_LIMIT: usize = 16 * 1024;
+const ERROR_BODY_DEADLINE: Duration = Duration::from_secs(2);
+const ERROR_MESSAGE_LIMIT: usize = 300;
+
+/// Reads what arrives of the body within the deadline, so a stalled body costs
+/// the run no more than the deadline and the status still stands.
+async fn read_bounded(mut response: reqwest::Response) -> Vec<u8> {
+    let mut body = Vec::new();
+    let _ = tokio::time::timeout(ERROR_BODY_DEADLINE, async {
+        while body.len() < ERROR_BODY_LIMIT {
+            let Ok(Some(chunk)) = response.chunk().await else {
+                break;
+            };
+            let room = ERROR_BODY_LIMIT - body.len();
+            body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+    })
+    .await;
+    body
+}
+
+/// The `error.message` of an `OpenAI`-style error body, or its `error` when that
+/// is a string. The key is redacted from the whole message before it is cut
+/// short, so a key that straddles the cut cannot leave a prefix behind.
+fn error_message(body: &[u8], key: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.as_str())?
+        .trim();
+    let message = match key {
+        Some(key) if !key.is_empty() => message.replace(key, "<redacted>"),
+        _ => message.to_owned(),
+    };
+    (!message.is_empty()).then(|| message.chars().take(ERROR_MESSAGE_LIMIT).collect())
 }
 
 fn parse_models(body: &[u8]) -> Result<Vec<String>, ModelsError> {

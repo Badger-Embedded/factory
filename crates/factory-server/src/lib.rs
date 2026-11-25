@@ -51,7 +51,8 @@ pub use github::{
 };
 pub use gitlab::GlabRepos;
 pub use local_server::{
-    HttpLocalServerProbe, LocalServerProbe, ModelsError, ModelsFuture, normalize_server_url,
+    HttpLocalServerProbe, LoadError, LoadFuture, LocalServerProbe, ModelsError, ModelsFuture,
+    normalize_server_url,
 };
 pub use mcp::{
     McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,

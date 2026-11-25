@@ -269,6 +269,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             registry: Arc::clone(&agents),
             store: Arc::clone(&store),
             plan_usage: Arc::clone(&plan_usage),
+            local_probe: Arc::new(HttpLocalServerProbe::new()),
         };
         let scheduler = Scheduler::new(
             Arc::clone(&store),

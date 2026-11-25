@@ -3,13 +3,13 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use factory_core::{
     Agent, Cli, Event, FileText, PackagingContext, PrDiff, RenovateAccess, RenovateCi,
 };
 use factory_runner::{
-    Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LocalTarget,
+    Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LocalTarget, LogLine,
     NOT_PERMITTED, Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport,
     SessionRun, WorkerConfig, WorkerRun, backend_for, observe, place_files, place_images,
     remove_container, run, run_checks, show_files, show_images,
@@ -17,11 +17,12 @@ use factory_runner::{
 
 use crate::accounts::{AccountSource, Operation, blame, credential_reason};
 use crate::forges::Forges;
+use crate::local_server::{LoadError, LocalServerProbe};
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PackagingRequest, PublishRequest,
-    Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, SessionSink,
-    SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, LocalKeyOwner, LogSink, PackagingRequest,
+    PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest,
+    SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -53,6 +54,8 @@ pub struct PodmanExecutor {
     pub store: Arc<Store>,
     /// Takes each plan usage report a run makes, for the board tile.
     pub plan_usage: Arc<PlanUsageCache>,
+    /// Waits for the local server to load the model of a Local run.
+    pub local_probe: Arc<dyn LocalServerProbe>,
 }
 
 /// Writes a credential file, such as Codex's `auth.json`, with mode 0600 so
@@ -224,6 +227,44 @@ fn job_images(job_dir: &Path) -> Vec<PathBuf> {
 }
 
 impl PodmanExecutor {
+    /// Sends the model load request and waits for its answer, so the worker
+    /// starts on a loaded model. The run holds its worker slot meanwhile.
+    async fn wait_for_local_model(
+        &self,
+        local: &crate::LocalRequest,
+        model: &str,
+        log: &mut LogSink,
+    ) -> Result<(), String> {
+        let target = &local.target;
+        let started = Instant::now();
+        let load = self.local_probe.load(
+            &target.base_url,
+            model,
+            target.key.as_deref(),
+            target.load_timeout,
+        );
+        tokio::pin!(load);
+        let mut noticed = false;
+        let result = tokio::select! {
+            result = &mut load => result,
+            () = tokio::time::sleep(LOAD_NOTICE_AFTER) => {
+                noticed = true;
+                log(LogLine::Other(format!(
+                    "Waiting for the local server to load `{model}`."
+                )));
+                load.await
+            }
+        };
+        let answered = !matches!(result, Err(LoadError::Timeout | LoadError::Connect));
+        if noticed && answered {
+            log(LogLine::Other(format!(
+                "The local server answered after {} seconds.",
+                started.elapsed().as_secs()
+            )));
+        }
+        result.map_err(|error| load_failure(&error, local, model))
+    }
+
     async fn prepare_checkout(
         &self,
         request: &AgentRequest,
@@ -255,6 +296,41 @@ impl PodmanExecutor {
     }
 }
 
+const LOAD_NOTICE_AFTER: Duration = Duration::from_secs(5);
+
+fn load_failure(error: &LoadError, local: &crate::LocalRequest, model: &str) -> String {
+    let target = &local.target;
+    match error {
+        LoadError::Timeout => {
+            let minutes = target.load_timeout.as_secs().div_ceil(60);
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            format!("The local server did not answer for `{model}` within {minutes} {unit}.")
+        }
+        LoadError::Connect => format!(
+            "The factory cannot reach the local server at {}.",
+            target.base_url
+        ),
+        LoadError::Status {
+            status: 401 | 403, ..
+        } => match &local.key_from {
+            LocalKeyOwner::Login(login) => format!(
+                "The local server rejected the Local API key of {login}. Replace it on \
+                 /settings/local."
+            ),
+            LocalKeyOwner::Factory => "The local server rejected the factory's Local API key. \
+                 Replace it on /settings/agents/local."
+                .to_owned(),
+            LocalKeyOwner::None => "The local server asks for an API key and none is set. Set \
+                 one on /settings/local, or the factory's on /settings/agents/local."
+                .to_owned(),
+        },
+        LoadError::Status { status, message } => match message {
+            Some(message) => format!("The local server answered HTTP {status}: {message}"),
+            None => format!("The local server answered HTTP {status}."),
+        },
+    }
+}
+
 /// Resolves the credential before the checkout or any container, so with
 /// none the run fails there. The agent failure keeps the task as its retry
 /// target, so a token saved on the settings page lets Retry run it. A Local
@@ -277,11 +353,12 @@ fn credential_and_cli(
 }
 
 impl Executor for PodmanExecutor {
+    #[allow(clippy::too_many_lines)]
     async fn run_agent(
         &self,
         settings: &Settings,
         request: AgentRequest,
-        log: LogSink,
+        mut log: LogSink,
         mut session: SessionSink,
     ) -> RunReport {
         let agent = request.agent;
@@ -292,6 +369,17 @@ impl Executor for PodmanExecutor {
             Ok(found) => found,
             Err(reason) => return failed(reason),
         };
+        if let Some(local) = &request_local
+            && let Err(reason) = self
+                .wait_for_local_model(
+                    local,
+                    request.model.as_deref().unwrap_or_default(),
+                    &mut log,
+                )
+                .await
+        {
+            return failed(reason);
+        }
         let backend = backend_for(cli).expect("the run's CLI has a worker backend");
         let image = entry
             .image(settings)
