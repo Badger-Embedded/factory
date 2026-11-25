@@ -782,7 +782,7 @@ async fn a_run_that_fails_after_an_intermediate_message_ends_on_the_failure() {
     let mut worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.expect = Expect::Review;
 
-    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}, || {}).await;
 
     match report.event {
         Event::ReviewFailed { reason } => {
@@ -823,7 +823,15 @@ async fn the_cost_note_is_logged_once_even_when_the_worker_prints_nothing() {
     let worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
 
     let mut log = Vec::new();
-    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+    let report = run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
 
     assert!(matches!(report.event, Event::AgentFailed { .. }));
     assert_eq!(cost_notes(&log), 1, "{log:?}");
@@ -845,7 +853,15 @@ async fn the_cost_note_is_logged_once_for_a_run_that_reaches_its_result_line() {
     let worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
 
     let mut log = Vec::new();
-    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+    let report = run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
 
     assert_eq!(report.cost_usd, None);
     assert_eq!(cost_notes(&log), 1, "{log:?}");
@@ -873,7 +889,15 @@ async fn a_checkpoint_is_logged_when_the_run_dies_before_its_result_line() {
     let worker = copilot_run(dir.path(), SessionRun::Start(SESSION.into()));
 
     let mut log = Vec::new();
-    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+    let report = run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
 
     assert!(matches!(report.event, Event::AgentFailed { .. }));
     assert!(
@@ -982,7 +1006,15 @@ async fn a_local_copilot_run_logs_no_cost_note_and_sets_no_github_token() {
     worker.token = TOKEN.into();
 
     let mut log = Vec::new();
-    run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+    run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
 
     assert_eq!(
         fs::read_to_string(env_file).unwrap(),
@@ -1027,6 +1059,7 @@ async fn a_local_copilot_run_reports_the_last_checkpoint_not_their_sum() {
         |_| {},
         |_| {},
         |_| {},
+        || {},
     )
     .await;
     let usage = local.token_usage.unwrap();
@@ -1038,6 +1071,7 @@ async fn a_local_copilot_run_reports_the_last_checkpoint_not_their_sum() {
         |_| {},
         |_| {},
         |_| {},
+        || {},
     )
     .await;
     assert_eq!(subscription.token_usage, None);

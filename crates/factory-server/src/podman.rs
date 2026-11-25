@@ -85,6 +85,18 @@ fn failed(reason: String) -> RunReport {
 }
 
 impl PodmanExecutor {
+    /// The session starts on its CLI once podman has spawned the worker, after
+    /// every step that can still fail the launch.
+    fn record_local_cli(&self, job_id: i64, local: Option<&crate::LocalRequest>) {
+        if let Some(local) = local
+            && let Err(err) =
+                self.store
+                    .record_session_local_cli(job_id, local.session, local.target.cli)
+        {
+            tracing::warn!("could not record the session's CLI: {err}");
+        }
+    }
+
     fn container(job_id: i64) -> String {
         format!("factory-job-{job_id}")
     }
@@ -354,15 +366,6 @@ impl Executor for PodmanExecutor {
             local,
         };
         let is_local = worker.local.is_some();
-        // The session starts on this CLI only now, after the checkout and the
-        // credential steps that can still fail the run.
-        if let Some(local) = &request_local
-            && let Err(err) =
-                self.store
-                    .record_session_local_cli(request.job_id, local.session, local.target.cli)
-        {
-            return failed(format!("could not record the session's CLI: {err}"));
-        }
         let report = run(
             &config,
             &worker,
@@ -374,6 +377,7 @@ impl Executor for PodmanExecutor {
                 }
             },
             |id: &str| session(id.to_owned()),
+            || self.record_local_cli(request.job_id, request_local.as_ref()),
         )
         .await;
         if let Some(path) = &credential_file {

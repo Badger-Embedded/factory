@@ -369,6 +369,7 @@ pub async fn run(
     mut log: impl FnMut(LogLine),
     mut usage: impl FnMut(PlanUsage),
     mut session: impl FnMut(&str),
+    started: impl FnOnce(),
 ) -> RunReport {
     // A review run fails closed. A crash or a missing result is a
     // `ReviewFailed`, so the factory does not merge. Every other run reports
@@ -433,6 +434,7 @@ pub async fn run(
         }
     };
 
+    started();
     let mut stderr = child.stderr.take().map(BufReader::new);
     let stderr_task = tokio::spawn(async move {
         let mut text = String::new();

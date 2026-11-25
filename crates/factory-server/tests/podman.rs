@@ -1649,3 +1649,51 @@ async fn a_local_run_needs_no_subscription_login_and_keeps_its_own_config_direct
         assert!(!job_dir.join(own_dir).exists(), "{cli:?}");
     }
 }
+
+async fn local_launch(
+    podman_path: &str,
+    cli: Cli,
+) -> (Option<Cli>, factory_runner::RunReport, Arc<Store>) {
+    let tools = Tools::new();
+    let store = Arc::new(Store::open_in_memory().expect("open store"));
+    let mut podman = tools.executor(Arc::clone(&store));
+    podman.base.podman = if podman_path.starts_with('/') {
+        PathBuf::from(podman_path)
+    } else {
+        support::executable(tools.dir.path(), "podman", podman_path)
+    };
+    let mut run = local_request(cli);
+    run.branch = Some("factory/job-7-pr-1".into());
+    let id = store.create("maestro", "alice", "x").unwrap();
+    run.job_id = id;
+    store
+        .session_uuid(id, factory_core::Session::Planning, Agent::Local)
+        .unwrap();
+    let report = podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+    let recorded = store
+        .session_local_cli(id, factory_core::Session::Planning)
+        .unwrap();
+    (recorded, report, store)
+}
+
+#[tokio::test]
+async fn a_local_session_records_no_cli_when_podman_cannot_start() {
+    let (recorded, report, _) = local_launch("/nonexistent/podman", Cli::Codex).await;
+
+    assert!(reason(report).starts_with("could not start"));
+    assert_eq!(recorded, None);
+}
+
+#[tokio::test]
+async fn a_local_session_records_its_cli_once_podman_has_started_the_worker() {
+    let (recorded, _, _) = local_launch("#!/bin/bash\nexit 0\n", Cli::Copilot).await;
+
+    assert_eq!(recorded, Some(Cli::Copilot));
+}
