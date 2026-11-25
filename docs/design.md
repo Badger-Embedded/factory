@@ -341,13 +341,15 @@ With Local selected, the stage panel's chips, datalist and hint come from the st
 
 ### Runs on moon
 
-Done for Claude Code only, by an operator on moon; Codex and Copilot are still pending, and so is the CLI version in the worker image for all three.
+Criterion 27 is not met. No cold-start Local implement run has been done for any CLI. Codex and Copilot have not run at all, and the deployed CLI versions are unrecorded.
 
-| CLI | Job | Stage | Worker start | Model-load wait | Output |
-| --- | --- | --- | --- | --- | --- |
-| Claude Code | `https://moon.rex-mimosa.ts.net/jobs/98` | clarifying, not implement, `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`, medium | 22:27:52, "Agent run started" | 76 s (waiting line at 22:27:57, answer at 22:29:09) | The model read the repository with Bash and Read, answered that the factory passes the Local model to the CLIs with `--model`, and returned structured output. The log records the run at $0 with 64459 input and 7292 output tokens. |
+Job 98 is a Claude Code smoke test of a clarifying stage, not an implement run:
 
-The wait of 76 s is longer than the 30 to 45 s seen in development, and the CLI did not time out. The run was a clarifying stage, so it does not show an implement stage creating a file. The CLI version was not reported.
+| CLI | Job | Stage | Model-load wait | First worker output after the load |
+| --- | --- | --- | --- | --- |
+| Claude Code | `https://moon.rex-mimosa.ts.net/jobs/98` | clarifying, `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`, medium | 76 s (waiting line at 22:27:57, answer at 22:29:09) | 22:29:24, a Bash call |
+
+The 22:27:52 "Agent run started" line precedes the wait, so it is not the worker start. The Bash call at 22:29:24 shows the worker running after the load. The CLI did not time out in 76 s, longer than the 30 to 45 s seen in development. The model read the repository, answered a question about the Local model and returned structured output. The log records $0 with 64459 input and 7292 output tokens.
 
 Procedure for the operator:
 
