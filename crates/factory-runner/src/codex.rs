@@ -24,10 +24,12 @@ use serde_json::Value;
 use crate::agent::{
     AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage, write_replacing,
 };
+use crate::copilot::SCHEMA_IN_PROMPT;
+use crate::final_json;
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
 use crate::worker::{
-    McpServerEntry, STDIO_STARTUP_TIMEOUT_SECS, SessionRun, WorkerConfig, WorkerRun,
+    LocalTarget, McpServerEntry, STDIO_STARTUP_TIMEOUT_SECS, SessionRun, WorkerConfig, WorkerRun,
 };
 
 /// The Codex config directory inside the worker, mounted from the job's `codex`
@@ -47,6 +49,17 @@ const AUTH_FILE: &str = "auth.json";
 /// and not its `CLAUDE.md`.
 const CONFIG_FILE: &str = "config.toml";
 const CONFIG_TOML: &str = "cli_auth_credentials_store = \"file\"\n";
+
+/// The provider id a Local run names with `model_provider`, and the variable its
+/// key comes from. [`run`](crate::worker::run) sets the key in podman's process
+/// environment, so it stays out of the arguments and the log.
+const LOCAL_PROVIDER: &str = "local";
+const LOCAL_KEY_ENV: &str = "FACTORY_LOCAL_API_KEY";
+
+/// Codex's idle timeout on a response stream, 300000 ms unless the provider sets
+/// `stream_idle_timeout_ms`. A Local run raises it to at least the model load
+/// timeout, because the server sends nothing while it loads the model.
+const DEFAULT_STREAM_IDLE_MS: u128 = 300_000;
 
 /// The output schema file the backend writes, passed to `codex exec
 /// --output-schema`, which makes the final agent message match it.
@@ -81,6 +94,17 @@ impl AgentBackend for CodexAgent {
         }
     }
 
+    fn local_prompt_style(&self) -> PromptStyle {
+        PromptStyle {
+            schema_in_prompt: Some(SCHEMA_IN_PROMPT),
+            ..self.prompt_style()
+        }
+    }
+
+    fn local_host_config_dir(&self) -> &'static str {
+        "local-codex"
+    }
+
     fn config_dir_env(&self) -> &'static str {
         "CODEX_HOME"
     }
@@ -106,7 +130,14 @@ impl AgentBackend for CodexAgent {
     }
 
     fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
-        let mut config = CONFIG_TOML.to_owned();
+        // A Local run has no login, so it writes no credential store line and no
+        // output schema: the model gets the schema in its prompt instead.
+        let local = run.local.is_some();
+        let mut config = if local {
+            String::new()
+        } else {
+            CONFIG_TOML.to_owned()
+        };
         for entry in run.mcp.iter().flat_map(|mcp| &mcp.servers) {
             if let McpServerEntry::Stdio {
                 name,
@@ -125,6 +156,9 @@ impl AgentBackend for CodexAgent {
             }
         }
         write_replacing(&run.config_dir, CONFIG_FILE, &config)?;
+        if local {
+            return Ok(());
+        }
         fs::write(
             run.config_dir.join(SCHEMA_FILE),
             run.expect.strict_schema().to_string(),
@@ -135,15 +169,19 @@ impl AgentBackend for CodexAgent {
         // The MCP run token, by name only, for a run with at least one remote
         // server. A run with none, such as one with only stdio servers, passes
         // none, so it gets no token.
-        match run
+        let mut env = Vec::new();
+        if let Some(proxy) = run
             .mcp
             .as_ref()
             .filter(|mcp| !mcp.servers.is_empty())
             .and_then(|mcp| mcp.proxy.as_ref())
         {
-            Some(proxy) => vec![(MCP_TOKEN_ENV, proxy.token.as_str())],
-            None => Vec::new(),
+            env.push((MCP_TOKEN_ENV, proxy.token.as_str()));
         }
+        if let Some(key) = run.local.as_ref().and_then(|local| local.key.as_deref()) {
+            env.push((LOCAL_KEY_ENV, key));
+        }
+        env
     }
 
     fn command(&self, _config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
@@ -160,19 +198,34 @@ impl AgentBackend for CodexAgent {
         // bypassed permissions, so Codex runs without its own approvals or
         // sandbox.
         codex.push("--dangerously-bypass-approvals-and-sandbox".into());
-        codex.push("--output-schema".into());
-        codex.push(schema);
+        if run.local.is_none() {
+            codex.push("--output-schema".into());
+            codex.push(schema);
+        }
         if let Some(model) = run.model.as_deref().filter(|model| !model.is_empty()) {
             codex.push("--model".into());
             codex.push(model.into());
         }
+        let default_effort = if run.local.is_some() {
+            Agent::Local
+        } else {
+            Agent::Codex
+        }
+        .default_effort();
         codex.push("-c".into());
         codex.push(format!(
             "model_reasoning_effort={}",
-            run.effort
-                .as_deref()
-                .unwrap_or_else(|| Agent::Codex.default_effort())
+            run.effort.as_deref().unwrap_or(default_effort)
         ));
+        if let Some(local) = run.local.as_ref() {
+            codex.push("-c".into());
+            codex.push(format!(
+                "model_providers.{LOCAL_PROVIDER}={}",
+                local_provider(local)
+            ));
+            codex.push("-c".into());
+            codex.push(format!("model_provider={LOCAL_PROVIDER}"));
+        }
         // A remote MCP server is pointed at the proxy. The run token is passed
         // by name, not value, so it stays out of the arguments; the proxy swaps
         // it for the project's stored headers. A run with no active server adds
@@ -205,8 +258,28 @@ impl AgentBackend for CodexAgent {
     }
 
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
-        parse_codex(expect, line)
+        parse_codex(expect, line, message_result)
     }
+
+    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+        parse_codex(expect, line, final_json::message_result)
+    }
+}
+
+/// The inline TOML table for the Local provider: the server's `/v1` URL over the
+/// Responses API, the key's variable when the run has a key, and an idle timeout
+/// that outlasts the model load.
+fn local_provider(local: &LocalTarget) -> String {
+    let idle_ms = local.load_timeout.as_millis().max(DEFAULT_STREAM_IDLE_MS);
+    let mut table = format!(
+        "{{ name = \"Local\", base_url = {}, wire_api = \"responses\", stream_idle_timeout_ms = {idle_ms}",
+        toml_string(&format!("{}/v1", local.base_url)),
+    );
+    if local.key.is_some() {
+        let _ = write!(table, ", env_key = \"{LOCAL_KEY_ENV}\"");
+    }
+    table.push_str(" }");
+    table
 }
 
 /// `value` as a TOML basic string, which `-c` parses as the override's value.
@@ -239,7 +312,11 @@ fn toml_array(values: &[String]) -> String {
 
 /// Parses one line of `codex exec --json`. A line the factory does not keep,
 /// such as `turn.started`, `item.started` or `item.updated`, gives nothing.
-fn parse_codex(expect: Expect, line: &str) -> Vec<AgentItem> {
+fn parse_codex(
+    expect: Expect,
+    line: &str,
+    final_result: fn(Expect, &str) -> RunResult,
+) -> Vec<AgentItem> {
     let line = line.trim();
     if line.is_empty() {
         return Vec::new();
@@ -264,7 +341,7 @@ fn parse_codex(expect: Expect, line: &str) -> Vec<AgentItem> {
             value.pointer("/error/message").and_then(Value::as_str),
         ),
         Some("error") => failure(expect, value.get("message").and_then(Value::as_str)),
-        Some("item.completed") => parse_item(expect, value.get("item")),
+        Some("item.completed") => parse_item(expect, value.get("item"), final_result),
         _ => Vec::new(),
     }
 }
@@ -286,7 +363,11 @@ fn failure(expect: Expect, message: Option<&str>) -> Vec<AgentItem> {
 /// Turns one `item.completed` item into the log lines and, for the final agent
 /// message, the result. A reasoning, web search or to-do item gives nothing, as
 /// Claude's thinking blocks do.
-fn parse_item(expect: Expect, item: Option<&Value>) -> Vec<AgentItem> {
+fn parse_item(
+    expect: Expect,
+    item: Option<&Value>,
+    final_result: fn(Expect, &str) -> RunResult,
+) -> Vec<AgentItem> {
     let Some(item) = item else {
         return Vec::new();
     };
@@ -298,7 +379,7 @@ fn parse_item(expect: Expect, item: Option<&Value>) -> Vec<AgentItem> {
                 items.push(AgentItem::Log(LogLine::Text(text.to_owned())));
             }
             // The last agent message wins: `run` keeps the latest result.
-            items.push(AgentItem::Result(message_result(expect, text)));
+            items.push(AgentItem::Result(final_result(expect, text)));
             items
         }
         Some("command_execution") => {

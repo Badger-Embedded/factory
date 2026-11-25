@@ -21,7 +21,7 @@ use std::path::Path;
 use factory_core::{Agent, Cli};
 use serde_json::Value;
 
-use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, write_replacing};
+use crate::agent::{AgentBackend, AgentItem, Credential, PromptStyle, TokenUsage, write_replacing};
 use crate::final_json::message_result;
 use crate::outcome::{Expect, failed_event};
 use crate::stream::LogLine;
@@ -35,6 +35,10 @@ use crate::worker::{
 /// flow stores.
 const CONFIG_DIR: &str = "/copilot";
 const MCP_CONFIG_FILE: &str = "factory-mcp.json";
+
+/// The variable a Local run's key goes in. [`run`](crate::worker::run) sets it
+/// in podman's process environment, so the key stays out of the arguments.
+const LOCAL_KEY_ENV: &str = "COPILOT_PROVIDER_API_KEY";
 
 /// The environment variable Copilot reads its GitHub token from. It is first in
 /// the CLI's lookup order, so the factory's stored login wins over any token in
@@ -51,7 +55,7 @@ const MCP_TOKEN_ENV: &str = "FACTORY_MCP_TOKEN";
 /// The instruction appended to a Copilot prompt. The CLI has no output-schema
 /// flag, so the run must end with the JSON itself; [`prompt`](crate::prompt)
 /// writes this text and then the stage's schema.
-const SCHEMA_IN_PROMPT: &str = "This agent has no structured-output mode, so produce the \
+pub(crate) const SCHEMA_IN_PROMPT: &str = "This agent has no structured-output mode, so produce the \
      outcome yourself. End the run with one final message that holds only the JSON for your \
      outcome and nothing else: no sentence before it and none after. The factory parses that \
      message as JSON, and any text outside the JSON fails the run. Put a summary, an \
@@ -114,15 +118,38 @@ impl AgentBackend for CopilotAgent {
     }
 
     fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
-        match run
+        let mut env = Vec::new();
+        if let Some(proxy) = run
             .mcp
             .as_ref()
             .filter(|mcp| !mcp.servers.is_empty())
             .and_then(|mcp| mcp.proxy.as_ref())
         {
-            Some(proxy) => vec![(MCP_TOKEN_ENV, proxy.token.as_str())],
-            None => Vec::new(),
+            env.push((MCP_TOKEN_ENV, proxy.token.as_str()));
         }
+        if let Some(key) = run.local.as_ref().and_then(|local| local.key.as_deref()) {
+            env.push((LOCAL_KEY_ENV, key));
+        }
+        env
+    }
+
+    fn local_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
+        // Copilot documents no request timeout for a custom provider, so it
+        // keeps its own behaviour while the server loads the model.
+        run.local.as_ref().map_or_else(Vec::new, |local| {
+            vec![
+                ("COPILOT_OFFLINE", "true".to_owned()),
+                (
+                    "COPILOT_PROVIDER_BASE_URL",
+                    format!("{}/v1", local.base_url),
+                ),
+                ("COPILOT_PROVIDER_TYPE", "openai".to_owned()),
+            ]
+        })
+    }
+
+    fn local_host_config_dir(&self) -> &'static str {
+        "local-copilot"
     }
 
     fn command(&self, _config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
@@ -154,12 +181,13 @@ impl AgentBackend for CopilotAgent {
             copilot.push(model.into());
         }
         copilot.push("--effort".into());
-        copilot.push(
-            run.effort
-                .as_deref()
-                .unwrap_or_else(|| Agent::Copilot.default_effort())
-                .into(),
-        );
+        let default_effort = if run.local.is_some() {
+            Agent::Local
+        } else {
+            Agent::Copilot
+        }
+        .default_effort();
+        copilot.push(run.effort.as_deref().unwrap_or(default_effort).into());
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             copilot.push("--additional-mcp-config".into());
             if mcp.has_stdio() {
@@ -182,6 +210,17 @@ impl AgentBackend for CopilotAgent {
 
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         parse_copilot(expect, line)
+    }
+
+    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+        let mut items = parse_copilot(expect, line);
+        if let Ok(value) = serde_json::from_str::<Value>(line.trim())
+            && value.get("type").and_then(Value::as_str) == Some("session.usage_checkpoint")
+            && let Some(total) = checkpoint_usage(value.get("data"))
+        {
+            items.push(AgentItem::UsageTotal(total));
+        }
+        items
     }
 }
 
@@ -383,6 +422,27 @@ fn parse_result(expect: Expect, value: &Value) -> Vec<AgentItem> {
         )));
     }
     items
+}
+
+/// The token counts of a checkpoint, which are running totals for the session.
+fn checkpoint_usage(data: Option<&Value>) -> Option<TokenUsage> {
+    let data = data?;
+    let count = |key: &str| {
+        data.pointer(&format!(
+            "/accountingSnapshot/tokenDetails/{key}/tokenCount"
+        ))
+        .and_then(Value::as_u64)
+    };
+    let (input, cached, output) = (count("input"), count("cache_read"), count("output"));
+    if input.is_none() && cached.is_none() && output.is_none() {
+        return None;
+    }
+    Some(TokenUsage {
+        input_tokens: input.unwrap_or(0),
+        cached_input_tokens: cached.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        reasoning_output_tokens: 0,
+    })
 }
 
 /// `totalNanoAiu` is in billionths of an AI credit, and `tokenDetails` holds one

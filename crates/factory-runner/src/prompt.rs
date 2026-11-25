@@ -1,23 +1,46 @@
 use std::fmt::Write;
 
-use factory_core::{Agent, Answered, FileText, Job, PackagingContext, PlannedPr, Task, Verdict};
+use factory_core::{
+    Agent, Answered, Cli, FileText, Job, PackagingContext, PlannedPr, Task, Verdict,
+};
 
 use crate::agent::{PromptStyle, backend_for};
 use crate::outcome::Expect;
 
-fn style(agent: Agent) -> PromptStyle {
-    agent
-        .cli()
-        .and_then(backend_for)
-        .expect("the run's CLI has a worker backend")
-        .prompt_style()
+/// Whose wording a prompt carries: an agent's own, or a Local run's on the CLI
+/// the factory is set to. A Local run on Codex asks for the schema in the
+/// prompt, since it passes no `--output-schema`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTarget {
+    Agent(Agent),
+    Local(Cli),
+}
+
+impl From<Agent> for PromptTarget {
+    fn from(agent: Agent) -> Self {
+        PromptTarget::Agent(agent)
+    }
+}
+
+fn style(target: PromptTarget) -> PromptStyle {
+    match target {
+        PromptTarget::Agent(agent) => agent
+            .cli()
+            .and_then(backend_for)
+            .expect("the run's CLI has a worker backend")
+            .prompt_style(),
+        PromptTarget::Local(cli) => backend_for(cli)
+            .expect("the run's CLI has a worker backend")
+            .local_prompt_style(),
+    }
 }
 
 /// The prompt for one agent run. `agent` picks the per-harness wording from its
 /// backend: the repository instructions file the prompt names and the sentence
 /// a review run follows to find its method.
 #[must_use]
-pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
+pub fn prompt(task: &Task, expect: Expect, agent: impl Into<PromptTarget>) -> String {
+    let agent = agent.into();
     let mut text = match task {
         Task::Clarify { request } => format!(
             "This is a feature request for the repository in the current directory:\n\n\
@@ -116,7 +139,7 @@ pub fn prompt(task: &Task, expect: Expect, agent: Agent) -> String {
     text
 }
 
-fn end_prompt(text: &mut String, agent: Agent, expect: Expect) {
+fn end_prompt(text: &mut String, agent: PromptTarget, expect: Expect) {
     text.push_str("\n\n");
     text.push_str(NIX_PARAGRAPH);
     append_schema(text, agent, expect);
@@ -132,7 +155,7 @@ const NIX_PARAGRAPH: &str = "Nix is installed in this environment, with flakes e
 /// no output-schema flag and asks for it in the prompt. The backend owns the
 /// wording, so this names no harness. A backend that passes the schema to its
 /// CLI leaves it empty and nothing is appended.
-fn append_schema(text: &mut String, agent: Agent, expect: Expect) {
+fn append_schema(text: &mut String, agent: PromptTarget, expect: Expect) {
     if let Some(instruction) = style(agent).schema_in_prompt {
         let schema = serde_json::to_string_pretty(&expect.schema())
             .unwrap_or_else(|_| expect.schema().to_string());
@@ -140,7 +163,7 @@ fn append_schema(text: &mut String, agent: Agent, expect: Expect) {
     }
 }
 
-fn failure_prompt(log: &str, agent: Agent) -> String {
+fn failure_prompt(log: &str, agent: PromptTarget) -> String {
     let mut text = format!(
         "CI failed on a Renovate pull request that updates a dependency, and reruns of the \
          failed runs did not fix it. This is the log:\n\n{log}\n\n\
@@ -160,7 +183,7 @@ fn failure_prompt(log: &str, agent: Agent) -> String {
 
 /// The prompt for the diff check of a Renovate pull request. The worker has
 /// no GitHub token, so the prompt carries the diff.
-fn diff_prompt(diff: &str, body: &str, agent: Agent) -> String {
+fn diff_prompt(diff: &str, body: &str, agent: PromptTarget) -> String {
     let mut text = format!(
         "This is a Renovate pull request, and all its checks passed. Its description:\n\n\
          {body}\n\n\
@@ -222,7 +245,7 @@ fn file_section(text: &mut String, title: &str, files: &[FileText], missing: &st
 
 /// The prompt for the packaging analysis. The worker has no GitHub token, so
 /// the prompt carries the manifest, the pull request and the upstream patches.
-fn gaps_prompt(context: &PackagingContext, agent: Agent) -> String {
+fn gaps_prompt(context: &PackagingContext, agent: PromptTarget) -> String {
     let mut text = format!(
         "A Renovate pull request that updates the upstream project {} merged into this \
          {} packaging repository. Find the packaging gaps: things the update introduced \
@@ -351,7 +374,7 @@ impl<'a> ReviewContext<'a> {
 /// session resumes across passes, so the first pass on a pull request gets the
 /// request, answers, spec and plan, and a later pass gets only the answers
 /// given since, with the feedback it asked for when it asked for changes.
-fn review_prompt(context: &ReviewContext, agent: Agent) -> String {
+fn review_prompt(context: &ReviewContext, agent: PromptTarget) -> String {
     let style = style(agent);
     let mut text = context.decisions.clone();
     let _ = write!(
@@ -415,15 +438,15 @@ pub fn job_prompt(
     job: &Job,
     task: &Task,
     expect: Expect,
-    agent: Agent,
+    agent: impl Into<PromptTarget>,
     mcp_servers: &[String],
 ) -> String {
-    let mut text = job_body(job, task, expect, agent);
+    let mut text = job_body(job, task, expect, agent.into());
     append_mcp(&mut text, mcp_servers);
     text
 }
 
-fn job_body(job: &Job, task: &Task, expect: Expect, agent: Agent) -> String {
+fn job_body(job: &Job, task: &Task, expect: Expect, agent: PromptTarget) -> String {
     if let Task::Review = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
     }

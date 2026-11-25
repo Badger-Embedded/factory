@@ -2,13 +2,14 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use factory_core::{
-    Agent, AgentResult, Command, DiffVerdict, Event, Gates, Job, PlanUsage, PlannedPr,
+    Agent, AgentResult, Cli, Command, DiffVerdict, Event, Gates, Job, PlanUsage, PlannedPr,
     PrDescription, Question, Stage, Task, UsageWindow,
 };
 use factory_runner::{
-    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, McpServerStatus,
+    AgentItem, Expect, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry, McpServerStatus,
     McpUnavailable, PlacedFile, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
     backend, event_from_result, job_prompt, parse_line, place_files, place_images, podman_args,
     prompt, remove_container, run, show_files, show_images,
@@ -57,6 +58,7 @@ fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
         effort: None,
         mcp: None,
         packages: Vec::new(),
+        local: None,
     }
 }
 
@@ -202,6 +204,205 @@ async fn a_run_passes_each_plan_usage_report_to_its_callback() {
     .await;
 
     assert_eq!(reports, [reported_usage()]);
+}
+
+const LOCAL_KEY: &str = "sk-local-0123456789";
+
+fn local_claude_run(dir: &Path, key: Option<&str>) -> WorkerRun {
+    let mut run = worker_run(dir, SessionRun::Start(SESSION.into()));
+    run.agent = Agent::Local;
+    run.token = String::new();
+    run.model = Some("unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M".into());
+    run.local = Some(LocalTarget {
+        cli: Cli::ClaudeCode,
+        base_url: "http://gfx1201:9931".into(),
+        key: key.map(str::to_owned),
+        load_timeout: Duration::from_mins(15),
+    });
+    run
+}
+
+/// Every `--env` value of the podman arguments.
+fn env_args(args: &[String]) -> Vec<&str> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == "--env")
+        .map(|(index, _)| args[index + 1].as_str())
+        .collect()
+}
+
+#[test]
+fn a_local_claude_run_points_at_the_server_with_no_subscription_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = strings(&podman_args(
+        &WorkerConfig::default(),
+        &local_claude_run(dir.path(), None),
+    ));
+    let env = env_args(&args);
+
+    for expected in [
+        "ANTHROPIC_BASE_URL=http://gfx1201:9931",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL=unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
+        "ANTHROPIC_SMALL_FAST_MODEL=unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+        "ANTHROPIC_AUTH_TOKEN=local",
+        "API_TIMEOUT_MS=900000",
+    ] {
+        assert!(env.contains(&expected), "missing {expected} in {env:?}");
+    }
+    assert!(!env.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+    assert_eq!(
+        value_after(&args, "--model"),
+        "unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M"
+    );
+    assert_eq!(value_after(&args, "--effort"), "medium");
+    assert!(args.contains(&"--json-schema".to_owned()));
+}
+
+#[test]
+fn a_local_claude_key_goes_by_name_only_in_place_of_the_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = local_claude_run(dir.path(), Some(LOCAL_KEY));
+    let args = strings(&podman_args(&WorkerConfig::default(), &run));
+    let env = env_args(&args);
+
+    assert!(env.contains(&"ANTHROPIC_AUTH_TOKEN"));
+    assert!(!env.contains(&"ANTHROPIC_AUTH_TOKEN=local"));
+    assert!(args.iter().all(|arg| !arg.contains(LOCAL_KEY)));
+    assert_eq!(
+        backend(Agent::Claude).unwrap().secret_env(&run),
+        [("ANTHROPIC_AUTH_TOKEN", LOCAL_KEY)]
+    );
+}
+
+#[tokio::test]
+async fn a_local_claude_run_reports_no_plan_usage_and_sets_no_oauth_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(&stdout, format!("{RATE_LIMIT_EVENT}\n")).unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, "", 0),
+        ..WorkerConfig::default()
+    };
+    let mut worker = local_claude_run(dir.path(), None);
+    worker.token = "sk-ant-oat01-token".into();
+
+    let mut reports = Vec::new();
+    run(
+        &config,
+        &worker,
+        |_| {},
+        |usage| reports.push(usage),
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(reports, Vec::<PlanUsage>::new());
+    assert_eq!(fs::read_to_string(dir.path().join("token")).unwrap(), "");
+}
+
+#[tokio::test]
+async fn a_local_run_redacts_its_key_from_stdout_and_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!("the key is {LOCAL_KEY}\n{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{LOCAL_KEY}\"}}]}}}}\n"),
+    )
+    .unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, &format!("401 for {LOCAL_KEY}"), 1),
+        ..WorkerConfig::default()
+    };
+    let worker = local_claude_run(dir.path(), Some(LOCAL_KEY));
+
+    let mut log = Vec::new();
+    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+
+    let shown = format!("{log:?} {:?}", report.event);
+    assert!(!shown.contains(LOCAL_KEY), "{shown}");
+    assert!(shown.contains("[redacted]"));
+}
+
+#[test]
+fn a_local_claude_result_reports_its_token_counts() {
+    let line = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","total_cost_usd":0.049,"usage":{"input_tokens":120,"cache_read_input_tokens":30,"output_tokens":45}}"#;
+    let claude = backend(Agent::Claude).unwrap();
+    let total = |items: Vec<AgentItem>| {
+        items.into_iter().find_map(|item| match item {
+            AgentItem::UsageTotal(usage) => Some((usage.input_tokens, usage.output_tokens)),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        total(claude.parse_local(Expect::Spec, line)),
+        Some((120, 45))
+    );
+    assert_eq!(total(claude.parse(Expect::Spec, line)), None);
+
+    let null =
+        r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","usage":null}"#;
+    assert_eq!(total(claude.parse_local(Expect::Spec, null)), None);
+}
+
+#[tokio::test]
+async fn a_local_key_that_matches_a_protocol_marker_or_holds_a_quote_still_parses() {
+    const RESULT_LINE: &str = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s","errors":["stopped"],"usage":{"input_tokens":7,"output_tokens":3}}"#;
+    for key in ["result", "a\"b"] {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("stdout");
+        let escaped = key.replace('"', "\\\"");
+        fs::write(
+            &stdout,
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"saw {escaped}\"}}]}}}}\n{RESULT_LINE}\n"
+            ),
+        )
+        .unwrap();
+        let config = WorkerConfig {
+            podman: fake_podman(
+                dir.path(),
+                &stdout,
+                &format!("{{\"error\":\"bad {escaped}\"}}"),
+                1,
+            ),
+            ..WorkerConfig::default()
+        };
+        let worker = local_claude_run(dir.path(), Some(key));
+
+        let mut log = Vec::new();
+        let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+
+        let shown = format!("{log:?}");
+        assert!(shown.contains("saw [redacted]"), "{key}: {shown}");
+        assert_eq!(report.token_usage.unwrap().input_tokens, 7, "{key}");
+    }
+}
+
+#[tokio::test]
+async fn a_local_key_with_a_quote_is_redacted_from_a_json_error_on_stderr() {
+    for key in ["a\"b", "ab\""] {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("stdout");
+        fs::write(&stdout, "").unwrap();
+        let escaped = key.replace('"', "\\\"");
+        let stderr = format!("{{\"error\":\"{escaped}\"}} and {key}");
+        let config = WorkerConfig {
+            podman: fake_podman(dir.path(), &stdout, &stderr, 1),
+            ..WorkerConfig::default()
+        };
+        let worker = local_claude_run(dir.path(), Some(key));
+
+        let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+
+        let Event::AgentFailed { reason } = report.event else {
+            panic!("expected a failure");
+        };
+        assert!(
+            reason.ends_with(r#"{"error":"[redacted]"} and [redacted]"#),
+            "{key}: {reason}"
+        );
+    }
 }
 
 #[test]
