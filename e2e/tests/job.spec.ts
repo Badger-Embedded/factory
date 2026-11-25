@@ -902,3 +902,24 @@ test('a job page on an unknown forge shows the notice and a plain Renovate numbe
   await expect(page.locator('p.meta .renovate-pr')).toHaveText('#8');
   await expect(page.locator('a.renovate-pr')).toHaveCount(0);
 });
+
+test('a recorded Local run shows $0.00 and a subscription run with no cost shows a dash', async ({
+  page,
+  factory,
+  project,
+}) => {
+  const local = newJob(factory, project, 'implementing');
+  const subscription = newJob(factory, project, 'implementing');
+  factory.fixture('cost', '--job', local, '--usd', '0', '--local-cli', 'codex');
+  factory.fixture('cost', '--job', subscription, '--usd', '0');
+
+  await page.goto(`/jobs/${local}`);
+  await expect(page.locator('#job-cost')).toHaveText('$0.00');
+  await page.goto(`/jobs/${subscription}`);
+  await expect(page.locator('#job-cost')).toHaveText('–');
+
+  await page.goto(`/?project=${project}`);
+  const cost = (job: string) => page.locator('li.job', { has: page.locator(`a[href="/jobs/${job}"]`) }).locator('span.cost');
+  await expect(cost(local)).toHaveText('$0.00');
+  await expect(cost(subscription)).toHaveText('–');
+});

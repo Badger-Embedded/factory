@@ -46,11 +46,11 @@ fn claude_is_the_default_agent() {
 }
 
 #[test]
-fn every_agent_but_local_can_run() {
+fn every_agent_can_run() {
     assert!(Agent::Claude.available());
     assert!(Agent::Codex.available());
     assert!(Agent::Copilot.available());
-    assert!(!Agent::Local.available());
+    assert!(Agent::Local.available());
 }
 
 #[test]

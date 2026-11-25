@@ -676,6 +676,7 @@ async fn a_run_reports_the_thread_id_usage_and_reads_the_refreshed_login_back() 
         |line| log.push(line),
         |_| {},
         |id| reported_sessions.push(id.to_owned()),
+        || {},
     )
     .await;
 
@@ -890,7 +891,15 @@ async fn a_local_codex_run_reads_no_auth_json_back_and_sets_the_key_in_podman_on
     let run_def = local_codex_run(dir.path(), Some(LOCAL_KEY));
 
     let mut log = Vec::new();
-    let report = run(&config, &run_def, |line| log.push(line), |_| {}, |_| {}).await;
+    let report = run(
+        &config,
+        &run_def,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
 
     assert_eq!(fs::read_to_string(env_file).unwrap(), LOCAL_KEY);
     assert_eq!(report.credential, None);

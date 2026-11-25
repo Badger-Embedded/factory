@@ -200,6 +200,7 @@ async fn a_run_passes_each_plan_usage_report_to_its_callback() {
         |_| {},
         |usage| reports.push(usage),
         |_| {},
+        || {},
     )
     .await;
 
@@ -294,6 +295,7 @@ async fn a_local_claude_run_reports_no_plan_usage_and_sets_no_oauth_token() {
         |_| {},
         |usage| reports.push(usage),
         |_| {},
+        || {},
     )
     .await;
 
@@ -317,7 +319,15 @@ async fn a_local_run_redacts_its_key_from_stdout_and_stderr() {
     let worker = local_claude_run(dir.path(), Some(LOCAL_KEY));
 
     let mut log = Vec::new();
-    let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+    let report = run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
 
     let shown = format!("{log:?} {:?}", report.event);
     assert!(!shown.contains(LOCAL_KEY), "{shown}");
@@ -371,7 +381,15 @@ async fn a_local_key_that_matches_a_protocol_marker_or_holds_a_quote_still_parse
         let worker = local_claude_run(dir.path(), Some(key));
 
         let mut log = Vec::new();
-        let report = run(&config, &worker, |line| log.push(line), |_| {}, |_| {}).await;
+        let report = run(
+            &config,
+            &worker,
+            |line| log.push(line),
+            |_| {},
+            |_| {},
+            || {},
+        )
+        .await;
 
         let shown = format!("{log:?}");
         assert!(shown.contains("saw [redacted]"), "{key}: {shown}");
@@ -393,7 +411,7 @@ async fn a_local_key_with_a_quote_is_redacted_from_a_json_error_on_stderr() {
         };
         let worker = local_claude_run(dir.path(), Some(key));
 
-        let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+        let report = run(&config, &worker, |_| {}, |_| {}, |_| {}, || {}).await;
 
         let Event::AgentFailed { reason } = report.event else {
             panic!("expected a failure");
@@ -721,7 +739,7 @@ async fn a_package_failure_fails_the_run_with_the_packages_named() {
     let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.packages = vec!["nope".into(), "also".into()];
 
-    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}, || {}).await;
     let reason = failure_reason(report.event);
     assert!(
         reason.contains("worker packages (nope, also) could not be installed"),
@@ -730,7 +748,7 @@ async fn a_package_failure_fails_the_run_with_the_packages_named() {
     assert!(reason.contains("attribute nope missing"), "{reason}");
 
     worker.packages = Vec::new();
-    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}, || {}).await;
     assert!(!failure_reason(report.event).contains("worker packages"));
 }
 
@@ -760,6 +778,7 @@ async fn a_finished_run_reports_its_event_session_cost_and_log() {
         |line| log.push(line),
         |_| {},
         |_| {},
+        || {},
     )
     .await;
 
@@ -799,7 +818,7 @@ async fn the_token_reaches_the_worker_environment_not_its_arguments() {
     let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.token = "sk-ant-oat01-secret".into();
 
-    run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+    run(&config, &worker, |_| {}, |_| {}, |_| {}, || {}).await;
 
     // podman saw the token in its environment, so it passes it to the container,
     // but the token is in none of the arguments.
@@ -829,6 +848,7 @@ async fn a_run_reports_each_mcp_server_the_init_line_shows_as_not_connected() {
         |_| {},
         |_| {},
         |_| {},
+        || {},
     )
     .await;
 
@@ -864,6 +884,7 @@ async fn a_worker_that_dies_without_a_result_fails_with_its_stderr() {
         |_| {},
         |_| {},
         |_| {},
+        || {},
     )
     .await;
 
@@ -886,6 +907,7 @@ async fn a_missing_podman_binary_fails_the_run() {
         |_| {},
         |_| {},
         |_| {},
+        || {},
     )
     .await;
     assert!(failure_reason(report.event).contains("could not start"));
@@ -2015,7 +2037,7 @@ async fn a_review_run_that_dies_without_a_result_fails_closed() {
     let mut worker = worker_run(dir.path(), SessionRun::Start(SESSION.into()));
     worker.expect = Expect::Review;
 
-    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}, || {}).await;
     let reason = review_failure_reason(report.event);
     assert!(reason.contains("the worker crashed"), "{reason}");
 }

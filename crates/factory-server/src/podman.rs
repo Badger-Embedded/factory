@@ -9,15 +9,15 @@ use factory_core::{
     Agent, Cli, Event, FileText, PackagingContext, PrDiff, RenovateAccess, RenovateCi,
 };
 use factory_runner::{
-    Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, NOT_PERMITTED,
-    Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport, SessionRun,
-    WorkerConfig, WorkerRun, backend_for, observe, place_files, place_images, remove_container,
-    run, run_checks, show_files, show_images,
+    Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LocalTarget,
+    NOT_PERMITTED, Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport,
+    SessionRun, WorkerConfig, WorkerRun, backend_for, observe, place_files, place_images,
+    remove_container, run, run_checks, show_files, show_images,
 };
 
 use crate::accounts::{AccountSource, Operation, blame, credential_reason};
 use crate::forges::Forges;
-use crate::registry::AgentRegistry;
+use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, LogSink, PackagingRequest, PublishRequest,
     Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, SessionSink,
@@ -85,6 +85,19 @@ fn failed(reason: String) -> RunReport {
 }
 
 impl PodmanExecutor {
+    /// The session starts on its CLI once the worker has printed its first line,
+    /// so a podman that fails to start the container records
+    /// nothing.
+    fn record_local_cli(&self, job_id: i64, local: Option<&crate::LocalRequest>) {
+        if let Some(local) = local
+            && let Err(err) =
+                self.store
+                    .record_session_local_cli(job_id, local.session, local.target.cli)
+        {
+            tracing::warn!("could not record the session's CLI: {err}");
+        }
+    }
+
     fn container(job_id: i64) -> String {
         format!("factory-job-{job_id}")
     }
@@ -117,7 +130,7 @@ impl PodmanExecutor {
     fn start_session_prompt(
         &self,
         request: &AgentRequest,
-        agent: Agent,
+        cli: Cli,
         workspace: &Path,
         job_dir: &Path,
     ) -> Result<String, String> {
@@ -131,19 +144,24 @@ impl PodmanExecutor {
         let placed = place_files(workspace, &files)
             .map_err(|err| format!("could not place the files: {err}"))?;
         prompt = show_files(&prompt, &placed);
-        self.warn_missing_agents_md(agent, workspace, request.job_id);
+        self.warn_missing_agents_md(cli, request.local.is_some(), workspace, request.job_id);
         Ok(prompt)
     }
 
-    /// Warns the job once that a fresh Codex session in a repository with no
+    /// Warns the job once that a fresh session in a repository with no
     /// `AGENTS.md` at its root runs without the repository's instructions. The
-    /// run goes on; only Codex reads `AGENTS.md`, so it is a no-op for Claude.
-    fn warn_missing_agents_md(&self, agent: Agent, workspace: &Path, job_id: i64) {
-        if agent == Agent::Codex
-            && !workspace.join(Cli::Codex.rules_doc()).exists()
+    /// run goes on. Codex always warns; Copilot warns on a Local run, where the
+    /// prompt names `AGENTS.md`. Claude Code reads `CLAUDE.md`, so it never does.
+    fn warn_missing_agents_md(&self, cli: Cli, local: bool, workspace: &Path, job_id: i64) {
+        let reads_agents_md = cli == Cli::Codex || (local && cli == Cli::Copilot);
+        if reads_agents_md
+            && !workspace.join(cli.rules_doc()).exists()
             && let Err(err) = self.store.append_factory_log(
                 job_id,
-                "This repository has no AGENTS.md, so Codex runs without its instructions.",
+                &format!(
+                    "This repository has no AGENTS.md, so {} runs without its instructions.",
+                    cli.display_name()
+                ),
             )
         {
             tracing::error!("job {job_id}: {err}");
@@ -237,6 +255,27 @@ impl PodmanExecutor {
     }
 }
 
+/// Resolves the credential before the checkout or any container, so with
+/// none the run fails there. The agent failure keeps the task as its retry
+/// target, so a token saved on the settings page lets Retry run it. A Local
+/// run has no subscription, so it resolves none and its key rides on the
+/// target.
+fn credential_and_cli(
+    entry: &AgentEntry<'_>,
+    agent: Agent,
+    local: Option<&LocalTarget>,
+) -> Result<(String, Cli), String> {
+    match local {
+        Some(local) => Ok((String::new(), local.cli)),
+        None => Ok((
+            entry.credential()?,
+            agent
+                .cli()
+                .expect("a run without a local target has an agent with a CLI"),
+        )),
+    }
+}
+
 impl Executor for PodmanExecutor {
     async fn run_agent(
         &self,
@@ -247,29 +286,26 @@ impl Executor for PodmanExecutor {
     ) -> RunReport {
         let agent = request.agent;
         let entry = self.registry.entry(agent);
-        // Resolve the credential before preparing the checkout or starting a
-        // container. With none, the run fails here; the agent failure keeps the
-        // task as its retry target, so the job page shows Retry and a token
-        // saved on the settings page lets Retry run the task.
-        let mut token = match entry.credential() {
-            Ok(token) => token,
+        let request_local = request.local.clone();
+        let local = request_local.clone().map(|local| local.target);
+        let (mut token, cli) = match credential_and_cli(&entry, agent, local.as_ref()) {
+            Ok(found) => found,
             Err(reason) => return failed(reason),
         };
-        let backend = agent
-            .cli()
-            .and_then(backend_for)
-            .expect("the run's CLI has a worker backend");
+        let backend = backend_for(cli).expect("the run's CLI has a worker backend");
         let image = entry
             .image(settings)
             .expect("the run's agent has a worker image");
         let config = self.worker_config(settings, image);
         let job_dir = self.job_dir(request.job_id);
         let workspace = job_dir.join("work");
-        let config_dir = job_dir.join(
-            entry
-                .host_config_dir()
-                .expect("the run's agent has a host config dir"),
-        );
+        // A Local run keeps its own config directory, so its written config and
+        // session files never mix with a subscription run of the same CLI.
+        let config_dir = job_dir.join(if local.is_some() {
+            backend.local_host_config_dir()
+        } else {
+            backend.host_config_dir()
+        });
         if let Err(err) = fs::create_dir_all(&config_dir) {
             return failed(format!("could not create {}: {err}", config_dir.display()));
         }
@@ -289,7 +325,7 @@ impl Executor for PodmanExecutor {
             .unwrap_or(&request.session_id);
         let session_run = backend.session_for(&config_dir, resume_id);
         let prompt = if matches!(session_run, SessionRun::Start(_)) {
-            match self.start_session_prompt(&request, agent, &workspace, &job_dir) {
+            match self.start_session_prompt(&request, cli, &workspace, &job_dir) {
                 Ok(prompt) => prompt,
                 Err(reason) => return failed(reason),
             }
@@ -302,8 +338,8 @@ impl Executor for PodmanExecutor {
         // run that waited writes the freshest stored login, so two runs cannot
         // rotate the same refresh token at once.
         let credential_file = match backend.credential() {
-            Credential::File(name) => Some(config_dir.join(name)),
-            Credential::Env(_) => None,
+            Credential::File(name) if local.is_none() => Some(config_dir.join(name)),
+            _ => None,
         };
         let codex_run = match &credential_file {
             Some(path) => match self.place_codex_login(path, token).await {
@@ -328,16 +364,21 @@ impl Executor for PodmanExecutor {
             effort: request.effort,
             mcp: request.mcp,
             packages: request.packages,
-            local: None,
+            local,
         };
+        let is_local = worker.local.is_some();
         let report = run(
             &config,
             &worker,
             log,
             |usage| {
-                self.plan_usage.record_now(usage);
+                // A Local run says nothing about the subscription's plan usage.
+                if !is_local {
+                    self.plan_usage.record_now(usage);
+                }
             },
             |id: &str| session(id.to_owned()),
+            || self.record_local_cli(request.job_id, request_local.as_ref()),
         )
         .await;
         if let Some(path) = &credential_file {

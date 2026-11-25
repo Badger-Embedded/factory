@@ -499,6 +499,7 @@ impl IntoResponse for AppError {
             AppError::Store(
                 err @ (StoreError::InvalidEffort(_)
                 | StoreError::InvalidAgent(_)
+                | StoreError::MissingLocalModel(_)
                 | StoreError::InvalidPrerequisite(_)),
             ) => (StatusCode::BAD_REQUEST, err.to_string()),
             AppError::Store(err) => {
@@ -1116,7 +1117,7 @@ struct JobData {
     settings: Settings,
     logs: Vec<crate::store::LogEntry>,
     events: Vec<crate::store::JobEvent>,
-    cost_usd: f64,
+    cost_usd: Option<f64>,
     models: StageModels,
     efforts: StageEfforts,
     auto_merge: bool,
@@ -1170,7 +1171,7 @@ fn load_job(state: &AppState, login: &str, id: i64) -> Result<JobData, AppError>
     let settings = state.store.settings()?;
     let logs = state.store.logs(id, LOG_LINES)?;
     let events = state.store.events(id)?;
-    let cost_usd = state.store.cost_usd(id)?;
+    let cost_usd = state.store.recorded_cost(id)?;
     let defaults = project
         .as_ref()
         .map(|project| project.models.clone())
@@ -2565,6 +2566,7 @@ async fn save_project_models(
     // checked against the agent its stage is being saved with.
     Store::check_agents(&agents)?;
     Store::check_efforts(&efforts, &agents)?;
+    Store::check_local_models(&models, &agents)?;
     state.store.save_project_efforts(&name, &efforts, &agents)?;
     state.store.save_project_agents(&name, &agents)?;
     state.store.save_project_models(&name, &models)?;

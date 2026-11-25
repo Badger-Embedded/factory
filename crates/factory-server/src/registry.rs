@@ -206,7 +206,7 @@ impl AgentEntry<'_> {
                 .ok_or_else(|| "no Claude token is set".to_owned()),
             Agent::Codex => self.registry.codex_login.credential(),
             Agent::Copilot => self.copilot_token(),
-            Agent::Local => Err("the Local agent is not available yet".to_owned()),
+            Agent::Local => Err("the Local agent has no subscription credential".to_owned()),
         }
     }
 

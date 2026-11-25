@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_core::{
-    Agent, AgentResult, Ask, BranchSummary, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
+    Agent, AgentResult, Ask, BranchSummary, Cli, DEFAULT_AGENT, Event, Gates, MAX_FAILED_ROUNDS,
     MAX_REVIEW_ROUNDS, PlanUsage, PlannedPr, PrDescription, Question, Session, Stage, Task, Turn,
     Wait,
 };
@@ -1653,6 +1653,45 @@ async fn a_job_without_cost_shows_a_dash() {
         page.body
             .contains("<span class=\"badge cost\" id=\"job-cost\">–</span>")
     );
+}
+
+#[tokio::test]
+async fn a_zero_cost_of_a_subscription_run_still_shows_a_dash() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 0.0, false).unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\" id=\"job-cost\">–</span>")
+    );
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("<span class=\"cost\">–</span>"));
+}
+
+#[tokio::test]
+async fn a_job_that_only_ran_on_local_shows_zero_dollars_with_no_estimate_mark() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 0.0, false).unwrap();
+    dashboard
+        .store
+        .session_uuid(id, Session::Planning, Agent::Local)
+        .unwrap();
+    dashboard
+        .store
+        .record_session_local_cli(id, Session::Planning, Cli::Codex)
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\" id=\"job-cost\">$0.00</span>")
+    );
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("<span class=\"cost\">$0.00</span>"));
+    assert!(!page.body.contains("≈"));
 }
 
 #[tokio::test]
@@ -7631,14 +7670,165 @@ fn codex_is_accepted_for_every_stage() {
 }
 
 #[test]
-fn local_is_rejected_for_a_stage_until_it_can_run() {
+fn local_is_accepted_for_a_stage() {
     let store = Store::open_in_memory().unwrap();
     let submitted = agents("local", "claude", "claude", "claude", "claude");
-    assert!(store.save_project_agents("maestro", &submitted).is_err());
+    store.save_project_agents("maestro", &submitted).unwrap();
+    assert_eq!(store.project_agents("maestro").unwrap(), submitted);
+}
+
+#[test]
+fn local_efforts_run_low_through_xhigh_and_reject_max_and_minimal() {
+    let store = Store::open_in_memory().unwrap();
+    let local = agents("local", "local", "local", "local", "local");
+    store
+        .save_project_efforts(
+            "maestro",
+            &efforts("low", "medium", "high", "xhigh", "low"),
+            &local,
+        )
+        .unwrap();
+    for level in ["max", "minimal"] {
+        let err = store
+            .save_project_efforts(
+                "maestro",
+                &efforts("low", "low", "low", level, "low"),
+                &local,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::InvalidEffort(found) if found == level),
+            "{err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn saving_a_local_stage_round_trips_and_a_bad_local_stage_stores_nothing() {
+    let dashboard = dashboard();
+    let form = |model: &str, effort: &str| {
+        format!(
+            "clarify=&spec=&plan=&implement={model}&review=&\
+             clarify_effort=medium&spec_effort=medium&plan_effort=medium&\
+             implement_effort={effort}&review_effort=medium&\
+             clarify_agent=claude&spec_agent=claude&plan_agent=claude&\
+             implement_agent=local&review_agent=claude"
+        )
+    };
+
+    for (model, effort) in [("gemma", "max"), ("gemma", "minimal"), ("", "high")] {
+        let reply = dashboard
+            .post("/settings/projects/maestro", &form(model, effort))
+            .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{model:?} {effort}");
+        assert_eq!(
+            dashboard.store.project_agents("maestro").unwrap(),
+            StageAgents::default()
+        );
+        assert_eq!(
+            dashboard.store.project_efforts("maestro").unwrap(),
+            StageEfforts::default()
+        );
+        assert_eq!(
+            dashboard
+                .store
+                .project_models("maestro", &StageModels::default())
+                .unwrap(),
+            StageModels::default()
+        );
+    }
+    let reply = dashboard
+        .post("/settings/projects/maestro", &form("", "high"))
+        .await;
+    assert!(reply.body.contains("The implement stage runs on Local"));
+
+    let reply = dashboard
+        .post("/settings/projects/maestro", &form("gemma", "high"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard.store.project_agents("maestro").unwrap(),
+        agents("claude", "claude", "claude", "local", "claude")
+    );
+    assert_eq!(
+        dashboard.store.project_efforts("maestro").unwrap(),
+        efforts("medium", "medium", "medium", "high", "medium")
+    );
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap()
+            .implement,
+        Some("gemma".into())
+    );
+}
+
+#[test]
+fn a_local_session_records_its_cli_once() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store.create("maestro", "alice", "x").unwrap();
+    store
+        .session_uuid(id, Session::Planning, Agent::Local)
+        .unwrap();
+    assert_eq!(
+        store.session_local_cli(id, Session::Planning).unwrap(),
+        None
+    );
+    store
+        .record_session_local_cli(id, Session::Planning, Cli::Codex)
+        .unwrap();
+    store
+        .record_session_local_cli(id, Session::Planning, Cli::Copilot)
+        .unwrap();
+    assert_eq!(
+        store.session_local_cli(id, Session::Planning).unwrap(),
+        Some(Cli::Codex)
+    );
+}
+
+#[test]
+fn a_database_from_before_the_local_cli_column_opens_and_keeps_its_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("factory.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .create_project(
+                "maestro",
+                &ForgeKind::GitHub,
+                "Badger-Embedded/maestro",
+                "main",
+                None,
+                Some("alice"),
+            )
+            .unwrap();
+        store
+            .save_project_agents(
+                "maestro",
+                &agents("codex", "claude", "claude", "claude", "copilot"),
+            )
+            .unwrap();
+        let id = store.create("maestro", "alice", "x").unwrap();
+        store
+            .session_uuid(id, Session::Planning, Agent::Codex)
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("ALTER TABLE sessions DROP COLUMN local_cli", [])
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
     assert_eq!(
         store.project_agents("maestro").unwrap(),
-        agents("claude", "claude", "claude", "claude", "claude")
+        agents("codex", "claude", "claude", "claude", "copilot")
     );
+    let (_, agent) = store
+        .session_uuid(1, Session::Planning, Agent::Claude)
+        .unwrap();
+    assert_eq!(agent, Agent::Codex);
+    assert_eq!(store.session_local_cli(1, Session::Planning).unwrap(), None);
 }
 
 #[test]
@@ -7912,10 +8102,12 @@ async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_selectable
         "Copilot should be a radio in all five stages",
     );
     assert_eq!(
-        page.body.matches("value=\"local\" disabled").count(),
+        page.body.matches("value=\"local\"").count(),
         5,
-        "Local should be a disabled radio in all five stages",
+        "Local should be a radio in all five stages",
     );
+    assert!(!page.body.contains("value=\"local\" disabled"));
+    assert!(!page.body.contains("value=\"local\" checked"));
     assert!(!page.body.contains("value=\"copilot\" checked"));
     assert!(!page.body.contains("value=\"copilot\" disabled"));
 }

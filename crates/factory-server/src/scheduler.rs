@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use factory_core::{
-    Agent, BranchSummary, Command, DEFAULT_AGENT, Event, ExistingGap, FixLink, FixOutcome,
+    Agent, BranchSummary, Cli, Command, DEFAULT_AGENT, Event, ExistingGap, FixLink, FixOutcome,
     FixState, Gap, Job, MAX_FAILED_ROUNDS, PackagingContext, PrDescription, RetryLimits,
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, McpProxy, McpServerEntry, NOT_PERMITTED,
-    Observation, RenovatePr, Rerun, RunReport, job_prompt,
+    Expect, ForgeKind, HeadCommit, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry,
+    NOT_PERMITTED, Observation, PromptTarget, RenovatePr, Rerun, RunReport, job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -126,6 +126,36 @@ pub struct AgentRequest {
     pub mcp: Option<McpConfig>,
     /// The project's worker packages, read on every run.
     pub packages: Vec<String>,
+    /// The local server and the CLI that drives it, set exactly when `agent` is
+    /// [`Agent::Local`].
+    pub local: Option<LocalRequest>,
+}
+
+/// What a Local run needs beyond an agent run's own fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRequest {
+    /// The server, the CLI and the key the run resolved. Its `Debug` hides the
+    /// key.
+    pub target: LocalTarget,
+    /// Whose key `target.key` is, for the job log.
+    pub key_from: LocalKeyOwner,
+    /// The CLI the Local settings name now. It differs from `target.cli` when
+    /// the run resumes a session that started on another CLI.
+    pub setting_cli: Cli,
+    /// The session the run belongs to. The executor records the CLI on it
+    /// once the worker starts.
+    pub session: Session,
+}
+
+/// Whose API key a Local run uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalKeyOwner {
+    /// The stored key of the login that requested the job.
+    Login(String),
+    /// The factory-wide key.
+    Factory,
+    /// No key.
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -793,8 +823,11 @@ impl<E: Executor> Scheduler<E> {
                     let Some(resolved) = self.resolve(&row, &project, &settings, true)? else {
                         continue;
                     };
-                    let (request, skipped) = self
-                        .agent_request(&row, &job, &project, &resolved, session, &task, expect)?;
+                    let Some((request, skipped)) = self
+                        .agent_request(&row, &job, &project, &resolved, session, &task, expect)?
+                    else {
+                        continue;
+                    };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
                     self.spawn(row.id, Kind::Worker, async move {
@@ -1333,10 +1366,11 @@ impl<E: Executor> Scheduler<E> {
         session: Session,
         task: &factory_core::Task,
         expect: Expect,
-    ) -> Result<(AgentRequest, Vec<SkippedServer>), StoreError> {
+    ) -> Result<Option<(AgentRequest, Vec<SkippedServer>)>, StoreError> {
         let agents = self.store.project_agents(&row.project)?;
         let stage = stage_agent(&agents, expect);
         let (session_id, agent) = self.store.session_uuid(row.id, session, stage)?;
+        let mut stage_note = None;
         let (model, effort) = if agent == stage {
             let models = self.store.project_models(&row.project, &project.models)?;
             let model = match expect {
@@ -1369,18 +1403,28 @@ impl<E: Executor> Scheduler<E> {
                 .as_ref()
                 .and_then(|last| last.effort.clone())
                 .unwrap_or_else(|| agent.default_effort().to_owned());
-            self.store.append_factory_log(
-                row.id,
-                &format!(
-                    "This session started on {from}, so it stays on {from} with its earlier model. \
-                     The {stage_name} stage is now set to {to}, which new sessions use.",
-                    from = agent.display_name(),
-                    to = stage.display_name(),
-                    stage_name = stage_name(expect),
-                ),
-            )?;
+            stage_note = Some(format!(
+                "This session started on {from}, so it stays on {from} with its earlier model. \
+                 The {stage_name} stage is now set to {to}, which new sessions use.",
+                from = agent.display_name(),
+                to = stage.display_name(),
+                stage_name = stage_name(expect),
+            ));
             (last.and_then(|last| last.model), effort)
         };
+        let local = if agent == Agent::Local {
+            match self.local_request(row, session, model.as_deref())? {
+                Ok(local) => Some(local),
+                Err(reason) => {
+                    self.open_run_log(row.id, None, stage_note.as_deref())?;
+                    self.store.apply(row.id, Event::AgentFailed { reason })?;
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+        self.open_run_log(row.id, local.as_ref(), stage_note.as_deref())?;
         let agent_session = self.store.agent_session(row.id, session)?;
         let selection = self.mcp_config(row.id, &row.project, expect)?;
         let mcp_servers: Vec<String> = selection
@@ -1402,13 +1446,97 @@ impl<E: Executor> Scheduler<E> {
             agent_session,
             agent,
             expect,
-            prompt: job_prompt(job, task, expect, agent, &mcp_servers),
+            prompt: job_prompt(
+                job,
+                task,
+                expect,
+                local.as_ref().map_or(PromptTarget::Agent(agent), |local| {
+                    PromptTarget::Local(local.target.cli)
+                }),
+                &mcp_servers,
+            ),
             model,
             effort: Some(effort),
             mcp: selection.config,
             packages: self.store.project_packages(&row.project)?,
+            local,
         };
-        Ok((request, selection.skipped))
+        Ok(Some((request, selection.skipped)))
+    }
+
+    /// The Local settings for a run of `session`, read afresh so a change
+    /// applies from the next run, or the reason the run cannot start. It checks
+    /// the server and the model before any checkout or container. A session
+    /// resumes on the CLI it started on, and a fresh one uses the CLI the
+    /// settings name now.
+    fn local_request(
+        &self,
+        row: &JobRow,
+        session: Session,
+        model: Option<&str>,
+    ) -> Result<Result<LocalRequest, String>, StoreError> {
+        let settings = self.store.local_settings()?;
+        let Some(base_url) = settings.url.clone() else {
+            return Ok(Err("no local server is set".to_owned()));
+        };
+        if model.is_none_or(|model| model.trim().is_empty()) {
+            return Ok(Err("no model is set for the Local agent".to_owned()));
+        }
+        let (key, key_from) = match self.local_key(&row.requested_by)? {
+            Ok(resolved) => resolved,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let cli = self
+            .store
+            .session_local_cli(row.id, session)?
+            .unwrap_or(settings.cli);
+        Ok(Ok(LocalRequest {
+            target: LocalTarget {
+                cli,
+                base_url,
+                key,
+                load_timeout: Duration::from_secs(u64::from(settings.load_timeout_minutes) * 60),
+            },
+            key_from,
+            setting_cli: settings.cli,
+            session,
+        }))
+    }
+
+    /// The API key a Local run of a job requested by `requested_by` uses. The
+    /// requester's own stored key wins, except for a job the factory itself
+    /// requested. Otherwise the factory key applies, or none. A key that cannot
+    /// be read fails the run and never falls back to another key.
+    fn local_key(
+        &self,
+        requested_by: &str,
+    ) -> Result<Result<(Option<String>, LocalKeyOwner), String>, StoreError> {
+        let secrets = &self.mcp.secrets;
+        if requested_by != FACTORY_REQUESTER {
+            match secrets.user_local_key(requested_by) {
+                Ok(Some(key)) if !key.is_empty() => {
+                    return Ok(Ok((
+                        Some(key),
+                        LocalKeyOwner::Login(requested_by.to_owned()),
+                    )));
+                }
+                Ok(_) => {}
+                Err(SecretError::Store(err)) => return Err(err),
+                Err(err) => {
+                    return Ok(Err(format!(
+                        "The Local API key of {requested_by} cannot be read: {err}."
+                    )));
+                }
+            }
+        }
+        match secrets.local_key() {
+            Ok(Some(key)) if !key.is_empty() => Ok(Ok((Some(key), LocalKeyOwner::Factory))),
+            Ok(_) => Ok(Ok((None, LocalKeyOwner::None))),
+            Err(SecretError::Store(err)) => Err(err),
+            Err(err) => Ok(Err(format!(
+                "The factory's Local API key cannot be read: {err}."
+            ))),
+        }
     }
 
     fn mcp_config(
@@ -1831,6 +1959,53 @@ impl<E: Executor> Scheduler<E> {
         self.apply(job_id, report.event);
     }
 
+    /// Writes the notices that precede a run's own output, the Local run line
+    /// first.
+    fn open_run_log(
+        &self,
+        job_id: i64,
+        local: Option<&LocalRequest>,
+        stage_note: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if let Some(local) = local {
+            self.note_local_run(job_id, local);
+        }
+        if let Some(note) = stage_note {
+            self.store.append_factory_log(job_id, note)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the line that opens a Local run: the CLI, the server and whose key
+    /// the run uses, never the key. A run that resumes a session on another CLI
+    /// than the settings name says so.
+    fn note_local_run(&self, job_id: i64, local: &LocalRequest) {
+        let key = match &local.key_from {
+            LocalKeyOwner::Login(login) => format!("the Local API key of {login}"),
+            LocalKeyOwner::Factory => "the factory's key".to_owned(),
+            LocalKeyOwner::None => "no key".to_owned(),
+        };
+        self.note(
+            job_id,
+            &format!(
+                "Local run on {} at {} with {key}.",
+                local.target.cli.display_name(),
+                local.target.base_url
+            ),
+        );
+        if local.target.cli != local.setting_cli {
+            self.note(
+                job_id,
+                &format!(
+                    "This session started on {from}, so it stays on {from}. The Local settings \
+                     name {to} now, which new sessions use.",
+                    from = local.target.cli.display_name(),
+                    to = local.setting_cli.display_name(),
+                ),
+            );
+        }
+    }
+
     /// Records the cost of a finished agent run and notes it on the job log. A
     /// run that reports a dollar figure, such as Claude's, reports the total of
     /// the session whose factory UUID is `session`, so the run records the
@@ -1849,6 +2024,25 @@ impl<E: Executor> Scheduler<E> {
         model: Option<&str>,
         report: &RunReport,
     ) {
+        if agent == Agent::Local {
+            // A local model has no price. The run adds a row of zero, so the job
+            // reads $0.00 instead of no cost, and ignores the dollar figure the
+            // CLI reports and the Codex price table.
+            if let Err(err) = self.store.add_cost(job_id, 0.0, false) {
+                tracing::error!("job {job_id}: {err}");
+            }
+            let mut text = "Local run finished, recorded at $0".to_owned();
+            if let Some(usage) = report.token_usage {
+                let _ = write!(
+                    text,
+                    ". {} input tokens, {} output tokens",
+                    usage.input_tokens, usage.output_tokens
+                );
+            }
+            text.push('.');
+            self.note(job_id, &text);
+            return;
+        }
         if agent == Agent::Copilot {
             // Copilot bills in credits the factory does not price, so the run
             // adds no cost row and the log says so once.

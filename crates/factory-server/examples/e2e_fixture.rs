@@ -8,6 +8,7 @@
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
 //! e2e_fixture renovate --db P --project N --number NUMBER --url URL
 //! e2e_fixture apply --db P --job ID --event start|approve|cancel|questions
+//! e2e_fixture cost --db P --job ID --usd AMOUNT [--local-cli claude-code|codex|copilot]
 //! e2e_fixture log --db P --job ID --text TEXT [--count N]
 //! e2e_fixture mcp --db P --job ID --server S --tool T [--blocked true]
 //! e2e_fixture tls --db P --dir D
@@ -24,8 +25,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use factory_core::{
-    AgentResult, DiffVerdict, Event, FixOutcome, PlannedPr, PrDescription, Question,
-    RenovateAccess, RenovateCi, RetryLimits,
+    Agent, AgentResult, Cli, DiffVerdict, Event, FixOutcome, PlannedPr, PrDescription, Question,
+    RenovateAccess, RenovateCi, RetryLimits, Session,
 };
 use factory_runner::ForgeKind;
 use factory_server::Store;
@@ -295,6 +296,20 @@ fn apply(store: &Store, flags: &HashMap<String, Vec<String>>) -> Result<()> {
     Ok(())
 }
 
+fn cost(store: &Store, flags: &HashMap<String, Vec<String>>) -> Result<()> {
+    let one = |name: &str| -> Result<&str> {
+        Ok(flags.get(name).ok_or(format!("--{name} is required"))?[0].as_str())
+    };
+    let job = one("job")?.parse()?;
+    store.add_cost(job, one("usd")?.parse()?, false)?;
+    if let Ok(cli) = one("local-cli") {
+        let cli = Cli::from_id(cli).ok_or("unknown --local-cli")?;
+        store.session_uuid(job, Session::Planning, Agent::Local)?;
+        store.record_session_local_cli(job, Session::Planning, cli)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing subcommand")?;
@@ -365,6 +380,7 @@ fn main() -> Result<()> {
             println!("{id}");
         }
         "apply" => apply(&store, &flags)?,
+        "cost" => cost(&store, &flags)?,
         "log" => {
             let job = one("job")?.parse()?;
             let text = one("text")?;

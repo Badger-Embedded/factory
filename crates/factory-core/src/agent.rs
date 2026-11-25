@@ -1,8 +1,7 @@
 //! The agents a stage can run on.
 //!
 //! The factory runs every stage with an agent. Claude Code, Codex and Copilot
-//! run. Local runs one of those CLIs against an OpenAI-compatible server and
-//! cannot be selected yet.
+//! run. Local runs one of those CLIs against an OpenAI-compatible server.
 //! Each agent has a stable id that the server stores per stage, a display name
 //! for the dashboard, and a flag for whether a stage can select it. A stage
 //! with no saved agent runs on [`DEFAULT_AGENT`].
@@ -129,8 +128,8 @@ impl Agent {
         }
     }
 
-    /// Whether a stage can select the agent. Local has no run path yet, so the
-    /// dashboard lists it as not available.
+    /// Whether a stage can select the agent. Every agent can run today; the flag
+    /// stays so a future agent can ship listed but not selectable.
     #[must_use]
     #[allow(clippy::match_same_arms)]
     pub fn available(self) -> bool {
@@ -138,7 +137,7 @@ impl Agent {
             Agent::Claude => true,
             Agent::Codex => true,
             Agent::Copilot => true,
-            Agent::Local => false,
+            Agent::Local => true,
         }
     }
 
