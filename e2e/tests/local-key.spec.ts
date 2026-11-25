@@ -90,4 +90,9 @@ test('a key typed on a page of the old server is not saved', async ({ browser, o
   await expect(carol.getByText('http://127.0.0.1:10', { exact: true })).toBeVisible();
   await expect(carol.getByLabel('Key')).toHaveAttribute('placeholder', 'not set');
   expect(await carol.content()).not.toContain('sk-e2e-stale');
+
+  await carol.getByLabel('Key').fill('sk-e2e-fresh');
+  await carol.getByRole('button', { name: 'Save key' }).click();
+  await expect(carol.getByText('Saved.', { exact: true })).toBeVisible();
+  await expect(carol.getByLabel('Key')).toHaveAttribute('placeholder', 'set');
 });
