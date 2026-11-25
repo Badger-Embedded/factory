@@ -3086,12 +3086,44 @@ fn stage_agent<'a>(agents: &'a StageAgents, stage: &str) -> &'a str {
 /// shows Codex's levels and a Claude stage shows Claude's. An empty slice, for a
 /// saved agent the registry no longer lists, draws no radios and no pips.
 fn stage_efforts<'a>(project: &'a ProjectSettings, stage: &str) -> &'a [String] {
-    let agent = stage_agent(&project.agent_selection, stage);
+    agent_effort_levels(project, stage_agent(&project.agent_selection, stage))
+}
+
+fn agent_effort_levels<'a>(project: &'a ProjectSettings, agent: &str) -> &'a [String] {
     project
         .agents
         .iter()
         .find(|choice| choice.id == agent)
         .map_or(&[], |choice| choice.efforts.as_slice())
+}
+
+/// Each agent's effort levels and default, then its model suggestions, hint and
+/// whether a model is required, as the JSON the agent fields' script reads from
+/// `data-agent-efforts` and `data-agent-models` to redraw them on a switch.
+fn agent_data(agents: &[AgentChoice]) -> (String, String) {
+    let by_agent = |value: &dyn Fn(&AgentChoice) -> serde_json::Value| {
+        serde_json::Value::Object(
+            agents
+                .iter()
+                .map(|choice| (choice.id.clone(), value(choice)))
+                .collect(),
+        )
+        .to_string()
+    };
+    let efforts = by_agent(&|choice| {
+        serde_json::json!({
+            "efforts": choice.efforts,
+            "default": choice.default_effort,
+        })
+    });
+    let models = by_agent(&|choice| {
+        serde_json::json!({
+            "models": choice.models,
+            "hint": choice.model_hint,
+            "required": choice.model_required,
+        })
+    });
+    (efforts, models)
 }
 
 fn stage_on(stages: McpStages, stage: &str) -> bool {
@@ -3119,41 +3151,7 @@ fn project_form(project: &ProjectSettings, selected: PipelinePart, admin: bool) 
             part.key()
         )
     };
-    // Each agent's effort levels and default, read by the pipeline script to
-    // redraw the effort radios when a stage's agent switches.
-    let agent_efforts = serde_json::Value::Object(
-        project
-            .agents
-            .iter()
-            .map(|choice| {
-                (
-                    choice.id.clone(),
-                    serde_json::json!({
-                        "efforts": choice.efforts,
-                        "default": choice.default_effort,
-                    }),
-                )
-            })
-            .collect(),
-    )
-    .to_string();
-    let agent_models = serde_json::Value::Object(
-        project
-            .agents
-            .iter()
-            .map(|choice| {
-                (
-                    choice.id.clone(),
-                    serde_json::json!({
-                        "models": choice.models,
-                        "hint": choice.model_hint,
-                        "required": choice.model_required,
-                    }),
-                )
-            })
-            .collect(),
-    )
-    .to_string();
+    let (agent_efforts, agent_models) = agent_data(&project.agents);
     html! {
         form.card.settings-form.pipeline-form method="post" action=(href(selected))
             data-agent-efforts=(agent_efforts) data-agent-models=(agent_models) {
@@ -3260,11 +3258,19 @@ fn gate_node(project: &ProjectSettings, gate: &str, selected: bool, href: &str) 
     }
 }
 
-fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bool) -> Markup {
-    let name = &project.name;
-    let model = stage_model(&project.models, stage).unwrap_or_default();
-    let effort = stage_effort(&project.efforts, stage);
-    let agent = stage_agent(&project.agent_selection, stage);
+/// The agent, model and effort fields of one panel. `key` names the fields:
+/// `{key}_agent`, `{key}` for the model and `{key}_effort`, plus the ids and
+/// `data-*` hooks the panel script finds them by. `aria` prefixes the radio
+/// groups' labels.
+fn agent_fields(
+    project: &ProjectSettings,
+    key: &str,
+    agent: &str,
+    model: &str,
+    effort: &str,
+    agent_hint: &str,
+    aria: &str,
+) -> Markup {
     let choice = project.agents.iter().find(|choice| choice.id == agent);
     let suggestions: &[String] = choice.map_or(&[], |choice| &choice.models);
     let model_required = choice.is_some_and(|choice| choice.model_required);
@@ -3277,6 +3283,57 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bo
         |choice| choice.model_hint.clone(),
     );
     html! {
+        div.field {
+            span.label { "Agent" }
+            div.seg role="radiogroup" aria-label={ (aria) " agent" } {
+                @for choice in &project.agents {
+                    label.disabled[!choice.available] {
+                        input type="radio" name={ (key) "_agent" } value=(choice.id)
+                            checked[choice.id == agent] disabled[!choice.available];
+                        span { (choice.display_name) }
+                        @if !choice.available {
+                            span.tag { "Not available yet" }
+                        }
+                    }
+                }
+            }
+            p.hint { (agent_hint) }
+        }
+        div.field {
+            label for={ (project.name) "-" (key) } { "Model" }
+            div.model-chips data-model-chips=(key) data-agent=(agent) {
+                @if !model_required {
+                    button.chip type="button" data-model="" data-model-for=(key) { "CLI default" }
+                }
+                @for suggestion in suggestions {
+                    button.chip type="button" data-model=(suggestion) data-model-for=(key) { (suggestion) }
+                }
+            }
+            input id={ (project.name) "-" (key) } type="text" name=(key) list={ "model-suggestions-" (key) }
+                placeholder=(if model_required { "Model ID" } else { "CLI default" }) value=(model) data-model-input=(key);
+            datalist id={ "model-suggestions-" (key) } {
+                @for suggestion in suggestions { option value=(suggestion) {} }
+            }
+            p.hint data-model-hint=(key) { (model_hint) }
+        }
+        div.field {
+            span.label { "Effort" }
+            div.seg role="radiogroup" aria-label={ (aria) " effort" } data-effort-seg=(key) {
+                @for level in agent_effort_levels(project, agent) {
+                    label {
+                        input type="radio" name={ (key) "_effort" } value=(level)
+                            checked[level == effort];
+                        span { (level) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bool) -> Markup {
+    let name = &project.name;
+    html! {
         div.pipe-panel data-panel=(stage) hidden[!selected] {
             h2 { (stage[..1].to_uppercase()) (stage[1..]) " stage" }
             @if stage == "review" {
@@ -3288,51 +3345,15 @@ fn stage_panel(project: &ProjectSettings, stage: &str, selected: bool, admin: bo
                     p.hint { "When the checks pass, the review model reads the branch and asks for changes or approves. Changes go back to the agent. Off, the review stage does not run." }
                 }
             }
-            div.field {
-                span.label { "Agent" }
-                div.seg role="radiogroup" aria-label={ (stage) " agent" } {
-                    @for choice in &project.agents {
-                        label.disabled[!choice.available] {
-                            input type="radio" name={ (stage) "_agent" } value=(choice.id)
-                                checked[choice.id == agent] disabled[!choice.available];
-                            span { (choice.display_name) }
-                            @if !choice.available {
-                                span.tag { "Not available yet" }
-                            }
-                        }
-                    }
-                }
-                p.hint { "The agent that runs this stage. A run already in flight keeps the agent it started on." }
-            }
-            div.field {
-                label for={ (name) "-" (stage) } { "Model" }
-                div.model-chips data-model-chips=(stage) data-agent=(agent) {
-                    @if !model_required {
-                        button.chip type="button" data-model="" data-model-for=(stage) { "CLI default" }
-                    }
-                    @for suggestion in suggestions {
-                        button.chip type="button" data-model=(suggestion) data-model-for=(stage) { (suggestion) }
-                    }
-                }
-                input id={ (name) "-" (stage) } type="text" name=(stage) list={ "model-suggestions-" (stage) }
-                    placeholder=(if model_required { "Model ID" } else { "CLI default" }) value=(model) data-model-input=(stage);
-                datalist id={ "model-suggestions-" (stage) } {
-                    @for suggestion in suggestions { option value=(suggestion) {} }
-                }
-                p.hint data-model-hint=(stage) { (model_hint) }
-            }
-            div.field {
-                span.label { "Effort" }
-                div.seg role="radiogroup" aria-label={ (stage) " effort" } data-effort-seg=(stage) {
-                    @for level in stage_efforts(project, stage) {
-                        label {
-                            input type="radio" name={ (stage) "_effort" } value=(level)
-                                checked[level == effort];
-                            span { (level) }
-                        }
-                    }
-                }
-            }
+            (agent_fields(
+                project,
+                stage,
+                stage_agent(&project.agent_selection, stage),
+                stage_model(&project.models, stage).unwrap_or_default(),
+                stage_effort(&project.efforts, stage),
+                "The agent that runs this stage. A run already in flight keeps the agent it started on.",
+                stage,
+            ))
             div.field {
                 span.label { "MCP servers in this stage" }
                 @if project.servers.is_empty() {
