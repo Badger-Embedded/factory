@@ -15,7 +15,7 @@
 //! through [`Store`]. Each row records its backend, so an external backend can
 //! be added without a schema change for existing rows.
 //!
-//! The Claude token, the Codex login and the Copilot token each live in one
+//! The Claude token, the Codex login, the Copilot token and the Local key each live in one
 //! reserved row keyed apart from every project/server/header credential and
 //! from each other, with its own associated data, so deleting or renaming an
 //! MCP server never touches any of them and a ciphertext moved between the
@@ -285,6 +285,32 @@ pub trait SecretStore: Send + Sync {
     /// Fails on a storage error.
     fn clear_copilot_token(&self) -> Result<(), SecretError>;
 
+    /// The factory's Local API key, or `None` when none is set. It is the
+    /// optional key for the local OpenAI-compatible server, kept in its own
+    /// reserved row.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable, when the stored value does not
+    /// decrypt, or on a storage error.
+    fn local_key(&self) -> Result<Option<String>, SecretError>;
+
+    /// Stores `value` as the factory's Local API key, replacing any key already
+    /// there. The store keeps the bytes as given.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn set_local_key(&self, value: &str) -> Result<(), SecretError>;
+
+    /// Deletes the factory's Local API key. Clearing a key that is not there is
+    /// fine, and it works without the master key.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error.
+    fn clear_local_key(&self) -> Result<(), SecretError>;
+
     /// Stores `value` as the forge token of `owner`, together with the
     /// `account` it belongs to, in one transaction. It replaces any token
     /// already there.
@@ -381,6 +407,13 @@ const COPILOT_TOKEN_REF: SecretRef<'static> = SecretRef {
     project: "",
     server: "",
     header: "copilot-token",
+};
+
+/// The `secrets` row that holds the factory's Local API key.
+const LOCAL_KEY_REF: SecretRef<'static> = SecretRef {
+    project: "",
+    server: "",
+    header: "local-key",
 };
 
 /// The local encrypted backend. It holds the cipher built from the master key
@@ -519,6 +552,25 @@ impl SecretStore for LocalSecrets {
 
     fn clear_copilot_token(&self) -> Result<(), SecretError> {
         self.store.delete_secret(COPILOT_TOKEN_REF)?;
+        Ok(())
+    }
+
+    fn local_key(&self) -> Result<Option<String>, SecretError> {
+        let Some((backend, stored)) = self.store.get_secret(LOCAL_KEY_REF)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open(&backend, &stored, LOCAL_KEY_AAD)?))
+    }
+
+    fn set_local_key(&self, value: &str) -> Result<(), SecretError> {
+        let stored = self.seal(LOCAL_KEY_AAD, value)?;
+        self.store
+            .put_secret(LOCAL_KEY_REF, LOCAL_BACKEND, &stored)?;
+        Ok(())
+    }
+
+    fn clear_local_key(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(LOCAL_KEY_REF)?;
         Ok(())
     }
 
@@ -699,6 +751,19 @@ impl SecretStore for UnavailableSecrets {
         Ok(())
     }
 
+    fn local_key(&self) -> Result<Option<String>, SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn set_local_key(&self, _value: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn clear_local_key(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(LOCAL_KEY_REF)?;
+        Ok(())
+    }
+
     fn put_forge_token(
         &self,
         _owner: ForgeTokenOwner<'_>,
@@ -838,6 +903,8 @@ const CLAUDE_TOKEN_AAD: &[u8] = b"factory:claude-token:v1";
 const CODEX_AUTH_AAD: &[u8] = b"factory:codex-auth:v1";
 
 const COPILOT_TOKEN_AAD: &[u8] = b"factory:copilot-token:v1";
+
+const LOCAL_KEY_AAD: &[u8] = b"factory:local-key:v1";
 
 /// The fixed tag every forge token's associated data starts with, followed by
 /// the length-framed owner kind, key and forge. Like the other tags it reads

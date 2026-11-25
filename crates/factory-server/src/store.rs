@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
-    Agent, AgentResult, Ask, Command, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink,
+    Agent, AgentResult, Ask, Cli, Command, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink,
     FixOutcome, FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session,
     Stage, Turn, Wait,
 };
@@ -293,10 +293,47 @@ CREATE TABLE IF NOT EXISTS forgejo_registrations (
 CREATE TABLE IF NOT EXISTS gh_token_copies (
     project TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS local_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    url TEXT,
+    cli TEXT NOT NULL DEFAULT 'codex',
+    load_timeout_minutes INTEGER NOT NULL DEFAULT 10,
+    models_fetched_at INTEGER,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS local_models (
+    id TEXT PRIMARY KEY,
+    position INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS store_boots (
     id INTEGER PRIMARY KEY AUTOINCREMENT
 );
 ";
+
+/// The longest model load wait the Local settings accept, in minutes.
+pub const MAX_LOCAL_LOAD_MINUTES: u32 = 60;
+
+/// The Local agent's factory-wide settings. `url` is `None` until an admin
+/// stores a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSettings {
+    pub url: Option<String>,
+    pub cli: Cli,
+    pub load_timeout_minutes: u32,
+    /// When the stored model list was fetched, in Unix seconds.
+    pub models_fetched_at: Option<i64>,
+}
+
+impl Default for LocalSettings {
+    fn default() -> Self {
+        LocalSettings {
+            url: None,
+            cli: Cli::Codex,
+            load_timeout_minutes: 10,
+            models_fetched_at: None,
+        }
+    }
+}
 
 /// A file attached to a request. `name` is the generated name on disk, such
 /// as `file-1.txt`; `original_name` is the browser's file name, shown on the
@@ -575,6 +612,8 @@ pub enum StoreError {
     /// A write named a Forgejo instance that was deleted, or registered again
     /// at another address, after the write's checks began.
     InstanceChanged(String),
+    /// The Local agent's settings were refused. The message says why.
+    Local(String),
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Io(std::io::Error),
@@ -616,7 +655,7 @@ impl fmt::Display for StoreError {
             StoreError::InvalidPrerequisite(id) => {
                 write!(f, "job #{id} is not a job this request can wait for")
             }
-            StoreError::Forgejo(message) => f.write_str(message),
+            StoreError::Forgejo(message) | StoreError::Local(message) => f.write_str(message),
             StoreError::InstanceChanged(name) => write!(
                 f,
                 "the Forgejo instance {name:?} was deleted or registered again while the write was checked"
@@ -2560,6 +2599,108 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The Local agent's settings, the defaults when none are stored.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn local_settings(&self) -> Result<LocalSettings, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT url, cli, load_timeout_minutes, models_fetched_at
+                 FROM local_settings WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(
+            row.map_or_else(LocalSettings::default, |(url, cli, minutes, fetched)| {
+                LocalSettings {
+                    url,
+                    cli: Cli::from_id(&cli).unwrap_or(Cli::Codex),
+                    load_timeout_minutes: minutes,
+                    models_fetched_at: fetched,
+                }
+            }),
+        )
+    }
+
+    /// Stores the Local server, the CLI and the model load timeout. The URL is
+    /// stored as given, so the caller normalizes it first. The stored model list
+    /// stays.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::Local`] when the timeout is outside 1 to 60
+    /// minutes, and on a database error. A refused save writes nothing.
+    pub fn save_local_settings(
+        &self,
+        url: Option<&str>,
+        cli: Cli,
+        load_timeout_minutes: u32,
+    ) -> Result<(), StoreError> {
+        if !(1..=MAX_LOCAL_LOAD_MINUTES).contains(&load_timeout_minutes) {
+            return Err(StoreError::Local(format!(
+                "The model load timeout must be 1 to {MAX_LOCAL_LOAD_MINUTES} minutes."
+            )));
+        }
+        self.conn().execute(
+            "INSERT INTO local_settings (id, url, cli, load_timeout_minutes)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT (id) DO UPDATE SET url = ?1, cli = ?2,
+                 load_timeout_minutes = ?3, updated_at = CURRENT_TIMESTAMP",
+            params![url, cli.id(), load_timeout_minutes],
+        )?;
+        Ok(())
+    }
+
+    /// The model ids the Local server listed at the last successful fetch, in
+    /// the server's order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn local_models(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id FROM local_models ORDER BY position")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Replaces the stored model list with `ids` and records `fetched_at`, in
+    /// Unix seconds. A failed fetch must not call this, so the earlier list
+    /// stays.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn replace_local_models(&self, ids: &[String], fetched_at: i64) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM local_models", [])?;
+        for (position, id) in (0_i64..).zip(ids) {
+            tx.execute(
+                "INSERT OR IGNORE INTO local_models (id, position) VALUES (?1, ?2)",
+                params![id, position],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO local_settings (id, models_fetched_at) VALUES (1, ?1)
+             ON CONFLICT (id) DO UPDATE SET models_fetched_at = ?1",
+            [fetched_at],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The Codex price for `model`, or `None` when the table has no row for it.

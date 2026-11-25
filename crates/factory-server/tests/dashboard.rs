@@ -11732,7 +11732,7 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
 
     let local = body.find("Local").unwrap();
     assert!(body.find("Copilot").unwrap() < local);
-    assert!(body.contains("Not available yet"));
+    assert!(body.contains(r#"href="/settings/agents/local""#));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;

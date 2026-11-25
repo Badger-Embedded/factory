@@ -13,6 +13,7 @@ mod forgejo_instances;
 mod forges;
 mod github;
 mod gitlab;
+mod local_server;
 mod localtime;
 mod mcp;
 mod packages;
@@ -49,6 +50,9 @@ pub use github::{
     check_repo,
 };
 pub use gitlab::GlabRepos;
+pub use local_server::{
+    HttpLocalServerProbe, LocalServerProbe, ModelsError, ModelsFuture, normalize_server_url,
+};
 pub use mcp::{
     McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
 };
@@ -76,8 +80,8 @@ pub use secrets::{
 pub use settings::Settings;
 pub use store::{
     Claim, CodexPrice, Collaborator, FACTORY_REQUESTER, GapJob, JobEvent, JobFile, JobRow,
-    LogEntry, Maintenance, MaintenanceSave, Packaging, PackagingType, PrerequisiteEdit,
-    ProjectGuard, ProjectTotals, Snapshot, Store, StoreError,
+    LocalSettings, LogEntry, Maintenance, MaintenanceSave, Packaging, PackagingType,
+    PrerequisiteEdit, ProjectGuard, ProjectTotals, Snapshot, Store, StoreError,
 };
 pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;
