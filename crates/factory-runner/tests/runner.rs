@@ -381,22 +381,28 @@ async fn a_local_key_that_matches_a_protocol_marker_or_holds_a_quote_still_parse
 
 #[tokio::test]
 async fn a_local_key_with_a_quote_is_redacted_from_a_json_error_on_stderr() {
-    let dir = tempfile::tempdir().unwrap();
-    let stdout = dir.path().join("stdout");
-    fs::write(&stdout, "").unwrap();
-    let stderr = r#"{"error":"bad key a\"b"} and a"b"#;
-    let config = WorkerConfig {
-        podman: fake_podman(dir.path(), &stdout, stderr, 1),
-        ..WorkerConfig::default()
-    };
-    let worker = local_claude_run(dir.path(), Some("a\"b"));
+    for key in ["a\"b", "ab\""] {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("stdout");
+        fs::write(&stdout, "").unwrap();
+        let escaped = key.replace('"', "\\\"");
+        let stderr = format!("{{\"error\":\"{escaped}\"}} and {key}");
+        let config = WorkerConfig {
+            podman: fake_podman(dir.path(), &stdout, &stderr, 1),
+            ..WorkerConfig::default()
+        };
+        let worker = local_claude_run(dir.path(), Some(key));
 
-    let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
+        let report = run(&config, &worker, |_| {}, |_| {}, |_| {}).await;
 
-    let reason = format!("{:?}", report.event);
-    assert!(reason.contains("[redacted]"), "{reason}");
-    assert!(!reason.contains("a\\\\\\\"b"), "{reason}");
-    assert!(!reason.contains("a\\\"b"), "{reason}");
+        let Event::AgentFailed { reason } = report.event else {
+            panic!("expected a failure");
+        };
+        assert!(
+            reason.ends_with(r#"{"error":"[redacted]"} and [redacted]"#),
+            "{key}: {reason}"
+        );
+    }
 }
 
 #[test]

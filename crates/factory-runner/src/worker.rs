@@ -501,7 +501,11 @@ impl Redactor {
         let key = key.filter(|key| !key.is_empty());
         let escaped = key
             .and_then(|key| serde_json::to_string(key).ok())
-            .map(|json| json.trim_matches('"').to_owned())
+            .and_then(|json| {
+                json.strip_prefix('"')
+                    .and_then(|json| json.strip_suffix('"'))
+                    .map(str::to_owned)
+            })
             .filter(|escaped| Some(escaped.as_str()) != key);
         Redactor {
             key: key.map(str::to_owned),
