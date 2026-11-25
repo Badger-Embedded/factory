@@ -18,7 +18,7 @@ use std::path::Path;
 
 use std::fmt::Write as _;
 
-use factory_core::Agent;
+use factory_core::{Agent, Cli};
 use serde_json::Value;
 
 use crate::agent::{
@@ -75,7 +75,7 @@ impl AgentBackend for CodexAgent {
 
     fn prompt_style(&self) -> PromptStyle {
         PromptStyle {
-            rules_doc: Agent::Codex.rules_doc(),
+            rules_doc: Cli::Codex.rules_doc(),
             review_method: REVIEW_METHOD,
             schema_in_prompt: None,
         }

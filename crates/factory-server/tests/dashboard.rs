@@ -7631,6 +7631,17 @@ fn codex_is_accepted_for_every_stage() {
 }
 
 #[test]
+fn local_is_rejected_for_a_stage_until_it_can_run() {
+    let store = Store::open_in_memory().unwrap();
+    let submitted = agents("local", "claude", "claude", "claude", "claude");
+    assert!(store.save_project_agents("maestro", &submitted).is_err());
+    assert_eq!(
+        store.project_agents("maestro").unwrap(),
+        agents("claude", "claude", "claude", "claude", "claude")
+    );
+}
+
+#[test]
 fn copilot_is_accepted_for_every_stage() {
     let store = Store::open_in_memory().unwrap();
     let submitted = agents("copilot", "copilot", "copilot", "copilot", "copilot");
@@ -7899,6 +7910,11 @@ async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_selectable
         page.body.matches("value=\"copilot\"").count(),
         5,
         "Copilot should be a radio in all five stages",
+    );
+    assert_eq!(
+        page.body.matches("value=\"local\" disabled").count(),
+        5,
+        "Local should be a disabled radio in all five stages",
     );
     assert!(!page.body.contains("value=\"copilot\" checked"));
     assert!(!page.body.contains("value=\"copilot\" disabled"));
@@ -11713,7 +11729,10 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
 
     assert!(body.contains("Copilot"));
     assert!(body.contains(r#"href="/settings/agents/copilot""#));
-    assert!(!body.contains("Not available yet"));
+
+    let local = body.find("Local").unwrap();
+    assert!(body.find("Copilot").unwrap() < local);
+    assert!(body.contains("Not available yet"));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;

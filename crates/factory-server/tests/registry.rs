@@ -39,7 +39,7 @@ fn registry_with_token(token: Option<&str>) -> AgentRegistry {
 fn the_registry_lists_the_agents_in_order() {
     let registry = registry_with_token(None);
     let ids: Vec<&str> = registry.entries().map(|entry| entry.id()).collect();
-    assert_eq!(ids, ["claude", "codex", "copilot"]);
+    assert_eq!(ids, ["claude", "codex", "copilot", "local"]);
 }
 
 #[test]
@@ -171,4 +171,19 @@ fn the_codex_entry_fails_with_no_login() {
         registry.entry(Agent::Codex).credential(),
         Err("no Codex login is set".to_owned())
     );
+}
+
+#[test]
+fn the_local_entry_points_at_its_page_and_offers_no_models_yet() {
+    let registry = registry_with_token(None);
+    let entry = registry
+        .entries()
+        .find(|entry| entry.id() == "local")
+        .expect("local entry");
+    assert_eq!(entry.display_name(), "Local");
+    assert!(!entry.available());
+    assert_eq!(entry.settings_url(), Some("/settings/agents/local"));
+    assert_eq!(entry.model_suggestions(), [] as [&str; 0]);
+    assert_eq!(entry.host_config_dir(), None);
+    assert!(entry.credential().is_err());
 }
