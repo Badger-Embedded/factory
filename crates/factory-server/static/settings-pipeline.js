@@ -42,7 +42,10 @@
     if (!label || !input) return;
     var review = stage === "review" && !form.querySelector('[name="llm_review"]').checked;
     var model = input.value.trim();
-    label.textContent = review ? "Off" : model || "CLI default";
+    var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+    var spec = agent && AGENT_MODELS[agent.value];
+    var blank = spec && spec.required ? "Model required" : "CLI default";
+    label.textContent = review ? "Off" : model || blank;
     label.classList.toggle("dflt", review || model === "");
     form.querySelector('[data-part="' + stage + '"]').classList.toggle("off", review);
   }
@@ -94,7 +97,7 @@
     var hint = form.querySelector('[data-model-hint="' + stage + '"]');
     chips.dataset.agent = agent.value;
     chips.textContent = "";
-    [""].concat(spec.models).forEach(function (model) {
+    (spec.required ? [] : [""]).concat(spec.models).forEach(function (model) {
       var chip = document.createElement("button");
       chip.type = "button";
       chip.className = "chip";
@@ -112,10 +115,11 @@
       });
     }
     if (hint) {
-      hint.textContent =
-        "An alias or any model ID. Empty runs the model the installed " + spec.cli + " CLI picks.";
+      hint.textContent = spec.hint;
     }
+    input.placeholder = spec.required ? "Model ID" : "CLI default";
     var value = input.value.trim();
+    setModelLabel(stage);
     if (value !== "" && previous && previous.models.indexOf(value) >= 0) {
       input.value = "";
       input.dispatchEvent(new Event("input", { bubbles: true }));
