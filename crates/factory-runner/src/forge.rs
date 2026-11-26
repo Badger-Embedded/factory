@@ -12,8 +12,34 @@ use std::pin::Pin;
 use factory_core::PrDescription;
 
 use crate::github::{
-    FailedCheck, HeadCommit, PrDetails, PrInfo, PrStatus, RebaseCheckbox, RenovatePr, Rerun,
+    FailedCheck, HeadCommit, OpenPr, PrDetails, PrInfo, PrStatus, PullRequest, RebaseCheckbox,
+    RenovatePr, Rerun,
 };
+
+/// The most rows `search_open_prs` returns. The caller shows one fewer, so it
+/// can tell that more matched.
+pub const SEARCH_PAGE: usize = 21;
+
+/// What a `search_open_prs` query asks for.
+pub(crate) enum PrQuery<'a> {
+    All,
+    Number(u64),
+    Title(&'a str),
+}
+
+impl<'a> PrQuery<'a> {
+    pub(crate) fn parse(query: &'a str) -> Self {
+        let query = query.trim();
+        if query.is_empty() {
+            return PrQuery::All;
+        }
+        let digits = query.strip_prefix('#').unwrap_or(query);
+        match digits.parse::<u64>() {
+            Ok(number) if digits.bytes().all(|b| b.is_ascii_digit()) => PrQuery::Number(number),
+            _ => PrQuery::Title(query),
+        }
+    }
+}
 
 /// A boxed future, so the trait stays object safe without a macro crate.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -331,6 +357,29 @@ pub trait Forge: Send + Sync {
         base: &'a str,
         author: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Vec<RenovatePr>, String>>;
+
+    /// One page of the open pull requests of `repo`, most recently updated
+    /// first, at most [`SEARCH_PAGE`] rows. With an empty `query` it lists
+    /// them all. A `query` of digits, with or without a leading `#`, finds
+    /// the pull request with that number if it is open. Any other `query`
+    /// matches titles. The forge is asked once for the listing and never for
+    /// a second page, so a result of [`SEARCH_PAGE`] rows means more may
+    /// match.
+    fn search_open_prs<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        query: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<OpenPr>, String>>;
+
+    /// A pull request of `repo` in any state, or `None` when it does not
+    /// exist.
+    fn pull_request<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Option<PullRequest>, String>>;
 
     /// The title, description, head and files of a pull request.
     fn pr_info<'a>(

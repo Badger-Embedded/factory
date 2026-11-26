@@ -1041,3 +1041,179 @@ fn pathdiff(path: &Path, base: &Path) -> PathBuf {
     }
     out.join(path.strip_prefix("/").unwrap())
 }
+
+const MR_JSON: &str = r#"{"iid":12,"title":"Add a flag","description":"Why","state":"opened","sha":"abc","web_url":"https://salsa.debian.org/team/pkg/-/merge_requests/12","source_branch":"flag","target_branch":"main","draft":true,"source_project_id":9,"target_project_id":5,"project_id":5,"author":{"username":"ana"}}"#;
+
+#[tokio::test]
+async fn an_empty_search_reads_one_page_of_the_latest_open_merge_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows: Vec<String> = (1..=21)
+        .map(|n| {
+            let source = if n == 2 { 9 } else { 5 };
+            format!(
+                r#"{{"iid":{n},"title":"t","state":"opened","source_branch":"b{n}","target_branch":"main","source_project_id":{source},"target_project_id":5,"web_url":"u","author":{{"username":"bob"}}}}"#
+            )
+        })
+        .collect();
+    let (glab, log) = fake_glab(dir.path(), &format!("echo '[{}]'", rows.join(",")));
+    let prs = glab
+        .search_open_prs(&account(), "team/pkg", "")
+        .await
+        .unwrap();
+    assert_eq!(prs.len(), 21);
+    assert!(!prs[0].fork && prs[1].fork && !prs[0].draft);
+    assert_eq!(prs[0].head_branch, "b1");
+    assert_eq!(prs[0].author, "bob");
+    let calls = calls(&log);
+    assert_eq!(calls.len(), 1);
+    for field in [
+        "state=opened",
+        "order_by=updated_at",
+        "sort=desc",
+        "per_page=21",
+    ] {
+        assert!(
+            calls[0].contains(field),
+            "{field} missing from {}",
+            calls[0]
+        );
+    }
+    assert!(!calls[0].contains("search="), "{}", calls[0]);
+    assert!(!calls[0].contains("page=1"), "{}", calls[0]);
+}
+
+#[tokio::test]
+async fn a_title_search_asks_gitlab_to_search_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, log) = fake_glab(dir.path(), &format!("echo '[{MR_JSON}]'"));
+    let prs = glab
+        .search_open_prs(&account(), "team/pkg", "flag")
+        .await
+        .unwrap();
+    assert_eq!(prs.len(), 1);
+    assert!(prs[0].fork && prs[0].draft);
+    assert_eq!(prs[0].base_branch, "main");
+    let calls = calls(&log);
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].contains("search=flag") && calls[0].contains("in=title"),
+        "{}",
+        calls[0]
+    );
+}
+
+#[tokio::test]
+async fn a_number_finds_that_merge_request_only_when_it_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, log) = fake_glab(
+        dir.path(),
+        &format!(
+            r#"case "$4" in
+  */merge_requests/12) echo '{MR_JSON}' ;;
+  */merge_requests/13) echo '{}' ;;
+  *) echo 'glab: 404 Not Found (HTTP 404)' >&2; exit 1 ;;
+esac"#,
+            MR_JSON.replace("opened", "merged").replace("12", "13")
+        ),
+    );
+    for query in ["12", "#12"] {
+        let prs = glab
+            .search_open_prs(&account(), "team/pkg", query)
+            .await
+            .unwrap();
+        assert_eq!(prs.len(), 1, "{query}");
+        assert_eq!(prs[0].number, 12);
+    }
+    assert_eq!(
+        glab.search_open_prs(&account(), "team/pkg", "13")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(
+        glab.search_open_prs(&account(), "team/pkg", "99")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(calls(&log).len(), 4);
+}
+
+#[tokio::test]
+async fn pull_request_reads_the_source_project_address_and_none_for_a_missing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        &format!(
+            r#"case "$4" in
+  */merge_requests/12) echo '{MR_JSON}' ;;
+  projects/9) echo '{{"http_url_to_repo":"https://salsa.debian.org/ana/pkg.git"}}' ;;
+  *) echo 'glab: 404 Not Found (HTTP 404)' >&2; exit 1 ;;
+esac"#
+        ),
+    );
+    let pr = glab
+        .pull_request(&account(), "team/pkg", 12)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pr.state, PrState::Open);
+    assert!(pr.fork && pr.draft);
+    assert_eq!(
+        pr.head_repo_clone_url.as_deref(),
+        Some("https://salsa.debian.org/ana/pkg.git")
+    );
+    assert_eq!(
+        (pr.head_branch.as_str(), pr.head_sha.as_str()),
+        ("flag", "abc")
+    );
+    assert_eq!(
+        (pr.title.as_str(), pr.body.as_str(), pr.author.as_str()),
+        ("Add a flag", "Why", "ana")
+    );
+    assert!(
+        glab.pull_request(&account(), "team/pkg", 99)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_source_project_error_other_than_missing_fails_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        &format!(
+            r#"case "$4" in
+  */merge_requests/12) echo '{MR_JSON}' ;;
+  projects/9) echo 'glab: 429 Too Many Requests (HTTP 429)' >&2; exit 1 ;;
+esac"#
+        ),
+    );
+    let err = glab
+        .pull_request(&account(), "team/pkg", 12)
+        .await
+        .unwrap_err();
+    assert!(err.contains("429"), "{err}");
+}
+
+#[tokio::test]
+async fn a_missing_source_project_leaves_the_clone_url_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        &format!(
+            r#"case "$4" in
+  */merge_requests/12) echo '{MR_JSON}' ;;
+  *) echo 'glab: 404 Not Found (HTTP 404)' >&2; exit 1 ;;
+esac"#
+        ),
+    );
+    let pr = glab
+        .pull_request(&account(), "team/pkg", 12)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pr.head_repo_clone_url, None);
+}

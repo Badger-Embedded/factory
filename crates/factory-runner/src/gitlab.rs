@@ -13,12 +13,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::forge::{
-    Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, REJECTED,
-    command_error,
+    Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, LookupError, PrQuery, REJECTED,
+    SEARCH_PAGE, command_error,
 };
 use crate::github::{
-    Ci, Comment, FailedCheck, HeadCommit, MAX_DIFF, MAX_LOG, PrDetails, PrInfo, PrState, PrStatus,
-    RebaseCheckbox, RenovatePr, Rerun, tail, tick_rebase_checkbox,
+    Ci, Comment, FailedCheck, HeadCommit, MAX_DIFF, MAX_LOG, OpenPr, PrDetails, PrInfo, PrState,
+    PrStatus, PullRequest, RebaseCheckbox, RenovatePr, Rerun, tail, tick_rebase_checkbox,
 };
 
 /// GitLab's access levels for a project member.
@@ -141,6 +141,56 @@ struct MrJson {
     target_branch: String,
     project_id: Option<u64>,
     source_project_id: Option<u64>,
+    target_project_id: Option<u64>,
+    #[serde(default)]
+    source_branch: String,
+    #[serde(default)]
+    draft: bool,
+    author: Option<AuthorJson>,
+}
+
+#[derive(Deserialize)]
+struct SourceProjectJson {
+    http_url_to_repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AuthorJson {
+    #[serde(default)]
+    username: String,
+}
+
+impl MrJson {
+    /// A merge request whose source project is not its target project, or
+    /// whose source project is gone.
+    fn is_fork(&self) -> bool {
+        match (
+            self.source_project_id,
+            self.target_project_id.or(self.project_id),
+        ) {
+            (Some(source), Some(target)) => source != target,
+            _ => true,
+        }
+    }
+
+    fn author(&self) -> String {
+        self.author
+            .as_ref()
+            .map_or_else(|| "ghost".to_owned(), |author| author.username.clone())
+    }
+
+    fn into_open(self) -> OpenPr {
+        OpenPr {
+            fork: self.is_fork(),
+            author: self.author(),
+            number: self.iid,
+            title: self.title,
+            head_branch: self.source_branch,
+            base_branch: self.target_branch,
+            draft: self.draft,
+            url: self.web_url,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1308,6 +1358,86 @@ impl Forge for GitLab {
                     head: mr.sha,
                 })
                 .collect())
+        })
+    }
+
+    fn search_open_prs<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        query: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<OpenPr>, String>> {
+        Box::pin(async move {
+            let endpoint = format!("{}/merge_requests", project(repo));
+            let list: Vec<MrJson> = match PrQuery::parse(query) {
+                PrQuery::Number(number) => match self.mr(account, repo, number).await {
+                    Ok(mr) if mr.state == "opened" => vec![mr],
+                    Ok(_) => Vec::new(),
+                    Err(err) if is_not_found(&err) => Vec::new(),
+                    Err(err) => return Err(err),
+                },
+                found => {
+                    let per_page = SEARCH_PAGE.to_string();
+                    let mut fields = vec![
+                        ("state", "opened"),
+                        ("order_by", "updated_at"),
+                        ("sort", "desc"),
+                        ("per_page", per_page.as_str()),
+                    ];
+                    if let PrQuery::Title(text) = found {
+                        fields.push(("search", text));
+                        fields.push(("in", "title"));
+                    }
+                    self.get_json(account, &endpoint, &fields).await?
+                }
+            };
+            Ok(list.into_iter().map(MrJson::into_open).collect())
+        })
+    }
+
+    fn pull_request<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Option<PullRequest>, String>> {
+        Box::pin(async move {
+            let mr = match self.mr(account, repo, number).await {
+                Ok(mr) => mr,
+                Err(err) if is_not_found(&err) => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            // The merge request does not carry the source project's address.
+            let head_repo_clone_url = match mr.source_project_id {
+                Some(id) => match self
+                    .get_json::<SourceProjectJson>(account, &format!("projects/{id}"), &[])
+                    .await
+                {
+                    Ok(found) => found.http_url_to_repo,
+                    Err(err) if is_not_found(&err) => None,
+                    Err(err) => return Err(err),
+                },
+                None => None,
+            };
+            let state = match mr.state.as_str() {
+                "merged" => PrState::Merged,
+                "closed" => PrState::Closed,
+                _ => PrState::Open,
+            };
+            Ok(Some(PullRequest {
+                number: mr.iid,
+                state,
+                draft: mr.draft,
+                fork: mr.is_fork(),
+                head_repo_clone_url,
+                author: mr.author(),
+                head_branch: mr.source_branch.clone(),
+                head_sha: mr.sha.clone(),
+                base_branch: mr.target_branch.clone(),
+                title: mr.title.clone(),
+                body: mr.description.clone().unwrap_or_default(),
+                url: mr.web_url.clone(),
+            }))
         })
     }
 

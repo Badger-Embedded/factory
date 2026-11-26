@@ -1557,3 +1557,152 @@ async fn an_account_with_no_token_reads_a_public_repository_over_https_and_never
             .all(|head| !head.to_ascii_lowercase().contains("authorization"))
     );
 }
+
+const REST_PULL: &str = r#"{"number": 12, "title": "Add a flag", "body": "Why", "state": "open", "merged": false, "draft": true, "html_url": "https://github.com/o/r/pull/12", "user": {"login": "ana"}, "head": {"sha": "abc", "ref": "flag", "repo": {"full_name": "ana/r", "clone_url": "https://github.com/ana/r.git"}}, "base": {"ref": "main", "repo": {"full_name": "o/r", "clone_url": "https://github.com/o/r.git"}}}"#;
+
+fn rest_pull(number: u64, head_repo: &str) -> String {
+    format!(
+        r#"{{"number": {number}, "title": "t{number}", "state": "open", "html_url": "u", "user": {{"login": "bob"}}, "head": {{"sha": "s", "ref": "b{number}", "repo": {{"full_name": "{head_repo}"}}}}, "base": {{"ref": "main", "repo": {{"full_name": "o/r"}}}}}}"#
+    )
+}
+
+#[tokio::test]
+async fn an_empty_search_reads_one_page_of_the_latest_open_pull_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows: Vec<String> = (1..=21)
+        .map(|n| rest_pull(n, if n == 2 { "ana/r" } else { "o/r" }))
+        .collect();
+    let (github, calls) = recording_github(dir.path(), &format!("echo '[{}]'", rows.join(",")));
+    let prs = github
+        .search_open_prs(&account(), "o/r", "  ")
+        .await
+        .unwrap();
+    assert_eq!(prs.len(), 21);
+    assert!(!prs[0].fork && prs[1].fork);
+    assert_eq!(prs[1].head_branch, "b2");
+    assert_eq!(prs[1].base_branch, "main");
+    assert_eq!(prs[1].author, "bob");
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap(),
+        "api --method GET repos/o/r/pulls -f state=open -f sort=updated -f direction=desc -f per_page=21\n"
+    );
+}
+
+#[tokio::test]
+async fn a_title_search_is_one_graphql_call_with_quoted_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"echo '[{"number": 7, "title": "Fix: login", "url": "u", "isDraft": true, "isCrossRepository": true, "headRefName": "fix", "baseRefName": "dev", "author": {"login": "ana"}}, {}, {"number": 8, "title": "x", "url": "v", "author": null}]'"#,
+    );
+    let prs = github
+        .search_open_prs(&account(), "o/r", "fix: repo:x/y")
+        .await
+        .unwrap();
+    assert_eq!(prs.len(), 2);
+    assert!(prs[0].fork && prs[0].draft);
+    assert_eq!(prs[0].head_branch, "fix");
+    assert_eq!(prs[0].base_branch, "dev");
+    assert_eq!(prs[1].author, "ghost");
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
+    assert!(
+        calls.contains(r#"q=repo:o/r is:pr is:open sort:updated-desc in:title "fix:" "repo:x/y""#)
+    );
+    assert!(calls.contains("-F n=21"));
+}
+
+#[tokio::test]
+async fn a_number_finds_that_pull_request_only_when_it_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        &format!(
+            r#"case "$2" in
+  repos/o/r/pulls/12) echo '{REST_PULL}' ;;
+  repos/o/r/pulls/13) echo '{}' ;;
+  *) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+esac"#,
+            REST_PULL
+                .replace(r#""open""#, r#""closed""#)
+                .replace("12", "13")
+        ),
+    );
+    for query in ["12", "#12"] {
+        let prs = github
+            .search_open_prs(&account(), "o/r", query)
+            .await
+            .unwrap();
+        assert_eq!(prs.len(), 1, "{query}");
+        assert_eq!(prs[0].number, 12);
+        assert!(prs[0].fork && prs[0].draft);
+    }
+    assert_eq!(
+        github
+            .search_open_prs(&account(), "o/r", "13")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(
+        github
+            .search_open_prs(&account(), "o/r", "99")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 4);
+}
+
+#[tokio::test]
+async fn pull_request_reads_the_head_repository_and_none_for_a_missing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        &format!(
+            r#"case "$2" in
+  repos/o/r/pulls/12) echo '{REST_PULL}' ;;
+  repos/o/r/pulls/14) echo '{}' ;;
+  *) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+esac"#,
+            r#"{"number": 14, "state": "closed", "merged": true, "head": {"sha": "z", "ref": "gone", "repo": null}, "base": {"ref": "main", "repo": {"full_name": "o/r"}}}"#
+        ),
+    );
+    let pr = github
+        .pull_request(&account(), "o/r", 12)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pr.state, PrState::Open);
+    assert!(pr.fork && pr.draft);
+    assert_eq!(
+        pr.head_repo_clone_url.as_deref(),
+        Some("https://github.com/ana/r.git")
+    );
+    assert_eq!(
+        (pr.head_branch.as_str(), pr.head_sha.as_str()),
+        ("flag", "abc")
+    );
+    assert_eq!(pr.base_branch, "main");
+    assert_eq!(
+        (pr.title.as_str(), pr.body.as_str(), pr.author.as_str()),
+        ("Add a flag", "Why", "ana")
+    );
+    assert_eq!(pr.url, "https://github.com/o/r/pull/12");
+
+    let merged = github
+        .pull_request(&account(), "o/r", 14)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.state, PrState::Merged);
+    assert!(merged.fork);
+    assert_eq!(merged.head_repo_clone_url, None);
+    assert!(
+        github
+            .pull_request(&account(), "o/r", 99)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

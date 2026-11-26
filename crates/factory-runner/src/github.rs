@@ -7,7 +7,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use factory_core::PrDescription;
 
-use crate::forge::{Access, Account, BoxFuture, Forge, ForgeAccount, LookupError, command_error};
+use crate::forge::{
+    Access, Account, BoxFuture, Forge, ForgeAccount, LookupError, PrQuery, SEARCH_PAGE,
+    command_error,
+};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -127,6 +130,41 @@ pub struct RenovatePr {
     pub head: String,
 }
 
+/// A row of the open pull request search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPr {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    /// The head branch is in another repository than the base branch.
+    pub fork: bool,
+    pub draft: bool,
+    pub url: String,
+}
+
+/// A pull request in any state, as `pull_request` reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub state: PrState,
+    pub draft: bool,
+    /// The head branch is in another repository than the base branch.
+    pub fork: bool,
+    /// Where the head repository can be cloned. `None` when the forge does
+    /// not say, as when the fork was deleted.
+    pub head_repo_clone_url: Option<String>,
+    pub head_branch: String,
+    /// The SHA of the head commit.
+    pub head_sha: String,
+    pub base_branch: String,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub url: String,
+}
+
 /// A pull request without its diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrInfo {
@@ -178,6 +216,114 @@ struct PullJson {
 #[derive(Deserialize)]
 struct HeadJson {
     sha: String,
+}
+
+#[derive(Deserialize)]
+struct FullPullJson {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    body: Option<String>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    merged: bool,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    html_url: String,
+    user: Option<Login>,
+    head: FullRef,
+    base: FullRef,
+}
+
+#[derive(Deserialize)]
+struct FullRef {
+    #[serde(default)]
+    sha: String,
+    #[serde(default, rename = "ref")]
+    name: String,
+    repo: Option<RepoJson>,
+}
+
+#[derive(Deserialize)]
+struct RepoJson {
+    #[serde(default)]
+    full_name: String,
+    clone_url: Option<String>,
+}
+
+impl FullPullJson {
+    fn is_fork(&self) -> bool {
+        match (&self.head.repo, &self.base.repo) {
+            (Some(head), Some(base)) => !head.full_name.eq_ignore_ascii_case(&base.full_name),
+            _ => true,
+        }
+    }
+
+    fn author(&self) -> String {
+        self.user
+            .as_ref()
+            .map_or_else(|| "ghost".to_owned(), |user| user.login.clone())
+    }
+
+    fn into_open(self) -> OpenPr {
+        OpenPr {
+            fork: self.is_fork(),
+            author: self.author(),
+            number: self.number,
+            title: self.title,
+            head_branch: self.head.name,
+            base_branch: self.base.name,
+            draft: self.draft,
+            url: self.html_url,
+        }
+    }
+
+    fn into_pull_request(self) -> PullRequest {
+        let state = if self.merged {
+            PrState::Merged
+        } else if self.state == "open" {
+            PrState::Open
+        } else {
+            PrState::Closed
+        };
+        PullRequest {
+            number: self.number,
+            state,
+            draft: self.draft,
+            fork: self.is_fork(),
+            author: self.author(),
+            head_repo_clone_url: self.head.repo.and_then(|repo| repo.clone_url),
+            head_branch: self.head.name,
+            head_sha: self.head.sha,
+            base_branch: self.base.name,
+            title: self.title,
+            body: self.body.unwrap_or_default(),
+            url: self.html_url,
+        }
+    }
+}
+
+/// A node of the GraphQL pull request search. A node that is not a pull
+/// request is an empty object.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchNode {
+    number: Option<u64>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    is_cross_repository: bool,
+    #[serde(default)]
+    head_ref_name: String,
+    #[serde(default)]
+    base_ref_name: String,
+    author: Option<Login>,
 }
 
 /// GitHub's `2026-01-02T03:04:05Z` as `2026-01-02 03:04:05`.
@@ -771,6 +917,142 @@ impl GitHub {
             )
             .await?;
         parse_renovate_prs(&lines)
+    }
+
+    /// One page of the open pull requests, see [`Forge::search_open_prs`].
+    /// The listing is one REST call, a number is one REST call and a title
+    /// search is one GraphQL call, because the search API returns no
+    /// branches. Each word of a title search is quoted, so a word such as
+    /// `repo:other/name` is text and not a qualifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails or its output does not parse.
+    async fn search_open_prs(
+        &self,
+        account: &Account,
+        repo: &str,
+        query: &str,
+    ) -> Result<Vec<OpenPr>, String> {
+        match PrQuery::parse(query) {
+            PrQuery::All => {
+                let out = self
+                    .run(
+                        account,
+                        &[
+                            "api",
+                            "--method",
+                            "GET",
+                            &format!("repos/{repo}/pulls"),
+                            "-f",
+                            "state=open",
+                            "-f",
+                            "sort=updated",
+                            "-f",
+                            "direction=desc",
+                            "-f",
+                            &format!("per_page={SEARCH_PAGE}"),
+                        ],
+                        None,
+                    )
+                    .await?;
+                let pulls: Vec<FullPullJson> = serde_json::from_str(&out)
+                    .map_err(|_| "gh api pulls returned unexpected output".to_owned())?;
+                Ok(pulls.into_iter().map(FullPullJson::into_open).collect())
+            }
+            PrQuery::Number(number) => Ok(self
+                .pull_request(account, repo, number)
+                .await?
+                .filter(|pr| pr.state == PrState::Open)
+                .map(|pr| OpenPr {
+                    number: pr.number,
+                    title: pr.title,
+                    author: pr.author,
+                    head_branch: pr.head_branch,
+                    base_branch: pr.base_branch,
+                    fork: pr.fork,
+                    draft: pr.draft,
+                    url: pr.url,
+                })
+                .into_iter()
+                .collect()),
+            PrQuery::Title(text) => {
+                let words: Vec<String> = text
+                    .split_whitespace()
+                    .map(|word| format!("\"{}\"", word.replace(['"', '\\'], "")))
+                    .collect();
+                let search = format!(
+                    "repo:{repo} is:pr is:open sort:updated-desc in:title {}",
+                    words.join(" ")
+                );
+                let graphql = "query($q:String!,$n:Int!){search(query:$q,type:ISSUE,first:$n){nodes{... on PullRequest{number title url isDraft isCrossRepository headRefName baseRefName author{login}}}}}";
+                let out = self
+                    .run(
+                        account,
+                        &[
+                            "api",
+                            "graphql",
+                            "-f",
+                            &format!("query={graphql}"),
+                            "-f",
+                            &format!("q={search}"),
+                            "-F",
+                            &format!("n={SEARCH_PAGE}"),
+                            "--jq",
+                            ".data.search.nodes",
+                        ],
+                        None,
+                    )
+                    .await?;
+                let nodes: Vec<SearchNode> = serde_json::from_str(&out)
+                    .map_err(|_| "gh api graphql returned unexpected output".to_owned())?;
+                Ok(nodes
+                    .into_iter()
+                    .filter_map(|node| {
+                        Some(OpenPr {
+                            number: node.number?,
+                            title: node.title,
+                            author: node
+                                .author
+                                .map_or_else(|| "ghost".to_owned(), |user| user.login),
+                            head_branch: node.head_ref_name,
+                            base_branch: node.base_ref_name,
+                            fork: node.is_cross_repository,
+                            draft: node.is_draft,
+                            url: node.url,
+                        })
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// A pull request in any state, or `None` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails or its output does not parse.
+    async fn pull_request(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<PullRequest>, String> {
+        let out = match self
+            .run(
+                account,
+                &["api", &format!("repos/{repo}/pulls/{number}")],
+                None,
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let pull: FullPullJson = serde_json::from_str(&out)
+            .map_err(|_| "gh api pull request returned unexpected output".to_owned())?;
+        Ok(Some(pull.into_pull_request()))
     }
 
     /// The title, description, head and changed files of a pull request,
@@ -1653,6 +1935,24 @@ impl Forge for GitHub {
         _author: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Vec<RenovatePr>, String>> {
         Box::pin(GitHub::renovate_prs(self, account, repo, base))
+    }
+
+    fn search_open_prs<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        query: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<OpenPr>, String>> {
+        Box::pin(GitHub::search_open_prs(self, account, repo, query))
+    }
+
+    fn pull_request<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Option<PullRequest>, String>> {
+        Box::pin(GitHub::pull_request(self, account, repo, number))
     }
 
     fn pr_info<'a>(

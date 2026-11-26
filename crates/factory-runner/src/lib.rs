@@ -30,7 +30,7 @@ pub use factory_core::BranchSummary;
 pub use files::{PlacedFile, place_files, show_files};
 pub use forge::{
     Access, Account, BoxFuture, Forge, ForgeAccount, ForgeKind, ForgejoServer, LookupError,
-    NOT_PERMITTED, REJECTED, rejected_by_forge,
+    NOT_PERMITTED, REJECTED, SEARCH_PAGE, rejected_by_forge,
 };
 pub use forgejo::{
     Forgejo, ForgejoVersion, client as forgejo_client,
@@ -38,9 +38,9 @@ pub use forgejo::{
 };
 pub use git::{Git, Remote, RemoteSource};
 pub use github::{
-    Ci, Comment, FailedCheck, GitHub, HeadCommit, Observation, PrDetails, PrInfo, PrState,
-    PrStatus, RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login, observe,
-    parse_renovate_prs, parse_status, tick_rebase_checkbox,
+    Ci, Comment, FailedCheck, GitHub, HeadCommit, Observation, OpenPr, PrDetails, PrInfo, PrState,
+    PrStatus, PullRequest, RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login,
+    observe, parse_renovate_prs, parse_status, tick_rebase_checkbox,
 };
 pub use gitlab::{
     GitLab, encode as gitlab_encode, gitlab_job_id, is_not_found as gitlab_not_found,
