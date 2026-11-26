@@ -500,22 +500,96 @@ test.describe('pull request picker', () => {
     const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
     await openPicker(page, name);
     await rows(page).first().click();
-    // The review buttons come with a later change, so the form is made to post a review here.
-    await page.locator('#request').evaluate((box: HTMLTextAreaElement) => {
-      box.required = false;
-      const mode = document.createElement('input');
-      mode.type = 'hidden';
-      mode.name = 'mode';
-      mode.value = 'quick-review';
-      box.form!.append(mode);
-    });
-    await page.getByRole('button', { name: 'Request' }).click();
+    await page.getByRole('button', { name: 'Quick review' }).click();
 
     await expect(page).toHaveURL(/\/jobs\/\d+$/);
     await expect(page.getByRole('heading', { level: 1 })).toContainText('Review #101: Add dark mode');
 
     await page.goto(`/?project=${name}`);
     await expect(page.locator('li.job')).toContainText('Review #101: Add dark mode');
+  });
+
+  test('the review buttons appear only once a pull request is picked', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await page.goto(`/?project=${name}`);
+    await expect(page.locator('.review-actions')).toBeHidden();
+    await expect(page.getByRole('button', { name: 'Quick review' })).toBeHidden();
+
+    await openPicker(page, name);
+    await rows(page).first().click();
+    await expect(page.getByRole('button', { name: 'Quick review' })).toBeVisible();
+    await expect(page.getByLabel('Also comment on the pull request')).not.toBeChecked();
+    await expect(page.getByRole('button', { name: 'Review and fix' })).toBeHidden();
+
+    await page.getByRole('button', { name: 'Remove' }).click();
+    await expect(page.locator('.review-actions')).toBeHidden();
+  });
+
+  test('the menu opens, moves with the keys, closes on Escape and starts a review and fix', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await rows(page).first().click();
+    const toggle = page.getByRole('button', { name: 'More review actions' });
+    const item = page.getByRole('menuitem', { name: 'Review and fix' });
+
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(item).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(item).toBeHidden();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(toggle).toBeFocused();
+
+    await page.keyboard.press('ArrowDown');
+    await expect(item).toBeFocused();
+    const posted = page.waitForRequest((request) => request.method() === 'POST' && request.url().endsWith('/jobs'));
+    await page.keyboard.press('Enter');
+    expect((await posted).postData()).toMatch(/name="mode"\r\n\r\nreview-and-fix\r\n/);
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+    await expect(page.getByRole('heading', { level: 1 })).toContainText('Review #101: Add dark mode');
+    await expect(page.locator('.review-badge')).toHaveText('review');
+  });
+
+  test('a review submits with an empty box and Request with an empty box is refused', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await rows(page).first().click();
+
+    await page.getByRole('button', { name: 'Request', exact: true }).click();
+    await expect(page).toHaveURL(new RegExp(`/\\?project=${name}$`));
+    await expect(page.locator('#request')).toHaveJSProperty('validity.valueMissing', true);
+
+    await page.getByLabel('Also comment on the pull request').check();
+    const posted = page.waitForRequest((request) => request.method() === 'POST' && request.url().endsWith('/jobs'));
+    await page.getByRole('button', { name: 'Quick review' }).click();
+    const data = (await posted).postData();
+    expect(data).toMatch(/name="mode"\r\n\r\nquick-review\r\n/);
+    expect(data).toMatch(/name="comment"\r\n\r\non\r\n/);
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+    await expect(page.getByRole('heading', { level: 1 })).toContainText('Review #101: Add dark mode');
+  });
+
+  test('Review and fix is disabled for a fork pull request and for one a job holds', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    factory.fixture(
+      'renovate', '--project', name, '--number', '104', '--url', `https://github.com/e2e/${name}/pull/104`,
+    );
+    await openPicker(page, name);
+    const toggle = page.getByRole('button', { name: 'More review actions' });
+    const item = page.getByRole('menuitem', { name: 'Review and fix' });
+
+    for (const index of [1, 3]) {
+      await rows(page).nth(index).click();
+      await expect(page.getByRole('button', { name: 'Quick review' })).toBeEnabled();
+      await toggle.click();
+      await expect(item).toBeDisabled();
+      await page.getByRole('button', { name: 'Remove' }).click();
+      await search(page).click();
+    }
+    await rows(page).nth(2).click();
+    await toggle.click();
+    await expect(item).toBeEnabled();
   });
 
   test('a forge error shows in the picker and the form keeps working', async ({ page, factory }, testInfo) => {

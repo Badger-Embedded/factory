@@ -737,6 +737,58 @@ test('a request on a picked pull request waits for the user to merge it', async 
   await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
 });
 
+test('a quick review waits with its score, review and commit, and Fix in this pull request starts the fix', async ({ page, factory, project }) => {
+  const url = `https://github.com/e2e/${project}/pull/12`;
+  const id = factory.fixture('reviewed', '--project', project, '--number', '12', '--url', url);
+  await page.goto(`/jobs/${id}`);
+
+  await expect(page.locator('.review-badge')).toHaveText('review');
+  const card = status(page).locator('.card.quick-review');
+  await expect(card.locator('.review-score')).toHaveText('4/5');
+  await expect(card).toContainText('The retry loop never gives up.');
+  await expect(card.locator('code')).toHaveText('0123456789ab');
+  await expect(card.locator('.comment-error')).toHaveCount(0);
+  await expect(card.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible();
+
+  await card.getByLabel('What should the agent do?').fill('Keep it small');
+  await card.getByRole('button', { name: 'Fix in this pull request' }).click();
+  await expect(page.getByRole('button', { name: 'Fix in this pull request' })).toHaveCount(0);
+  await expect(status(page).locator('.card.quick-review')).toHaveCount(0);
+});
+
+test('the quick review card shows the error of a failed comment', async ({ page, factory, project }) => {
+  const url = `https://github.com/e2e/${project}/pull/12`;
+  const id = factory.fixture('reviewed', '--project', project, '--number', '12', '--url', url, '--comment', 'failed');
+  await page.goto(`/jobs/${id}`);
+
+  await expect(status(page).locator('.comment-error')).toContainText('the forge refused the comment');
+  await expect(status(page).locator('.review-score')).toHaveText('4/5');
+});
+
+test('the quick review card offers no fix in place for a fork pull request or one a job holds', async ({ page, factory, project }) => {
+  const url = `https://github.com/e2e/${project}/pull/12`;
+  const fork = factory.fixture('reviewed', '--project', project, '--number', '12', '--url', url, '--fork', 'true');
+  await page.goto(`/jobs/${fork}`);
+  await expect(status(page).getByRole('button', { name: 'Fix in this pull request' })).toHaveCount(0);
+  await expect(status(page).locator('.card.quick-review')).toContainText("cannot push to a fork's branch");
+
+  const other = `https://github.com/e2e/${project}/pull/13`;
+  const review = factory.fixture('reviewed', '--project', project, '--number', '13', '--url', other);
+  const holder = factory.fixture('picked', '--project', project, '--number', '13', '--url', other);
+  await page.goto(`/jobs/${review}`);
+  await expect(status(page).getByRole('button', { name: 'Fix in this pull request' })).toHaveCount(0);
+  await expect(status(page).getByRole('link', { name: `#${holder}` })).toHaveAttribute('href', `/jobs/${holder}`);
+});
+
+test('Cancel on a quick review ends the job', async ({ page, factory, project }) => {
+  const url = `https://github.com/e2e/${project}/pull/12`;
+  const id = factory.fixture('reviewed', '--project', project, '--number', '12', '--url', url);
+  await page.goto(`/jobs/${id}`);
+
+  await status(page).locator('.card.quick-review').getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(status(page).locator('.badge').first()).toHaveText('cancelled');
+});
+
 test('a safe Renovate pull request on a Read-only account waits as ready to merge and names the account', async ({
   page,
   factory,

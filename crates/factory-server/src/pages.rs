@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use factory_core::{
-    Ask, BranchSummary, Command, DELETED_PREREQUISITE, Gates, Job, PlanUsageSnapshot,
-    PrerequisiteState, RenovatePr, RenovateWait, Stage, Task, Turn, UsageWindow, Verdict, Wait,
+    Ask, BranchSummary, Command, CommentState, DELETED_PREREQUISITE, Gates, Job, PlanUsageSnapshot,
+    PrMode, PrerequisiteState, RenovatePr, RenovateWait, Stage, Task, Turn, UsageWindow, Verdict,
+    Wait,
 };
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -395,7 +396,10 @@ fn composer(project: &str, shown: &str, rows: &[&JobRow]) -> Markup {
             div.composer-line {
                 textarea #request name="request" required rows="1"
                     placeholder={ "Describe a change for " (shown) "…" } {}
-                button.primary { "Request" }
+                div.composer-actions {
+                    button.primary.request-button type="submit" name="mode" value="request" { "Request" }
+                    (review_actions())
+                }
             }
             div.composer-more tabindex="-1" {
                 div.file-picker {
@@ -412,6 +416,27 @@ fn composer(project: &str, shown: &str, rows: &[&JobRow]) -> Markup {
             }
             script { (PreEscaped(PASTE_IMAGES)) }
             script { (PreEscaped(PR_PICKER)) }
+        }
+    }
+}
+
+fn review_actions() -> Markup {
+    html! {
+        div.review-actions hidden {
+            div.split-button {
+                button.primary.split-main type="submit" name="mode" value="quick-review"
+                    formnovalidate { "Quick review" }
+                button.split-toggle type="button" aria-haspopup="menu" aria-expanded="false"
+                    aria-controls="review-menu" aria-label="More review actions" { "▾" }
+                div #review-menu.split-menu role="menu" hidden {
+                    button.split-item type="submit" name="mode" value="review-and-fix"
+                        role="menuitem" formnovalidate { "Review and fix" }
+                }
+            }
+            label.review-comment {
+                input type="checkbox" name="comment" value="on";
+                " Also comment on the pull request"
+            }
         }
     }
 }
@@ -4928,6 +4953,9 @@ fn job_header(
 fn picked_link(job: &Job) -> Markup {
     html! {
         @if let Some(pr) = job.picked_pr() {
+            @if matches!(pr.mode, PrMode::QuickReview { .. } | PrMode::ReviewAndFix) {
+                span.badge.factory.review-badge { "review" }
+            }
             (external_link(&pr.url, html! { "#" (pr.number) }, Some("picked-pr"), Some(&pr.title)))
         }
     }
@@ -5307,6 +5335,9 @@ pub struct JobLinks {
     pub fix: Option<i64>,
     /// The Renovate job a fix job is for, when it still is that pull request's job.
     pub source: Option<i64>,
+    /// The other live job that may push to or merge a quick-reviewed pull
+    /// request.
+    pub held_by: Option<i64>,
     /// The token the job page's own forms carry.
     pub csrf: String,
 }
@@ -5425,6 +5456,62 @@ fn proposal_card(id: i64, job: &Job) -> Markup {
     }
 }
 
+fn quick_review_card(
+    id: i64,
+    job: &Job,
+    links: &JobLinks,
+    score: u8,
+    review: &str,
+    head: &str,
+    comment: &CommentState,
+) -> Markup {
+    let fork = job.picked_pr().is_some_and(|picked| picked.fork);
+    html! {
+        div.card.needs-you.quick-review {
+            div.card-head {
+                span.badge.you { "needs you" }
+                h2 { "Review of the pull request: " span.review-score { (score) "/5" } }
+            }
+            p.meta { "Reviewed commit " code title=(head) { (head.chars().take(12).collect::<String>()) } }
+            @match comment {
+                CommentState::Posted => { p.hint { "The review is posted on the pull request." } }
+                CommentState::Pending => { p.hint { "The factory is posting the review on the pull request." } }
+                CommentState::Failed { error, .. } => {
+                    p.status-detail.comment-error { "Posting the review comment failed: " (error) }
+                }
+                CommentState::Off => {}
+            }
+            pre.review-text { (review) }
+            @if *comment != CommentState::Pending {
+            form.fix-form method="post" action={ "/jobs/" (id) "/fix-here" } {
+                input type="hidden" name="csrf" value=(links.csrf);
+                label for="review-instructions" { "What should the agent do?" }
+                textarea #review-instructions name="instructions" rows="3"
+                    placeholder="Instructions for the fix. Optional." {}
+                @if fork {
+                    p.hint { "The factory cannot push to a fork's branch, so it cannot fix this pull request in place." }
+                } @else if let Some(holder) = links.held_by {
+                    p.hint {
+                        "Job " a href={ "/jobs/" (holder) } { "#" (holder) }
+                        " may push to or merge this pull request, so it cannot be fixed in place."
+                    }
+                }
+                div.row.actions {
+                    @if !fork && links.held_by.is_none() {
+                        button.primary { "Fix in this pull request" }
+                    }
+                }
+            }
+            }
+            div.row.actions {
+                form method="post" action={ "/jobs/" (id) "/cancel" } {
+                    button { "Cancel" }
+                }
+            }
+        }
+    }
+}
+
 fn merge_left_card(job: &Job) -> Markup {
     html! {
         div.card.needs-you {
@@ -5526,6 +5613,15 @@ fn status_card(
             }
         },
         (_, Turn::User(Ask::MergeLeftToUser)) => merge_left_card(job),
+        (
+            _,
+            Turn::User(Ask::QuickReview {
+                score,
+                review,
+                head,
+                comment,
+            }),
+        ) => quick_review_card(id, job, links, *score, review, head, comment),
         (_, Turn::User(Ask::ReviewStopped { reason, .. })) => html! {
             div.card.needs-you {
                 div.card-head {

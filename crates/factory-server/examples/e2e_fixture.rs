@@ -8,6 +8,7 @@
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
 //! e2e_fixture renovate --db P --project N --number NUMBER --url URL
 //! e2e_fixture picked --db P --project N --number NUMBER --url URL
+//! e2e_fixture reviewed --db P --project N --number NUMBER --url URL [--fork true] [--comment off|posted|failed]
 //! e2e_fixture apply --db P --job ID --event start|approve|cancel|questions
 //! e2e_fixture cost --db P --job ID --usd AMOUNT [--local-cli claude-code|codex|copilot]
 //! e2e_fixture log --db P --job ID --text TEXT [--count N]
@@ -15,7 +16,7 @@
 //! e2e_fixture tls --db P --dir D
 //! ```
 //!
-//! `job`, `renovate` and `picked` print the new job's id. `tls` writes `ca.pem`, `cert.pem` and
+//! `job`, `renovate`, `picked` and `reviewed` print the new job's id. `tls` writes `ca.pem`, `cert.pem` and
 //! `key.pem` into `D`: a throwaway CA and a leaf certificate for `127.0.0.1`,
 //! so the stub MCP and Forgejo servers can serve TLS and the factory can trust
 //! them through `FACTORY_MCP_CA_FILE` and `FACTORY_FORGEJO_CA_FILE`. It does not open the database.
@@ -242,6 +243,56 @@ fn picked(store: &Store, project: &str, number: u64, url: &str) -> Result<i64> {
     Ok(id)
 }
 
+/// A quick review of pull request `number` that waits in Needs you with the
+/// score 4. `comment` is `off`, `posted` or `failed`.
+fn reviewed(
+    store: &Store,
+    project: &str,
+    number: u64,
+    url: &str,
+    fork: bool,
+    comment: &str,
+) -> Result<i64> {
+    let picked = factory_core::PickedPr {
+        number,
+        url: url.to_owned(),
+        title: "Handle the reboot error".into(),
+        body: String::new(),
+        head_branch: "carol/reboot".into(),
+        base_branch: "main".into(),
+        fork,
+        mode: factory_core::PrMode::QuickReview {
+            comment: comment != "off",
+        },
+    };
+    let id = store.create_pull_request_job(project, ADMIN, "", &[], picked)?;
+    store.apply(id, Event::Start)?;
+    store.apply(
+        id,
+        Event::QuickReviewed {
+            score: 4,
+            review: "The retry loop never gives up.\nAdd a cap.".into(),
+            head: "0123456789abcdef0123".into(),
+        },
+    )?;
+    match comment {
+        "off" => {}
+        "posted" => {
+            store.apply(id, Event::Commented)?;
+        }
+        "failed" => {
+            store.apply(
+                id,
+                Event::CommentFailed {
+                    error: "the forge refused the comment".into(),
+                },
+            )?;
+        }
+        other => return Err(format!("unknown --comment {other}").into()),
+    }
+    Ok(id)
+}
+
 fn seed_local(store: &Store, url: &str, models: Option<&Vec<String>>) -> Result<()> {
     store.save_local_settings(Some(url), Cli::Codex, 10)?;
     store.replace_local_models(models.map_or(&[][..], Vec::as_slice), 0)?;
@@ -430,6 +481,17 @@ fn main() -> Result<()> {
                 one("project")?,
                 one("number")?.parse()?,
                 one("url")?
+            )?
+        ),
+        "reviewed" => println!(
+            "{}",
+            reviewed(
+                &store,
+                one("project")?,
+                one("number")?.parse()?,
+                one("url")?,
+                flags.get("fork").is_some_and(|v| v[0] == "true"),
+                flags.get("comment").map_or("off", |v| v[0].as_str()),
             )?
         ),
         "apply" => apply(&store, &flags)?,
