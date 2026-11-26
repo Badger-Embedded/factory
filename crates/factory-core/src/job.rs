@@ -1767,7 +1767,14 @@ impl Job {
         if ran {
             self.checks_errors = 0;
         }
-        if matches!(stage, Stage::Implementing { .. }) && turn != Turn::Agent(Task::MergeHead) {
+        let same_pr = matches!(
+            (&self.stage, &stage),
+            (
+                Stage::Implementing { pr: before } | Stage::PrOpen { pr: before },
+                Stage::Implementing { pr: now },
+            ) if before == now
+        );
+        if matches!(stage, Stage::Implementing { .. }) && !same_pr {
             self.failed_rounds = 0;
             self.review_rounds = 0;
             self.checks_errors = 0;

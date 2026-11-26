@@ -1870,32 +1870,87 @@ async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Pub
     publish_with(&picked_tools(forge_base, git_arms), false).await
 }
 
-#[tokio::test]
-async fn a_restart_after_the_merge_of_a_moved_head_never_pushes_it_unchecked() {
-    let reject = "push) echo '! [rejected] moved' >&2; exit 1 ;;";
-    let tools = picked_tools("develop", reject);
-    let first = publish_with(&tools, true).await;
-    assert!(matches!(
-        first,
-        factory_server::Published::HeadMoved { conflicted: false }
-    ));
-    let pushes = |tools: &Tools| {
-        tools
-            .calls()
-            .lines()
-            .filter(|call| call.starts_with("git push") || call.contains(" push "))
-            .count()
-    };
-    assert_eq!(pushes(&tools), 1);
+fn pushes(tools: &Tools) -> usize {
+    tools
+        .calls()
+        .lines()
+        .filter(|call| call.contains(" push "))
+        .count()
+}
 
-    // The job was still waiting to publish when the factory restarted, so the
-    // same publish comes again on the merged checkout.
-    let second = publish_with(&tools, true).await;
+#[tokio::test]
+async fn a_commit_the_checks_have_not_passed_on_is_never_pushed_after_a_restart() {
+    let tools = picked_tools("develop", "");
+    let job = tools.dir.path().join("data/jobs/7");
+
+    // Nothing is recorded: the checks never passed on this commit.
+    let unrecorded = publish_with(&tools, true).await;
     assert!(matches!(
-        second,
+        unrecorded,
         factory_server::Published::HeadMoved { conflicted: false }
     ));
+    // The merge commit was created, but the checks passed on an older commit.
+    std::fs::write(job.join("checked-head"), "older").unwrap();
+    let merged = publish_with(&tools, true).await;
+    assert!(matches!(
+        merged,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    assert_eq!(pushes(&tools), 0);
+
+    std::fs::write(job.join("checked-head"), "abc123\n").unwrap();
+    assert!(matches!(
+        publish_with(&tools, true).await,
+        factory_server::Published::Open(12)
+    ));
     assert_eq!(pushes(&tools), 1);
+}
+
+#[tokio::test]
+async fn a_restart_during_a_conflicted_merge_hands_it_to_the_agent_without_pushing() {
+    let tools = picked_tools("develop", "");
+    let job = tools.dir.path().join("data/jobs/7");
+    std::fs::write(job.join("checked-head"), "abc123").unwrap();
+    std::fs::create_dir_all(job.join("work/.git")).unwrap();
+    std::fs::write(job.join("work/.git/MERGE_HEAD"), "def").unwrap();
+
+    assert!(matches!(
+        publish_with(&tools, true).await,
+        factory_server::Published::HeadMoved { conflicted: true }
+    ));
+    assert_eq!(pushes(&tools), 0);
+}
+
+#[tokio::test]
+async fn a_review_of_a_retargeted_pull_request_stops_before_the_reviewer_starts() {
+    let tools = picked_tools("main", "");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut run = request();
+    run.repo = "o/r".into();
+    run.base = "develop".into();
+    run.expect = Expect::Review;
+    run.branch = Some("factory/job-7-pr-1".into());
+    run.existing = Some(factory_server::ExistingPr {
+        number: 12,
+        head_branch: "carol/reboot".into(),
+        head_ref: "refs/pull/12/head".into(),
+    });
+
+    let report = podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+
+    assert!(
+        matches!(&report.event, Event::AgentFailed { reason } if reason.contains("develop")),
+        "{:?}",
+        report.event
+    );
+    assert!(!tools.calls().contains("clone"), "{}", tools.calls());
 }
 
 #[tokio::test]

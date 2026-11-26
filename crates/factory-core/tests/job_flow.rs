@@ -3912,6 +3912,13 @@ fn the_review_cap_still_applies_after_a_merge_head_turn() {
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::HeadMoved { conflicted: true });
     assert_eq!(job.turn(), &Turn::Agent(Task::MergeHead));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Questions(vec![Question {
+            text: "keep which side?".into(),
+        }])),
+    );
+    apply(&mut job, Event::Answer(vec!["theirs".into()]));
     apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 42 });

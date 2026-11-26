@@ -116,10 +116,10 @@ impl PodmanExecutor {
         format!("factory-job-{job_id}")
     }
 
-    /// Holds the commit of a merge that the checks have not run on yet, so a
-    /// restart before the job records the merge cannot push it unchecked.
-    fn unchecked_marker(&self, job_id: i64) -> PathBuf {
-        self.job_dir(job_id).join("unchecked-head")
+    /// Holds the commit the checks last passed on, so a publish never pushes
+    /// a commit the checks have not run on, whenever the factory restarted.
+    fn checked_marker(&self, job_id: i64) -> PathBuf {
+        self.job_dir(job_id).join("checked-head")
     }
 
     async fn retarget_reason(&self, request: &WatchRequest) -> Result<Option<String>, String> {
@@ -360,12 +360,15 @@ impl PodmanExecutor {
             }
         }
         let workspace = self.job_dir(request.job_id).join("work");
-        let marker = self.unchecked_marker(request.job_id);
-        if request.checks
-            && let Ok(saved) = fs::read_to_string(&marker)
-            && saved.trim() == self.git.head(&workspace).await?
-        {
-            return Ok(Published::HeadMoved { conflicted: false });
+        if request.checks {
+            if workspace.join(".git/MERGE_HEAD").exists() {
+                return Ok(Published::HeadMoved { conflicted: true });
+            }
+            let checked = fs::read_to_string(self.checked_marker(request.job_id)).ok();
+            let head = self.git.head(&workspace).await?;
+            if checked.is_none_or(|saved| saved.trim() != head) {
+                return Ok(Published::HeadMoved { conflicted: false });
+            }
         }
         let pusher = Mutex::new(None);
         let remote = || {
@@ -398,10 +401,6 @@ impl PodmanExecutor {
                 .git
                 .merge_pr_head(&workspace, &remote, &existing.head_ref, existing.number)
                 .await?;
-            if merged && request.checks {
-                fs::write(&marker, self.git.head(&workspace).await?)
-                    .map_err(|err| format!("saving {}: {err}", marker.display()))?;
-            }
             return Ok(Published::HeadMoved {
                 conflicted: !merged,
             });
@@ -558,6 +557,30 @@ impl Executor for PodmanExecutor {
         if let Err(err) = fs::create_dir_all(&config_dir) {
             return failed(format!("could not create {}: {err}", config_dir.display()));
         }
+        if matches!(request.expect, factory_runner::Expect::Review)
+            && let Some(existing) = &request.existing
+        {
+            let forge = self.forges.forge(&request.forge);
+            let live = async {
+                let reader = request.account.resolve()?;
+                blame(
+                    &reader.owner,
+                    forge
+                        .pull_request(&reader.account, &request.repo, existing.number)
+                        .await,
+                )
+            }
+            .await;
+            match live {
+                Ok(Some(pr)) => {
+                    if let Some(reason) = retargeted(&pr, &request.base) {
+                        return failed(reason);
+                    }
+                }
+                Ok(None) => {}
+                Err(reason) => return failed(reason),
+            }
+        }
         if let Err(reason) = self.prepare_checkout(&request, &workspace).await {
             return failed(reason);
         }
@@ -674,7 +697,9 @@ impl Executor for PodmanExecutor {
         )
         .await?;
         if matches!(event, Event::ChecksPassed) {
-            let _ = fs::remove_file(self.unchecked_marker(request.job_id));
+            let head = self.git.head(&workspace).await?;
+            fs::write(self.checked_marker(request.job_id), head)
+                .map_err(|err| format!("saving the checked commit: {err}"))?;
         }
         Ok(event)
     }
