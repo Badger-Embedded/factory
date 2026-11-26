@@ -7,6 +7,7 @@
 //! e2e_fixture project --db P --name N [--repo OWNER/REPO] [--forge NAME] --login L [--login L ...]
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
 //! e2e_fixture renovate --db P --project N --number NUMBER --url URL
+//! e2e_fixture picked --db P --project N --number NUMBER --url URL
 //! e2e_fixture apply --db P --job ID --event start|approve|cancel|questions
 //! e2e_fixture cost --db P --job ID --usd AMOUNT [--local-cli claude-code|codex|copilot]
 //! e2e_fixture log --db P --job ID --text TEXT [--count N]
@@ -14,7 +15,7 @@
 //! e2e_fixture tls --db P --dir D
 //! ```
 //!
-//! `job` and `renovate` print the new job's id. `tls` writes `ca.pem`, `cert.pem` and
+//! `job`, `renovate` and `picked` print the new job's id. `tls` writes `ca.pem`, `cert.pem` and
 //! `key.pem` into `D`: a throwaway CA and a leaf certificate for `127.0.0.1`,
 //! so the stub MCP and Forgejo servers can serve TLS and the factory can trust
 //! them through `FACTORY_MCP_CA_FILE` and `FACTORY_FORGEJO_CA_FILE`. It does not open the database.
@@ -209,6 +210,37 @@ fn create_job(
     Ok(id)
 }
 
+/// A request job on pull request `number` that waits for the user to merge.
+fn picked(store: &Store, project: &str, number: u64, url: &str) -> Result<i64> {
+    let picked = factory_core::PickedPr {
+        number,
+        url: url.to_owned(),
+        title: "Handle the reboot error".into(),
+        head_branch: "carol/reboot".into(),
+        base_branch: "main".into(),
+        fork: false,
+        mode: factory_core::PrMode::Request,
+    };
+    let id = store.create_pull_request_job(project, ADMIN, "Handle the error", &[], picked)?;
+    let plan = vec![planned("Handle the error")];
+    let events = events_for("implementing")?
+        .into_iter()
+        .map(|event| match event {
+            Event::Agent(AgentResult::Plan(_)) => Event::Agent(AgentResult::Plan(plan.clone())),
+            other => other,
+        })
+        .chain([
+            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::ChecksPassed,
+            Event::Published { number },
+            Event::MergeLeftToUser,
+        ]);
+    for event in events {
+        store.apply(id, event)?;
+    }
+    Ok(id)
+}
+
 fn seed_local(store: &Store, url: &str, models: Option<&Vec<String>>) -> Result<()> {
     store.save_local_settings(Some(url), Cli::Codex, 10)?;
     store.replace_local_models(models.map_or(&[][..], Vec::as_slice), 0)?;
@@ -316,6 +348,10 @@ fn cost(store: &Store, flags: &HashMap<String, Vec<String>>) -> Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per fixture subcommand"
+)]
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or("missing subcommand")?;
@@ -386,6 +422,15 @@ fn main() -> Result<()> {
                 .ok_or("the pull request already has a job")?;
             println!("{id}");
         }
+        "picked" => println!(
+            "{}",
+            picked(
+                &store,
+                one("project")?,
+                one("number")?.parse()?,
+                one("url")?
+            )?
+        ),
         "apply" => apply(&store, &flags)?,
         "cost" => cost(&store, &flags)?,
         "log" => {

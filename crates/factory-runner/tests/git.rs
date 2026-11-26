@@ -296,6 +296,37 @@ async fn every_pull_request_run_fetches_the_newest_base() {
 }
 
 #[tokio::test]
+async fn commits_already_on_a_picked_pull_request_are_not_attributed_to_the_job() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let git_ = Git::default();
+    git_.prepare(
+        &work,
+        &|| Ok(remote.remote()),
+        "main",
+        Some("factory/job-7-pr-1"),
+    )
+    .await
+    .unwrap();
+    let trailer = "\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>";
+    commit(&work, "a", &format!("theirs{trailer}"));
+    git(&work, &["update-ref", "refs/factory/pr-12/head", "HEAD"]);
+    commit(&work, "b", &format!("ours{trailer}"));
+
+    let all = git_
+        .attributed_commits_after(&work, "main", None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let ours = git_
+        .attributed_commits_after(&work, "main", Some(12))
+        .await
+        .unwrap();
+    assert_eq!(ours.len(), 1);
+    assert!(ours[0].ends_with("ours"), "{ours:?}");
+}
+
+#[tokio::test]
 async fn commits_that_credit_an_ai_tool_are_found() {
     let remote = Fixture::new();
     let work = remote.work();
@@ -1043,4 +1074,87 @@ async fn a_denied_push_is_not_reported_as_rejected_when_the_head_also_moved() {
         .await
         .unwrap_err();
     assert!(matches!(err, factory_runner::PushError::Failed(_)), "{err}");
+}
+
+/// Pushes a new commit to the forge's head ref of pull request 5, as a person
+/// would after the checkout was made.
+fn advance_pull_request(fixture: &Fixture, file: &str, content: &str) {
+    let upstream = fixture.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, file, content);
+    let bare_repo = fixture.root.path().join("remotes/owner/repo.git");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            bare_repo.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    git(&upstream, &["checkout", "-q", "main"]);
+}
+
+#[tokio::test]
+async fn a_moved_pull_request_head_merges_into_the_checkout() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    advance_pull_request(&remote, "theirs", "their fix");
+
+    let merged = git_
+        .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+        .await
+        .unwrap();
+    assert!(merged);
+    assert!(work.join("theirs").exists());
+    assert!(work.join("agent-file").exists());
+}
+
+#[tokio::test]
+async fn a_moved_pull_request_head_that_conflicts_stays_unfinished_and_survives_the_next_prepare() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "pr-file", "agent edit");
+    advance_pull_request(&remote, "pr-file", "their edit");
+
+    let merged = git_
+        .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+        .await
+        .unwrap();
+    assert!(!merged);
+    assert!(work.join(".git/MERGE_HEAD").exists());
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert!(work.join(".git/MERGE_HEAD").exists());
+    assert!(git(&work, &["status", "--porcelain"]).contains("UU pr-file"));
+}
+
+#[tokio::test]
+async fn a_head_that_moves_again_leaves_the_conflict_against_the_latest_head() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "pr-file", "agent edit");
+    advance_pull_request(&remote, "pr-file", "their edit");
+    assert!(
+        !git_
+            .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+            .await
+            .unwrap()
+    );
+
+    advance_pull_request(&remote, "pr-file", "their second edit");
+    prepare_pr(&remote, &git_, "main", head).await;
+    let latest = git(&work, &["rev-parse", "refs/factory/pr-5/head"]);
+    assert_eq!(git(&work, &["rev-parse", "MERGE_HEAD"]), latest);
+    assert!(git(&work, &["status", "--porcelain"]).contains("UU pr-file"));
 }

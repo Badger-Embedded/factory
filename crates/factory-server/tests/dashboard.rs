@@ -18431,3 +18431,246 @@ async fn the_renovate_agent_and_the_stage_panel_save_independently() {
             .is_some()
     );
 }
+
+/// A dashboard whose fake `gh` serves pull requests 12 (open), 13 (closed),
+/// 14 (merged) and 15 (from a fork) of the project, and no other.
+fn picked_pr_dashboard() -> Dashboard {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let gh = |dir: &Path| {
+        let gh = support::executable(
+            dir,
+            "gh",
+            r#"#!/usr/bin/env bash
+pull() {
+  echo "{\"number\":$1,\"title\":\"Fix $1\",\"state\":\"$2\",\"merged\":$3,\"draft\":false,\"html_url\":\"https://github.com/Badger-Embedded/maestro/pull/$1\",\"user\":{\"login\":\"carol\"},\"head\":{\"sha\":\"abc\",\"ref\":\"carol/fix\",\"repo\":{\"full_name\":\"$4\"}},\"base\":{\"sha\":\"def\",\"ref\":\"develop\",\"repo\":{\"full_name\":\"Badger-Embedded/maestro\"}}}"
+}
+case "$1 $2" in
+  "api repos/Badger-Embedded/maestro/pulls/12") pull 12 open false Badger-Embedded/maestro ;;
+  "api repos/Badger-Embedded/maestro/pulls/13") pull 13 closed false Badger-Embedded/maestro ;;
+  "api repos/Badger-Embedded/maestro/pulls/14") pull 14 closed true Badger-Embedded/maestro ;;
+  "api repos/Badger-Embedded/maestro/pulls/15") pull 15 open false someone/maestro ;;
+  "api repos/Badger-Embedded/maestro/pulls/99") echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  *) echo "fake gh: unexpected: $*" >&2; exit 1 ;;
+esac
+"#,
+        );
+        GitHub {
+            gh,
+            ..GitHub::default()
+        }
+    };
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(LocalSecrets::new(&[7; MASTER_KEY_LEN], Arc::clone(&store)));
+    let dashboard = dashboard_build(
+        store,
+        Arc::new(FakeRepos::fit()),
+        None,
+        |_| None,
+        secrets,
+        vec![USER.to_owned()],
+        gh,
+        Vec::new(),
+    );
+    seed_project_token(&dashboard, "tok-alice", "alice-bot", 11);
+    dashboard
+}
+
+async fn post_picked(dashboard: &Dashboard, request: &str, pr: &str) -> Reply {
+    let mut body = String::new();
+    for (name, value) in [("project", "maestro"), ("request", request), ("pr", pr)] {
+        write!(
+            body,
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .unwrap();
+    }
+    write!(body, "--{BOUNDARY}--\r\n").unwrap();
+    dashboard
+        .send(
+            Request::post("/jobs")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .header(USER_HEADER, USER)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_request_with_an_open_pull_request_creates_a_pull_request_job() {
+    let dashboard = picked_pr_dashboard();
+    let reply = post_picked(&dashboard, "handle the error", "#12").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let jobs = dashboard.store.list().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let picked = jobs[0].job.picked_pr().unwrap();
+    assert_eq!(picked.number, 12);
+    assert_eq!(picked.head_branch, "carol/fix");
+    assert_eq!(picked.base_branch, "develop");
+    assert!(!picked.fork);
+    assert!(!jobs[0].job.may_merge());
+}
+
+#[tokio::test]
+async fn a_request_with_a_pull_request_the_factory_cannot_change_creates_no_job() {
+    let dashboard = picked_pr_dashboard();
+    for (pr, reason) in [
+        ("13", "is closed"),
+        ("14", "is already merged"),
+        ("99", "does not exist"),
+        ("15", "cannot push to a fork's branch"),
+        ("abc", "pull request"),
+    ] {
+        let reply = post_picked(&dashboard, "x", pr).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{pr}");
+        assert!(reply.body.contains(reason), "{pr}: {}", reply.body);
+    }
+    let empty = post_picked(&dashboard, "  ", "12").await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_pull_request_held_by_a_live_job_creates_no_job() {
+    let dashboard = picked_pr_dashboard();
+    let first = post_picked(&dashboard, "one", "12").await;
+    assert_eq!(first.status, StatusCode::SEE_OTHER);
+    let holder = dashboard.store.list().unwrap()[0].id;
+    assert_eq!(
+        dashboard.store.holding_job("maestro", 12).unwrap(),
+        Some(holder)
+    );
+    assert_eq!(dashboard.store.holding_job("maestro", 13).unwrap(), None);
+
+    let second = post_picked(&dashboard, "two", "12").await;
+    assert_eq!(second.status, StatusCode::BAD_REQUEST);
+    assert!(
+        second.body.contains(&format!("job #{holder}")),
+        "{}",
+        second.body
+    );
+    assert_eq!(dashboard.store.list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_post_without_a_pull_request_creates_the_job_it_always_did() {
+    let dashboard = picked_pr_dashboard();
+    let reply = dashboard.post_job("maestro", "add a flag", &[]).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert!(dashboard.store.list().unwrap()[0].job.picked_pr().is_none());
+}
+
+fn picked_number(number: u64) -> factory_core::PickedPr {
+    factory_core::PickedPr {
+        number,
+        url: format!("https://github.com/Badger-Embedded/maestro/pull/{number}"),
+        title: "Update serde".into(),
+        head_branch: "renovate/serde".into(),
+        base_branch: "main".into(),
+        fork: false,
+        mode: factory_core::PrMode::Request,
+    }
+}
+
+#[test]
+fn discovery_leaves_a_pull_request_a_picked_job_holds() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    store
+        .create_pull_request_job("maestro", "alice", "fix it", &[], picked_number(7))
+        .unwrap();
+    let found = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap();
+    assert_eq!(found, None);
+    assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn a_pick_is_refused_for_a_pull_request_discovery_already_took() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let renovate = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    let error = store
+        .create_pull_request_job("maestro", "alice", "fix it", &[], picked_number(7))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(&format!("job #{renovate}")),
+        "{error}"
+    );
+}
+
+#[test]
+fn retrying_a_failed_job_whose_pull_request_was_taken_is_refused() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let first = store
+        .create_pull_request_job("maestro", "alice", "one", &[], picked_number(7))
+        .unwrap();
+    store.apply(first, Event::Start).unwrap();
+    store
+        .apply(
+            first,
+            Event::AgentFailed {
+                reason: "out of memory".into(),
+            },
+        )
+        .unwrap();
+    let second = store
+        .create_pull_request_job("maestro", "alice", "two", &[], picked_number(7))
+        .unwrap();
+
+    let error = store.apply(first, Event::Retry).unwrap_err();
+    assert!(
+        error.to_string().contains(&format!("job #{second}")),
+        "{error}"
+    );
+    assert!(store.get(first).unwrap().job.is_finished());
+
+    store.apply(second, Event::Cancel).unwrap();
+    store.apply(first, Event::Retry).unwrap();
+    assert!(!store.get(first).unwrap().job.is_finished());
+}

@@ -10,9 +10,9 @@ use factory_core::{
 };
 use factory_runner::{
     Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LocalTarget, LogLine,
-    NOT_PERMITTED, Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport,
-    SessionRun, WorkerConfig, WorkerRun, backend_for, observe, place_files, place_images,
-    remove_container, run, run_checks, show_files, show_images,
+    NOT_PERMITTED, Observation, PrState, PushError, RebaseCheckbox, Remote, RemoteSource,
+    RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend_for, observe,
+    place_files, place_images, remove_container, run, run_checks, show_files, show_images,
 };
 
 use crate::accounts::{AccountSource, Operation, blame, credential_reason};
@@ -20,13 +20,15 @@ use crate::forges::Forges;
 use crate::local_server::{LoadError, LocalServerProbe};
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, LocalKeyOwner, LogSink, PackagingRequest,
-    PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest,
-    SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, LocalKeyOwner, LogSink,
+    PackagingRequest, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest,
+    RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action,
+    watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
 use crate::usage::PlanUsageCache;
+use factory_core::CHECKOUT_REPAIR;
 
 /// Runs agents in podman worker containers.
 ///
@@ -76,6 +78,16 @@ fn write_credential_file(path: &Path, contents: &str) -> std::io::Result<()> {
     file.write_all(contents.as_bytes())
 }
 
+fn retargeted(pr: &factory_runner::PullRequest, saved_base: &str) -> Option<String> {
+    (pr.base_branch != saved_base).then(|| {
+        format!(
+            "Pull request #{} now merges into {} instead of {saved_base}, where the job \
+             started. Move it back, or cancel this job and start a new one.",
+            pr.number, pr.base_branch
+        )
+    })
+}
+
 fn failed(reason: String) -> RunReport {
     RunReport {
         event: Event::AgentFailed { reason },
@@ -85,6 +97,19 @@ fn failed(reason: String) -> RunReport {
         credential: None,
         token_usage: None,
     }
+}
+
+fn repair_checkout(branch: &str, current: &str) -> String {
+    let on = if current.is_empty() {
+        "a detached HEAD".to_owned()
+    } else {
+        format!("the branch {current}")
+    };
+    format!(
+        "{CHECKOUT_REPAIR} It is on {on}, or {branch} points at another commit than HEAD. \
+         Check out {branch} with git checkout {branch}, after you commit or move any \
+         work you want to keep, and leave the checks' changes to the branch alone."
+    )
 }
 
 impl PodmanExecutor {
@@ -103,6 +128,24 @@ impl PodmanExecutor {
 
     fn container(job_id: i64) -> String {
         format!("factory-job-{job_id}")
+    }
+
+    /// Holds the commit the checks last passed on, so a publish never pushes
+    /// a commit the checks have not run on, whenever the factory restarted.
+    fn checked_marker(&self, job_id: i64) -> PathBuf {
+        self.job_dir(job_id).join("checked-head")
+    }
+
+    async fn retarget_reason(&self, request: &WatchRequest) -> Result<Option<String>, String> {
+        let reader = request.account.resolve()?;
+        let found = blame(
+            &reader.owner,
+            self.forges
+                .forge(&request.forge)
+                .pull_request(&reader.account, &request.repo, request.number)
+                .await,
+        )?;
+        Ok(found.and_then(|pr| retargeted(&pr, &request.base)))
     }
 
     fn job_dir(&self, job_id: i64) -> PathBuf {
@@ -265,6 +308,152 @@ impl PodmanExecutor {
         result.map_err(|error| load_failure(&error, local, model))
     }
 
+    /// Checks out the head of the picked pull request into `branch`, and for a
+    /// conflict run starts merging the base branch in. A merge a run left
+    /// unfinished stays as it is.
+    async fn prepare_picked(
+        &self,
+        request: &AgentRequest,
+        workspace: &Path,
+        remote: &RemoteSource<'_>,
+        existing: &ExistingPr,
+        branch: &str,
+    ) -> Result<(), String> {
+        self.git
+            .prepare_pr(
+                workspace,
+                remote,
+                &request.base,
+                &existing.head_ref,
+                existing.number,
+                branch,
+            )
+            .await?;
+        if request.merge_base && !workspace.join(".git/MERGE_HEAD").exists() {
+            self.git.merge_base(workspace, &request.base).await?;
+        }
+        Ok(())
+    }
+
+    /// The branch the checkout has checked out, `HEAD` and the tip of `branch`.
+    /// A push transfers the tip, so the checks vouch for it only when the
+    /// checkout is on `branch`.
+    async fn checkout_state(
+        &self,
+        workspace: &Path,
+        branch: &str,
+    ) -> Result<(String, String, String), String> {
+        let current = self.git.current_branch(workspace).await?;
+        let head = self.git.head(workspace).await?;
+        let tip = self.git.branch_tip(workspace, branch).await?;
+        Ok((current, head, tip))
+    }
+
+    /// Pushes the branch's new commits to the picked pull request's own branch
+    /// without force, and touches nothing else on the pull request: no title,
+    /// no description, no merge. A push that the remote refuses because
+    /// someone pushed meanwhile brings their commits into the checkout with a
+    /// merge, so the factory neither drops nor overwrites them, and the job runs the checks on the merged branch, or hands a
+    /// conflict to the agent, before it pushes again.
+    async fn publish_existing(
+        &self,
+        request: &PublishRequest,
+        existing: &ExistingPr,
+        forge: &dyn Forge,
+    ) -> Result<Published, String> {
+        let reader = request.account.resolve()?;
+        let found = blame(
+            &reader.owner,
+            forge
+                .pull_request(&reader.account, &request.repo, existing.number)
+                .await,
+        )?;
+        match found {
+            Some(pr) if pr.state == PrState::Merged => {
+                return Ok(Published::AlreadyMerged(existing.number));
+            }
+            Some(pr) if pr.state == PrState::Closed => {
+                return Ok(Published::AlreadyClosed(existing.number));
+            }
+            Some(pr) => {
+                if let Some(reason) = retargeted(&pr, &request.base) {
+                    return Ok(Published::Stopped(reason));
+                }
+            }
+            None => {
+                return Err(format!(
+                    "pull request #{} no longer exists",
+                    existing.number
+                ));
+            }
+        }
+        let workspace = self.job_dir(request.job_id).join("work");
+        if workspace.join(".git/MERGE_HEAD").exists() {
+            return Ok(Published::HeadMoved { conflicted: true });
+        }
+        if request.checks {
+            let checked = fs::read_to_string(self.checked_marker(request.job_id)).ok();
+            let tip = self.git.branch_tip(&workspace, &request.branch).await?;
+            if checked.is_none_or(|saved| saved.trim() != tip) {
+                return Ok(Published::HeadMoved { conflicted: false });
+            }
+        }
+        let pusher = Mutex::new(None);
+        let remote = || {
+            let operation = request.account.resolve()?;
+            let remote = Remote::new(forge, &operation.account, &request.repo);
+            *pusher.lock().unwrap_or_else(PoisonError::into_inner) = Some(operation);
+            Ok(remote)
+        };
+        let record = || {
+            if let Some(operation) = &*pusher.lock().unwrap_or_else(PoisonError::into_inner) {
+                request.pushed.record(&format!(
+                    "{} ({})",
+                    operation.account.login,
+                    operation.owner.label()
+                ));
+            }
+        };
+        let result = self
+            .git
+            .push_fast_forward(
+                &workspace,
+                &remote,
+                &request.branch,
+                &existing.head_branch,
+                &record,
+            )
+            .await;
+        if matches!(result, Err(PushError::Rejected(_))) {
+            let current = self.git.current_branch(&workspace).await?;
+            if current != request.branch {
+                return Ok(Published::Stopped(format!(
+                    "the checkout is on {current:?}, not on {}, so the new head of the \
+                     pull request cannot be merged into the branch that is pushed",
+                    request.branch
+                )));
+            }
+            let merged = self
+                .git
+                .merge_pr_head(&workspace, &remote, &existing.head_ref, existing.number)
+                .await?;
+            return Ok(Published::HeadMoved {
+                conflicted: !merged,
+            });
+        }
+        let owner = pusher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|operation| operation.owner.clone());
+        let result = result.map_err(|err| err.to_string());
+        match &owner {
+            Some(owner) => blame(owner, result)?,
+            None => result?,
+        }
+        Ok(Published::Open(existing.number))
+    }
+
     async fn prepare_checkout(
         &self,
         request: &AgentRequest,
@@ -278,10 +467,17 @@ impl PodmanExecutor {
             *owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(operation.owner);
             Ok(remote)
         };
-        let result = self
-            .git
-            .prepare(workspace, &remote, &request.base, request.branch.as_deref())
-            .await;
+        let result = match (&request.existing, request.branch.as_deref()) {
+            (Some(existing), Some(branch)) => {
+                self.prepare_picked(request, workspace, &remote, existing, branch)
+                    .await
+            }
+            _ => {
+                self.git
+                    .prepare(workspace, &remote, &request.base, request.branch.as_deref())
+                    .await
+            }
+        };
         let owner = owner.into_inner().unwrap_or_else(PoisonError::into_inner);
         let result = match &owner {
             Some(owner) => blame(owner, result),
@@ -397,7 +593,33 @@ impl Executor for PodmanExecutor {
         if let Err(err) = fs::create_dir_all(&config_dir) {
             return failed(format!("could not create {}: {err}", config_dir.display()));
         }
-        if let Err(reason) = self.prepare_checkout(&request, &workspace).await {
+        if matches!(request.expect, factory_runner::Expect::Review)
+            && let Some(existing) = &request.existing
+        {
+            let forge = self.forges.forge(&request.forge);
+            let live = async {
+                let reader = request.account.resolve()?;
+                blame(
+                    &reader.owner,
+                    forge
+                        .pull_request(&reader.account, &request.repo, existing.number)
+                        .await,
+                )
+            }
+            .await;
+            match live {
+                Ok(Some(pr)) => {
+                    if let Some(reason) = retargeted(&pr, &request.base) {
+                        return failed(reason);
+                    }
+                }
+                Ok(None) => {}
+                Err(reason) => return failed(reason),
+            }
+        }
+        if !request.keep_checkout
+            && let Err(reason) = self.prepare_checkout(&request, &workspace).await
+        {
             return failed(reason);
         }
 
@@ -490,7 +712,7 @@ impl Executor for PodmanExecutor {
         let workspace = self.job_dir(request.job_id).join("work");
         let attributed = self
             .git
-            .attributed_commits(&workspace, &request.base)
+            .attributed_commits_after(&workspace, &request.base, request.existing)
             .await?;
         if !attributed.is_empty() {
             return Ok(Event::ChecksFailed {
@@ -504,14 +726,30 @@ impl Executor for PodmanExecutor {
                 ),
             });
         }
-        run_checks(
+        let tested = self.checkout_state(&workspace, &request.branch).await?;
+        if tested.0 != request.branch || tested.1 != tested.2 {
+            return Ok(Event::ChecksFailed {
+                report: repair_checkout(&request.branch, &tested.0),
+            });
+        }
+        let event = run_checks(
             &config,
             &name,
             &workspace,
             &request.command,
             &request.packages,
         )
-        .await
+        .await?;
+        if matches!(event, Event::ChecksPassed) {
+            if self.checkout_state(&workspace, &request.branch).await? != tested {
+                return Ok(Event::ChecksFailed {
+                    report: repair_checkout(&request.branch, &tested.0),
+                });
+            }
+            fs::write(self.checked_marker(request.job_id), &tested.1)
+                .map_err(|err| format!("saving the checked commit: {err}"))?;
+        }
+        Ok(event)
     }
 
     async fn summarize(&self, request: SummaryRequest) -> Result<BranchSummary, String> {
@@ -521,6 +759,9 @@ impl Executor for PodmanExecutor {
 
     async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
         let forge = self.forges.forge(&request.forge);
+        if let Some(existing) = &request.existing {
+            return self.publish_existing(&request, existing, &*forge).await;
+        }
         let lookup = request.account.resolve()?;
         if let Some(number) = blame(
             &lookup.owner,
@@ -605,12 +846,23 @@ impl Executor for PodmanExecutor {
                 merged_by_factory: false,
             });
         }
+        if matches!(observation, Observation::Ready)
+            && !request.may_merge
+            && let Some(reason) = self.retarget_reason(&request).await?
+        {
+            return Ok(WatchReport {
+                event: Some(Event::FactoryFailed { reason }),
+                seen_until: None,
+                merged_by_factory: false,
+            });
+        }
         let mut merged_by_factory = false;
         let (event, seen_until) = match observation {
             Observation::Ready => match ready_action(
                 request.llm_review,
                 request.review_approved,
                 request.auto_merge,
+                request.may_merge,
             ) {
                 ReadyAction::Review => (
                     Some(Event::StartReview {
@@ -630,15 +882,24 @@ impl Executor for PodmanExecutor {
                     (Some(Event::Merged), None)
                 }
                 ReadyAction::Wait => (None, None),
+                ReadyAction::LeaveToUser => (Some(Event::MergeLeftToUser), None),
             },
             Observation::Merged => (Some(Event::Merged), None),
             Observation::Closed => (Some(Event::ClosedUnmerged), None),
-            Observation::Conflicted => (
-                Some(Event::Conflicted {
-                    base: request.base.clone(),
-                }),
-                None,
-            ),
+            Observation::Conflicted => {
+                let retargeted = if request.may_merge {
+                    None
+                } else {
+                    self.retarget_reason(&request).await?
+                };
+                let event = match retargeted {
+                    Some(reason) => Event::FactoryFailed { reason },
+                    None => Event::Conflicted {
+                        base: request.base.clone(),
+                    },
+                };
+                (Some(event), None)
+            }
             Observation::CiFailed(checks) => {
                 let reporter = request.account.resolve()?;
                 let log = blame(

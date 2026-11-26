@@ -176,6 +176,7 @@ impl Git {
         {
             self.run(work, &["rebase", "--abort"], None).await?;
         }
+        let mut leave_conflict = false;
         if work.join(".git/MERGE_HEAD").exists() {
             let current = self.run(work, &["branch", "--show-current"], None).await?;
             let base_ref = format!("refs/remotes/origin/{base}");
@@ -187,6 +188,10 @@ impl Git {
                 .run(work, &["rev-parse", &base_ref], None)
                 .await
                 .map(|out| out.trim().to_owned());
+            let head_tip = self
+                .run(work, &["rev-parse", &tracking], None)
+                .await
+                .map(|out| out.trim().to_owned());
             let head_seen = self
                 .run(
                     work,
@@ -195,9 +200,21 @@ impl Git {
                 )
                 .await
                 .is_ok();
-            if current.trim() == branch && head_seen && merging.is_ok() && merging == base_tip {
+            let base_merge = head_seen && merging == base_tip;
+            let head_merge = merging == head_tip;
+            if current.trim() == branch && merging.is_ok() && (base_merge || head_merge) {
                 return Ok(());
             }
+            // An older head's merge is redone against the latest head, and a
+            // conflict stays in the checkout for the agent.
+            leave_conflict = current.trim() == branch
+                && match &merging {
+                    Ok(old) => self
+                        .run(work, &["merge-base", "--is-ancestor", old, &tracking], None)
+                        .await
+                        .is_ok(),
+                    Err(_) => false,
+                };
             self.run(work, &["merge", "--abort"], None).await?;
         }
         let local = format!("refs/heads/{branch}");
@@ -229,6 +246,12 @@ impl Git {
         if fast_forward.is_ok() {
             return Ok(());
         }
+        if leave_conflict {
+            return self
+                .merge_leaving_conflicts(work, &tracking)
+                .await
+                .map(|_| ());
+        }
         self.merge_or_abort(work, &tracking).await
     }
 
@@ -240,8 +263,75 @@ impl Git {
     ///
     /// Returns git's message when the merge fails for another reason.
     pub async fn merge_base(&self, work: &Path, base: &str) -> Result<bool, String> {
-        let target = format!("origin/{base}");
-        match self.run(work, &["merge", "--no-edit", &target], None).await {
+        self.merge_leaving_conflicts(work, &format!("origin/{base}"))
+            .await
+    }
+
+    /// Fetches the pull request's head again and merges it into the
+    /// checked-out branch with a merge commit, for a push the remote refused
+    /// because someone pushed first. On a conflict the merge stays unfinished
+    /// in the checkout, for the agent to resolve, and `Ok(false)` comes back.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when the fetch fails or the merge fails for
+    /// another reason.
+    pub async fn merge_pr_head(
+        &self,
+        work: &Path,
+        remote_source: &RemoteSource<'_>,
+        head_ref: &str,
+        number: u64,
+    ) -> Result<bool, String> {
+        let tracking = format!("refs/factory/pr-{number}/head");
+        let remote = remote_source()?;
+        self.fetch_ref(work, &remote, head_ref, &tracking).await?;
+        self.merge_leaving_conflicts(work, &tracking).await
+    }
+
+    /// The commit the checkout is at.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when it fails.
+    pub async fn head(&self, work: &Path) -> Result<String, String> {
+        let out = self.run(work, &["rev-parse", "HEAD"], None).await?;
+        Ok(out.trim().to_owned())
+    }
+
+    /// The commit that `refs/heads/<branch>` points at, which is what a push of
+    /// the branch transfers.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when it fails.
+    pub async fn branch_tip(&self, work: &Path, branch: &str) -> Result<String, String> {
+        let out = self
+            .run(work, &["rev-parse", &format!("refs/heads/{branch}")], None)
+            .await?;
+        Ok(out.trim().to_owned())
+    }
+
+    /// The branch the checkout has checked out, or an empty string when `HEAD`
+    /// is detached.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when it fails for a reason other than a detached
+    /// `HEAD`.
+    pub async fn current_branch(&self, work: &Path) -> Result<String, String> {
+        match self
+            .run(work, &["symbolic-ref", "--quiet", "--short", "HEAD"], None)
+            .await
+        {
+            Ok(out) => Ok(out.trim().to_owned()),
+            Err(_) if self.head(work).await.is_ok() => Ok(String::new()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn merge_leaving_conflicts(&self, work: &Path, target: &str) -> Result<bool, String> {
+        match self.run(work, &["merge", "--no-edit", target], None).await {
             Ok(_) => Ok(true),
             Err(err) => {
                 let conflicted = self
@@ -396,15 +486,34 @@ impl Git {
     ///
     /// Returns git's message when `git log` fails.
     pub async fn attributed_commits(&self, work: &Path, base: &str) -> Result<Vec<String>, String> {
+        self.attributed_commits_after(work, base, None).await
+    }
+
+    /// Like `attributed_commits`, without the commits that pull request
+    /// `existing` already holds. Those are someone else's to reword, and a
+    /// reword would rewrite history the factory must keep.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when `git log` fails.
+    pub async fn attributed_commits_after(
+        &self,
+        work: &Path,
+        base: &str,
+        existing: Option<u64>,
+    ) -> Result<Vec<String>, String> {
         let range = format!("origin/{base}..HEAD");
-        let log = self
-            .run(work, &["log", "--format=%h %s%x1f%B%x1e", &range], None)
-            .await?;
+        let held = existing.map(|number| format!("^refs/factory/pr-{number}/head"));
+        let mut args = vec!["log", "--format=%h %s%x1f%B%x1e", &range];
+        args.extend(held.as_deref());
+        let log = self.run(work, &args, None).await?;
         Ok(log
             .split('\u{1e}')
             .filter_map(|entry| {
-                let (head, body) = entry.trim().split_once('\u{1f}')?;
-                body.lines().any(credits_ai).then(|| head.trim().to_owned())
+                let (short, body) = entry.trim().split_once('\u{1f}')?;
+                body.lines()
+                    .any(credits_ai)
+                    .then(|| short.trim().to_owned())
             })
             .collect())
     }

@@ -5331,6 +5331,26 @@ fn proposal_card(id: i64, job: &Job) -> Markup {
     }
 }
 
+fn merge_left_card(job: &Job) -> Markup {
+    html! {
+        div.card.needs-you {
+            div.card-head {
+                span.badge.you { "needs you" }
+                h2 { "Merge the pull request" }
+            }
+            p.status-detail {
+                "CI is green and nothing waits for the agent. The factory never merges a \
+                 pull request picked in the request form, so the merge is left to you. \
+                 Merge it on the forge and the job ends."
+            }
+            @if let Some(picked) = job.picked_pr() {
+                p { (external_link(&picked.url, format!("Pull request #{}", picked.number), None, None)) }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines, reason = "one match arm per card")]
 fn status_card(
     id: i64,
     project: &ProjectLabel,
@@ -5411,6 +5431,7 @@ fn status_card(
                 }
             }
         },
+        (_, Turn::User(Ask::MergeLeftToUser)) => merge_left_card(job),
         (_, Turn::User(Ask::ReviewStopped { reason, .. })) => html! {
             div.card.needs-you {
                 div.card-head {
@@ -5621,7 +5642,9 @@ fn status(job: &Job, auto_merge: bool, wait: &Wait) -> Status {
             }),
         ) => (Lane::Factory, "factory", "waiting for fix"),
         (_, Turn::User(_)) if !collecting(job) => (Lane::You, "you", "needs you"),
-        _ if in_review(job) && auto_merge => (Lane::Factory, "factory", "merges when green"),
+        _ if in_review(job) && auto_merge && job.may_merge() => {
+            (Lane::Factory, "factory", "merges when green")
+        }
         _ if in_review(job) => (Lane::You, "you", "in review"),
         (_, Turn::Agent(_)) => (Lane::Agent, "agent", "agent working"),
         (_, Turn::User(_) | Turn::Factory | Turn::RerunCi { .. } | Turn::Done) => {
@@ -5686,9 +5709,19 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool, wait: &Wait) ->
             Some(Command::RunChecks { .. }) => {
                 "The factory is running the project's checks.".into()
             }
+            Some(Command::Publish { pr }) if job.picked_pr().is_some() => {
+                let number = job.plan()[pr].number.unwrap_or_default();
+                format!("The factory is pushing the commits to pull request #{number}.")
+            }
             Some(Command::Publish { .. }) => {
                 "The factory is pushing the branch and opening the pull request.".into()
             }
+            Some(Command::WatchPr { number, .. }) if job.picked_pr().is_some() => format!(
+                "Pull request #{number} waits for CI. The factory never merges it: merge it \
+                 yourself on the forge when it is ready. Review comments go to the agent. \
+                 The factory looks every {} seconds.",
+                settings.poll_seconds
+            ),
             Some(Command::WatchPr { number, .. }) if auto_merge => format!(
                 "Auto-merge is on. The factory merges pull request #{number} once all its \
                  checks pass, unless review comments come first, which go to the agent. It \
@@ -5759,6 +5792,7 @@ pub(crate) fn task_label(task: &Task) -> &'static str {
         Task::FixChecks { .. } => "fixing failed checks",
         Task::FixCi { .. } => "fixing the CI failure",
         Task::AddressReview { .. } => "addressing review comments",
+        Task::MergeHead => "merging the commits someone else pushed to the pull request",
         Task::Rebase { .. } => "rebasing onto the newest base branch to resolve a conflict",
         Task::Review => "reviewing the pull request",
         Task::AnalyzeFailure { .. } => "reading the CI failure log",

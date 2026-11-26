@@ -30,8 +30,17 @@ const UNCHANGED_REASON: &str = "The author added no commit after the last review
      verdict. Merge the pull request on GitHub to accept it as it is, or retry to run the \
      reviewer again.";
 
+/// What a failed check report starts with when the checks left the checkout off
+/// the job branch.
+pub const CHECKOUT_REPAIR: &str = "The checkout is not on the job branch.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
+    /// Whether the last failed checks left the checkout off the job branch and
+    /// an agent run is repairing it, including a run that resumes after an
+    /// answer.
+    #[serde(default)]
+    checkout_repair: bool,
     request: String,
     stage: Stage,
     turn: Turn,
@@ -1080,6 +1089,10 @@ pub enum Task {
     Rebase {
         base: String,
     },
+    /// Finish the merge of the picked pull request's newer head into the
+    /// checkout. Someone pushed to the branch while the job ran, and their
+    /// commits conflict with the job's.
+    MergeHead,
     /// Review the pull request's diff and end with `approve` or `changes`. The
     /// worker gets no GitHub token and reads the diff from the checkout.
     Review,
@@ -1295,6 +1308,13 @@ pub enum Event {
     /// CI is green on the pull request of a job that never merges, and the
     /// reviewer has nothing left to say. See [`Job::may_merge`].
     MergeLeftToUser,
+    /// The push to a picked pull request was refused because someone pushed
+    /// to its branch first, and the factory merged their commits into the
+    /// checkout. With `conflicted`, the merge is unfinished and an agent
+    /// resolves it. Otherwise the checks run again on the merged branch.
+    HeadMoved {
+        conflicted: bool,
+    },
     /// The pull request no longer merges cleanly into `base`.
     Conflicted {
         base: String,
@@ -1419,6 +1439,7 @@ impl Job {
     #[must_use]
     pub fn new(request: impl Into<String>, gates: Gates) -> Self {
         Job {
+            checkout_repair: false,
             request: request.into(),
             stage: Stage::Requested,
             turn: Turn::Factory,
@@ -1522,6 +1543,13 @@ impl Job {
             | JobKind::Fix { .. }
             | JobKind::PullRequest(_) => None,
         }
+    }
+
+    /// Whether the agent run now due repairs a checkout the checks left off the
+    /// job branch.
+    #[must_use]
+    pub fn repairing_checkout(&self) -> bool {
+        self.checkout_repair
     }
 
     /// The pull request the user picked, or `None` for any other job.
@@ -1756,7 +1784,14 @@ impl Job {
         if ran {
             self.checks_errors = 0;
         }
-        if let Stage::Implementing { .. } = stage {
+        let same_pr = matches!(
+            (&self.stage, &stage),
+            (
+                Stage::Implementing { pr: before } | Stage::PrOpen { pr: before },
+                Stage::Implementing { pr: now },
+            ) if before == now
+        );
+        if matches!(stage, Stage::Implementing { .. }) && !same_pr {
             self.failed_rounds = 0;
             self.review_rounds = 0;
             self.checks_errors = 0;
@@ -1878,6 +1913,18 @@ impl Job {
         Ok(next)
     }
 
+    fn after_head_moved(pr: usize, conflicted: bool) -> (Stage, Turn) {
+        if conflicted {
+            (Stage::Implementing { pr }, Turn::Agent(Task::MergeHead))
+        } else {
+            (Stage::Verifying { pr }, Turn::Factory)
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match arm per factory event, as in `transition`"
+    )]
     fn deliver(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
         use Event as E;
         use Stage as S;
@@ -1897,7 +1944,10 @@ impl Job {
             (S::Verifying { pr }, Turn::Factory, E::ChecksError { error }) => {
                 self.checks_error(*pr, &error)
             }
-            (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => self.after_checks(*pr),
+            (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => {
+                self.checkout_repair = false;
+                self.after_checks(*pr)
+            }
             (
                 S::Verifying { pr },
                 Turn::User(Ask::PublishApproval { summary: None }),
@@ -1921,6 +1971,7 @@ impl Job {
             ),
             (S::Verifying { pr }, Turn::Factory, E::ChecksFailed { report }) => {
                 let pr = *pr;
+                self.checkout_repair = report.starts_with(CHECKOUT_REPAIR);
                 self.fail_round(S::Verifying { pr }, Turn::Agent(Task::FixChecks { report }))
             }
 
@@ -1934,6 +1985,11 @@ impl Job {
                 self.pushed = true;
                 self.review = ReviewState::Pending;
                 (S::CiAndReview { pr }, Turn::Factory)
+            }
+            (S::PrOpen { pr }, Turn::Factory, E::HeadMoved { conflicted })
+                if self.picked_pr().is_some() =>
+            {
+                Self::after_head_moved(*pr, conflicted)
             }
             (S::PrOpen { pr }, Turn::Factory, E::NothingToPublish) => {
                 let pr = *pr;

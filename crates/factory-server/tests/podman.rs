@@ -98,6 +98,9 @@ fn request() -> AgentRequest {
         repo: "owner/name".into(),
         base: "main".into(),
         branch: None,
+        existing: None,
+        merge_base: false,
+        keep_checkout: false,
         session_id: "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10".into(),
         agent_session: None,
         agent: factory_core::DEFAULT_AGENT,
@@ -1040,10 +1043,12 @@ async fn clone_push_and_every_gh_call_use_the_token_of_the_account_the_request_n
             repo: "o/r".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1120,10 +1125,12 @@ async fn a_token_that_changes_during_a_publish_applies_to_the_next_operation() {
             repo: "o/r".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1178,10 +1185,12 @@ async fn a_push_is_logged_even_when_the_pull_request_step_has_no_account() {
             repo: "o/r".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1270,6 +1279,7 @@ async fn a_refused_token_reading_a_ci_log_after_a_good_status_read_fails_the_wat
             number: 5,
             seen_until: None,
             auto_merge: false,
+            may_merge: true,
             llm_review: false,
             review_approved: false,
             watch_only: false,
@@ -1601,10 +1611,12 @@ async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account
             repo: "team/forged".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1728,4 +1740,413 @@ async fn a_local_session_records_its_cli_once_the_worker_has_started() {
     let (recorded, _, _) = local_launch("#!/bin/bash\necho '{}'\nexit 0\n", Cli::Copilot).await;
 
     assert_eq!(recorded, Some(Cli::Copilot));
+}
+
+#[tokio::test]
+async fn publishing_to_a_picked_pull_request_pushes_its_branch_and_never_opens_or_edits_one() {
+    let tools = Tools::new();
+    let calls = tools.dir.path().join("calls");
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        &format!(
+            "#!/bin/bash\necho \"gh $* | ${{GH_TOKEN}}\" >> '{calls}'\n\
+             case \"$*\" in\n\
+             *pulls/12*) echo '{{\"number\":12,\"state\":\"open\",\"merged\":false,\
+             \"head\":{{\"sha\":\"a\",\"ref\":\"carol/reboot\",\"repo\":{{\"full_name\":\"o/r\"}}}},\
+             \"base\":{{\"sha\":\"b\",\"ref\":\"develop\",\"repo\":{{\"full_name\":\"o/r\"}}}}}}' ;;\n\
+             esac\n",
+            calls = calls.display()
+        ),
+    );
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    let published = podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+            repo: "o/r".into(),
+            base: "develop".into(),
+            branch: "factory/job-7-pr-1".into(),
+            existing: Some(factory_server::ExistingPr {
+                number: 12,
+                head_branch: "carol/reboot".into(),
+                head_ref: "refs/pull/12/head".into(),
+            }),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            checks: false,
+            pushed: factory_server::PushLog::new(|_| {}),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(published, factory_server::Published::Open(12)));
+    let calls = tools.calls();
+    let push = calls
+        .lines()
+        .find(|call| call.starts_with("git ") && call.contains(" push "))
+        .unwrap_or_else(|| panic!("no push in {calls}"));
+    assert!(push.contains("refs/heads/carol/reboot"), "{push}");
+    assert!(!push.contains("--force"), "{push}");
+    for call in calls.lines().filter(|call| call.starts_with("gh ")) {
+        assert!(
+            !call.contains("pr create") && !call.contains("pr edit"),
+            "{call}"
+        );
+    }
+}
+
+/// Tools for pull request 12 of `o/r` whose forge base is `forge_base`.
+/// `git_arms` adds `case` arms on the subcommand to the fake `git`.
+fn picked_tools(forge_base: &str, git_arms: &str) -> Tools {
+    let tools = Tools::new();
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        &format!(
+            "#!/bin/bash\n\
+             case \"$*\" in\n\
+             *pulls/12/*) ;;\n\
+             *pulls/12*) echo '{{\"number\":12,\"state\":\"open\",\"merged\":false,\
+             \"head\":{{\"sha\":\"a\",\"ref\":\"carol/reboot\",\"repo\":{{\"full_name\":\"o/r\"}}}},\
+             \"base\":{{\"sha\":\"b\",\"ref\":\"{forge_base}\",\"repo\":{{\"full_name\":\"o/r\"}}}}}}' ;;\n\
+             *\"pr view\"*) echo '{{\"state\":\"OPEN\",\"headRefOid\":\"h1\",\"mergeable\":\"MERGEABLE\",\
+             \"statusCheckRollup\":[{{\"name\":\"Lint\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\"}}]}}' ;;\n\
+             esac\n"
+        ),
+    );
+    support::executable(
+        tools.dir.path(),
+        "git",
+        &format!(
+            "#!/bin/bash\n\
+             while [ \"$1\" = -c ]; do shift 2; done\n\
+             case \"$1\" in --git-dir=*) shift ;; esac\n\
+             echo \"git $*\" >> '{calls}'\n\
+             case \"$1\" in\n\
+             clone) mkdir -p \"${{@: -1}}/.git\" ;;\n\
+             log) echo 'abc1234 one' ;;\n\
+             symbolic-ref) cat '{on}' 2>/dev/null || echo factory/job-7-pr-1 ;;\n\
+             rev-parse) case \"$2\" in refs/heads/*) cat '{tip}' 2>/dev/null || echo abc123 ;; *) echo abc123 ;; esac ;;\n\
+             config) case \"$*\" in *--get-regexp*) exit 1 ;; esac ;;\n\
+             {git_arms}\n\
+             esac\n",
+            calls = tools.dir.path().join("calls").display(),
+            tip = tools.dir.path().join("tip").display(),
+            on = tools.dir.path().join("on").display()
+        ),
+    );
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    tools
+}
+
+async fn publish_with(tools: &Tools, checks: bool) -> factory_server::Published {
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+            repo: "o/r".into(),
+            base: "develop".into(),
+            branch: "factory/job-7-pr-1".into(),
+            existing: Some(factory_server::ExistingPr {
+                number: 12,
+                head_branch: "carol/reboot".into(),
+                head_ref: "refs/pull/12/head".into(),
+            }),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            checks,
+            pushed: factory_server::PushLog::new(|_| {}),
+        })
+        .await
+        .unwrap()
+}
+
+async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Published {
+    publish_with(&picked_tools(forge_base, git_arms), false).await
+}
+
+fn pushes(tools: &Tools) -> usize {
+    tools
+        .calls()
+        .lines()
+        .filter(|call| call.contains(" push "))
+        .count()
+}
+
+#[tokio::test]
+async fn a_commit_the_checks_have_not_passed_on_is_never_pushed_after_a_restart() {
+    let tools = picked_tools("develop", "");
+    let job = tools.dir.path().join("data/jobs/7");
+
+    // Nothing is recorded: the checks never passed on this commit.
+    let unrecorded = publish_with(&tools, true).await;
+    assert!(matches!(
+        unrecorded,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    // The merge commit was created, but the checks passed on an older commit.
+    std::fs::write(job.join("checked-head"), "older").unwrap();
+    let merged = publish_with(&tools, true).await;
+    assert!(matches!(
+        merged,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    assert_eq!(pushes(&tools), 0);
+
+    std::fs::write(job.join("checked-head"), "abc123\n").unwrap();
+    assert!(matches!(
+        publish_with(&tools, true).await,
+        factory_server::Published::Open(12)
+    ));
+    assert_eq!(pushes(&tools), 1);
+}
+
+#[tokio::test]
+async fn a_restart_during_a_conflicted_merge_hands_it_to_the_agent_without_pushing() {
+    for checks in [true, false] {
+        let tools = picked_tools("develop", "");
+        let job = tools.dir.path().join("data/jobs/7");
+        std::fs::write(job.join("checked-head"), "abc123").unwrap();
+        std::fs::create_dir_all(job.join("work/.git")).unwrap();
+        std::fs::write(job.join("work/.git/MERGE_HEAD"), "def").unwrap();
+
+        assert!(
+            matches!(
+                publish_with(&tools, checks).await,
+                factory_server::Published::HeadMoved { conflicted: true }
+            ),
+            "checks {checks}"
+        );
+        assert_eq!(pushes(&tools), 0);
+    }
+}
+
+#[tokio::test]
+async fn the_commit_the_checks_passed_on_must_be_the_branch_tip_that_is_pushed() {
+    let tools = picked_tools("develop", "");
+    let job = tools.dir.path().join("data/jobs/7");
+    // HEAD is abc123 and the checks passed on it, but the branch moved on.
+    std::fs::write(job.join("checked-head"), "abc123").unwrap();
+    std::fs::write(tools.dir.path().join("tip"), "def456\n").unwrap();
+
+    assert!(matches!(
+        publish_with(&tools, true).await,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    assert_eq!(pushes(&tools), 0);
+
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let event = podman
+        .run_checks(
+            &Settings::default(),
+            factory_server::ChecksRequest {
+                job_id: 7,
+                base: "develop".into(),
+                existing: Some(12),
+                branch: "factory/job-7-pr-1".into(),
+                command: "true".into(),
+                packages: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(event, Event::ChecksFailed { .. }), "{event:?}");
+}
+
+#[tokio::test]
+async fn a_review_of_a_retargeted_pull_request_stops_before_the_reviewer_starts() {
+    let tools = picked_tools("main", "");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut run = request();
+    run.repo = "o/r".into();
+    run.base = "develop".into();
+    run.expect = Expect::Review;
+    run.branch = Some("factory/job-7-pr-1".into());
+    run.existing = Some(factory_server::ExistingPr {
+        number: 12,
+        head_branch: "carol/reboot".into(),
+        head_ref: "refs/pull/12/head".into(),
+    });
+
+    let report = podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+
+    assert!(
+        matches!(&report.event, Event::AgentFailed { reason } if reason.contains("develop")),
+        "{:?}",
+        report.event
+    );
+    assert!(!tools.calls().contains("clone"), "{}", tools.calls());
+}
+
+#[tokio::test]
+async fn a_green_pull_request_that_was_retargeted_fails_instead_of_asking_for_the_merge() {
+    let tools = picked_tools("main", "");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let report = podman
+        .watch(factory_server::WatchRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+            repo: "o/r".into(),
+            base: "develop".into(),
+            number: 12,
+            seen_until: None,
+            auto_merge: false,
+            may_merge: false,
+            llm_review: true,
+            review_approved: false,
+            watch_only: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&report.event, Some(Event::FactoryFailed { reason }) if reason.contains("develop")),
+        "{:?}",
+        report.event
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_push_to_a_picked_pull_request_merges_the_new_head_and_leaves_the_checks_to_rerun()
+ {
+    let published =
+        publish_picked("develop", "push) echo '! [rejected] moved' >&2; exit 1 ;;").await;
+    assert!(matches!(
+        published,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+}
+
+#[tokio::test]
+async fn a_rejected_push_whose_merge_conflicts_hands_the_conflict_to_the_agent() {
+    let published = publish_picked(
+        "develop",
+        "push) echo '! [rejected] moved' >&2; exit 1 ;;\n\
+         merge) exit 1 ;;\n\
+         diff) echo README ;;",
+    )
+    .await;
+    assert!(matches!(
+        published,
+        factory_server::Published::HeadMoved { conflicted: true }
+    ));
+}
+
+#[tokio::test]
+async fn publishing_after_the_pull_request_was_retargeted_stops_with_a_clear_reason() {
+    let published = publish_picked("main", "").await;
+    let factory_server::Published::Stopped(reason) = published else {
+        panic!("expected a stop, got {published:?}");
+    };
+    assert!(
+        reason.contains("main") && reason.contains("develop"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_checkout_off_the_job_branch_is_sent_to_the_agent_and_never_merged_into() {
+    let tools = picked_tools("develop", "push) echo '! [rejected] moved' >&2; exit 1 ;;");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::write(tools.dir.path().join("on"), "other\n").unwrap();
+
+    let event = podman
+        .run_checks(
+            &Settings::default(),
+            factory_server::ChecksRequest {
+                job_id: 7,
+                base: "develop".into(),
+                existing: Some(12),
+                branch: "factory/job-7-pr-1".into(),
+                command: "true".into(),
+                packages: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(&event, Event::ChecksFailed { report } if report.contains("git checkout factory/job-7-pr-1")),
+        "{event:?}"
+    );
+
+    let published = publish_with(&tools, false).await;
+    assert!(
+        matches!(&published, factory_server::Published::Stopped(_)),
+        "{published:?}"
+    );
+    assert!(!tools.calls().contains("merge"), "{}", tools.calls());
+}
+
+async fn picked_agent_run(tools: &Tools, keep_checkout: bool, expect: Expect, prompt: &str) {
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work/.git")).unwrap();
+    std::fs::write(tools.dir.path().join("on"), "other\n").unwrap();
+    let mut podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    podman.base.podman = support::executable(
+        tools.dir.path(),
+        "podman",
+        &format!(
+            "#!/bin/bash\necho \"podman $*\" >> '{}'\nexit 1\n",
+            tools.dir.path().join("podman-calls").display()
+        ),
+    );
+    let mut run = request();
+    run.repo = "o/r".into();
+    run.base = "develop".into();
+    run.expect = expect;
+    run.prompt = prompt.into();
+    run.keep_checkout = keep_checkout;
+    run.branch = Some("factory/job-7-pr-1".into());
+    run.existing = Some(factory_server::ExistingPr {
+        number: 12,
+        head_branch: "carol/reboot".into(),
+        head_ref: "refs/pull/12/head".into(),
+    });
+    podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+}
+
+fn worker_started_with(tools: &Tools, prompt: &str) -> bool {
+    std::fs::read_to_string(tools.dir.path().join("podman-calls"))
+        .is_ok_and(|calls| calls.contains(prompt))
+}
+
+#[tokio::test]
+async fn the_repair_agent_starts_with_its_prompt_in_a_checkout_that_switching_branches_would_refuse()
+ {
+    let tools = picked_tools("develop", "checkout) echo 'would overwrite' >&2; exit 1 ;;");
+    picked_agent_run(&tools, true, Expect::Commits, "REPAIR-PROMPT").await;
+
+    assert!(!tools.calls().contains("checkout"), "{}", tools.calls());
+    assert!(worker_started_with(&tools, "REPAIR-PROMPT"));
+}
+
+#[tokio::test]
+async fn a_review_of_a_picked_pull_request_still_prepares_its_checkout() {
+    let tools = picked_tools("develop", "checkout) echo 'would overwrite' >&2; exit 1 ;;");
+    picked_agent_run(&tools, false, Expect::Review, "REVIEW-PROMPT").await;
+
+    assert!(tools.calls().contains("fetch"), "{}", tools.calls());
+    assert!(!worker_started_with(&tools, "REVIEW-PROMPT"));
 }
