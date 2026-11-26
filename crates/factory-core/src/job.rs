@@ -78,6 +78,11 @@ pub struct Job {
     /// [`JobKind::Request`].
     #[serde(default)]
     kind: JobKind,
+    /// Whether the factory pushed to the picked pull request's branch. The
+    /// publish approval stops the first push of a job on a picked pull
+    /// request, whose plan already holds its number.
+    #[serde(default)]
+    pushed: bool,
 }
 
 /// What a job works on.
@@ -98,6 +103,39 @@ pub enum JobKind {
     /// pass, made in its own pull request. `source_job` is the Renovate job
     /// and `source_pr` its pull request number. It runs like a request.
     Fix { source_job: i64, source_pr: u64 },
+    /// A job on a pull request the user picked in the new-request form. It
+    /// never opens a pull request and never merges one. See [`PickedPr`].
+    PullRequest(Box<PickedPr>),
+}
+
+/// The pull request a user picked in the new-request form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickedPr {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    /// The branch the pull request is made from.
+    pub head_branch: String,
+    /// The branch the pull request merges into.
+    pub base_branch: String,
+    /// Whether the head branch is in another repository than the project's.
+    #[serde(default)]
+    pub fork: bool,
+    #[serde(default)]
+    pub mode: PrMode,
+}
+
+/// What a job on a picked pull request does with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrMode {
+    /// Carry out a change request in the pull request's branch.
+    #[default]
+    Request,
+    /// Review the pull request once and report a score. `comment` posts the
+    /// review on the pull request.
+    QuickReview { comment: bool },
+    /// Run the review loop on the pull request from the first pass.
+    ReviewAndFix,
 }
 
 /// How many times the factory reruns failed CI on one head commit of a
@@ -940,6 +978,10 @@ pub enum Ask {
     },
     /// A gap job waits for the user to approve or dismiss it.
     Proposal,
+    /// The pull request of a job that never merges is ready: CI is green and
+    /// the reviewer has nothing left. The job waits for the user to merge it
+    /// on the forge, and keeps watching so it sees the merge or a close.
+    MergeLeftToUser,
     /// A Renovate job waits for the user. `reason` says why in words.
     Renovate {
         reason: String,
@@ -1250,6 +1292,9 @@ pub enum Event {
     /// The approval or the merge of a Renovate head failed. The job goes back
     /// to watching, so the next look sees the current head and state.
     MergeFailed,
+    /// CI is green on the pull request of a job that never merges, and the
+    /// reviewer has nothing left to say. See [`Job::may_merge`].
+    MergeLeftToUser,
     /// The pull request no longer merges cleanly into `base`.
     Conflicted {
         base: String,
@@ -1390,6 +1435,7 @@ impl Job {
             review_head: None,
             skipped: Vec::new(),
             kind: JobKind::Request,
+            pushed: false,
         }
     }
 
@@ -1422,6 +1468,15 @@ impl Job {
             source_job,
             source_pr,
         };
+        job
+    }
+
+    /// A job that carries out `request` on the pull request `picked`. It runs
+    /// like a request under `gates`, but its plan is the picked pull request.
+    #[must_use]
+    pub fn pull_request(request: impl Into<String>, gates: Gates, picked: PickedPr) -> Self {
+        let mut job = Job::new(request, gates);
+        job.kind = JobKind::PullRequest(Box::new(picked));
         job
     }
 
@@ -1462,8 +1517,27 @@ impl Job {
     pub fn renovate_pr(&self) -> Option<&RenovatePr> {
         match &self.kind {
             JobKind::Renovate(pr) => Some(&**pr),
-            JobKind::Request | JobKind::Gap { .. } | JobKind::Fix { .. } => None,
+            JobKind::Request
+            | JobKind::Gap { .. }
+            | JobKind::Fix { .. }
+            | JobKind::PullRequest(_) => None,
         }
+    }
+
+    /// The pull request the user picked, or `None` for any other job.
+    #[must_use]
+    pub fn picked_pr(&self) -> Option<&PickedPr> {
+        match &self.kind {
+            JobKind::PullRequest(picked) => Some(&**picked),
+            _ => None,
+        }
+    }
+
+    /// Whether the factory may merge the job's pull request. False for a job
+    /// on a picked pull request, which leaves the merge to the user.
+    #[must_use]
+    pub fn may_merge(&self) -> bool {
+        self.picked_pr().is_none()
     }
 
     /// The Renovate job and pull request number a gap job came from.
@@ -1592,6 +1666,13 @@ impl Job {
             // GitHub and fails when they close it, without merging or
             // restarting the reviewer on its own.
             (Turn::User(Ask::ReviewStopped { .. }), Stage::CiAndReview { pr }) => {
+                self.plan[*pr].number.map(|number| Command::WatchPr {
+                    pr: *pr,
+                    number,
+                    watch_only: true,
+                })
+            }
+            (Turn::User(Ask::MergeLeftToUser), Stage::CiAndReview { pr }) => {
                 self.plan[*pr].number.map(|number| Command::WatchPr {
                     pr: *pr,
                     number,
@@ -1757,15 +1838,7 @@ impl Job {
             }
 
             (S::Plan, Turn::Agent(_), E::Agent(AgentResult::Plan(plan))) => {
-                if plan.is_empty() {
-                    return Err(Rejected::EmptyPlan);
-                }
-                self.plan = plan;
-                if self.gates.plan {
-                    (S::Plan, Turn::User(Ask::PlanApproval))
-                } else {
-                    self.implement(0)
-                }
+                return self.record_plan(plan);
             }
             (S::Plan, Turn::User(Ask::PlanApproval), E::Approve) => self.implement(0),
 
@@ -1824,16 +1897,7 @@ impl Job {
             (S::Verifying { pr }, Turn::Factory, E::ChecksError { error }) => {
                 self.checks_error(*pr, &error)
             }
-            (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => {
-                if self.gates.publish && self.plan[*pr].number.is_none() {
-                    (
-                        S::Verifying { pr: *pr },
-                        Turn::User(Ask::PublishApproval { summary: None }),
-                    )
-                } else {
-                    (S::PrOpen { pr: *pr }, Turn::Factory)
-                }
-            }
+            (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => self.after_checks(*pr),
             (
                 S::Verifying { pr },
                 Turn::User(Ask::PublishApproval { summary: None }),
@@ -1863,6 +1927,7 @@ impl Job {
             (S::PrOpen { pr }, Turn::Factory, E::Published { number }) => {
                 let pr = *pr;
                 self.plan[pr].number = Some(number);
+                self.pushed = true;
                 self.review = ReviewState::Pending;
                 (S::CiAndReview { pr }, Turn::Factory)
             }
@@ -1872,6 +1937,9 @@ impl Job {
             }
             (S::CiAndReview { pr }, Turn::Factory, E::CiFailed { log }) => {
                 self.fail_round(S::CiAndReview { pr: *pr }, Turn::Agent(Task::FixCi { log }))
+            }
+            (S::CiAndReview { pr }, Turn::Factory, E::MergeLeftToUser) if !self.may_merge() => {
+                (S::CiAndReview { pr: *pr }, Turn::User(Ask::MergeLeftToUser))
             }
             (S::CiAndReview { pr }, Turn::Factory, E::Conflicted { base }) => self.fail_round(
                 S::CiAndReview { pr: *pr },
@@ -2099,7 +2167,10 @@ impl Job {
     fn renovate_mut(&mut self) -> Option<&mut RenovatePr> {
         match &mut self.kind {
             JobKind::Renovate(pr) => Some(&mut **pr),
-            JobKind::Request | JobKind::Gap { .. } | JobKind::Fix { .. } => None,
+            JobKind::Request
+            | JobKind::Gap { .. }
+            | JobKind::Fix { .. }
+            | JobKind::PullRequest(_) => None,
         }
     }
 
@@ -2147,6 +2218,63 @@ impl Job {
                 Turn::Done,
             ),
         }
+    }
+
+    fn record_plan(&mut self, plan: Vec<PlannedPr>) -> Result<(Stage, Turn), Rejected> {
+        if plan.is_empty() {
+            return Err(Rejected::EmptyPlan);
+        }
+        self.plan = match self.picked_pr() {
+            Some(picked) => vec![Self::one_pr(plan, picked.number)],
+            None => plan,
+        };
+        Ok(if self.gates.plan {
+            (Stage::Plan, Turn::User(Ask::PlanApproval))
+        } else {
+            self.implement(0)
+        })
+    }
+
+    /// Where the job goes once the checks pass on planned pull request `pr`.
+    fn after_checks(&self, pr: usize) -> (Stage, Turn) {
+        if self.gates.publish && (self.plan[pr].number.is_none() || self.held_back()) {
+            (
+                Stage::Verifying { pr },
+                Turn::User(Ask::PublishApproval { summary: None }),
+            )
+        } else {
+            (Stage::PrOpen { pr }, Turn::Factory)
+        }
+    }
+
+    /// Folds the planned pull requests into the one the job has, numbered
+    /// `number`. The agent plans as if it opened new pull requests, and the
+    /// picked one takes all of the work, so a plan with several is joined
+    /// instead of rejected, which would fail a job for a planning detail.
+    fn one_pr(plan: Vec<PlannedPr>, number: u64) -> PlannedPr {
+        let mut plan = plan.into_iter();
+        let mut one = plan.next().unwrap_or_else(|| PlannedPr {
+            title: String::new(),
+            summary: String::new(),
+            number: None,
+            description: None,
+            notes: None,
+        });
+        for next in plan {
+            one.summary = format!("{}\n\n{}", one.summary, next.summary);
+            one.notes = match (one.notes, next.notes) {
+                (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+                (a, b) => a.or(b),
+            };
+        }
+        one.number = Some(number);
+        one
+    }
+
+    /// Whether the job holds a picked pull request it has not pushed to yet,
+    /// so the publish approval applies although the plan has its number.
+    fn held_back(&self) -> bool {
+        self.picked_pr().is_some() && !self.pushed
     }
 
     fn after(&self, pr: usize) -> (Stage, Turn) {

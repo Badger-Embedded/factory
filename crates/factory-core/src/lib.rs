@@ -14,9 +14,9 @@ pub use agent::{Agent, Cli, DEFAULT_AGENT, UnknownAgent};
 pub use job::{
     AgentResult, Answered, Ask, BranchSummary, Command, CommentKind, DELETED_PREREQUISITE,
     DiffVerdict, Event, ExistingGap, FileText, FixLink, FixOutcome, FixState, Gap, Gates, Job,
-    JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PackagingContext, PlannedPr, PrDescription,
-    PrDiff, PrerequisiteState, Question, RebaseState, Rejected, RenovateAccess, RenovateCi,
-    RenovatePr, RenovateVerdict, RenovateWait, RetryLimits, RetryTarget, ReviewPass, ReviewState,
-    ReviewStop, Session, Stage, Task, Turn, Verdict, Wait,
+    JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PackagingContext, PickedPr, PlannedPr,
+    PrDescription, PrDiff, PrMode, PrerequisiteState, Question, RebaseState, Rejected,
+    RenovateAccess, RenovateCi, RenovatePr, RenovateVerdict, RenovateWait, RetryLimits,
+    RetryTarget, ReviewPass, ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict, Wait,
 };
 pub use usage::{ParseError, PlanUsage, PlanUsageSnapshot, UsageWindow};
