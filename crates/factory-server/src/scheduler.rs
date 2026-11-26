@@ -83,19 +83,18 @@ impl JobRefs {
 fn job_refs(job_id: i64, job: &Job, project: &Project, pr: usize) -> JobRefs {
     let branch = branch_name(job_id, pr);
     match job.picked_pr() {
-        Some(picked) if job.stacked_on().is_some() => JobRefs {
-            remote_branch: branch.clone(),
-            branch,
-            // A fork's branch is not ours to target, so its stack goes to the
-            // base branch and carries the fork's commits.
-            base: if picked.fork {
-                picked.base_branch.clone()
-            } else {
-                picked.head_branch.clone()
-            },
-            picked: Some(picked.number),
-            stacked: true,
-        },
+        Some(picked) if job.stacked_on().is_some() => {
+            // The reviewed pull request only seeds the branch. Once the stack
+            // is open, its checkout and reads come from the stack itself.
+            let opened = job.plan().get(pr).and_then(|planned| planned.number);
+            JobRefs {
+                remote_branch: branch.clone(),
+                branch,
+                base: job.stacked_base().unwrap_or(&picked.base_branch).to_owned(),
+                picked: Some(opened.unwrap_or(picked.number)),
+                stacked: opened.is_none(),
+            }
+        }
         Some(picked) => JobRefs {
             branch,
             remote_branch: picked.head_branch.clone(),
@@ -2016,7 +2015,7 @@ impl<E: Executor> Scheduler<E> {
             .flatten();
         let description = match (job.plan()[pr].description.clone(), &existing) {
             (Some(mut description), _) => {
-                if let Some(reviewed) = job.stacked_on() {
+                if let (Some(reviewed), None) = (job.stacked_on(), &existing) {
                     description.body = format!(
                         "{}\n\nFixes review of {}",
                         description.body.trim_end(),

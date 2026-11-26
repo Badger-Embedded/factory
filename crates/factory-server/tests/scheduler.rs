@@ -9363,7 +9363,14 @@ async fn fixing_a_quick_review_loops_never_merges_and_stops_at_the_round_cap() {
     );
 }
 
-async fn stacked_publish(fork: bool) -> (i64, Arc<FakeExecutor>, Arc<Store>) {
+async fn stacked_publish(
+    fork: bool,
+) -> (
+    i64,
+    Arc<FakeExecutor>,
+    Arc<Store>,
+    Arc<Scheduler<FakeExecutor>>,
+) {
     let (store, executor, scheduler) = review_setup();
     store.save_project_settings("maestro", true, false).unwrap();
     let mut pick = picked(12);
@@ -9386,12 +9393,12 @@ async fn stacked_publish(fork: bool) -> (i64, Arc<FakeExecutor>, Arc<Store>) {
     step(&scheduler).await; // fix
     step(&scheduler).await; // checks
     step(&scheduler).await; // publish
-    (id, executor, store)
+    (id, executor, store, scheduler)
 }
 
 #[tokio::test]
 async fn fixing_elsewhere_stacks_a_pull_request_on_the_reviewed_branch() {
-    let (id, executor, store) = stacked_publish(false).await;
+    let (id, executor, store, _) = stacked_publish(false).await;
 
     let requests = executor.requests();
     assert!(requests[1].prompt.contains("Keep it small."));
@@ -9429,10 +9436,49 @@ async fn fixing_elsewhere_stacks_a_pull_request_on_the_reviewed_branch() {
 
 #[tokio::test]
 async fn fixing_elsewhere_on_a_fork_targets_the_reviewed_base_branch() {
-    let (_, executor, _) = stacked_publish(true).await;
+    let (_, executor, _, _) = stacked_publish(true).await;
 
     assert_eq!(executor.requests()[1].base, "develop");
     let published = executor.published.lock().unwrap().clone();
     assert!(published[0].existing.is_none());
     assert_eq!(published[0].base, "develop");
+}
+
+async fn stacked_review(fork: bool) -> (i64, AgentRequest) {
+    let (id, executor, _, scheduler) = stacked_publish(fork).await;
+    *executor.checkout_head.lock().unwrap() = Some("h2".into());
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::StartReview { head: "h2".into() }),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+    step(&scheduler).await; // watch
+    executor.release(1);
+    step(&scheduler).await; // reviewer
+    let request = executor
+        .requests()
+        .into_iter()
+        .find(|request| request.expect == Expect::Review)
+        .expect("a review pass ran");
+    (id, request)
+}
+
+#[tokio::test]
+async fn the_review_of_a_stack_reads_the_stack_not_the_reviewed_pull_request() {
+    let (id, request) = stacked_review(false).await;
+
+    assert_eq!(request.existing.as_ref().unwrap().number, 77);
+    assert_eq!(request.base, "carol/reboot");
+    assert_eq!(
+        request.branch.as_deref(),
+        Some(format!("factory/job-{id}-pr-1").as_str())
+    );
+}
+
+#[tokio::test]
+async fn the_review_of_a_fork_stack_reads_the_stack_against_the_base_branch() {
+    let (_, request) = stacked_review(true).await;
+
+    assert_eq!(request.existing.as_ref().unwrap().number, 77);
+    assert_eq!(request.base, "develop");
 }

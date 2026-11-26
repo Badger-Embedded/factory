@@ -1678,6 +1678,20 @@ impl Job {
         self.picked_pr().filter(|_| self.stacked)
     }
 
+    /// The branch the stacked pull request targets: the reviewed pull
+    /// request's branch, or its base branch for a fork, whose branch is not
+    /// ours to target.
+    #[must_use]
+    pub fn stacked_base(&self) -> Option<&str> {
+        self.stacked_on().map(|picked| {
+            if picked.fork {
+                picked.base_branch.as_str()
+            } else {
+                picked.head_branch.as_str()
+            }
+        })
+    }
+
     /// Whether the job only reads its picked pull request: a quick review the
     /// user has not chosen to fix. It never pushes to or merges the pull
     /// request, so it holds nothing.

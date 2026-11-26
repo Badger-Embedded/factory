@@ -396,15 +396,35 @@ struct PickedContext<'a> {
 
 impl<'a> ReviewContext<'a> {
     fn for_job(job: &'a Job) -> Self {
-        let pr = job
-            .picked_pr()
-            .filter(|picked| !matches!(picked.mode, PrMode::Request))
-            .map(|picked| PickedContext {
-                title: &picked.title,
-                body: &picked.body,
-                base: &picked.base_branch,
+        let stack = job
+            .stacked_base()
+            .zip(job.plan().first())
+            .filter(|(_, planned)| planned.number.is_some());
+        let pr = match stack {
+            // Once the stack is open, the reviewer reads it, not the pull
+            // request it fixes.
+            Some((base, planned)) => Some(PickedContext {
+                title: planned
+                    .description
+                    .as_ref()
+                    .map_or(&planned.title, |description| &description.title),
+                body: planned
+                    .description
+                    .as_ref()
+                    .map_or(&planned.summary, |description| &description.body),
+                base,
                 focus: "",
-            });
+            }),
+            None => job
+                .picked_pr()
+                .filter(|picked| !matches!(picked.mode, PrMode::Request))
+                .map(|picked| PickedContext {
+                    title: &picked.title,
+                    body: &picked.body,
+                    base: &picked.base_branch,
+                    focus: "",
+                }),
+        };
         let mut context = Self::for_stage(job);
         if let Some(mut pr) = pr {
             if context.previous.is_none() && context.new_answers.is_empty() {
