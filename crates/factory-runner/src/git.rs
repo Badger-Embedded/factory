@@ -299,6 +299,19 @@ impl Git {
         Ok(out.trim().to_owned())
     }
 
+    /// The commit that `refs/heads/<branch>` points at, which is what a push of
+    /// the branch transfers.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when it fails.
+    pub async fn branch_tip(&self, work: &Path, branch: &str) -> Result<String, String> {
+        let out = self
+            .run(work, &["rev-parse", &format!("refs/heads/{branch}")], None)
+            .await?;
+        Ok(out.trim().to_owned())
+    }
+
     async fn merge_leaving_conflicts(&self, work: &Path, target: &str) -> Result<bool, String> {
         match self.run(work, &["merge", "--no-edit", target], None).await {
             Ok(_) => Ok(true),

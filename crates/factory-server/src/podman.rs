@@ -321,6 +321,18 @@ impl PodmanExecutor {
         Ok(())
     }
 
+    /// `HEAD` and the tip of `branch`. A push transfers the tip, so the checks
+    /// vouch for it only when `HEAD` is the same commit.
+    async fn checkout_tips(
+        &self,
+        workspace: &Path,
+        branch: &str,
+    ) -> Result<(String, String), String> {
+        let head = self.git.head(workspace).await?;
+        let tip = self.git.branch_tip(workspace, branch).await?;
+        Ok((head, tip))
+    }
+
     /// Pushes the branch's new commits to the picked pull request's own branch
     /// without force, and touches nothing else on the pull request: no title,
     /// no description, no merge. A push that the remote refuses because
@@ -360,13 +372,13 @@ impl PodmanExecutor {
             }
         }
         let workspace = self.job_dir(request.job_id).join("work");
+        if workspace.join(".git/MERGE_HEAD").exists() {
+            return Ok(Published::HeadMoved { conflicted: true });
+        }
         if request.checks {
-            if workspace.join(".git/MERGE_HEAD").exists() {
-                return Ok(Published::HeadMoved { conflicted: true });
-            }
             let checked = fs::read_to_string(self.checked_marker(request.job_id)).ok();
-            let head = self.git.head(&workspace).await?;
-            if checked.is_none_or(|saved| saved.trim() != head) {
+            let tip = self.git.branch_tip(&workspace, &request.branch).await?;
+            if checked.is_none_or(|saved| saved.trim() != tip) {
                 return Ok(Published::HeadMoved { conflicted: false });
             }
         }
@@ -688,6 +700,13 @@ impl Executor for PodmanExecutor {
                 ),
             });
         }
+        let tested = self.checkout_tips(&workspace, &request.branch).await?;
+        if tested.0 != tested.1 {
+            return Err(format!(
+                "the checkout is at {}, not at the tip {} of {}",
+                tested.0, tested.1, request.branch
+            ));
+        }
         let event = run_checks(
             &config,
             &name,
@@ -697,8 +716,14 @@ impl Executor for PodmanExecutor {
         )
         .await?;
         if matches!(event, Event::ChecksPassed) {
-            let head = self.git.head(&workspace).await?;
-            fs::write(self.checked_marker(request.job_id), head)
+            if self.checkout_tips(&workspace, &request.branch).await? != tested {
+                return Ok(Event::ChecksFailed {
+                    report: "The checks moved HEAD or the job branch. Run them without \
+                             changing the checkout."
+                        .into(),
+                });
+            }
+            fs::write(self.checked_marker(request.job_id), &tested.1)
                 .map_err(|err| format!("saving the checked commit: {err}"))?;
         }
         Ok(event)

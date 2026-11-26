@@ -234,6 +234,8 @@ pub struct ChecksRequest {
     /// The picked pull request the branch starts from. The commits it already
     /// holds are not the factory's to check.
     pub existing: Option<u64>,
+    /// The branch of the checkout, which a publish pushes.
+    pub branch: String,
     /// The project's `checks` command.
     pub command: String,
     /// The project's worker packages, read on every run.
@@ -1833,7 +1835,7 @@ impl<E: Executor> Scheduler<E> {
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
         let refs = job_refs(job_id, job, project, pr);
-        let (base, existing) = (refs.base, refs.picked);
+        let (base, existing, branch) = (refs.base, refs.picked, refs.branch);
         let packages = self.store.project_packages(&row.project)?;
         self.spawn(job_id, Kind::Worker, async move {
             scheduler.note(job_id, &format!("Running the checks: {command}"));
@@ -1845,6 +1847,7 @@ impl<E: Executor> Scheduler<E> {
                         job_id,
                         base,
                         existing,
+                        branch,
                         command,
                         packages,
                     },

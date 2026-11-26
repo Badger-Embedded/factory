@@ -1829,11 +1829,12 @@ fn picked_tools(forge_base: &str, git_arms: &str) -> Tools {
              case \"$1\" in\n\
              clone) mkdir -p \"${{@: -1}}/.git\" ;;\n\
              log) echo 'abc1234 one' ;;\n\
-             rev-parse) echo abc123 ;;\n\
+             rev-parse) case \"$2\" in refs/heads/*) cat '{tip}' 2>/dev/null || echo abc123 ;; *) echo abc123 ;; esac ;;\n\
              config) case \"$*\" in *--get-regexp*) exit 1 ;; esac ;;\n\
              {git_arms}\n\
              esac\n",
-            calls = tools.dir.path().join("calls").display()
+            calls = tools.dir.path().join("calls").display(),
+            tip = tools.dir.path().join("tip").display()
         ),
     );
     std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
@@ -1908,15 +1909,35 @@ async fn a_commit_the_checks_have_not_passed_on_is_never_pushed_after_a_restart(
 
 #[tokio::test]
 async fn a_restart_during_a_conflicted_merge_hands_it_to_the_agent_without_pushing() {
+    for checks in [true, false] {
+        let tools = picked_tools("develop", "");
+        let job = tools.dir.path().join("data/jobs/7");
+        std::fs::write(job.join("checked-head"), "abc123").unwrap();
+        std::fs::create_dir_all(job.join("work/.git")).unwrap();
+        std::fs::write(job.join("work/.git/MERGE_HEAD"), "def").unwrap();
+
+        assert!(
+            matches!(
+                publish_with(&tools, checks).await,
+                factory_server::Published::HeadMoved { conflicted: true }
+            ),
+            "checks {checks}"
+        );
+        assert_eq!(pushes(&tools), 0);
+    }
+}
+
+#[tokio::test]
+async fn the_commit_the_checks_passed_on_must_be_the_branch_tip_that_is_pushed() {
     let tools = picked_tools("develop", "");
     let job = tools.dir.path().join("data/jobs/7");
+    // HEAD is abc123 and the checks passed on it, but the branch moved on.
     std::fs::write(job.join("checked-head"), "abc123").unwrap();
-    std::fs::create_dir_all(job.join("work/.git")).unwrap();
-    std::fs::write(job.join("work/.git/MERGE_HEAD"), "def").unwrap();
+    std::fs::write(tools.dir.path().join("tip"), "def456\n").unwrap();
 
     assert!(matches!(
         publish_with(&tools, true).await,
-        factory_server::Published::HeadMoved { conflicted: true }
+        factory_server::Published::HeadMoved { conflicted: false }
     ));
     assert_eq!(pushes(&tools), 0);
 }
