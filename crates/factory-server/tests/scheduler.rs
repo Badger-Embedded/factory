@@ -9498,10 +9498,33 @@ async fn the_review_of_a_fork_stack_reads_the_stack_against_the_base_branch() {
 #[tokio::test]
 async fn a_conflict_on_a_published_stack_rebases_and_pushes_it_like_any_branch() {
     let (id, executor, store, scheduler) = stacked_publish(false).await;
+    let rebase = conflict_on_stack(id, &executor, &store, &scheduler, "carol/reboot").await;
+    assert!(!rebase.merge_base);
+    assert!(
+        rebase.prompt.contains("Rebase the branch"),
+        "{}",
+        rebase.prompt
+    );
+}
+
+#[tokio::test]
+async fn a_conflict_on_a_fork_stack_merges_the_base_so_the_forks_commits_stay() {
+    let (id, executor, store, scheduler) = stacked_publish(true).await;
+    let rebase = conflict_on_stack(id, &executor, &store, &scheduler, "develop").await;
+    assert!(rebase.merge_base);
+    assert!(rebase.prompt.contains("Do not rebase"), "{}", rebase.prompt);
+}
+
+async fn conflict_on_stack(
+    id: i64,
+    executor: &Arc<FakeExecutor>,
+    store: &Arc<Store>,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+    base: &str,
+) -> AgentRequest {
+    let scheduler = scheduler.clone();
     executor.watches.lock().unwrap().push_back(Ok(WatchReport {
-        event: Some(Event::Conflicted {
-            base: "carol/reboot".into(),
-        }),
+        event: Some(Event::Conflicted { base: base.into() }),
         seen_until: None,
         merged_by_factory: false,
     }));
@@ -9516,10 +9539,9 @@ async fn a_conflict_on_a_published_stack_rebases_and_pushes_it_like_any_branch()
         .into_iter()
         .rfind(|request| request.prompt.contains("rebase"))
         .expect("a rebase run");
-    assert!(!rebase.merge_base);
     assert_eq!(rebase.existing.as_ref().unwrap().number, 77);
     assert!(
-        rebase.prompt.contains("origin/carol/reboot"),
+        rebase.prompt.contains(&format!("origin/{base}")),
         "{}",
         rebase.prompt
     );
@@ -9527,9 +9549,10 @@ async fn a_conflict_on_a_published_stack_rebases_and_pushes_it_like_any_branch()
     assert_eq!(published.len(), 2);
     assert!(published[1].existing.is_none());
     assert_eq!(published[1].branch, format!("factory/job-{id}-pr-1"));
-    assert_eq!(published[1].base, "carol/reboot");
+    assert_eq!(published[1].base, base);
     assert_eq!(
         store.get(id).unwrap().job.stage(),
         &Stage::CiAndReview { pr: 0 }
     );
+    rebase
 }

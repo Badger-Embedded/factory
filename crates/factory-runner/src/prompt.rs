@@ -640,6 +640,13 @@ fn job_body(job: &Job, task: &Task, expect: Expect, agent: PromptTarget) -> Stri
         agent,
         job.picked_pr().is_some() && job.stacked_on().is_none(),
     );
+    // A fork's stack carries the fork author's commits, so a conflict is
+    // merged, never rebased.
+    if let (Some(picked), Task::Rebase { base }) = (job.stacked_on(), task)
+        && picked.fork
+    {
+        body = rebase_prompt(base, true);
+    }
     if let (Some(reviewed), Task::AddressReview { .. }) = (job.stacked_on(), task) {
         body = format!(
             "This branch starts at the head of pull request #{} ({}). Your commits go in a \

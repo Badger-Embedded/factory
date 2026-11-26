@@ -1637,7 +1637,7 @@ impl<E: Executor> Scheduler<E> {
                 .then(|| refs.existing(&resolved.forge))
                 .flatten(),
             merge_base: refs.picked.is_some()
-                && !refs.stacked
+                && (!refs.stacked || job.stacked_on().is_some_and(|picked| picked.fork))
                 && matches!(task, factory_core::Task::Rebase { .. }),
             keep_checkout: refs.picked.is_some()
                 && (matches!(task, factory_core::Task::FixChecks { report } if report.starts_with(factory_core::CHECKOUT_REPAIR))
