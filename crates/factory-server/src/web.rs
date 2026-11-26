@@ -149,7 +149,8 @@ pub fn app(
 /// `local_probe`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the dashboard wires each long-lived dependency the handlers share"
+    clippy::too_many_lines,
+    reason = "the dashboard wires each long-lived dependency and route the handlers share"
 )]
 pub fn app_with_forgejo_probe(
     store: Arc<Store>,
@@ -203,6 +204,7 @@ pub fn app_with_forgejo_probe(
             "/jobs",
             post(create_job).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
+        .route("/projects/{project}/pulls", get(search_pulls))
         .route("/jobs/{id}", get(show_job))
         .route(
             "/jobs/{id}/edit",
@@ -1050,16 +1052,7 @@ async fn read_picked_pr(
     login: &str,
     number: u64,
 ) -> Result<PickedPr, AppError> {
-    let accounts = Accounts::new(
-        Arc::clone(&state.store),
-        Arc::clone(&state.secrets),
-        state.forges.clone(),
-    );
-    let resolved = match accounts.resolve(name, project, login) {
-        Ok(resolved) => resolved,
-        Err(ResolveError::Store(err)) => return Err(err.into()),
-        Err(ResolveError::Account(why)) => return Err(AppError::BadRequest(why)),
-    };
+    let resolved = resolve_forge(state, name, project, login)?;
     let found = state
         .forges
         .forge(&resolved.forge)
@@ -1100,6 +1093,67 @@ async fn read_picked_pr(
         fork: pr.fork,
         mode: PrMode::Request,
     })
+}
+
+/// The forge and account `login` uses on `project`. A token that cannot be
+/// used comes back as [`AppError::BadRequest`] with the reason.
+fn resolve_forge(
+    state: &AppState,
+    name: &str,
+    project: &Project,
+    login: &str,
+) -> Result<crate::accounts::Resolved, AppError> {
+    let accounts = Accounts::new(
+        Arc::clone(&state.store),
+        Arc::clone(&state.secrets),
+        state.forges.clone(),
+    );
+    match accounts.resolve(name, project, login) {
+        Ok(resolved) => Ok(resolved),
+        Err(ResolveError::Store(err)) => Err(err.into()),
+        Err(ResolveError::Account(why)) => Err(AppError::BadRequest(why)),
+    }
+}
+
+#[derive(Deserialize)]
+struct PullSearch {
+    #[serde(default)]
+    q: String,
+}
+
+/// The rows of the new-request form's pull request picker: at most
+/// [`pages::PR_ROWS`] open pull requests of the project that match `q`, from
+/// one request to the forge. A forge or token failure comes back as a message
+/// row, so the rest of the form keeps working.
+async fn search_pulls(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Query(search): Query<PullSearch>,
+) -> Result<Markup, AppError> {
+    let found = visible_project(&state, &headers, &project)?;
+    let login = user(&headers);
+    let resolved = match resolve_forge(&state, &project, &found, &login) {
+        Ok(resolved) => resolved,
+        Err(AppError::BadRequest(why)) => return Ok(pages::pr_results_error(&why)),
+        Err(err) => return Err(err),
+    };
+    let found = state
+        .forges
+        .forge(&resolved.forge)
+        .search_open_prs(&resolved.account, &found.repo, &search.q)
+        .await;
+    let prs = match blame(&resolved.owner, found) {
+        Ok(prs) => prs,
+        Err(why) => return Ok(pages::pr_results_error(&why)),
+    };
+    let more = prs.len() > pages::PR_ROWS;
+    let mut choices = Vec::new();
+    for pr in prs.into_iter().take(pages::PR_ROWS) {
+        let held_by = state.store.holding_job(&project, pr.number)?;
+        choices.push(pages::PrChoice { pr, held_by });
+    }
+    Ok(pages::pr_results(&choices, more))
 }
 
 async fn create_job(

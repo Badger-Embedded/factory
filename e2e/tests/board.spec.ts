@@ -14,8 +14,19 @@
 //   survives: "a job created after page load appears and keeps the typed request"
 // - An opened "Show N older" disclosure stays open across a poll:
 //   "an opened Show older disclosure stays open across a poll"
+// - The new-request form's pull request picker, under "pull request picker":
+//   searching, badges, keyboard, picking, Remove, polls, blocked picks, errors
 import type { Page } from '@playwright/test';
-import { ADMIN, COLLABORATOR, OUTSIDER, SHARED_PROJECT, chooseProject, expect, test } from '../fixtures';
+import {
+  ADMIN,
+  COLLABORATOR,
+  OUTSIDER,
+  SHARED_PROJECT,
+  chooseProject,
+  expect,
+  test,
+  type Factory,
+} from '../fixtures';
 
 // A 1x1 PNG, so the server's byte check accepts it as an image.
 const PNG_BASE64 =
@@ -250,6 +261,227 @@ test('a job created after page load appears and keeps the typed request', async 
 
   await expect(page.getByRole('link', { name: 'Created behind the page' })).toBeVisible();
   await expect(request).toHaveValue('A half-typed request');
+});
+
+test.describe('pull request picker', () => {
+  let counter = 0;
+
+  // A project on a fake forge repository named like `repo`, with a project token
+  // so the factory can search it. `prs` has a normal, a fork, a draft, a Renovate
+  // and a release pull request, `many` has 21 and `broken` fails every search.
+  async function pullProject(page: Page, factory: Factory, repo: string, workerIndex: number) {
+    const name = `${repo}-${workerIndex}-${counter++}`;
+    factory.fixture('project', '--name', name, '--login', ADMIN, '--repo', `e2e/${name}`);
+    await page.goto(`/settings/projects/${name}`);
+    await page.locator('#forge-account').getByLabel('Project token').fill('tok-e2e-alice');
+    await page.getByRole('button', { name: 'Save project token' }).click();
+    await expect(page.getByText('Saved. The project token belongs to alice-bot.')).toBeVisible();
+    return name;
+  }
+
+  const search = (page: Page) => page.getByRole('combobox', { name: 'Pull request' });
+  const rows = (page: Page) => page.locator('#pr-results li[role="option"]');
+
+  async function openPicker(page: Page, name: string) {
+    await page.goto(`/?project=${name}`);
+    await page.locator('#request').click();
+    await search(page).click();
+  }
+
+  test('an empty query lists the latest pull requests with their badges', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    const held = factory.fixture(
+      'renovate', '--project', name, '--number', '104', '--url', `https://github.com/e2e/${name}/pull/104`,
+    );
+    await openPicker(page, name);
+
+    await expect(rows(page)).toHaveCount(5);
+    await expect(rows(page).nth(0)).toContainText('#101');
+    await expect(rows(page).nth(0)).toContainText('Add dark mode');
+    await expect(rows(page).nth(0)).toContainText('carol');
+    await expect(rows(page).nth(0)).toContainText('carol/dark → main');
+    await expect(rows(page).nth(1).locator('.badge')).toHaveText('fork');
+    await expect(rows(page).nth(2).locator('.badge')).toHaveText('draft');
+    await expect(rows(page).nth(3).locator('.badge')).toHaveText(`job #${held}`);
+    await expect(rows(page).nth(4)).toContainText('release → next');
+    await expect(rows(page).nth(0).locator('.badge')).toHaveCount(0);
+    await expect(page.locator('#pr-results .pr-note')).toHaveCount(0);
+  });
+
+  test('a title, a number and a number with a hash find pull requests', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await expect(rows(page)).toHaveCount(5);
+
+    await search(page).fill('typo readme');
+    await expect(rows(page)).toHaveCount(1);
+    await expect(rows(page).first()).toContainText('#102');
+
+    for (const query of ['103', '#103']) {
+      await search(page).fill(query);
+      await expect(rows(page)).toHaveCount(1);
+      await expect(rows(page).first()).toContainText('Rework the parser');
+    }
+
+    await search(page).fill('nothing like this');
+    await expect(rows(page)).toHaveCount(0);
+    await expect(page.locator('#pr-results .pr-note')).toHaveText('No pull request matches.');
+    await search(page).fill('#999');
+    await expect(page.locator('#pr-results .pr-note')).toHaveText('No pull request matches.');
+  });
+
+  test('more than twenty matches show twenty rows and ask to refine the search', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'many', testInfo.workerIndex);
+    await openPicker(page, name);
+
+    await expect(rows(page)).toHaveCount(20);
+    await expect(page.locator('#pr-results .pr-note')).toHaveText('Refine the search to see more.');
+    await search(page).fill('request 21');
+    await expect(rows(page)).toHaveCount(1);
+    await expect(page.locator('#pr-results .pr-note')).toHaveCount(0);
+  });
+
+  test('typing sends one search after the pause and not one per key', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    const queries: string[] = [];
+    page.on('request', (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === `/projects/${name}/pulls`) queries.push(url.searchParams.get('q') ?? '');
+    });
+    await openPicker(page, name);
+    await expect(rows(page)).toHaveCount(5);
+    await search(page).pressSequentially('dark', { delay: 30 });
+    await expect(rows(page)).toHaveCount(1);
+    await page.waitForTimeout(500);
+    expect(queries).toEqual(['', 'dark']);
+  });
+
+  test('the keyboard picks a pull request, Enter does not submit and Escape closes the list', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await expect(rows(page)).toHaveCount(5);
+    await expect(search(page)).toHaveAttribute('aria-expanded', 'true');
+
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#pr-results')).toBeHidden();
+    await expect(search(page)).toHaveAttribute('aria-expanded', 'false');
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('#pr-results')).toBeVisible();
+
+    await page.keyboard.press('ArrowDown');
+    await expect(rows(page).nth(1)).toHaveClass(/active/);
+    await expect(search(page)).toHaveAttribute('aria-activedescendant', 'pr-option-102');
+    await page.keyboard.press('ArrowUp');
+    await expect(rows(page).nth(0)).toHaveClass(/active/);
+    await page.keyboard.press('Enter');
+
+    await expect(page).toHaveURL(new RegExp(`/\\?project=${name}$`));
+    await expect(page.locator('.pr-picked')).toContainText('#101 Add dark mode');
+    await expect(page.locator('input[name="pr"]')).toHaveValue('101');
+    await expect(page.locator('#pr-results')).toBeHidden();
+  });
+
+  test('a picked pull request links to the forge in a new tab, and Remove clears the pick', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await rows(page).first().click();
+
+    const link = page.locator('.pr-picked a.picked-pr');
+    await expect(link).toHaveAttribute('href', `https://github.com/e2e/${name}/pull/101`);
+    await expect(link).toHaveAttribute('target', '_blank');
+    await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(page.getByRole('button', { name: 'Request' })).toBeEnabled();
+
+    await page.getByRole('button', { name: 'Remove' }).click();
+    await expect(page.locator('.pr-picked')).toBeHidden();
+    await expect(page.locator('input[name="pr"]')).toHaveValue('');
+    await expect(search(page)).toBeVisible();
+    await expect(search(page)).toBeFocused();
+  });
+
+  test('a pick, a query and the typed text survive a board poll', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await search(page).fill('typo');
+    await expect(rows(page)).toHaveCount(1);
+    await page.locator('#request').fill('Half typed');
+
+    factory.fixture('job', '--project', name, '--stage', 'questions', '--request', 'Created behind the picker');
+    await expect(page.getByRole('link', { name: 'Created behind the picker' })).toBeVisible();
+    await expect(search(page)).toHaveValue('typo');
+    await expect(page.locator('#request')).toHaveValue('Half typed');
+
+    await rows(page).first().click();
+    factory.fixture('job', '--project', name, '--stage', 'questions', '--request', 'Created behind the pick');
+    await expect(page.getByRole('link', { name: 'Created behind the pick' })).toBeVisible();
+    await expect(page.locator('.pr-picked')).toContainText('#102');
+    await expect(page.locator('input[name="pr"]')).toHaveValue('102');
+    await expect(page.locator('#request')).toHaveValue('Half typed');
+  });
+
+  test('Request is disabled for a fork pull request and for one a job holds', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    const held = factory.fixture(
+      'renovate', '--project', name, '--number', '104', '--url', `https://github.com/e2e/${name}/pull/104`,
+    );
+    await openPicker(page, name);
+    const request = page.getByRole('button', { name: 'Request' });
+
+    await rows(page).nth(1).click();
+    await expect(request).toBeDisabled();
+    await expect(page.locator('.pr-hint')).toContainText("cannot push to a fork's branch");
+
+    await page.getByRole('button', { name: 'Remove' }).click();
+    await expect(request).toBeEnabled();
+    await search(page).click();
+    await rows(page).nth(3).click();
+    await expect(request).toBeDisabled();
+    await expect(page.locator('.pr-hint a')).toHaveAttribute('href', `/jobs/${held}`);
+
+    await page.getByRole('button', { name: 'Remove' }).click();
+    await search(page).click();
+    await rows(page).nth(2).click();
+    await expect(request).toBeEnabled();
+  });
+
+  test('a request on a picked pull request creates a job that links the pull request', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await rows(page).first().click();
+    await page.locator('#request').fill('Handle the empty case');
+    await page.getByRole('button', { name: 'Request' }).click();
+
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+    const link = page.locator('a.picked-pr');
+    await expect(link).toHaveAttribute('href', `https://github.com/e2e/${name}/pull/101`);
+    await expect(link).toHaveAttribute('target', '_blank');
+    await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+
+    await page.goto(`/?project=${name}`);
+    await expect(page.locator('li.job a.picked-pr')).toHaveText('#101');
+    await expect(page.locator('li.job a.picked-pr')).toHaveAttribute('target', '_blank');
+  });
+
+  test('a forge error shows in the picker and the form keeps working', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'broken', testInfo.workerIndex);
+    await openPicker(page, name);
+
+    await expect(page.locator('#pr-results .pr-error')).toContainText('Could not search pull requests');
+    await expect(page.locator('#pr-results .pr-error')).toContainText('rate limit');
+    await page.locator('#request').fill('Still works');
+    await page.getByRole('button', { name: 'Request' }).click();
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+  });
+
+  test('the search answers 404 to a login that is not a collaborator', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    const outsider = await page.request.get(`/projects/${name}/pulls`, {
+      headers: { 'Tailscale-User-Login': OUTSIDER },
+    });
+    expect(outsider.status()).toBe(404);
+    const member = await page.request.get(`/projects/${name}/pulls`);
+    expect(member.status()).toBe(200);
+  });
 });
 
 test('an opened Show older disclosure stays open across a poll', async ({ page, factory, project }) => {
@@ -509,6 +741,28 @@ test.describe('without scripts', () => {
     } finally {
       await setWorkers(2);
     }
+  });
+
+  test('a pull request number typed by hand creates a job on that pull request', async ({ page, factory }, testInfo) => {
+    const name = `prs-nojs-${testInfo.workerIndex}-${Date.now()}`;
+    factory.fixture('project', '--name', name, '--login', ADMIN, '--repo', `e2e/${name}`);
+    await page.goto(`/settings/projects/${name}`);
+    await page.locator('#forge-account').getByLabel('Project token').fill('tok-e2e-alice');
+    await page.getByRole('button', { name: 'Save project token' }).click();
+    await expect(page.getByText('Saved. The project token belongs to alice-bot.')).toBeVisible();
+
+    await page.goto(`/?project=${name}`);
+    await page.locator('#request').fill('Fix the parser');
+    await page.getByLabel('Pull request', { exact: true }).fill('#103');
+    await page.getByRole('button', { name: 'Request' }).click();
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+    await expect(page.locator('a.picked-pr')).toHaveAttribute('href', `https://github.com/e2e/${name}/pull/103`);
+
+    await page.goto(`/?project=${name}`);
+    await page.locator('#request').fill('Fix a missing one');
+    await page.getByLabel('Pull request', { exact: true }).fill('999');
+    await page.getByRole('button', { name: 'Request' }).click();
+    await expect(page.getByText('pull request #999 does not exist')).toBeVisible();
   });
 
   test('a request filed with a Start after selection waits', async ({ page, factory, project }) => {

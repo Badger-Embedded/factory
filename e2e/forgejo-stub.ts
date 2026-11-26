@@ -29,6 +29,33 @@ export interface ForgejoStub {
   stop(): Promise<void>;
 }
 
+/** An open pull request as Forgejo lists it. A `fork` has a head repository other than the base's. */
+export function forgejoPull(
+  number: number,
+  title: string,
+  options: { fork?: boolean; draft?: boolean; author?: string } = {},
+) {
+  return {
+    number,
+    title,
+    state: 'open',
+    merged: false,
+    draft: options.draft ?? false,
+    html_url: `https://forge.test/owner/name/pulls/${number}`,
+    user: { login: options.author ?? 'carol' },
+    head: { sha: 'abc', ref: `b${number}`, repo_id: options.fork ? 9 : 5 },
+    base: { ref: 'main', repo_id: 5 },
+  };
+}
+
+/** A route that lists `pulls` for `repo`, which is what the picker's search asks Forgejo for. */
+export function forgejoPullList(repo: string, pulls: unknown[]): StubRoute {
+  return (request, url) =>
+    request.method === 'GET' && url.pathname.endsWith(`/api/v1/repos/${repo}/pulls`)
+      ? { body: pulls }
+      : undefined;
+}
+
 /** A version string as Forgejo writes it, which Gitea does not. */
 export const FORGEJO_VERSION = '17.0.2+gitea-1.22.0';
 

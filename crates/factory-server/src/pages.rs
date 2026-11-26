@@ -12,7 +12,7 @@ use crate::cost::{format_cost, merge_fraction};
 use crate::forgejo_instances::ForgejoInstance;
 use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages, McpToolState, McpTransport};
-use factory_runner::{ForgeAccount, ForgeKind};
+use factory_runner::{ForgeAccount, ForgeKind, OpenPr};
 
 use crate::projects::{Project, ProjectLabel, RenovateAgent};
 use crate::projects::{StageAgents, StageEfforts, StageModels};
@@ -31,6 +31,7 @@ pub const HTMX: &str = include_str!("../static/htmx.min.js");
 const PROJECT_PICKER: &str = include_str!("../static/project-picker.js");
 const ONBOARD_FORGE: &str = include_str!("../static/onboard-forge.js");
 const SOURCE_LINK: &str = include_str!("../static/source-link.js");
+const PR_PICKER: &str = include_str!("../static/pr-picker.js");
 const PASTE_IMAGES: &str = include_str!("../static/paste-images.js");
 const MCP_ROWS: &str = include_str!("../static/mcp-rows.js");
 const NOTIFICATIONS: &str = include_str!("../static/notifications.js");
@@ -406,10 +407,89 @@ fn composer(project: &str, shown: &str, rows: &[&JobRow]) -> Markup {
                     }
                 }
                 ul #pasted-images.pasted-images {}
+                (pr_picker(project))
                 (start_after(&options))
             }
             script { (PreEscaped(PASTE_IMAGES)) }
+            script { (PreEscaped(PR_PICKER)) }
         }
+    }
+}
+
+/// The most rows the pull request picker lists.
+pub const PR_ROWS: usize = 20;
+
+/// A row of the pull request picker: the pull request and the live job that
+/// may push to or merge it, if any.
+pub struct PrChoice {
+    pub pr: OpenPr,
+    pub held_by: Option<i64>,
+}
+
+/// The pull request field of the new-request form. Without scripts it is a
+/// text box for a pull request number. `pr-picker.js` turns it into a search
+/// box with a result list, and posts the pick as `pr`.
+fn pr_picker(project: &str) -> Markup {
+    html! {
+        div.pr-picker data-project=(project) {
+            label.pr-label for="pr-search" { "Pull request" }
+            input #pr-search type="text" name="pr" autocomplete="off" inputmode="numeric"
+                placeholder="Number";
+            ul #pr-results.pr-results role="listbox" aria-label="Open pull requests" hidden {}
+            div.pr-picked hidden {}
+        }
+    }
+}
+
+/// The rows the picker lists for one search. `more` is set when the forge
+/// had more matches than [`PR_ROWS`].
+pub fn pr_results(choices: &[PrChoice], more: bool) -> Markup {
+    html! {
+        @for PrChoice { pr, held_by } in choices {
+            li.pr-row role="option" #{ "pr-option-" (pr.number) } data-number=(pr.number)
+                data-fork=[pr.fork.then_some("true")] data-held-job=[*held_by] {
+                span.pr-main {
+                    span.pr-number { "#" (pr.number) }
+                    span.pr-title { (pr.title) }
+                    @if pr.fork { span.badge.neutral { "fork" } }
+                    @if pr.draft { span.badge.neutral { "draft" } }
+                    @if let Some(job) = held_by { span.badge.factory { "job #" (job) } }
+                }
+                span.pr-meta { (pr.author) " · " (pr.head_branch) " → " (pr.base_branch) }
+                template {
+                    (external_link(
+                        &pr.url,
+                        html! { "#" (pr.number) " " (pr.title) },
+                        Some("picked-pr"),
+                        None,
+                    ))
+                    @if pr.fork {
+                        span.pr-hint {
+                            "The factory cannot push to a fork's branch, so it cannot change this \
+                             pull request. Quick review stays available."
+                        }
+                    } @else if let Some(job) = held_by {
+                        span.pr-hint {
+                            "Job " a href={ "/jobs/" (job) } { "#" (job) } " may push to or merge \
+                             this pull request."
+                        }
+                    }
+                }
+            }
+        }
+        @if choices.is_empty() {
+            li.pr-note role="presentation" { "No pull request matches." }
+        } @else if more {
+            li.pr-note role="presentation" { "Refine the search to see more." }
+        }
+    }
+}
+
+/// A message row for a search the forge refused or the factory could not
+/// make.
+pub fn pr_results_error(message: &str) -> Markup {
+    html! {
+        li.pr-note.pr-error role="presentation" { "Could not search pull requests: " (message) }
     }
 }
 
@@ -4215,6 +4295,7 @@ fn job_rows(
                     }
                     div.job-sub {
                         (renovate_link(&row.job, links))
+                        (picked_link(&row.job))
                         (turn_badge(&row.job, auto_merge, wait))
                         @if !row.job.is_finished() { (flow_steps(&row.job)) }
                         @if let (Stage::Requested, Some(waits_for)) = (row.job.stage(), waits_for(wait)) {
@@ -4817,6 +4898,9 @@ fn job_header(
         @if job.renovate_pr().is_some() {
             p.meta { (renovate_link(job, repo_url)) }
         }
+        @if job.picked_pr().is_some() {
+            p.meta { (picked_link(job)) }
+        }
         @if let Some((source, number)) = job.fix_source() {
             p.meta {
                 "Fixes Renovate pull request #" (number) ", in "
@@ -4835,6 +4919,15 @@ fn job_header(
                 (label.shown)
             }
             " · requested by " (row.requested_by) " · " (crate::localtime::date_time(&row.created_at))
+        }
+    }
+}
+
+/// The pull request a job works on, as "#N" linking to it on the forge.
+fn picked_link(job: &Job) -> Markup {
+    html! {
+        @if let Some(pr) = job.picked_pr() {
+            (external_link(&pr.url, html! { "#" (pr.number) }, Some("picked-pr"), Some(&pr.title)))
         }
     }
 }

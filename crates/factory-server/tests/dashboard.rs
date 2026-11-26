@@ -18454,7 +18454,16 @@ fn picked_pr_dashboard() -> Dashboard {
 pull() {
   echo "{\"number\":$1,\"title\":\"Fix $1\",\"state\":\"$2\",\"merged\":$3,\"draft\":false,\"html_url\":\"https://github.com/Badger-Embedded/maestro/pull/$1\",\"user\":{\"login\":\"carol\"},\"head\":{\"sha\":\"abc\",\"ref\":\"carol/fix\",\"repo\":{\"full_name\":\"$4\"}},\"base\":{\"sha\":\"def\",\"ref\":\"develop\",\"repo\":{\"full_name\":\"Badger-Embedded/maestro\"}}}"
 }
+listing() {
+  printf '['
+  for n in $(seq 1 21); do
+    [ "$n" -gt 1 ] && printf ','
+    echo -n "{\"number\":$n,\"title\":\"Pull $n\",\"state\":\"open\",\"draft\":false,\"html_url\":\"https://github.com/Badger-Embedded/maestro/pull/$n\",\"user\":{\"login\":\"carol\"},\"head\":{\"ref\":\"b$n\",\"repo\":{\"full_name\":\"Badger-Embedded/maestro\"}},\"base\":{\"ref\":\"main\",\"repo\":{\"full_name\":\"Badger-Embedded/maestro\"}}}"
+  done
+  echo ']'
+}
 case "$1 $2" in
+  "api --method") listing ;;
   "api repos/Badger-Embedded/maestro/pulls/12") pull 12 open false Badger-Embedded/maestro ;;
   "api repos/Badger-Embedded/maestro/pulls/13") pull 13 closed false Badger-Embedded/maestro ;;
   "api repos/Badger-Embedded/maestro/pulls/14") pull 14 closed true Badger-Embedded/maestro ;;
@@ -18563,6 +18572,60 @@ async fn a_pull_request_held_by_a_live_job_creates_no_job() {
         second.body
     );
     assert_eq!(dashboard.store.list().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_pull_request_search_lists_twenty_rows_and_asks_to_refine() {
+    let dashboard = picked_pr_dashboard();
+    let reply = dashboard.get("/projects/maestro/pulls").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body.matches("data-number=").count(), 20);
+    assert!(reply.body.contains("Refine the search to see more."));
+    assert!(!reply.body.contains("data-number=\"21\""));
+    assert!(
+        reply
+            .body
+            .contains("target=\"_blank\" rel=\"noopener noreferrer\"")
+    );
+}
+
+#[tokio::test]
+async fn the_pull_request_search_marks_held_pull_requests_and_says_when_none_match() {
+    let dashboard = picked_pr_dashboard();
+    post_picked(&dashboard, "one", "12").await;
+    let holder = dashboard.store.list().unwrap()[0].id;
+    let reply = dashboard.get("/projects/maestro/pulls?q=%2312").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(reply.body.contains(&format!("data-held-job=\"{holder}\"")));
+    assert!(reply.body.contains(&format!("job #{holder}")));
+    assert!(!reply.body.contains("Refine the search"));
+    let none = dashboard.get("/projects/maestro/pulls?q=13").await;
+    assert!(
+        none.body.contains("No pull request matches."),
+        "{}",
+        none.body
+    );
+}
+
+#[tokio::test]
+async fn the_pull_request_search_is_not_found_for_a_login_that_is_not_a_collaborator() {
+    let dashboard = picked_pr_dashboard();
+    let reply = dashboard.get_as("mallory", "/projects/maestro/pulls").await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    let unknown = dashboard.get("/projects/nothing/pulls").await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_pull_request_job_shows_its_pull_request_as_a_link_on_the_board_and_job_page() {
+    let dashboard = picked_pr_dashboard();
+    post_picked(&dashboard, "one", "12").await;
+    let id = dashboard.store.list().unwrap()[0].id;
+    let link = "<a class=\"picked-pr\" href=\"https://github.com/Badger-Embedded/maestro/pull/12\"";
+    let board = dashboard.get("/").await;
+    assert!(board.body.contains(link), "{}", board.body);
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains(link), "{}", page.body);
 }
 
 #[tokio::test]
