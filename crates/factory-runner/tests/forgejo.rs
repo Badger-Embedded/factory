@@ -1899,3 +1899,26 @@ async fn a_listing_with_null_entries_still_returns_the_rest() {
     assert_eq!(prs.len(), 1);
     assert_eq!(stub.seen().len(), 1);
 }
+
+#[tokio::test]
+async fn a_title_search_over_a_page_of_body_only_hits_is_an_error_without_a_second_page() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/issues" => {
+            let rows: Vec<Value> = (1..=21)
+                .map(|n| json!({"number": n, "title": "unrelated"}))
+                .collect();
+            ok(&json!(rows))
+        }
+        _ => rep(404, ""),
+    })
+    .await;
+    let err = stub
+        .forge
+        .search_open_prs(&account(&stub.forge), REPO, "thing")
+        .await
+        .unwrap_err();
+    assert!(err.contains("incomplete"), "{err}");
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 1);
+    assert!(!seen[0].query.contains("page="), "{}", seen[0].query);
+}

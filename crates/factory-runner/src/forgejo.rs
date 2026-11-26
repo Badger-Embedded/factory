@@ -1617,9 +1617,9 @@ impl Forge for Forgejo {
     /// because the pulls endpoint has no query. That search also matches the
     /// body and has no title-only mode, so the rows are filtered to those
     /// whose title holds the text, and each is read again as a pull request
-    /// for its branches. The page is cut before the filter, so a page full
-    /// of body-only matches can hide a title match, and the result may be
-    /// shorter than 21 rows while more titles match.
+    /// for its branches. The page is cut before the filter, so when the forge
+    /// fills the page and the filter leaves fewer than 20 rows, the search
+    /// is an error and not a short result.
     fn search_open_prs<'a>(
         &'a self,
         account: &'a Account,
@@ -1668,6 +1668,7 @@ impl Forge for Forgejo {
                         )
                         .await?;
                     let mut pulls = Vec::new();
+                    let saturated = found.len() >= SEARCH_PAGE;
                     let needle = text.to_lowercase();
                     for row in found
                         .into_iter()
@@ -1679,6 +1680,12 @@ impl Forge for Forgejo {
                             Err(err) if err.status == Some(404) => {}
                             Err(err) => return Err(err.into()),
                         }
+                    }
+                    if saturated && pulls.len() < SEARCH_PAGE - 1 {
+                        return Err(format!(
+                            "{} cannot search pull request titles, and the first {SEARCH_PAGE} matches of {text:?} include other fields, so the title matches may be incomplete. Search for more of the title, or a number",
+                            self.host()
+                        ));
                     }
                     pulls
                 }
