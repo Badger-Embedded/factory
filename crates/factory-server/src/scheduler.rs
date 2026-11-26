@@ -1381,8 +1381,8 @@ impl<E: Executor> Scheduler<E> {
         let (session_id, agent) = self.store.session_uuid(row.id, session, stage)?;
         let mut stage_note = None;
         let recorded = self.store.session_settings(row.id, session)?;
-        let resumed =
-            renovate.is_some() && recorded.as_ref().is_some_and(|last| last.effort.is_some());
+        let resumed = matches!(session, Session::Renovate(_))
+            && recorded.as_ref().is_some_and(|last| last.effort.is_some());
         let (model, effort) = if agent == stage && !resumed {
             let (model, effort) = match renovate {
                 Some(over) => (over.model, over.effort),

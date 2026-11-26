@@ -5535,6 +5535,68 @@ async fn a_retried_renovate_run_keeps_its_model_and_effort_when_only_those_chang
 }
 
 #[tokio::test]
+async fn clearing_the_renovate_agent_keeps_a_started_session_and_a_fresh_run_uses_the_review_stage()
+{
+    let (store, executor, scheduler) = setup(failing_diff_check);
+    review_stage_settings(&store);
+    let agents = StageAgents {
+        review: "copilot".into(),
+        ..StageAgents::default()
+    };
+    store.save_project_agents("maestro", &agents).unwrap();
+    store
+        .save_project_efforts(
+            "maestro",
+            &stage_efforts("low", "low", "low", "low", "high"),
+            &agents,
+        )
+        .unwrap();
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+        )
+        .unwrap();
+    let id = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    executor.release(10);
+    failure_then_diff_check(&store, &scheduler, id, false).await;
+    store.save_project_renovate_agent("maestro", None).unwrap();
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let (first, retry) = (&requests[requests.len() - 2], &requests[requests.len() - 1]);
+    assert_eq!(retry.session_id, first.session_id);
+    assert_eq!(retry.model.as_deref(), Some("cheap-model"));
+    assert_eq!(retry.effort.as_deref(), Some("low"));
+
+    let other = store
+        .create_renovate_job("maestro", 8, "Update tokio", "https://example/pull/8")
+        .unwrap()
+        .unwrap();
+    store
+        .apply(
+            other,
+            observed(
+                "h2",
+                factory_core::RenovateCi::Failed { log: "boom".into() },
+            ),
+        )
+        .unwrap();
+    step(&scheduler).await;
+    let fresh = executor.requests().into_iter().last().unwrap();
+    assert_eq!(fresh.job_id, other);
+    assert_eq!(fresh.expect, Expect::FailureAnalysis);
+    assert_ne!(fresh.session_id, first.session_id);
+    assert_eq!(fresh.agent, Agent::Copilot);
+    assert_eq!(fresh.model.as_deref(), Some("review-model"));
+    assert_eq!(fresh.effort.as_deref(), Some("high"));
+}
+
+#[tokio::test]
 async fn the_packaging_analysis_uses_the_review_stage_when_no_renovate_agent_is_set() {
     let (store, executor, scheduler, id) = renovate_setup(packaging_runs(Vec::new()));
     review_stage_settings(&store);
