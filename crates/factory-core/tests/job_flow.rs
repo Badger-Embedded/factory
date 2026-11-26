@@ -3786,8 +3786,6 @@ fn picked() -> PickedPr {
     }
 }
 
-/// A job on picked pull request #42 whose plan is approved and whose agent
-/// has committed.
 fn picked_committed(gates: Gates) -> Job {
     let mut job = Job::pull_request("fix the typo", gates, picked());
     apply(&mut job, Event::Start);
@@ -3807,7 +3805,6 @@ fn picked_committed(gates: Gates) -> Job {
     job
 }
 
-/// A job on picked pull request #42 that pushed and watches it.
 fn picked_watching() -> Job {
     let mut job = picked_committed(Gates::default());
     apply(&mut job, Event::ChecksPassed);
@@ -3967,4 +3964,14 @@ fn a_picked_pull_request_job_survives_json_and_loads_without_the_new_fields() {
     let mut old_request = request;
     old_request.as_object_mut().unwrap().remove("pushed");
     assert!(serde_json::from_value::<Job>(old_request).is_ok());
+}
+
+#[test]
+fn a_picked_pull_request_job_rejects_a_published_number_that_is_not_the_pick() {
+    let mut job = picked_committed(Gates::default());
+    apply(&mut job, Event::ChecksPassed);
+    let before = job.clone();
+    assert!(job.apply(Event::Published { number: 99 }).is_err());
+    assert_eq!(job, before);
+    assert_eq!(job.plan()[0].number, Some(42));
 }

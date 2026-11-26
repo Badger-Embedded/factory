@@ -1924,7 +1924,11 @@ impl Job {
                 self.fail_round(S::Verifying { pr }, Turn::Agent(Task::FixChecks { report }))
             }
 
-            (S::PrOpen { pr }, Turn::Factory, E::Published { number }) => {
+            (S::PrOpen { pr }, Turn::Factory, E::Published { number })
+                if self
+                    .picked_pr()
+                    .is_none_or(|picked| picked.number == number) =>
+            {
                 let pr = *pr;
                 self.plan[pr].number = Some(number);
                 self.pushed = true;
@@ -2235,7 +2239,6 @@ impl Job {
         })
     }
 
-    /// Where the job goes once the checks pass on planned pull request `pr`.
     fn after_checks(&self, pr: usize) -> (Stage, Turn) {
         if self.gates.publish && (self.plan[pr].number.is_none() || self.held_back()) {
             (

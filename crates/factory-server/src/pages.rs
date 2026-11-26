@@ -5739,11 +5739,6 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool, wait: &Wait) ->
             "The factory is collecting the commits and the diff stat for your approval.".into()
         }
         Turn::RerunCi { .. } => "The factory is rerunning the failed CI runs.".into(),
-        Turn::User(Ask::MergeLeftToUser) => {
-            "CI is green and the review has nothing left. The factory does not merge this pull \
-             request. Merge it on the forge when you are ready."
-                .into()
-        }
         Turn::User(_) => "Waiting for you.".into(),
         Turn::Done => match job.stage() {
             Stage::Merged => "Every planned pull request is merged.".into(),
