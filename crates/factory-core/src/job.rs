@@ -1767,7 +1767,7 @@ impl Job {
         if ran {
             self.checks_errors = 0;
         }
-        if let Stage::Implementing { .. } = stage {
+        if matches!(stage, Stage::Implementing { .. }) && turn != Turn::Agent(Task::MergeHead) {
             self.failed_rounds = 0;
             self.review_rounds = 0;
             self.checks_errors = 0;

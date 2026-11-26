@@ -264,6 +264,9 @@ pub struct PublishRequest {
     /// description, so `description` is not used.
     pub existing: Option<ExistingPr>,
     pub description: PrDescription,
+    /// Whether the project runs checks before a push. A picked pull request
+    /// job then never pushes a merge commit that the checks have not run on.
+    pub checks: bool,
     /// Told the account of each push right after it succeeds, before the pull
     /// request is opened.
     pub pushed: PushLog,
@@ -1945,6 +1948,7 @@ impl<E: Executor> Scheduler<E> {
             branch: refs.branch.clone(),
             existing,
             description,
+            checks: project.checks.is_some(),
             pushed: PushLog::new({
                 let scheduler = Arc::clone(self);
                 let (branch, repo) = (refs.remote_branch, project.repo.clone());

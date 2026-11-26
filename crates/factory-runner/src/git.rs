@@ -176,6 +176,7 @@ impl Git {
         {
             self.run(work, &["rebase", "--abort"], None).await?;
         }
+        let mut leave_conflict = false;
         if work.join(".git/MERGE_HEAD").exists() {
             let current = self.run(work, &["branch", "--show-current"], None).await?;
             let base_ref = format!("refs/remotes/origin/{base}");
@@ -204,6 +205,16 @@ impl Git {
             if current.trim() == branch && merging.is_ok() && (base_merge || head_merge) {
                 return Ok(());
             }
+            // An older head's merge is redone against the latest head, and a
+            // conflict stays in the checkout for the agent.
+            leave_conflict = current.trim() == branch
+                && match &merging {
+                    Ok(old) => self
+                        .run(work, &["merge-base", "--is-ancestor", old, &tracking], None)
+                        .await
+                        .is_ok(),
+                    Err(_) => false,
+                };
             self.run(work, &["merge", "--abort"], None).await?;
         }
         let local = format!("refs/heads/{branch}");
@@ -234,6 +245,12 @@ impl Git {
             .await;
         if fast_forward.is_ok() {
             return Ok(());
+        }
+        if leave_conflict {
+            return self
+                .merge_leaving_conflicts(work, &tracking)
+                .await
+                .map(|_| ());
         }
         self.merge_or_abort(work, &tracking).await
     }
@@ -270,6 +287,16 @@ impl Git {
         let remote = remote_source()?;
         self.fetch_ref(work, &remote, head_ref, &tracking).await?;
         self.merge_leaving_conflicts(work, &tracking).await
+    }
+
+    /// The commit the checkout is at.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when it fails.
+    pub async fn head(&self, work: &Path) -> Result<String, String> {
+        let out = self.run(work, &["rev-parse", "HEAD"], None).await?;
+        Ok(out.trim().to_owned())
     }
 
     async fn merge_leaving_conflicts(&self, work: &Path, target: &str) -> Result<bool, String> {

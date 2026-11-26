@@ -1047,6 +1047,7 @@ async fn clone_push_and_every_gh_call_use_the_token_of_the_account_the_request_n
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1128,6 +1129,7 @@ async fn a_token_that_changes_during_a_publish_applies_to_the_next_operation() {
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1187,6 +1189,7 @@ async fn a_push_is_logged_even_when_the_pull_request_step_has_no_account() {
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1612,6 +1615,7 @@ async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1773,6 +1777,7 @@ async fn publishing_to_a_picked_pull_request_pushes_its_branch_and_never_opens_o
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks: false,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1794,10 +1799,9 @@ async fn publishing_to_a_picked_pull_request_pushes_its_branch_and_never_opens_o
     }
 }
 
-/// Publishes to pull request 12 of `o/r` whose forge base is `forge_base`,
-/// from a job saved with base `develop`. `git_arms` adds `case` arms on the
-/// subcommand to the fake `git`.
-async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Published {
+/// Tools for pull request 12 of `o/r` whose forge base is `forge_base`.
+/// `git_arms` adds `case` arms on the subcommand to the fake `git`.
+fn picked_tools(forge_base: &str, git_arms: &str) -> Tools {
     let tools = Tools::new();
     support::executable(
         tools.dir.path(),
@@ -1805,9 +1809,12 @@ async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Pub
         &format!(
             "#!/bin/bash\n\
              case \"$*\" in\n\
+             *pulls/12/*) ;;\n\
              *pulls/12*) echo '{{\"number\":12,\"state\":\"open\",\"merged\":false,\
              \"head\":{{\"sha\":\"a\",\"ref\":\"carol/reboot\",\"repo\":{{\"full_name\":\"o/r\"}}}},\
              \"base\":{{\"sha\":\"b\",\"ref\":\"{forge_base}\",\"repo\":{{\"full_name\":\"o/r\"}}}}}}' ;;\n\
+             *\"pr view\"*) echo '{{\"state\":\"OPEN\",\"headRefOid\":\"h1\",\"mergeable\":\"MERGEABLE\",\
+             \"statusCheckRollup\":[{{\"name\":\"Lint\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\"}}]}}' ;;\n\
              esac\n"
         ),
     );
@@ -1818,16 +1825,23 @@ async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Pub
             "#!/bin/bash\n\
              while [ \"$1\" = -c ]; do shift 2; done\n\
              case \"$1\" in --git-dir=*) shift ;; esac\n\
+             echo \"git $*\" >> '{calls}'\n\
              case \"$1\" in\n\
              clone) mkdir -p \"${{@: -1}}/.git\" ;;\n\
              log) echo 'abc1234 one' ;;\n\
+             rev-parse) echo abc123 ;;\n\
              config) case \"$*\" in *--get-regexp*) exit 1 ;; esac ;;\n\
              {git_arms}\n\
-             esac\n"
+             esac\n",
+            calls = tools.dir.path().join("calls").display()
         ),
     );
-    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
     std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    tools
+}
+
+async fn publish_with(tools: &Tools, checks: bool) -> factory_server::Published {
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
     podman
         .publish(factory_server::PublishRequest {
             job_id: 7,
@@ -1845,10 +1859,71 @@ async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Pub
                 title: "t".into(),
                 body: "b".into(),
             },
+            checks,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
         .unwrap()
+}
+
+async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Published {
+    publish_with(&picked_tools(forge_base, git_arms), false).await
+}
+
+#[tokio::test]
+async fn a_restart_after_the_merge_of_a_moved_head_never_pushes_it_unchecked() {
+    let reject = "push) echo '! [rejected] moved' >&2; exit 1 ;;";
+    let tools = picked_tools("develop", reject);
+    let first = publish_with(&tools, true).await;
+    assert!(matches!(
+        first,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    let pushes = |tools: &Tools| {
+        tools
+            .calls()
+            .lines()
+            .filter(|call| call.starts_with("git push") || call.contains(" push "))
+            .count()
+    };
+    assert_eq!(pushes(&tools), 1);
+
+    // The job was still waiting to publish when the factory restarted, so the
+    // same publish comes again on the merged checkout.
+    let second = publish_with(&tools, true).await;
+    assert!(matches!(
+        second,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    assert_eq!(pushes(&tools), 1);
+}
+
+#[tokio::test]
+async fn a_green_pull_request_that_was_retargeted_fails_instead_of_asking_for_the_merge() {
+    let tools = picked_tools("main", "");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let report = podman
+        .watch(factory_server::WatchRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+            repo: "o/r".into(),
+            base: "develop".into(),
+            number: 12,
+            seen_until: None,
+            auto_merge: false,
+            may_merge: false,
+            llm_review: true,
+            review_approved: false,
+            watch_only: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&report.event, Some(Event::FactoryFailed { reason }) if reason.contains("develop")),
+        "{:?}",
+        report.event
+    );
 }
 
 #[tokio::test]

@@ -3896,6 +3896,43 @@ fn a_moved_head_reruns_the_checks_or_asks_the_agent_to_merge() {
 }
 
 #[test]
+fn the_review_cap_still_applies_after_a_merge_head_turn() {
+    let mut job = picked_watching();
+    for _ in 2..MAX_REVIEW_ROUNDS {
+        review_changes_round(&mut job, 42);
+    }
+    apply(&mut job, start_review());
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "tighten".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::HeadMoved { conflicted: true });
+    assert_eq!(job.turn(), &Turn::Agent(Task::MergeHead));
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 42 });
+
+    apply(&mut job, start_review());
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "again".into(),
+        },
+    );
+    assert!(matches!(
+        job.turn(),
+        Turn::User(Ask::ReviewStopped {
+            stop: ReviewStop::CapReached { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
 fn a_moved_head_is_rejected_for_a_job_that_opened_its_own_pull_request() {
     let mut job = Job::new("x", Gates::default());
     assert!(job.apply(Event::HeadMoved { conflicted: false }).is_err());

@@ -1135,3 +1135,26 @@ async fn a_moved_pull_request_head_that_conflicts_stays_unfinished_and_survives_
     assert!(work.join(".git/MERGE_HEAD").exists());
     assert!(git(&work, &["status", "--porcelain"]).contains("UU pr-file"));
 }
+
+#[tokio::test]
+async fn a_head_that_moves_again_leaves_the_conflict_against_the_latest_head() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "pr-file", "agent edit");
+    advance_pull_request(&remote, "pr-file", "their edit");
+    assert!(
+        !git_
+            .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+            .await
+            .unwrap()
+    );
+
+    advance_pull_request(&remote, "pr-file", "their second edit");
+    prepare_pr(&remote, &git_, "main", head).await;
+    let latest = git(&work, &["rev-parse", "refs/factory/pr-5/head"]);
+    assert_eq!(git(&work, &["rev-parse", "MERGE_HEAD"]), latest);
+    assert!(git(&work, &["status", "--porcelain"]).contains("UU pr-file"));
+}

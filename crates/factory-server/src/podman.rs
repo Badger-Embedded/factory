@@ -63,19 +63,6 @@ pub struct PodmanExecutor {
 /// only the worker user reads it. A file left by an earlier crashed run is
 /// removed first, so the new one is created with the right mode rather than
 /// keeping the old one's.
-/// Why the job cannot go on when the pull request now merges into another
-/// branch than the one the job saved. The conflict and the diff the job works
-/// from are against the saved base, so they would no longer match the forge.
-fn retargeted(pr: &factory_runner::PullRequest, saved_base: &str) -> Option<String> {
-    (pr.base_branch != saved_base).then(|| {
-        format!(
-            "Pull request #{} now merges into {} instead of {saved_base}, where the job \
-             started. Move it back, or cancel this job and start a new one.",
-            pr.number, pr.base_branch
-        )
-    })
-}
-
 fn write_credential_file(path: &Path, contents: &str) -> std::io::Result<()> {
     match fs::remove_file(path) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
@@ -88,6 +75,16 @@ fn write_credential_file(path: &Path, contents: &str) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(contents.as_bytes())
+}
+
+fn retargeted(pr: &factory_runner::PullRequest, saved_base: &str) -> Option<String> {
+    (pr.base_branch != saved_base).then(|| {
+        format!(
+            "Pull request #{} now merges into {} instead of {saved_base}, where the job \
+             started. Move it back, or cancel this job and start a new one.",
+            pr.number, pr.base_branch
+        )
+    })
 }
 
 fn failed(reason: String) -> RunReport {
@@ -117,6 +114,24 @@ impl PodmanExecutor {
 
     fn container(job_id: i64) -> String {
         format!("factory-job-{job_id}")
+    }
+
+    /// Holds the commit of a merge that the checks have not run on yet, so a
+    /// restart before the job records the merge cannot push it unchecked.
+    fn unchecked_marker(&self, job_id: i64) -> PathBuf {
+        self.job_dir(job_id).join("unchecked-head")
+    }
+
+    async fn retarget_reason(&self, request: &WatchRequest) -> Result<Option<String>, String> {
+        let reader = request.account.resolve()?;
+        let found = blame(
+            &reader.owner,
+            self.forges
+                .forge(&request.forge)
+                .pull_request(&reader.account, &request.repo, request.number)
+                .await,
+        )?;
+        Ok(found.and_then(|pr| retargeted(&pr, &request.base)))
     }
 
     fn job_dir(&self, job_id: i64) -> PathBuf {
@@ -345,6 +360,13 @@ impl PodmanExecutor {
             }
         }
         let workspace = self.job_dir(request.job_id).join("work");
+        let marker = self.unchecked_marker(request.job_id);
+        if request.checks
+            && let Ok(saved) = fs::read_to_string(&marker)
+            && saved.trim() == self.git.head(&workspace).await?
+        {
+            return Ok(Published::HeadMoved { conflicted: false });
+        }
         let pusher = Mutex::new(None);
         let remote = || {
             let operation = request.account.resolve()?;
@@ -376,6 +398,10 @@ impl PodmanExecutor {
                 .git
                 .merge_pr_head(&workspace, &remote, &existing.head_ref, existing.number)
                 .await?;
+            if merged && request.checks {
+                fs::write(&marker, self.git.head(&workspace).await?)
+                    .map_err(|err| format!("saving {}: {err}", marker.display()))?;
+            }
             return Ok(Published::HeadMoved {
                 conflicted: !merged,
             });
@@ -639,14 +665,18 @@ impl Executor for PodmanExecutor {
                 ),
             });
         }
-        run_checks(
+        let event = run_checks(
             &config,
             &name,
             &workspace,
             &request.command,
             &request.packages,
         )
-        .await
+        .await?;
+        if matches!(event, Event::ChecksPassed) {
+            let _ = fs::remove_file(self.unchecked_marker(request.job_id));
+        }
+        Ok(event)
     }
 
     async fn summarize(&self, request: SummaryRequest) -> Result<BranchSummary, String> {
@@ -743,6 +773,16 @@ impl Executor for PodmanExecutor {
                 merged_by_factory: false,
             });
         }
+        if matches!(observation, Observation::Ready)
+            && !request.may_merge
+            && let Some(reason) = self.retarget_reason(&request).await?
+        {
+            return Ok(WatchReport {
+                event: Some(Event::FactoryFailed { reason }),
+                seen_until: None,
+                merged_by_factory: false,
+            });
+        }
         let mut merged_by_factory = false;
         let (event, seen_until) = match observation {
             Observation::Ready => match ready_action(
@@ -777,13 +817,7 @@ impl Executor for PodmanExecutor {
                 let retargeted = if request.may_merge {
                     None
                 } else {
-                    blame(
-                        &reader.owner,
-                        forge
-                            .pull_request(&reader.account, &request.repo, request.number)
-                            .await,
-                    )?
-                    .and_then(|pr| retargeted(&pr, &request.base))
+                    self.retarget_reason(&request).await?
                 };
                 let event = match retargeted {
                     Some(reason) => Event::FactoryFailed { reason },
