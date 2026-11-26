@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use factory_core::{
-    Agent, AgentResult, Cli, Command, DiffVerdict, Event, Gates, Job, PlanUsage, PlannedPr,
-    PrDescription, Question, Stage, Task, UsageWindow,
+    Agent, AgentResult, Cli, Command, DiffVerdict, Event, Gates, Job, PickedPr, PlanUsage,
+    PlannedPr, PrDescription, PrMode, Question, Stage, Task, UsageWindow,
 };
 use factory_runner::{
     AgentItem, Expect, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry, McpServerStatus,
@@ -1657,6 +1657,152 @@ fn review_failure_reason(event: Event) -> String {
 fn a_review_task_expects_a_review_verdict() {
     let expect = Expect::for_task(&Stage::CiAndReview { pr: 0 }, &Task::Review);
     assert_eq!(expect, Some(Expect::Review));
+}
+
+#[test]
+fn a_quick_review_task_expects_a_score() {
+    let expect = Expect::for_task(&Stage::CiAndReview { pr: 0 }, &Task::QuickReview);
+    assert_eq!(expect, Some(Expect::QuickReview));
+}
+
+#[test]
+fn the_quick_review_schema_matches_the_bundled_schema() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .join("agents/schemas/quick-review.json");
+    let bundled: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(Expect::QuickReview.schema(), bundled);
+    assert_eq!(Expect::QuickReview.strict_schema(), bundled);
+}
+
+#[test]
+fn a_quick_review_result_carries_its_score_and_text() {
+    use factory_runner::event_from_output;
+    assert_eq!(
+        event_from_output(
+            Expect::QuickReview,
+            Some(json!({"score": 4, "review": "Fine, one nit in src/a.rs:3."}))
+        ),
+        Event::QuickReviewed {
+            score: 4,
+            review: "Fine, one nit in src/a.rs:3.".into(),
+            head: String::new(),
+        }
+    );
+}
+
+#[test]
+fn a_quick_review_result_without_a_valid_score_fails_the_review() {
+    use factory_runner::event_from_output;
+    for output in [
+        json!({"score": 0, "review": "x"}),
+        json!({"score": 6, "review": "x"}),
+        json!({"score": -1, "review": "x"}),
+        json!({"score": 3.5, "review": "x"}),
+        json!({"score": "4", "review": "x"}),
+        json!({"score": 4}),
+        json!({"review": "x"}),
+        json!({"score": 4, "review": "  "}),
+        json!({"score": null, "review": "x"}),
+        json!({"outcome": "approve", "score": 4, "review": "x"}),
+    ] {
+        assert!(
+            matches!(
+                event_from_output(Expect::QuickReview, Some(output.clone())),
+                Event::ReviewFailed { .. }
+            ),
+            "{output} should fail the review"
+        );
+    }
+    assert!(matches!(
+        event_from_output(Expect::QuickReview, None),
+        Event::ReviewFailed { .. }
+    ));
+}
+
+fn quick_job(text: &str) -> Job {
+    Job::pull_request(
+        text,
+        Gates::default(),
+        PickedPr {
+            number: 42,
+            url: "https://github.com/acme/maestro/pull/42".into(),
+            title: "maestrod: add a reboot endpoint".into(),
+            body: "Adds POST /reboot for the device page.".into(),
+            head_branch: "reboot".into(),
+            base_branch: "release-1".into(),
+            fork: true,
+            mode: PrMode::QuickReview { comment: false },
+        },
+    )
+}
+
+#[test]
+fn the_quick_review_prompt_holds_the_pull_request_and_the_focus() {
+    let job = quick_job("check the error paths");
+    let text = job_prompt(
+        &job,
+        &Task::QuickReview,
+        Expect::QuickReview,
+        Agent::Claude,
+        &[],
+    );
+    assert!(text.contains("maestrod: add a reboot endpoint"));
+    assert!(text.contains("Adds POST /reboot for the device page."));
+    assert!(text.contains("check the error paths"));
+    assert!(text.contains("git diff 'refs/remotes/origin/release-1...HEAD'"));
+    assert!(text.contains("5 means it is safe to merge"));
+    assert!(text.contains("1 means do not merge"));
+    assert!(text.contains("do not push"));
+}
+
+#[test]
+fn the_quick_review_prompt_quotes_a_base_branch_that_needs_it() {
+    let mut picked = quick_job("").picked_pr().unwrap().clone();
+    picked.base_branch = "rel'$(x)".into();
+    let job = Job::pull_request("", Gates::default(), picked);
+    let text = job_prompt(
+        &job,
+        &Task::QuickReview,
+        Expect::QuickReview,
+        Agent::Claude,
+        &[],
+    );
+    assert!(text.contains(r"git diff 'refs/remotes/origin/rel'\''$(x)...HEAD'"));
+    assert!(text.contains("Ignore that part"));
+}
+
+#[test]
+fn the_quick_review_prompt_has_no_focus_section_for_an_empty_text() {
+    let job = quick_job("");
+    let text = job_prompt(
+        &job,
+        &Task::QuickReview,
+        Expect::QuickReview,
+        Agent::Claude,
+        &[],
+    );
+    assert!(!text.contains("extra instructions"));
+}
+
+#[test]
+fn the_review_loop_prompt_reads_the_picked_pull_request_against_its_base() {
+    let mut job = quick_job("look at locking");
+    job = Job::pull_request(
+        job.request(),
+        Gates::default(),
+        PickedPr {
+            mode: PrMode::ReviewAndFix,
+            ..job.picked_pr().unwrap().clone()
+        },
+    );
+    let text = job_prompt(&job, &Task::Review, Expect::Review, Agent::Claude, &[]);
+    assert!(text.contains("look at locking"));
+    assert!(text.contains("Adds POST /reboot for the device page."));
+    assert!(text.contains("git diff 'refs/remotes/origin/release-1...HEAD'"));
+    assert!(text.contains("\"approve\""));
 }
 
 #[test]

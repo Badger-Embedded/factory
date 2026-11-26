@@ -18641,6 +18641,7 @@ fn picked_number(number: u64) -> factory_core::PickedPr {
         number,
         url: format!("https://github.com/Badger-Embedded/maestro/pull/{number}"),
         title: "Update serde".into(),
+        body: String::new(),
         head_branch: "renovate/serde".into(),
         base_branch: "main".into(),
         fork: false,

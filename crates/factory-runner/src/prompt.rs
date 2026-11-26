@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use factory_core::{
-    Agent, Answered, Cli, FileText, Job, PackagingContext, PlannedPr, Task, Verdict,
+    Agent, Answered, Cli, FileText, Job, PackagingContext, PlannedPr, PrMode, Task, Verdict,
 };
 
 use crate::agent::{PromptStyle, backend_for};
@@ -156,8 +156,11 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
         ),
-        Task::Review | Task::QuickReview => {
+        Task::Review => {
             return review_prompt(&ReviewContext::default(), agent);
+        }
+        Task::QuickReview => {
+            return quick_review_prompt(&ReviewContext::default(), agent);
         }
         Task::AnalyzeFailure { log } => {
             return failure_prompt(log, agent);
@@ -376,10 +379,46 @@ struct ReviewContext<'a> {
     new_answers: &'a [Answered],
     /// The feedback the last pass asked for, when it asked for changes.
     previous: Option<&'a str>,
+    /// The picked pull request, for a review of one.
+    pr: Option<PickedContext<'a>>,
+}
+
+/// What a review of a picked pull request reads besides the diff.
+struct PickedContext<'a> {
+    title: &'a str,
+    body: &'a str,
+    /// The pull request's own base branch, which the diff is read against.
+    base: &'a str,
+    /// The text the user typed in the form, as extra instructions. Empty
+    /// when there is none or on a later pass, whose session holds it.
+    focus: &'a str,
 }
 
 impl<'a> ReviewContext<'a> {
     fn for_job(job: &'a Job) -> Self {
+        let pr = job
+            .picked_pr()
+            .filter(|picked| !matches!(picked.mode, PrMode::Request))
+            .map(|picked| PickedContext {
+                title: &picked.title,
+                body: &picked.body,
+                base: &picked.base_branch,
+                focus: "",
+            });
+        let mut context = Self::for_stage(job);
+        if let Some(mut pr) = pr {
+            if context.previous.is_none() && context.new_answers.is_empty() {
+                pr.focus = job.request().trim();
+            }
+            // The request is the review's focus, so the decisions block that
+            // restates it as a feature request is left out.
+            context.decisions.clear();
+            context.pr = Some(pr);
+        }
+        context
+    }
+
+    fn for_stage(job: &'a Job) -> Self {
         let Some(pr) = job.stage().pr() else {
             return ReviewContext::default();
         };
@@ -408,6 +447,7 @@ impl<'a> ReviewContext<'a> {
             previous: (last.verdict == Verdict::Changes)
                 .then_some(last.feedback.as_deref())
                 .flatten(),
+            ..ReviewContext::default()
         }
     }
 }
@@ -420,12 +460,15 @@ impl<'a> ReviewContext<'a> {
 fn review_prompt(context: &ReviewContext, agent: PromptTarget) -> String {
     let style = style(agent);
     let mut text = context.decisions.clone();
+    if let Some(pr) = &context.pr {
+        picked_section(&mut text, pr);
+    }
     let _ = write!(
         text,
-        "Review the commits this branch adds on top of its base. Read the diff with git, \
-         against the base branch the checkout is on. Check the change for correctness and \
-         for the repository's own rules in {} and CONTRIBUTING.md. Do not change any \
-         files and do not push.\n\n",
+        "Review the commits this branch adds on top of its base. {} Check the change for \
+         correctness and for the repository's own rules in {} and CONTRIBUTING.md. Do not \
+         change any files and do not push.\n\n",
+        diff_sentence(context.pr.as_ref()),
         style.rules_doc
     );
     if !context.decisions.is_empty() {
@@ -454,6 +497,81 @@ fn review_prompt(context: &ReviewContext, agent: PromptTarget) -> String {
          feedback the author can act on when it is not.",
     );
     end_prompt(&mut text, agent, Expect::Review);
+    text
+}
+
+/// The pull request's title and description, and the user's instructions for
+/// the review when there are any.
+fn picked_section(text: &mut String, pr: &PickedContext) {
+    let _ = write!(text, "The pull request is titled:\n\n{}\n\n", pr.title);
+    if pr.body.trim().is_empty() {
+        text.push_str("Its description is empty.\n\n");
+    } else {
+        let _ = write!(text, "Its description:\n\n{}\n\n", pr.body);
+    }
+    if !pr.focus.is_empty() {
+        let _ = write!(
+            text,
+            "The requester gave these extra instructions for the review, such as what to \
+             focus on:\n\n{}\n\n",
+            pr.focus
+        );
+    }
+}
+
+/// How the reviewer reads the diff. A picked pull request is read against its
+/// own base branch, which is not always the project's.
+fn diff_sentence(pr: Option<&PickedContext>) -> String {
+    match pr {
+        Some(pr) => format!(
+            "Read the diff with `git diff {range}`, since the pull request merges into \
+             {base}.",
+            range = shell_quote(&format!("refs/remotes/origin/{}...HEAD", pr.base)),
+            base = pr.base
+        ),
+        None => "Read the diff with git, against the base branch the checkout is on.".to_owned(),
+    }
+}
+
+/// Quotes `text` as one shell word, so a branch name with metacharacters
+/// cannot break the command.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The prompt for the quick review of a picked pull request. It reads the
+/// pull request's diff from the checkout, as the review loop does, and ends
+/// with a score and the review text, with no verdict and no question.
+fn quick_review_prompt(context: &ReviewContext, agent: PromptTarget) -> String {
+    let style = style(agent);
+    let mut text = String::new();
+    if let Some(pr) = &context.pr {
+        picked_section(&mut text, pr);
+    }
+    let _ = write!(
+        text,
+        "Review the pull request in the current checkout. {} Check the change for \
+         correctness and for the repository's own rules in {} and CONTRIBUTING.md. Do not \
+         change any files and do not push.\n\n",
+        diff_sentence(context.pr.as_ref()),
+        style.rules_doc
+    );
+    text.push_str(style.review_method);
+    text.push_str(
+        "The review skill ends with an approve or changes verdict. Ignore that part: this \
+         review ends with the score and the review text described below, and has no \
+         \"outcome\" field.\n\n\
+         Give the pull request a score from 1 to 5 for how safe it is to merge as it is. \
+         5 means it is safe to merge. 1 means do not merge. The scores between are your \
+         judgment of how much is wrong and how serious it is: a change with only small \
+         problems scores 4, and a change with a defect that must be fixed before a merge \
+         scores 2 or lower.\n\n\
+         End with the structured output. Its \"score\" is the whole number and its \
+         \"review\" is the whole review as Markdown. The review gives the reason for the \
+         score and lists each problem with its file and line, concrete enough to act on \
+         without the diff in view. The requester reads it and decides what happens next.",
+    );
+    end_prompt(&mut text, agent, Expect::QuickReview);
     text
 }
 
@@ -490,7 +608,10 @@ pub fn job_prompt(
 }
 
 fn job_body(job: &Job, task: &Task, expect: Expect, agent: PromptTarget) -> String {
-    if let Task::Review | Task::QuickReview = task {
+    if let Task::QuickReview = task {
+        return quick_review_prompt(&ReviewContext::for_job(job), agent);
+    }
+    if let Task::Review = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
     }
     let body = prompt_for(task, expect, agent, job.picked_pr().is_some());

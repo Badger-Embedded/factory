@@ -135,6 +135,9 @@ pub struct PickedPr {
     pub number: u64,
     pub url: String,
     pub title: String,
+    /// The pull request's description.
+    #[serde(default)]
+    pub body: String,
     /// The branch the pull request is made from.
     pub head_branch: String,
     /// The branch the pull request merges into.

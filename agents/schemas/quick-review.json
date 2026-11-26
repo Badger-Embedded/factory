@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "score": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5,
+      "description": "How safe the pull request is to merge: 5 is safe to merge, 1 is do not merge."
+    },
+    "review": {
+      "type": "string",
+      "description": "The whole review as Markdown: what the pull request does well, and each problem with its file and line."
+    }
+  },
+  "required": ["score", "review"],
+  "additionalProperties": false
+}

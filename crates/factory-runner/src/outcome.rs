@@ -19,6 +19,9 @@ pub enum Expect {
     /// feedback. The other stages instead end with `questions` or their own
     /// done outcome.
     Review,
+    /// The quick review of a picked pull request. It ends with a `score`
+    /// from 1 to 5 and the `review` text, and never asks a question.
+    QuickReview,
     /// The failure analysis of a Renovate pull request. It ends with
     /// `transient` or `caused_by_update`, each with a reason, and never asks
     /// a question.
@@ -60,6 +63,7 @@ impl Expect {
         match (Self::for_stage(stage)?, task) {
             (Expect::Commits, Task::FixCi { .. }) => Some(Expect::FixCi),
             (_, Task::Review) => Some(Expect::Review),
+            (_, Task::QuickReview) => Some(Expect::QuickReview),
             (expect, _) => Some(expect),
         }
     }
@@ -76,6 +80,7 @@ impl Expect {
             Expect::Plan => "plan",
             Expect::Commits | Expect::FixCi => "commits_ready",
             Expect::Review => return vec!["approve", "changes"],
+            Expect::QuickReview => return vec!["review"],
             Expect::FailureAnalysis => return vec!["transient", "caused_by_update"],
             Expect::DiffCheck => return vec!["safe", "unsafe"],
             Expect::PackagingGaps => return vec!["gaps"],
@@ -91,6 +96,9 @@ impl Expect {
     /// matches `agents/schemas/review.json`, which the review skill cites.
     #[must_use]
     pub fn schema(self) -> Value {
+        if self == Expect::QuickReview {
+            return quick_review_schema();
+        }
         if self == Expect::Review {
             return json!({
                 "type": "object",
@@ -161,6 +169,7 @@ impl Expect {
             // Review returns its own schema above, before this match.
             Expect::Clarify
             | Expect::Review
+            | Expect::QuickReview
             | Expect::FailureAnalysis
             | Expect::DiffCheck
             | Expect::PackagingGaps => {}
@@ -286,6 +295,10 @@ impl Expect {
     #[must_use]
     pub fn strict_schema(self) -> Value {
         let mut schema = self.schema();
+        // Every property of the quick review is required already.
+        if self == Expect::QuickReview {
+            return schema;
+        }
         let object = schema.as_object_mut().expect("the schema is a JSON object");
         let keys: Vec<Value> = object["properties"]
             .as_object()
@@ -306,6 +319,27 @@ impl Expect {
         }
         schema
     }
+}
+
+/// The quick review's schema, which matches `agents/schemas/quick-review.json`.
+fn quick_review_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "score": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5,
+                "description": "How safe the pull request is to merge: 5 is safe to merge, 1 is do not merge."
+            },
+            "review": {
+                "type": "string",
+                "description": "The whole review as Markdown: what the pull request does well, and each problem with its file and line."
+            }
+        },
+        "required": ["score", "review"],
+        "additionalProperties": false
+    })
 }
 
 /// Adds `"null"` to a property's `type`, so a strict schema can require the
@@ -353,6 +387,13 @@ struct PlanEntry {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuickReviewOutput {
+    score: i64,
+    review: String,
+}
+
+#[derive(Deserialize)]
 struct ReviewOutput {
     outcome: String,
     feedback: Option<String>,
@@ -364,7 +405,7 @@ struct ReviewOutput {
 /// their failures through this, so a review never resolves to an agent failure.
 #[must_use]
 pub fn failed_event(expect: Expect, reason: String) -> Event {
-    if expect == Expect::Review {
+    if matches!(expect, Expect::Review | Expect::QuickReview) {
         Event::ReviewFailed { reason }
     } else {
         Event::AgentFailed { reason }
@@ -377,7 +418,7 @@ pub fn failed_event(expect: Expect, reason: String) -> Event {
 /// becomes an agent result or [`Event::AgentFailed`].
 #[must_use]
 pub fn event_from_result(expect: Expect, result: &ResultMessage) -> Event {
-    if expect == Expect::Review {
+    if matches!(expect, Expect::Review | Expect::QuickReview) {
         if let Some(reason) = run_error(result, "reviewer run") {
             return Event::ReviewFailed { reason };
         }
@@ -396,6 +437,12 @@ pub fn event_from_result(expect: Expect, result: &ResultMessage) -> Event {
 pub fn event_from_output(expect: Expect, output: Option<Value>) -> Event {
     if expect == Expect::Review {
         return match review_output(output) {
+            Ok(event) => event,
+            Err(reason) => Event::ReviewFailed { reason },
+        };
+    }
+    if expect == Expect::QuickReview {
+        return match quick_review_output(output) {
             Ok(event) => event,
             Err(reason) => Event::ReviewFailed { reason },
         };
@@ -441,6 +488,33 @@ fn review_output(output: Option<Value>) -> Result<Event, String> {
             "the reviewer ended with outcome {other:?}, expected \"approve\" or \"changes\""
         )),
     }
+}
+
+/// Turns a quick review's structured output into [`Event::QuickReviewed`].
+/// The output does not hold the reviewed head, so `head` is empty and the
+/// executor fills it in from the checkout. A score outside 1 to 5 or an empty
+/// review is an error the caller turns into [`Event::ReviewFailed`].
+fn quick_review_output(output: Option<Value>) -> Result<Event, String> {
+    let output = output.ok_or("the reviewer run ended without structured output")?;
+    let output: QuickReviewOutput = serde_json::from_value(output)
+        .map_err(|err| format!("the reviewer's structured output does not parse: {err}"))?;
+    let score = u8::try_from(output.score)
+        .ok()
+        .filter(|score| (1..=5).contains(score))
+        .ok_or_else(|| {
+            format!(
+                "the reviewer gave the score {}, expected a whole number from 1 to 5",
+                output.score
+            )
+        })?;
+    if output.review.trim().is_empty() {
+        return Err("the reviewer gave a score but wrote no review".into());
+    }
+    Ok(Event::QuickReviewed {
+        score,
+        review: output.review,
+        head: String::new(),
+    })
 }
 
 fn gaps_result(entries: Option<Vec<GapEntry>>) -> Result<AgentResult, String> {

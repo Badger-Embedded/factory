@@ -11,6 +11,7 @@ this directory to `/factory-agents`.
 skills/review/SKILL.md       judges a branch's diff before a merge
 skills/comment-review/SKILL.md  checks the comments a diff adds
 schemas/review.json          the review skill's approve/changes output schema
+schemas/quick-review.json    the quick review's score and review output schema
 ```
 
 ## How each harness loads it
