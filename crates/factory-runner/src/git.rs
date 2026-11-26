@@ -343,6 +343,42 @@ impl Git {
         }
     }
 
+    /// Pushes `branch` like [`Git::push_fast_forward`], after checking that
+    /// the head of pull request `number`, fetched by `prepare_pr`, is an
+    /// ancestor of the branch. A first push has no remote tip to compare with,
+    /// so this is what keeps a rewritten branch from dropping that head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PushError::Rejected` when the branch lost the head, and what
+    /// `push_fast_forward` returns otherwise.
+    pub async fn push_keeping_head(
+        &self,
+        work: &Path,
+        remote: &RemoteSource<'_>,
+        branch: &str,
+        number: u64,
+        pushed: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), PushError> {
+        let tracking = format!("refs/factory/pr-{number}/head");
+        let local = format!("refs/heads/{branch}");
+        if self
+            .run(
+                work,
+                &["merge-base", "--is-ancestor", &tracking, &local],
+                None,
+            )
+            .await
+            .is_err()
+        {
+            return Err(PushError::Rejected(format!(
+                "{branch} no longer holds the head of pull request #{number}"
+            )));
+        }
+        self.push_fast_forward(work, remote, branch, branch, pushed)
+            .await
+    }
+
     /// Pushes `branch` to `branch_on_remote` without force. The remote refuses
     /// a push that would drop a commit someone else pushed, and that comes
     /// back as `PushError::Rejected`. `pushed` runs once the push succeeds.

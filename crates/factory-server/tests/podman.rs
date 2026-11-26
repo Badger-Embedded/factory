@@ -1049,7 +1049,7 @@ async fn clone_push_and_every_gh_call_use_the_token_of_the_account_the_request_n
                 body: "b".into(),
             },
             checks: false,
-            keep_history: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1132,7 +1132,7 @@ async fn a_token_that_changes_during_a_publish_applies_to_the_next_operation() {
                 body: "b".into(),
             },
             checks: false,
-            keep_history: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1193,7 +1193,7 @@ async fn a_push_is_logged_even_when_the_pull_request_step_has_no_account() {
                 body: "b".into(),
             },
             checks: false,
-            keep_history: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1620,7 +1620,7 @@ async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account
                 body: "b".into(),
             },
             checks: false,
-            keep_history: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1783,7 +1783,7 @@ async fn publishing_to_a_picked_pull_request_pushes_its_branch_and_never_opens_o
                 body: "b".into(),
             },
             checks: false,
-            keep_history: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1869,7 +1869,7 @@ async fn publish_with(tools: &Tools, checks: bool) -> factory_server::Published 
                 body: "b".into(),
             },
             checks,
-            keep_history: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await

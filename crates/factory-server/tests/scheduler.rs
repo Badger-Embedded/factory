@@ -9515,7 +9515,11 @@ async fn a_conflict_on_a_fork_stack_merges_the_base_so_the_forks_commits_stay() 
     assert!(rebase.prompt.contains("Do not rebase"), "{}", rebase.prompt);
     let published = executor.published.lock().unwrap().clone();
     assert_eq!(published.len(), 2);
-    assert!(published.iter().all(|publish| publish.keep_history));
+    assert!(
+        published
+            .iter()
+            .all(|publish| publish.keep_history == Some(12))
+    );
 }
 
 async fn conflict_on_stack(
