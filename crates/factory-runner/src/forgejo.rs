@@ -12,11 +12,12 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::forge::{
-    Access, Account, BoxFuture, Forge, ForgeAccount, LookupError, NOT_PERMITTED, REJECTED,
+    Access, Account, BoxFuture, Forge, ForgeAccount, LookupError, NOT_PERMITTED, PrQuery, REJECTED,
+    SEARCH_PAGE,
 };
 use crate::github::{
-    Ci, Comment, FailedCheck, HeadCommit, MAX_DIFF, MAX_LOG, PrDetails, PrInfo, PrState, PrStatus,
-    RebaseCheckbox, RenovatePr, Rerun, tail, tick_rebase_checkbox,
+    Ci, Comment, FailedCheck, HeadCommit, MAX_DIFF, MAX_LOG, OpenPr, PrDetails, PrInfo, PrState,
+    PrStatus, PullRequest, RebaseCheckbox, RenovatePr, Rerun, tail, tick_rebase_checkbox,
 };
 
 const PAGE_SIZE: usize = 50;
@@ -201,6 +202,12 @@ struct RefJson {
     label: String,
     #[serde(default)]
     repo_id: u64,
+    repo: Option<RefRepoJson>,
+}
+
+#[derive(Deserialize)]
+struct RefRepoJson {
+    clone_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +231,19 @@ struct PullJson {
     head: RefJson,
     #[serde(default)]
     base: RefJson,
+}
+
+impl PullJson {
+    /// A head repository that is not the base repository, or that is gone.
+    fn is_fork(&self) -> bool {
+        self.head.repo_id == 0 || self.head.repo_id != self.base.repo_id
+    }
+
+    fn author(&self) -> String {
+        self.user
+            .as_ref()
+            .map_or_else(|| "ghost".to_owned(), |user| user.login.clone())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1589,6 +1609,118 @@ impl Forge for Forgejo {
                     head: pull.head.sha,
                 })
                 .collect())
+        })
+    }
+
+    /// A listing is the pulls endpoint, one page. Its title search is the
+    /// issues endpoint with `type=pulls`, because the pulls endpoint has no
+    /// query. That search matches the body as well as the title, and its
+    /// rows carry no branches, so each row is read again as a pull request.
+    fn search_open_prs<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        query: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<OpenPr>, String>> {
+        Box::pin(async move {
+            let limit = SEARCH_PAGE.to_string();
+            let path = repo_path(repo)?;
+            let pulls: Vec<PullJson> = match PrQuery::parse(query) {
+                PrQuery::Number(number) => match self.pull(account, repo, number).await {
+                    Ok(pull) => vec![pull],
+                    Err(err) if err.status == Some(404) => Vec::new(),
+                    Err(err) => return Err(err.into()),
+                },
+                PrQuery::All => {
+                    self.get(
+                        account,
+                        &format!("{path}/pulls"),
+                        &[
+                            ("state", "open"),
+                            ("sort", "recentupdate"),
+                            ("limit", &limit),
+                        ],
+                    )
+                    .await?
+                }
+                PrQuery::Title(text) => {
+                    #[derive(Deserialize)]
+                    struct Found {
+                        number: u64,
+                    }
+                    let found: Vec<Found> = self
+                        .get(
+                            account,
+                            &format!("{path}/issues"),
+                            &[
+                                ("type", "pulls"),
+                                ("state", "open"),
+                                ("q", text),
+                                ("limit", &limit),
+                            ],
+                        )
+                        .await?;
+                    let mut pulls = Vec::new();
+                    for row in found {
+                        match self.pull(account, repo, row.number).await {
+                            Ok(pull) => pulls.push(pull),
+                            Err(err) if err.status == Some(404) => {}
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                    pulls
+                }
+            };
+            Ok(pulls
+                .into_iter()
+                .filter(|pull| pull.state == "open" && !pull.merged)
+                .map(|pull| OpenPr {
+                    fork: pull.is_fork(),
+                    author: pull.author(),
+                    number: pull.number,
+                    title: pull.title,
+                    head_branch: pull.head.name,
+                    base_branch: pull.base.name,
+                    draft: pull.draft,
+                    url: pull.html_url,
+                })
+                .collect())
+        })
+    }
+
+    fn pull_request<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Option<PullRequest>, String>> {
+        Box::pin(async move {
+            let pull = match self.pull(account, repo, number).await {
+                Ok(pull) => pull,
+                Err(err) if err.status == Some(404) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            let state = if pull.merged {
+                PrState::Merged
+            } else if pull.state == "open" {
+                PrState::Open
+            } else {
+                PrState::Closed
+            };
+            Ok(Some(PullRequest {
+                number: pull.number,
+                state,
+                draft: pull.draft,
+                fork: pull.is_fork(),
+                author: pull.author(),
+                head_repo_clone_url: pull.head.repo.and_then(|repo| repo.clone_url),
+                head_branch: pull.head.name,
+                head_sha: pull.head.sha,
+                base_branch: pull.base.name,
+                title: pull.title,
+                body: pull.body.unwrap_or_default(),
+                url: pull.html_url,
+            }))
         })
     }
 

@@ -1726,3 +1726,158 @@ async fn the_version_is_read_from_the_server() {
     let down = serve(|_| rep(500, "")).await;
     assert!(down.forge.version().await.unwrap_err().contains("HTTP 500"));
 }
+
+fn numbered(number: u64, head_repo_id: u64) -> Value {
+    let mut pull = pull("abc");
+    pull["number"] = json!(number);
+    pull["head"]["repo_id"] = json!(head_repo_id);
+    pull["head"]["ref"] = json!(format!("b{number}"));
+    pull
+}
+
+#[tokio::test]
+async fn an_empty_search_reads_one_page_of_the_latest_open_pull_requests() {
+    let stub = serve(|_| {
+        let rows: Vec<Value> = (1..=21)
+            .map(|n| numbered(n, if n == 2 { 9 } else { 5 }))
+            .collect();
+        ok(&json!(rows))
+    })
+    .await;
+    let prs = stub
+        .forge
+        .search_open_prs(&account(&stub.forge), REPO, "")
+        .await
+        .unwrap();
+    assert_eq!(prs.len(), 21);
+    assert!(!prs[0].fork && prs[1].fork);
+    assert_eq!(prs[1].head_branch, "b2");
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/repos/owner/name/pulls");
+    for pair in ["state=open", "sort=recentupdate", "limit=21"] {
+        assert!(
+            seen[0].query.split('&').any(|p| p == pair),
+            "{}",
+            seen[0].query
+        );
+    }
+    assert!(!seen[0].query.contains("page="), "{}", seen[0].query);
+}
+
+#[tokio::test]
+async fn a_title_search_uses_the_issue_search_and_reads_each_row_once() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/issues" => ok(&json!([{"number": 4}, {"number": 6}])),
+        "/repos/owner/name/pulls/4" => {
+            let mut draft = numbered(4, 5);
+            draft["draft"] = json!(true);
+            ok(&draft)
+        }
+        "/repos/owner/name/pulls/6" => {
+            let mut closed = numbered(6, 5);
+            closed["state"] = json!("closed");
+            ok(&closed)
+        }
+        _ => rep(404, ""),
+    })
+    .await;
+    let prs = stub
+        .forge
+        .search_open_prs(&account(&stub.forge), REPO, "a thing")
+        .await
+        .unwrap();
+    assert_eq!(prs.len(), 1);
+    assert_eq!(prs[0].number, 4);
+    assert!(prs[0].draft && !prs[0].fork);
+    let issues = stub.requests("GET", "/repos/owner/name/issues");
+    assert_eq!(issues.len(), 1);
+    for pair in ["type=pulls", "state=open", "limit=21", "q=a+thing"] {
+        assert!(
+            issues[0].query.split('&').any(|p| p == pair),
+            "{}",
+            issues[0].query
+        );
+    }
+    assert_eq!(stub.seen().len(), 3);
+}
+
+#[tokio::test]
+async fn a_number_finds_that_pull_request_only_when_it_is_open() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/12" => ok(&numbered(12, 5)),
+        "/repos/owner/name/pulls/13" => {
+            let mut merged = numbered(13, 5);
+            merged["state"] = json!("closed");
+            merged["merged"] = json!(true);
+            ok(&merged)
+        }
+        _ => rep(404, ""),
+    })
+    .await;
+    let account = account(&stub.forge);
+    for query in ["12", "#12"] {
+        let prs = stub
+            .forge
+            .search_open_prs(&account, REPO, query)
+            .await
+            .unwrap();
+        assert_eq!(prs.len(), 1, "{query}");
+        assert_eq!(prs[0].number, 12);
+    }
+    assert_eq!(
+        stub.forge
+            .search_open_prs(&account, REPO, "13")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(
+        stub.forge
+            .search_open_prs(&account, REPO, "99")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(stub.seen().len(), 4);
+}
+
+#[tokio::test]
+async fn pull_request_reads_the_head_repository_and_none_for_a_missing_one() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/12" => {
+            let mut fork = numbered(12, 9);
+            fork["draft"] = json!(true);
+            fork["head"]["repo"] = json!({"clone_url": "https://forge.test/ana/name.git"});
+            ok(&fork)
+        }
+        _ => rep(404, ""),
+    })
+    .await;
+    let account = account(&stub.forge);
+    let pr = stub
+        .forge
+        .pull_request(&account, REPO, 12)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pr.state, PrState::Open);
+    assert!(pr.fork && pr.draft);
+    assert_eq!(
+        pr.head_repo_clone_url.as_deref(),
+        Some("https://forge.test/ana/name.git")
+    );
+    assert_eq!(
+        (pr.head_branch.as_str(), pr.head_sha.as_str()),
+        ("b12", "abc")
+    );
+    assert_eq!(pr.base_branch, "main");
+    assert_eq!(pr.body, "the body");
+    assert!(
+        stub.forge
+            .pull_request(&account, REPO, 99)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
