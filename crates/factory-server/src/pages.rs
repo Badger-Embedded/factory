@@ -5889,6 +5889,7 @@ pub(crate) fn task_label(task: &Task) -> &'static str {
         Task::MergeHead => "merging the commits someone else pushed to the pull request",
         Task::Rebase { .. } => "rebasing onto the newest base branch to resolve a conflict",
         Task::Review => "reviewing the pull request",
+        Task::QuickReview => "reviewing the pull request for a score",
         Task::AnalyzeFailure { .. } => "reading the CI failure log",
         Task::CheckDiff { .. } => "checking the diff of the update",
         Task::FindGaps { .. } => "looking for packaging gaps",

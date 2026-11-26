@@ -34,6 +34,10 @@ const UNCHANGED_REASON: &str = "The author added no commit after the last review
 /// the job branch.
 pub const CHECKOUT_REPAIR: &str = "The checkout is not on the job branch.";
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is stored state of the job and serialized on its own"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     /// Whether the last failed checks left the checkout off the job branch and
@@ -92,6 +96,10 @@ pub struct Job {
     /// request, whose plan already holds its number.
     #[serde(default)]
     pushed: bool,
+    /// Whether the quick review's reviewer run returned a valid result. A
+    /// retry reruns the quick review until it did, and the review loop after.
+    #[serde(default)]
+    quick_reviewed: bool,
 }
 
 /// What a job works on.
@@ -145,6 +153,20 @@ pub enum PrMode {
     QuickReview { comment: bool },
     /// Run the review loop on the pull request from the first pass.
     ReviewAndFix,
+}
+
+/// Whether the quick review's comment is on the pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommentState {
+    /// The user did not ask for a comment.
+    Off,
+    /// The factory has not posted the comment yet.
+    Pending,
+    Posted,
+    /// Posting failed. The review still shows on the job page.
+    Failed {
+        error: String,
+    },
 }
 
 /// How many times the factory reruns failed CI on one head commit of a
@@ -991,6 +1013,16 @@ pub enum Ask {
     /// the reviewer has nothing left. The job waits for the user to merge it
     /// on the forge, and keeps watching so it sees the merge or a close.
     MergeLeftToUser,
+    /// The quick review finished and the user decides what happens next:
+    /// [`Event::FixHere`] or [`Event::Cancel`].
+    QuickReview {
+        /// From 1, do not merge, to 5, safe to merge.
+        score: u8,
+        review: String,
+        /// The head commit the reviewer read.
+        head: String,
+        comment: CommentState,
+    },
     /// A Renovate job waits for the user. `reason` says why in words.
     Renovate {
         reason: String,
@@ -1096,6 +1128,10 @@ pub enum Task {
     /// Review the pull request's diff and end with `approve` or `changes`. The
     /// worker gets no GitHub token and reads the diff from the checkout.
     Review,
+    /// Review the picked pull request once, on the project's review stage
+    /// settings, and end with a score and the review text. It runs in the
+    /// review session, and the worker gets no forge token.
+    QuickReview,
     /// Read the log of failed CI on a Renovate pull request, whose automatic
     /// reruns are used up, and decide whether the failure is transient. The
     /// worker gets no GitHub token and the factory passes the log.
@@ -1352,6 +1388,24 @@ pub enum Event {
     },
     /// The factory posted the comment of [`Command::PostComment`].
     Commented,
+    /// The quick review's comment could not be posted. The ask stays.
+    CommentFailed {
+        error: String,
+    },
+    /// The quick review's reviewer run ended with `score`, from 1 to 5, and
+    /// the review text, having read `head`. Any other score fails the run.
+    QuickReviewed {
+        score: u8,
+        review: String,
+        head: String,
+    },
+    /// Fix what the quick review found in the picked pull request's branch.
+    /// `held` says a live job may push to the pull request. The job refuses
+    /// it for a fork or a held pull request, which allow only a review.
+    FixHere {
+        instructions: String,
+        held: bool,
+    },
     Merged,
     /// A Renovate pull request merged. `packaging` says the project is a
     /// packaging project and `manifest_changed` that the pull request changed
@@ -1457,6 +1511,7 @@ impl Job {
             skipped: Vec::new(),
             kind: JobKind::Request,
             pushed: false,
+            quick_reviewed: false,
         }
     }
 
@@ -1566,6 +1621,15 @@ impl Job {
     #[must_use]
     pub fn may_merge(&self) -> bool {
         self.picked_pr().is_none()
+    }
+
+    /// Whether the reviewer runs whatever the project's LLM review setting
+    /// says. True for a quick review and a review-and-fix job, whose review
+    /// was asked for.
+    #[must_use]
+    pub fn forces_review(&self) -> bool {
+        self.picked_pr()
+            .is_some_and(|picked| picked.mode != PrMode::Request)
     }
 
     /// The Renovate job and pull request number a gap job came from.
@@ -1700,6 +1764,18 @@ impl Job {
                     watch_only: true,
                 })
             }
+            (
+                Turn::User(Ask::QuickReview {
+                    comment: CommentState::Pending,
+                    score,
+                    review,
+                    head,
+                }),
+                Stage::CiAndReview { pr },
+            ) => self.plan[*pr].number.map(|number| Command::PostComment {
+                number,
+                body: Self::quick_review_comment(*score, head, review),
+            }),
             (Turn::User(Ask::MergeLeftToUser), Stage::CiAndReview { pr }) => {
                 self.plan[*pr].number.map(|number| Command::WatchPr {
                     pr: *pr,
@@ -1801,6 +1877,10 @@ impl Job {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match arm per event, as in `deliver`"
+    )]
     fn transition(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
         use Event as E;
         use Stage as S;
@@ -1817,8 +1897,18 @@ impl Job {
             return Err(self.unexpected(event));
         }
 
+        let review_mode = self.picked_pr().map(|picked| picked.mode);
         let next = match (&self.stage, &self.turn, event) {
             (_, _, E::Cancel) => (S::Cancelled, Turn::Done),
+
+            (S::Requested, Turn::Factory, E::Start)
+                if matches!(
+                    review_mode,
+                    Some(PrMode::QuickReview { .. } | PrMode::ReviewAndFix)
+                ) =>
+            {
+                self.start_review()
+            }
 
             (S::Requested, Turn::Factory, E::Start) => (
                 S::Clarifying,
@@ -1884,6 +1974,85 @@ impl Job {
             ) => (stage.clone(), Turn::Agent(Task::Revise { feedback })),
 
             (
+                S::CiAndReview { pr },
+                Turn::Agent(Task::QuickReview),
+                E::QuickReviewed {
+                    score,
+                    review,
+                    head,
+                },
+            ) => {
+                let pr = *pr;
+                if (1..=5).contains(&score) {
+                    self.quick_reviewed = true;
+                    let comment = if review_mode == Some(PrMode::QuickReview { comment: true }) {
+                        CommentState::Pending
+                    } else {
+                        CommentState::Off
+                    };
+                    (
+                        S::CiAndReview { pr },
+                        Turn::User(Ask::QuickReview {
+                            score,
+                            review,
+                            head,
+                            comment,
+                        }),
+                    )
+                } else {
+                    (
+                        S::CiAndReview { pr },
+                        Turn::User(Ask::ReviewStopped {
+                            reason: format!(
+                                "the reviewer gave the score {score}, which is not from 1 to 5"
+                            ),
+                            stop: ReviewStop::ReviewerFailed,
+                        }),
+                    )
+                }
+            }
+            (
+                S::CiAndReview { pr },
+                Turn::User(Ask::QuickReview {
+                    score,
+                    review,
+                    head,
+                    comment: CommentState::Pending,
+                }),
+                event @ (E::Commented | E::CommentFailed { .. }),
+            ) => {
+                let comment = match event {
+                    E::CommentFailed { error } => CommentState::Failed { error },
+                    _ => CommentState::Posted,
+                };
+                (
+                    S::CiAndReview { pr: *pr },
+                    Turn::User(Ask::QuickReview {
+                        score: *score,
+                        review: review.clone(),
+                        head: head.clone(),
+                        comment,
+                    }),
+                )
+            }
+            // A fix in another branch is a second event here, added with the
+            // action that sends it.
+            (
+                S::CiAndReview { pr },
+                Turn::User(Ask::QuickReview { review, .. }),
+                E::FixHere { instructions, held },
+            ) if !held && self.picked_pr().is_some_and(|picked| !picked.fork) => {
+                let comments = if instructions.trim().is_empty() {
+                    review.clone()
+                } else {
+                    format!("{review}\n\n{instructions}")
+                };
+                (
+                    S::CiAndReview { pr: *pr },
+                    Turn::Agent(Task::AddressReview { comments }),
+                )
+            }
+            (
                 S::CiAndReview { .. },
                 _,
                 event @ (E::StartReview { .. }
@@ -1911,6 +2080,30 @@ impl Job {
             (_, _, event) => return Err(self.unexpected(event)),
         };
         Ok(next)
+    }
+
+    /// Starts a quick review or a review-and-fix job. Neither runs clarify,
+    /// spec, plan or implement, so the plan holds the picked pull request.
+    fn start_review(&mut self) -> (Stage, Turn) {
+        let Some(picked) = self.picked_pr() else {
+            return (Stage::Requested, Turn::Factory);
+        };
+        let quick = matches!(picked.mode, PrMode::QuickReview { .. });
+        let mut one = Self::one_pr(Vec::new(), picked.number);
+        one.title.clone_from(&picked.title);
+        self.plan = vec![one];
+        self.review = ReviewState::Pending;
+        let turn = if quick {
+            Turn::Agent(Task::QuickReview)
+        } else {
+            Turn::Factory
+        };
+        (Stage::CiAndReview { pr: 0 }, turn)
+    }
+
+    /// The comment a quick review posts on the pull request.
+    fn quick_review_comment(score: u8, head: &str, review: &str) -> String {
+        format!("LGTM score: {score}/5\n\nReviewed commit: {head}\n\n{review}")
     }
 
     fn after_head_moved(pr: usize, conflicted: bool) -> (Stage, Turn) {
@@ -2238,7 +2431,9 @@ impl Job {
         if let Some(pr) = self.renovate_pr() {
             return Session::Renovate(pr.runs);
         }
-        if let (Stage::CiAndReview { pr }, Turn::Agent(Task::Review)) = (&self.stage, &self.turn) {
+        if let (Stage::CiAndReview { pr }, Turn::Agent(Task::Review | Task::QuickReview)) =
+            (&self.stage, &self.turn)
+        {
             return Session::Review(*pr);
         }
         match &self.stage {
@@ -2430,7 +2625,11 @@ impl Job {
                     )
                 }
             }
-            (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewFailed { reason }) => (
+            (
+                S::CiAndReview { pr },
+                Turn::Agent(Task::Review | Task::QuickReview),
+                E::ReviewFailed { reason },
+            ) => (
                 S::CiAndReview { pr: *pr },
                 Turn::User(Ask::ReviewStopped {
                     reason,
@@ -2496,6 +2695,15 @@ impl Job {
         self.reviews.iter().filter(move |pass| pass.pr == Some(pr))
     }
 
+    /// Whether the job still owes its quick review, so a retry reruns that
+    /// and not a pass of the review loop.
+    fn needs_quick_review(&self) -> bool {
+        !self.quick_reviewed
+            && self
+                .picked_pr()
+                .is_some_and(|picked| matches!(picked.mode, PrMode::QuickReview { .. }))
+    }
+
     fn current_pr(&self) -> Option<usize> {
         match self.stage {
             Stage::Implementing { pr }
@@ -2541,7 +2749,12 @@ impl Job {
                 // A reviewer run failed, so rerun the reviewer in the same
                 // review session. The round counts stay as they are.
                 ReviewStop::ReviewerFailed | ReviewStop::Unchanged => {
-                    (Stage::CiAndReview { pr }, Turn::Agent(Task::Review))
+                    let task = if self.needs_quick_review() {
+                        Task::QuickReview
+                    } else {
+                        Task::Review
+                    };
+                    (Stage::CiAndReview { pr }, Turn::Agent(task))
                 }
                 // The review hit its cap, so hand the last feedback back to
                 // the implement session and give the pull request five fresh

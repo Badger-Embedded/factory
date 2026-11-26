@@ -1,8 +1,9 @@
 use factory_core::{
-    AgentResult, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event, FixOutcome, Gates,
-    Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PickedPr, PlannedPr, PrDescription, PrDiff,
-    PrMode, Question, Rejected, RenovateAccess, RenovateCi, RenovateWait, RetryLimits, RetryTarget,
-    ReviewPass, ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
+    AgentResult, Ask, BranchSummary, Command, CommentKind, CommentState, DiffVerdict, Event,
+    FixOutcome, Gates, Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PickedPr, PlannedPr,
+    PrDescription, PrDiff, PrMode, Question, Rejected, RenovateAccess, RenovateCi, RenovateWait,
+    RetryLimits, RetryTarget, ReviewPass, ReviewState, ReviewStop, Session, Stage, Task, Turn,
+    Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -4039,4 +4040,338 @@ fn a_picked_pull_request_job_rejects_a_published_number_that_is_not_the_pick() {
     assert!(job.apply(Event::Published { number: 99 }).is_err());
     assert_eq!(job, before);
     assert_eq!(job.plan()[0].number, Some(42));
+}
+
+fn review_job(mode: PrMode, fork: bool) -> Job {
+    let mut pick = picked();
+    pick.mode = mode;
+    pick.fork = fork;
+    let mut job = Job::pull_request("", Gates::default(), pick);
+    apply(&mut job, Event::Start);
+    job
+}
+
+fn quick(comment: bool) -> Job {
+    review_job(PrMode::QuickReview { comment }, false)
+}
+
+fn quick_reviewed(job: &mut Job) {
+    apply(
+        job,
+        Event::QuickReviewed {
+            score: 4,
+            review: "Looks fine.".into(),
+            head: "abc123".into(),
+        },
+    );
+}
+
+fn quick_ask(comment: CommentState) -> Turn {
+    Turn::User(Ask::QuickReview {
+        score: 4,
+        review: "Looks fine.".into(),
+        head: "abc123".into(),
+        comment,
+    })
+}
+
+#[test]
+fn a_quick_review_runs_only_the_reviewer_and_asks_the_user() {
+    let mut job = quick(false);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(job.turn(), &Turn::Agent(Task::QuickReview));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::RunAgent {
+            session: Session::Review(0),
+            task: Task::QuickReview
+        })
+    );
+    assert_eq!(job.plan()[0].number, Some(42));
+    assert!(job.forces_review());
+
+    quick_reviewed(&mut job);
+    assert_eq!(job.turn(), &quick_ask(CommentState::Off));
+    assert_eq!(job.next_command(), None);
+}
+
+#[test]
+fn a_quick_review_score_outside_one_to_five_stops_the_review() {
+    for score in [0, 6] {
+        let mut job = quick(false);
+        apply(
+            &mut job,
+            Event::QuickReviewed {
+                score,
+                review: "x".into(),
+                head: "abc".into(),
+            },
+        );
+        assert!(matches!(
+            job.turn(),
+            Turn::User(Ask::ReviewStopped {
+                stop: ReviewStop::ReviewerFailed,
+                ..
+            })
+        ));
+        apply(&mut job, Event::Retry);
+        assert_eq!(job.turn(), &Turn::Agent(Task::QuickReview));
+    }
+}
+
+#[test]
+fn a_quick_review_comment_is_posted_once_and_the_ask_stays() {
+    let mut job = quick(true);
+    quick_reviewed(&mut job);
+    assert_eq!(job.turn(), &quick_ask(CommentState::Pending));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::PostComment {
+            number: 42,
+            body: "LGTM score: 4/5\n\nReviewed commit: abc123\n\nLooks fine.".into()
+        })
+    );
+
+    apply(&mut job, Event::Commented);
+    assert_eq!(job.turn(), &quick_ask(CommentState::Posted));
+    assert_eq!(job.next_command(), None);
+    assert!(job.apply(Event::Commented).is_err());
+}
+
+#[test]
+fn a_failed_quick_review_comment_keeps_the_review_and_the_error() {
+    let mut job = quick(true);
+    quick_reviewed(&mut job);
+    apply(
+        &mut job,
+        Event::CommentFailed {
+            error: "403 Forbidden".into(),
+        },
+    );
+    assert_eq!(
+        job.turn(),
+        &quick_ask(CommentState::Failed {
+            error: "403 Forbidden".into()
+        })
+    );
+    assert_eq!(job.next_command(), None);
+}
+
+#[test]
+fn fixing_in_a_fork_or_a_held_pull_request_is_refused() {
+    let mut fork = review_job(PrMode::QuickReview { comment: false }, true);
+    quick_reviewed(&mut fork);
+    let before = fork.clone();
+    let fix = Event::FixHere {
+        instructions: String::new(),
+        held: false,
+    };
+    assert!(fork.apply(fix.clone()).is_err());
+    assert_eq!(fork, before);
+
+    let mut held = quick(false);
+    quick_reviewed(&mut held);
+    let held_fix = Event::FixHere {
+        instructions: String::new(),
+        held: true,
+    };
+    assert!(held.apply(held_fix).is_err());
+    assert_eq!(held.turn(), &quick_ask(CommentState::Off));
+
+    assert!(quick(false).apply(fix).is_err());
+}
+
+#[test]
+fn fixing_here_sends_the_review_and_instructions_then_runs_the_loop() {
+    let mut job = quick(false);
+    quick_reviewed(&mut job);
+    apply(
+        &mut job,
+        Event::FixHere {
+            instructions: "Leave the docs alone.".into(),
+            held: false,
+        },
+    );
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(
+        job.turn(),
+        &Turn::Agent(Task::AddressReview {
+            comments: "Looks fine.\n\nLeave the docs alone.".into()
+        })
+    );
+    assert_eq!(
+        job.next_command(),
+        Some(Command::RunAgent {
+            session: Session::Pr(0),
+            task: Task::AddressReview {
+                comments: "Looks fine.\n\nLeave the docs alone.".into()
+            }
+        })
+    );
+
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
+    apply(&mut job, Event::Published { number: 42 });
+    apply(&mut job, Event::StartReview { head: "def".into() });
+    apply(&mut job, Event::ReviewApproved);
+    apply(&mut job, Event::MergeLeftToUser);
+    assert_eq!(job.turn(), &Turn::User(Ask::MergeLeftToUser));
+}
+
+#[test]
+fn the_publish_gate_stops_the_first_push_of_a_fix() {
+    let mut pick = picked();
+    pick.mode = PrMode::QuickReview { comment: false };
+    let mut gated = Job::pull_request(
+        "",
+        Gates {
+            publish: true,
+            ..Gates::default()
+        },
+        pick,
+    );
+    apply(&mut gated, Event::Start);
+    quick_reviewed(&mut gated);
+    apply(
+        &mut gated,
+        Event::FixHere {
+            instructions: String::new(),
+            held: false,
+        },
+    );
+    apply(&mut gated, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut gated, Event::ChecksPassed);
+    assert_eq!(
+        gated.turn(),
+        &Turn::User(Ask::PublishApproval { summary: None })
+    );
+}
+
+#[test]
+fn the_review_loop_after_a_quick_review_stops_at_the_round_cap() {
+    let mut job = quick(false);
+    quick_reviewed(&mut job);
+    apply(
+        &mut job,
+        Event::FixHere {
+            instructions: String::new(),
+            held: false,
+        },
+    );
+    for round in 0..MAX_REVIEW_ROUNDS {
+        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(&mut job, Event::ChecksPassed);
+        apply(&mut job, Event::Published { number: 42 });
+        apply(
+            &mut job,
+            Event::StartReview {
+                head: format!("head{round}"),
+            },
+        );
+        apply(
+            &mut job,
+            Event::ReviewChanges {
+                feedback: "more".into(),
+            },
+        );
+    }
+    assert!(matches!(
+        job.turn(),
+        Turn::User(Ask::ReviewStopped {
+            stop: ReviewStop::CapReached { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn review_and_fix_approving_on_the_first_pass_pushes_nothing() {
+    let mut job = review_job(PrMode::ReviewAndFix, false);
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(job.turn(), &Turn::Factory);
+    assert!(job.forces_review());
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 42,
+            watch_only: false
+        })
+    );
+
+    apply(&mut job, Event::StartReview { head: "abc".into() });
+    assert_eq!(job.turn(), &Turn::Agent(Task::Review));
+    apply(&mut job, Event::ReviewApproved);
+    assert!(!matches!(job.next_command(), Some(Command::Publish { .. })));
+    apply(&mut job, Event::MergeLeftToUser);
+    assert_eq!(job.turn(), &Turn::User(Ask::MergeLeftToUser));
+}
+
+#[test]
+fn review_and_fix_fixes_what_the_first_pass_asks_for() {
+    let mut job = review_job(PrMode::ReviewAndFix, false);
+    apply(&mut job, Event::StartReview { head: "abc".into() });
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "rename it".into(),
+        },
+    );
+    assert_eq!(
+        job.turn(),
+        &Turn::Agent(Task::AddressReview {
+            comments: "rename it".into()
+        })
+    );
+}
+
+#[test]
+fn a_failed_quick_review_retries_the_quick_review_and_a_failed_loop_pass_the_loop() {
+    let mut job = quick(false);
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "timed out".into(),
+        },
+    );
+    assert!(job.can_retry());
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.turn(), &Turn::Agent(Task::QuickReview));
+
+    quick_reviewed(&mut job);
+    apply(
+        &mut job,
+        Event::FixHere {
+            instructions: String::new(),
+            held: false,
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 42 });
+    apply(&mut job, Event::StartReview { head: "abc".into() });
+    apply(
+        &mut job,
+        Event::ReviewFailed {
+            reason: "crashed".into(),
+        },
+    );
+    apply(&mut job, Event::Retry);
+    assert_eq!(job.turn(), &Turn::Agent(Task::Review));
+}
+
+#[test]
+fn a_quick_review_job_can_be_cancelled_while_it_waits() {
+    let mut job = quick(true);
+    quick_reviewed(&mut job);
+    apply(&mut job, Event::Cancel);
+    assert_eq!(job.stage(), &Stage::Cancelled);
+    assert_eq!(job.next_command(), None);
+}
+
+#[test]
+fn a_request_on_a_picked_pull_request_does_not_force_the_review() {
+    assert!(!picked_watching().forces_review());
+    assert!(!Job::new("x", Gates::default()).forces_review());
 }
