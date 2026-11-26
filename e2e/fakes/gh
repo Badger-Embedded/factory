@@ -1,5 +1,102 @@
 #!/usr/bin/env bash
 # Stands in for the GitHub CLI. The browser tests never reach GitHub.
+# The pull request picker's searches. A repository's pull requests come from
+# pull_table, as number|title|author|head branch|base branch|fork|draft: a
+# repository named `prs`, `prs-N` and so on has one of each kind, `many` has 21
+# and `broken` fails. A suffix lets each test have its own project, because a
+# repository belongs to one project.
+pull_table() {
+  case "${1%%-*}" in
+    prs)
+      echo '101|Add dark mode|carol|carol/dark|main|false|false'
+      echo '102|Fix typo in README|dan|dan/typo|main|true|false'
+      echo '103|Rework the parser|erin|erin/parser|main|false|true'
+      echo '104|Update dependency foo to v2|renovate[bot]|renovate/foo-2.x|main|false|false'
+      echo '105|Prepare the release train|carol|release|next|false|false'
+      ;;
+    many)
+      for n in $(seq 1 21); do echo "$n|Many pull request $n|carol|many/$n|main|false|false"; done
+      ;;
+  esac
+}
+
+pull_rest() {
+  while IFS='|' read -r number title author head base fork draft; do
+    head_repo="e2e/$1"
+    [ "$fork" = true ] && head_repo="$author/$1"
+    printf '{"number":%s,"title":"%s","state":"open","draft":%s,"html_url":"https://github.com/e2e/%s/pull/%s","user":{"login":"%s"},"head":{"sha":"abc","ref":"%s","repo":{"full_name":"%s"}},"base":{"sha":"def","ref":"%s","repo":{"full_name":"e2e/%s"}}}\n' \
+      "$number" "$title" "$draft" "$1" "$number" "$author" "$head" "$head_repo" "$base" "$1"
+  done
+}
+
+join_rows() {
+  paste -sd, - | sed 's/^/[/; s/$/]/'
+}
+
+pull_search() {
+  repo=$1
+  shift
+  if [ "${repo%%-*}" = broken ]; then
+    echo "gh: API rate limit exceeded (HTTP 403)" >&2
+    exit 1
+  fi
+  for arg in "$@"; do
+    case "$arg" in
+      repos/e2e/*/pulls/*)
+        number=${arg##*/}
+        row=$(pull_table "$repo" | awk -F'|' -v n="$number" '$1 == n')
+        if [ -z "$row" ]; then
+          echo "gh: Not Found (HTTP 404)" >&2
+          exit 1
+        fi
+        echo "$row" | pull_rest "$repo"
+        exit 0
+        ;;
+      repos/e2e/*/pulls)
+        pull_table "$repo" | head -n 21 | pull_rest "$repo" | join_rows
+        exit 0
+        ;;
+      q=*)
+        words=${arg##*in:title }
+        words=${words//\"/}
+        pull_table "$repo" | while IFS='|' read -r number title author head base fork draft; do
+          match=true
+          for word in $words; do
+            case "${title,,}" in *"${word,,}"*) ;; *) match=false ;; esac
+          done
+          [ "$match" = true ] || continue
+          cross=false
+          [ "$fork" = true ] && cross=true
+          printf '{"number":%s,"title":"%s","url":"https://github.com/e2e/%s/pull/%s","isDraft":%s,"isCrossRepository":%s,"headRefName":"%s","baseRefName":"%s","author":{"login":"%s"}}\n' \
+            "$number" "$title" "$repo" "$number" "$draft" "$cross" "$head" "$base" "$author"
+        done | head -n 21 | join_rows
+        exit 0
+        ;;
+    esac
+  done
+}
+
+if [ "$1" = api ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      repos/e2e/prs*/pulls | repos/e2e/prs*/pulls/* | repos/e2e/many*/pulls | repos/e2e/many*/pulls/* | repos/e2e/broken*/pulls)
+        repo=${arg#repos/e2e/}
+        pull_search "${repo%%/*}" "$@"
+        ;;
+    esac
+  done
+  if [ "$2" = graphql ]; then
+    for arg in "$@"; do
+      case "$arg" in
+        q=repo:e2e/*)
+          repo=${arg#q=repo:e2e/}
+          pull_search "${repo%% *}" "$@"
+          ;;
+      esac
+    done
+  fi
+fi
+
 if [ "$1" = api ]; then
   case "$2" in
     user)

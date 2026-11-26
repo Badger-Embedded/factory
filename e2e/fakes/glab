@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 # Stands in for the GitLab CLI. The browser tests never reach Salsa.
+salsa_mr() {
+  case "$1" in
+    1) set -- 1 "Salsa add a flag" flag false 5 carol ;;
+    2) set -- 2 "Salsa fork fix" fork-fix false 9 dan ;;
+    3) set -- 3 "Salsa rework" rework true 5 erin ;;
+    *) return 1 ;;
+  esac
+  echo "{\"iid\":$1,\"title\":\"$2\",\"state\":\"opened\",\"source_branch\":\"$3\",\"target_branch\":\"main\",\"draft\":$4,\"source_project_id\":$5,\"target_project_id\":5,\"web_url\":\"https://salsa.debian.org/e2e/sub/good/-/merge_requests/$1\",\"author\":{\"username\":\"$6\"}}"
+}
+
 if [ "$1" = api ] && [ "$GITLAB_HOST" = salsa.debian.org ]; then
   case "$2 $3" in
     "--method GET")
@@ -14,7 +24,7 @@ if [ "$1" = api ] && [ "$GITLAB_HOST" = salsa.debian.org ]; then
         exit 1
       fi
       # The Renovate settings test onboards its own project, apart from good.
-      set -- "$1" "$2" "$3" "${4//e2e%2Fsub%2Frenovate/e2e%2Fsub%2Fgood}"
+      set -- "$1" "$2" "$3" "${4//e2e%2Fsub%2Frenovate/e2e%2Fsub%2Fgood}" "${@:5}"
       case "$4" in
         projects/e2e%2Fsub%2Fgood)
           echo '{"squash_option":"default_on","permissions":{"project_access":{"access_level":30},"group_access":null}}'
@@ -44,6 +54,30 @@ if [ "$1" = api ] && [ "$GITLAB_HOST" = salsa.debian.org ]; then
           # Readable only with deb-bot's token, as a private repository is.
           if [ "$GITLAB_TOKEN" = tok-e2e-deb ]; then
             echo '{"permissions":{"project_access":null,"group_access":null}}'
+            exit 0
+          fi
+          echo "glab: 404 Not Found (HTTP 404)" >&2
+          exit 1
+          ;;
+        projects/e2e%2Fsub%2Fgood/merge_requests)
+          search=""
+          for arg in "$@"; do
+            case "$arg" in search=*) search=${arg#search=} ;; esac
+          done
+          out=""
+          for number in 1 2 3; do
+            mr=$(salsa_mr "$number")
+            title=${mr#*\"title\":\"}
+            title=${title%%\"*}
+            [[ "${title,,}" == *"${search,,}"* ]] || continue
+            out="${out:+$out,}$mr"
+          done
+          echo "[$out]"
+          exit 0
+          ;;
+        projects/e2e%2Fsub%2Fgood/merge_requests/[0-9]*)
+          if mr=$(salsa_mr "${4##*/}"); then
+            echo "$mr"
             exit 0
           fi
           echo "glab: 404 Not Found (HTTP 404)" >&2

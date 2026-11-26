@@ -1,3 +1,4 @@
+import type { Page } from '@playwright/test';
 import {
   ADMIN,
   COLLABORATOR,
@@ -6,7 +7,7 @@ import {
   test as base,
   type Factory,
 } from '../fixtures';
-import { startForgejoStub } from '../forgejo-stub';
+import { forgejoPull, forgejoPullList, startForgejoStub } from '../forgejo-stub';
 
 const test = base.extend<{ own: Factory }>({
   own: async ({}, use) => {
@@ -232,6 +233,115 @@ test('a newly registered Forgejo server is selectable at onboarding and as an up
     await card.getByRole('button', { name: 'Clear mine upstream token' }).click();
     await expect(card.locator('#upstream-token-mine')).toContainText('No mine token is stored.');
     await expect(page.locator('#forge-account')).toContainText('alice-bot');
+  } finally {
+    await stub.stop();
+  }
+});
+
+async function saveProjectToken(page: Page, project: string, token: string) {
+  await page.goto(`/settings/projects/${project}`);
+  await page.locator('#forge-account').getByLabel('Project token').fill(token);
+  await page.getByRole('button', { name: 'Save project token' }).click();
+  await expect(page.getByText('Saved. The project token belongs to')).toBeVisible();
+}
+
+test('the pull request picker searches a GitHub project and a Salsa project', async ({ page, own }) => {
+  await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': ADMIN });
+  own.fixture('project', '--name', 'hub', '--login', ADMIN, '--repo', 'e2e/prs');
+  own.fixture('project', '--name', 'deb', '--login', ADMIN, '--repo', 'e2e/sub/good', '--forge', 'salsa');
+
+  for (const [project, token] of [
+    ['hub', 'tok-e2e-alice'],
+    ['deb', 'tok-e2e-deb'],
+  ]) {
+    await saveProjectToken(page, project, token);
+  }
+
+  const rows = page.locator('#pr-results li[role="option"]');
+  const open = async (project: string) => {
+    await page.goto(`/?project=${project}`);
+    await page.locator('#request').click();
+    await page.getByRole('combobox', { name: 'Pull request' }).click();
+  };
+
+  await open('hub');
+  await expect(rows).toHaveCount(5);
+  await expect(rows.nth(1).locator('.badge')).toHaveText('fork');
+
+  await open('deb');
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(0)).toContainText('Salsa add a flag');
+  await expect(rows.nth(1).locator('.badge')).toHaveText('fork');
+  await expect(rows.nth(2).locator('.badge')).toHaveText('draft');
+
+  const search = page.getByRole('combobox', { name: 'Pull request' });
+  await search.fill('REWORK');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.nth(0)).toContainText('Salsa rework');
+  await search.fill('#2');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.nth(0)).toContainText('Salsa fork fix');
+  await search.fill('#99');
+  await expect(page.locator('#pr-results .pr-note')).toHaveText('No pull request matches.');
+});
+
+test('the pull request picker searches a Forgejo project', async ({ page, own }) => {
+  const stub = await startForgejoStub(own);
+  try {
+    stub.route((request, url) => {
+      if (!url.pathname.endsWith('/api/v1/user')) return undefined;
+      return request.headers.authorization === 'token tok-e2e-forgejo'
+        ? { body: { login: 'forgejo-bot', id: 9 } }
+        : { status: 401, body: { message: 'bad token' } };
+    });
+    stub.route((_request, url) =>
+      url.pathname.endsWith('/api/v1/repos/owner/name')
+        ? { body: { permissions: { admin: false, push: true, pull: true } } }
+        : undefined,
+    );
+    stub.route(
+      forgejoPullList('owner/name', [
+        forgejoPull(1, 'Forgejo add a flag'),
+        forgejoPull(2, 'Forgejo fork fix', { fork: true }),
+        forgejoPull(3, 'Forgejo rework', { draft: true }),
+      ]),
+    );
+    // Routes added later are tried first, so this answers before the list above.
+    stub.route((_request, url) =>
+      url.pathname.endsWith('/api/v1/repos/owner/name/issues') && url.searchParams.get('q') === 'flaky'
+        ? { body: Array.from({ length: 21 }, (_, i) => ({ number: 100 + i, title: `Other ${i}` })) }
+        : undefined,
+    );
+    own.fixture('project', '--name', 'forgejo', '--login', ADMIN, '--repo', 'owner/name', '--forge', 'mine');
+
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': ADMIN });
+    await page.goto('/settings/forgejo');
+    await page.getByLabel('Name', { exact: true }).fill('mine');
+    await page.getByLabel('URL', { exact: true }).fill(stub.url);
+    await page.getByRole('button', { name: 'Add server' }).click();
+    await expect(page.getByText(`Added mine at ${stub.url}.`)).toBeVisible();
+    await saveProjectToken(page, 'forgejo', 'tok-e2e-forgejo');
+
+    await page.goto('/?project=forgejo');
+    await page.locator('#request').click();
+    await page.getByRole('combobox', { name: 'Pull request' }).click();
+    const rows = page.locator('#pr-results li[role="option"]');
+    await expect(rows).toHaveCount(3);
+    await expect(rows.nth(0)).toContainText('Forgejo add a flag');
+    await expect(rows.nth(1).locator('.badge')).toHaveText('fork');
+    await expect(rows.nth(2).locator('.badge')).toHaveText('draft');
+
+    const search = page.getByRole('combobox', { name: 'Pull request' });
+    await search.fill('rework');
+    await expect(rows).toHaveCount(1);
+    await expect(rows.nth(0)).toContainText('Forgejo rework');
+    await search.fill('#2');
+    await expect(rows).toHaveCount(1);
+    await expect(rows.nth(0)).toContainText('Forgejo fork fix');
+
+    await search.fill('flaky');
+    await expect(page.locator('#pr-results .pr-error')).toContainText('title matches may be incomplete');
+    await expect(rows).toHaveCount(0);
   } finally {
     await stub.stop();
   }
