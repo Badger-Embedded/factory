@@ -969,3 +969,78 @@ async fn a_push_that_fails_for_another_reason_is_not_reported_as_rejected() {
         .unwrap_err();
     assert!(matches!(err, factory_runner::PushError::Failed(_)), "{err}");
 }
+
+#[tokio::test]
+async fn a_pending_base_merge_is_dropped_when_the_pull_request_head_moved() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "README", "pr edit");
+    commit(&remote.upstream(), "README", "main edit");
+    git(&remote.upstream(), &["push", "-q", "origin", "main"]);
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert!(!git_.merge_base(&work, "main").await.unwrap());
+
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, "theirs", "foreign commit");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            bare.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    prepare_pr(&remote, &git_, "main", head).await;
+
+    assert!(!work.join(".git/MERGE_HEAD").exists());
+    assert!(work.join("theirs").exists());
+    assert_eq!(git(&work, &["status", "--porcelain"]), "");
+    assert!(!git_.merge_base(&work, "main").await.unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_denied_push_is_not_reported_as_rejected_when_the_head_also_moved() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    git(
+        remote.root.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/pr-branch",
+            "refs/pull/5/head",
+        ],
+    );
+    prepare_pr(&remote, &Git::default(), "main", head).await;
+    commit(&work, "fix", "agent fix");
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, "theirs", "foreign commit");
+    git(&upstream, &["push", "-q", "origin", "pr-branch"]);
+    let tools = tempfile::tempdir().unwrap();
+    let git_ = fake_git(
+        tools.path(),
+        "if echo \"$@\" | grep -q ' push '; then\n  echo ' ! [remote rejected] pr-branch (permission denied)' >&2\n  exit 1\nfi\nexec git \"$@\"",
+    );
+    let err = git_
+        .push_fast_forward(
+            &work,
+            &|| Ok(remote.remote()),
+            "pr-branch",
+            "pr-branch",
+            &|| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, factory_runner::PushError::Failed(_)), "{err}");
+}

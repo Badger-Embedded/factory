@@ -143,8 +143,10 @@ impl Git {
     /// existing one keeps its commits: it fast-forwards to a head that moved,
     /// or takes the new head in with a merge commit. A merge that conflicts is
     /// aborted and returned as an error. A merge of the base that an earlier
-    /// run left conflicted stays as it is when its branch is checked out, so
-    /// the agent can finish it. `origin/<base>` is fetched too, for diffs
+    /// run left conflicted stays as it is when its branch is checked out, it
+    /// already holds the pull request's head and it merges the fetched base,
+    /// so the agent can finish it. Otherwise it is aborted and the branch
+    /// synchronized, and the caller merges the base again. `origin/<base>` is fetched too, for diffs
     /// against the pull request's own base.
     ///
     /// # Errors
@@ -176,7 +178,24 @@ impl Git {
         }
         if work.join(".git/MERGE_HEAD").exists() {
             let current = self.run(work, &["branch", "--show-current"], None).await?;
-            if current.trim() == branch {
+            let base_ref = format!("refs/remotes/origin/{base}");
+            let merging = self
+                .run(work, &["rev-parse", "MERGE_HEAD"], None)
+                .await
+                .map(|out| out.trim().to_owned());
+            let base_tip = self
+                .run(work, &["rev-parse", &base_ref], None)
+                .await
+                .map(|out| out.trim().to_owned());
+            let head_seen = self
+                .run(
+                    work,
+                    &["merge-base", "--is-ancestor", &tracking, "HEAD"],
+                    None,
+                )
+                .await
+                .is_ok();
+            if current.trim() == branch && head_seen && merging.is_ok() && merging == base_tip {
                 return Ok(());
             }
             self.run(work, &["merge", "--abort"], None).await?;
@@ -286,15 +305,16 @@ impl Git {
             // updating one is reported as a generic remote failure, so look at
             // the remote branch before calling this one anything else.
             let moved = err.contains("[rejected]")
-                || self
-                    .remote_branch_moved(
-                        transfer.path(),
-                        &git_dir,
-                        remote,
-                        branch_on_remote,
-                        &local,
-                    )
-                    .await;
+                || err.contains("failed to update ref")
+                    && self
+                        .remote_branch_moved(
+                            transfer.path(),
+                            &git_dir,
+                            remote,
+                            branch_on_remote,
+                            &local,
+                        )
+                        .await;
             return Err(if moved {
                 PushError::Rejected(format!(
                     "the pull request's branch has new commits, so the push was rejected: {err}"
