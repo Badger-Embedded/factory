@@ -8819,3 +8819,56 @@ async fn a_publish_that_stops_fails_the_job_with_the_reason_and_retry_publishes_
     step(&scheduler).await;
     assert_eq!(executor.published.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn a_checkout_repair_keeps_the_checkout_after_the_agent_asks_a_question() {
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&asked);
+    let (store, executor, scheduler) = setup(move |request| {
+        if request.keep_checkout && !seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            questions()
+        } else {
+            Event::Agent(AgentResult::CommitsReady(ready()))
+        }
+    });
+    quick_polls(&store);
+    executor
+        .checks
+        .lock()
+        .unwrap()
+        .push_back(Ok(Event::ChecksFailed {
+            report: format!("{} It is on other.", factory_core::CHECKOUT_REPAIR),
+        }));
+    executor.release(1); // the repair run starts without waiting
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+    assert!(
+        matches!(
+            store.get(id).unwrap().job.turn(),
+            Turn::User(Ask::Answers { .. })
+        ),
+        "{:?}",
+        store.get(id).unwrap().job.turn()
+    );
+    assert!(
+        executor
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .keep_checkout
+    );
+
+    assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+    store.apply(id, Event::Answer(vec!["yes".into()])).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // the answer resumes the repair
+
+    let request = executor.requests.lock().unwrap().last().unwrap().clone();
+    assert!(request.keep_checkout);
+    assert!(
+        request.prompt.contains("Which board?"),
+        "{}",
+        request.prompt
+    );
+}

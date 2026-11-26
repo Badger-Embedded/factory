@@ -30,8 +30,17 @@ const UNCHANGED_REASON: &str = "The author added no commit after the last review
      verdict. Merge the pull request on GitHub to accept it as it is, or retry to run the \
      reviewer again.";
 
+/// What a failed check report starts with when the checks left the checkout off
+/// the job branch.
+pub const CHECKOUT_REPAIR: &str = "The checkout is not on the job branch.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
+    /// Whether the last failed checks left the checkout off the job branch and
+    /// an agent run is repairing it, including a run that resumes after an
+    /// answer.
+    #[serde(default)]
+    checkout_repair: bool,
     request: String,
     stage: Stage,
     turn: Turn,
@@ -1430,6 +1439,7 @@ impl Job {
     #[must_use]
     pub fn new(request: impl Into<String>, gates: Gates) -> Self {
         Job {
+            checkout_repair: false,
             request: request.into(),
             stage: Stage::Requested,
             turn: Turn::Factory,
@@ -1533,6 +1543,13 @@ impl Job {
             | JobKind::Fix { .. }
             | JobKind::PullRequest(_) => None,
         }
+    }
+
+    /// Whether the agent run now due repairs a checkout the checks left off the
+    /// job branch.
+    #[must_use]
+    pub fn repairing_checkout(&self) -> bool {
+        self.checkout_repair
     }
 
     /// The pull request the user picked, or `None` for any other job.
@@ -1927,7 +1944,10 @@ impl Job {
             (S::Verifying { pr }, Turn::Factory, E::ChecksError { error }) => {
                 self.checks_error(*pr, &error)
             }
-            (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => self.after_checks(*pr),
+            (S::Verifying { pr }, Turn::Factory, E::ChecksPassed) => {
+                self.checkout_repair = false;
+                self.after_checks(*pr)
+            }
             (
                 S::Verifying { pr },
                 Turn::User(Ask::PublishApproval { summary: None }),
@@ -1951,6 +1971,7 @@ impl Job {
             ),
             (S::Verifying { pr }, Turn::Factory, E::ChecksFailed { report }) => {
                 let pr = *pr;
+                self.checkout_repair = report.starts_with(CHECKOUT_REPAIR);
                 self.fail_round(S::Verifying { pr }, Turn::Agent(Task::FixChecks { report }))
             }
 

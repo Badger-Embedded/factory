@@ -54,10 +54,6 @@ pub fn branch_name(job_id: i64, pr: usize) -> String {
     format!("factory/job-{job_id}-pr-{}", pr + 1)
 }
 
-/// What a failed check report starts with when the checks left the checkout off
-/// the job branch.
-pub const CHECKOUT_REPAIR: &str = "The checkout is not on the job branch.";
-
 struct JobRefs {
     /// The branch of the job's checkout.
     branch: String,
@@ -1572,7 +1568,9 @@ impl<E: Executor> Scheduler<E> {
                 .flatten(),
             merge_base: refs.picked.is_some() && matches!(task, factory_core::Task::Rebase { .. }),
             keep_checkout: refs.picked.is_some()
-                && matches!(task, factory_core::Task::FixChecks { report } if report.starts_with(CHECKOUT_REPAIR)),
+                && (matches!(task, factory_core::Task::FixChecks { report } if report.starts_with(factory_core::CHECKOUT_REPAIR))
+                    || matches!(task, factory_core::Task::Answer { .. })
+                        && job.repairing_checkout()),
             session_id,
             agent_session,
             agent,

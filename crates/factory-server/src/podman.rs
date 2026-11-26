@@ -20,14 +20,15 @@ use crate::forges::Forges;
 use crate::local_server::{LoadError, LocalServerProbe};
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
-    APPROVAL, AgentRequest, CHECKOUT_REPAIR, ChecksRequest, Executor, ExistingPr, LocalKeyOwner,
-    LogSink, PackagingRequest, PublishRequest, Published, ReadyAction, Rebase,
-    RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest,
-    ready_action, watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, LocalKeyOwner, LogSink,
+    PackagingRequest, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest,
+    RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action,
+    watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
 use crate::usage::PlanUsageCache;
+use factory_core::CHECKOUT_REPAIR;
 
 /// Runs agents in podman worker containers.
 ///
