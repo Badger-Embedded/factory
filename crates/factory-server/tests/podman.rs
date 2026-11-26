@@ -98,6 +98,8 @@ fn request() -> AgentRequest {
         repo: "owner/name".into(),
         base: "main".into(),
         branch: None,
+        existing: None,
+        merge_base: false,
         session_id: "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10".into(),
         agent_session: None,
         agent: factory_core::DEFAULT_AGENT,
@@ -1040,6 +1042,7 @@ async fn clone_push_and_every_gh_call_use_the_token_of_the_account_the_request_n
             repo: "o/r".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
@@ -1120,6 +1123,7 @@ async fn a_token_that_changes_during_a_publish_applies_to_the_next_operation() {
             repo: "o/r".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
@@ -1178,6 +1182,7 @@ async fn a_push_is_logged_even_when_the_pull_request_step_has_no_account() {
             repo: "o/r".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
@@ -1270,6 +1275,7 @@ async fn a_refused_token_reading_a_ci_log_after_a_good_status_read_fails_the_wat
             number: 5,
             seen_until: None,
             auto_merge: false,
+            may_merge: true,
             llm_review: false,
             review_approved: false,
             watch_only: false,
@@ -1601,6 +1607,7 @@ async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account
             repo: "team/forged".into(),
             base: "main".into(),
             branch: "factory/job-7-pr-1".into(),
+            existing: None,
             description: factory_core::PrDescription {
                 title: "t".into(),
                 body: "b".into(),
@@ -1728,4 +1735,61 @@ async fn a_local_session_records_its_cli_once_the_worker_has_started() {
     let (recorded, _, _) = local_launch("#!/bin/bash\necho '{}'\nexit 0\n", Cli::Copilot).await;
 
     assert_eq!(recorded, Some(Cli::Copilot));
+}
+
+#[tokio::test]
+async fn publishing_to_a_picked_pull_request_pushes_its_branch_and_never_opens_or_edits_one() {
+    let tools = Tools::new();
+    let calls = tools.dir.path().join("calls");
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        &format!(
+            "#!/bin/bash\necho \"gh $* | ${{GH_TOKEN}}\" >> '{calls}'\n\
+             case \"$*\" in\n\
+             *pulls/12*) echo '{{\"number\":12,\"state\":\"open\",\"merged\":false,\
+             \"head\":{{\"sha\":\"a\",\"ref\":\"carol/reboot\",\"repo\":{{\"full_name\":\"o/r\"}}}},\
+             \"base\":{{\"sha\":\"b\",\"ref\":\"develop\",\"repo\":{{\"full_name\":\"o/r\"}}}}}}' ;;\n\
+             esac\n",
+            calls = calls.display()
+        ),
+    );
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    let published = podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+            repo: "o/r".into(),
+            base: "develop".into(),
+            branch: "factory/job-7-pr-1".into(),
+            existing: Some(factory_server::ExistingPr {
+                number: 12,
+                head_branch: "carol/reboot".into(),
+                head_ref: "refs/pull/12/head".into(),
+            }),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            pushed: factory_server::PushLog::new(|_| {}),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(published, factory_server::Published::Open(12)));
+    let calls = tools.calls();
+    let push = calls
+        .lines()
+        .find(|call| call.starts_with("git ") && call.contains(" push "))
+        .unwrap_or_else(|| panic!("no push in {calls}"));
+    assert!(push.contains("refs/heads/carol/reboot"), "{push}");
+    assert!(!push.contains("--force"), "{push}");
+    for call in calls.lines().filter(|call| call.starts_with("gh ")) {
+        assert!(
+            !call.contains("pr create") && !call.contains("pr edit"),
+            "{call}"
+        );
+    }
 }

@@ -10,9 +10,9 @@ use factory_core::{
 };
 use factory_runner::{
     Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LocalTarget, LogLine,
-    NOT_PERMITTED, Observation, PrState, RebaseCheckbox, Remote, RenovatePr, Rerun, RunReport,
-    SessionRun, WorkerConfig, WorkerRun, backend_for, observe, place_files, place_images,
-    remove_container, run, run_checks, show_files, show_images,
+    NOT_PERMITTED, Observation, PrState, PushError, RebaseCheckbox, Remote, RemoteSource,
+    RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend_for, observe,
+    place_files, place_images, remove_container, run, run_checks, show_files, show_images,
 };
 
 use crate::accounts::{AccountSource, Operation, blame, credential_reason};
@@ -20,9 +20,10 @@ use crate::forges::Forges;
 use crate::local_server::{LoadError, LocalServerProbe};
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, LocalKeyOwner, LogSink, PackagingRequest,
-    PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest,
-    SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action, watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, LocalKeyOwner, LogSink,
+    PackagingRequest, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest,
+    RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action,
+    watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -265,6 +266,121 @@ impl PodmanExecutor {
         result.map_err(|error| load_failure(&error, local, model))
     }
 
+    /// Checks out the head of the picked pull request into `branch`, and for a
+    /// conflict run starts merging the base branch in. A merge a run left
+    /// unfinished stays as it is.
+    async fn prepare_picked(
+        &self,
+        request: &AgentRequest,
+        workspace: &Path,
+        remote: &RemoteSource<'_>,
+        existing: &ExistingPr,
+        branch: &str,
+    ) -> Result<(), String> {
+        self.git
+            .prepare_pr(
+                workspace,
+                remote,
+                &request.base,
+                &existing.head_ref,
+                existing.number,
+                branch,
+            )
+            .await?;
+        if request.merge_base && !workspace.join(".git/MERGE_HEAD").exists() {
+            self.git.merge_base(workspace, &request.base).await?;
+        }
+        Ok(())
+    }
+
+    /// Pushes the branch's new commits to the picked pull request's own branch
+    /// without force, and touches nothing else on the pull request: no title,
+    /// no description, no merge. A push that the remote refuses because
+    /// someone pushed meanwhile brings their commits into the checkout with a
+    /// merge and pushes again, so the factory neither drops nor overwrites
+    /// them. It does not rerun the checks on that merge. The CI watch that
+    /// follows covers it.
+    async fn publish_existing(
+        &self,
+        request: &PublishRequest,
+        existing: &ExistingPr,
+        forge: &dyn Forge,
+    ) -> Result<Published, String> {
+        const ATTEMPTS: usize = 3;
+        let reader = request.account.resolve()?;
+        let found = blame(
+            &reader.owner,
+            forge
+                .pull_request(&reader.account, &request.repo, existing.number)
+                .await,
+        )?;
+        match found.map(|pr| pr.state) {
+            Some(PrState::Open) => {}
+            Some(PrState::Merged) => return Ok(Published::AlreadyMerged(existing.number)),
+            Some(PrState::Closed) => return Ok(Published::AlreadyClosed(existing.number)),
+            None => {
+                return Err(format!(
+                    "pull request #{} no longer exists",
+                    existing.number
+                ));
+            }
+        }
+        let workspace = self.job_dir(request.job_id).join("work");
+        let pusher = Mutex::new(None);
+        let remote = || {
+            let operation = request.account.resolve()?;
+            let remote = Remote::new(forge, &operation.account, &request.repo);
+            *pusher.lock().unwrap_or_else(PoisonError::into_inner) = Some(operation);
+            Ok(remote)
+        };
+        let record = || {
+            if let Some(operation) = &*pusher.lock().unwrap_or_else(PoisonError::into_inner) {
+                request.pushed.record(&format!(
+                    "{} ({})",
+                    operation.account.login,
+                    operation.owner.label()
+                ));
+            }
+        };
+        let mut result = Ok(());
+        for attempt in 1..=ATTEMPTS {
+            result = self
+                .git
+                .push_fast_forward(
+                    &workspace,
+                    &remote,
+                    &request.branch,
+                    &existing.head_branch,
+                    &record,
+                )
+                .await;
+            if !matches!(result, Err(PushError::Rejected(_))) || attempt == ATTEMPTS {
+                break;
+            }
+            self.git
+                .prepare_pr(
+                    &workspace,
+                    &remote,
+                    &request.base,
+                    &existing.head_ref,
+                    existing.number,
+                    &request.branch,
+                )
+                .await?;
+        }
+        let owner = pusher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|operation| operation.owner.clone());
+        let result = result.map_err(|err| err.to_string());
+        match &owner {
+            Some(owner) => blame(owner, result)?,
+            None => result?,
+        }
+        Ok(Published::Open(existing.number))
+    }
+
     async fn prepare_checkout(
         &self,
         request: &AgentRequest,
@@ -278,10 +394,17 @@ impl PodmanExecutor {
             *owner.lock().unwrap_or_else(PoisonError::into_inner) = Some(operation.owner);
             Ok(remote)
         };
-        let result = self
-            .git
-            .prepare(workspace, &remote, &request.base, request.branch.as_deref())
-            .await;
+        let result = match (&request.existing, request.branch.as_deref()) {
+            (Some(existing), Some(branch)) => {
+                self.prepare_picked(request, workspace, &remote, existing, branch)
+                    .await
+            }
+            _ => {
+                self.git
+                    .prepare(workspace, &remote, &request.base, request.branch.as_deref())
+                    .await
+            }
+        };
         let owner = owner.into_inner().unwrap_or_else(PoisonError::into_inner);
         let result = match &owner {
             Some(owner) => blame(owner, result),
@@ -490,7 +613,7 @@ impl Executor for PodmanExecutor {
         let workspace = self.job_dir(request.job_id).join("work");
         let attributed = self
             .git
-            .attributed_commits(&workspace, &request.base)
+            .attributed_commits_after(&workspace, &request.base, request.existing)
             .await?;
         if !attributed.is_empty() {
             return Ok(Event::ChecksFailed {
@@ -521,6 +644,9 @@ impl Executor for PodmanExecutor {
 
     async fn publish(&self, request: PublishRequest) -> Result<Published, String> {
         let forge = self.forges.forge(&request.forge);
+        if let Some(existing) = &request.existing {
+            return self.publish_existing(&request, existing, &*forge).await;
+        }
         let lookup = request.account.resolve()?;
         if let Some(number) = blame(
             &lookup.owner,
@@ -611,6 +737,7 @@ impl Executor for PodmanExecutor {
                 request.llm_review,
                 request.review_approved,
                 request.auto_merge,
+                request.may_merge,
             ) {
                 ReadyAction::Review => (
                     Some(Event::StartReview {
@@ -630,6 +757,7 @@ impl Executor for PodmanExecutor {
                     (Some(Event::Merged), None)
                 }
                 ReadyAction::Wait => (None, None),
+                ReadyAction::LeaveToUser => (Some(Event::MergeLeftToUser), None),
             },
             Observation::Merged => (Some(Event::Merged), None),
             Observation::Closed => (Some(Event::ClosedUnmerged), None),

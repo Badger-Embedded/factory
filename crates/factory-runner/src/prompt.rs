@@ -40,7 +40,35 @@ fn style(target: PromptTarget) -> PromptStyle {
 /// a review run follows to find its method.
 #[must_use]
 pub fn prompt(task: &Task, expect: Expect, agent: impl Into<PromptTarget>) -> String {
-    let agent = agent.into();
+    prompt_for(task, expect, agent.into(), false)
+}
+
+fn rebase_prompt(base: &str, picked: bool) -> String {
+    if picked {
+        format!(
+            "The pull request no longer merges cleanly into {base}. The factory started \
+             merging the newest origin/{base} into this checkout. If conflicts remain, \
+             resolve them so that both your change and the changes on {base} keep working, \
+             stage the files and finish the merge with `git commit --no-edit`. Do not \
+             rebase, and do not rewrite or drop any commit, because the pull request holds \
+             commits the factory did not write. Run the tests. Do not push. Leave the pull \
+             request title and description alone."
+        )
+    } else {
+        format!(
+            "The pull request no longer merges cleanly into {base}. The factory fetched \
+             the newest origin/{base} into this checkout. Rebase the branch onto \
+             origin/{base} and resolve the conflicts so that both your change and the \
+             changes on {base} keep working. Run the tests. Do not push. Update the pull \
+             request title and description if the rebase changed what they describe."
+        )
+    }
+}
+
+/// [`prompt`], for a job on a picked pull request when `picked` is set. The
+/// branch then holds commits the factory did not write and the pull request
+/// is not the factory's to retitle, so the prompt says to keep both.
+fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) -> String {
     let mut text = match task {
         Task::Clarify { request } => format!(
             "This is a feature request for the repository in the current directory:\n\n\
@@ -83,6 +111,9 @@ pub fn prompt(task: &Task, expect: Expect, agent: impl Into<PromptTarget>) -> St
                  the way CONTRIBUTING.md asks.",
                 style(agent).rules_doc
             );
+            if picked {
+                text.push_str(PICKED_NOTE);
+            }
             text
         }
         Task::Answer { questions, answers } => {
@@ -109,13 +140,7 @@ pub fn prompt(task: &Task, expect: Expect, agent: impl Into<PromptTarget>) -> St
                  that cites the log. The factory then reruns the failed CI runs."
             )
         }
-        Task::Rebase { base } => format!(
-            "The pull request no longer merges cleanly into {base}. The factory fetched \
-             the newest origin/{base} into this checkout. Rebase the branch onto \
-             origin/{base} and resolve the conflicts so that both your change and the \
-             changes on {base} keep working. Run the tests. Do not push. Update the pull \
-             request title and description if the rebase changed what they describe."
-        ),
+        Task::Rebase { base } => rebase_prompt(base, picked),
         Task::AddressReview { comments } => format!(
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
@@ -138,6 +163,11 @@ pub fn prompt(task: &Task, expect: Expect, agent: impl Into<PromptTarget>) -> St
     end_prompt(&mut text, agent, expect);
     text
 }
+
+const PICKED_NOTE: &str = " The branch holds an existing pull request. Add commits on top \
+     of it. Do not rewrite, drop or amend a commit that was already there, and do not rebase. \
+     The title and description of the pull request stay as they are, so what you return for them \
+     is not used.";
 
 fn end_prompt(text: &mut String, agent: PromptTarget, expect: Expect) {
     text.push_str("\n\n");
@@ -450,7 +480,7 @@ fn job_body(job: &Job, task: &Task, expect: Expect, agent: PromptTarget) -> Stri
     if let Task::Review = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
     }
-    let body = prompt(task, expect, agent);
+    let body = prompt_for(task, expect, agent, job.picked_pr().is_some());
     if !job.fresh_sessions() {
         return body;
     }

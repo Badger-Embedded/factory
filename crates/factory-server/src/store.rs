@@ -6,8 +6,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use factory_core::{
     Agent, AgentResult, Ask, Cli, Command, DEFAULT_AGENT, DELETED_PREREQUISITE, Event, FixLink,
-    FixOutcome, FixState, Gap, Gates, Job, PrerequisiteState, RebaseState, Rejected, Session,
-    Stage, Turn, Wait,
+    FixOutcome, FixState, Gap, Gates, Job, PickedPr, PrMode, PrerequisiteState, RebaseState,
+    Rejected, Session, Stage, Turn, Wait,
 };
 use factory_runner::{ForgeAccount, ForgeKind, ForgejoServer, LogLine};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -660,6 +660,12 @@ pub enum StoreError {
     /// another project, or cannot be waited for. The message is the same for
     /// each, so it leaks nothing about other projects.
     InvalidPrerequisite(i64),
+    /// A job on pull request `number` was refused because live job `job` may
+    /// push to or merge it.
+    PrHeld {
+        number: u64,
+        job: i64,
+    },
     /// A project's upstream forge names no fixed kind and no registered
     /// instance. Nothing reads such an upstream, as it would be another server.
     UnknownUpstreamForge(String),
@@ -719,6 +725,10 @@ impl fmt::Display for StoreError {
             StoreError::InvalidPrerequisite(id) => {
                 write!(f, "job #{id} is not a job this request can wait for")
             }
+            StoreError::PrHeld { number, job } => write!(
+                f,
+                "pull request #{number} is held by job #{job}, which may still push to or merge it"
+            ),
             StoreError::Forgejo(message) | StoreError::Local(message) => f.write_str(message),
             StoreError::InstanceChanged(name) => write!(
                 f,
@@ -1309,7 +1319,93 @@ impl Store {
         after: &[i64],
     ) -> Result<i64, StoreError> {
         let gates = self.project_gates(project)?;
-        let new = Job::new(request, gates);
+        self.insert_after(
+            project,
+            requested_by,
+            &Job::new(request, gates),
+            after,
+            |_| Ok(()),
+        )
+    }
+
+    /// Creates a job that carries out `request` on the pull request `picked`,
+    /// and waits for the jobs in `after` as [`Store::create_after`] does. The
+    /// held check and the insert share one transaction, so two jobs never
+    /// start on one pull request.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::PrHeld`] when another live job may push to or
+    /// merge the pull request, unless `picked` is a quick review, which only
+    /// reads it. Fails as [`Store::create_after`] does otherwise.
+    pub fn create_pull_request_job(
+        &self,
+        project: &str,
+        requested_by: &str,
+        request: &str,
+        after: &[i64],
+        picked: PickedPr,
+    ) -> Result<i64, StoreError> {
+        let gates = self.project_gates(project)?;
+        let number = picked.number;
+        let reads_only = matches!(picked.mode, PrMode::QuickReview { .. });
+        let new = Job::pull_request(request, gates, picked);
+        self.insert_after(project, requested_by, &new, after, |tx| {
+            if reads_only {
+                return Ok(());
+            }
+            match Self::holder(tx, project, number)? {
+                Some(job) => Err(StoreError::PrHeld { number, job }),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// The live job of `project` that may push to or merge pull request
+    /// `number`, or `None` when no job holds it. A live job holds it when it
+    /// watches the pull request as a Renovate job, when its plan has the
+    /// number, or when it works on it as a picked pull request and is not a
+    /// quick review. A quick review only reads the pull request.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error or a stored job that does not parse.
+    pub fn holding_job(&self, project: &str, number: u64) -> Result<Option<i64>, StoreError> {
+        Self::holder(&self.conn(), project, number)
+    }
+
+    fn holder(conn: &Connection, project: &str, number: u64) -> Result<Option<i64>, StoreError> {
+        let mut stmt = conn.prepare(
+            "SELECT id, project, requested_by, created_at, job FROM jobs
+             WHERE project = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([project], raw_row)?;
+        for row in rows {
+            let row = parse_row(row?)?;
+            if row.job.is_finished() {
+                continue;
+            }
+            let job = &row.job;
+            let renovates = job.renovate_pr().is_some_and(|pr| pr.number == number);
+            let plans = job.plan().iter().any(|pr| pr.number == Some(number));
+            let works = job.picked_pr().is_some_and(|picked| {
+                picked.number == number && !matches!(picked.mode, PrMode::QuickReview { .. })
+            });
+            if renovates || plans || works {
+                return Ok(Some(row.id));
+            }
+        }
+        Ok(None)
+    }
+
+    fn insert_after(
+        &self,
+        project: &str,
+        requested_by: &str,
+        new: &Job,
+        after: &[i64],
+        check: impl FnOnce(&Transaction<'_>) -> Result<(), StoreError>,
+    ) -> Result<i64, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut ids = after.to_vec();
@@ -1324,7 +1420,8 @@ impl Store {
                 Err(err) => return Err(err),
             }
         }
-        let id = Self::insert_job(&tx, project, requested_by, &new)?;
+        check(&tx)?;
+        let id = Self::insert_job(&tx, project, requested_by, new)?;
         for prerequisite in ids {
             tx.execute(
                 "INSERT INTO job_prerequisites (job_id, prerequisite) VALUES (?1, ?2)",

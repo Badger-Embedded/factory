@@ -10,13 +10,15 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use factory_core::{Agent, Cli, Command, DEFAULT_AGENT, Event, Gates, Stage, Wait};
-use factory_runner::{Access, Account, Expect, ForgeAccount, ForgeKind};
+use factory_core::{
+    Agent, Cli, Command, DEFAULT_AGENT, Event, Gates, PickedPr, PrMode, Stage, Wait,
+};
+use factory_runner::{Access, Account, Expect, ForgeAccount, ForgeKind, PrState};
 use maud::{Markup, html};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::accounts::{Accounts, ResolveError, TokenRow, UpstreamCredential};
+use crate::accounts::{Accounts, ResolveError, TokenRow, UpstreamCredential, blame};
 use crate::check::{CheckOutcome, McpChecker, ToolList};
 use crate::copilot::validate_copilot_token;
 use crate::csrf::CsrfKey;
@@ -509,7 +511,8 @@ impl IntoResponse for AppError {
                 | StoreError::InvalidAgent(_)
                 | StoreError::MissingLocalModel(_)
                 | StoreError::InvalidRenovateAgent(_)
-                | StoreError::InvalidPrerequisite(_)),
+                | StoreError::InvalidPrerequisite(_)
+                | StoreError::PrHeld { .. }),
             ) => (StatusCode::BAD_REQUEST, err.to_string()),
             AppError::Store(err) => {
                 tracing::error!("{err}");
@@ -1019,6 +1022,86 @@ async fn read_job_number(field: Field<'_>) -> Result<i64, AppError> {
         .map_err(|_| AppError::BadRequest(format!("{value:?} is not a job number to wait for")))
 }
 
+/// Reads a posted pull request number, as `12` or `#12`.
+async fn read_pr_number(field: Field<'_>) -> Result<Option<u64>, AppError> {
+    let value = read_text(field).await?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .strip_prefix('#')
+        .unwrap_or(value)
+        .parse::<u64>()
+        .ok()
+        .filter(|&number| number > 0)
+        .map(Some)
+        .ok_or_else(|| AppError::BadRequest(format!("{value:?} is not a pull request number")))
+}
+
+/// Reads the pull request `number` of `project` with the account of `login`
+/// and returns it as a job's picked pull request. Refuses one that is closed,
+/// merged or missing, and one from a fork, whose branch the factory cannot
+/// push to.
+async fn read_picked_pr(
+    state: &AppState,
+    name: &str,
+    project: &Project,
+    login: &str,
+    number: u64,
+) -> Result<PickedPr, AppError> {
+    let accounts = Accounts::new(
+        Arc::clone(&state.store),
+        Arc::clone(&state.secrets),
+        state.forges.clone(),
+    );
+    let resolved = match accounts.resolve(name, project, login) {
+        Ok(resolved) => resolved,
+        Err(ResolveError::Store(err)) => return Err(err.into()),
+        Err(ResolveError::Account(why)) => return Err(AppError::BadRequest(why)),
+    };
+    let found = state
+        .forges
+        .forge(&resolved.forge)
+        .pull_request(&resolved.account, &project.repo, number)
+        .await;
+    let found = blame(&resolved.owner, found).map_err(|err| {
+        AppError::BadRequest(format!("could not read pull request #{number}: {err}"))
+    })?;
+    let Some(pr) = found else {
+        return Err(AppError::BadRequest(format!(
+            "pull request #{number} does not exist"
+        )));
+    };
+    match pr.state {
+        PrState::Open => {}
+        PrState::Merged => {
+            return Err(AppError::BadRequest(format!(
+                "pull request #{number} is already merged"
+            )));
+        }
+        PrState::Closed => {
+            return Err(AppError::BadRequest(format!(
+                "pull request #{number} is closed"
+            )));
+        }
+    }
+    if pr.fork {
+        return Err(AppError::BadRequest(format!(
+            "the factory cannot push to a fork's branch, so it cannot change pull request #{number}"
+        )));
+    }
+    Ok(PickedPr {
+        number,
+        url: pr.url,
+        title: pr.title,
+        head_branch: pr.head_branch,
+        base_branch: pr.base_branch,
+        fork: pr.fork,
+        mode: PrMode::Request,
+    })
+}
+
 async fn create_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1026,6 +1109,7 @@ async fn create_job(
 ) -> Result<Redirect, AppError> {
     let mut project = None;
     let mut request = None;
+    let mut pr = None;
     let mut after = Vec::new();
     let mut attachments = Vec::new();
     while let Some(field) = form
@@ -1037,20 +1121,30 @@ async fn create_job(
             Some("project") => project = Some(read_text(field).await?),
             Some("request") => request = Some(read_text(field).await?),
             Some("after") => after.push(read_job_number(field).await?),
+            Some("pr") => pr = read_pr_number(field).await?,
             Some("images") => read_attachment(field, &mut attachments).await?,
             _ => {}
         }
     }
     let project = project.unwrap_or_default();
-    visible_project(&state, &headers, &project)?;
+    let found = visible_project(&state, &headers, &project)?;
     let request = request.unwrap_or_default();
     let request = request.trim();
     if request.is_empty() {
         return Err(AppError::BadRequest("the request is empty".into()));
     }
-    let id = state
-        .store
-        .create_after(&project, &user(&headers), request, &after)?;
+    let login = user(&headers);
+    let id = match pr {
+        None => state
+            .store
+            .create_after(&project, &login, request, &after)?,
+        Some(number) => {
+            let picked = read_picked_pr(&state, &project, &found, &login, number).await?;
+            state
+                .store
+                .create_pull_request_job(&project, &login, request, &after, picked)?
+        }
+    };
     if !attachments.is_empty()
         && let Err(err) = save_attachments(&state, id, &attachments)
     {

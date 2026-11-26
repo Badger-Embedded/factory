@@ -55,14 +55,43 @@ pub fn branch_name(job_id: i64, pr: usize) -> String {
 }
 
 struct JobRefs {
+    /// The branch of the job's checkout.
     branch: String,
+    /// The branch the factory pushes to. It differs from `branch` for a job
+    /// on a picked pull request, whose commits go to the pull request's own
+    /// branch.
+    remote_branch: String,
     base: String,
+    /// The number of the picked pull request the checkout starts from.
+    picked: Option<u64>,
 }
 
-fn job_refs(job_id: i64, _job: &Job, project: &Project, pr: usize) -> JobRefs {
-    JobRefs {
-        branch: branch_name(job_id, pr),
-        base: project.base.clone(),
+impl JobRefs {
+    /// The pull request the checkout starts from, read on `forge`.
+    fn existing(&self, forge: &ForgeKind) -> Option<ExistingPr> {
+        self.picked.map(|number| ExistingPr {
+            number,
+            head_branch: self.remote_branch.clone(),
+            head_ref: forge.pr_head_ref(number),
+        })
+    }
+}
+
+fn job_refs(job_id: i64, job: &Job, project: &Project, pr: usize) -> JobRefs {
+    let branch = branch_name(job_id, pr);
+    match job.picked_pr() {
+        Some(picked) => JobRefs {
+            branch,
+            remote_branch: picked.head_branch.clone(),
+            base: picked.base_branch.clone(),
+            picked: Some(picked.number),
+        },
+        None => JobRefs {
+            remote_branch: branch.clone(),
+            branch,
+            base: project.base.clone(),
+            picked: None,
+        },
     }
 }
 
@@ -118,6 +147,14 @@ pub struct AgentRequest {
     /// The pull request branch, or `None` for a planning run, which reads
     /// the base branch.
     pub branch: Option<String>,
+    /// The picked pull request `branch` starts from, or `None` for a branch
+    /// the factory opens itself. The checkout then takes the pull request's
+    /// head in and keeps the commits it holds.
+    pub existing: Option<ExistingPr>,
+    /// Start merging `origin/<base>` into the branch before the run, for a
+    /// conflict with the picked pull request's base branch. The merge stays
+    /// unfinished in the checkout when it conflicts, for the agent to resolve.
+    pub merge_base: bool,
     /// The agent session UUID the factory picks. Claude passes it to
     /// `--session-id` and `--resume`; Codex, which names its own session, uses it
     /// only as the key its reported id is stored under.
@@ -149,6 +186,17 @@ pub struct AgentRequest {
     /// The local server and the CLI that drives it, set exactly when `agent` is
     /// [`Agent::Local`].
     pub local: Option<LocalRequest>,
+}
+
+/// A pull request that already exists, which a job adds commits to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingPr {
+    pub number: u64,
+    /// The pull request's branch on the project's repository.
+    pub head_branch: String,
+    /// The forge's ref of the pull request's head, which holds the commits to
+    /// start from.
+    pub head_ref: String,
 }
 
 /// What a Local run needs beyond an agent run's own fields.
@@ -183,6 +231,9 @@ pub struct ChecksRequest {
     pub job_id: i64,
     /// The branch the pull request targets.
     pub base: String,
+    /// The picked pull request the branch starts from. The commits it already
+    /// holds are not the factory's to check.
+    pub existing: Option<u64>,
     /// The project's `checks` command.
     pub command: String,
     /// The project's worker packages, read on every run.
@@ -205,7 +256,13 @@ pub struct PublishRequest {
     pub account: AccountSource,
     pub repo: String,
     pub base: String,
+    /// The branch of the checkout.
     pub branch: String,
+    /// The pull request that holds the branch's commits when the job works on
+    /// a picked one. The publish then pushes fast-forward only to the pull
+    /// request's own branch, and opens no pull request and edits no title or
+    /// description, so `description` is not used.
+    pub existing: Option<ExistingPr>,
     pub description: PrDescription,
     /// Told the account of each push right after it succeeds, before the pull
     /// request is opened.
@@ -251,6 +308,9 @@ pub enum Published {
     /// The branch has no commits after the base branch, so the factory
     /// pushed nothing and opened no pull request.
     Empty,
+    /// The picked pull request was closed without merging before the push, so
+    /// the factory pushed nothing.
+    AlreadyClosed(u64),
 }
 
 #[allow(
@@ -272,6 +332,9 @@ pub struct WatchRequest {
     pub seen_until: Option<String>,
     /// Merge the pull request when it is ready.
     pub auto_merge: bool,
+    /// Whether the factory may merge the pull request at all. When false, a
+    /// ready pull request is left to the user whatever `auto_merge` says.
+    pub may_merge: bool,
     /// Run the LLM review before any merge. When it is on and the current head
     /// is not yet approved, a ready pull request starts a review instead of
     /// merging or waiting.
@@ -298,15 +361,30 @@ pub enum ReadyAction {
     Merge,
     /// Leave the pull request for the user to merge on GitHub.
     Wait,
+    /// Leave the pull request for the user and tell the job, which asks the
+    /// user to merge. For a job that may not merge.
+    LeaveToUser,
 }
 
-/// Decides [`ReadyAction`] from the project's flags and the head's review
-/// state. The review comes first: a reviewing project reviews an unapproved
-/// head before it merges or waits.
+/// Decides [`ReadyAction`] from the project's flags, the head's review state
+/// and whether the job may merge. The review comes first: a reviewing project
+/// reviews an unapproved head before it merges or waits. A job that may not
+/// merge never gets [`ReadyAction::Merge`].
 #[must_use]
-pub fn ready_action(llm_review: bool, review_approved: bool, auto_merge: bool) -> ReadyAction {
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "each flag is one independent project or job setting"
+)]
+pub fn ready_action(
+    llm_review: bool,
+    review_approved: bool,
+    auto_merge: bool,
+    may_merge: bool,
+) -> ReadyAction {
     if llm_review && !review_approved {
         ReadyAction::Review
+    } else if !may_merge {
+        ReadyAction::LeaveToUser
     } else if auto_merge {
         ReadyAction::Merge
     } else {
@@ -1377,6 +1455,10 @@ impl<E: Executor> Scheduler<E> {
         clippy::too_many_arguments,
         reason = "each argument is a separate fact of the operation that starts"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one request built from the session's settings, refs and MCP config"
+    )]
     fn agent_request(
         &self,
         row: &JobRow,
@@ -1463,8 +1545,13 @@ impl<E: Executor> Scheduler<E> {
             forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
-            base: refs.base,
-            branch: matches!(session, Session::Pr(_) | Session::Review(_)).then_some(refs.branch),
+            base: refs.base.clone(),
+            branch: matches!(session, Session::Pr(_) | Session::Review(_))
+                .then(|| refs.branch.clone()),
+            existing: matches!(session, Session::Pr(_) | Session::Review(_))
+                .then(|| refs.existing(&resolved.forge))
+                .flatten(),
+            merge_base: refs.picked.is_some() && matches!(task, factory_core::Task::Rebase { .. }),
             session_id,
             agent_session,
             agent,
@@ -1736,7 +1823,8 @@ impl<E: Executor> Scheduler<E> {
         }
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
-        let base = job_refs(job_id, job, project, pr).base;
+        let refs = job_refs(job_id, job, project, pr);
+        let (base, existing) = (refs.base, refs.picked);
         let packages = self.store.project_packages(&row.project)?;
         self.spawn(job_id, Kind::Worker, async move {
             scheduler.note(job_id, &format!("Running the checks: {command}"));
@@ -1747,6 +1835,7 @@ impl<E: Executor> Scheduler<E> {
                     ChecksRequest {
                         job_id,
                         base,
+                        existing,
                         command,
                         packages,
                     },
@@ -1825,14 +1914,22 @@ impl<E: Executor> Scheduler<E> {
         resolved: &Resolved,
         settings: &Settings,
     ) -> Result<(), StoreError> {
-        let Some(description) = job.plan()[pr].description.clone() else {
-            self.store.append_factory_log(
-                job_id,
-                "The agent wrote no pull request description, so there is nothing to publish.",
-            )?;
-            return Ok(());
-        };
         let refs = job_refs(job_id, job, project, pr);
+        let existing = refs.existing(&resolved.forge);
+        let description = match (job.plan()[pr].description.clone(), &existing) {
+            (Some(description), _) => description,
+            (None, Some(_)) => PrDescription {
+                title: job.plan()[pr].title.clone(),
+                body: job.plan()[pr].summary.clone(),
+            },
+            (None, None) => {
+                self.store.append_factory_log(
+                    job_id,
+                    "The agent wrote no pull request description, so there is nothing to publish.",
+                )?;
+                return Ok(());
+            }
+        };
         let request = PublishRequest {
             job_id,
             forge: resolved.forge.clone(),
@@ -1840,10 +1937,11 @@ impl<E: Executor> Scheduler<E> {
             repo: project.repo.clone(),
             base: refs.base,
             branch: refs.branch.clone(),
+            existing,
             description,
             pushed: PushLog::new({
                 let scheduler = Arc::clone(self);
-                let (branch, repo) = (refs.branch, project.repo.clone());
+                let (branch, repo) = (refs.remote_branch, project.repo.clone());
                 move |pushed_as| {
                     scheduler.note(
                         job_id,
@@ -1868,6 +1966,14 @@ impl<E: Executor> Scheduler<E> {
                     );
                     scheduler.apply(job_id, Event::Published { number });
                     scheduler.apply(job_id, Event::Merged);
+                }
+                Ok(Published::AlreadyClosed(number)) => {
+                    scheduler.note(
+                        job_id,
+                        &format!("Pull request #{number} was closed before the push, so the factory pushed nothing."),
+                    );
+                    scheduler.apply(job_id, Event::Published { number });
+                    scheduler.apply(job_id, Event::ClosedUnmerged);
                 }
                 Ok(Published::Empty) => {
                     scheduler.note(
@@ -1919,6 +2025,7 @@ impl<E: Executor> Scheduler<E> {
             auto_merge: self
                 .store
                 .project_auto_merge(&row.project, project.auto_merge)?,
+            may_merge: job.may_merge(),
             llm_review: self
                 .store
                 .project_llm_review(&row.project, project.llm_review)?,

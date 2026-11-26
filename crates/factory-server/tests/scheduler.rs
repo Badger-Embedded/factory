@@ -2630,16 +2630,26 @@ fn green(executor: &FakeExecutor, event: Event) {
 #[test]
 fn a_ready_pull_request_reviews_before_it_merges_or_waits() {
     // Review off: auto-merge alone decides a merge or a wait, as before.
-    assert_eq!(ready_action(false, false, true), ReadyAction::Merge);
-    assert_eq!(ready_action(false, false, false), ReadyAction::Wait);
+    assert_eq!(ready_action(false, false, true, true), ReadyAction::Merge);
+    assert_eq!(ready_action(false, false, false, true), ReadyAction::Wait);
     // Review on and the head not yet approved: review first, whatever
     // auto-merge says.
-    assert_eq!(ready_action(true, false, true), ReadyAction::Review);
-    assert_eq!(ready_action(true, false, false), ReadyAction::Review);
+    assert_eq!(ready_action(true, false, true, true), ReadyAction::Review);
+    assert_eq!(ready_action(true, false, false, true), ReadyAction::Review);
     // Review on and the head approved: merge or wait like a project with no
     // review.
-    assert_eq!(ready_action(true, true, true), ReadyAction::Merge);
-    assert_eq!(ready_action(true, true, false), ReadyAction::Wait);
+    assert_eq!(ready_action(true, true, true, true), ReadyAction::Merge);
+    assert_eq!(ready_action(true, true, false, true), ReadyAction::Wait);
+    // A job that may not merge leaves it to the user once review is settled.
+    assert_eq!(
+        ready_action(false, false, true, false),
+        ReadyAction::LeaveToUser
+    );
+    assert_eq!(
+        ready_action(true, true, true, false),
+        ReadyAction::LeaveToUser
+    );
+    assert_eq!(ready_action(true, false, true, false), ReadyAction::Review);
 }
 
 #[tokio::test]
@@ -2737,7 +2747,8 @@ async fn with_auto_merge_off_the_review_runs_and_the_factory_does_not_merge() {
         ready_action(
             watched.llm_review,
             watched.review_approved,
-            watched.auto_merge
+            watched.auto_merge,
+            watched.may_merge
         ),
         ReadyAction::Wait
     );
@@ -8623,4 +8634,112 @@ async fn a_change_to_the_worker_packages_reaches_the_next_run() {
         executor.checks_run.lock().unwrap()[0].packages,
         strings(&["jq"])
     );
+}
+
+fn picked(number: u64) -> factory_core::PickedPr {
+    factory_core::PickedPr {
+        number,
+        url: format!("https://github.com/Badger-Embedded/maestro/pull/{number}"),
+        title: "Fix the reboot".into(),
+        head_branch: "carol/reboot".into(),
+        base_branch: "develop".into(),
+        fork: false,
+        mode: factory_core::PrMode::Request,
+    }
+}
+
+/// Drives a request job on pull request 12 to its first publish.
+async fn picked_to_published(
+    store: &Store,
+    executor: &FakeExecutor,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+) -> i64 {
+    let id = store
+        .create_pull_request_job("maestro", "alice", "handle the error", &[], picked(12))
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Clarified))
+        .unwrap();
+    store
+        .apply(id, Event::Agent(AgentResult::Spec("spec".into())))
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    store
+        .apply(
+            id,
+            Event::Agent(AgentResult::Plan(vec![factory_core::PlannedPr {
+                title: "handle the error".into(),
+                summary: "Handle it.".into(),
+                number: None,
+                description: None,
+                notes: None,
+            }])),
+        )
+        .unwrap();
+    store.apply(id, Event::Approve).unwrap();
+    executor.release(1);
+    step(scheduler).await; // implement
+    step(scheduler).await; // checks
+    step(scheduler).await; // publish
+    id
+}
+
+#[tokio::test]
+async fn a_picked_pull_request_job_works_in_its_head_branch_and_never_opens_a_pull_request() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+
+    let request = executor.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!(request.base, "develop");
+    let existing = request.existing.unwrap();
+    assert_eq!(existing.number, 12);
+    assert_eq!(existing.head_branch, "carol/reboot");
+    assert_eq!(request.branch.unwrap(), format!("factory/job-{id}-pr-1"));
+
+    let published = executor.published.lock().unwrap()[0].clone();
+    assert_eq!(published.existing.unwrap().head_branch, "carol/reboot");
+    assert_eq!(published.base, "develop");
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn a_picked_pull_request_job_never_asks_the_executor_to_merge() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, false).unwrap();
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+    green(&executor, Event::MergeLeftToUser);
+    step(&scheduler).await;
+
+    let watched = executor.watched.lock().unwrap().last().unwrap().clone();
+    assert!(!watched.may_merge);
+    assert!(watched.auto_merge);
+    let job = store.get(id).unwrap().job;
+    assert!(matches!(job.turn(), Turn::User(Ask::MergeLeftToUser)));
+}
+
+#[tokio::test]
+async fn a_conflict_on_a_picked_pull_request_asks_for_a_merge_not_a_rebase() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+    green(
+        &executor,
+        Event::Conflicted {
+            base: "develop".into(),
+        },
+    );
+    step(&scheduler).await;
+    executor.release(1);
+    step(&scheduler).await;
+
+    let request = executor.requests.lock().unwrap().last().unwrap().clone();
+    assert!(request.merge_base);
+    assert_eq!(request.base, "develop");
+    assert!(store.get(id).unwrap().job.picked_pr().is_some());
 }

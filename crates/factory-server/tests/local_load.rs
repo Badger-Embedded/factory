@@ -213,6 +213,8 @@ fn request(
         repo: "owner/name".into(),
         base: "main".into(),
         branch: None,
+        existing: None,
+        merge_base: false,
         session_id: "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10".into(),
         agent_session: None,
         agent: Agent::Local,

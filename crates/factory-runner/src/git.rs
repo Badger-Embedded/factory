@@ -396,15 +396,34 @@ impl Git {
     ///
     /// Returns git's message when `git log` fails.
     pub async fn attributed_commits(&self, work: &Path, base: &str) -> Result<Vec<String>, String> {
+        self.attributed_commits_after(work, base, None).await
+    }
+
+    /// Like `attributed_commits`, without the commits that pull request
+    /// `existing` already holds. Those are someone else's to reword, and a
+    /// reword would rewrite history the factory must keep.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when `git log` fails.
+    pub async fn attributed_commits_after(
+        &self,
+        work: &Path,
+        base: &str,
+        existing: Option<u64>,
+    ) -> Result<Vec<String>, String> {
         let range = format!("origin/{base}..HEAD");
-        let log = self
-            .run(work, &["log", "--format=%h %s%x1f%B%x1e", &range], None)
-            .await?;
+        let held = existing.map(|number| format!("^refs/factory/pr-{number}/head"));
+        let mut args = vec!["log", "--format=%h %s%x1f%B%x1e", &range];
+        args.extend(held.as_deref());
+        let log = self.run(work, &args, None).await?;
         Ok(log
             .split('\u{1e}')
             .filter_map(|entry| {
-                let (head, body) = entry.trim().split_once('\u{1f}')?;
-                body.lines().any(credits_ai).then(|| head.trim().to_owned())
+                let (short, body) = entry.trim().split_once('\u{1f}')?;
+                body.lines()
+                    .any(credits_ai)
+                    .then(|| short.trim().to_owned())
             })
             .collect())
     }

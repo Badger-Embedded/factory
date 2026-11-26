@@ -296,6 +296,37 @@ async fn every_pull_request_run_fetches_the_newest_base() {
 }
 
 #[tokio::test]
+async fn commits_already_on_a_picked_pull_request_are_not_attributed_to_the_job() {
+    let remote = Fixture::new();
+    let work = remote.work();
+    let git_ = Git::default();
+    git_.prepare(
+        &work,
+        &|| Ok(remote.remote()),
+        "main",
+        Some("factory/job-7-pr-1"),
+    )
+    .await
+    .unwrap();
+    let trailer = "\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>";
+    commit(&work, "a", &format!("theirs{trailer}"));
+    git(&work, &["update-ref", "refs/factory/pr-12/head", "HEAD"]);
+    commit(&work, "b", &format!("ours{trailer}"));
+
+    let all = git_
+        .attributed_commits_after(&work, "main", None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let ours = git_
+        .attributed_commits_after(&work, "main", Some(12))
+        .await
+        .unwrap();
+    assert_eq!(ours.len(), 1);
+    assert!(ours[0].ends_with("ours"), "{ours:?}");
+}
+
+#[tokio::test]
 async fn commits_that_credit_an_ai_tool_are_found() {
     let remote = Fixture::new();
     let work = remote.work();
