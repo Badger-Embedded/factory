@@ -54,6 +54,26 @@ pub fn branch_name(job_id: i64, pr: usize) -> String {
     format!("factory/job-{job_id}-pr-{}", pr + 1)
 }
 
+struct JobRefs {
+    branch: String,
+    base: String,
+}
+
+fn job_refs(job_id: i64, _job: &Job, project: &Project, pr: usize) -> JobRefs {
+    JobRefs {
+        branch: branch_name(job_id, pr),
+        base: project.base.clone(),
+    }
+}
+
+fn session_refs(job_id: i64, job: &Job, project: &Project, session: Session) -> JobRefs {
+    let pr = match session {
+        Session::Pr(pr) | Session::Review(pr) => pr,
+        _ => 0,
+    };
+    job_refs(job_id, job, project, pr)
+}
+
 /// The agent a run in `expect` reads from `agents`, with the same stage mapping
 /// as the model and the effort: the check fix and CI fix runs use the implement
 /// agent. A stored id always names an available agent; a stray one falls back to
@@ -834,11 +854,11 @@ impl<E: Executor> Scheduler<E> {
                         scheduler.agent(&settings, request, skipped).await;
                     });
                 }
-                Command::RunChecks { .. } => {
-                    self.checks(row.id, &row.project, &project, &settings, workers_free)?;
+                Command::RunChecks { pr } => {
+                    self.checks(&row, pr, &job, &project, &settings, workers_free)?;
                 }
-                Command::Summarize { .. } if self.due(row.id) => {
-                    self.summarize(row.id, &project, &settings);
+                Command::Summarize { pr } if self.due(row.id) => {
+                    self.summarize(row.id, pr, &job, &project, &settings);
                 }
                 Command::Publish { pr } if self.due(row.id) => {
                     let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
@@ -1437,16 +1457,14 @@ impl<E: Executor> Scheduler<E> {
             .as_ref()
             .map(|config| config.names().into_iter().map(str::to_owned).collect())
             .unwrap_or_default();
+        let refs = session_refs(row.id, job, project, session);
         let request = AgentRequest {
             job_id: row.id,
             forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
-            base: project.base.clone(),
-            branch: match session {
-                Session::Planning | Session::Spec | Session::Plan | Session::Renovate(_) => None,
-                Session::Pr(pr) | Session::Review(pr) => Some(branch_name(row.id, pr)),
-            },
+            base: refs.base,
+            branch: matches!(session, Session::Pr(_) | Session::Review(_)).then_some(refs.branch),
             session_id,
             agent_session,
             agent,
@@ -1696,12 +1714,14 @@ impl<E: Executor> Scheduler<E> {
 
     fn checks(
         self: &Arc<Self>,
-        job_id: i64,
-        project_name: &str,
+        row: &JobRow,
+        pr: usize,
+        job: &Job,
         project: &Project,
         settings: &Settings,
         workers_free: bool,
     ) -> Result<(), StoreError> {
+        let job_id = row.id;
         let Some(command) = project.checks.clone() else {
             self.store.append_factory_log(
                 job_id,
@@ -1716,8 +1736,8 @@ impl<E: Executor> Scheduler<E> {
         }
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
-        let base = project.base.clone();
-        let packages = self.store.project_packages(project_name)?;
+        let base = job_refs(job_id, job, project, pr).base;
+        let packages = self.store.project_packages(&row.project)?;
         self.spawn(job_id, Kind::Worker, async move {
             scheduler.note(job_id, &format!("Running the checks: {command}"));
             let result = scheduler
@@ -1774,10 +1794,17 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    fn summarize(self: &Arc<Self>, job_id: i64, project: &Project, settings: &Settings) {
+    fn summarize(
+        self: &Arc<Self>,
+        job_id: i64,
+        pr: usize,
+        job: &Job,
+        project: &Project,
+        settings: &Settings,
+    ) {
         let request = SummaryRequest {
             job_id,
-            base: project.base.clone(),
+            base: job_refs(job_id, job, project, pr).base,
         };
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
@@ -1805,17 +1832,18 @@ impl<E: Executor> Scheduler<E> {
             )?;
             return Ok(());
         };
+        let refs = job_refs(job_id, job, project, pr);
         let request = PublishRequest {
             job_id,
             forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
-            base: project.base.clone(),
-            branch: branch_name(job_id, pr),
+            base: refs.base,
+            branch: refs.branch.clone(),
             description,
             pushed: PushLog::new({
                 let scheduler = Arc::clone(self);
-                let (branch, repo) = (branch_name(job_id, pr), project.repo.clone());
+                let (branch, repo) = (refs.branch, project.repo.clone());
                 move |pushed_as| {
                     scheduler.note(
                         job_id,
@@ -1879,12 +1907,13 @@ impl<E: Executor> Scheduler<E> {
         else {
             return Ok(());
         };
+        let refs = job_refs(row.id, job, project, pr);
         let request = WatchRequest {
             job_id: row.id,
             forge: resolved.forge.clone(),
             account: resolved.source.clone(),
             repo: project.repo.clone(),
-            base: project.base.clone(),
+            base: refs.base,
             number,
             seen_until: self.store.pr_watermark(row.id, pr)?,
             auto_merge: self
