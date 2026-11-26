@@ -19,9 +19,9 @@ use factory_server::{
     HttpLocalServerProbe, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN, McpProjectSettings,
     McpRuntime, McpStages, McpTransport, McpWarnings, Owner, PlanUsageCache, PodmanExecutor,
     PrerequisiteEdit, Project, ProjectForge, Projects, PublishRequest, Published, ReadyAction,
-    Rebase, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore,
-    SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store, SummaryRequest,
-    UnavailableSecrets, UpstreamCredential, WatchReport, WatchRequest, WorkerSlots,
+    Rebase, RenovateAgent, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef,
+    SecretStore, SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store,
+    SummaryRequest, UnavailableSecrets, UpstreamCredential, WatchReport, WatchRequest, WorkerSlots,
     credential_failure, format_cost, ready_action, watch_only_event,
 };
 use tokio::sync::{Notify, Semaphore};
@@ -5218,6 +5218,456 @@ async fn renovate_runs_get_their_own_sessions_on_the_review_stage_settings() {
         assert_eq!(request.effort.as_deref(), Some("high"));
         assert_eq!(mcp_stage(request), ["review-only"]);
     }
+}
+
+fn renovate_override(agent: &str, model: Option<&str>, effort: &str) -> RenovateAgent {
+    RenovateAgent {
+        agent: agent.into(),
+        model: model.map(Into::into),
+        effort: effort.into(),
+    }
+}
+
+async fn failure_then_diff_check(
+    store: &Store,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+    id: i64,
+    retry: bool,
+) {
+    store
+        .apply(
+            id,
+            observed(
+                "h1",
+                factory_core::RenovateCi::Failed { log: "boom".into() },
+            ),
+        )
+        .unwrap();
+    step(scheduler).await;
+    store.apply(id, Event::CiRerun).unwrap();
+    store
+        .apply(
+            id,
+            observed(
+                "h1",
+                factory_core::RenovateCi::Passed {
+                    details: Some(Box::new(factory_core::PrDiff {
+                        diff: "+serde = 1.0.2".into(),
+                        body: "Bumps serde".into(),
+                    })),
+                },
+            ),
+        )
+        .unwrap();
+    step(scheduler).await;
+    if retry {
+        store.apply(id, Event::Retry).unwrap();
+        step(scheduler).await;
+    }
+}
+
+fn failing_diff_check(request: &AgentRequest) -> Event {
+    match request.expect {
+        Expect::FailureAnalysis => Event::Agent(AgentResult::FailureVerdict {
+            transient: true,
+            reason: "the runner lost its network".into(),
+        }),
+        _ => Event::AgentFailed {
+            reason: "timed out".into(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn renovate_runs_use_the_renovate_agent_when_it_is_set() {
+    let (store, executor, scheduler) = setup(failing_diff_check);
+    review_stage_settings(&store);
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+        )
+        .unwrap();
+    let id = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    executor.release(10);
+    failure_then_diff_check(&store, &scheduler, id, true).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].session_id, requests[2].session_id);
+    for request in &requests {
+        assert_eq!(request.agent, Agent::Copilot);
+        assert_eq!(request.model.as_deref(), Some("cheap-model"));
+        assert_eq!(request.effort.as_deref(), Some("low"));
+        assert_eq!(mcp_stage(request), ["review-only"]);
+    }
+}
+
+#[tokio::test]
+async fn a_renovate_agent_with_no_model_runs_with_no_model() {
+    let (store, executor, scheduler) = setup(failing_diff_check);
+    review_stage_settings(&store);
+    store
+        .save_project_renovate_agent("maestro", Some(&renovate_override("claude", None, "low")))
+        .unwrap();
+    let id = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    executor.release(10);
+    failure_then_diff_check(&store, &scheduler, id, false).await;
+
+    for request in executor.requests() {
+        assert_eq!(request.agent, Agent::Claude);
+        assert_eq!(request.model, None);
+        assert_eq!(request.effort.as_deref(), Some("low"));
+    }
+}
+
+#[tokio::test]
+async fn the_packaging_analysis_uses_the_renovate_agent_when_it_is_set() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(Vec::new()));
+    review_stage_settings(&store);
+    packaging_project(&store);
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+        )
+        .unwrap();
+    merge_with(&store, &executor, &scheduler, id, &["snap/snapcraft.yaml"]).await;
+
+    let requests = executor.requests();
+    let expects: Vec<_> = requests.iter().map(|r| r.expect).collect();
+    assert!(expects.contains(&Expect::DiffCheck));
+    assert!(expects.contains(&Expect::PackagingGaps));
+    for request in &requests {
+        assert_eq!(request.agent, Agent::Copilot);
+        assert_eq!(request.model.as_deref(), Some("cheap-model"));
+        assert_eq!(request.effort.as_deref(), Some("low"));
+        assert_eq!(mcp_stage(request), ["review-only"]);
+    }
+}
+
+#[tokio::test]
+async fn a_renovate_agent_saved_or_removed_in_flight_applies_to_the_next_fresh_run() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::DiffCheck => Event::Agent(AgentResult::DiffVerdict(Box::new(
+            factory_core::DiffVerdict {
+                safe: false,
+                reason: "it edits the build script".into(),
+                summary: "Bumps serde".into(),
+                from: None,
+                to: None,
+            },
+        ))),
+        _ => failing_diff_check(request),
+    });
+    review_stage_settings(&store);
+    let id = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    executor.release(10);
+    store
+        .apply(
+            id,
+            observed(
+                "h1",
+                factory_core::RenovateCi::Failed { log: "boom".into() },
+            ),
+        )
+        .unwrap();
+    step(&scheduler).await;
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+        )
+        .unwrap();
+    store.apply(id, Event::CiRerun).unwrap();
+    store
+        .apply(
+            id,
+            observed(
+                "h1",
+                factory_core::RenovateCi::Passed {
+                    details: Some(Box::new(factory_core::PrDiff {
+                        diff: "+serde = 1.0.2".into(),
+                        body: "Bumps serde".into(),
+                    })),
+                },
+            ),
+        )
+        .unwrap();
+    step_until(&scheduler, || {
+        needs_you(&store, id) == Some(RenovateWait::Unsafe)
+    })
+    .await;
+    store.save_project_renovate_agent("maestro", None).unwrap();
+    store
+        .apply(
+            id,
+            observed(
+                "h2",
+                factory_core::RenovateCi::Failed { log: "boom".into() },
+            ),
+        )
+        .unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let seen: Vec<_> = requests
+        .iter()
+        .map(|r| (r.expect, r.agent, r.model.clone()))
+        .collect();
+    assert_eq!(
+        seen[0],
+        (
+            Expect::FailureAnalysis,
+            Agent::Codex,
+            Some("review-model".into())
+        )
+    );
+    assert_eq!(seen[1].1, Agent::Copilot);
+    assert_eq!(seen[1].2.as_deref(), Some("cheap-model"));
+    let last = seen.last().unwrap();
+    assert_eq!(
+        (last.1, last.2.as_deref()),
+        (Agent::Codex, Some("review-model"))
+    );
+}
+
+#[tokio::test]
+async fn a_retried_renovate_run_keeps_its_session_agent_and_names_the_renovate_setting() {
+    let (store, executor, scheduler) = setup(failing_diff_check);
+    review_stage_settings(&store);
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+        )
+        .unwrap();
+    let id = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    executor.release(10);
+    failure_then_diff_check(&store, &scheduler, id, false).await;
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("claude", Some("sonnet"), "high")),
+        )
+        .unwrap();
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let retry = requests.last().unwrap();
+    assert_eq!(retry.expect, Expect::DiffCheck);
+    assert_eq!(retry.agent, Agent::Copilot);
+    let notes: Vec<String> = store
+        .logs(id, 50)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .filter(|text| text.contains("stays on Copilot"))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "This session started on Copilot, so it stays on Copilot with its earlier model. \
+             The Renovate agent setting is now set to Claude, which new sessions use."
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_retried_renovate_run_keeps_its_model_and_effort_when_only_those_change() {
+    let (store, executor, scheduler) = setup(failing_diff_check);
+    review_stage_settings(&store);
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+        )
+        .unwrap();
+    let id = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    executor.release(10);
+    failure_then_diff_check(&store, &scheduler, id, false).await;
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("other-model"), "high")),
+        )
+        .unwrap();
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let (first, retry) = (&requests[requests.len() - 2], &requests[requests.len() - 1]);
+    assert_eq!(retry.expect, Expect::DiffCheck);
+    assert_eq!(retry.session_id, first.session_id);
+    assert_eq!(retry.agent, Agent::Copilot);
+    assert_eq!(retry.model.as_deref(), Some("cheap-model"));
+    assert_eq!(retry.effort.as_deref(), Some("low"));
+    let notes: Vec<String> = store
+        .logs(id, 50)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .filter(|text| text.contains("stays on Copilot"))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "This session started on Copilot, so it stays on Copilot with its earlier model. \
+             The Renovate agent setting is now set to Copilot, which new sessions use."
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_packaging_analysis_uses_the_review_stage_when_no_renovate_agent_is_set() {
+    let (store, executor, scheduler, id) = renovate_setup(packaging_runs(Vec::new()));
+    review_stage_settings(&store);
+    packaging_project(&store);
+    merge_with(&store, &executor, &scheduler, id, &["snap/snapcraft.yaml"]).await;
+
+    let request = executor
+        .requests()
+        .into_iter()
+        .find(|request| request.expect == Expect::PackagingGaps)
+        .unwrap();
+    assert_eq!(request.agent, Agent::Codex);
+    assert_eq!(request.model.as_deref(), Some("review-model"));
+    assert_eq!(request.effort.as_deref(), Some("high"));
+    assert_eq!(mcp_stage(&request), ["review-only"]);
+}
+
+#[tokio::test]
+async fn a_fix_job_ignores_the_renovate_agent() {
+    let (store, executor, scheduler, _id, fix) = {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        review_stage_settings(&store);
+        store
+            .save_project_renovate_agent(
+                "maestro",
+                Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+            )
+            .unwrap();
+        fix_started_in(store).await
+    };
+    store.apply(fix, Event::Start).unwrap();
+    step(&scheduler).await;
+
+    let request = executor
+        .requests()
+        .into_iter()
+        .find(|request| request.job_id == fix)
+        .unwrap();
+    assert_eq!(request.expect, Expect::Clarify);
+    assert_eq!(request.agent, Agent::Claude);
+    assert_eq!(request.model.as_deref(), Some("clarify-model"));
+    assert_eq!(request.effort.as_deref(), Some("low"));
+}
+
+#[tokio::test]
+async fn a_request_job_review_ignores_the_renovate_agent() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewApproved,
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    store.save_project_settings("maestro", true, true).unwrap();
+    review_stage_settings(&store);
+    store
+        .save_project_renovate_agent(
+            "maestro",
+            Some(&renovate_override("copilot", Some("cheap-model"), "low")),
+        )
+        .unwrap();
+    let id = to_watching(&store, &executor, &scheduler).await;
+    green(&executor, start_review());
+    step(&scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::Review)
+    ));
+    executor.release(1);
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    let review = requests.last().unwrap();
+    assert_eq!(review.expect, Expect::Review);
+    assert_eq!(review.agent, Agent::Codex);
+    assert_eq!(review.model.as_deref(), Some("review-model"));
+    assert_eq!(review.effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn the_renovate_agent_round_trips_and_is_checked_before_any_write() {
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.project_renovate_agent("maestro").unwrap(), None);
+    let agents = StageAgents::default();
+    let before = (
+        store.project_agents("maestro").unwrap(),
+        store.project_efforts("maestro").unwrap(),
+    );
+    let set = renovate_override("copilot", Some("cheap-model"), "low");
+    store
+        .save_project_renovate_agent("maestro", Some(&set))
+        .unwrap();
+    assert_eq!(
+        store.project_renovate_agent("maestro").unwrap(),
+        Some(set.clone())
+    );
+    assert_eq!(store.project_agents("maestro").unwrap(), agents);
+    assert_eq!(
+        (
+            store.project_agents("maestro").unwrap(),
+            store.project_efforts("maestro").unwrap()
+        ),
+        before
+    );
+
+    for bad in [
+        renovate_override("nonsense", Some("m"), "low"),
+        renovate_override("codex", Some("m"), "max"),
+        renovate_override("local", Some("  "), "medium"),
+        renovate_override("local", None, "medium"),
+    ] {
+        let err = store
+            .save_project_renovate_agent("maestro", Some(&bad))
+            .unwrap_err();
+        assert!(err.to_string().contains("Renovate agent"), "{err}");
+        assert_eq!(
+            store.project_renovate_agent("maestro").unwrap(),
+            Some(set.clone())
+        );
+    }
+
+    let blank = renovate_override("claude", Some(" "), "low");
+    store
+        .save_project_renovate_agent("maestro", Some(&blank))
+        .unwrap();
+    assert_eq!(
+        store
+            .project_renovate_agent("maestro")
+            .unwrap()
+            .unwrap()
+            .model,
+        None
+    );
+    store.save_project_renovate_agent("maestro", None).unwrap();
+    assert_eq!(store.project_renovate_agent("maestro").unwrap(), None);
 }
 
 fn renovate_pr(number: u64) -> RenovatePr {

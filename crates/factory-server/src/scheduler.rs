@@ -1368,49 +1368,54 @@ impl<E: Executor> Scheduler<E> {
         expect: Expect,
     ) -> Result<Option<(AgentRequest, Vec<SkippedServer>)>, StoreError> {
         let agents = self.store.project_agents(&row.project)?;
-        let stage = stage_agent(&agents, expect);
+        let renovate = match expect {
+            Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
+                self.store.project_renovate_agent(&row.project)?
+            }
+            _ => None,
+        };
+        let stage = match &renovate {
+            Some(over) => Agent::from_id(&over.agent).unwrap_or(DEFAULT_AGENT),
+            None => stage_agent(&agents, expect),
+        };
         let (session_id, agent) = self.store.session_uuid(row.id, session, stage)?;
         let mut stage_note = None;
-        let (model, effort) = if agent == stage {
-            let models = self.store.project_models(&row.project, &project.models)?;
-            let model = match expect {
-                Expect::Clarify => models.clarify,
-                Expect::Spec => models.spec,
-                Expect::Plan => models.plan,
-                Expect::Commits | Expect::FixCi => models.implement,
-                Expect::Review
-                | Expect::FailureAnalysis
-                | Expect::DiffCheck
-                | Expect::PackagingGaps => models.review,
-            };
-            let efforts = self.store.project_efforts(&row.project)?;
-            let effort = match expect {
-                Expect::Clarify => efforts.clarify,
-                Expect::Spec => efforts.spec,
-                Expect::Plan => efforts.plan,
-                Expect::Commits | Expect::FixCi => efforts.implement,
-                Expect::Review
-                | Expect::FailureAnalysis
-                | Expect::DiffCheck
-                | Expect::PackagingGaps => efforts.review,
+        let recorded = self.store.session_settings(row.id, session)?;
+        let resumed =
+            renovate.is_some() && recorded.as_ref().is_some_and(|last| last.effort.is_some());
+        let (model, effort) = if agent == stage && !resumed {
+            let (model, effort) = match renovate {
+                Some(over) => (over.model, over.effort),
+                None => self.stage_settings(row, project, expect)?,
             };
             self.store
                 .record_session_settings(row.id, session, model.as_deref(), &effort)?;
             (model, effort)
         } else {
-            let last = self.store.session_settings(row.id, session)?;
+            let last = recorded;
             let effort = last
                 .as_ref()
                 .and_then(|last| last.effort.clone())
                 .unwrap_or_else(|| agent.default_effort().to_owned());
-            stage_note = Some(format!(
-                "This session started on {from}, so it stays on {from} with its earlier model. \
-                 The {stage_name} stage is now set to {to}, which new sessions use.",
-                from = agent.display_name(),
-                to = stage.display_name(),
-                stage_name = stage_name(expect),
-            ));
-            (last.and_then(|last| last.model), effort)
+            let model = last.and_then(|last| last.model);
+            let changed = agent != stage
+                || renovate
+                    .as_ref()
+                    .is_some_and(|over| over.model != model || over.effort != effort);
+            if changed {
+                let setting = if renovate.is_some() {
+                    "Renovate agent setting".to_owned()
+                } else {
+                    format!("{} stage", stage_name(expect))
+                };
+                stage_note = Some(format!(
+                    "This session started on {from}, so it stays on {from} with its earlier model. \
+                     The {setting} is now set to {to}, which new sessions use.",
+                    from = agent.display_name(),
+                    to = stage.display_name(),
+                ));
+            }
+            (model, effort)
         };
         let local = if agent == Agent::Local {
             match self.local_request(row, session, model.as_deref())? {
@@ -1462,6 +1467,37 @@ impl<E: Executor> Scheduler<E> {
             local,
         };
         Ok(Some((request, selection.skipped)))
+    }
+
+    fn stage_settings(
+        &self,
+        row: &JobRow,
+        project: &Project,
+        expect: Expect,
+    ) -> Result<(Option<String>, String), StoreError> {
+        let models = self.store.project_models(&row.project, &project.models)?;
+        let model = match expect {
+            Expect::Clarify => models.clarify,
+            Expect::Spec => models.spec,
+            Expect::Plan => models.plan,
+            Expect::Commits | Expect::FixCi => models.implement,
+            Expect::Review
+            | Expect::FailureAnalysis
+            | Expect::DiffCheck
+            | Expect::PackagingGaps => models.review,
+        };
+        let efforts = self.store.project_efforts(&row.project)?;
+        let effort = match expect {
+            Expect::Clarify => efforts.clarify,
+            Expect::Spec => efforts.spec,
+            Expect::Plan => efforts.plan,
+            Expect::Commits | Expect::FixCi => efforts.implement,
+            Expect::Review
+            | Expect::FailureAnalysis
+            | Expect::DiffCheck
+            | Expect::PackagingGaps => efforts.review,
+        };
+        Ok((model, effort))
     }
 
     /// The Local settings for a run of `session`, read afresh so a change

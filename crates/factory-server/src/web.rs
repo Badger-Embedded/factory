@@ -500,6 +500,7 @@ impl IntoResponse for AppError {
                 err @ (StoreError::InvalidEffort(_)
                 | StoreError::InvalidAgent(_)
                 | StoreError::MissingLocalModel(_)
+                | StoreError::InvalidRenovateAgent(_)
                 | StoreError::InvalidPrerequisite(_)),
             ) => (StatusCode::BAD_REQUEST, err.to_string()),
             AppError::Store(err) => {

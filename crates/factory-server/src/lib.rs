@@ -59,8 +59,8 @@ pub use mcp::{
 };
 pub use podman::PodmanExecutor;
 pub use projects::{
-    ImportError, Project, ProjectForge, Projects, StageAgents, StageEfforts, StageModels,
-    import_tomls,
+    ImportError, Project, ProjectForge, Projects, RenovateAgent, StageAgents, StageEfforts,
+    StageModels, import_tomls,
 };
 pub use proxy::{
     ProxyEvent, ProxyEventFn, RunTokens, StoreUpstreams, Upstream, Upstreams, proxy_app,
