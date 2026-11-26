@@ -64,8 +64,8 @@ struct JobRefs {
     base: String,
     /// The number of the picked pull request the checkout starts from.
     picked: Option<u64>,
-    /// The job opens its own pull request, stacked on the picked one. Its
-    /// checkout starts at the picked head, but the publish is a normal one.
+    /// The job owns a pull request stacked on the picked one. It is rebased
+    /// and pushed like any job's own pull request, not merged into.
     stacked: bool,
 }
 
@@ -92,7 +92,7 @@ fn job_refs(job_id: i64, job: &Job, project: &Project, pr: usize) -> JobRefs {
                 branch,
                 base: job.stacked_base().unwrap_or(&picked.base_branch).to_owned(),
                 picked: Some(opened.unwrap_or(picked.number)),
-                stacked: opened.is_none(),
+                stacked: true,
             }
         }
         Some(picked) => JobRefs {
