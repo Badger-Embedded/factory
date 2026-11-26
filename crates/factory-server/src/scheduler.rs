@@ -113,13 +113,19 @@ fn job_refs(job_id: i64, job: &Job, project: &Project, pr: usize) -> JobRefs {
 }
 
 /// The reviewed commit of a fork pull request that a stacked job's branch
-/// must keep, or its tracking ref when the review recorded none.
-fn forked_head(job: &Job) -> Option<String> {
-    let picked = job.stacked_on().filter(|picked| picked.fork)?;
-    Some(job.reviewed_head().map_or_else(
-        || format!("refs/factory/pr-{}/head", picked.number),
-        str::to_owned,
-    ))
+/// must keep. `Err` when the job is a fork's stack and the review recorded
+/// none, since the source ref a force-push can move is no substitute.
+fn forked_head(job: &Job) -> Result<Option<String>, String> {
+    if job.stacked_on().is_none_or(|picked| !picked.fork) {
+        return Ok(None);
+    }
+    job.reviewed_head()
+        .map(|head| Some(head.to_owned()))
+        .ok_or_else(|| {
+            "the quick review recorded no commit for the fork's pull request, so the factory \
+             cannot check that the fix keeps it and publishes nothing"
+                .to_owned()
+        })
 }
 
 fn session_refs(job_id: i64, job: &Job, project: &Project, session: Session) -> JobRefs {
@@ -2014,6 +2020,7 @@ impl<E: Executor> Scheduler<E> {
         });
     }
 
+    #[allow(clippy::too_many_lines, reason = "one match arm per publish outcome")]
     fn publish(
         self: &Arc<Self>,
         job_id: i64,
@@ -2050,6 +2057,13 @@ impl<E: Executor> Scheduler<E> {
                 return Ok(());
             }
         };
+        let keep_history = match forked_head(job) {
+            Ok(keep) => keep,
+            Err(reason) => {
+                self.apply(job_id, Event::FactoryFailed { reason });
+                return Ok(());
+            }
+        };
         let request = PublishRequest {
             job_id,
             forge: resolved.forge.clone(),
@@ -2060,7 +2074,7 @@ impl<E: Executor> Scheduler<E> {
             existing,
             description,
             checks: project.checks.is_some(),
-            keep_history: forked_head(job),
+            keep_history,
             pushed: PushLog::new({
                 let scheduler = Arc::clone(self);
                 let (branch, repo) = (refs.remote_branch, project.repo.clone());
