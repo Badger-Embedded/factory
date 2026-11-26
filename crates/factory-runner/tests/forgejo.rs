@@ -1922,3 +1922,28 @@ async fn a_title_search_over_a_page_of_body_only_hits_is_an_error_without_a_seco
     assert_eq!(seen.len(), 1);
     assert!(!seen[0].query.contains("page="), "{}", seen[0].query);
 }
+
+#[tokio::test]
+async fn a_title_search_with_20_title_matches_on_a_full_page_is_an_error() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/issues" => {
+            let rows: Vec<Value> = (1..=21)
+                .map(|n| json!({"number": n, "title": if n == 21 { "unrelated" } else { "a thing" }}))
+                .collect();
+            ok(&json!(rows))
+        }
+        path => path
+            .rsplit('/')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .map_or_else(|| rep(404, ""), |n| ok(&numbered(n, 5))),
+    })
+    .await;
+    let err = stub
+        .forge
+        .search_open_prs(&account(&stub.forge), REPO, "thing")
+        .await
+        .unwrap_err();
+    assert!(err.contains("incomplete"), "{err}");
+    assert!(stub.seen().iter().all(|seen| !seen.query.contains("page=")));
+}
