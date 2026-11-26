@@ -1706,6 +1706,7 @@ fn a_quick_review_result_without_a_valid_score_fails_the_review() {
         json!({"review": "x"}),
         json!({"score": 4, "review": "  "}),
         json!({"score": null, "review": "x"}),
+        json!({"outcome": "approve", "score": 4, "review": "x"}),
     ] {
         assert!(
             matches!(
@@ -1751,10 +1752,26 @@ fn the_quick_review_prompt_holds_the_pull_request_and_the_focus() {
     assert!(text.contains("maestrod: add a reboot endpoint"));
     assert!(text.contains("Adds POST /reboot for the device page."));
     assert!(text.contains("check the error paths"));
-    assert!(text.contains("git diff origin/release-1...HEAD"));
+    assert!(text.contains("git diff 'refs/remotes/origin/release-1...HEAD'"));
     assert!(text.contains("5 means it is safe to merge"));
     assert!(text.contains("1 means do not merge"));
     assert!(text.contains("do not push"));
+}
+
+#[test]
+fn the_quick_review_prompt_quotes_a_base_branch_that_needs_it() {
+    let mut picked = quick_job("").picked_pr().unwrap().clone();
+    picked.base_branch = "rel'$(x)".into();
+    let job = Job::pull_request("", Gates::default(), picked);
+    let text = job_prompt(
+        &job,
+        &Task::QuickReview,
+        Expect::QuickReview,
+        Agent::Claude,
+        &[],
+    );
+    assert!(text.contains(r"git diff 'refs/remotes/origin/rel'\''$(x)...HEAD'"));
+    assert!(text.contains("Ignore that part"));
 }
 
 #[test]
@@ -1784,7 +1801,7 @@ fn the_review_loop_prompt_reads_the_picked_pull_request_against_its_base() {
     let text = job_prompt(&job, &Task::Review, Expect::Review, Agent::Claude, &[]);
     assert!(text.contains("look at locking"));
     assert!(text.contains("Adds POST /reboot for the device page."));
-    assert!(text.contains("git diff origin/release-1...HEAD"));
+    assert!(text.contains("git diff 'refs/remotes/origin/release-1...HEAD'"));
     assert!(text.contains("\"approve\""));
 }
 

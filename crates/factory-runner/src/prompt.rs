@@ -410,7 +410,8 @@ impl<'a> ReviewContext<'a> {
             if context.previous.is_none() && context.new_answers.is_empty() {
                 pr.focus = job.request().trim();
             }
-            // A review job has no spec or plan, and its request is the focus.
+            // The request is the review's focus, so the decisions block that
+            // restates it as a feature request is left out.
             context.decisions.clear();
             context.pr = Some(pr);
         }
@@ -523,12 +524,19 @@ fn picked_section(text: &mut String, pr: &PickedContext) {
 fn diff_sentence(pr: Option<&PickedContext>) -> String {
     match pr {
         Some(pr) => format!(
-            "Read the diff with `git diff origin/{base}...HEAD`, since the pull request \
-             merges into {base}.",
+            "Read the diff with `git diff {range}`, since the pull request merges into \
+             {base}.",
+            range = shell_quote(&format!("refs/remotes/origin/{}...HEAD", pr.base)),
             base = pr.base
         ),
         None => "Read the diff with git, against the base branch the checkout is on.".to_owned(),
     }
+}
+
+/// Quotes `text` as one shell word, so a branch name with metacharacters
+/// cannot break the command.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// The prompt for the quick review of a picked pull request. It reads the
@@ -550,7 +558,10 @@ fn quick_review_prompt(context: &ReviewContext, agent: PromptTarget) -> String {
     );
     text.push_str(style.review_method);
     text.push_str(
-        "Give the pull request a score from 1 to 5 for how safe it is to merge as it is. \
+        "The review skill ends with an approve or changes verdict. Ignore that part: this \
+         review ends with the score and the review text described below, and has no \
+         \"outcome\" field.\n\n\
+         Give the pull request a score from 1 to 5 for how safe it is to merge as it is. \
          5 means it is safe to merge. 1 means do not merge. The scores between are your \
          judgment of how much is wrong and how serious it is: a change with only small \
          problems scores 4, and a change with a defect that must be fixed before a merge \

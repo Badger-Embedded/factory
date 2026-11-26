@@ -387,6 +387,7 @@ struct PlanEntry {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QuickReviewOutput {
     score: i64,
     review: String,
