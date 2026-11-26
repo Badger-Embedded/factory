@@ -273,6 +273,16 @@ test('the pull request picker searches a GitHub project and a Salsa project', as
   await expect(rows.nth(0)).toContainText('Salsa add a flag');
   await expect(rows.nth(1).locator('.badge')).toHaveText('fork');
   await expect(rows.nth(2).locator('.badge')).toHaveText('draft');
+
+  const search = page.getByRole('combobox', { name: 'Pull request' });
+  await search.fill('REWORK');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.nth(0)).toContainText('Salsa rework');
+  await search.fill('#2');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.nth(0)).toContainText('Salsa fork fix');
+  await search.fill('#99');
+  await expect(page.locator('#pr-results .pr-note')).toHaveText('No pull request matches.');
 });
 
 test('the pull request picker searches a Forgejo project', async ({ page, own }) => {
@@ -296,6 +306,12 @@ test('the pull request picker searches a Forgejo project', async ({ page, own })
         forgejoPull(3, 'Forgejo rework', { draft: true }),
       ]),
     );
+    // Routes added later are tried first, so this answers before the list above.
+    stub.route((_request, url) =>
+      url.pathname.endsWith('/api/v1/repos/owner/name/issues') && url.searchParams.get('q') === 'flaky'
+        ? { body: Array.from({ length: 21 }, (_, i) => ({ number: 100 + i, title: `Other ${i}` })) }
+        : undefined,
+    );
     own.fixture('project', '--name', 'forgejo', '--login', ADMIN, '--repo', 'owner/name', '--forge', 'mine');
 
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': ADMIN });
@@ -314,6 +330,18 @@ test('the pull request picker searches a Forgejo project', async ({ page, own })
     await expect(rows.nth(0)).toContainText('Forgejo add a flag');
     await expect(rows.nth(1).locator('.badge')).toHaveText('fork');
     await expect(rows.nth(2).locator('.badge')).toHaveText('draft');
+
+    const search = page.getByRole('combobox', { name: 'Pull request' });
+    await search.fill('rework');
+    await expect(rows).toHaveCount(1);
+    await expect(rows.nth(0)).toContainText('Forgejo rework');
+    await search.fill('#2');
+    await expect(rows).toHaveCount(1);
+    await expect(rows.nth(0)).toContainText('Forgejo fork fix');
+
+    await search.fill('flaky');
+    await expect(page.locator('#pr-results .pr-error')).toContainText('title matches may be incomplete');
+    await expect(rows).toHaveCount(0);
   } finally {
     await stub.stop();
   }

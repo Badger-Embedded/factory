@@ -266,9 +266,6 @@ test('a job created after page load appears and keeps the typed request', async 
 test.describe('pull request picker', () => {
   let counter = 0;
 
-  // A project on a fake forge repository named like `repo`, with a project token
-  // so the factory can search it. `prs` has a normal, a fork, a draft, a Renovate
-  // and a release pull request, `many` has 21 and `broken` fails every search.
   async function pullProject(page: Page, factory: Factory, repo: string, workerIndex: number) {
     const name = `${repo}-${workerIndex}-${counter++}`;
     factory.fixture('project', '--name', name, '--login', ADMIN, '--repo', `e2e/${name}`);
@@ -354,6 +351,33 @@ test.describe('pull request picker', () => {
     await expect(rows(page)).toHaveCount(1);
     await page.waitForTimeout(500);
     expect(queries).toEqual(['', 'dark']);
+  });
+
+  test('Enter while a replacement search is pending picks nothing, and Escape keeps the list closed', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    let delay = 0;
+    await page.route(`**/projects/${name}/pulls?*`, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      await route.continue().catch(() => undefined);
+    });
+    await openPicker(page, name);
+    await expect(rows(page)).toHaveCount(5);
+    await expect(rows(page).first()).toHaveClass(/active/);
+
+    delay = 1500;
+    await search(page).pressSequentially('#102');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('input[name="pr"]')).toHaveValue('');
+    await expect(page.locator('.pr-picked')).toBeHidden();
+    await expect(rows(page)).toHaveCount(0);
+    await expect(rows(page)).toHaveCount(1);
+    await expect(page.locator('#pr-results')).toBeVisible();
+
+    await search(page).pressSequentially('0');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(2200);
+    await expect(page.locator('#pr-results')).toBeHidden();
+    await expect(search(page)).toHaveAttribute('aria-expanded', 'false');
   });
 
   test('the keyboard picks a pull request, Enter does not submit and Escape closes the list', async ({ page, factory }, testInfo) => {

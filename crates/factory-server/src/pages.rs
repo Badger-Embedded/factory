@@ -466,9 +466,10 @@ pub fn pr_results(choices: &[PrChoice], more: bool) -> Markup {
                     @if pr.fork {
                         span.pr-hint {
                             "The factory cannot push to a fork's branch, so it cannot change this \
-                             pull request. Quick review stays available."
+                             pull request."
                         }
-                    } @else if let Some(job) = held_by {
+                    }
+                    @if let Some(job) = held_by {
                         span.pr-hint {
                             "Job " a href={ "/jobs/" (job) } { "#" (job) } " may push to or merge \
                              this pull request."

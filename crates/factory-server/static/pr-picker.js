@@ -9,8 +9,6 @@
   const url = "/projects/" + encodeURIComponent(picker.dataset.project) + "/pulls";
   const DEBOUNCE_MS = 250;
 
-  // The text box searches and the hidden field carries the pick, so a typed
-  // query never posts as a pull request number.
   const chosen = document.createElement("input");
   chosen.type = "hidden";
   chosen.name = "pr";
@@ -60,9 +58,15 @@
     search.removeAttribute("aria-activedescendant");
   }
 
-  function load() {
+  function cancel() {
     clearTimeout(timer);
+    timer = null;
     if (pending) pending.abort();
+    pending = null;
+  }
+
+  function load() {
+    cancel();
     const controller = new AbortController();
     pending = controller;
     fetch(url + "?q=" + encodeURIComponent(search.value.trim()), { signal: controller.signal })
@@ -71,13 +75,14 @@
         return response.text();
       })
       .then(function (html) {
+        if (pending !== controller) return;
         list.innerHTML = html;
         loaded = true;
         open();
         highlight(rows()[0] || null);
       })
       .catch(function (error) {
-        if (error.name === "AbortError") return;
+        if (error.name === "AbortError" || pending !== controller) return;
         const note = document.createElement("li");
         note.className = "pr-note pr-error";
         note.setAttribute("role", "presentation");
@@ -92,8 +97,7 @@
   }
 
   function pick(row) {
-    if (pending) pending.abort();
-    clearTimeout(timer);
+    cancel();
     chosen.value = row.dataset.number;
     picked.replaceChildren(row.querySelector("template").content.cloneNode(true));
     const remove = document.createElement("button");
@@ -129,7 +133,11 @@
   }
 
   search.addEventListener("input", function () {
-    clearTimeout(timer);
+    cancel();
+    loaded = false;
+    list.replaceChildren();
+    highlight(null);
+    close();
     timer = setTimeout(load, DEBOUNCE_MS);
   });
   search.addEventListener("focus", function () {
@@ -141,7 +149,8 @@
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       if (list.hidden) {
-        open();
+        if (loaded) open();
+        else load();
         return;
       }
       const all = rows();
@@ -153,8 +162,9 @@
       event.preventDefault();
       const row = activeRow();
       if (row && !list.hidden) pick(row);
-    } else if (event.key === "Escape" && !list.hidden) {
+    } else if (event.key === "Escape" && (!list.hidden || pending || timer)) {
       event.preventDefault();
+      cancel();
       close();
     }
   });

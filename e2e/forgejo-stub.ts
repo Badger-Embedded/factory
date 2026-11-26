@@ -33,7 +33,7 @@ export interface ForgejoStub {
 export function forgejoPull(
   number: number,
   title: string,
-  options: { fork?: boolean; draft?: boolean; author?: string } = {},
+  options: { fork?: boolean; draft?: boolean; author?: string; body?: string } = {},
 ) {
   return {
     number,
@@ -41,6 +41,7 @@ export function forgejoPull(
     state: 'open',
     merged: false,
     draft: options.draft ?? false,
+    body: options.body ?? '',
     html_url: `https://forge.test/owner/name/pulls/${number}`,
     user: { login: options.author ?? 'carol' },
     head: { sha: 'abc', ref: `b${number}`, repo_id: options.fork ? 9 : 5 },
@@ -48,12 +49,28 @@ export function forgejoPull(
   };
 }
 
-/** A route that lists `pulls` for `repo`, which is what the picker's search asks Forgejo for. */
-export function forgejoPullList(repo: string, pulls: unknown[]): StubRoute {
-  return (request, url) =>
-    request.method === 'GET' && url.pathname.endsWith(`/api/v1/repos/${repo}/pulls`)
-      ? { body: pulls }
-      : undefined;
+/**
+ * A route that serves `pulls` for `repo` as Forgejo does for the picker's search: the
+ * listing, one pull request by number, and the issues search, which matches the title
+ * or the body.
+ */
+export function forgejoPullList(repo: string, pulls: ReturnType<typeof forgejoPull>[]): StubRoute {
+  const base = `/api/v1/repos/${repo}`;
+  return (request, url) => {
+    if (request.method !== 'GET') return undefined;
+    if (url.pathname === `${base}/pulls`) return { body: pulls };
+    const one = url.pathname.match(new RegExp(`^${base}/pulls/(\\d+)$`));
+    if (one) {
+      const found = pulls.find((pull) => pull.number === Number(one[1]));
+      return found ? { body: found } : { status: 404, body: { message: 'not found' } };
+    }
+    if (url.pathname === `${base}/issues`) {
+      const text = (url.searchParams.get('q') ?? '').toLowerCase();
+      const hits = pulls.filter((pull) => `${pull.title} ${pull.body}`.toLowerCase().includes(text));
+      return { body: hits.map(({ number, title }) => ({ number, title })) };
+    }
+    return undefined;
+  };
 }
 
 /** A version string as Forgejo writes it, which Gitea does not. */
