@@ -100,6 +100,10 @@ pub struct Job {
     /// retry reruns the quick review until it did, and the review loop after.
     #[serde(default)]
     quick_reviewed: bool,
+    /// Whether the user chose to fix the quick-reviewed pull request, which
+    /// makes the job a writer that holds the pull request.
+    #[serde(default)]
+    fixing: bool,
 }
 
 /// What a job works on.
@@ -1512,6 +1516,7 @@ impl Job {
             kind: JobKind::Request,
             pushed: false,
             quick_reviewed: false,
+            fixing: false,
         }
     }
 
@@ -1630,6 +1635,17 @@ impl Job {
     pub fn forces_review(&self) -> bool {
         self.picked_pr()
             .is_some_and(|picked| picked.mode != PrMode::Request)
+    }
+
+    /// Whether the job only reads its picked pull request: a quick review the
+    /// user has not chosen to fix. It never pushes to or merges the pull
+    /// request, so it holds nothing.
+    #[must_use]
+    pub fn reads_only(&self) -> bool {
+        !self.fixing
+            && self
+                .picked_pr()
+                .is_some_and(|picked| matches!(picked.mode, PrMode::QuickReview { .. }))
     }
 
     /// The Renovate job and pull request number a gap job came from.
@@ -2035,20 +2051,25 @@ impl Job {
                     }),
                 )
             }
-            // A fix in another branch is a second event here, added with the
-            // action that sends it.
             (
                 S::CiAndReview { pr },
-                Turn::User(Ask::QuickReview { review, .. }),
+                Turn::User(Ask::QuickReview {
+                    review, comment, ..
+                }),
                 E::FixHere { instructions, held },
-            ) if !held && self.picked_pr().is_some_and(|picked| !picked.fork) => {
+            ) if !held
+                && *comment != CommentState::Pending
+                && self.picked_pr().is_some_and(|picked| !picked.fork) =>
+            {
+                let pr = *pr;
+                self.fixing = true;
                 let comments = if instructions.trim().is_empty() {
                     review.clone()
                 } else {
                     format!("{review}\n\n{instructions}")
                 };
                 (
-                    S::CiAndReview { pr: *pr },
+                    S::CiAndReview { pr },
                     Turn::Agent(Task::AddressReview { comments }),
                 )
             }
@@ -2088,20 +2109,18 @@ impl Job {
         let Some(picked) = self.picked_pr() else {
             return (Stage::Requested, Turn::Factory);
         };
-        let quick = matches!(picked.mode, PrMode::QuickReview { .. });
+        let task = if matches!(picked.mode, PrMode::QuickReview { .. }) {
+            Task::QuickReview
+        } else {
+            Task::Review
+        };
         let mut one = Self::one_pr(Vec::new(), picked.number);
         one.title.clone_from(&picked.title);
         self.plan = vec![one];
         self.review = ReviewState::Pending;
-        let turn = if quick {
-            Turn::Agent(Task::QuickReview)
-        } else {
-            Turn::Factory
-        };
-        (Stage::CiAndReview { pr: 0 }, turn)
+        (Stage::CiAndReview { pr: 0 }, Turn::Agent(task))
     }
 
-    /// The comment a quick review posts on the pull request.
     fn quick_review_comment(score: u8, head: &str, review: &str) -> String {
         format!("LGTM score: {score}/5\n\nReviewed commit: {head}\n\n{review}")
     }
@@ -2126,9 +2145,9 @@ impl Job {
         let next = match (&self.stage, &self.turn, event) {
             (
                 S::Implementing { pr } | S::Verifying { pr } | S::CiAndReview { pr },
-                Turn::Agent(_),
+                Turn::Agent(task),
                 E::Agent(AgentResult::CommitsReady(description)),
-            ) => {
+            ) if !matches!(task, Task::Review | Task::QuickReview) => {
                 let pr = *pr;
                 self.plan[pr].description = Some(description);
                 (S::Verifying { pr }, Turn::Factory)

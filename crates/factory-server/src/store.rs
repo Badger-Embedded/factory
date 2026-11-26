@@ -1392,7 +1392,7 @@ impl Store {
             }
             let job = &row.job;
             let renovates = job.renovate_pr().is_some_and(|pr| pr.number == number);
-            let plans = job.plan().iter().any(|pr| pr.number == Some(number));
+            let plans = !job.reads_only() && job.plan().iter().any(|pr| pr.number == Some(number));
             let works = job.picked_pr().is_some_and(|picked| {
                 picked.number == number && !matches!(picked.mode, PrMode::QuickReview { .. })
             });
@@ -1416,7 +1416,12 @@ impl Store {
             .renovate_pr()
             .map(|pr| pr.number)
             .into_iter()
-            .chain(job.plan().iter().filter_map(|pr| pr.number))
+            .chain(
+                job.plan()
+                    .iter()
+                    .filter_map(|pr| pr.number)
+                    .filter(|_| !job.reads_only()),
+            )
             .chain(picked);
         for number in numbers {
             if let Some(holder) = Self::holder(tx, &row.project, number, Some(row.id))? {
@@ -2109,6 +2114,12 @@ impl Store {
         let was_merged = *row.job.stage() == Stage::Merged;
         if matches!(event, Event::Retry) {
             Self::check_claims(tx, row)?;
+        }
+        if matches!(event, Event::FixHere { .. })
+            && let Some(number) = row.job.picked_pr().map(|picked| picked.number)
+            && let Some(job) = Self::holder(tx, &row.project, number, Some(row.id))?
+        {
+            return Err(StoreError::PrHeld { number, job });
         }
         let name = event.name();
         let detail = match &event {

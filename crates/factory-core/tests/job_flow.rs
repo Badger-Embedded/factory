@@ -4289,19 +4289,16 @@ fn the_review_loop_after_a_quick_review_stops_at_the_round_cap() {
 fn review_and_fix_approving_on_the_first_pass_pushes_nothing() {
     let mut job = review_job(PrMode::ReviewAndFix, false);
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
-    assert_eq!(job.turn(), &Turn::Factory);
+    assert_eq!(job.turn(), &Turn::Agent(Task::Review));
     assert!(job.forces_review());
     assert_eq!(
         job.next_command(),
-        Some(Command::WatchPr {
-            pr: 0,
-            number: 42,
-            watch_only: false
+        Some(Command::RunAgent {
+            session: Session::Review(0),
+            task: Task::Review
         })
     );
 
-    apply(&mut job, Event::StartReview { head: "abc".into() });
-    assert_eq!(job.turn(), &Turn::Agent(Task::Review));
     apply(&mut job, Event::ReviewApproved);
     assert!(!matches!(job.next_command(), Some(Command::Publish { .. })));
     apply(&mut job, Event::MergeLeftToUser);
@@ -4311,7 +4308,6 @@ fn review_and_fix_approving_on_the_first_pass_pushes_nothing() {
 #[test]
 fn review_and_fix_fixes_what_the_first_pass_asks_for() {
     let mut job = review_job(PrMode::ReviewAndFix, false);
-    apply(&mut job, Event::StartReview { head: "abc".into() });
     apply(
         &mut job,
         Event::ReviewChanges {
@@ -4374,4 +4370,80 @@ fn a_quick_review_job_can_be_cancelled_while_it_waits() {
 fn a_request_on_a_picked_pull_request_does_not_force_the_review() {
     assert!(!picked_watching().forces_review());
     assert!(!Job::new("x", Gates::default()).forces_review());
+}
+
+#[test]
+fn a_commit_result_cannot_move_a_reviewer_onto_the_publish_path() {
+    for mode in [PrMode::QuickReview { comment: false }, PrMode::ReviewAndFix] {
+        let mut job = review_job(mode, false);
+        let before = job.clone();
+        assert!(
+            job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+                .is_err()
+        );
+        assert_eq!(job, before);
+    }
+}
+
+#[test]
+fn a_fix_waits_for_the_comment_attempt_to_finish() {
+    let fix = Event::FixHere {
+        instructions: String::new(),
+        held: false,
+    };
+
+    let mut job = quick(true);
+    quick_reviewed(&mut job);
+    let pending = job.clone();
+    assert!(job.apply(fix.clone()).is_err());
+    assert_eq!(job, pending);
+    apply(&mut job, Event::Commented);
+    apply(&mut job, fix.clone());
+    assert!(matches!(
+        job.turn(),
+        Turn::Agent(Task::AddressReview { .. })
+    ));
+
+    let mut failed = quick(true);
+    quick_reviewed(&mut failed);
+    assert!(failed.apply(fix.clone()).is_err());
+    apply(
+        &mut failed,
+        Event::CommentFailed {
+            error: "403".into(),
+        },
+    );
+    apply(&mut failed, fix);
+    assert!(matches!(
+        failed.turn(),
+        Turn::Agent(Task::AddressReview { .. })
+    ));
+}
+
+#[test]
+fn a_quick_review_reads_only_until_the_user_fixes() {
+    let mut job = quick(false);
+    assert!(job.reads_only());
+    quick_reviewed(&mut job);
+    apply(
+        &mut job,
+        Event::FixHere {
+            instructions: String::new(),
+            held: false,
+        },
+    );
+    assert!(!job.reads_only());
+    assert!(!review_job(PrMode::ReviewAndFix, false).reads_only());
+}
+
+#[test]
+fn review_and_fix_reviews_first_even_when_ci_is_not_green() {
+    let job = review_job(PrMode::ReviewAndFix, false);
+    assert!(matches!(
+        job.next_command(),
+        Some(Command::RunAgent {
+            task: Task::Review,
+            ..
+        })
+    ));
 }
