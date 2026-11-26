@@ -286,7 +286,7 @@ pub fn workers(
                             @let shown = shown_name(visible, &row.project);
                             li.worker.busy {
                                 span.worker-name { "Worker " (number) }
-                                a.worker-job href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
+                                a.worker-job href={ "/jobs/" (row.id) } title=(job_title(&row.job)) {
                                     "#" (row.id)
                                     @if row.project != project { " " (shown) }
                                     " · " (stage_label(&row.job))
@@ -349,7 +349,7 @@ impl StartAfterOption {
             name: "after",
             value: row.id,
             id: row.id,
-            title: first_line(row.job.request()),
+            title: job_title(&row.job),
             checked: false,
             state: None,
         }
@@ -4291,8 +4291,8 @@ fn job_rows(
                 @let lane = status(&row.job, auto_merge, wait).lane;
                 li class={ "job job-" (Section::of(lane).name()) } {
                     span.id { "#" (row.id) }
-                    a.title href={ "/jobs/" (row.id) } title=(first_line(row.job.request())) {
-                        (first_line(row.job.request()))
+                    a.title href={ "/jobs/" (row.id) } title=(job_title(&row.job)) {
+                        (job_title(&row.job))
                     }
                     div.job-sub {
                         (renovate_link(&row.job, links))
@@ -4893,7 +4893,7 @@ fn job_header(
     let job = &row.job;
     html! {
         div.title-row {
-            h1 { "#" (id) " " (first_line(job.request())) }
+            h1 { "#" (id) " " (job_title(job)) }
             (cost_badge(false, cost_usd, estimated))
         }
         @if job.renovate_pr().is_some() {
@@ -5591,7 +5591,7 @@ fn waiting_card(id: i64, job: &Job, wait: &Wait, prerequisites: &[PrerequisiteVi
                     (prerequisite_link(prerequisite))
                     " "
                     @if let Some(job) = &prerequisite.job {
-                        (first_line(job.request()))
+                        (job_title(job))
                     } @else {
                         (first_line(&prerequisite.title))
                     }
@@ -5757,7 +5757,7 @@ pub fn attention(job: &Job, auto_merge: bool, wait: &Wait) -> Option<&'static st
 }
 
 pub fn job_title(job: &Job) -> String {
-    first_line(job.request())
+    first_line(&job.title())
 }
 
 fn turn_badge(job: &Job, auto_merge: bool, wait: &Wait) -> Markup {

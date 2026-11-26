@@ -1883,6 +1883,31 @@ impl Forge for Forgejo {
         })
     }
 
+    fn has_comment<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        body: &'a str,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let repo = repo_path(repo)?;
+            let comments: Vec<CommentJson> = self
+                .list(
+                    account,
+                    &format!("{repo}/issues/{number}/comments"),
+                    &[],
+                    None,
+                )
+                .await?;
+            Ok(comments.iter().any(|comment| {
+                comment.user.as_ref().is_some_and(|user| {
+                    crate::forge::is_posted_comment(account, &user.login, &comment.body, body)
+                })
+            }))
+        })
+    }
+
     fn approve<'a>(
         &'a self,
         account: &'a Account,

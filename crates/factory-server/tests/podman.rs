@@ -1995,6 +1995,36 @@ async fn a_review_of_a_retargeted_pull_request_stops_before_the_reviewer_starts(
 }
 
 #[tokio::test]
+async fn a_quick_review_that_cannot_start_stops_for_a_retry_and_does_not_fail_the_job() {
+    let tools = picked_tools("main", "");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut run = request();
+    run.repo = "o/r".into();
+    run.base = "develop".into();
+    run.expect = Expect::QuickReview;
+    run.existing = Some(factory_server::ExistingPr {
+        number: 12,
+        head_branch: "carol/reboot".into(),
+        head_ref: "refs/pull/12/head".into(),
+    });
+
+    let report = podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+
+    assert!(
+        matches!(&report.event, Event::ReviewFailed { reason } if reason.contains("develop")),
+        "{:?}",
+        report.event
+    );
+}
+
+#[tokio::test]
 async fn a_green_pull_request_that_was_retargeted_fails_instead_of_asking_for_the_merge() {
     let tools = picked_tools("main", "");
     let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));

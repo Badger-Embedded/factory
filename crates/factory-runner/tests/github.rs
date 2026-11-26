@@ -1706,3 +1706,42 @@ esac"#,
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn has_comment_finds_the_account_s_comment_on_a_later_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, calls) = recording_github(
+        dir.path(),
+        r#"for n in $(seq 1 150); do echo '{"login":"someone","body":"comment"}'; done
+echo '{"login":"factory-bot","body":"LGTM score: 4/5\n\n<!-- id -->"}'"#,
+    );
+    let body = "LGTM score: 4/5\n\n<!-- id -->";
+    assert!(
+        github
+            .has_comment(&account(), "o/r", 5, body)
+            .await
+            .unwrap()
+    );
+    assert!(
+        fs::read_to_string(&calls)
+            .unwrap()
+            .starts_with("api --paginate repos/o/r/issues/5/comments")
+    );
+}
+
+#[tokio::test]
+async fn has_comment_ignores_another_author_that_quotes_the_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (github, _) = recording_github(
+        dir.path(),
+        r#"echo '{"login":"someone","body":"LGTM score: 4/5\n\n<!-- id -->"}'
+echo '{"login":"factory-bot","body":"quote: LGTM score: 4/5\n\n<!-- id -->"}'"#,
+    );
+    let body = "LGTM score: 4/5\n\n<!-- id -->";
+    assert!(
+        !github
+            .has_comment(&account(), "o/r", 5, body)
+            .await
+            .unwrap()
+    );
+}

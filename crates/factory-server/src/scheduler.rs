@@ -637,6 +637,18 @@ pub trait Executor: Send + Sync + 'static {
         body: &str,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
+    /// Whether the account `author` already posted `body` as a comment of the
+    /// pull request. The lookup reads with the job's account.
+    fn has_comment(
+        &self,
+        forge: &ForgeKind,
+        account: &AccountSource,
+        author: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> impl Future<Output = Result<bool, String>> + Send;
+
     /// Approves the pull request with a plain review text and squash-merges
     /// `head`, and only that head.
     fn merge_renovate(
@@ -828,6 +840,10 @@ pub struct Scheduler<E> {
     discovered: Mutex<HashMap<String, Instant>>,
 }
 
+fn quick_review_marker(session: &str) -> String {
+    format!("<!-- factory quick review {session} -->")
+}
+
 fn rerun_request(
     job_id: i64,
     resolved: &Resolved,
@@ -937,7 +953,8 @@ impl<E: Executor> Scheduler<E> {
                     let Some(expect) = Expect::for_task(job.stage(), &task) else {
                         continue;
                     };
-                    let Some(resolved) = self.resolve(&row, &project, &settings, true)? else {
+                    let Some(resolved) = self.resolve(&row, &project, &settings, Some(expect))?
+                    else {
                         continue;
                     };
                     let Some((request, skipped)) = self
@@ -958,19 +975,19 @@ impl<E: Executor> Scheduler<E> {
                     self.summarize(row.id, pr, &job, &project, &settings);
                 }
                 Command::Publish { pr } if self.due(row.id) => {
-                    let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
+                    let Some(resolved) = self.resolve(&row, &project, &settings, None)? else {
                         continue;
                     };
                     self.publish(row.id, pr, &job, &project, &resolved, &settings)?;
                 }
                 watch @ Command::WatchPr { .. } if self.due(row.id) => {
-                    let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
+                    let Some(resolved) = self.resolve(&row, &project, &settings, None)? else {
                         continue;
                     };
                     self.watch_pr(&row, &job, &project, &resolved, &settings, &watch)?;
                 }
                 Command::RerunCi { number, reason, .. } if self.due(row.id) => {
-                    let Some(resolved) = self.resolve(&row, &project, &settings, false)? else {
+                    let Some(resolved) = self.resolve(&row, &project, &settings, None)? else {
                         continue;
                     };
                     let request = rerun_request(row.id, &resolved, &project, number, false);
@@ -999,6 +1016,35 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
+    /// The account a Renovate command runs as. A quick review's comment is
+    /// optional, so an account that cannot be read ends it like a forge error
+    /// and does not retry.
+    fn resolve_for(
+        &self,
+        row: &JobRow,
+        job: &Job,
+        project: &Project,
+        settings: &Settings,
+        command: &Command,
+    ) -> Result<Option<Resolved>, StoreError> {
+        if job.picked_pr().is_none() || !matches!(command, Command::PostComment { .. }) {
+            return self.resolve(row, project, settings, None);
+        }
+        match self
+            .accounts
+            .resolve(&row.project, project, &row.requested_by)
+        {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(ResolveError::Store(err)) => Err(err),
+            Err(ResolveError::Account(reason)) => {
+                let error = credential_failure(&reason);
+                self.note(row.id, &format!("Could not comment: {error}"));
+                self.apply(row.id, Event::CommentFailed { error });
+                Ok(None)
+            }
+        }
+    }
+
     /// Starts the factory turn of a Renovate job.
     fn renovate_command(
         self: &Arc<Self>,
@@ -1009,7 +1055,7 @@ impl<E: Executor> Scheduler<E> {
         command: Command,
     ) -> Result<(), StoreError> {
         let id = row.id;
-        let Some(resolved) = self.resolve(row, project, settings, false)? else {
+        let Some(resolved) = self.resolve_for(row, job, project, settings, &command)? else {
             return Ok(());
         };
         match command {
@@ -1055,11 +1101,12 @@ impl<E: Executor> Scheduler<E> {
             }
             Command::PostComment { number, body } => {
                 let repo = project.repo.clone();
+                let quick_review = job.picked_pr().is_some();
                 let scheduler = Arc::clone(self);
                 let settings = settings.clone();
                 self.spawn(id, Kind::Factory, async move {
                     scheduler
-                        .post_comment(&settings, id, &resolved, &repo, number, &body)
+                        .post_comment(&settings, id, &resolved, &repo, number, &body, quick_review)
                         .await;
                 });
             }
@@ -1175,7 +1222,7 @@ impl<E: Executor> Scheduler<E> {
         row: &JobRow,
         project: &Project,
         settings: &Settings,
-        agent: bool,
+        agent: Option<Expect>,
     ) -> Result<Option<Resolved>, StoreError> {
         match self
             .accounts
@@ -1184,8 +1231,9 @@ impl<E: Executor> Scheduler<E> {
             Ok(resolved) => Ok(Some(resolved)),
             Err(ResolveError::Store(err)) => Err(err),
             Err(ResolveError::Account(reason)) => {
-                if agent {
-                    self.store.apply(row.id, Event::AgentFailed { reason })?;
+                if let Some(expect) = agent {
+                    self.store
+                        .apply(row.id, factory_runner::failed_event(expect, reason))?;
                 } else {
                     self.retry_later(settings, row.id, &credential_failure(&reason));
                 }
@@ -1543,7 +1591,8 @@ impl<E: Executor> Scheduler<E> {
                 Ok(local) => Some(local),
                 Err(reason) => {
                     self.open_run_log(row.id, None, stage_note.as_deref())?;
-                    self.store.apply(row.id, Event::AgentFailed { reason })?;
+                    self.store
+                        .apply(row.id, factory_runner::failed_event(expect, reason))?;
                     return Ok(None);
                 }
             }
@@ -2068,9 +2117,10 @@ impl<E: Executor> Scheduler<E> {
                 .store
                 .project_auto_merge(&row.project, project.auto_merge)?,
             may_merge: job.may_merge(),
-            llm_review: self
-                .store
-                .project_llm_review(&row.project, project.llm_review)?,
+            llm_review: job.forces_review()
+                || self
+                    .store
+                    .project_llm_review(&row.project, project.llm_review)?,
             review_approved: job.review_state() == ReviewState::Approved,
             watch_only,
         };
@@ -2171,6 +2221,19 @@ impl<E: Executor> Scheduler<E> {
         }
         self.record_run_cost(job_id, &cost_session, agent, model.as_deref(), &report);
         match report.head {
+            Some(head) if matches!(report.event, Event::QuickReviewed { .. }) => {
+                let Event::QuickReviewed { score, review, .. } = report.event else {
+                    unreachable!("matched above");
+                };
+                self.apply(
+                    job_id,
+                    Event::QuickReviewed {
+                        score,
+                        review,
+                        head,
+                    },
+                );
+            }
             Some(head)
                 if matches!(
                     report.event,
@@ -2587,6 +2650,55 @@ impl<E: Executor> Scheduler<E> {
         self.apply(job_id, event);
     }
 
+    /// One account for the lookup, the saved login and the POST of a quick
+    /// review's comment, so a switch during the step cannot split them. A
+    /// failure is recorded as `CommentFailed` and gives `None`.
+    fn pinned_source(
+        &self,
+        job_id: i64,
+        resolved: &Resolved,
+        number: u64,
+    ) -> Option<AccountSource> {
+        match resolved.source.resolve() {
+            Ok(operation) => Some(AccountSource::new(move || Ok(operation.clone()))),
+            Err(err) => {
+                self.note(job_id, &format!("Could not comment on #{number}: {err}"));
+                self.apply(job_id, Event::CommentFailed { error: err });
+                None
+            }
+        }
+    }
+
+    fn comment_failed(&self, job_id: i64, number: u64, error: String) {
+        self.note(job_id, &format!("Could not comment on #{number}: {error}"));
+        self.apply(job_id, Event::CommentFailed { error });
+    }
+
+    /// The login that posted or was about to post the comment, or the pinned
+    /// account's when there was no earlier attempt.
+    fn saved_author(&self, job_id: i64, source: &AccountSource) -> Result<String, String> {
+        match self
+            .store
+            .comment_author(job_id)
+            .map_err(|err| err.to_string())?
+        {
+            Some(login) => Ok(login),
+            None => Ok(source.resolve()?.account.login),
+        }
+    }
+
+    /// Saves the pinned account's login before the POST.
+    fn save_author(&self, job_id: i64, source: &AccountSource) -> Result<(), String> {
+        let login = source.resolve()?.account.login;
+        self.store
+            .set_comment_author(job_id, &login)
+            .map_err(|err| err.to_string())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a separate fact of the operation that starts"
+    )]
     async fn post_comment(
         &self,
         settings: &Settings,
@@ -2595,15 +2707,89 @@ impl<E: Executor> Scheduler<E> {
         repo: &str,
         number: u64,
         body: &str,
+        quick_review: bool,
     ) {
+        let full;
+        let pinned;
+        let source = if quick_review {
+            let Some(source) = self.pinned_source(job_id, resolved, number) else {
+                return;
+            };
+            pinned = source;
+            &pinned
+        } else {
+            &resolved.source
+        };
+        let body = if quick_review {
+            // The marker holds the review session's id, which is stored with
+            // the job. A restart that lost the saved result finds the comment
+            // the account already posted, and only that comment counts.
+            let session = match self
+                .store
+                .session_uuid(job_id, Session::Review(0), DEFAULT_AGENT)
+            {
+                Ok((session, _)) => session,
+                Err(err) => {
+                    self.note(job_id, &format!("Could not comment on #{number}: {err}"));
+                    self.apply(
+                        job_id,
+                        Event::CommentFailed {
+                            error: err.to_string(),
+                        },
+                    );
+                    return;
+                }
+            };
+            full = format!("{body}\n\n{}", quick_review_marker(&session));
+            // The account that may already have posted is the one recorded
+            // before the first attempt, which a switch of the job's account
+            // does not change.
+            let author = match self.saved_author(job_id, source) {
+                Ok(author) => author,
+                Err(err) => {
+                    self.comment_failed(job_id, number, err);
+                    return;
+                }
+            };
+            match self
+                .executor
+                .has_comment(&resolved.forge, source, &author, repo, number, &full)
+                .await
+            {
+                Ok(true) => {
+                    self.note(job_id, &format!("Already commented on #{number}."));
+                    self.apply(job_id, Event::Commented);
+                    return;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    self.note(job_id, &format!("Could not comment on #{number}: {err}"));
+                    self.apply(job_id, Event::CommentFailed { error: err });
+                    return;
+                }
+            }
+            if let Err(err) = self.save_author(job_id, source) {
+                self.comment_failed(job_id, number, err);
+                return;
+            }
+            &full
+        } else {
+            body
+        };
         match self
             .executor
-            .comment(&resolved.forge, &resolved.source, repo, number, body)
+            .comment(&resolved.forge, source, repo, number, body)
             .await
         {
             Ok(()) => {
                 self.note(job_id, &format!("Commented on #{number}: {body}"));
                 self.apply(job_id, Event::Commented);
+            }
+            // A quick review's comment is optional, so the review stays on the
+            // job page with the forge's error instead of waiting to retry.
+            Err(err) if quick_review => {
+                self.note(job_id, &format!("Could not comment on #{number}: {err}"));
+                self.apply(job_id, Event::CommentFailed { error: err });
             }
             Err(err) => self.retry_later(settings, job_id, &err),
         }

@@ -447,6 +447,12 @@ struct IssueCommentJson {
 }
 
 #[derive(Deserialize)]
+struct PostedJson {
+    login: Option<String>,
+    body: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReviewJson {
     author: Option<Login>,
@@ -1283,6 +1289,48 @@ impl GitHub {
         .map(|_| ())
     }
 
+    /// Whether the account already posted `body` as a plain comment of the
+    /// pull request. It reads every page of the comments.
+    ///
+    /// # Errors
+    ///
+    /// Returns gh's message when the call fails, or when its output does not
+    /// parse.
+    async fn has_comment(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<bool, String> {
+        let lines = self
+            .run(
+                account,
+                &[
+                    "api",
+                    "--paginate",
+                    &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+                    "--jq",
+                    ".[] | {login: .user.login, body: .body}",
+                ],
+                None,
+            )
+            .await?;
+        for line in lines.lines().filter(|line| !line.trim().is_empty()) {
+            let comment: PostedJson =
+                serde_json::from_str(line).map_err(|err| format!("comments: {err}"))?;
+            if crate::forge::is_posted_comment(
+                account,
+                comment.login.as_deref().unwrap_or_default(),
+                comment.body.as_deref().unwrap_or_default(),
+                body,
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Approves commit `head` of the pull request with `body` as the review
     /// text. GitHub refuses the review when `head` is no longer a commit of
     /// the pull request.
@@ -2011,6 +2059,16 @@ impl Forge for GitHub {
         body: &'a str,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(GitHub::comment(self, account, repo, number, body))
+    }
+
+    fn has_comment<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        body: &'a str,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(GitHub::has_comment(self, account, repo, number, body))
     }
 
     fn approve<'a>(

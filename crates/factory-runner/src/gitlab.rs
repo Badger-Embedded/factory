@@ -237,6 +237,15 @@ struct NoteJson {
 }
 
 #[derive(Deserialize)]
+struct PostedNote {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    system: bool,
+    author: Option<NoteAuthor>,
+}
+
+#[derive(Deserialize)]
 struct NoteAuthor {
     username: String,
     #[serde(default)]
@@ -1030,6 +1039,28 @@ impl GitLab {
         .map(|_| ())
     }
 
+    async fn has_comment(
+        &self,
+        account: &Account,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<bool, String> {
+        let notes: Vec<PostedNote> = self
+            .get_all(
+                account,
+                &format!("{}/merge_requests/{number}/notes", project(repo)),
+                &[],
+            )
+            .await?;
+        Ok(notes.iter().any(|note| {
+            !note.system
+                && note.author.as_ref().is_some_and(|author| {
+                    crate::forge::is_posted_comment(account, &author.username, &note.body, body)
+                })
+        }))
+    }
+
     async fn approve(
         &self,
         account: &Account,
@@ -1500,6 +1531,16 @@ impl Forge for GitLab {
         body: &'a str,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(GitLab::comment(self, account, repo, number, body))
+    }
+
+    fn has_comment<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        body: &'a str,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(GitLab::has_comment(self, account, repo, number, body))
     }
 
     fn approve<'a>(

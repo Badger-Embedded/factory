@@ -619,6 +619,41 @@ async fn comments_carry_their_location_and_utc_time_and_skip_ignored_logins() {
 }
 
 #[tokio::test]
+async fn has_comment_reads_only_the_issue_comments() {
+    let body = "LGTM score: 4/5";
+    let stub = serve(move |seen| match seen.path.as_str() {
+        "/repos/owner/name/issues/3/comments" => page(
+            seen,
+            &json!([{"body": body, "created_at": "2026-11-23T10:00:00Z", "user": {"login": "Factory-Bot"}}]),
+        ),
+        _ => rep(500, "boom"),
+    })
+    .await;
+    assert!(
+        stub.forge
+            .has_comment(&account(&stub.forge), REPO, 3, body)
+            .await
+            .unwrap()
+    );
+
+    let review = serve(move |seen| match seen.path.as_str() {
+        "/repos/owner/name/pulls/3/reviews" => page(
+            seen,
+            &json!([{"id": 1, "body": body, "state": "COMMENT", "submitted_at": "2026-11-23T10:00:00Z", "comments_count": 0, "user": {"login": "factory-bot"}}]),
+        ),
+        _ => quiet(seen),
+    })
+    .await;
+    assert!(
+        !review
+            .forge
+            .has_comment(&account(&review.forge), REPO, 3, body)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn times_convert_across_a_day_and_year_boundary() {
     let stub = serve(|seen| match seen.path.as_str() {
         "/repos/owner/name/pulls/3" => {
