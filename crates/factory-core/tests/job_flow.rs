@@ -4306,6 +4306,7 @@ fn fixing_elsewhere_opens_a_new_pull_request_and_never_merges_it() {
     );
     assert_eq!(job.plan()[0].number, None);
     assert_eq!(job.stacked_on().map(|picked| picked.number), Some(42));
+    assert_eq!(job.reviewed_head(), Some("abc123"));
 
     apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
     apply(&mut job, Event::ChecksPassed);

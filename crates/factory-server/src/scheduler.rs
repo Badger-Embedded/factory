@@ -112,11 +112,14 @@ fn job_refs(job_id: i64, job: &Job, project: &Project, pr: usize) -> JobRefs {
     }
 }
 
-/// The fork pull request whose head a stacked job's branch must keep.
-fn forked_head(job: &Job) -> Option<u64> {
-    job.stacked_on()
-        .filter(|picked| picked.fork)
-        .map(|picked| picked.number)
+/// The reviewed commit of a fork pull request that a stacked job's branch
+/// must keep, or its tracking ref when the review recorded none.
+fn forked_head(job: &Job) -> Option<String> {
+    let picked = job.stacked_on().filter(|picked| picked.fork)?;
+    Some(job.reviewed_head().map_or_else(
+        || format!("refs/factory/pr-{}/head", picked.number),
+        str::to_owned,
+    ))
 }
 
 fn session_refs(job_id: i64, job: &Job, project: &Project, session: Session) -> JobRefs {
@@ -301,10 +304,10 @@ pub struct PublishRequest {
     /// Whether the project runs checks before a push. A picked pull request
     /// job then never pushes a merge commit that the checks have not run on.
     pub checks: bool,
-    /// The number of the fork pull request whose head the job's own branch
-    /// must keep. The push is then fast-forward only and refused when the
+    /// The commit the fork pull request had when it was reviewed, which the
+    /// job's own branch must keep. The push is then fast-forward only and refused when the
     /// branch lost that head, even on its first push.
-    pub keep_history: Option<u64>,
+    pub keep_history: Option<String>,
     /// Told the account of each push right after it succeeds, before the pull
     /// request is opened.
     pub pushed: PushLog,

@@ -109,6 +109,9 @@ pub struct Job {
     /// [`Event::FixElsewhere`].
     #[serde(default)]
     stacked: bool,
+    /// The commit the quick review read, which a stacked job keeps.
+    #[serde(default)]
+    reviewed_head: Option<String>,
 }
 
 /// What a job works on.
@@ -1538,6 +1541,7 @@ impl Job {
             quick_reviewed: false,
             fixing: false,
             stacked: false,
+            reviewed_head: None,
         }
     }
 
@@ -1676,6 +1680,12 @@ impl Job {
     #[must_use]
     pub fn stacked_on(&self) -> Option<&PickedPr> {
         self.picked_pr().filter(|_| self.stacked)
+    }
+
+    /// The commit the quick review read, for a stacked job.
+    #[must_use]
+    pub fn reviewed_head(&self) -> Option<&str> {
+        self.reviewed_head.as_deref()
     }
 
     /// The branch the stacked pull request targets: the reviewed pull
@@ -2131,7 +2141,10 @@ impl Job {
             (
                 S::CiAndReview { .. },
                 Turn::User(Ask::QuickReview {
-                    review, comment, ..
+                    review,
+                    comment,
+                    head,
+                    ..
                 }),
                 E::FixElsewhere { instructions },
             ) if *comment != CommentState::Pending => {
@@ -2142,6 +2155,7 @@ impl Job {
                 };
                 self.fixing = true;
                 self.stacked = true;
+                self.reviewed_head = Some(head.clone()).filter(|head| !head.is_empty());
                 let title = self.picked_pr().map(|picked| picked.title.clone());
                 self.plan = vec![PlannedPr {
                     title: title.unwrap_or_default(),

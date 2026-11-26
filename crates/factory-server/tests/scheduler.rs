@@ -9511,6 +9511,13 @@ async fn a_conflict_on_a_published_stack_rebases_and_pushes_it_like_any_branch()
 async fn a_conflict_on_a_fork_stack_merges_the_base_so_the_forks_commits_stay() {
     let (id, executor, store, scheduler) = stacked_publish(true).await;
     let rebase = conflict_on_stack(id, &executor, &store, &scheduler, "develop").await;
+    let recorded = store
+        .get(id)
+        .unwrap()
+        .job
+        .reviewed_head()
+        .map(str::to_owned);
+    assert!(recorded.is_some());
     assert!(rebase.merge_base);
     assert!(rebase.prompt.contains("Do not rebase"), "{}", rebase.prompt);
     let published = executor.published.lock().unwrap().clone();
@@ -9518,7 +9525,7 @@ async fn a_conflict_on_a_fork_stack_merges_the_base_so_the_forks_commits_stay() 
     assert!(
         published
             .iter()
-            .all(|publish| publish.keep_history == Some(12))
+            .all(|publish| publish.keep_history.as_deref() == recorded.as_deref())
     );
 }
 

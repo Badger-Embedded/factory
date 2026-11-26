@@ -343,39 +343,32 @@ impl Git {
         }
     }
 
-    /// Pushes `branch` like [`Git::push_fast_forward`], after checking that
-    /// the head of pull request `number`, fetched by `prepare_pr`, is an
-    /// ancestor of the branch. A first push has no remote tip to compare with,
-    /// so this is what keeps a rewritten branch from dropping that head.
+    /// Pushes `branch` like [`Git::push_fast_forward`], after checking in the
+    /// transfer repository that `keep`, a commit or a ref of the checkout, is
+    /// an ancestor of the exact tip that is pushed. A first push has no remote
+    /// tip to compare with, so this keeps a rewritten branch from dropping it.
     ///
     /// # Errors
     ///
-    /// Returns `PushError::Rejected` when the branch lost the head, and what
+    /// Returns `PushError::Rejected` when the tip lost `keep`, and what
     /// `push_fast_forward` returns otherwise.
     pub async fn push_keeping_head(
         &self,
         work: &Path,
         remote: &RemoteSource<'_>,
         branch: &str,
-        number: u64,
+        keep: &str,
         pushed: &(dyn Fn() + Send + Sync),
     ) -> Result<(), PushError> {
-        let tracking = format!("refs/factory/pr-{number}/head");
-        let local = format!("refs/heads/{branch}");
-        if self
+        let commit = self
             .run(
                 work,
-                &["merge-base", "--is-ancestor", &tracking, &local],
+                &["rev-parse", "--verify", &format!("{keep}^{{commit}}")],
                 None,
             )
             .await
-            .is_err()
-        {
-            return Err(PushError::Rejected(format!(
-                "{branch} no longer holds the head of pull request #{number}"
-            )));
-        }
-        self.push_fast_forward(work, remote, branch, branch, pushed)
+            .map_or_else(|_| keep.to_owned(), |out| out.trim().to_owned());
+        self.push_ff(work, remote, branch, branch, Some(&commit), pushed)
             .await
     }
 
@@ -393,6 +386,19 @@ impl Git {
         remote: &RemoteSource<'_>,
         branch: &str,
         branch_on_remote: &str,
+        pushed: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), PushError> {
+        self.push_ff(work, remote, branch, branch_on_remote, None, pushed)
+            .await
+    }
+
+    async fn push_ff(
+        &self,
+        work: &Path,
+        remote: &RemoteSource<'_>,
+        branch: &str,
+        branch_on_remote: &str,
+        keep: Option<&str>,
         pushed: &(dyn Fn() + Send + Sync),
     ) -> Result<(), PushError> {
         let transfer = tempfile::tempdir().map_err(|err| {
@@ -417,6 +423,20 @@ impl Git {
         )
         .await
         .map_err(PushError::Failed)?;
+        if let Some(keep) = keep
+            && self
+                .run(
+                    transfer.path(),
+                    &[&git_dir, "merge-base", "--is-ancestor", keep, &local],
+                    None,
+                )
+                .await
+                .is_err()
+        {
+            return Err(PushError::Rejected(format!(
+                "{branch} no longer holds the reviewed commit {keep}"
+            )));
+        }
         let pushing = remote().map_err(PushError::Failed)?;
         let refspec = format!("{local}:refs/heads/{branch_on_remote}");
         if let Err(err) = self

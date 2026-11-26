@@ -824,9 +824,9 @@ impl Executor for PodmanExecutor {
                 ));
             }
         };
-        let result = if let Some(reviewed) = request.keep_history {
+        let result = if let Some(keep) = &request.keep_history {
             self.git
-                .push_keeping_head(&workspace, &remote, &request.branch, reviewed, &record)
+                .push_keeping_head(&workspace, &remote, &request.branch, keep, &record)
                 .await
                 .map_err(|err| match err {
                     PushError::Rejected(message) => format!(

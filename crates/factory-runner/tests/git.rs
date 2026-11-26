@@ -880,13 +880,23 @@ async fn a_first_push_of_a_stack_that_lost_the_reviewed_head_creates_no_branch()
             .success()
     };
 
+    let reviewed = git(&work, &["rev-parse", "refs/factory/pr-5/head"]);
+    // The source pull request was force-pushed after the review.
+    git(
+        &work,
+        &[
+            "update-ref",
+            "refs/factory/pr-5/head",
+            "refs/remotes/origin/main",
+        ],
+    );
     git(
         &work,
         &["checkout", "-q", "-b", "stack", "refs/remotes/origin/main"],
     );
     commit(&work, "again", "rewritten fix");
     let rejected = git_
-        .push_keeping_head(&work, &|| Ok(remote.remote()), "stack", 5, &|| {})
+        .push_keeping_head(&work, &|| Ok(remote.remote()), "stack", &reviewed, &|| {})
         .await
         .unwrap_err();
     assert!(
@@ -895,11 +905,8 @@ async fn a_first_push_of_a_stack_that_lost_the_reviewed_head_creates_no_branch()
     );
     assert!(!has_stack());
 
-    git(
-        &work,
-        &["merge", "-q", "--no-edit", "refs/factory/pr-5/head"],
-    );
-    git_.push_keeping_head(&work, &|| Ok(remote.remote()), "stack", 5, &|| {})
+    git(&work, &["merge", "-q", "--no-edit", &reviewed]);
+    git_.push_keeping_head(&work, &|| Ok(remote.remote()), "stack", &reviewed, &|| {})
         .await
         .unwrap();
     assert!(has_stack());
