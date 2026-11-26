@@ -130,6 +130,16 @@ impl ForgeKind {
         }
     }
 
+    /// The ref on the forge that holds the head of pull request `number`. It
+    /// exists for a fork's pull request too.
+    #[must_use]
+    pub fn pr_head_ref(&self, number: u64) -> String {
+        match self {
+            ForgeKind::GitHub | ForgeKind::Forgejo(_) => format!("refs/pull/{number}/head"),
+            ForgeKind::Salsa => format!("refs/merge-requests/{number}/head"),
+        }
+    }
+
     /// Whether `repo` has the form the kind's repositories have: `owner/name`
     /// on GitHub and Forgejo, and the full project path of two or more
     /// segments on Salsa. Each segment is non-empty and holds only letters,

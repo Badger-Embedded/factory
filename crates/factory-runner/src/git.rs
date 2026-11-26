@@ -27,6 +27,24 @@ impl Default for Git {
     }
 }
 
+/// Why a push failed. A rejection means the remote branch holds commits the
+/// checkout does not, so a new `prepare_pr` brings them in before the next push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushError {
+    Rejected(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::Rejected(message) | PushError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PushError {}
+
 /// Where a checkout comes from and who its commits belong to: the clone URL
 /// and authentication header from the forge, and the account's commit
 /// identity. The header holds the account's token, and git gets it through
@@ -116,6 +134,205 @@ impl Git {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Like `prepare` with a branch, for a branch that holds an existing pull
+    /// request. `head_ref` is the forge's ref of the pull request's head, which
+    /// also exists for a fork's pull request. It is fetched into
+    /// `refs/factory/pr-<number>/head`, a namespace no branch name can reach. A new local branch starts there. An
+    /// existing one keeps its commits: it fast-forwards to a head that moved,
+    /// or takes the new head in with a merge commit. A merge that conflicts is
+    /// aborted and returned as an error. A merge of the base that an earlier
+    /// run left conflicted stays as it is when its branch is checked out, it
+    /// already holds the pull request's head and it merges the fetched base,
+    /// so the agent can finish it. Otherwise it is aborted and the branch
+    /// synchronized, and the caller merges the base again. `origin/<base>` is fetched too, for diffs
+    /// against the pull request's own base.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when a git command fails.
+    pub async fn prepare_pr(
+        &self,
+        work: &Path,
+        remote_source: &RemoteSource<'_>,
+        base: &str,
+        head_ref: &str,
+        number: u64,
+        branch: &str,
+    ) -> Result<(), String> {
+        if !work.join(".git").exists() {
+            self.clone_into(work, &remote_source()?, base).await?;
+        }
+        let remote = remote_source()?;
+        self.set_identity(work, &remote).await?;
+        self.fetch_base(work, &remote, base).await?;
+        let tracking = format!("refs/factory/pr-{number}/head");
+        let remote = remote_source()?;
+        self.fetch_ref(work, &remote, head_ref, &tracking).await?;
+        if ["rebase-merge", "rebase-apply"]
+            .iter()
+            .any(|dir| work.join(".git").join(dir).exists())
+        {
+            self.run(work, &["rebase", "--abort"], None).await?;
+        }
+        if work.join(".git/MERGE_HEAD").exists() {
+            let current = self.run(work, &["branch", "--show-current"], None).await?;
+            let base_ref = format!("refs/remotes/origin/{base}");
+            let merging = self
+                .run(work, &["rev-parse", "MERGE_HEAD"], None)
+                .await
+                .map(|out| out.trim().to_owned());
+            let base_tip = self
+                .run(work, &["rev-parse", &base_ref], None)
+                .await
+                .map(|out| out.trim().to_owned());
+            let head_seen = self
+                .run(
+                    work,
+                    &["merge-base", "--is-ancestor", &tracking, "HEAD"],
+                    None,
+                )
+                .await
+                .is_ok();
+            if current.trim() == branch && head_seen && merging.is_ok() && merging == base_tip {
+                return Ok(());
+            }
+            self.run(work, &["merge", "--abort"], None).await?;
+        }
+        let local = format!("refs/heads/{branch}");
+        if self
+            .run(work, &["rev-parse", "--verify", "--quiet", &local], None)
+            .await
+            .is_err()
+        {
+            return self
+                .run(work, &["checkout", "-b", branch, &tracking], None)
+                .await
+                .map(|_| ());
+        }
+        self.run(work, &["checkout", branch], None).await?;
+        if self
+            .run(
+                work,
+                &["merge-base", "--is-ancestor", &tracking, "HEAD"],
+                None,
+            )
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let fast_forward = self
+            .run(work, &["merge", "--ff-only", &tracking], None)
+            .await;
+        if fast_forward.is_ok() {
+            return Ok(());
+        }
+        self.merge_or_abort(work, &tracking).await
+    }
+
+    /// Merges `origin/<base>` into the checked-out branch with a merge commit,
+    /// never a rebase. On a conflict the merge stays unfinished in the
+    /// checkout, for the agent to resolve, and `Ok(false)` comes back.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when the merge fails for another reason.
+    pub async fn merge_base(&self, work: &Path, base: &str) -> Result<bool, String> {
+        let target = format!("origin/{base}");
+        match self.run(work, &["merge", "--no-edit", &target], None).await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let conflicted = self
+                    .run(work, &["diff", "--name-only", "--diff-filter=U"], None)
+                    .await
+                    .is_ok_and(|out| !out.trim().is_empty());
+                if conflicted { Ok(false) } else { Err(err) }
+            }
+        }
+    }
+
+    /// Pushes `branch` to `branch_on_remote` without force. The remote refuses
+    /// a push that would drop a commit someone else pushed, and that comes
+    /// back as `PushError::Rejected`. `pushed` runs once the push succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PushError::Rejected` when the remote branch moved, and
+    /// `PushError::Failed` with git's message for any other failure.
+    pub async fn push_fast_forward(
+        &self,
+        work: &Path,
+        remote: &RemoteSource<'_>,
+        branch: &str,
+        branch_on_remote: &str,
+        pushed: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), PushError> {
+        let transfer = tempfile::tempdir().map_err(|err| {
+            PushError::Failed(format!("could not create a transfer repository: {err}"))
+        })?;
+        let git_dir = self
+            .init_transfer(transfer.path())
+            .await
+            .map_err(PushError::Failed)?;
+        let local = format!("refs/heads/{branch}");
+        let from_checkout = work.to_string_lossy();
+        self.run(
+            transfer.path(),
+            &[
+                &git_dir,
+                "fetch",
+                "--no-tags",
+                &from_checkout,
+                &format!("+{local}:{local}"),
+            ],
+            None,
+        )
+        .await
+        .map_err(PushError::Failed)?;
+        let pushing = remote().map_err(PushError::Failed)?;
+        let refspec = format!("{local}:refs/heads/{branch_on_remote}");
+        if let Err(err) = self
+            .run(
+                transfer.path(),
+                &[&git_dir, "push", &pushing.url, &refspec],
+                Some(&pushing),
+            )
+            .await
+        {
+            // A push that lands between git reading the refs and the server
+            // updating one is reported as a generic remote failure, so look at
+            // the remote branch before calling this one anything else.
+            let moved = err.contains("[rejected]")
+                || err.contains("failed to update ref")
+                    && self
+                        .remote_branch_moved(
+                            transfer.path(),
+                            &git_dir,
+                            remote,
+                            branch_on_remote,
+                            &local,
+                        )
+                        .await;
+            return Err(if moved {
+                PushError::Rejected(format!(
+                    "the pull request's branch has new commits, so the push was rejected: {err}"
+                ))
+            } else {
+                PushError::Failed(err)
+            });
+        }
+        pushed();
+        let tracking = format!("refs/remotes/origin/{branch_on_remote}");
+        let tip = self
+            .run(work, &["rev-parse", &local], None)
+            .await
+            .map_err(PushError::Failed)?;
+        self.run(work, &["update-ref", &tracking, tip.trim()], None)
+            .await
+            .map(|_| ())
+            .map_err(PushError::Failed)
     }
 
     /// Pushes `branch` to the remote's URL. The branch belongs to the
@@ -265,6 +482,98 @@ impl Git {
         self.run(work, &["fetch", "--no-tags", &source, &tracking], None)
             .await
             .map(|_| ())
+    }
+
+    /// Fetches `source` into the checkout's `target` through a transfer
+    /// repository, like `fetch_base`.
+    async fn fetch_ref(
+        &self,
+        work: &Path,
+        remote: &Remote,
+        source: &str,
+        target: &str,
+    ) -> Result<(), String> {
+        let transfer = tempfile::tempdir()
+            .map_err(|err| format!("could not create a transfer repository: {err}"))?;
+        let git_dir = self.init_transfer(transfer.path()).await?;
+        self.run(
+            transfer.path(),
+            &[
+                &git_dir,
+                "fetch",
+                "--no-tags",
+                &remote.url,
+                &format!("+{source}:refs/fetched"),
+            ],
+            Some(remote),
+        )
+        .await?;
+        let path = transfer.path().to_string_lossy();
+        self.run(
+            work,
+            &[
+                "fetch",
+                "--no-tags",
+                &path,
+                &format!("+refs/fetched:{target}"),
+            ],
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Whether the remote's `branch_on_remote` holds a commit that `local`
+    /// does not. A remote that cannot be read counts as not moved.
+    async fn remote_branch_moved(
+        &self,
+        transfer: &Path,
+        git_dir: &str,
+        remote: &RemoteSource<'_>,
+        branch_on_remote: &str,
+        local: &str,
+    ) -> bool {
+        let Ok(remote) = remote() else {
+            return false;
+        };
+        let fetched = self
+            .run(
+                transfer,
+                &[
+                    git_dir,
+                    "fetch",
+                    "--no-tags",
+                    &remote.url,
+                    &format!("+refs/heads/{branch_on_remote}:refs/remote-head"),
+                ],
+                Some(&remote),
+            )
+            .await;
+        fetched.is_ok()
+            && self
+                .run(
+                    transfer,
+                    &[
+                        git_dir,
+                        "merge-base",
+                        "--is-ancestor",
+                        "refs/remote-head",
+                        local,
+                    ],
+                    None,
+                )
+                .await
+                .is_err()
+    }
+
+    async fn merge_or_abort(&self, work: &Path, target: &str) -> Result<(), String> {
+        match self.run(work, &["merge", "--no-edit", target], None).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let _ = self.run(work, &["merge", "--abort"], None).await;
+                Err(err)
+            }
+        }
     }
 
     /// Makes a bare repository in `dir`, with no hooks or configuration of

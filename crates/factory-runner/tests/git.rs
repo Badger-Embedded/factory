@@ -640,3 +640,407 @@ async fn the_remote_is_resolved_before_each_authenticated_command() {
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(git(&work, &["config", "user.name"]), "bot2");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pull_request_prepare_resolves_the_remote_for_each_fetch() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    Git::default()
+        .prepare_pr(
+            &work,
+            &|| {
+                let n = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Ok(remote.remote_as(&format!("bot{n}"), n as u64))
+            },
+            "main",
+            head,
+            5,
+            "pr-branch",
+        )
+        .await
+        .unwrap();
+
+    // The clone, the base fetch with the identity, and the head fetch.
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(git(&work, &["config", "user.name"]), "bot2");
+}
+
+/// Makes the forge's head ref of pull request 5 point at a new commit on
+/// `pr-branch`, as a fork's pull request would have, and returns the ref.
+fn open_pull_request(fixture: &Fixture, base: &str) -> &'static str {
+    let upstream = fixture.upstream();
+    git(&upstream, &["checkout", "-q", "-b", "pr-branch", base]);
+    commit(&upstream, "pr-file", "pr commit");
+    let bare_repo = fixture.root.path().join("remotes/owner/repo.git");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            bare_repo.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    git(&upstream, &["checkout", "-q", "main"]);
+    "refs/pull/5/head"
+}
+
+async fn prepare_pr(remote: &Fixture, git_: &Git, base: &str, head: &str) {
+    git_.prepare_pr(
+        &remote.work(),
+        &|| Ok(remote.remote()),
+        base,
+        head,
+        5,
+        "pr-branch",
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_pull_request_ref_starts_the_branch_and_commits_land_on_top() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert_eq!(git(&work, &["branch", "--show-current"]), "pr-branch");
+    assert!(work.join("pr-file").exists());
+
+    commit(&work, "fix", "agent fix");
+    git_.push_fast_forward(
+        &work,
+        &|| Ok(remote.remote()),
+        "pr-branch",
+        "pr-branch",
+        &|| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        remote.remote_log("pr-branch"),
+        "agent fix\npr commit\nfirst"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_commit_is_never_overwritten() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    git(
+        remote.root.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/pr-branch",
+            "refs/pull/5/head",
+        ],
+    );
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "fix", "agent fix");
+
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, "theirs", "foreign commit");
+    git(&upstream, &["push", "-q", "origin", "pr-branch"]);
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            bare.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+
+    let rejected = git_
+        .push_fast_forward(
+            &work,
+            &|| Ok(remote.remote()),
+            "pr-branch",
+            "pr-branch",
+            &|| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(rejected, factory_runner::PushError::Rejected(_)),
+        "{rejected}"
+    );
+    assert_eq!(
+        remote.remote_log("pr-branch"),
+        "foreign commit\npr commit\nfirst"
+    );
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert!(work.join("theirs").exists());
+    assert!(work.join("fix").exists());
+    git_.push_fast_forward(
+        &work,
+        &|| Ok(remote.remote()),
+        "pr-branch",
+        "pr-branch",
+        &|| {},
+    )
+    .await
+    .unwrap();
+    let log = remote.remote_log("pr-branch");
+    assert!(
+        log.contains("foreign commit") && log.contains("agent fix"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn a_base_merge_makes_a_merge_commit_and_the_summary_uses_the_pr_base() {
+    let remote = Fixture::new();
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "-b", "develop"]);
+    commit(&upstream, "dev", "develop work");
+    git(&upstream, &["push", "-q", "origin", "develop"]);
+    let head = open_pull_request(&remote, "develop");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "develop", head).await;
+
+    git(&upstream, &["checkout", "-q", "develop"]);
+    commit(&upstream, "dev2", "develop moved");
+    git(&upstream, &["push", "-q", "origin", "develop"]);
+    prepare_pr(&remote, &git_, "develop", head).await;
+    assert!(git_.merge_base(&work, "develop").await.unwrap());
+    assert_eq!(
+        git(&work, &["rev-list", "--parents", "-n1", "HEAD"])
+            .split(' ')
+            .count(),
+        3
+    );
+    assert!(work.join("dev2").exists());
+
+    let summary = git_.summarize_branch(&work, "develop").await.unwrap();
+    assert!(
+        summary.diff_stat.contains("pr-file"),
+        "{}",
+        summary.diff_stat
+    );
+    assert!(!summary.diff_stat.contains("dev"), "{}", summary.diff_stat);
+}
+
+#[test]
+fn the_head_ref_depends_on_the_forge() {
+    assert_eq!(
+        factory_runner::ForgeKind::GitHub.pr_head_ref(5),
+        "refs/pull/5/head"
+    );
+    assert_eq!(
+        factory_runner::ForgeKind::Salsa.pr_head_ref(5),
+        "refs/merge-requests/5/head"
+    );
+}
+
+#[tokio::test]
+async fn a_conflicted_base_merge_survives_the_next_prepare() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "README", "pr edit");
+    commit(&remote.upstream(), "README", "main edit");
+    git(&remote.upstream(), &["push", "-q", "origin", "main"]);
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert!(!git_.merge_base(&work, "main").await.unwrap());
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert_eq!(git(&work, &["branch", "--show-current"]), "pr-branch");
+    assert!(work.join(".git/MERGE_HEAD").exists());
+    assert!(git(&work, &["status", "--porcelain"]).contains("UU README"));
+}
+
+#[tokio::test]
+async fn a_pull_request_into_a_branch_named_like_its_ref_keeps_its_base() {
+    let remote = Fixture::new();
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "-b", "pr-5"]);
+    commit(&upstream, "base-file", "pr-5 base");
+    git(&upstream, &["push", "-q", "origin", "pr-5"]);
+    let head = open_pull_request(&remote, "pr-5");
+    let work = remote.work();
+    prepare_pr(&remote, &Git::default(), "pr-5", head).await;
+
+    let summary = Git::default()
+        .summarize_branch(&work, "pr-5")
+        .await
+        .unwrap();
+    assert_eq!(summary.commits.len(), 1, "{:?}", summary.commits);
+    assert!(summary.commits[0].ends_with("pr commit"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_push_that_loses_a_race_is_reported_as_rejected() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    git(
+        remote.root.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/pr-branch",
+            "refs/pull/5/head",
+        ],
+    );
+    prepare_pr(&remote, &Git::default(), "main", head).await;
+    commit(&work, "fix", "agent fix");
+
+    // Someone pushes after git read the refs, and the server answers with a
+    // generic failure instead of a non-fast-forward rejection.
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, "theirs", "foreign commit");
+    let tools = tempfile::tempdir().unwrap();
+    let git_ = fake_git(
+        tools.path(),
+        &format!(
+            "if echo \"$@\" | grep -q ' push '; then\n  git -C {} push -q {} pr-branch:pr-branch\n  echo ' ! [remote rejected] pr-branch -> pr-branch (failed to update ref)' >&2\n  exit 1\nfi\nexec git \"$@\"",
+            upstream.display(),
+            bare.display()
+        ),
+    );
+    let err = git_
+        .push_fast_forward(
+            &work,
+            &|| Ok(remote.remote()),
+            "pr-branch",
+            "pr-branch",
+            &|| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, factory_runner::PushError::Rejected(_)),
+        "{err}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_push_that_fails_for_another_reason_is_not_reported_as_rejected() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    git(
+        remote.root.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/pr-branch",
+            "refs/pull/5/head",
+        ],
+    );
+    prepare_pr(&remote, &Git::default(), "main", head).await;
+    commit(&work, "fix", "agent fix");
+    let tools = tempfile::tempdir().unwrap();
+    let git_ = fake_git(
+        tools.path(),
+        "if echo \"$@\" | grep -q ' push '; then\n  echo ' ! [remote rejected] pr-branch (hook declined)' >&2\n  exit 1\nfi\nexec git \"$@\"",
+    );
+    let err = git_
+        .push_fast_forward(
+            &work,
+            &|| Ok(remote.remote()),
+            "pr-branch",
+            "pr-branch",
+            &|| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, factory_runner::PushError::Failed(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_pending_base_merge_is_dropped_when_the_pull_request_head_moved() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "README", "pr edit");
+    commit(&remote.upstream(), "README", "main edit");
+    git(&remote.upstream(), &["push", "-q", "origin", "main"]);
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert!(!git_.merge_base(&work, "main").await.unwrap());
+
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, "theirs", "foreign commit");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            bare.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    prepare_pr(&remote, &git_, "main", head).await;
+
+    assert!(!work.join(".git/MERGE_HEAD").exists());
+    assert!(work.join("theirs").exists());
+    assert_eq!(git(&work, &["status", "--porcelain"]), "");
+    assert!(!git_.merge_base(&work, "main").await.unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_denied_push_is_not_reported_as_rejected_when_the_head_also_moved() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    git(
+        remote.root.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/pr-branch",
+            "refs/pull/5/head",
+        ],
+    );
+    prepare_pr(&remote, &Git::default(), "main", head).await;
+    commit(&work, "fix", "agent fix");
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, "theirs", "foreign commit");
+    git(&upstream, &["push", "-q", "origin", "pr-branch"]);
+    let tools = tempfile::tempdir().unwrap();
+    let git_ = fake_git(
+        tools.path(),
+        "if echo \"$@\" | grep -q ' push '; then\n  echo ' ! [remote rejected] pr-branch (permission denied)' >&2\n  exit 1\nfi\nexec git \"$@\"",
+    );
+    let err = git_
+        .push_fast_forward(
+            &work,
+            &|| Ok(remote.remote()),
+            "pr-branch",
+            "pr-branch",
+            &|| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, factory_runner::PushError::Failed(_)), "{err}");
+}
