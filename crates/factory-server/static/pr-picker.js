@@ -5,7 +5,11 @@
   const search = picker.querySelector("#pr-search");
   const list = picker.querySelector("#pr-results");
   const picked = picker.querySelector(".pr-picked");
-  const request = form.querySelector(".composer-line button.primary");
+  const request = form.querySelector(".request-button");
+  const actions = form.querySelector(".review-actions");
+  const toggle = actions.querySelector(".split-toggle");
+  const menu = actions.querySelector(".split-menu");
+  const fixItem = menu.querySelector(".split-item");
   const url = "/projects/" + encodeURIComponent(picker.dataset.project) + "/pulls";
   const DEBOUNCE_MS = 250;
 
@@ -96,6 +100,58 @@
       });
   }
 
+  function openMenu() {
+    menu.hidden = false;
+    toggle.setAttribute("aria-expanded", "true");
+  }
+
+  function closeMenu() {
+    menu.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
+  }
+
+  function items() {
+    return Array.from(menu.querySelectorAll("button:not(:disabled)"));
+  }
+
+  toggle.addEventListener("click", function () {
+    if (menu.hidden) {
+      openMenu();
+      const first = items()[0];
+      if (first) first.focus();
+    } else {
+      closeMenu();
+    }
+  });
+  toggle.addEventListener("keydown", function (event) {
+    if (event.key === "ArrowDown" && menu.hidden) {
+      event.preventDefault();
+      openMenu();
+      const first = items()[0];
+      if (first) first.focus();
+    } else if (event.key === "Escape" && !menu.hidden) {
+      event.preventDefault();
+      closeMenu();
+    }
+  });
+  menu.addEventListener("keydown", function (event) {
+    const all = items();
+    const at = all.indexOf(document.activeElement);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (all.length === 0) return;
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      all[(at + step + all.length) % all.length].focus();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeMenu();
+      toggle.focus();
+    }
+  });
+  document.addEventListener("click", function (event) {
+    if (!actions.contains(event.target)) closeMenu();
+  });
+
   function pick(row) {
     cancel();
     chosen.value = row.dataset.number;
@@ -110,6 +166,8 @@
     picked.dataset.number = row.dataset.number;
     const blocked = row.dataset.fork === "true" || row.dataset.heldJob !== undefined;
     request.disabled = blocked;
+    fixItem.disabled = blocked;
+    actions.hidden = false;
     search.hidden = true;
     picker.querySelector(".pr-label").hidden = true;
     close();
@@ -121,6 +179,10 @@
   function clear() {
     chosen.value = "";
     request.disabled = false;
+    fixItem.disabled = false;
+    actions.hidden = true;
+    closeMenu();
+    actions.querySelector("input[name=comment]").checked = false;
     search.hidden = false;
     picker.querySelector(".pr-label").hidden = false;
     search.value = "";

@@ -18978,3 +18978,90 @@ async fn fix_here_is_refused_for_a_fork_and_for_a_held_pull_request() {
         factory_core::Turn::User(factory_core::Ask::QuickReview { .. })
     ));
 }
+
+#[tokio::test]
+async fn the_quick_review_card_shows_the_score_review_and_commit() {
+    let dashboard = picked_pr_dashboard();
+    let id = reviewed(&dashboard, "12").await;
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("3/5"), "{}", page.body);
+    assert!(page.body.contains("Needs tests."));
+    assert!(page.body.contains("abc"));
+    assert!(page.body.contains("Fix in this pull request"));
+    assert!(page.body.contains(&format!("/jobs/{id}/fix-here")));
+    assert!(page.body.contains("review-badge"));
+    assert!(!page.body.contains("comment-error"));
+}
+
+#[tokio::test]
+async fn the_quick_review_card_hides_the_fix_for_a_fork_and_a_held_pull_request() {
+    let dashboard = picked_pr_dashboard();
+    let fork = reviewed(&dashboard, "15").await;
+    let page = dashboard.get(&format!("/jobs/{fork}")).await;
+    assert!(!page.body.contains("Fix in this pull request"));
+    assert!(page.body.contains("fork"));
+
+    let review = reviewed(&dashboard, "12").await;
+    post_picked(&dashboard, "one", "12").await;
+    let holder = dashboard
+        .store
+        .list()
+        .unwrap()
+        .iter()
+        .map(|row| row.id)
+        .find(|&id| id != fork && id != review)
+        .unwrap();
+    let page = dashboard.get(&format!("/jobs/{review}")).await;
+    assert!(!page.body.contains("Fix in this pull request"));
+    assert!(page.body.contains(&format!("href=\"/jobs/{holder}\"")));
+}
+
+#[tokio::test]
+async fn the_board_row_of_a_review_job_has_the_review_badge() {
+    let dashboard = picked_pr_dashboard();
+    reviewed(&dashboard, "12").await;
+    let board = dashboard.get("/?project=maestro").await;
+    assert!(board.body.contains("review-badge"), "{}", board.body);
+    assert!(board.body.contains("Review #12"));
+}
+
+#[tokio::test]
+async fn the_quick_review_card_shows_the_error_of_a_failed_comment() {
+    let dashboard = picked_pr_dashboard();
+    let reply = post_picked_with(
+        &dashboard,
+        "",
+        "12",
+        &[("mode", "quick-review"), ("comment", "on")],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let id = dashboard.store.list().unwrap()[0].id;
+    dashboard.apply(id, Event::Start);
+    dashboard.apply(
+        id,
+        Event::QuickReviewed {
+            score: 2,
+            review: "Needs tests.".into(),
+            head: "abc".into(),
+        },
+    );
+    let pending = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        pending.body.contains("is posting the review"),
+        "{}",
+        pending.body
+    );
+    assert!(!pending.body.contains("Fix in this pull request"));
+    dashboard.apply(
+        id,
+        Event::CommentFailed {
+            error: "forge said no".into(),
+        },
+    );
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(page.body.contains("Fix in this pull request"));
+    assert!(page.body.contains("comment-error"), "{}", page.body);
+    assert!(page.body.contains("forge said no"));
+    assert!(page.body.contains("2/5"));
+}

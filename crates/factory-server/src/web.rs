@@ -1418,6 +1418,13 @@ fn job_links(state: &AppState, row: &JobRow, login: &str) -> Result<JobLinks, St
             };
         }
     }
+    if let Some(picked) = row.job.picked_pr()
+        && matches!(picked.mode, PrMode::QuickReview { .. })
+    {
+        links.held_by = store
+            .holding_job(&row.project, picked.number)?
+            .filter(|&holder| holder != row.id);
+    }
     if let Some((source, number)) = row.job.fix_source() {
         links.source = match store.get(source) {
             Ok(found)
