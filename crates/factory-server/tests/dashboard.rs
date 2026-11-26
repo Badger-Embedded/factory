@@ -12815,6 +12815,16 @@ fn fill_project(dashboard: &Dashboard, project: &str, job: i64) {
         .unwrap();
     store.save_project_settings(project, true, true).unwrap();
     store
+        .save_project_renovate_agent(
+            project,
+            Some(&factory_server::RenovateAgent {
+                agent: "claude".into(),
+                model: None,
+                effort: "low".into(),
+            }),
+        )
+        .unwrap();
+    store
         .save_project_maintenance(
             project,
             &factory_server::Maintenance {
@@ -12889,6 +12899,7 @@ async fn removing_a_project_cancels_its_jobs_and_deletes_its_data() {
         ("project_gates", "project"),
         ("project_efforts", "project"),
         ("project_agents", "project"),
+        ("project_renovate_agent", "project"),
         ("project_mcp", "project"),
         ("project_mcp_tools", "project"),
         ("project_mcp_tool_refreshes", "project"),

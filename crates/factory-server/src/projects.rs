@@ -81,6 +81,17 @@ impl Default for StageAgents {
     }
 }
 
+/// A project's Renovate agent override. Its presence means the override is on:
+/// the failure analysis, diff check and packaging analysis of a Renovate job
+/// run on this agent, model and effort instead of the review stage's. `None`
+/// for the model means the agent CLI's default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenovateAgent {
+    pub agent: String,
+    pub model: Option<String>,
+    pub effort: String,
+}
+
 /// The forge a project's row names. A name no kind carries is kept, so one bad
 /// row is an error for that project and not for the list it is in.
 #[derive(Debug, Clone, PartialEq, Eq)]

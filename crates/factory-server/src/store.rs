@@ -17,7 +17,7 @@ use crate::mcp::{
     self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
 };
 use crate::projects::{
-    Project, ProjectForge, ProjectLabel, StageAgents, StageEfforts, StageModels,
+    Project, ProjectForge, ProjectLabel, RenovateAgent, StageAgents, StageEfforts, StageModels,
 };
 use crate::secrets::{ForgeTokenOwner, SecretRef};
 use crate::settings::Settings;
@@ -94,6 +94,12 @@ CREATE TABLE IF NOT EXISTS project_agents (
     plan TEXT NOT NULL,
     implement TEXT NOT NULL,
     review TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_renovate_agent (
+    project TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    model TEXT,
+    effort TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
     job_id INTEGER NOT NULL REFERENCES jobs (id),
@@ -610,6 +616,9 @@ pub enum StoreError {
     /// A stage was submitted on the Local agent with no model. The value is the
     /// stage's name. It is not stored.
     MissingLocalModel(&'static str),
+    /// The Renovate agent setting was refused. The message says why. It is not
+    /// stored.
+    InvalidRenovateAgent(String),
     /// A request tried to remove the sole remaining collaborator of a project.
     /// The project would then be visible to nobody, so removal is refused.
     LastCollaborator,
@@ -666,6 +675,9 @@ impl fmt::Display for StoreError {
                 "The {stage} stage runs on Local, which needs a model. \
                  The local server picks the model from its id."
             ),
+            StoreError::InvalidRenovateAgent(reason) => {
+                write!(f, "The Renovate agent setting is invalid: {reason}")
+            }
             StoreError::LastCollaborator => write!(
                 f,
                 "A project needs at least one collaborator. Remove the project instead."
@@ -3509,7 +3521,7 @@ impl Store {
     ///
     /// The deleted configuration is the project's rows in `projects`,
     /// `project_models`, `project_settings`, `project_gates`, `project_efforts`,
-    /// `project_agents`, `project_mcp`, `project_mcp_tools`,
+    /// `project_agents`, `project_renovate_agent`, `project_mcp`, `project_mcp_tools`,
     /// `project_mcp_tool_refreshes`, `project_mcp_args`, `project_packages`, `project_totals` and
     /// `project_collaborators`, `project_maintenance`, `renovate_prs`, its MCP header values in `secrets`, its
     /// `job_costs` rows, and the `cost` rows in `job_events` for its jobs. With
@@ -3554,6 +3566,7 @@ impl Store {
             "project_gates",
             "project_efforts",
             "project_agents",
+            "project_renovate_agent",
             "project_mcp",
             "project_mcp_tools",
             "project_mcp_tool_refreshes",
@@ -3845,6 +3858,104 @@ impl Store {
                 agents.review
             ],
         )?;
+        Ok(())
+    }
+
+    /// The Renovate agent override saved for `project`. `None` means the
+    /// override is off and Renovate runs use the review stage's settings.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_renovate_agent(
+        &self,
+        project: &str,
+    ) -> Result<Option<RenovateAgent>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT agent, model, effort FROM project_renovate_agent WHERE project = ?1",
+                [project],
+                |row| {
+                    Ok(RenovateAgent {
+                        agent: row.get(0)?,
+                        model: row.get(1)?,
+                        effort: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Checks a Renovate agent override with the stage rules, without writing:
+    /// the agent is available, accepts the effort, and Local has a model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidRenovateAgent`] with the reason.
+    pub fn check_renovate_agent(agent: &RenovateAgent) -> Result<(), StoreError> {
+        let invalid = |reason: String| StoreError::InvalidRenovateAgent(reason);
+        let parsed = match Agent::from_id(&agent.agent) {
+            Ok(parsed) if parsed.available() => parsed,
+            _ => {
+                return Err(invalid(format!(
+                    "{:?} is not an available agent",
+                    agent.agent
+                )));
+            }
+        };
+        if !parsed.accepts_effort(&agent.effort) {
+            return Err(invalid(format!(
+                "{:?} is not an effort level of {}",
+                agent.effort, agent.agent
+            )));
+        }
+        if agent.agent == Agent::Local.id()
+            && agent
+                .model
+                .as_deref()
+                .is_none_or(|model| model.trim().is_empty())
+        {
+            return Err(invalid(
+                "Local needs a model, because the local server picks the model from its id"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Saves `project`'s Renovate agent override, or removes it with `None`.
+    /// A blank model is stored as none. Writes only the override's table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidRenovateAgent`] before any write, see
+    /// [`Store::check_renovate_agent`]. Otherwise fails only on a database
+    /// error.
+    pub fn save_project_renovate_agent(
+        &self,
+        project: &str,
+        agent: Option<&RenovateAgent>,
+    ) -> Result<(), StoreError> {
+        match agent {
+            Some(agent) => {
+                Self::check_renovate_agent(agent)?;
+                let model = agent.model.as_deref().filter(|m| !m.trim().is_empty());
+                self.conn().execute(
+                    "INSERT INTO project_renovate_agent (project, agent, model, effort)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (project) DO UPDATE SET agent = excluded.agent,
+                        model = excluded.model, effort = excluded.effort",
+                    params![project, agent.agent, model, agent.effort],
+                )?;
+            }
+            None => {
+                self.conn().execute(
+                    "DELETE FROM project_renovate_agent WHERE project = ?1",
+                    [project],
+                )?;
+            }
+        }
         Ok(())
     }
 
