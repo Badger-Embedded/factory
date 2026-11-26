@@ -71,6 +71,7 @@ impl Ask {
             Ask::ReviewStopped { .. } => "review-stopped",
             Ask::Renovate { .. } => "renovate",
             Ask::Proposal => "proposal",
+            Ask::MergeLeftToUser => "merge-left-to-user",
         }
     }
 }
@@ -130,6 +131,7 @@ impl Event {
             Event::RenovateObserved { .. } => "renovate-observed",
             Event::Commented => "commented",
             Event::Merged => "merged",
+            Event::MergeLeftToUser => "merge-left-to-user",
             Event::RenovateMerged { .. } => "renovate-merged",
             Event::PackagingGathered(_) => "packaging-gathered",
             Event::GapsProposed { .. } => "gaps-proposed",

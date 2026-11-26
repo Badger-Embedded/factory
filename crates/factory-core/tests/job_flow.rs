@@ -1,8 +1,8 @@
 use factory_core::{
     AgentResult, Ask, BranchSummary, Command, CommentKind, DiffVerdict, Event, FixOutcome, Gates,
-    Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PlannedPr, PrDescription, PrDiff, Question,
-    Rejected, RenovateAccess, RenovateCi, RenovateWait, RetryLimits, RetryTarget, ReviewPass,
-    ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
+    Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PickedPr, PlannedPr, PrDescription, PrDiff,
+    PrMode, Question, Rejected, RenovateAccess, RenovateCi, RenovateWait, RetryLimits, RetryTarget,
+    ReviewPass, ReviewState, ReviewStop, Session, Stage, Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -3772,4 +3772,206 @@ fn a_job_stored_without_the_checks_error_count_loads_with_zero() {
     assert_eq!(loaded.stage(), &Stage::Verifying { pr: 0 });
     checks_error(&mut loaded, 1);
     assert!(loaded.checks_could_not_run());
+}
+
+fn picked() -> PickedPr {
+    PickedPr {
+        number: 42,
+        url: "https://github.com/acme/maestro/pull/42".into(),
+        title: "maestrod: add a reboot endpoint".into(),
+        head_branch: "reboot".into(),
+        base_branch: "main".into(),
+        fork: false,
+        mode: PrMode::Request,
+    }
+}
+
+fn picked_committed(gates: Gates) -> Job {
+    let mut job = Job::pull_request("fix the typo", gates, picked());
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    if gates.spec {
+        apply(&mut job, Event::Approve);
+    }
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Plan(vec![planned("only")])),
+    );
+    if gates.plan {
+        apply(&mut job, Event::Approve);
+    }
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    job
+}
+
+fn picked_watching() -> Job {
+    let mut job = picked_committed(Gates::default());
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 42 });
+    job
+}
+
+#[test]
+fn a_picked_pull_request_job_keeps_the_pick_and_runs_the_gates() {
+    let mut job = Job::pull_request("fix the typo", Gates::default(), picked());
+    assert_eq!(job.picked_pr(), Some(&picked()));
+    assert!(matches!(job.kind(), JobKind::PullRequest(_)));
+    assert!(job.renovate_pr().is_none());
+
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    assert_eq!(job.turn(), &Turn::User(Ask::SpecApproval));
+    apply(&mut job, Event::Approve);
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Plan(vec![planned("only")])),
+    );
+    assert_eq!(job.turn(), &Turn::User(Ask::PlanApproval));
+    assert!(job.can_be_prerequisite());
+}
+
+#[test]
+fn the_plan_of_a_picked_pull_request_is_one_pull_request_with_its_number() {
+    let mut job = Job::pull_request("fix the typo", SKIP_BOTH, picked());
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::Plan(vec![planned("one"), planned("two")])),
+    );
+    assert_eq!(job.plan().len(), 1);
+    assert_eq!(job.plan()[0].number, Some(42));
+    assert_eq!(job.plan()[0].title, "one");
+    assert_eq!(job.plan()[0].summary, "one summary\n\ntwo summary");
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 0 });
+}
+
+#[test]
+fn a_picked_pull_request_still_rejects_an_empty_plan() {
+    let mut job = Job::pull_request("fix the typo", SKIP_BOTH, picked());
+    apply(&mut job, Event::Start);
+    apply(&mut job, Event::Agent(AgentResult::Clarified));
+    apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
+    assert_eq!(
+        job.apply(Event::Agent(AgentResult::Plan(Vec::new()))),
+        Err(Rejected::EmptyPlan)
+    );
+}
+
+#[test]
+fn the_publish_gate_stops_the_first_push_to_a_picked_pull_request() {
+    let mut job = picked_committed(publish_gate());
+    apply(&mut job, Event::ChecksPassed);
+    assert_eq!(
+        job.turn(),
+        &Turn::User(Ask::PublishApproval { summary: None })
+    );
+    apply(&mut job, Event::Summarized(summary()));
+    apply(&mut job, Event::Approve);
+    assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
+    apply(&mut job, Event::Published { number: 42 });
+
+    apply(&mut job, Event::CiFailed { log: "fail".into() });
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
+}
+
+#[test]
+fn a_picked_pull_request_job_never_may_merge() {
+    assert!(!picked_watching().may_merge());
+    assert!(!Job::pull_request("x", Gates::default(), picked()).may_merge());
+    assert!(Job::new("x", Gates::default()).may_merge());
+    assert!(Job::fix("x", Gates::default(), 1, 2).may_merge());
+}
+
+#[test]
+fn green_ci_after_approval_leaves_the_merge_to_the_user_and_keeps_watching() {
+    let mut job = picked_watching();
+    apply(&mut job, Event::StartReview { head: "abc".into() });
+    apply(&mut job, Event::ReviewApproved);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 42,
+            watch_only: false
+        })
+    );
+
+    apply(&mut job, Event::MergeLeftToUser);
+    assert_eq!(job.turn(), &Turn::User(Ask::MergeLeftToUser));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 42,
+            watch_only: true
+        })
+    );
+    assert!(!job.is_finished());
+}
+
+#[test]
+fn a_merge_on_the_forge_ends_a_waiting_picked_pull_request_job_in_merged() {
+    let mut job = picked_watching();
+    apply(&mut job, Event::MergeLeftToUser);
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+    assert!(job.is_finished());
+}
+
+#[test]
+fn a_close_on_the_forge_fails_a_waiting_picked_pull_request_job() {
+    let mut job = picked_watching();
+    apply(&mut job, Event::MergeLeftToUser);
+    apply(&mut job, Event::ClosedUnmerged);
+    let Stage::Failed { reason, .. } = job.stage() else {
+        panic!("not failed");
+    };
+    assert_eq!(reason, "the pull request was closed without merging");
+}
+
+#[test]
+fn only_a_job_that_never_merges_takes_merge_left_to_user() {
+    let mut job = watching(7);
+    assert!(job.apply(Event::MergeLeftToUser).is_err());
+    assert_eq!(job.turn(), &Turn::Factory);
+}
+
+#[test]
+fn a_picked_pull_request_job_survives_json_and_loads_without_the_new_fields() {
+    let job = picked_watching();
+    let json = serde_json::to_value(&job).unwrap();
+    assert_eq!(serde_json::from_value::<Job>(json.clone()).unwrap(), job);
+
+    let mut old = json;
+    old.as_object_mut().unwrap().remove("pushed").unwrap();
+    let pick = &mut old["kind"]["PullRequest"];
+    pick.as_object_mut().unwrap().remove("fork").unwrap();
+    pick.as_object_mut().unwrap().remove("mode").unwrap();
+    let loaded: Job = serde_json::from_value(old).unwrap();
+    assert_eq!(loaded.picked_pr(), Some(&picked()));
+    assert_eq!(
+        loaded.picked_pr().map(|pick| pick.mode),
+        Some(PrMode::Request)
+    );
+
+    let request = serde_json::to_value(Job::new("add a reboot button", Gates::default())).unwrap();
+    let mut old_request = request;
+    old_request.as_object_mut().unwrap().remove("pushed");
+    assert!(serde_json::from_value::<Job>(old_request).is_ok());
+}
+
+#[test]
+fn a_picked_pull_request_job_rejects_a_published_number_that_is_not_the_pick() {
+    let mut job = picked_committed(Gates::default());
+    apply(&mut job, Event::ChecksPassed);
+    let before = job.clone();
+    assert!(job.apply(Event::Published { number: 99 }).is_err());
+    assert_eq!(job, before);
+    assert_eq!(job.plan()[0].number, Some(42));
 }
