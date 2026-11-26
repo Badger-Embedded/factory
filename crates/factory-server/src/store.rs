@@ -4885,6 +4885,24 @@ impl Store {
         Ok(row)
     }
 
+    /// Applies [`Event::ReviewRead`] for `head` and then the review verdict
+    /// `event` in one transaction, so a verdict never lands without the head
+    /// the reviewer read.
+    ///
+    /// # Errors
+    ///
+    /// Fails when either event is rejected, in which case neither applies, or
+    /// on a database error.
+    pub fn apply_review(&self, id: i64, head: String, event: Event) -> Result<JobRow, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut row = Self::load(&tx, id)?;
+        Self::apply_in(&tx, &mut row, Event::ReviewRead { head })?;
+        Self::apply_in(&tx, &mut row, event)?;
+        tx.commit()?;
+        Ok(row)
+    }
+
     /// # Errors
     ///
     /// Fails on a database error.

@@ -96,6 +96,7 @@ fn failed(reason: String) -> RunReport {
         mcp_unavailable: Vec::new(),
         credential: None,
         token_usage: None,
+        head: None,
     }
 }
 
@@ -622,6 +623,20 @@ impl Executor for PodmanExecutor {
         {
             return failed(reason);
         }
+        // Read from the checkout the reviewer reads, not from the forge
+        // afterwards, so a push between the two cannot change it.
+        let head = if matches!(request.expect, factory_runner::Expect::Review)
+            && request.existing.is_some()
+        {
+            match self.git.head(&workspace).await {
+                Ok(head) => Some(head),
+                Err(reason) => {
+                    return failed(format!("could not read the checkout's head: {reason}"));
+                }
+            }
+        } else {
+            None
+        };
 
         let name = Self::container(request.job_id);
         if let Err(err) = remove_container(&config, &name).await {
@@ -696,7 +711,7 @@ impl Executor for PodmanExecutor {
                 .await;
         }
         drop(codex_run);
-        report
+        RunReport { head, ..report }
     }
 
     async fn run_checks(
