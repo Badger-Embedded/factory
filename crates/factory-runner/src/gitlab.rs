@@ -1409,11 +1409,14 @@ impl Forge for GitLab {
             };
             // The merge request does not carry the source project's address.
             let head_repo_clone_url = match mr.source_project_id {
-                Some(id) => self
+                Some(id) => match self
                     .get_json::<SourceProjectJson>(account, &format!("projects/{id}"), &[])
                     .await
-                    .ok()
-                    .and_then(|found| found.http_url_to_repo),
+                {
+                    Ok(found) => found.http_url_to_repo,
+                    Err(err) if is_not_found(&err) => None,
+                    Err(err) => return Err(err),
+                },
                 None => None,
             };
             let state = match mr.state.as_str() {

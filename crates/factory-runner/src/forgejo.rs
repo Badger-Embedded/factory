@@ -1612,10 +1612,14 @@ impl Forge for Forgejo {
         })
     }
 
-    /// A listing is the pulls endpoint, one page. Its title search is the
-    /// issues endpoint with `type=pulls`, because the pulls endpoint has no
-    /// query. That search matches the body as well as the title, and its
-    /// rows carry no branches, so each row is read again as a pull request.
+    /// A listing is the pulls endpoint, one page, and null entries in it are
+    /// skipped. Its title search is the issues endpoint with `type=pulls`,
+    /// because the pulls endpoint has no query. That search also matches the
+    /// body and has no title-only mode, so the rows are filtered to those
+    /// whose title holds the text, and each is read again as a pull request
+    /// for its branches. The page is cut before the filter, so a page full
+    /// of body-only matches can hide a title match, and the result may be
+    /// shorter than 21 rows while more titles match.
     fn search_open_prs<'a>(
         &'a self,
         account: &'a Account,
@@ -1625,9 +1629,9 @@ impl Forge for Forgejo {
         Box::pin(async move {
             let limit = SEARCH_PAGE.to_string();
             let path = repo_path(repo)?;
-            let pulls: Vec<PullJson> = match PrQuery::parse(query) {
+            let pulls: Vec<Option<PullJson>> = match PrQuery::parse(query) {
                 PrQuery::Number(number) => match self.pull(account, repo, number).await {
-                    Ok(pull) => vec![pull],
+                    Ok(pull) => vec![Some(pull)],
                     Err(err) if err.status == Some(404) => Vec::new(),
                     Err(err) => return Err(err.into()),
                 },
@@ -1647,8 +1651,10 @@ impl Forge for Forgejo {
                     #[derive(Deserialize)]
                     struct Found {
                         number: u64,
+                        #[serde(default)]
+                        title: String,
                     }
-                    let found: Vec<Found> = self
+                    let found: Vec<Option<Found>> = self
                         .get(
                             account,
                             &format!("{path}/issues"),
@@ -1656,14 +1662,20 @@ impl Forge for Forgejo {
                                 ("type", "pulls"),
                                 ("state", "open"),
                                 ("q", text),
+                                ("sort", "recentupdate"),
                                 ("limit", &limit),
                             ],
                         )
                         .await?;
                     let mut pulls = Vec::new();
-                    for row in found {
+                    let needle = text.to_lowercase();
+                    for row in found
+                        .into_iter()
+                        .flatten()
+                        .filter(|row| row.title.to_lowercase().contains(&needle))
+                    {
                         match self.pull(account, repo, row.number).await {
-                            Ok(pull) => pulls.push(pull),
+                            Ok(pull) => pulls.push(Some(pull)),
                             Err(err) if err.status == Some(404) => {}
                             Err(err) => return Err(err.into()),
                         }
@@ -1673,6 +1685,7 @@ impl Forge for Forgejo {
             };
             Ok(pulls
                 .into_iter()
+                .flatten()
                 .filter(|pull| pull.state == "open" && !pull.merged)
                 .map(|pull| OpenPr {
                     fork: pull.is_fork(),

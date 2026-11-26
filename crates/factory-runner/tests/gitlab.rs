@@ -1178,3 +1178,42 @@ esac"#
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn a_source_project_error_other_than_missing_fails_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        &format!(
+            r#"case "$4" in
+  */merge_requests/12) echo '{MR_JSON}' ;;
+  projects/9) echo 'glab: 429 Too Many Requests (HTTP 429)' >&2; exit 1 ;;
+esac"#
+        ),
+    );
+    let err = glab
+        .pull_request(&account(), "team/pkg", 12)
+        .await
+        .unwrap_err();
+    assert!(err.contains("429"), "{err}");
+}
+
+#[tokio::test]
+async fn a_missing_source_project_leaves_the_clone_url_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, _) = fake_glab(
+        dir.path(),
+        &format!(
+            r#"case "$4" in
+  */merge_requests/12) echo '{MR_JSON}' ;;
+  *) echo 'glab: 404 Not Found (HTTP 404)' >&2; exit 1 ;;
+esac"#
+        ),
+    );
+    let pr = glab
+        .pull_request(&account(), "team/pkg", 12)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pr.head_repo_clone_url, None);
+}

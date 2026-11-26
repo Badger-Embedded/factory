@@ -1768,7 +1768,7 @@ async fn an_empty_search_reads_one_page_of_the_latest_open_pull_requests() {
 #[tokio::test]
 async fn a_title_search_uses_the_issue_search_and_reads_each_row_once() {
     let stub = serve(|seen| match seen.path.as_str() {
-        "/repos/owner/name/issues" => ok(&json!([{"number": 4}, {"number": 6}])),
+        "/repos/owner/name/issues" => ok(&json!([null, {"number": 4, "title": "Add A Thing"}, {"number": 5, "title": "body only"}, {"number": 6, "title": "a thing too"}])),
         "/repos/owner/name/pulls/4" => {
             let mut draft = numbered(4, 5);
             draft["draft"] = json!(true);
@@ -1792,7 +1792,13 @@ async fn a_title_search_uses_the_issue_search_and_reads_each_row_once() {
     assert!(prs[0].draft && !prs[0].fork);
     let issues = stub.requests("GET", "/repos/owner/name/issues");
     assert_eq!(issues.len(), 1);
-    for pair in ["type=pulls", "state=open", "limit=21", "q=a+thing"] {
+    for pair in [
+        "type=pulls",
+        "state=open",
+        "limit=21",
+        "q=a+thing",
+        "sort=recentupdate",
+    ] {
         assert!(
             issues[0].query.split('&').any(|p| p == pair),
             "{}",
@@ -1880,4 +1886,16 @@ async fn pull_request_reads_the_head_repository_and_none_for_a_missing_one() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn a_listing_with_null_entries_still_returns_the_rest() {
+    let stub = serve(|_| ok(&json!([null, numbered(1, 5), null]))).await;
+    let prs = stub
+        .forge
+        .search_open_prs(&account(&stub.forge), REPO, "")
+        .await
+        .unwrap();
+    assert_eq!(prs.len(), 1);
+    assert_eq!(stub.seen().len(), 1);
 }
