@@ -14,7 +14,7 @@ use crate::github::RepoReport;
 use crate::mcp::{McpServer, McpStages, McpToolState, McpTransport};
 use factory_runner::{ForgeAccount, ForgeKind};
 
-use crate::projects::{Project, ProjectLabel};
+use crate::projects::{Project, ProjectLabel, RenovateAgent};
 use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{
@@ -795,6 +795,9 @@ pub struct ProjectSettings {
     pub packages: Vec<String>,
     /// The form token the Local checks and Worker packages cards post.
     pub checks_csrf: String,
+    /// The Renovate agent override, or `None` when Renovate runs use the review
+    /// stage's agent, model and effort.
+    pub renovate_agent: Option<RenovateAgent>,
 }
 
 const CHECKS_LABEL: &str = "Local checks command (optional)";
@@ -2193,6 +2196,7 @@ pub fn settings_project(
             (project_checks_card(project))
             (project_packages_card(project))
             (project_maintenance_card(project))
+            (project_renovate_agent_card(project))
             (project_servers_card(project, nav.admin))
             @if let Some(problem) = problem {
                 div.card.failed { (problem) }
@@ -2280,6 +2284,49 @@ fn project_packages_card(project: &ProjectSettings) -> Markup {
             }
             input type="hidden" name="csrf" value=(project.checks_csrf);
             (save_bar("Save packages"))
+        }
+    }
+}
+
+fn project_renovate_agent_card(project: &ProjectSettings) -> Markup {
+    let (agent_efforts, agent_models) = agent_data(&project.agents);
+    let stored = project.renovate_agent.as_ref();
+    let (agent, model, effort) = match stored {
+        Some(stored) => (
+            stored.agent.as_str(),
+            stored.model.as_deref().unwrap_or_default(),
+            stored.effort.as_str(),
+        ),
+        None => (
+            stage_agent(&project.agent_selection, "review"),
+            stage_model(&project.models, "review").unwrap_or_default(),
+            stage_effort(&project.efforts, "review"),
+        ),
+    };
+    html! {
+        form.card.settings-form.renovate-agent-form method="post"
+            action={ "/settings/projects/" (crate::web::query_escape(&project.name)) "/renovate-agent" }
+            data-agent-efforts=(agent_efforts) data-agent-models=(agent_models) {
+            h2 { "Renovate agent" }
+            input type="hidden" name="csrf" value=(project.checks_csrf);
+            div.field {
+                label.check {
+                    input type="checkbox" name="renovate_override" value="on" checked[stored.is_some()];
+                    " Use a separate agent for Renovate runs"
+                }
+                p.hint { "Off by default. When off, Renovate runs use the review stage's agent, model and effort." }
+                p.hint { "Covers the failure analysis, the diff check and the packaging analysis of Renovate pull requests. Fix jobs and gap jobs use the normal stages." }
+            }
+            (agent_fields(
+                project,
+                "renovate",
+                agent,
+                model,
+                effort,
+                "The agent that runs Renovate's analyses. A run already in flight keeps the agent it started on.",
+                "Renovate",
+            ))
+            (save_bar("Save Renovate agent"))
         }
     }
 }

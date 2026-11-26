@@ -117,6 +117,35 @@ test("changing a stage's agent redraws its model and effort choices", async ({ p
   await expect(chips).toHaveText(['CLI default', 'fable', 'opus', 'sonnet', 'haiku']);
 });
 
+test('the Renovate agent redraws its choices and persists after a reload', async ({
+  page,
+  project,
+}) => {
+  await page.goto(settingsPath(project));
+  const card = page.locator('.renovate-agent-form');
+  const toggle = card.getByRole('checkbox', { name: /separate agent for Renovate/ });
+  const chips = card.locator('.model-chips .chip');
+  const efforts = card.locator('[data-effort-seg] label');
+  await expect(toggle).not.toBeChecked();
+  await expect(chips).toHaveText(['CLI default', 'fable', 'opus', 'sonnet', 'haiku']);
+
+  await toggle.check();
+  await card.getByRole('radio', { name: 'Codex' }).check();
+  await expect(chips).toHaveText(['CLI default', 'gpt-6.1-sol', 'gpt-6.1-codex']);
+  await expect(efforts).toHaveText(['minimal', 'low', 'medium', 'high', 'xhigh']);
+  await card.getByRole('button', { name: 'gpt-6.1-sol' }).click();
+  await card.getByRole('radio', { name: 'low', exact: true }).check();
+  await card.getByRole('button', { name: 'Save Renovate agent' }).click();
+  await expect(page.getByText('Saved.')).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`${settingsPath(project)}\\?notice=Saved\\.$`));
+
+  await page.reload();
+  await expect(toggle).toBeChecked();
+  await expect(card.getByRole('radio', { name: 'Codex' })).toBeChecked();
+  await expect(card.getByLabel('Model')).toHaveValue('gpt-6.1-sol');
+  await expect(card.getByRole('radio', { name: 'low', exact: true })).toBeChecked();
+});
+
 test('a saved agent, model, effort, gate and merge setting persist after a reload', async ({
   page,
   project,
