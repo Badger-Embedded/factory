@@ -4756,6 +4756,138 @@ async fn removing_a_project_drops_it_from_every_group() {
 }
 
 #[tokio::test]
+async fn a_group_id_that_is_not_the_logins_leaves_a_project_where_it_is() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    store
+        .save_project_groups("someone@else", &[], Some("Theirs"))
+        .unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    let theirs = store.project_groups("someone@else").unwrap()[0].id;
+    store
+        .set_project_groups(USER, &[("a-idle".into(), Some(home))])
+        .unwrap();
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+
+    for foreign in [999, theirs] {
+        dashboard
+            .post(
+                "/settings/groups/projects",
+                &format!("csrf={csrf}&project%3Aa-idle={foreign}"),
+            )
+            .await;
+        assert_eq!(store.project_groups(USER).unwrap()[0].projects, ["a-idle"]);
+        assert_eq!(
+            store.project_groups("someone@else").unwrap()[0]
+                .projects
+                .len(),
+            0
+        );
+    }
+    dashboard
+        .post(
+            "/settings/groups/projects",
+            &format!("csrf={csrf}&project%3Aa-idle="),
+        )
+        .await;
+    assert_eq!(store.project_groups(USER).unwrap()[0].projects.len(), 0);
+}
+
+#[tokio::test]
+async fn the_group_routes_reject_a_missing_token_and_ignore_another_logins_group() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    store
+        .save_project_groups("someone@else", &[], Some("Theirs"))
+        .unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    let theirs = store.project_groups("someone@else").unwrap()[0].id;
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+
+    let forbidden = dashboard
+        .post(
+            "/settings/groups/projects",
+            &format!("project%3Aa-idle={home}"),
+        )
+        .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+    assert_eq!(store.project_groups(USER).unwrap()[0].projects.len(), 0);
+
+    dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{theirs}=Mine"),
+        )
+        .await;
+    assert_eq!(
+        store.project_groups("someone@else").unwrap()[0].name,
+        "Theirs"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_group_field_is_checked_as_it_is_saved() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+    let long = "x".repeat(41);
+    dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{home}=Hobby&group-{home}={long}"),
+        )
+        .await;
+    assert_eq!(store.project_groups(USER).unwrap()[0].name, "Hobby");
+}
+
+#[tokio::test]
+async fn the_picker_escapes_group_names_and_its_fragment_lists_the_sections() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    let before = dashboard.get("/fragments/picker?project=a-idle").await.body;
+    store
+        .save_project_groups(USER, &[], Some("<b>Home</b>"))
+        .unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    store
+        .set_project_groups(USER, &[("a-idle".into(), Some(home))])
+        .unwrap();
+
+    let page = dashboard.get("/?project=a-idle").await.body;
+    assert!(page.contains("&lt;b&gt;Home&lt;/b&gt;"));
+    assert!(!page.contains("<b>Home</b>"));
+    let fragment = dashboard.get("/fragments/picker?project=a-idle").await;
+    assert_eq!(fragment.status, StatusCode::OK);
+    assert!(fragment.body.contains("picker-section"));
+    assert!(fragment.body.contains("&lt;b&gt;Home&lt;/b&gt;"));
+    let version = |body: &str| {
+        body.split("/fragments/picker?")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .map(str::to_owned)
+    };
+    assert_ne!(version(&before), version(&fragment.body));
+}
+
+#[tokio::test]
+async fn a_login_that_is_not_an_admin_reaches_the_project_groups_page() {
+    let dashboard = four_projects();
+    dashboard
+        .store
+        .add_collaborator("a-idle", "bob@example.com", "alice")
+        .unwrap();
+    let page = dashboard
+        .get_as("bob@example.com", "/settings/groups")
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("href=\"/settings/groups\""));
+}
+
+#[tokio::test]
 async fn the_picker_lists_and_counts_only_the_projects_the_login_collaborates_on() {
     let dashboard = two_projects();
     dashboard

@@ -1863,7 +1863,12 @@ async fn save_groups(
                 .any(|group| group.id == id)
                 .then(|| (id, value.trim().to_owned()))
         })
-        .collect();
+        .fold(Vec::new(), |mut names, (id, name)| {
+            if !names.iter().any(|(seen, _)| *seen == id) {
+                names.push((id, name));
+            }
+            names
+        });
     let added = form_value(&form, "new").trim();
     let mut kept: Vec<String> = known
         .iter()
@@ -1918,11 +1923,14 @@ async fn save_group_members(
             if !projects.iter().any(|label| label.id == project) {
                 return None;
             }
-            let group = value
-                .parse::<i64>()
-                .ok()
-                .filter(|id| groups.iter().any(|group| group.id == *id));
-            Some((project.to_owned(), group))
+            if value.is_empty() {
+                return Some((project.to_owned(), None));
+            }
+            let id = value.parse::<i64>().ok()?;
+            groups
+                .iter()
+                .any(|group| group.id == id)
+                .then(|| (project.to_owned(), Some(id)))
         })
         .collect();
     state.store.set_project_groups(&login, &assignments)?;

@@ -264,6 +264,7 @@ test.describe('on a touch device', () => {
     await expect(page.locator('.picker-panel')).toBeVisible();
     await expect(page.locator('kbd:visible')).toHaveCount(0);
     await expect(page.locator('.picker-keys')).toBeHidden();
+    await expect(page.getByRole('link', { name: 'Edit groups' })).toBeVisible();
   });
 });
 
@@ -277,5 +278,6 @@ test.describe('without JavaScript', () => {
     await button(page).click();
     await expect(page.locator('.picker-panel')).toBeVisible();
     await expect(page.locator('kbd:visible')).toHaveCount(0);
+    await expect(page.getByRole('link', { name: 'Edit groups' })).toBeVisible();
   });
 });
