@@ -180,7 +180,7 @@
           search.focus();
           return;
         }
-        if (event.key === "Enter" && !(target instanceof Element && target.closest("#picker-list a"))) {
+        if (event.key === "Enter" && !(target instanceof Element && target.closest("#picker-list a, .picker-foot a"))) {
           event.preventDefault();
           openHighlighted();
           return;

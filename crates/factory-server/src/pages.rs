@@ -776,7 +776,6 @@ fn picker_sections(attention: &[ProjectAttention]) -> Vec<PickerSection<'_>> {
     .collect()
 }
 
-/// The mark in front of the selected project's row.
 fn picker_check() -> Markup {
     html! {
         svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"
@@ -1251,8 +1250,7 @@ pub fn settings_groups(
     )
 }
 
-/// The longest project group name the Project groups page takes, in characters.
-pub const MAX_GROUP_NAME: usize = 40;
+pub use crate::store::MAX_GROUP_NAME;
 
 pub fn settings_workers(
     user: &str,

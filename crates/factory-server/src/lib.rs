@@ -81,8 +81,8 @@ pub use secrets::{
 };
 pub use settings::Settings;
 pub use store::{
-    Claim, CodexPrice, Collaborator, FACTORY_REQUESTER, GapJob, JobEvent, JobFile, JobRow,
-    LocalSettings, LogEntry, Maintenance, MaintenanceSave, Packaging, PackagingType,
+    Claim, CodexPrice, Collaborator, FACTORY_REQUESTER, GapJob, GroupsSave, JobEvent, JobFile,
+    JobRow, LocalSettings, LogEntry, Maintenance, MaintenanceSave, Packaging, PackagingType,
     PrerequisiteEdit, ProjectGuard, ProjectTotals, Snapshot, Store, StoreError,
 };
 pub use usage::PlanUsageCache;

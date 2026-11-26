@@ -4639,7 +4639,6 @@ async fn the_picker_lists_a_logins_groups_in_name_order_then_other() {
             (Some("Other".to_owned()), vec!["d-running".to_owned()]),
         ]
     );
-    // Another login's picker stays flat.
     store
         .add_collaborator("a-idle", "bob@example.com", "alice")
         .unwrap();
@@ -4864,13 +4863,40 @@ async fn the_picker_escapes_group_names_and_its_fragment_lists_the_sections() {
     assert_eq!(fragment.status, StatusCode::OK);
     assert!(fragment.body.contains("picker-section"));
     assert!(fragment.body.contains("&lt;b&gt;Home&lt;/b&gt;"));
-    let version = |body: &str| {
-        body.split("/fragments/picker?")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .map(str::to_owned)
-    };
-    assert_ne!(version(&before), version(&fragment.body));
+    assert_ne!(poll_url(&before), poll_url(&fragment.body));
+}
+
+/// The `hx-get` URL of the picker list in `body`.
+fn poll_url(body: &str) -> Option<String> {
+    body.split("hx-get=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .map(|url| url.replace("&amp;", "&"))
+}
+
+#[tokio::test]
+async fn renaming_a_populated_group_invalidates_a_grouped_poll() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    store
+        .set_project_groups(USER, &[("a-idle".into(), Some(home))])
+        .unwrap();
+    let url = poll_url(&dashboard.get("/fragments/picker?project=a-idle").await.body).unwrap();
+    assert_eq!(dashboard.get(&url).await.status, StatusCode::NO_CONTENT);
+
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+    dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{home}=Hobby"),
+        )
+        .await;
+    let stale = dashboard.get(&url).await;
+    assert_eq!(stale.status, StatusCode::OK);
+    assert!(stale.body.contains(">Hobby<"));
+    assert!(stale.body.contains("hx-swap-oob=\"true\""));
 }
 
 #[tokio::test]

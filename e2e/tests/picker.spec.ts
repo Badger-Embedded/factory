@@ -185,6 +185,20 @@ test.describe('as a login of its own', () => {
     await expect(page.locator('.picker-heading')).toHaveText(['Needs you']);
   });
 
+  test('Enter on the focused Edit groups link follows it', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    projectFor(factory, login, `a${tag}`);
+    projectFor(factory, login, `b${tag}`);
+
+    await page.goto(`/?project=a${tag}`);
+    await button(page).click();
+    await page.getByRole('link', { name: 'Edit groups' }).focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(/\/settings\/groups$/);
+  });
+
   test('a click outside and Esc close the panel', async ({ page, factory }, testInfo) => {
     const login = uniqueLogin(testInfo.workerIndex);
     const tag = login.split('@')[0];

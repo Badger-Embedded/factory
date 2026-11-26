@@ -37,9 +37,9 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, MAX_LOCAL_LOAD_MINUTES, Maintenance, MaintenanceSave,
-    Packaging, PackagingType, PrerequisiteEdit, PrerequisiteView, ProjectGuard, ProjectTotals,
-    Store, StoreError,
+    FACTORY_REQUESTER, GroupsSave, JobFile, JobRow, MAX_LOCAL_LOAD_MINUTES, Maintenance,
+    MaintenanceSave, Packaging, PackagingType, PrerequisiteEdit, PrerequisiteView, ProjectGuard,
+    ProjectTotals, Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -1853,54 +1853,32 @@ async fn save_groups(
 ) -> Result<Markup, AppError> {
     let login = user(&headers);
     require_csrf(&state, &login, form_value(&form, "csrf"))?;
-    let known = state.store.project_groups(&login)?;
     let names: Vec<(i64, String)> = form
         .iter()
         .filter_map(|(key, value)| {
             let id = key.strip_prefix("group-")?.parse::<i64>().ok()?;
-            known
-                .iter()
-                .any(|group| group.id == id)
-                .then(|| (id, value.trim().to_owned()))
+            Some((id, value.trim().to_owned()))
         })
-        .fold(Vec::new(), |mut names, (id, name)| {
-            if !names.iter().any(|(seen, _)| *seen == id) {
-                names.push((id, name));
-            }
-            names
-        });
-    let added = form_value(&form, "new").trim();
-    let mut kept: Vec<String> = known
-        .iter()
-        .map(|group| {
-            names
-                .iter()
-                .find(|(id, _)| *id == group.id)
-                .map_or_else(|| group.name.clone(), |(_, name)| name.clone())
-        })
-        .filter(|name| !name.is_empty())
         .collect();
-    if !added.is_empty() {
-        kept.push(added.to_owned());
+    let added = form_value(&form, "new").trim();
+    let saved =
+        state
+            .store
+            .save_project_groups(&login, &names, (!added.is_empty()).then_some(added))?;
+    match saved {
+        GroupsSave::Saved => {}
+        GroupsSave::TooLong(long) => {
+            let notice = format!(
+                "\"{long}\" is longer than {} characters, so nothing was saved.",
+                pages::MAX_GROUP_NAME
+            );
+            return groups_page(&state, &headers, Some(&notice));
+        }
+        GroupsSave::Repeated(repeat) => {
+            let notice = format!("Two groups are named \"{repeat}\", so nothing was saved.");
+            return groups_page(&state, &headers, Some(&notice));
+        }
     }
-    if let Some(long) = kept
-        .iter()
-        .find(|name| name.chars().count() > pages::MAX_GROUP_NAME)
-    {
-        let notice = format!(
-            "\"{long}\" is longer than {} characters, so nothing was saved.",
-            pages::MAX_GROUP_NAME
-        );
-        return groups_page(&state, &headers, Some(&notice));
-    }
-    let mut seen = HashSet::new();
-    if let Some(repeat) = kept.iter().find(|name| !seen.insert(name.to_lowercase())) {
-        let notice = format!("Two groups are named \"{repeat}\", so nothing was saved.");
-        return groups_page(&state, &headers, Some(&notice));
-    }
-    state
-        .store
-        .save_project_groups(&login, &names, (!added.is_empty()).then_some(added))?;
     groups_page(&state, &headers, Some("Saved."))
 }
 
