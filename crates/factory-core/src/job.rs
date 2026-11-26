@@ -1367,6 +1367,11 @@ pub enum Event {
     StartReview {
         head: String,
     },
+    /// The first reviewer pass of a review-and-fix job read `head`. It runs
+    /// before any CI watch, so this is where the job learns the head.
+    ReviewRead {
+        head: String,
+    },
     /// The reviewer approved the pull request's current head.
     ReviewApproved,
     /// The reviewer asked for changes and gave `feedback`.
@@ -2077,6 +2082,7 @@ impl Job {
                 S::CiAndReview { .. },
                 _,
                 event @ (E::StartReview { .. }
+                | E::ReviewRead { .. }
                 | E::ReviewApproved
                 | E::ReviewChanges { .. }
                 | E::ReviewFailed { .. }),
@@ -2622,7 +2628,19 @@ impl Job {
                 let pr = *pr;
                 self.record_review(pr, Verdict::Approve, None);
                 self.review = ReviewState::Approved;
-                (S::CiAndReview { pr }, Turn::Factory)
+                let first_pass = !self.pushed
+                    && self
+                        .picked_pr()
+                        .is_some_and(|picked| picked.mode == PrMode::ReviewAndFix);
+                if first_pass {
+                    (S::CiAndReview { pr }, Turn::User(Ask::MergeLeftToUser))
+                } else {
+                    (S::CiAndReview { pr }, Turn::Factory)
+                }
+            }
+            (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewRead { head }) => {
+                self.review_head = Some(head);
+                (S::CiAndReview { pr: *pr }, Turn::Agent(Task::Review))
             }
             (S::CiAndReview { pr }, Turn::Agent(Task::Review), E::ReviewChanges { feedback }) => {
                 let pr = *pr;

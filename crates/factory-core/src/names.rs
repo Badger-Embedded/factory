@@ -129,6 +129,7 @@ impl Event {
             Event::Conflicted { .. } => "conflicted",
             Event::ReviewComments { .. } => "review-comments",
             Event::StartReview { .. } => "start-review",
+            Event::ReviewRead { .. } => "review-read",
             Event::ReviewApproved => "review-approved",
             Event::ReviewChanges { .. } => "review-changes",
             Event::ReviewFailed { .. } => "review-failed",

@@ -4300,9 +4300,15 @@ fn review_and_fix_approving_on_the_first_pass_pushes_nothing() {
     );
 
     apply(&mut job, Event::ReviewApproved);
-    assert!(!matches!(job.next_command(), Some(Command::Publish { .. })));
-    apply(&mut job, Event::MergeLeftToUser);
     assert_eq!(job.turn(), &Turn::User(Ask::MergeLeftToUser));
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 42,
+            watch_only: true
+        })
+    );
 }
 
 #[test]
@@ -4443,6 +4449,30 @@ fn review_and_fix_reviews_first_even_when_ci_is_not_green() {
         job.next_command(),
         Some(Command::RunAgent {
             task: Task::Review,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn an_unchanged_head_after_the_first_pass_stops_instead_of_reviewing_again() {
+    let mut job = review_job(PrMode::ReviewAndFix, false);
+    apply(&mut job, Event::ReviewRead { head: "abc".into() });
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "rename it".into(),
+        },
+    );
+    assert_eq!(job.reviews()[0].head.as_deref(), Some("abc"));
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 42 });
+    apply(&mut job, Event::StartReview { head: "abc".into() });
+    assert!(matches!(
+        job.turn(),
+        Turn::User(Ask::ReviewStopped {
+            stop: ReviewStop::Unchanged,
             ..
         })
     ));
