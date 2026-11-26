@@ -59,7 +59,7 @@ impl Expect {
         }
         match (Self::for_stage(stage)?, task) {
             (Expect::Commits, Task::FixCi { .. }) => Some(Expect::FixCi),
-            (_, Task::Review | Task::QuickReview) => Some(Expect::Review),
+            (_, Task::Review) => Some(Expect::Review),
             (expect, _) => Some(expect),
         }
     }

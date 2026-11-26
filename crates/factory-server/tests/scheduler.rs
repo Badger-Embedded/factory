@@ -8716,6 +8716,31 @@ async fn a_review_and_fix_first_pass_records_the_checkout_head_with_its_verdict(
     let reviews = store.get(id).unwrap().job.reviews().to_vec();
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].head.as_deref(), Some("h1"));
+
+    // The fix leaves the head as the reviewer read it, so the loop stops.
+    executor.release(1);
+    step(&scheduler).await; // fix
+    step(&scheduler).await; // checks
+    step(&scheduler).await; // publish
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::StartReview { head: "h1".into() }),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+    step(&scheduler).await; // watch
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::ReviewStopped {
+            stop: factory_core::ReviewStop::Unchanged,
+            ..
+        })
+    ));
+    let reviewers = executor
+        .requests()
+        .iter()
+        .filter(|request| request.expect == Expect::Review)
+        .count();
+    assert_eq!(reviewers, 1);
 }
 
 #[tokio::test]
