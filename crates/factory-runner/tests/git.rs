@@ -1075,3 +1075,63 @@ async fn a_denied_push_is_not_reported_as_rejected_when_the_head_also_moved() {
         .unwrap_err();
     assert!(matches!(err, factory_runner::PushError::Failed(_)), "{err}");
 }
+
+/// Pushes a new commit to the forge's head ref of pull request 5, as a person
+/// would after the checkout was made.
+fn advance_pull_request(fixture: &Fixture, file: &str, content: &str) {
+    let upstream = fixture.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, file, content);
+    let bare_repo = fixture.root.path().join("remotes/owner/repo.git");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            bare_repo.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    git(&upstream, &["checkout", "-q", "main"]);
+}
+
+#[tokio::test]
+async fn a_moved_pull_request_head_merges_into_the_checkout() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    advance_pull_request(&remote, "theirs", "their fix");
+
+    let merged = git_
+        .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+        .await
+        .unwrap();
+    assert!(merged);
+    assert!(work.join("theirs").exists());
+    assert!(work.join("agent-file").exists());
+}
+
+#[tokio::test]
+async fn a_moved_pull_request_head_that_conflicts_stays_unfinished_and_survives_the_next_prepare() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "pr-file", "agent edit");
+    advance_pull_request(&remote, "pr-file", "their edit");
+
+    let merged = git_
+        .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+        .await
+        .unwrap();
+    assert!(!merged);
+    assert!(work.join(".git/MERGE_HEAD").exists());
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert!(work.join(".git/MERGE_HEAD").exists());
+    assert!(git(&work, &["status", "--porcelain"]).contains("UU pr-file"));
+}

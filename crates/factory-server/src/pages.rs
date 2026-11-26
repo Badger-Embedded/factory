@@ -5792,6 +5792,7 @@ pub(crate) fn task_label(task: &Task) -> &'static str {
         Task::FixChecks { .. } => "fixing failed checks",
         Task::FixCi { .. } => "fixing the CI failure",
         Task::AddressReview { .. } => "addressing review comments",
+        Task::MergeHead => "merging the commits someone else pushed to the pull request",
         Task::Rebase { .. } => "rebasing onto the newest base branch to resolve a conflict",
         Task::Review => "reviewing the pull request",
         Task::AnalyzeFailure { .. } => "reading the CI failure log",

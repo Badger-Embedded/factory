@@ -1080,6 +1080,10 @@ pub enum Task {
     Rebase {
         base: String,
     },
+    /// Finish the merge of the picked pull request's newer head into the
+    /// checkout. Someone pushed to the branch while the job ran, and their
+    /// commits conflict with the job's.
+    MergeHead,
     /// Review the pull request's diff and end with `approve` or `changes`. The
     /// worker gets no GitHub token and reads the diff from the checkout.
     Review,
@@ -1295,6 +1299,13 @@ pub enum Event {
     /// CI is green on the pull request of a job that never merges, and the
     /// reviewer has nothing left to say. See [`Job::may_merge`].
     MergeLeftToUser,
+    /// The push to a picked pull request was refused because someone pushed
+    /// to its branch first, and the factory merged their commits into the
+    /// checkout. With `conflicted`, the merge is unfinished and an agent
+    /// resolves it. Otherwise the checks run again on the merged branch.
+    HeadMoved {
+        conflicted: bool,
+    },
     /// The pull request no longer merges cleanly into `base`.
     Conflicted {
         base: String,
@@ -1878,6 +1889,18 @@ impl Job {
         Ok(next)
     }
 
+    fn after_head_moved(pr: usize, conflicted: bool) -> (Stage, Turn) {
+        if conflicted {
+            (Stage::Implementing { pr }, Turn::Agent(Task::MergeHead))
+        } else {
+            (Stage::Verifying { pr }, Turn::Factory)
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match arm per factory event, as in `transition`"
+    )]
     fn deliver(&mut self, event: Event) -> Result<(Stage, Turn), Rejected> {
         use Event as E;
         use Stage as S;
@@ -1934,6 +1957,11 @@ impl Job {
                 self.pushed = true;
                 self.review = ReviewState::Pending;
                 (S::CiAndReview { pr }, Turn::Factory)
+            }
+            (S::PrOpen { pr }, Turn::Factory, E::HeadMoved { conflicted })
+                if self.picked_pr().is_some() =>
+            {
+                Self::after_head_moved(*pr, conflicted)
             }
             (S::PrOpen { pr }, Turn::Factory, E::NothingToPublish) => {
                 let pr = *pr;

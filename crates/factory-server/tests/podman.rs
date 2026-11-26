@@ -1793,3 +1793,98 @@ async fn publishing_to_a_picked_pull_request_pushes_its_branch_and_never_opens_o
         );
     }
 }
+
+/// Publishes to pull request 12 of `o/r` whose forge base is `forge_base`,
+/// from a job saved with base `develop`. `git_arms` adds `case` arms on the
+/// subcommand to the fake `git`.
+async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Published {
+    let tools = Tools::new();
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        &format!(
+            "#!/bin/bash\n\
+             case \"$*\" in\n\
+             *pulls/12*) echo '{{\"number\":12,\"state\":\"open\",\"merged\":false,\
+             \"head\":{{\"sha\":\"a\",\"ref\":\"carol/reboot\",\"repo\":{{\"full_name\":\"o/r\"}}}},\
+             \"base\":{{\"sha\":\"b\",\"ref\":\"{forge_base}\",\"repo\":{{\"full_name\":\"o/r\"}}}}}}' ;;\n\
+             esac\n"
+        ),
+    );
+    support::executable(
+        tools.dir.path(),
+        "git",
+        &format!(
+            "#!/bin/bash\n\
+             while [ \"$1\" = -c ]; do shift 2; done\n\
+             case \"$1\" in --git-dir=*) shift ;; esac\n\
+             case \"$1\" in\n\
+             clone) mkdir -p \"${{@: -1}}/.git\" ;;\n\
+             log) echo 'abc1234 one' ;;\n\
+             config) case \"$*\" in *--get-regexp*) exit 1 ;; esac ;;\n\
+             {git_arms}\n\
+             esac\n"
+        ),
+    );
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+            repo: "o/r".into(),
+            base: "develop".into(),
+            branch: "factory/job-7-pr-1".into(),
+            existing: Some(factory_server::ExistingPr {
+                number: 12,
+                head_branch: "carol/reboot".into(),
+                head_ref: "refs/pull/12/head".into(),
+            }),
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            pushed: factory_server::PushLog::new(|_| {}),
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_rejected_push_to_a_picked_pull_request_merges_the_new_head_and_leaves_the_checks_to_rerun()
+ {
+    let published =
+        publish_picked("develop", "push) echo '! [rejected] moved' >&2; exit 1 ;;").await;
+    assert!(matches!(
+        published,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+}
+
+#[tokio::test]
+async fn a_rejected_push_whose_merge_conflicts_hands_the_conflict_to_the_agent() {
+    let published = publish_picked(
+        "develop",
+        "push) echo '! [rejected] moved' >&2; exit 1 ;;\n\
+         merge) exit 1 ;;\n\
+         diff) echo README ;;",
+    )
+    .await;
+    assert!(matches!(
+        published,
+        factory_server::Published::HeadMoved { conflicted: true }
+    ));
+}
+
+#[tokio::test]
+async fn publishing_after_the_pull_request_was_retargeted_stops_with_a_clear_reason() {
+    let published = publish_picked("main", "").await;
+    let factory_server::Published::Stopped(reason) = published else {
+        panic!("expected a stop, got {published:?}");
+    };
+    assert!(
+        reason.contains("main") && reason.contains("develop"),
+        "{reason}"
+    );
+}

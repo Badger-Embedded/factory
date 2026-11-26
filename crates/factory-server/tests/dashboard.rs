@@ -18572,3 +18572,105 @@ async fn a_post_without_a_pull_request_creates_the_job_it_always_did() {
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert!(dashboard.store.list().unwrap()[0].job.picked_pr().is_none());
 }
+
+fn picked_number(number: u64) -> factory_core::PickedPr {
+    factory_core::PickedPr {
+        number,
+        url: format!("https://github.com/Badger-Embedded/maestro/pull/{number}"),
+        title: "Update serde".into(),
+        head_branch: "renovate/serde".into(),
+        base_branch: "main".into(),
+        fork: false,
+        mode: factory_core::PrMode::Request,
+    }
+}
+
+#[test]
+fn discovery_leaves_a_pull_request_a_picked_job_holds() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    store
+        .create_pull_request_job("maestro", "alice", "fix it", &[], picked_number(7))
+        .unwrap();
+    let found = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap();
+    assert_eq!(found, None);
+    assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn a_pick_is_refused_for_a_pull_request_discovery_already_took() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let renovate = store
+        .create_renovate_job("maestro", 7, "Update serde", "https://example/pull/7")
+        .unwrap()
+        .unwrap();
+    let error = store
+        .create_pull_request_job("maestro", "alice", "fix it", &[], picked_number(7))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(&format!("job #{renovate}")),
+        "{error}"
+    );
+}
+
+#[test]
+fn retrying_a_failed_job_whose_pull_request_was_taken_is_refused() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let first = store
+        .create_pull_request_job("maestro", "alice", "one", &[], picked_number(7))
+        .unwrap();
+    store.apply(first, Event::Start).unwrap();
+    store
+        .apply(
+            first,
+            Event::AgentFailed {
+                reason: "out of memory".into(),
+            },
+        )
+        .unwrap();
+    let second = store
+        .create_pull_request_job("maestro", "alice", "two", &[], picked_number(7))
+        .unwrap();
+
+    let error = store.apply(first, Event::Retry).unwrap_err();
+    assert!(
+        error.to_string().contains(&format!("job #{second}")),
+        "{error}"
+    );
+    assert!(store.get(first).unwrap().job.is_finished());
+
+    store.apply(second, Event::Cancel).unwrap();
+    store.apply(first, Event::Retry).unwrap();
+    assert!(!store.get(first).unwrap().job.is_finished());
+}

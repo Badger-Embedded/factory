@@ -311,6 +311,12 @@ pub enum Published {
     /// The picked pull request was closed without merging before the push, so
     /// the factory pushed nothing.
     AlreadyClosed(u64),
+    /// The push to a picked pull request was refused because someone pushed
+    /// first. The factory merged their commits into the checkout, which is
+    /// left unfinished when `conflicted`.
+    HeadMoved { conflicted: bool },
+    /// The job cannot go on, for this reason, and the factory pushed nothing.
+    Stopped(String),
 }
 
 #[allow(
@@ -1974,6 +1980,20 @@ impl<E: Executor> Scheduler<E> {
                     );
                     scheduler.apply(job_id, Event::Published { number });
                     scheduler.apply(job_id, Event::ClosedUnmerged);
+                }
+                Ok(Published::HeadMoved { conflicted }) => {
+                    scheduler.note(
+                        job_id,
+                        if conflicted {
+                            "Someone pushed to the pull request first and their commits conflict with the job's, so the agent resolves the merge."
+                        } else {
+                            "Someone pushed to the pull request first. The factory merged their commits and runs the checks again before it pushes."
+                        },
+                    );
+                    scheduler.apply(job_id, Event::HeadMoved { conflicted });
+                }
+                Ok(Published::Stopped(reason)) => {
+                    scheduler.apply(job_id, Event::FactoryFailed { reason });
                 }
                 Ok(Published::Empty) => {
                     scheduler.note(

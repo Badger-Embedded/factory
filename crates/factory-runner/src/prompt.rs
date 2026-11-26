@@ -141,6 +141,13 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
             )
         }
         Task::Rebase { base } => rebase_prompt(base, picked),
+        Task::MergeHead => "Someone pushed to the pull request's branch while you worked. The \
+             factory started merging their commits into this checkout and the merge \
+             conflicts. Resolve the conflicts so that both their change and yours keep \
+             working, stage the files and finish the merge with `git commit --no-edit`. Do \
+             not rebase, and do not rewrite or drop any commit. Run the tests. Do not push. \
+             Leave the pull request title and description alone."
+            .to_owned(),
         Task::AddressReview { comments } => format!(
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."

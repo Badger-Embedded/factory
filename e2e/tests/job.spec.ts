@@ -722,6 +722,21 @@ test('a job page links its Renovate pull request through the forge', async ({ pa
   await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
 });
 
+test('a request on a picked pull request waits for the user to merge it', async ({ page, factory, project }) => {
+  const url = `https://github.com/e2e/${project}/pull/12`;
+  const id = factory.fixture('picked', '--project', project, '--number', '12', '--url', url);
+  await page.goto(`/jobs/${id}`);
+
+  await expect(status(page).locator('.badge').first()).toHaveText('needs you');
+  const card = status(page).locator('.card.needs-you');
+  await expect(card.getByRole('heading', { name: 'Merge the pull request' })).toBeVisible();
+  await expect(card).toContainText('the merge is left to you');
+  const link = card.getByRole('link', { name: 'Pull request #12' });
+  await expect(link).toHaveAttribute('href', url);
+  await expect(link).toHaveAttribute('target', '_blank');
+  await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+});
+
 test('a safe Renovate pull request on a Read-only account waits as ready to merge and names the account', async ({
   page,
   factory,

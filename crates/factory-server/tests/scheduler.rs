@@ -2640,7 +2640,10 @@ fn a_ready_pull_request_reviews_before_it_merges_or_waits() {
     // review.
     assert_eq!(ready_action(true, true, true, true), ReadyAction::Merge);
     assert_eq!(ready_action(true, true, false, true), ReadyAction::Wait);
-    // A job that may not merge leaves it to the user once review is settled.
+}
+
+#[test]
+fn a_job_that_may_not_merge_leaves_the_merge_to_the_user_once_review_settles() {
     assert_eq!(
         ready_action(false, false, true, false),
         ReadyAction::LeaveToUser
@@ -8742,4 +8745,77 @@ async fn a_conflict_on_a_picked_pull_request_asks_for_a_merge_not_a_rebase() {
     assert!(request.merge_base);
     assert_eq!(request.base, "develop");
     assert!(store.get(id).unwrap().job.picked_pr().is_some());
+}
+
+#[tokio::test]
+async fn a_clean_merge_of_a_moved_head_reruns_the_checks_before_the_push() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Ok(Published::HeadMoved { conflicted: false }));
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+    assert_eq!(executor.checks_run.lock().unwrap().len(), 1);
+    assert!(matches!(
+        store.get(id).unwrap().job.stage(),
+        Stage::Verifying { .. }
+    ));
+
+    step(&scheduler).await; // checks on the combined tree
+    step(&scheduler).await; // push again
+    assert_eq!(executor.checks_run.lock().unwrap().len(), 2);
+    assert_eq!(executor.published.lock().unwrap().len(), 2);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+}
+
+#[tokio::test]
+async fn a_conflicting_moved_head_goes_to_the_agent_to_merge() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Ok(Published::HeadMoved { conflicted: true }));
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::MergeHead)
+    ));
+
+    let before = executor.requests.lock().unwrap().len();
+    executor.release(1);
+    step(&scheduler).await;
+    let requests = executor.requests.lock().unwrap();
+    assert_eq!(requests.len(), before + 1);
+    assert_eq!(requests[before].existing.as_ref().unwrap().number, 12);
+}
+
+#[tokio::test]
+async fn a_publish_that_stops_fails_the_job_with_the_reason_and_retry_publishes_again() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Ok(Published::Stopped(
+            "the pull request now targets main, not develop".into(),
+        )));
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+    let job = store.get(id).unwrap().job;
+    assert!(
+        matches!(job.stage(), Stage::Failed { reason, .. } if reason.contains("now targets main")),
+        "{:?}",
+        job.stage()
+    );
+
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+    assert_eq!(executor.published.lock().unwrap().len(), 2);
 }

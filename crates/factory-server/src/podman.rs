@@ -63,6 +63,19 @@ pub struct PodmanExecutor {
 /// only the worker user reads it. A file left by an earlier crashed run is
 /// removed first, so the new one is created with the right mode rather than
 /// keeping the old one's.
+/// Why the job cannot go on when the pull request now merges into another
+/// branch than the one the job saved. The conflict and the diff the job works
+/// from are against the saved base, so they would no longer match the forge.
+fn retargeted(pr: &factory_runner::PullRequest, saved_base: &str) -> Option<String> {
+    (pr.base_branch != saved_base).then(|| {
+        format!(
+            "Pull request #{} now merges into {} instead of {saved_base}, where the job \
+             started. Move it back, or cancel this job and start a new one.",
+            pr.number, pr.base_branch
+        )
+    })
+}
+
 fn write_credential_file(path: &Path, contents: &str) -> std::io::Result<()> {
     match fs::remove_file(path) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
@@ -297,16 +310,14 @@ impl PodmanExecutor {
     /// without force, and touches nothing else on the pull request: no title,
     /// no description, no merge. A push that the remote refuses because
     /// someone pushed meanwhile brings their commits into the checkout with a
-    /// merge and pushes again, so the factory neither drops nor overwrites
-    /// them. It does not rerun the checks on that merge. The CI watch that
-    /// follows covers it.
+    /// merge, so the factory neither drops nor overwrites them, and the job runs the checks on the merged branch, or hands a
+    /// conflict to the agent, before it pushes again.
     async fn publish_existing(
         &self,
         request: &PublishRequest,
         existing: &ExistingPr,
         forge: &dyn Forge,
     ) -> Result<Published, String> {
-        const ATTEMPTS: usize = 3;
         let reader = request.account.resolve()?;
         let found = blame(
             &reader.owner,
@@ -314,10 +325,18 @@ impl PodmanExecutor {
                 .pull_request(&reader.account, &request.repo, existing.number)
                 .await,
         )?;
-        match found.map(|pr| pr.state) {
-            Some(PrState::Open) => {}
-            Some(PrState::Merged) => return Ok(Published::AlreadyMerged(existing.number)),
-            Some(PrState::Closed) => return Ok(Published::AlreadyClosed(existing.number)),
+        match found {
+            Some(pr) if pr.state == PrState::Merged => {
+                return Ok(Published::AlreadyMerged(existing.number));
+            }
+            Some(pr) if pr.state == PrState::Closed => {
+                return Ok(Published::AlreadyClosed(existing.number));
+            }
+            Some(pr) => {
+                if let Some(reason) = retargeted(&pr, &request.base) {
+                    return Ok(Published::Stopped(reason));
+                }
+            }
             None => {
                 return Err(format!(
                     "pull request #{} no longer exists",
@@ -342,31 +361,24 @@ impl PodmanExecutor {
                 ));
             }
         };
-        let mut result = Ok(());
-        for attempt in 1..=ATTEMPTS {
-            result = self
+        let result = self
+            .git
+            .push_fast_forward(
+                &workspace,
+                &remote,
+                &request.branch,
+                &existing.head_branch,
+                &record,
+            )
+            .await;
+        if matches!(result, Err(PushError::Rejected(_))) {
+            let merged = self
                 .git
-                .push_fast_forward(
-                    &workspace,
-                    &remote,
-                    &request.branch,
-                    &existing.head_branch,
-                    &record,
-                )
-                .await;
-            if !matches!(result, Err(PushError::Rejected(_))) || attempt == ATTEMPTS {
-                break;
-            }
-            self.git
-                .prepare_pr(
-                    &workspace,
-                    &remote,
-                    &request.base,
-                    &existing.head_ref,
-                    existing.number,
-                    &request.branch,
-                )
+                .merge_pr_head(&workspace, &remote, &existing.head_ref, existing.number)
                 .await?;
+            return Ok(Published::HeadMoved {
+                conflicted: !merged,
+            });
         }
         let owner = pusher
             .lock()
@@ -761,12 +773,26 @@ impl Executor for PodmanExecutor {
             },
             Observation::Merged => (Some(Event::Merged), None),
             Observation::Closed => (Some(Event::ClosedUnmerged), None),
-            Observation::Conflicted => (
-                Some(Event::Conflicted {
-                    base: request.base.clone(),
-                }),
-                None,
-            ),
+            Observation::Conflicted => {
+                let retargeted = if request.may_merge {
+                    None
+                } else {
+                    blame(
+                        &reader.owner,
+                        forge
+                            .pull_request(&reader.account, &request.repo, request.number)
+                            .await,
+                    )?
+                    .and_then(|pr| retargeted(&pr, &request.base))
+                };
+                let event = match retargeted {
+                    Some(reason) => Event::FactoryFailed { reason },
+                    None => Event::Conflicted {
+                        base: request.base.clone(),
+                    },
+                };
+                (Some(event), None)
+            }
             Observation::CiFailed(checks) => {
                 let reporter = request.account.resolve()?;
                 let log = blame(

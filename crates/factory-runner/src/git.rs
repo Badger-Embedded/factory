@@ -187,6 +187,10 @@ impl Git {
                 .run(work, &["rev-parse", &base_ref], None)
                 .await
                 .map(|out| out.trim().to_owned());
+            let head_tip = self
+                .run(work, &["rev-parse", &tracking], None)
+                .await
+                .map(|out| out.trim().to_owned());
             let head_seen = self
                 .run(
                     work,
@@ -195,7 +199,9 @@ impl Git {
                 )
                 .await
                 .is_ok();
-            if current.trim() == branch && head_seen && merging.is_ok() && merging == base_tip {
+            let base_merge = head_seen && merging == base_tip;
+            let head_merge = merging == head_tip;
+            if current.trim() == branch && merging.is_ok() && (base_merge || head_merge) {
                 return Ok(());
             }
             self.run(work, &["merge", "--abort"], None).await?;
@@ -240,8 +246,34 @@ impl Git {
     ///
     /// Returns git's message when the merge fails for another reason.
     pub async fn merge_base(&self, work: &Path, base: &str) -> Result<bool, String> {
-        let target = format!("origin/{base}");
-        match self.run(work, &["merge", "--no-edit", &target], None).await {
+        self.merge_leaving_conflicts(work, &format!("origin/{base}"))
+            .await
+    }
+
+    /// Fetches the pull request's head again and merges it into the
+    /// checked-out branch with a merge commit, for a push the remote refused
+    /// because someone pushed first. On a conflict the merge stays unfinished
+    /// in the checkout, for the agent to resolve, and `Ok(false)` comes back.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when the fetch fails or the merge fails for
+    /// another reason.
+    pub async fn merge_pr_head(
+        &self,
+        work: &Path,
+        remote_source: &RemoteSource<'_>,
+        head_ref: &str,
+        number: u64,
+    ) -> Result<bool, String> {
+        let tracking = format!("refs/factory/pr-{number}/head");
+        let remote = remote_source()?;
+        self.fetch_ref(work, &remote, head_ref, &tracking).await?;
+        self.merge_leaving_conflicts(work, &tracking).await
+    }
+
+    async fn merge_leaving_conflicts(&self, work: &Path, target: &str) -> Result<bool, String> {
+        match self.run(work, &["merge", "--no-edit", target], None).await {
             Ok(_) => Ok(true),
             Err(err) => {
                 let conflicted = self

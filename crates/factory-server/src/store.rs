@@ -1354,7 +1354,7 @@ impl Store {
             if reads_only {
                 return Ok(());
             }
-            match Self::holder(tx, project, number)? {
+            match Self::holder(tx, project, number, None)? {
                 Some(job) => Err(StoreError::PrHeld { number, job }),
                 None => Ok(()),
             }
@@ -1371,10 +1371,15 @@ impl Store {
     ///
     /// Fails on a database error or a stored job that does not parse.
     pub fn holding_job(&self, project: &str, number: u64) -> Result<Option<i64>, StoreError> {
-        Self::holder(&self.conn(), project, number)
+        Self::holder(&self.conn(), project, number, None)
     }
 
-    fn holder(conn: &Connection, project: &str, number: u64) -> Result<Option<i64>, StoreError> {
+    fn holder(
+        conn: &Connection,
+        project: &str,
+        number: u64,
+        except: Option<i64>,
+    ) -> Result<Option<i64>, StoreError> {
         let mut stmt = conn.prepare(
             "SELECT id, project, requested_by, created_at, job FROM jobs
              WHERE project = ?1 ORDER BY id",
@@ -1382,7 +1387,7 @@ impl Store {
         let rows = stmt.query_map([project], raw_row)?;
         for row in rows {
             let row = parse_row(row?)?;
-            if row.job.is_finished() {
+            if row.job.is_finished() || except == Some(row.id) {
                 continue;
             }
             let job = &row.job;
@@ -1396,6 +1401,32 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// Fails with [`StoreError::PrHeld`] when job `row` would claim a pull
+    /// request that another live job holds. A retry brings a finished job back
+    /// to life, so it takes the claim again.
+    fn check_claims(tx: &Transaction<'_>, row: &JobRow) -> Result<(), StoreError> {
+        let job = &row.job;
+        let picked = job
+            .picked_pr()
+            .filter(|picked| !matches!(picked.mode, PrMode::QuickReview { .. }))
+            .map(|picked| picked.number);
+        let numbers = job
+            .renovate_pr()
+            .map(|pr| pr.number)
+            .into_iter()
+            .chain(job.plan().iter().filter_map(|pr| pr.number))
+            .chain(picked);
+        for number in numbers {
+            if let Some(holder) = Self::holder(tx, &row.project, number, Some(row.id))? {
+                return Err(StoreError::PrHeld {
+                    number,
+                    job: holder,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn insert_after(
@@ -1461,6 +1492,11 @@ impl Store {
             .optional()?
             .is_some();
         if known {
+            return Ok(None);
+        }
+        // A picked pull request job holds the pull request, so discovery
+        // leaves it and looks again once that job is done.
+        if Self::holder(&tx, project, u64::try_from(number).unwrap_or(0), None)?.is_some() {
             return Ok(None);
         }
         let id = Self::insert_job(&tx, project, FACTORY_REQUESTER, &new)?;
@@ -2071,6 +2107,9 @@ impl Store {
     /// these.
     fn apply_in(tx: &Transaction<'_>, row: &mut JobRow, event: Event) -> Result<(), StoreError> {
         let was_merged = *row.job.stage() == Stage::Merged;
+        if matches!(event, Event::Retry) {
+            Self::check_claims(tx, row)?;
+        }
         let name = event.name();
         let detail = match &event {
             Event::AgentFailed { reason }
