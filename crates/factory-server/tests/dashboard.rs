@@ -4863,15 +4863,16 @@ async fn the_picker_escapes_group_names_and_its_fragment_lists_the_sections() {
     assert_eq!(fragment.status, StatusCode::OK);
     assert!(fragment.body.contains("picker-section"));
     assert!(fragment.body.contains("&lt;b&gt;Home&lt;/b&gt;"));
-    assert_ne!(poll_url(&before), poll_url(&fragment.body));
+    assert_ne!(picker_poll_url(&before), picker_poll_url(&fragment.body));
 }
 
-/// The `hx-get` URL of the picker list in `body`.
-fn poll_url(body: &str) -> Option<String> {
-    body.split("hx-get=\"")
-        .nth(1)
-        .and_then(|rest| rest.split('"').next())
-        .map(|url| url.replace("&amp;", "&"))
+fn picker_poll_url(body: &str) -> Option<String> {
+    let doc = scraper::Html::parse_fragment(body);
+    let list = doc
+        .select(&scraper::Selector::parse("#picker-list").unwrap())
+        .next()?;
+    let url = list.value().attr("hx-get")?;
+    Some(url.to_owned())
 }
 
 #[tokio::test]
@@ -4883,7 +4884,8 @@ async fn renaming_a_populated_group_invalidates_a_grouped_poll() {
     store
         .set_project_groups(USER, &[("a-idle".into(), Some(home))])
         .unwrap();
-    let url = poll_url(&dashboard.get("/fragments/picker?project=a-idle").await.body).unwrap();
+    let url =
+        picker_poll_url(&dashboard.get("/fragments/picker?project=a-idle").await.body).unwrap();
     assert_eq!(dashboard.get(&url).await.status, StatusCode::NO_CONTENT);
 
     let csrf = form_token(&dashboard.get("/settings/groups").await.body);
