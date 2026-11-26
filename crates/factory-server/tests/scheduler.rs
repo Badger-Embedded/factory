@@ -9362,3 +9362,77 @@ async fn fixing_a_quick_review_loops_never_merges_and_stops_at_the_round_cap() {
             .all(|publish| publish.existing.as_ref().unwrap().head_branch == "carol/reboot")
     );
 }
+
+async fn stacked_publish(fork: bool) -> (i64, Arc<FakeExecutor>, Arc<Store>) {
+    let (store, executor, scheduler) = review_setup();
+    store.save_project_settings("maestro", true, false).unwrap();
+    let mut pick = picked(12);
+    pick.fork = fork;
+    let id = quick_reviewed(&store, &executor, &scheduler, false, pick).await;
+    store
+        .apply(
+            id,
+            Event::FixElsewhere {
+                instructions: "Keep it small.".into(),
+            },
+        )
+        .unwrap();
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Ok(Published::Open(77)));
+    executor.release(1);
+    step(&scheduler).await; // fix
+    step(&scheduler).await; // checks
+    step(&scheduler).await; // publish
+    (id, executor, store)
+}
+
+#[tokio::test]
+async fn fixing_elsewhere_stacks_a_pull_request_on_the_reviewed_branch() {
+    let (id, executor, store) = stacked_publish(false).await;
+
+    let requests = executor.requests();
+    assert!(requests[1].prompt.contains("Keep it small."));
+    assert!(
+        requests[1]
+            .prompt
+            .contains("starts at the head of pull request #12")
+    );
+    assert_eq!(requests[1].base, "carol/reboot");
+    assert_eq!(
+        requests[1].branch.as_deref(),
+        Some(format!("factory/job-{id}-pr-1").as_str())
+    );
+    assert_eq!(requests[1].existing.as_ref().unwrap().number, 12);
+    assert!(!requests[1].merge_base);
+
+    let published = executor.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 1);
+    assert!(published[0].existing.is_none());
+    assert_eq!(published[0].base, "carol/reboot");
+    assert_eq!(published[0].branch, format!("factory/job-{id}-pr-1"));
+    assert!(
+        published[0]
+            .description
+            .body
+            .ends_with("Fixes review of https://github.com/Badger-Embedded/maestro/pull/12"),
+        "{}",
+        published[0].description.body
+    );
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.plan()[0].number, Some(77));
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert!(!job.may_merge());
+}
+
+#[tokio::test]
+async fn fixing_elsewhere_on_a_fork_targets_the_reviewed_base_branch() {
+    let (_, executor, _) = stacked_publish(true).await;
+
+    assert_eq!(executor.requests()[1].base, "develop");
+    let published = executor.published.lock().unwrap().clone();
+    assert!(published[0].existing.is_none());
+    assert_eq!(published[0].base, "develop");
+}

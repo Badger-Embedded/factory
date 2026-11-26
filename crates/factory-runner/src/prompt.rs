@@ -614,7 +614,20 @@ fn job_body(job: &Job, task: &Task, expect: Expect, agent: PromptTarget) -> Stri
     if let Task::Review = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
     }
-    let body = prompt_for(task, expect, agent, job.picked_pr().is_some());
+    let mut body = prompt_for(
+        task,
+        expect,
+        agent,
+        job.picked_pr().is_some() && job.stacked_on().is_none(),
+    );
+    if let (Some(reviewed), Task::AddressReview { .. }) = (job.stacked_on(), task) {
+        body = format!(
+            "This branch starts at the head of pull request #{} ({}). Your commits go in a \
+             new pull request that fixes it, so write the title and description you return \
+             for the fixes, not for the whole reviewed pull request.\n\n{body}",
+            reviewed.number, reviewed.title
+        );
+    }
     if !job.fresh_sessions() {
         return body;
     }

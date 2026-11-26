@@ -8,7 +8,7 @@
 //! e2e_fixture job --db P --project N --stage STAGE [--request TEXT]
 //! e2e_fixture renovate --db P --project N --number NUMBER --url URL
 //! e2e_fixture picked --db P --project N --number NUMBER --url URL
-//! e2e_fixture reviewed --db P --project N --number NUMBER --url URL [--fork true] [--comment off|posted|failed]
+//! e2e_fixture reviewed --db P --project N --number NUMBER --url URL [--fork true] [--comment off|posted|failed] [--stacked NUMBER]
 //! e2e_fixture apply --db P --job ID --event start|approve|cancel|questions
 //! e2e_fixture cost --db P --job ID --usd AMOUNT [--local-cli claude-code|codex|copilot]
 //! e2e_fixture log --db P --job ID --text TEXT [--count N]
@@ -244,7 +244,8 @@ fn picked(store: &Store, project: &str, number: u64, url: &str) -> Result<i64> {
 }
 
 /// A quick review of pull request `number` that waits in Needs you with the
-/// score 4. `comment` is `off`, `posted` or `failed`.
+/// score 4. `comment` is `off`, `posted` or `failed`. With `stacked`, the
+/// job then fixes it in another branch and opens pull request `stacked`.
 fn reviewed(
     store: &Store,
     project: &str,
@@ -252,6 +253,7 @@ fn reviewed(
     url: &str,
     fork: bool,
     comment: &str,
+    stacked: Option<u64>,
 ) -> Result<i64> {
     let picked = factory_core::PickedPr {
         number,
@@ -289,6 +291,18 @@ fn reviewed(
             )?;
         }
         other => return Err(format!("unknown --comment {other}").into()),
+    }
+    if let Some(number) = stacked {
+        for event in [
+            Event::FixElsewhere {
+                instructions: String::new(),
+            },
+            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::ChecksPassed,
+            Event::Published { number },
+        ] {
+            store.apply(id, event)?;
+        }
     }
     Ok(id)
 }
@@ -492,6 +506,7 @@ fn main() -> Result<()> {
                 one("url")?,
                 flags.get("fork").is_some_and(|v| v[0] == "true"),
                 flags.get("comment").map_or("off", |v| v[0].as_str()),
+                flags.get("stacked").map(|v| v[0].parse()).transpose()?,
             )?
         ),
         "apply" => apply(&store, &flags)?,

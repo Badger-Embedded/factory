@@ -780,6 +780,35 @@ test('the quick review card offers no fix in place for a fork pull request or on
   await expect(status(page).getByRole('link', { name: `#${holder}` })).toHaveAttribute('href', `/jobs/${holder}`);
 });
 
+test('Fix in another branch is offered for a fork pull request and starts the fix', async ({ page, factory, project }) => {
+  const url = `https://github.com/e2e/${project}/pull/12`;
+  const id = factory.fixture('reviewed', '--project', project, '--number', '12', '--url', url, '--fork', 'true');
+  await page.goto(`/jobs/${id}`);
+
+  const card = status(page).locator('.card.quick-review');
+  await expect(card.getByRole('button', { name: 'Fix in this pull request' })).toHaveCount(0);
+  await card.getByLabel('What should the agent do?').fill('Keep it small');
+  await card.getByRole('button', { name: 'Fix in another branch' }).click();
+  await expect(status(page).locator('.card.quick-review')).toHaveCount(0);
+  await expect(status(page)).toContainText('The agent is addressing review comments');
+});
+
+test('a fix in another branch links the reviewed and the stacked pull request in new tabs', async ({ page, factory, project }) => {
+  const url = `https://github.com/e2e/${project}/pull/12`;
+  const id = factory.fixture('reviewed', '--project', project, '--number', '12', '--url', url, '--stacked', '77');
+  await page.goto(`/jobs/${id}`);
+
+  const reviewed = page.locator('.picked-pr');
+  await expect(reviewed).toHaveAttribute('href', url);
+  await expect(reviewed).toHaveAttribute('target', '_blank');
+  await expect(reviewed).toHaveAttribute('rel', 'noopener noreferrer');
+  const stacked = page.locator('.stacked-pr');
+  await expect(stacked).toHaveText('#77');
+  await expect(stacked).toHaveAttribute('href', `https://github.com/e2e/${project}/pull/77`);
+  await expect(stacked).toHaveAttribute('target', '_blank');
+  await expect(stacked).toHaveAttribute('rel', 'noopener noreferrer');
+});
+
 test('Cancel on a quick review ends the job', async ({ page, factory, project }) => {
   const url = `https://github.com/e2e/${project}/pull/12`;
   const id = factory.fixture('reviewed', '--project', project, '--number', '12', '--url', url);

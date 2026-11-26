@@ -4286,6 +4286,101 @@ fn the_review_loop_after_a_quick_review_stops_at_the_round_cap() {
     ));
 }
 
+fn fix_elsewhere(instructions: &str) -> Event {
+    Event::FixElsewhere {
+        instructions: instructions.into(),
+    }
+}
+
+#[test]
+fn fixing_elsewhere_opens_a_new_pull_request_and_never_merges_it() {
+    let mut job = quick(false);
+    quick_reviewed(&mut job);
+    apply(&mut job, fix_elsewhere("Leave the docs alone."));
+    assert_eq!(job.stage(), &Stage::Implementing { pr: 0 });
+    assert_eq!(
+        job.turn(),
+        &Turn::Agent(Task::AddressReview {
+            comments: "Looks fine.\n\nLeave the docs alone.".into()
+        })
+    );
+    assert_eq!(job.plan()[0].number, None);
+    assert_eq!(job.stacked_on().map(|picked| picked.number), Some(42));
+
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
+    apply(&mut job, Event::Published { number: 77 });
+    assert_eq!(job.plan()[0].number, Some(77));
+    apply(&mut job, Event::StartReview { head: "def".into() });
+    apply(&mut job, Event::ReviewApproved);
+    apply(&mut job, Event::MergeLeftToUser);
+    assert_eq!(job.turn(), &Turn::User(Ask::MergeLeftToUser));
+    assert!(!job.may_merge());
+
+    apply(&mut job, Event::Merged);
+    assert_eq!(job.stage(), &Stage::Merged);
+}
+
+#[test]
+fn closing_the_stacked_pull_request_fails_the_job() {
+    let mut job = quick(false);
+    quick_reviewed(&mut job);
+    apply(&mut job, fix_elsewhere(""));
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 77 });
+    apply(&mut job, Event::ClosedUnmerged);
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+}
+
+#[test]
+fn fixing_elsewhere_works_for_a_fork_and_waits_for_the_comment() {
+    let mut fork = review_job(PrMode::QuickReview { comment: false }, true);
+    quick_reviewed(&mut fork);
+    apply(&mut fork, fix_elsewhere(""));
+    assert_eq!(fork.stage(), &Stage::Implementing { pr: 0 });
+
+    let mut commenting = quick(true);
+    quick_reviewed(&mut commenting);
+    assert!(commenting.apply(fix_elsewhere("")).is_err());
+    assert!(quick(false).apply(fix_elsewhere("")).is_err());
+}
+
+#[test]
+fn the_publish_gate_stops_the_first_push_of_a_stacked_pull_request() {
+    let mut pick = picked();
+    pick.mode = PrMode::QuickReview { comment: false };
+    let mut gated = Job::pull_request(
+        "",
+        Gates {
+            publish: true,
+            ..Gates::default()
+        },
+        pick,
+    );
+    apply(&mut gated, Event::Start);
+    quick_reviewed(&mut gated);
+    apply(&mut gated, fix_elsewhere(""));
+    apply(&mut gated, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut gated, Event::ChecksPassed);
+    assert_eq!(
+        gated.turn(),
+        &Turn::User(Ask::PublishApproval { summary: None })
+    );
+}
+
+#[test]
+fn a_stacked_branch_with_no_commits_fails_the_job() {
+    let mut job = quick(false);
+    quick_reviewed(&mut job);
+    apply(&mut job, fix_elsewhere(""));
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::NothingToPublish);
+    assert!(matches!(job.stage(), Stage::Failed { .. }));
+}
+
 #[test]
 fn review_and_fix_approving_on_the_first_pass_pushes_nothing() {
     let mut job = review_job(PrMode::ReviewAndFix, false);

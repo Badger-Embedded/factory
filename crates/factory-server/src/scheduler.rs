@@ -64,6 +64,9 @@ struct JobRefs {
     base: String,
     /// The number of the picked pull request the checkout starts from.
     picked: Option<u64>,
+    /// The job opens its own pull request, stacked on the picked one. Its
+    /// checkout starts at the picked head, but the publish is a normal one.
+    stacked: bool,
 }
 
 impl JobRefs {
@@ -80,17 +83,32 @@ impl JobRefs {
 fn job_refs(job_id: i64, job: &Job, project: &Project, pr: usize) -> JobRefs {
     let branch = branch_name(job_id, pr);
     match job.picked_pr() {
+        Some(picked) if job.stacked_on().is_some() => JobRefs {
+            remote_branch: branch.clone(),
+            branch,
+            // A fork's branch is not ours to target, so its stack goes to the
+            // base branch and carries the fork's commits.
+            base: if picked.fork {
+                picked.base_branch.clone()
+            } else {
+                picked.head_branch.clone()
+            },
+            picked: Some(picked.number),
+            stacked: true,
+        },
         Some(picked) => JobRefs {
             branch,
             remote_branch: picked.head_branch.clone(),
             base: picked.base_branch.clone(),
             picked: Some(picked.number),
+            stacked: false,
         },
         None => JobRefs {
             remote_branch: branch.clone(),
             branch,
             base: project.base.clone(),
             picked: None,
+            stacked: false,
         },
     }
 }
@@ -1619,7 +1637,9 @@ impl<E: Executor> Scheduler<E> {
             existing: matches!(session, Session::Pr(_) | Session::Review(_))
                 .then(|| refs.existing(&resolved.forge))
                 .flatten(),
-            merge_base: refs.picked.is_some() && matches!(task, factory_core::Task::Rebase { .. }),
+            merge_base: refs.picked.is_some()
+                && !refs.stacked
+                && matches!(task, factory_core::Task::Rebase { .. }),
             keep_checkout: refs.picked.is_some()
                 && (matches!(task, factory_core::Task::FixChecks { report } if report.starts_with(factory_core::CHECKOUT_REPAIR))
                     || matches!(task, factory_core::Task::Answer { .. })
@@ -1991,9 +2011,20 @@ impl<E: Executor> Scheduler<E> {
         settings: &Settings,
     ) -> Result<(), StoreError> {
         let refs = job_refs(job_id, job, project, pr);
-        let existing = refs.existing(&resolved.forge);
+        let existing = (!refs.stacked)
+            .then(|| refs.existing(&resolved.forge))
+            .flatten();
         let description = match (job.plan()[pr].description.clone(), &existing) {
-            (Some(description), _) => description,
+            (Some(mut description), _) => {
+                if let Some(reviewed) = job.stacked_on() {
+                    description.body = format!(
+                        "{}\n\nFixes review of {}",
+                        description.body.trim_end(),
+                        reviewed.url
+                    );
+                }
+                description
+            }
             (None, Some(_)) => PrDescription {
                 title: job.plan()[pr].title.clone(),
                 body: job.plan()[pr].summary.clone(),
