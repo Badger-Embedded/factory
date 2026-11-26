@@ -12,7 +12,7 @@ mod usage;
 
 pub use agent::{Agent, Cli, DEFAULT_AGENT, UnknownAgent};
 pub use job::{
-    AgentResult, Answered, Ask, BranchSummary, CHECKOUT_REPAIR, Command, CommentKind,
+    AgentResult, Answered, Ask, BranchSummary, CHECKOUT_REPAIR, Command, CommentKind, CommentState,
     DELETED_PREREQUISITE, DiffVerdict, Event, ExistingGap, FileText, FixLink, FixOutcome, FixState,
     Gap, Gates, Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PackagingContext, PickedPr,
     PlannedPr, PrDescription, PrDiff, PrMode, PrerequisiteState, Question, RebaseState, Rejected,

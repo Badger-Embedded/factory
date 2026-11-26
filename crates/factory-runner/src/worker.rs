@@ -261,6 +261,9 @@ pub struct RunReport {
     /// the executor turns into an estimated cost. `None` for a run that reports
     /// a dollar cost instead, such as Claude's.
     pub token_usage: Option<TokenUsage>,
+    /// The commit the checkout was at when a review run of a picked pull
+    /// request started, which the executor sets and the worker leaves `None`.
+    pub head: Option<String>,
 }
 
 /// An active MCP server that was not `connected` in the run's `init` line: its
@@ -363,6 +366,7 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
 /// Codex's thread id, to `session` as it arrives, and returns the event for the
 /// job. Every failure, including podman failing to start, becomes
 /// [`Event::AgentFailed`].
+#[allow(clippy::too_many_lines, reason = "one run from start to report")]
 pub async fn run(
     config: &WorkerConfig,
     run: &WorkerRun,
@@ -381,6 +385,7 @@ pub async fn run(
         mcp_unavailable: Vec::new(),
         credential: None,
         token_usage: None,
+        head: None,
     };
     let Some(backend) = run.cli().and_then(backend_for) else {
         return failed(format!(
@@ -643,6 +648,7 @@ impl Collected {
                 mcp_unavailable: self.mcp_unavailable,
                 credential,
                 token_usage: self.token_usage,
+                head: None,
             };
         }
         let event = self.failure.unwrap_or_else(|| {
@@ -662,6 +668,7 @@ impl Collected {
             mcp_unavailable: self.mcp_unavailable,
             credential,
             token_usage: self.token_usage,
+            head: None,
         }
     }
 }

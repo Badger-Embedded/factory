@@ -18737,3 +18737,74 @@ fn retrying_a_failed_job_whose_pull_request_was_taken_is_refused() {
     store.apply(first, Event::Retry).unwrap();
     assert!(!store.get(first).unwrap().job.is_finished());
 }
+
+#[test]
+fn a_quick_review_holds_nothing_until_it_fixes_and_retries_while_another_job_holds() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            "maestro",
+            &ForgeKind::GitHub,
+            "Badger-Embedded/maestro",
+            "main",
+            None,
+            Some("alice"),
+        )
+        .unwrap();
+    let mut pick = picked_number(7);
+    pick.mode = factory_core::PrMode::QuickReview { comment: false };
+    let review = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(review, Event::Start).unwrap();
+    assert_eq!(store.holding_job("maestro", 7).unwrap(), None);
+
+    let holder = store
+        .create_pull_request_job("maestro", "alice", "fix it", &[], picked_number(7))
+        .unwrap();
+    store
+        .apply(
+            review,
+            Event::ReviewFailed {
+                reason: "timed out".into(),
+            },
+        )
+        .unwrap();
+    store.apply(review, Event::Retry).unwrap();
+    store
+        .apply(
+            review,
+            Event::QuickReviewed {
+                score: 3,
+                review: "ok".into(),
+                head: "abc".into(),
+            },
+        )
+        .unwrap();
+
+    let error = store
+        .apply(
+            review,
+            Event::FixHere {
+                instructions: String::new(),
+                held: false,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(&format!("job #{holder}")),
+        "{error}"
+    );
+
+    store.apply(holder, Event::Cancel).unwrap();
+    store
+        .apply(
+            review,
+            Event::FixHere {
+                instructions: String::new(),
+                held: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(store.holding_job("maestro", 7).unwrap(), Some(review));
+}

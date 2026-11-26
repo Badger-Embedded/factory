@@ -2163,7 +2163,18 @@ impl<E: Executor> Scheduler<E> {
                 .record(job_id, &unavailable.server, &unavailable.reason);
         }
         self.record_run_cost(job_id, &cost_session, agent, model.as_deref(), &report);
-        self.apply(job_id, report.event);
+        match report.head {
+            Some(head)
+                if matches!(
+                    report.event,
+                    Event::ReviewApproved | Event::ReviewChanges { .. }
+                ) =>
+            {
+                let result = self.store.apply_review(job_id, head, report.event);
+                self.report(job_id, result.map(|_| ()));
+            }
+            _ => self.apply(job_id, report.event),
+        }
     }
 
     /// Writes the notices that precede a run's own output, the Local run line

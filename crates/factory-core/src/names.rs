@@ -54,6 +54,7 @@ impl Task {
             Task::Rebase { .. } => "rebase",
             Task::MergeHead => "merge-head",
             Task::Review => "review",
+            Task::QuickReview => "quick-review",
             Task::AnalyzeFailure { .. } => "analyze-failure",
             Task::CheckDiff { .. } => "check-diff",
             Task::FindGaps { .. } => "find-gaps",
@@ -73,6 +74,7 @@ impl Ask {
             Ask::Renovate { .. } => "renovate",
             Ask::Proposal => "proposal",
             Ask::MergeLeftToUser => "merge-left-to-user",
+            Ask::QuickReview { .. } => "quick-review",
         }
     }
 }
@@ -127,11 +129,15 @@ impl Event {
             Event::Conflicted { .. } => "conflicted",
             Event::ReviewComments { .. } => "review-comments",
             Event::StartReview { .. } => "start-review",
+            Event::ReviewRead { .. } => "review-read",
             Event::ReviewApproved => "review-approved",
             Event::ReviewChanges { .. } => "review-changes",
             Event::ReviewFailed { .. } => "review-failed",
             Event::RenovateObserved { .. } => "renovate-observed",
             Event::Commented => "commented",
+            Event::CommentFailed { .. } => "comment-failed",
+            Event::QuickReviewed { .. } => "quick-reviewed",
+            Event::FixHere { .. } => "fix-here",
             Event::Merged => "merged",
             Event::MergeLeftToUser => "merge-left-to-user",
             Event::RenovateMerged { .. } => "renovate-merged",

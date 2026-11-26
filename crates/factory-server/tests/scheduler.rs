@@ -103,6 +103,9 @@ struct FakeExecutor {
     local_store: Mutex<Option<Arc<Store>>>,
     /// How many next Local runs fail before the worker starts.
     prestart_failures: Mutex<usize>,
+    /// The commit each review run of a picked pull request reports as its
+    /// checkout, as the podman executor does.
+    checkout_head: Mutex<Option<String>>,
 }
 
 /// The state the fake reports for the Renovate pull request.
@@ -118,6 +121,7 @@ impl FakeExecutor {
     fn new(respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(FakeExecutor {
             gate: Semaphore::new(0),
+            checkout_head: Mutex::new(None),
             respond: Box::new(respond),
             requests: Mutex::new(Vec::new()),
             costs: Mutex::new(VecDeque::new()),
@@ -228,6 +232,7 @@ impl Executor for FakeExecutor {
                     mcp_unavailable: Vec::new(),
                     credential: None,
                     token_usage: None,
+                    head: None,
                 };
             }
             if let Some(store) = self.local_store.lock().unwrap().as_ref() {
@@ -269,6 +274,7 @@ impl Executor for FakeExecutor {
                 .unwrap_or_default(),
             credential: None,
             token_usage,
+            head: self.checkout_head.lock().unwrap().clone(),
         }
     }
 
@@ -8686,6 +8692,55 @@ async fn picked_to_published(
     step(scheduler).await; // checks
     step(scheduler).await; // publish
     id
+}
+
+#[tokio::test]
+async fn a_review_and_fix_first_pass_records_the_checkout_head_with_its_verdict() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewChanges {
+            feedback: "Handle the error.".into(),
+        },
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&store);
+    *executor.checkout_head.lock().unwrap() = Some("h1".into());
+    let mut pick = picked(12);
+    pick.mode = factory_core::PrMode::ReviewAndFix;
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await;
+
+    let reviews = store.get(id).unwrap().job.reviews().to_vec();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].head.as_deref(), Some("h1"));
+
+    // The fix leaves the head as the reviewer read it, so the loop stops.
+    executor.release(1);
+    step(&scheduler).await; // fix
+    step(&scheduler).await; // checks
+    step(&scheduler).await; // publish
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::StartReview { head: "h1".into() }),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+    step(&scheduler).await; // watch
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::ReviewStopped {
+            stop: factory_core::ReviewStop::Unchanged,
+            ..
+        })
+    ));
+    let reviewers = executor
+        .requests()
+        .iter()
+        .filter(|request| request.expect == Expect::Review)
+        .count();
+    assert_eq!(reviewers, 1);
 }
 
 #[tokio::test]

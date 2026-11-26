@@ -68,6 +68,10 @@ fn rebase_prompt(base: &str, picked: bool) -> String {
 /// [`prompt`], for a job on a picked pull request when `picked` is set. The
 /// branch then holds commits the factory did not write and the pull request
 /// is not the factory's to retitle, so the prompt says to keep both.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match arm per task, as in `job_body`"
+)]
 fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) -> String {
     let mut text = match task {
         Task::Clarify { request } => format!(
@@ -152,7 +156,9 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
             "The reviewer left comments on the pull request:\n\n{comments}\n\n\
              Address them and commit."
         ),
-        Task::Review => return review_prompt(&ReviewContext::default(), agent),
+        Task::Review | Task::QuickReview => {
+            return review_prompt(&ReviewContext::default(), agent);
+        }
         Task::AnalyzeFailure { log } => {
             return failure_prompt(log, agent);
         }
@@ -484,7 +490,7 @@ pub fn job_prompt(
 }
 
 fn job_body(job: &Job, task: &Task, expect: Expect, agent: PromptTarget) -> String {
-    if let Task::Review = task {
+    if let Task::Review | Task::QuickReview = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
     }
     let body = prompt_for(task, expect, agent, job.picked_pr().is_some());
