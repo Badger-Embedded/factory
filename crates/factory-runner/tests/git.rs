@@ -831,6 +831,39 @@ async fn a_foreign_commit_is_never_overwritten() {
 }
 
 #[tokio::test]
+async fn a_rewritten_branch_never_drops_the_reviewed_commit_from_the_remote() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "fix", "agent fix");
+    let push = || async {
+        git_.push_fast_forward(
+            &work,
+            &|| Ok(remote.remote()),
+            "pr-branch",
+            "pr-branch",
+            &|| {},
+        )
+        .await
+    };
+    push().await.unwrap();
+
+    git(&work, &["reset", "-q", "--hard", "HEAD~2"]);
+    commit(&work, "again", "rewritten fix");
+    let rejected = push().await.unwrap_err();
+    assert!(
+        matches!(rejected, factory_runner::PushError::Rejected(_)),
+        "{rejected}"
+    );
+    assert_eq!(
+        remote.remote_log("pr-branch"),
+        "agent fix\npr commit\nfirst"
+    );
+}
+
+#[tokio::test]
 async fn a_base_merge_makes_a_merge_commit_and_the_summary_uses_the_pr_base() {
     let remote = Fixture::new();
     let upstream = remote.upstream();

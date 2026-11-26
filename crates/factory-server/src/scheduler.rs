@@ -294,6 +294,9 @@ pub struct PublishRequest {
     /// Whether the project runs checks before a push. A picked pull request
     /// job then never pushes a merge commit that the checks have not run on.
     pub checks: bool,
+    /// Push the job's own branch fast-forward only, so a commit that is not
+    /// the job's, like a fork author's, is never dropped from it.
+    pub keep_history: bool,
     /// Told the account of each push right after it succeeds, before the pull
     /// request is opened.
     pub pushed: PushLog,
@@ -2046,6 +2049,7 @@ impl<E: Executor> Scheduler<E> {
             existing,
             description,
             checks: project.checks.is_some(),
+            keep_history: job.stacked_on().is_some_and(|picked| picked.fork),
             pushed: PushLog::new({
                 let scheduler = Arc::clone(self);
                 let (branch, repo) = (refs.remote_branch, project.repo.clone());

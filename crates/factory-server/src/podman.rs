@@ -824,10 +824,28 @@ impl Executor for PodmanExecutor {
                 ));
             }
         };
-        let result = self
-            .git
-            .push(&workspace, &remote, &request.branch, &record)
-            .await;
+        let result = if request.keep_history {
+            self.git
+                .push_fast_forward(
+                    &workspace,
+                    &remote,
+                    &request.branch,
+                    &request.branch,
+                    &record,
+                )
+                .await
+                .map_err(|err| match err {
+                    PushError::Rejected(message) => format!(
+                        "the push would drop a commit of the fork's pull request or of someone \
+                         else: {message}"
+                    ),
+                    PushError::Failed(message) => message,
+                })
+        } else {
+            self.git
+                .push(&workspace, &remote, &request.branch, &record)
+                .await
+        };
         let owner = pusher
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
