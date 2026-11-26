@@ -396,15 +396,35 @@ struct PickedContext<'a> {
 
 impl<'a> ReviewContext<'a> {
     fn for_job(job: &'a Job) -> Self {
-        let pr = job
-            .picked_pr()
-            .filter(|picked| !matches!(picked.mode, PrMode::Request))
-            .map(|picked| PickedContext {
-                title: &picked.title,
-                body: &picked.body,
-                base: &picked.base_branch,
+        let stack = job
+            .stacked_base()
+            .zip(job.plan().first())
+            .filter(|(_, planned)| planned.number.is_some());
+        let pr = match stack {
+            // Once the stack is open, the reviewer reads it, not the pull
+            // request it fixes.
+            Some((base, planned)) => Some(PickedContext {
+                title: planned
+                    .description
+                    .as_ref()
+                    .map_or(&planned.title, |description| &description.title),
+                body: planned
+                    .description
+                    .as_ref()
+                    .map_or(&planned.summary, |description| &description.body),
+                base,
                 focus: "",
-            });
+            }),
+            None => job
+                .picked_pr()
+                .filter(|picked| !matches!(picked.mode, PrMode::Request))
+                .map(|picked| PickedContext {
+                    title: &picked.title,
+                    body: &picked.body,
+                    base: &picked.base_branch,
+                    focus: "",
+                }),
+        };
         let mut context = Self::for_stage(job);
         if let Some(mut pr) = pr {
             if context.previous.is_none() && context.new_answers.is_empty() {
@@ -614,7 +634,27 @@ fn job_body(job: &Job, task: &Task, expect: Expect, agent: PromptTarget) -> Stri
     if let Task::Review = task {
         return review_prompt(&ReviewContext::for_job(job), agent);
     }
-    let body = prompt_for(task, expect, agent, job.picked_pr().is_some());
+    let mut body = prompt_for(
+        task,
+        expect,
+        agent,
+        job.picked_pr().is_some() && job.stacked_on().is_none(),
+    );
+    // A fork's stack carries the fork author's commits, so a conflict is
+    // merged, never rebased.
+    if let (Some(picked), Task::Rebase { base }) = (job.stacked_on(), task)
+        && picked.fork
+    {
+        body = rebase_prompt(base, true);
+    }
+    if let (Some(reviewed), Task::AddressReview { .. }) = (job.stacked_on(), task) {
+        body = format!(
+            "This branch starts at the head of pull request #{} ({}). Your commits go in a \
+             new pull request that fixes it, so write the title and description you return \
+             for the fixes, not for the whole reviewed pull request.\n\n{body}",
+            reviewed.number, reviewed.title
+        );
+    }
     if !job.fresh_sessions() {
         return body;
     }

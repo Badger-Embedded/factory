@@ -1049,6 +1049,7 @@ async fn clone_push_and_every_gh_call_use_the_token_of_the_account_the_request_n
                 body: "b".into(),
             },
             checks: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1131,6 +1132,7 @@ async fn a_token_that_changes_during_a_publish_applies_to_the_next_operation() {
                 body: "b".into(),
             },
             checks: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1191,6 +1193,7 @@ async fn a_push_is_logged_even_when_the_pull_request_step_has_no_account() {
                 body: "b".into(),
             },
             checks: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(move |account| {
                 log.lock().unwrap().push(account.to_owned());
             }),
@@ -1617,6 +1620,7 @@ async fn a_forgejo_request_clones_pushes_and_opens_with_the_token_of_its_account
                 body: "b".into(),
             },
             checks: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1779,6 +1783,7 @@ async fn publishing_to_a_picked_pull_request_pushes_its_branch_and_never_opens_o
                 body: "b".into(),
             },
             checks: false,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -1864,6 +1869,7 @@ async fn publish_with(tools: &Tools, checks: bool) -> factory_server::Published 
                 body: "b".into(),
             },
             checks,
+            keep_history: None,
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
@@ -2179,4 +2185,50 @@ async fn a_review_of_a_picked_pull_request_still_prepares_its_checkout() {
 
     assert!(tools.calls().contains("fetch"), "{}", tools.calls());
     assert!(!worker_started_with(&tools, "REVIEW-PROMPT"));
+}
+
+#[tokio::test]
+async fn a_fork_stack_that_lost_the_reviewed_commit_is_neither_pushed_nor_opened() {
+    let tools = Tools::new();
+    let calls = tools.dir.path().join("calls");
+    support::executable(
+        tools.dir.path(),
+        "git",
+        &format!(
+            "#!/bin/bash\necho \"git $*\" >> '{calls}'\n\
+             while [ \"$1\" = -c ]; do shift 2; done\n\
+             case \"$1\" in --git-dir=*) shift ;; esac\n\
+             case \"$1\" in\n\
+             log) echo 'abc1234 one' ;;\n\
+             merge-base) exit 1 ;;\n\
+             esac\n",
+            calls = calls.display()
+        ),
+    );
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
+    let result = podman
+        .publish(factory_server::PublishRequest {
+            job_id: 7,
+            forge: ForgeKind::GitHub,
+            account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+            repo: "o/r".into(),
+            base: "develop".into(),
+            branch: "factory/job-7-pr-1".into(),
+            existing: None,
+            description: factory_core::PrDescription {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            checks: false,
+            keep_history: Some("0123abc".into()),
+            pushed: factory_server::PushLog::new(|_| {}),
+        })
+        .await;
+
+    let err = result.unwrap_err();
+    assert!(err.contains("no longer holds the reviewed commit"), "{err}");
+    let calls = tools.calls();
+    assert!(!calls.contains(" push "), "{calls}");
+    assert!(!calls.contains("pr create"), "{calls}");
 }

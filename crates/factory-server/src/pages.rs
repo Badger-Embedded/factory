@@ -4925,7 +4925,19 @@ fn job_header(
             p.meta { (renovate_link(job, repo_url)) }
         }
         @if job.picked_pr().is_some() {
-            p.meta { (picked_link(job)) }
+            p.meta {
+                (picked_link(job))
+                @if job.stacked_on().is_some()
+                    && let Some(number) = job.plan().first().and_then(|pr| pr.number)
+                {
+                    " · fixed in "
+                    @if let Some(links) = repo_url {
+                        (external_link(&links.pr_url(number), html! { "#" (number) }, Some("stacked-pr"), None))
+                    } @else {
+                        span.stacked-pr { "#" (number) }
+                    }
+                }
+            }
         }
         @if let Some((source, number)) = job.fix_source() {
             p.meta {
@@ -5500,6 +5512,14 @@ fn quick_review_card(
                     @if !fork && links.held_by.is_none() {
                         button.primary { "Fix in this pull request" }
                     }
+                    button.fix-elsewhere formaction={ "/jobs/" (id) "/fix-elsewhere" } { "Fix in another branch" }
+                }
+                p.hint {
+                    @if fork {
+                        "Another branch holds the fork's commits plus the fixes in a new pull request against its base branch."
+                    } @else {
+                        "Another branch opens a new pull request stacked on this one, which its author can merge in."
+                    }
                 }
             }
             }
@@ -5899,7 +5919,9 @@ fn turn_detail(job: &Job, settings: &Settings, auto_merge: bool, wait: &Wait) ->
             Some(Command::RunChecks { .. }) => {
                 "The factory is running the project's checks.".into()
             }
-            Some(Command::Publish { pr }) if job.picked_pr().is_some() => {
+            Some(Command::Publish { pr })
+                if job.picked_pr().is_some() && job.stacked_on().is_none() =>
+            {
                 let number = job.plan()[pr].number.unwrap_or_default();
                 format!("The factory is pushing the commits to pull request #{number}.")
             }

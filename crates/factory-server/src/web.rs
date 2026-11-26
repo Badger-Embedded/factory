@@ -220,6 +220,7 @@ pub fn app_with_forgejo_probe(
         .route("/jobs/{id}/retry", post(retry))
         .route("/jobs/{id}/fix", post(start_fix))
         .route("/jobs/{id}/fix-here", post(fix_here))
+        .route("/jobs/{id}/fix-elsewhere", post(fix_elsewhere))
         .route("/jobs/{id}/dismiss", post(dismiss))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -1897,6 +1898,33 @@ async fn fix_here(
     state
         .store
         .append_factory_log(id, "Started fixing the pull request from the dashboard.")?;
+    board_redirect(&state, form.project, redirect)
+}
+
+/// Fixes a quick-reviewed pull request in a new branch that starts at its
+/// head, and opens a pull request for it. Unlike [`fix_here`] it allows a fork
+/// pull request and a held one, because it never pushes to the reviewed one.
+async fn fix_elsewhere(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<FixForm>,
+) -> Result<Redirect, AppError> {
+    let row = visible_job(&state, &headers, id)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    if row.job.picked_pr().is_none() {
+        return Err(AppError::BadRequest(
+            "this job has no picked pull request".into(),
+        ));
+    }
+    let event = Event::FixElsewhere {
+        instructions: form.instructions.trim().to_owned(),
+    };
+    let redirect = apply(&state, id, event)?;
+    state.store.append_factory_log(
+        id,
+        "Started fixing the pull request in another branch from the dashboard.",
+    )?;
     board_redirect(&state, form.project, redirect)
 }
 

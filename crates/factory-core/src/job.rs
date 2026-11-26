@@ -104,6 +104,14 @@ pub struct Job {
     /// makes the job a writer that holds the pull request.
     #[serde(default)]
     fixing: bool,
+    /// Whether the fix of a quick-reviewed pull request goes to a pull
+    /// request of its own, stacked on the picked one. See
+    /// [`Event::FixElsewhere`].
+    #[serde(default)]
+    stacked: bool,
+    /// The commit the quick review read, which a stacked job keeps.
+    #[serde(default)]
+    reviewed_head: Option<String>,
 }
 
 /// What a job works on.
@@ -1418,6 +1426,13 @@ pub enum Event {
         instructions: String,
         held: bool,
     },
+    /// Fix what the quick review found in a new branch that starts at the
+    /// picked pull request's head, and open a pull request for it. Unlike
+    /// [`Event::FixHere`] it is allowed for a fork or a held pull request,
+    /// because it never pushes to the picked pull request.
+    FixElsewhere {
+        instructions: String,
+    },
     Merged,
     /// A Renovate pull request merged. `packaging` says the project is a
     /// packaging project and `manifest_changed` that the pull request changed
@@ -1525,6 +1540,8 @@ impl Job {
             pushed: false,
             quick_reviewed: false,
             fixing: false,
+            stacked: false,
+            reviewed_head: None,
         }
     }
 
@@ -1656,6 +1673,33 @@ impl Job {
     pub fn forces_review(&self) -> bool {
         self.picked_pr()
             .is_some_and(|picked| picked.mode != PrMode::Request)
+    }
+
+    /// The picked pull request when the job opens its own pull request
+    /// stacked on it, or `None` for any other job.
+    #[must_use]
+    pub fn stacked_on(&self) -> Option<&PickedPr> {
+        self.picked_pr().filter(|_| self.stacked)
+    }
+
+    /// The commit the quick review read, for a stacked job.
+    #[must_use]
+    pub fn reviewed_head(&self) -> Option<&str> {
+        self.reviewed_head.as_deref()
+    }
+
+    /// The branch the stacked pull request targets: the reviewed pull
+    /// request's branch, or its base branch for a fork, whose branch is not
+    /// ours to target.
+    #[must_use]
+    pub fn stacked_base(&self) -> Option<&str> {
+        self.stacked_on().map(|picked| {
+            if picked.fork {
+                picked.base_branch.as_str()
+            } else {
+                picked.head_branch.as_str()
+            }
+        })
     }
 
     /// Whether the job only reads its picked pull request: a quick review the
@@ -2096,6 +2140,38 @@ impl Job {
             }
             (
                 S::CiAndReview { .. },
+                Turn::User(Ask::QuickReview {
+                    review,
+                    comment,
+                    head,
+                    ..
+                }),
+                E::FixElsewhere { instructions },
+            ) if *comment != CommentState::Pending => {
+                let comments = if instructions.trim().is_empty() {
+                    review.clone()
+                } else {
+                    format!("{review}\n\n{instructions}")
+                };
+                self.fixing = true;
+                self.stacked = true;
+                self.reviewed_head = Some(head.clone()).filter(|head| !head.is_empty());
+                let title = self.picked_pr().map(|picked| picked.title.clone());
+                self.plan = vec![PlannedPr {
+                    title: title.unwrap_or_default(),
+                    summary: comments.clone(),
+                    number: None,
+                    description: None,
+                    notes: None,
+                }];
+                self.review = ReviewState::Pending;
+                (
+                    S::Implementing { pr: 0 },
+                    Turn::Agent(Task::AddressReview { comments }),
+                )
+            }
+            (
+                S::CiAndReview { .. },
                 _,
                 event @ (E::StartReview { .. }
                 | E::ReviewRead { .. }
@@ -2210,9 +2286,10 @@ impl Job {
             }
 
             (S::PrOpen { pr }, Turn::Factory, E::Published { number })
-                if self
-                    .picked_pr()
-                    .is_none_or(|picked| picked.number == number) =>
+                if self.stacked
+                    || self
+                        .picked_pr()
+                        .is_none_or(|picked| picked.number == number) =>
             {
                 let pr = *pr;
                 self.plan[pr].number = Some(number);
@@ -2499,6 +2576,14 @@ impl Job {
 
     fn skip(&mut self, pr: usize) -> (Stage, Turn) {
         match self.plan[pr].number {
+            None if self.stacked => (
+                Self::failed(
+                    "the agent's branch has no commits after the base branch, so there is no \
+                     pull request to open",
+                    None,
+                ),
+                Turn::Done,
+            ),
             None => {
                 self.skipped.push(pr);
                 self.after(pr)

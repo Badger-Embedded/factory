@@ -138,6 +138,7 @@ impl Event {
             Event::CommentFailed { .. } => "comment-failed",
             Event::QuickReviewed { .. } => "quick-reviewed",
             Event::FixHere { .. } => "fix-here",
+            Event::FixElsewhere { .. } => "fix-elsewhere",
             Event::Merged => "merged",
             Event::MergeLeftToUser => "merge-left-to-user",
             Event::RenovateMerged { .. } => "renovate-merged",

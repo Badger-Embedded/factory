@@ -19065,3 +19065,85 @@ async fn the_quick_review_card_shows_the_error_of_a_failed_comment() {
     assert!(page.body.contains("forge said no"));
     assert!(page.body.contains("2/5"));
 }
+
+async fn post_fix_elsewhere(dashboard: &Dashboard, id: i64, instructions: &str) -> Reply {
+    let page = dashboard.get("/settings/groups").await;
+    let csrf = form_token(&page.body);
+    dashboard
+        .post(
+            &format!("/jobs/{id}/fix-elsewhere"),
+            &format!("instructions={instructions}&csrf={csrf}"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn fix_elsewhere_needs_a_csrf_token_and_a_picked_pull_request() {
+    let dashboard = picked_pr_dashboard();
+    let id = reviewed(&dashboard, "12").await;
+    let forged = dashboard
+        .post(
+            &format!("/jobs/{id}/fix-elsewhere"),
+            "instructions=x&csrf=forged",
+        )
+        .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+
+    post_picked(&dashboard, "plain request", "").await;
+    let plain = dashboard
+        .store
+        .list()
+        .unwrap()
+        .iter()
+        .map(|row| row.id)
+        .find(|&other| other != id)
+        .unwrap();
+    let reply = post_fix_elsewhere(&dashboard, plain, "").await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn fix_elsewhere_is_allowed_for_a_fork_and_a_held_pull_request() {
+    let dashboard = picked_pr_dashboard();
+    let fork = reviewed(&dashboard, "15").await;
+    let reply = post_fix_elsewhere(&dashboard, fork, "keep+it+small").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    assert!(matches!(
+        dashboard.store.get(fork).unwrap().job.turn(),
+        factory_core::Turn::Agent(factory_core::Task::AddressReview { comments })
+            if comments.contains("Needs tests.") && comments.contains("keep it small")
+    ));
+
+    let review = reviewed(&dashboard, "12").await;
+    post_picked(&dashboard, "one", "12").await;
+    let held = post_fix_elsewhere(&dashboard, review, "").await;
+    assert_eq!(held.status, StatusCode::SEE_OTHER, "{}", held.body);
+}
+
+#[tokio::test]
+async fn the_review_card_offers_fix_elsewhere_for_a_fork_and_the_job_page_links_both_pull_requests()
+{
+    let dashboard = picked_pr_dashboard();
+    let fork = reviewed(&dashboard, "15").await;
+    let page = dashboard.get(&format!("/jobs/{fork}")).await;
+    assert!(page.body.contains("Fix in another branch"));
+    assert!(page.body.contains(&format!("/jobs/{fork}/fix-elsewhere")));
+    assert!(!page.body.contains("Fix in this pull request"));
+
+    post_fix_elsewhere(&dashboard, fork, "").await;
+    dashboard.apply(
+        fork,
+        Event::Agent(factory_core::AgentResult::CommitsReady(
+            factory_core::PrDescription {
+                title: "maestro: fix".into(),
+                body: "Fixes.".into(),
+            },
+        )),
+    );
+    dashboard.apply(fork, Event::ChecksPassed);
+    dashboard.apply(fork, Event::Published { number: 77 });
+    let page = dashboard.get(&format!("/jobs/{fork}")).await;
+    assert!(page.body.contains("picked-pr"), "{}", page.body);
+    assert!(page.body.contains("stacked-pr"), "{}", page.body);
+    assert!(page.body.contains("/pull/77"), "{}", page.body);
+}

@@ -9362,3 +9362,211 @@ async fn fixing_a_quick_review_loops_never_merges_and_stops_at_the_round_cap() {
             .all(|publish| publish.existing.as_ref().unwrap().head_branch == "carol/reboot")
     );
 }
+
+async fn stacked_publish(
+    fork: bool,
+) -> (
+    i64,
+    Arc<FakeExecutor>,
+    Arc<Store>,
+    Arc<Scheduler<FakeExecutor>>,
+) {
+    let (store, executor, scheduler) = review_setup();
+    store.save_project_settings("maestro", true, false).unwrap();
+    let mut pick = picked(12);
+    pick.fork = fork;
+    let id = quick_reviewed(&store, &executor, &scheduler, false, pick).await;
+    store
+        .apply(
+            id,
+            Event::FixElsewhere {
+                instructions: "Keep it small.".into(),
+            },
+        )
+        .unwrap();
+    executor
+        .publishes
+        .lock()
+        .unwrap()
+        .push_back(Ok(Published::Open(77)));
+    executor.release(1);
+    step(&scheduler).await; // fix
+    step(&scheduler).await; // checks
+    step(&scheduler).await; // publish
+    (id, executor, store, scheduler)
+}
+
+#[tokio::test]
+async fn fixing_elsewhere_stacks_a_pull_request_on_the_reviewed_branch() {
+    let (id, executor, store, _) = stacked_publish(false).await;
+
+    let requests = executor.requests();
+    assert!(requests[1].prompt.contains("Keep it small."));
+    assert!(
+        requests[1]
+            .prompt
+            .contains("starts at the head of pull request #12")
+    );
+    assert_eq!(requests[1].base, "carol/reboot");
+    assert_eq!(
+        requests[1].branch.as_deref(),
+        Some(format!("factory/job-{id}-pr-1").as_str())
+    );
+    assert_eq!(requests[1].existing.as_ref().unwrap().number, 12);
+    assert!(!requests[1].merge_base);
+
+    let published = executor.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 1);
+    assert!(published[0].existing.is_none());
+    assert_eq!(published[0].base, "carol/reboot");
+    assert_eq!(published[0].branch, format!("factory/job-{id}-pr-1"));
+    assert!(
+        published[0]
+            .description
+            .body
+            .ends_with("Fixes review of https://github.com/Badger-Embedded/maestro/pull/12"),
+        "{}",
+        published[0].description.body
+    );
+    let job = store.get(id).unwrap().job;
+    assert_eq!(job.plan()[0].number, Some(77));
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert!(!job.may_merge());
+}
+
+#[tokio::test]
+async fn fixing_elsewhere_on_a_fork_targets_the_reviewed_base_branch() {
+    let (_, executor, _, _) = stacked_publish(true).await;
+
+    assert_eq!(executor.requests()[1].base, "develop");
+    let published = executor.published.lock().unwrap().clone();
+    assert!(published[0].existing.is_none());
+    assert_eq!(published[0].base, "develop");
+}
+
+async fn stacked_review(fork: bool) -> (i64, AgentRequest) {
+    let (id, executor, _, scheduler) = stacked_publish(fork).await;
+    *executor.checkout_head.lock().unwrap() = Some("h2".into());
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::StartReview { head: "h2".into() }),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+    step(&scheduler).await; // watch
+    executor.release(1);
+    step(&scheduler).await; // reviewer
+    let request = executor
+        .requests()
+        .into_iter()
+        .find(|request| request.expect == Expect::Review)
+        .expect("a review pass ran");
+    (id, request)
+}
+
+#[tokio::test]
+async fn the_review_of_a_stack_reads_the_stack_not_the_reviewed_pull_request() {
+    let (id, request) = stacked_review(false).await;
+
+    assert_eq!(request.existing.as_ref().unwrap().number, 77);
+    assert_eq!(request.base, "carol/reboot");
+    assert!(
+        request
+            .prompt
+            .contains("refs/remotes/origin/carol/reboot...HEAD")
+    );
+    assert!(request.prompt.contains(&ready().title));
+    assert!(request.prompt.contains(&ready().body));
+    assert_eq!(
+        request.branch.as_deref(),
+        Some(format!("factory/job-{id}-pr-1").as_str())
+    );
+}
+
+#[tokio::test]
+async fn the_review_of_a_fork_stack_reads_the_stack_against_the_base_branch() {
+    let (_, request) = stacked_review(true).await;
+
+    assert_eq!(request.existing.as_ref().unwrap().number, 77);
+    assert_eq!(request.base, "develop");
+    assert!(
+        request
+            .prompt
+            .contains("refs/remotes/origin/develop...HEAD")
+    );
+}
+
+#[tokio::test]
+async fn a_conflict_on_a_published_stack_rebases_and_pushes_it_like_any_branch() {
+    let (id, executor, store, scheduler) = stacked_publish(false).await;
+    let rebase = conflict_on_stack(id, &executor, &store, &scheduler, "carol/reboot").await;
+    assert!(!rebase.merge_base);
+    assert!(
+        rebase.prompt.contains("Rebase the branch"),
+        "{}",
+        rebase.prompt
+    );
+}
+
+#[tokio::test]
+async fn a_conflict_on_a_fork_stack_merges_the_base_so_the_forks_commits_stay() {
+    let (id, executor, store, scheduler) = stacked_publish(true).await;
+    let rebase = conflict_on_stack(id, &executor, &store, &scheduler, "develop").await;
+    let recorded = store
+        .get(id)
+        .unwrap()
+        .job
+        .reviewed_head()
+        .map(str::to_owned);
+    assert!(recorded.is_some());
+    assert!(rebase.merge_base);
+    assert!(rebase.prompt.contains("Do not rebase"), "{}", rebase.prompt);
+    let published = executor.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 2);
+    assert!(
+        published
+            .iter()
+            .all(|publish| publish.keep_history.as_deref() == recorded.as_deref())
+    );
+}
+
+async fn conflict_on_stack(
+    id: i64,
+    executor: &Arc<FakeExecutor>,
+    store: &Arc<Store>,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+    base: &str,
+) -> AgentRequest {
+    let scheduler = scheduler.clone();
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::Conflicted { base: base.into() }),
+        seen_until: None,
+        merged_by_factory: false,
+    }));
+    step(&scheduler).await; // watch
+    executor.release(1);
+    step(&scheduler).await; // rebase
+    step(&scheduler).await; // checks
+    step(&scheduler).await; // publish
+
+    let rebase = executor
+        .requests()
+        .into_iter()
+        .rfind(|request| request.prompt.contains("rebase"))
+        .expect("a rebase run");
+    assert_eq!(rebase.existing.as_ref().unwrap().number, 77);
+    assert!(
+        rebase.prompt.contains(&format!("origin/{base}")),
+        "{}",
+        rebase.prompt
+    );
+    let published = executor.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 2);
+    assert!(published[1].existing.is_none());
+    assert_eq!(published[1].branch, format!("factory/job-{id}-pr-1"));
+    assert_eq!(published[1].base, base);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
+    rebase
+}

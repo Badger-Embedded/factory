@@ -831,6 +831,89 @@ async fn a_foreign_commit_is_never_overwritten() {
 }
 
 #[tokio::test]
+async fn a_rewritten_branch_never_drops_the_reviewed_commit_from_the_remote() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "fix", "agent fix");
+    let push = || async {
+        git_.push_fast_forward(
+            &work,
+            &|| Ok(remote.remote()),
+            "pr-branch",
+            "pr-branch",
+            &|| {},
+        )
+        .await
+    };
+    push().await.unwrap();
+
+    git(&work, &["reset", "-q", "--hard", "HEAD~2"]);
+    commit(&work, "again", "rewritten fix");
+    let rejected = push().await.unwrap_err();
+    assert!(
+        matches!(rejected, factory_runner::PushError::Rejected(_)),
+        "{rejected}"
+    );
+    assert_eq!(
+        remote.remote_log("pr-branch"),
+        "agent fix\npr commit\nfirst"
+    );
+}
+
+#[tokio::test]
+async fn a_first_push_of_a_stack_that_lost_the_reviewed_head_creates_no_branch() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    let has_stack = || {
+        std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap()])
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/stack"])
+            .status()
+            .unwrap()
+            .success()
+    };
+
+    let reviewed = git(&work, &["rev-parse", "refs/factory/pr-5/head"]);
+    // The source pull request was force-pushed after the review.
+    git(
+        &work,
+        &[
+            "update-ref",
+            "refs/factory/pr-5/head",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(
+        &work,
+        &["checkout", "-q", "-b", "stack", "refs/remotes/origin/main"],
+    );
+    commit(&work, "again", "rewritten fix");
+    let rejected = git_
+        .push_keeping_head(&work, &|| Ok(remote.remote()), "stack", &reviewed, &|| {})
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(rejected, factory_runner::PushError::Rejected(_)),
+        "{rejected}"
+    );
+    assert!(!has_stack());
+
+    git(&work, &["merge", "-q", "--no-edit", &reviewed]);
+    git_.push_keeping_head(&work, &|| Ok(remote.remote()), "stack", &reviewed, &|| {})
+        .await
+        .unwrap();
+    assert!(has_stack());
+    assert!(remote.remote_log("stack").contains("pr commit"));
+}
+
+#[tokio::test]
 async fn a_base_merge_makes_a_merge_commit_and_the_summary_uses_the_pr_base() {
     let remote = Fixture::new();
     let upstream = remote.upstream();

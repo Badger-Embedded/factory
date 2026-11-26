@@ -64,6 +64,9 @@ struct JobRefs {
     base: String,
     /// The number of the picked pull request the checkout starts from.
     picked: Option<u64>,
+    /// The job owns a pull request stacked on the picked one. It is rebased
+    /// and pushed like any job's own pull request, not merged into.
+    stacked: bool,
 }
 
 impl JobRefs {
@@ -80,19 +83,49 @@ impl JobRefs {
 fn job_refs(job_id: i64, job: &Job, project: &Project, pr: usize) -> JobRefs {
     let branch = branch_name(job_id, pr);
     match job.picked_pr() {
+        Some(picked) if job.stacked_on().is_some() => {
+            // The reviewed pull request only seeds the branch. Once the stack
+            // is open, its checkout and reads come from the stack itself.
+            let opened = job.plan().get(pr).and_then(|planned| planned.number);
+            JobRefs {
+                remote_branch: branch.clone(),
+                branch,
+                base: job.stacked_base().unwrap_or(&picked.base_branch).to_owned(),
+                picked: Some(opened.unwrap_or(picked.number)),
+                stacked: true,
+            }
+        }
         Some(picked) => JobRefs {
             branch,
             remote_branch: picked.head_branch.clone(),
             base: picked.base_branch.clone(),
             picked: Some(picked.number),
+            stacked: false,
         },
         None => JobRefs {
             remote_branch: branch.clone(),
             branch,
             base: project.base.clone(),
             picked: None,
+            stacked: false,
         },
     }
+}
+
+/// The reviewed commit of a fork pull request that a stacked job's branch
+/// must keep. `Err` when the job is a fork's stack and the review recorded
+/// none, since the source ref a force-push can move is no substitute.
+fn forked_head(job: &Job) -> Result<Option<String>, String> {
+    if job.stacked_on().is_none_or(|picked| !picked.fork) {
+        return Ok(None);
+    }
+    job.reviewed_head()
+        .map(|head| Some(head.to_owned()))
+        .ok_or_else(|| {
+            "the quick review recorded no commit for the fork's pull request, so the factory \
+             cannot check that the fix keeps it and publishes nothing"
+                .to_owned()
+        })
 }
 
 fn session_refs(job_id: i64, job: &Job, project: &Project, session: Session) -> JobRefs {
@@ -277,6 +310,10 @@ pub struct PublishRequest {
     /// Whether the project runs checks before a push. A picked pull request
     /// job then never pushes a merge commit that the checks have not run on.
     pub checks: bool,
+    /// The commit the fork pull request had when it was reviewed, which the
+    /// job's own branch must keep. The push is then fast-forward only and refused when the
+    /// branch lost that head, even on its first push.
+    pub keep_history: Option<String>,
     /// Told the account of each push right after it succeeds, before the pull
     /// request is opened.
     pub pushed: PushLog,
@@ -1619,7 +1656,9 @@ impl<E: Executor> Scheduler<E> {
             existing: matches!(session, Session::Pr(_) | Session::Review(_))
                 .then(|| refs.existing(&resolved.forge))
                 .flatten(),
-            merge_base: refs.picked.is_some() && matches!(task, factory_core::Task::Rebase { .. }),
+            merge_base: refs.picked.is_some()
+                && (!refs.stacked || job.stacked_on().is_some_and(|picked| picked.fork))
+                && matches!(task, factory_core::Task::Rebase { .. }),
             keep_checkout: refs.picked.is_some()
                 && (matches!(task, factory_core::Task::FixChecks { report } if report.starts_with(factory_core::CHECKOUT_REPAIR))
                     || matches!(task, factory_core::Task::Answer { .. })
@@ -1981,6 +2020,7 @@ impl<E: Executor> Scheduler<E> {
         });
     }
 
+    #[allow(clippy::too_many_lines, reason = "one match arm per publish outcome")]
     fn publish(
         self: &Arc<Self>,
         job_id: i64,
@@ -1991,9 +2031,20 @@ impl<E: Executor> Scheduler<E> {
         settings: &Settings,
     ) -> Result<(), StoreError> {
         let refs = job_refs(job_id, job, project, pr);
-        let existing = refs.existing(&resolved.forge);
+        let existing = (!refs.stacked)
+            .then(|| refs.existing(&resolved.forge))
+            .flatten();
         let description = match (job.plan()[pr].description.clone(), &existing) {
-            (Some(description), _) => description,
+            (Some(mut description), _) => {
+                if let (Some(reviewed), None) = (job.stacked_on(), &existing) {
+                    description.body = format!(
+                        "{}\n\nFixes review of {}",
+                        description.body.trim_end(),
+                        reviewed.url
+                    );
+                }
+                description
+            }
             (None, Some(_)) => PrDescription {
                 title: job.plan()[pr].title.clone(),
                 body: job.plan()[pr].summary.clone(),
@@ -2003,6 +2054,13 @@ impl<E: Executor> Scheduler<E> {
                     job_id,
                     "The agent wrote no pull request description, so there is nothing to publish.",
                 )?;
+                return Ok(());
+            }
+        };
+        let keep_history = match forked_head(job) {
+            Ok(keep) => keep,
+            Err(reason) => {
+                self.apply(job_id, Event::FactoryFailed { reason });
                 return Ok(());
             }
         };
@@ -2016,6 +2074,7 @@ impl<E: Executor> Scheduler<E> {
             existing,
             description,
             checks: project.checks.is_some(),
+            keep_history,
             pushed: PushLog::new({
                 let scheduler = Arc::clone(self);
                 let (branch, repo) = (refs.remote_branch, project.repo.clone());
