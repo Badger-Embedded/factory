@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Stands in for the GitLab CLI. The browser tests never reach Salsa.
-# The merge requests of e2e/sub/good, which the picker lists and searches.
 salsa_mr() {
   case "$1" in
     1) set -- 1 "Salsa add a flag" flag false 5 carol ;;

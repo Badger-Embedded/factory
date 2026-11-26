@@ -16,7 +16,7 @@
 //   "an opened Show older disclosure stays open across a poll"
 // - The new-request form's pull request picker, under "pull request picker":
 //   searching, badges, keyboard, picking, Remove, polls, blocked picks, errors
-import type { Page } from '@playwright/test';
+import type { Page, Route } from '@playwright/test';
 import {
   ADMIN,
   COLLABORATOR,
@@ -355,27 +355,37 @@ test.describe('pull request picker', () => {
 
   test('Enter while a replacement search is pending picks nothing, and Escape keeps the list closed', async ({ page, factory }, testInfo) => {
     const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
-    let delay = 0;
+    let hold = false;
+    const held: Route[] = [];
     await page.route(`**/projects/${name}/pulls?*`, async (route) => {
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      await route.continue().catch(() => undefined);
+      if (!hold) return route.continue();
+      held.push(route);
     });
+    const release = async () => {
+      hold = false;
+      await Promise.all(held.splice(0).map((route) => route.continue().catch(() => undefined)));
+    };
     await openPicker(page, name);
     await expect(rows(page)).toHaveCount(5);
     await expect(rows(page).first()).toHaveClass(/active/);
 
-    delay = 1500;
+    hold = true;
     await search(page).pressSequentially('#102');
     await page.keyboard.press('Enter');
     await expect(page.locator('input[name="pr"]')).toHaveValue('');
     await expect(page.locator('.pr-picked')).toBeHidden();
     await expect(rows(page)).toHaveCount(0);
+    await expect.poll(() => held.length).toBeGreaterThan(0);
+    await release();
     await expect(rows(page)).toHaveCount(1);
     await expect(page.locator('#pr-results')).toBeVisible();
 
+    hold = true;
     await search(page).pressSequentially('0');
+    await expect.poll(() => held.length).toBeGreaterThan(0);
     await page.keyboard.press('Escape');
-    await page.waitForTimeout(2200);
+    await release();
+    await page.waitForTimeout(500);
     await expect(page.locator('#pr-results')).toBeHidden();
     await expect(search(page)).toHaveAttribute('aria-expanded', 'false');
   });
