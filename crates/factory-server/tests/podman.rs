@@ -1829,12 +1829,14 @@ fn picked_tools(forge_base: &str, git_arms: &str) -> Tools {
              case \"$1\" in\n\
              clone) mkdir -p \"${{@: -1}}/.git\" ;;\n\
              log) echo 'abc1234 one' ;;\n\
+             symbolic-ref) cat '{on}' 2>/dev/null || echo factory/job-7-pr-1 ;;\n\
              rev-parse) case \"$2\" in refs/heads/*) cat '{tip}' 2>/dev/null || echo abc123 ;; *) echo abc123 ;; esac ;;\n\
              config) case \"$*\" in *--get-regexp*) exit 1 ;; esac ;;\n\
              {git_arms}\n\
              esac\n",
             calls = tools.dir.path().join("calls").display(),
-            tip = tools.dir.path().join("tip").display()
+            tip = tools.dir.path().join("tip").display(),
+            on = tools.dir.path().join("on").display()
         ),
     );
     std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work")).unwrap();
@@ -1940,6 +1942,23 @@ async fn the_commit_the_checks_passed_on_must_be_the_branch_tip_that_is_pushed()
         factory_server::Published::HeadMoved { conflicted: false }
     ));
     assert_eq!(pushes(&tools), 0);
+
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let event = podman
+        .run_checks(
+            &Settings::default(),
+            factory_server::ChecksRequest {
+                job_id: 7,
+                base: "develop".into(),
+                existing: Some(12),
+                branch: "factory/job-7-pr-1".into(),
+                command: "true".into(),
+                packages: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(event, Event::ChecksFailed { .. }), "{event:?}");
 }
 
 #[tokio::test]
@@ -2038,4 +2057,37 @@ async fn publishing_after_the_pull_request_was_retargeted_stops_with_a_clear_rea
         reason.contains("main") && reason.contains("develop"),
         "{reason}"
     );
+}
+
+#[tokio::test]
+async fn a_checkout_off_the_job_branch_is_sent_to_the_agent_and_never_merged_into() {
+    let tools = picked_tools("develop", "push) echo '! [rejected] moved' >&2; exit 1 ;;");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    std::fs::write(tools.dir.path().join("on"), "other\n").unwrap();
+
+    let event = podman
+        .run_checks(
+            &Settings::default(),
+            factory_server::ChecksRequest {
+                job_id: 7,
+                base: "develop".into(),
+                existing: Some(12),
+                branch: "factory/job-7-pr-1".into(),
+                command: "true".into(),
+                packages: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(&event, Event::ChecksFailed { report } if report.contains("git checkout factory/job-7-pr-1")),
+        "{event:?}"
+    );
+
+    let published = publish_with(&tools, false).await;
+    assert!(
+        matches!(&published, factory_server::Published::Stopped(_)),
+        "{published:?}"
+    );
+    assert!(!tools.calls().contains("merge"), "{}", tools.calls());
 }

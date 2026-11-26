@@ -312,6 +312,24 @@ impl Git {
         Ok(out.trim().to_owned())
     }
 
+    /// The branch the checkout has checked out, or an empty string when `HEAD`
+    /// is detached.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when it fails for a reason other than a detached
+    /// `HEAD`.
+    pub async fn current_branch(&self, work: &Path) -> Result<String, String> {
+        match self
+            .run(work, &["symbolic-ref", "--quiet", "--short", "HEAD"], None)
+            .await
+        {
+            Ok(out) => Ok(out.trim().to_owned()),
+            Err(_) if self.head(work).await.is_ok() => Ok(String::new()),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn merge_leaving_conflicts(&self, work: &Path, target: &str) -> Result<bool, String> {
         match self.run(work, &["merge", "--no-edit", target], None).await {
             Ok(_) => Ok(true),

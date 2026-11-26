@@ -98,6 +98,19 @@ fn failed(reason: String) -> RunReport {
     }
 }
 
+fn repair_checkout(branch: &str, current: &str) -> String {
+    let on = if current.is_empty() {
+        "a detached HEAD".to_owned()
+    } else {
+        format!("the branch {current}")
+    };
+    format!(
+        "The checkout is on {on}, or {branch} points at another commit than HEAD. \
+         Check out {branch} with git checkout {branch}, after you commit or move any \
+         work you want to keep, and leave the checks' changes to the branch alone."
+    )
+}
+
 impl PodmanExecutor {
     /// The session starts on its CLI once the worker has printed its first line,
     /// so a podman that fails to start the container records
@@ -321,16 +334,18 @@ impl PodmanExecutor {
         Ok(())
     }
 
-    /// `HEAD` and the tip of `branch`. A push transfers the tip, so the checks
-    /// vouch for it only when `HEAD` is the same commit.
-    async fn checkout_tips(
+    /// The branch the checkout has checked out, `HEAD` and the tip of `branch`.
+    /// A push transfers the tip, so the checks vouch for it only when the
+    /// checkout is on `branch`.
+    async fn checkout_state(
         &self,
         workspace: &Path,
         branch: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String, String), String> {
+        let current = self.git.current_branch(workspace).await?;
         let head = self.git.head(workspace).await?;
         let tip = self.git.branch_tip(workspace, branch).await?;
-        Ok((head, tip))
+        Ok((current, head, tip))
     }
 
     /// Pushes the branch's new commits to the picked pull request's own branch
@@ -409,6 +424,14 @@ impl PodmanExecutor {
             )
             .await;
         if matches!(result, Err(PushError::Rejected(_))) {
+            let current = self.git.current_branch(&workspace).await?;
+            if current != request.branch {
+                return Ok(Published::Stopped(format!(
+                    "the checkout is on {current:?}, not on {}, so the new head of the \
+                     pull request cannot be merged into the branch that is pushed",
+                    request.branch
+                )));
+            }
             let merged = self
                 .git
                 .merge_pr_head(&workspace, &remote, &existing.head_ref, existing.number)
@@ -700,12 +723,11 @@ impl Executor for PodmanExecutor {
                 ),
             });
         }
-        let tested = self.checkout_tips(&workspace, &request.branch).await?;
-        if tested.0 != tested.1 {
-            return Err(format!(
-                "the checkout is at {}, not at the tip {} of {}",
-                tested.0, tested.1, request.branch
-            ));
+        let tested = self.checkout_state(&workspace, &request.branch).await?;
+        if tested.0 != request.branch || tested.1 != tested.2 {
+            return Ok(Event::ChecksFailed {
+                report: repair_checkout(&request.branch, &tested.0),
+            });
         }
         let event = run_checks(
             &config,
@@ -716,11 +738,9 @@ impl Executor for PodmanExecutor {
         )
         .await?;
         if matches!(event, Event::ChecksPassed) {
-            if self.checkout_tips(&workspace, &request.branch).await? != tested {
+            if self.checkout_state(&workspace, &request.branch).await? != tested {
                 return Ok(Event::ChecksFailed {
-                    report: "The checks moved HEAD or the job branch. Run them without \
-                             changing the checkout."
-                        .into(),
+                    report: repair_checkout(&request.branch, &tested.0),
                 });
             }
             fs::write(self.checked_marker(request.job_id), &tested.1)
