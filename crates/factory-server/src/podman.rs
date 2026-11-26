@@ -100,6 +100,16 @@ fn failed(reason: String) -> RunReport {
     }
 }
 
+/// A quick review that cannot start stops in Needs you with Retry, like a
+/// reviewer run that failed, and does not fail the job.
+fn failed_for(expect: factory_runner::Expect, reason: String) -> RunReport {
+    let mut report = failed(reason.clone());
+    if expect == factory_runner::Expect::QuickReview {
+        report.event = factory_runner::failed_event(expect, reason);
+    }
+    report
+}
+
 fn repair_checkout(branch: &str, current: &str) -> String {
     let on = if current.is_empty() {
         "a detached HEAD".to_owned()
@@ -559,12 +569,13 @@ impl Executor for PodmanExecutor {
         mut session: SessionSink,
     ) -> RunReport {
         let agent = request.agent;
+        let expect = request.expect;
         let entry = self.registry.entry(agent);
         let request_local = request.local.clone();
         let local = request_local.clone().map(|local| local.target);
         let (mut token, cli) = match credential_and_cli(&entry, agent, local.as_ref()) {
             Ok(found) => found,
-            Err(reason) => return failed(reason),
+            Err(reason) => return failed_for(expect, reason),
         };
         if let Some(local) = &request_local
             && let Err(reason) = self
@@ -575,7 +586,7 @@ impl Executor for PodmanExecutor {
                 )
                 .await
         {
-            return failed(reason);
+            return failed_for(expect, reason);
         }
         let backend = backend_for(cli).expect("the run's CLI has a worker backend");
         let image = entry
@@ -592,11 +603,16 @@ impl Executor for PodmanExecutor {
             backend.host_config_dir()
         });
         if let Err(err) = fs::create_dir_all(&config_dir) {
-            return failed(format!("could not create {}: {err}", config_dir.display()));
+            return failed_for(
+                expect,
+                format!("could not create {}: {err}", config_dir.display()),
+            );
         }
-        if matches!(request.expect, factory_runner::Expect::Review)
-            && let Some(existing) = &request.existing
-        {
+        let reads_pr = matches!(
+            request.expect,
+            factory_runner::Expect::Review | factory_runner::Expect::QuickReview
+        );
+        if reads_pr && let Some(existing) = &request.existing {
             let forge = self.forges.forge(&request.forge);
             let live = async {
                 let reader = request.account.resolve()?;
@@ -611,27 +627,28 @@ impl Executor for PodmanExecutor {
             match live {
                 Ok(Some(pr)) => {
                     if let Some(reason) = retargeted(&pr, &request.base) {
-                        return failed(reason);
+                        return failed_for(expect, reason);
                     }
                 }
                 Ok(None) => {}
-                Err(reason) => return failed(reason),
+                Err(reason) => return failed_for(expect, reason),
             }
         }
         if !request.keep_checkout
             && let Err(reason) = self.prepare_checkout(&request, &workspace).await
         {
-            return failed(reason);
+            return failed_for(expect, reason);
         }
         // Read from the checkout the reviewer reads, not from the forge
         // afterwards, so a push between the two cannot change it.
-        let head = if matches!(request.expect, factory_runner::Expect::Review)
-            && request.existing.is_some()
-        {
+        let head = if reads_pr && request.existing.is_some() {
             match self.git.head(&workspace).await {
                 Ok(head) => Some(head),
                 Err(reason) => {
-                    return failed(format!("could not read the checkout's head: {reason}"));
+                    return failed_for(
+                        expect,
+                        format!("could not read the checkout's head: {reason}"),
+                    );
                 }
             }
         } else {
@@ -652,7 +669,7 @@ impl Executor for PodmanExecutor {
         let prompt = if matches!(session_run, SessionRun::Start(_)) {
             match self.start_session_prompt(&request, cli, &workspace, &job_dir) {
                 Ok(prompt) => prompt,
-                Err(reason) => return failed(reason),
+                Err(reason) => return failed_for(expect, reason),
             }
         } else {
             request.prompt
@@ -672,7 +689,7 @@ impl Executor for PodmanExecutor {
                     token = auth;
                     Some(run)
                 }
-                Err(reason) => return failed(reason),
+                Err(reason) => return failed_for(expect, reason),
             },
             None => None,
         };
@@ -1085,6 +1102,26 @@ impl Executor for PodmanExecutor {
             self.forges
                 .forge(forge)
                 .comment(&operation.account, repo, number, body)
+                .await,
+        )
+    }
+
+    async fn has_comment(
+        &self,
+        forge: &ForgeKind,
+        account: &AccountSource,
+        author: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<bool, String> {
+        let mut operation = account.resolve()?;
+        author.clone_into(&mut operation.account.login);
+        blame(
+            &operation.owner,
+            self.forges
+                .forge(forge)
+                .has_comment(&operation.account, repo, number, body)
                 .await,
         )
     }

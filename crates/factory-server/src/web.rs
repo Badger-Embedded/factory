@@ -219,6 +219,7 @@ pub fn app_with_forgejo_probe(
         .route("/jobs/{id}/approve", post(approve))
         .route("/jobs/{id}/retry", post(retry))
         .route("/jobs/{id}/fix", post(start_fix))
+        .route("/jobs/{id}/fix-here", post(fix_here))
         .route("/jobs/{id}/dismiss", post(dismiss))
         .route("/jobs/{id}/changes", post(request_changes))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -1042,15 +1043,16 @@ async fn read_pr_number(field: Field<'_>) -> Result<Option<u64>, AppError> {
 }
 
 /// Reads the pull request `number` of `project` with the account of `login`
-/// and returns it as a job's picked pull request. Refuses one that is closed,
-/// merged or missing, and one from a fork, whose branch the factory cannot
-/// push to.
+/// and returns it as a job's picked pull request in `mode`. Refuses one that is
+/// closed, merged or missing, and one from a fork unless the job only reviews
+/// it, because the factory cannot push to a fork's branch.
 async fn read_picked_pr(
     state: &AppState,
     name: &str,
     project: &Project,
     login: &str,
     number: u64,
+    mode: PrMode,
 ) -> Result<PickedPr, AppError> {
     let resolved = resolve_forge(state, name, project, login)?;
     let found = state
@@ -1079,9 +1081,13 @@ async fn read_picked_pr(
             )));
         }
     }
-    if pr.fork {
+    if pr.fork && !matches!(mode, PrMode::QuickReview { .. }) {
+        let what = match mode {
+            PrMode::ReviewAndFix => "review and fix",
+            _ => "change",
+        };
         return Err(AppError::BadRequest(format!(
-            "the factory cannot push to a fork's branch, so it cannot change pull request #{number}"
+            "the factory cannot push to a fork's branch, so it cannot {what} pull request #{number}"
         )));
     }
     Ok(PickedPr {
@@ -1092,8 +1098,25 @@ async fn read_picked_pr(
         head_branch: pr.head_branch,
         base_branch: pr.base_branch,
         fork: pr.fork,
-        mode: PrMode::Request,
+        mode,
     })
+}
+
+/// Reads the form's `mode` and `comment` fields. A review needs a picked pull
+/// request, and only a quick review takes the comment box.
+fn read_pr_mode(mode: Option<&str>, comment: bool, pr: Option<u64>) -> Result<PrMode, AppError> {
+    let mode = match mode.map(str::trim) {
+        None | Some("" | "request") => PrMode::Request,
+        Some("quick-review") => PrMode::QuickReview { comment },
+        Some("review-and-fix") => PrMode::ReviewAndFix,
+        Some(other) => {
+            return Err(AppError::BadRequest(format!("{other:?} is not a mode")));
+        }
+    };
+    if mode != PrMode::Request && pr.is_none() {
+        return Err(AppError::BadRequest("a review needs a pull request".into()));
+    }
+    Ok(mode)
 }
 
 /// The forge and account `login` uses on `project`. A token that cannot be
@@ -1165,6 +1188,8 @@ async fn create_job(
     let mut project = None;
     let mut request = None;
     let mut pr = None;
+    let mut mode = None;
+    let mut comment = false;
     let mut after = Vec::new();
     let mut attachments = Vec::new();
     while let Some(field) = form
@@ -1177,6 +1202,8 @@ async fn create_job(
             Some("request") => request = Some(read_text(field).await?),
             Some("after") => after.push(read_job_number(field).await?),
             Some("pr") => pr = read_pr_number(field).await?,
+            Some("mode") => mode = Some(read_text(field).await?),
+            Some("comment") => comment = !read_text(field).await?.trim().is_empty(),
             Some("images") => read_attachment(field, &mut attachments).await?,
             _ => {}
         }
@@ -1185,7 +1212,8 @@ async fn create_job(
     let found = visible_project(&state, &headers, &project)?;
     let request = request.unwrap_or_default();
     let request = request.trim();
-    if request.is_empty() {
+    let mode = read_pr_mode(mode.as_deref(), comment, pr)?;
+    if request.is_empty() && mode == PrMode::Request {
         return Err(AppError::BadRequest("the request is empty".into()));
     }
     let login = user(&headers);
@@ -1194,7 +1222,7 @@ async fn create_job(
             .store
             .create_after(&project, &login, request, &after)?,
         Some(number) => {
-            let picked = read_picked_pr(&state, &project, &found, &login, number).await?;
+            let picked = read_picked_pr(&state, &project, &found, &login, number, mode).await?;
             state
                 .store
                 .create_pull_request_job(&project, &login, request, &after, picked)?
@@ -1818,6 +1846,51 @@ async fn start_fix(
         .store
         .append_factory_log(id, &format!("Started fix job #{fix} from the dashboard."))?;
     board_redirect(&state, form.project, job_redirect(id))
+}
+
+/// Fixes a quick-reviewed pull request in its own branch, with the review and
+/// the user's instructions. Refused for a fork pull request and for one that
+/// another live job holds.
+async fn fix_here(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<FixForm>,
+) -> Result<Redirect, AppError> {
+    let row = visible_job(&state, &headers, id)?;
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let Some(picked) = row.job.picked_pr() else {
+        return Err(AppError::BadRequest(
+            "this job has no picked pull request".into(),
+        ));
+    };
+    if picked.fork {
+        return Err(AppError::BadRequest(format!(
+            "the factory cannot push to a fork's branch, so it cannot fix pull request #{}",
+            picked.number
+        )));
+    }
+    if let Some(job) = state
+        .store
+        .holding_job(&row.project, picked.number)?
+        .filter(|&holder| holder != id)
+    {
+        return Err(StoreError::PrHeld {
+            number: picked.number,
+            job,
+        }
+        .into());
+    }
+    let instructions = form.instructions.trim().to_owned();
+    let event = Event::FixHere {
+        instructions,
+        held: false,
+    };
+    let redirect = apply(&state, id, event)?;
+    state
+        .store
+        .append_factory_log(id, "Started fixing the pull request from the dashboard.")?;
+    board_redirect(&state, form.project, redirect)
 }
 
 async fn dismiss(

@@ -71,6 +71,10 @@ struct FakeExecutor {
     renovate_now: Mutex<RenovateNow>,
     renovate_watched: Mutex<Vec<RenovateWatchRequest>>,
     comments: Mutex<Vec<(u64, String)>>,
+    /// Errors the next comment attempts return.
+    comment_errors: Mutex<VecDeque<String>>,
+    comment_authors: Mutex<Vec<String>>,
+    seeded_poster: Mutex<Option<String>>,
     /// Each approval and squash merge of `(number, head)`.
     merged: Mutex<Vec<(u64, String)>>,
     merge_failures: Mutex<VecDeque<RenovateNow>>,
@@ -147,6 +151,9 @@ impl FakeExecutor {
             renovate_now: Mutex::new(RenovateNow::Nothing),
             renovate_watched: Mutex::new(Vec::new()),
             comments: Mutex::new(Vec::new()),
+            comment_errors: Mutex::new(VecDeque::new()),
+            comment_authors: Mutex::new(Vec::new()),
+            seeded_poster: Mutex::new(None),
             merged: Mutex::new(Vec::new()),
             merge_failures: Mutex::new(VecDeque::new()),
             merge_errors: Mutex::new(VecDeque::new()),
@@ -431,11 +438,38 @@ impl Executor for FakeExecutor {
         body: &str,
     ) -> Result<(), String> {
         tokio::task::yield_now().await;
+        if let Some(error) = self.comment_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         self.comments
             .lock()
             .unwrap()
             .push((number, body.to_owned()));
         Ok(())
+    }
+
+    async fn has_comment(
+        &self,
+        _forge: &ForgeKind,
+        _account: &AccountSource,
+        author: &str,
+        _repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<bool, String> {
+        tokio::task::yield_now().await;
+        self.comment_authors.lock().unwrap().push(author.to_owned());
+        if let Some(poster) = &*self.seeded_poster.lock().unwrap()
+            && poster != author
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .comments
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(at, posted)| *at == number && posted == body))
     }
 
     async fn renovate_merged(
@@ -8930,5 +8964,401 @@ async fn a_checkout_repair_keeps_the_checkout_after_the_agent_asks_a_question() 
         request.prompt.contains("Which board?"),
         "{}",
         request.prompt
+    );
+}
+
+fn review_setup() -> (Arc<Store>, Arc<FakeExecutor>, Arc<Scheduler<FakeExecutor>>) {
+    let setup = setup(|request| match request.expect {
+        Expect::QuickReview => Event::QuickReviewed {
+            score: 4,
+            review: "Handle the error.".into(),
+            head: String::new(),
+        },
+        Expect::Review => Event::ReviewChanges {
+            feedback: "Handle the error.".into(),
+        },
+        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+    });
+    quick_polls(&setup.0);
+    *setup.1.checkout_head.lock().unwrap() = Some("h1".into());
+    setup
+}
+
+async fn quick_reviewed(
+    store: &Store,
+    executor: &FakeExecutor,
+    scheduler: &Arc<Scheduler<FakeExecutor>>,
+    comment: bool,
+    pick: factory_core::PickedPr,
+) -> i64 {
+    let mut pick = pick;
+    pick.mode = factory_core::PrMode::QuickReview { comment };
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(scheduler).await; // reviewer
+    step(scheduler).await; // comment, when asked
+    id
+}
+
+#[tokio::test]
+async fn a_quick_review_runs_the_review_stage_agent_with_llm_review_off() {
+    let (store, executor, scheduler) = review_setup();
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                review: "codex".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    store
+        .save_project_models(
+            "maestro",
+            &StageModels {
+                review: Some("gpt-5.4".into()),
+                implement: Some("other".into()),
+                ..StageModels::default()
+            },
+        )
+        .unwrap();
+    let id = quick_reviewed(&store, &executor, &scheduler, false, picked(12)).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].expect, Expect::QuickReview);
+    assert_eq!(requests[0].agent, Agent::Codex);
+    assert_eq!(requests[0].model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(requests[0].base, "develop");
+    assert_eq!(requests[0].existing.as_ref().unwrap().number, 12);
+    match store.get(id).unwrap().job.turn() {
+        Turn::User(Ask::QuickReview {
+            score,
+            head,
+            comment,
+            ..
+        }) => {
+            assert_eq!(*score, 4);
+            assert_eq!(head, "h1");
+            assert_eq!(*comment, factory_core::CommentState::Off);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(executor.comments.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_quick_review_with_the_box_checked_posts_one_scored_comment() {
+    let (store, executor, scheduler) = review_setup();
+    let mut fork = picked(12);
+    fork.fork = true;
+    let id = quick_reviewed(&store, &executor, &scheduler, true, fork).await;
+
+    let comments = executor.comments.lock().unwrap().clone();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].0, 12);
+    assert!(
+        comments[0].1.starts_with("LGTM score: 4/5"),
+        "{}",
+        comments[0].1
+    );
+    assert!(comments[0].1.contains("h1"));
+    assert!(comments[0].1.contains("Handle the error."));
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::QuickReview {
+            comment: factory_core::CommentState::Posted,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_quick_review_comment_the_forge_already_holds_is_not_posted_again() {
+    let (store, executor, scheduler) = review_setup();
+    let pick = factory_core::PickedPr {
+        mode: factory_core::PrMode::QuickReview { comment: true },
+        ..picked(12)
+    };
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // reviewer
+    // A restart after the forge took the comment and before the job saved it.
+    let (session, _) = store
+        .session_uuid(
+            id,
+            factory_core::Session::Review(0),
+            factory_core::DEFAULT_AGENT,
+        )
+        .unwrap();
+    executor.comments.lock().unwrap().push((
+        12,
+        format!(
+            "LGTM score: 4/5\n\nReviewed commit: h1\n\nHandle the error.\n\n<!-- factory quick review {session} -->"
+        ),
+    ));
+    step(&scheduler).await; // comment
+
+    assert_eq!(executor.comments.lock().unwrap().len(), 1);
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::QuickReview {
+            comment: factory_core::CommentState::Posted,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_comment_that_only_quotes_the_marker_does_not_count_as_posted() {
+    let (store, executor, scheduler) = review_setup();
+    let pick = factory_core::PickedPr {
+        mode: factory_core::PrMode::QuickReview { comment: true },
+        ..picked(12)
+    };
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // reviewer
+    let (session, _) = store
+        .session_uuid(
+            id,
+            factory_core::Session::Review(0),
+            factory_core::DEFAULT_AGENT,
+        )
+        .unwrap();
+    executor.comments.lock().unwrap().push((
+        12,
+        format!("Quoting: <!-- factory quick review {session} -->"),
+    ));
+    step(&scheduler).await; // comment
+
+    let comments = executor.comments.lock().unwrap().clone();
+    assert_eq!(comments.len(), 2);
+    assert!(comments[1].1.starts_with("LGTM score: 4/5"));
+}
+
+#[tokio::test]
+async fn a_restart_across_an_account_switch_looks_for_the_comment_as_the_first_account() {
+    let (store, executor, scheduler) = review_setup();
+    let pick = factory_core::PickedPr {
+        mode: factory_core::PrMode::QuickReview { comment: true },
+        ..picked(12)
+    };
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // reviewer
+    let (session, _) = store
+        .session_uuid(
+            id,
+            factory_core::Session::Review(0),
+            factory_core::DEFAULT_AGENT,
+        )
+        .unwrap();
+    // The first account posted the comment, and the project's account is
+    // another one by the time the job restarts.
+    executor.comments.lock().unwrap().push((
+        12,
+        format!(
+            "LGTM score: 4/5\n\nReviewed commit: h1\n\nHandle the error.\n\n<!-- factory quick review {session} -->"
+        ),
+    ));
+    *executor.seeded_poster.lock().unwrap() = Some("project-bot".into());
+    store.set_comment_author(id, "project-bot").unwrap();
+    step(&scheduler).await; // comment
+
+    assert_eq!(*executor.comment_authors.lock().unwrap(), ["project-bot"]);
+    assert_eq!(executor.comments.lock().unwrap().len(), 1);
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::QuickReview {
+            comment: factory_core::CommentState::Posted,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn deleting_a_job_removes_its_recorded_comment_author() {
+    let (store, _, _) = review_setup();
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], picked(12))
+        .unwrap();
+    store.set_comment_author(id, "project-bot").unwrap();
+    store
+        .delete_job(id, std::path::Path::new("/nonexistent"))
+        .unwrap();
+    assert_eq!(store.comment_author(id).unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_quick_review_whose_credential_is_gone_before_the_reviewer_waits_for_a_retry() {
+    let (store, _, scheduler) = review_setup();
+    user_secrets(&store)
+        .delete_forge_token(ForgeTokenOwner::Project {
+            project: "maestro",
+            forge: &ForgeKind::GitHub,
+        })
+        .unwrap();
+    let pick = factory_core::PickedPr {
+        mode: factory_core::PrMode::QuickReview { comment: false },
+        ..picked(12)
+    };
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    step(&scheduler).await;
+
+    assert!(
+        matches!(
+            store.get(id).unwrap().job.stage(),
+            Stage::CiAndReview { .. }
+        ),
+        "{:?}",
+        store.get(id).unwrap().job.stage()
+    );
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::ReviewStopped { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_quick_review_comment_whose_account_cannot_be_read_is_recorded_and_not_retried() {
+    let (store, executor, scheduler) = review_setup();
+    let pick = factory_core::PickedPr {
+        mode: factory_core::PrMode::QuickReview { comment: true },
+        ..picked(12)
+    };
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // reviewer
+    user_secrets(&store)
+        .delete_forge_token(ForgeTokenOwner::Project {
+            project: "maestro",
+            forge: &ForgeKind::GitHub,
+        })
+        .unwrap();
+    step(&scheduler).await; // comment
+
+    assert!(executor.comments.lock().unwrap().is_empty());
+    match store.get(id).unwrap().job.turn() {
+        Turn::User(Ask::QuickReview { comment, .. }) => assert!(
+            matches!(comment, factory_core::CommentState::Failed { error, .. } if error.contains("project token")),
+            "{comment:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_failed_quick_review_comment_is_recorded_and_the_review_stays() {
+    let (store, executor, scheduler) = review_setup();
+    executor
+        .comment_errors
+        .lock()
+        .unwrap()
+        .push_back("403 Forbidden".into());
+    let id = quick_reviewed(&store, &executor, &scheduler, true, picked(12)).await;
+
+    assert!(executor.comments.lock().unwrap().is_empty());
+    match store.get(id).unwrap().job.turn() {
+        Turn::User(Ask::QuickReview {
+            review, comment, ..
+        }) => {
+            assert_eq!(review, "Handle the error.");
+            assert!(
+                matches!(comment, factory_core::CommentState::Failed { error, .. } if error.contains("403")),
+                "{comment:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fixing_a_quick_review_loops_never_merges_and_stops_at_the_round_cap() {
+    let (store, executor, scheduler) = review_setup();
+    store.save_project_settings("maestro", true, false).unwrap();
+    let id = quick_reviewed(&store, &executor, &scheduler, false, picked(12)).await;
+    store
+        .apply(
+            id,
+            Event::FixHere {
+                instructions: "Keep it small.".into(),
+                held: false,
+            },
+        )
+        .unwrap();
+
+    for round in 1..=factory_core::MAX_REVIEW_ROUNDS + 1 {
+        if matches!(
+            store.get(id).unwrap().job.turn(),
+            Turn::User(Ask::ReviewStopped { .. })
+        ) {
+            break;
+        }
+        executor.release(1);
+        step(&scheduler).await; // fix
+        step(&scheduler).await; // checks
+        step(&scheduler).await; // publish
+        *executor.checkout_head.lock().unwrap() = Some(format!("h{}", round + 1));
+        executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+            event: Some(Event::StartReview {
+                head: format!("h{}", round + 1),
+            }),
+            seen_until: None,
+            merged_by_factory: false,
+        }));
+        step(&scheduler).await; // watch
+        executor.release(1);
+        step(&scheduler).await; // reviewer
+    }
+
+    let job = store.get(id).unwrap().job;
+    assert!(
+        matches!(
+            job.turn(),
+            Turn::User(Ask::ReviewStopped {
+                stop: factory_core::ReviewStop::CapReached { .. },
+                ..
+            })
+        ),
+        "{:?}",
+        job.turn()
+    );
+    let requests = executor.requests();
+    assert!(requests[1].prompt.contains("Keep it small."));
+    assert!(executor.merged.lock().unwrap().is_empty());
+    assert!(
+        executor
+            .watched
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|watch| { !watch.may_merge && watch.llm_review })
+    );
+    assert!(
+        executor
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|publish| publish.existing.as_ref().unwrap().head_branch == "carol/reboot")
     );
 }

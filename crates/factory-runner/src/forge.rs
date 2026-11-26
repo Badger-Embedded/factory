@@ -443,6 +443,16 @@ pub trait Forge: Send + Sync {
         body: &'a str,
     ) -> BoxFuture<'a, Result<(), String>>;
 
+    /// Whether the account already posted `body` as a plain comment of the
+    /// pull request, on any page of its comments.
+    fn has_comment<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        number: u64,
+        body: &'a str,
+    ) -> BoxFuture<'a, Result<bool, String>>;
+
     /// Approves the pull request at `head`.
     fn approve<'a>(
         &'a self,
@@ -501,4 +511,12 @@ pub trait Forge: Send + Sync {
         repo: &'a str,
         checks: &'a [FailedCheck],
     ) -> BoxFuture<'a, Result<String, String>>;
+}
+
+/// Whether a comment the forge returned is the one the account posted. A forge
+/// may normalise line endings and trailing space.
+#[must_use]
+pub fn is_posted_comment(account: &Account, author: &str, posted: &str, body: &str) -> bool {
+    let normal = |text: &str| text.replace("\r\n", "\n").trim().to_owned();
+    author.eq_ignore_ascii_case(&account.login) && normal(posted) == normal(body)
 }

@@ -1620,6 +1620,19 @@ impl Job {
         self.checkout_repair
     }
 
+    /// The job's title: the first line of its request, or for a review that
+    /// started with an empty box, "Review #N: <pull request title>".
+    #[must_use]
+    pub fn title(&self) -> String {
+        let line = self.request.lines().next().unwrap_or_default();
+        match self.picked_pr() {
+            Some(picked) if self.request.trim().is_empty() => {
+                format!("Review #{}: {}", picked.number, picked.title)
+            }
+            _ => line.to_owned(),
+        }
+    }
+
     /// The pull request the user picked, or `None` for any other job.
     #[must_use]
     pub fn picked_pr(&self) -> Option<&PickedPr> {

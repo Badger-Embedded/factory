@@ -496,6 +496,28 @@ test.describe('pull request picker', () => {
     await expect(page.locator('li.job a.picked-pr')).toHaveAttribute('target', '_blank');
   });
 
+  test('a review with an empty box is titled with the pull request on the board and the job page', async ({ page, factory }, testInfo) => {
+    const name = await pullProject(page, factory, 'prs', testInfo.workerIndex);
+    await openPicker(page, name);
+    await rows(page).first().click();
+    // The review buttons come with a later change, so the form is made to post a review here.
+    await page.locator('#request').evaluate((box: HTMLTextAreaElement) => {
+      box.required = false;
+      const mode = document.createElement('input');
+      mode.type = 'hidden';
+      mode.name = 'mode';
+      mode.value = 'quick-review';
+      box.form!.append(mode);
+    });
+    await page.getByRole('button', { name: 'Request' }).click();
+
+    await expect(page).toHaveURL(/\/jobs\/\d+$/);
+    await expect(page.getByRole('heading', { level: 1 })).toContainText('Review #101: Add dark mode');
+
+    await page.goto(`/?project=${name}`);
+    await expect(page.locator('li.job')).toContainText('Review #101: Add dark mode');
+  });
+
   test('a forge error shows in the picker and the form keeps working', async ({ page, factory }, testInfo) => {
     const name = await pullProject(page, factory, 'broken', testInfo.workerIndex);
     await openPicker(page, name);

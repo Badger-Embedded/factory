@@ -113,6 +113,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     local_cli TEXT,
     PRIMARY KEY (job_id, session)
 );
+CREATE TABLE IF NOT EXISTS comment_authors (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
+    login TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY,
     job_id INTEGER NOT NULL REFERENCES jobs (id),
@@ -1911,6 +1915,7 @@ impl Store {
             "cost_closed_jobs",
             "rebase_claims",
             "renovate_heads",
+            "comment_authors",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
@@ -1926,7 +1931,7 @@ impl Store {
                 } else {
                     "unmerged"
                 },
-                row.job.request().lines().next().unwrap_or_default()
+                row.job.title()
             ],
         )?;
         tx.execute("DELETE FROM job_prerequisites WHERE job_id = ?1", [id])?;
@@ -2041,7 +2046,7 @@ impl Store {
                 (_, None) => PrerequisiteState::Blocked,
             };
             let title = match &job {
-                Some(job) => job.request().lines().next().unwrap_or_default().to_owned(),
+                Some(job) => job.title(),
                 None => title.unwrap_or_default(),
             };
             views.push(PrerequisiteView {
@@ -4707,6 +4712,38 @@ impl Store {
         // than failing the run.
         let agent = Agent::from_id(&agent_id).unwrap_or(DEFAULT_AGENT);
         Ok((uuid, agent))
+    }
+
+    /// The login a quick review's comment was or is about to be posted as, or
+    /// `None` before the first attempt.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn comment_author(&self, job_id: i64) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT login FROM comment_authors WHERE job_id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records the login the next attempt to post job `job_id`'s comment runs
+    /// as, before the forge is asked.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_comment_author(&self, job_id: i64, login: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO comment_authors (job_id, login) VALUES (?1, ?2)
+             ON CONFLICT (job_id) DO UPDATE SET login = excluded.login",
+            params![job_id, login],
+        )?;
+        Ok(())
     }
 
     /// The agent and the model and effort `session` of job `job_id` last ran

@@ -18495,8 +18495,20 @@ esac
 }
 
 async fn post_picked(dashboard: &Dashboard, request: &str, pr: &str) -> Reply {
+    post_picked_with(dashboard, request, pr, &[]).await
+}
+
+async fn post_picked_with(
+    dashboard: &Dashboard,
+    request: &str,
+    pr: &str,
+    extra: &[(&str, &str)],
+) -> Reply {
     let mut body = String::new();
-    for (name, value) in [("project", "maestro"), ("request", request), ("pr", pr)] {
+    for (name, value) in [("project", "maestro"), ("request", request), ("pr", pr)]
+        .into_iter()
+        .chain(extra.iter().copied())
+    {
         write!(
             body,
             "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
@@ -18808,4 +18820,161 @@ fn a_quick_review_holds_nothing_until_it_fixes_and_retries_while_another_job_hol
         )
         .unwrap();
     assert_eq!(store.holding_job("maestro", 7).unwrap(), Some(review));
+}
+
+#[tokio::test]
+async fn a_review_with_an_empty_box_is_accepted_and_titled_after_the_pull_request() {
+    let dashboard = picked_pr_dashboard();
+    let reply = post_picked_with(
+        &dashboard,
+        "",
+        "12",
+        &[("mode", "quick-review"), ("comment", "on")],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let fork = post_picked_with(
+        &dashboard,
+        "focus on locking",
+        "15",
+        &[("mode", "quick-review")],
+    )
+    .await;
+    assert_eq!(fork.status, StatusCode::SEE_OTHER, "{}", fork.body);
+    let both = post_picked_with(&dashboard, "", "12", &[("mode", "review-and-fix")]).await;
+    assert_eq!(
+        both.status,
+        StatusCode::SEE_OTHER,
+        "a quick review holds nothing: {}",
+        both.body
+    );
+
+    let jobs = dashboard.store.list().unwrap();
+    let modes: Vec<_> = jobs
+        .iter()
+        .map(|row| row.job.picked_pr().unwrap().mode)
+        .collect();
+    assert_eq!(
+        modes,
+        [
+            factory_core::PrMode::ReviewAndFix,
+            factory_core::PrMode::QuickReview { comment: false },
+            factory_core::PrMode::QuickReview { comment: true },
+        ]
+    );
+    assert_eq!(jobs[2].job.title(), "Review #12: Fix 12");
+    assert_eq!(jobs[1].job.title(), "focus on locking");
+    assert!(jobs[1].job.picked_pr().unwrap().fork);
+    let board = dashboard.get("/").await;
+    assert!(board.body.contains("Review #12: Fix 12"), "{}", board.body);
+}
+
+#[tokio::test]
+async fn a_request_stays_refused_with_an_empty_box_and_a_review_needs_a_pull_request() {
+    let dashboard = picked_pr_dashboard();
+    for (pr, mode) in [("12", "request"), ("", "quick-review"), ("12", "bogus")] {
+        let reply = post_picked_with(&dashboard, "", pr, &[("mode", mode)]).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{pr} {mode}");
+    }
+    assert_eq!(dashboard.store.list().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn review_and_fix_is_refused_for_a_fork_and_for_a_held_pull_request() {
+    let dashboard = picked_pr_dashboard();
+    let fork = post_picked_with(&dashboard, "", "15", &[("mode", "review-and-fix")]).await;
+    assert_eq!(fork.status, StatusCode::BAD_REQUEST);
+    assert!(
+        fork.body.contains("cannot push to a fork's branch"),
+        "{}",
+        fork.body
+    );
+
+    post_picked(&dashboard, "one", "12").await;
+    let holder = dashboard.store.list().unwrap()[0].id;
+    let held = post_picked_with(&dashboard, "", "12", &[("mode", "review-and-fix")]).await;
+    assert_eq!(held.status, StatusCode::BAD_REQUEST);
+    assert!(
+        held.body.contains(&format!("job #{holder}")),
+        "{}",
+        held.body
+    );
+    assert_eq!(dashboard.store.list().unwrap().len(), 1);
+}
+
+async fn reviewed(dashboard: &Dashboard, pr: &str) -> i64 {
+    let reply = post_picked_with(dashboard, "", pr, &[("mode", "quick-review")]).await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let id = dashboard.store.list().unwrap().first().unwrap().id;
+    dashboard.apply(id, Event::Start);
+    dashboard.apply(
+        id,
+        Event::QuickReviewed {
+            score: 3,
+            review: "Needs tests.".into(),
+            head: "abc".into(),
+        },
+    );
+    id
+}
+
+async fn post_fix_here(dashboard: &Dashboard, id: i64, instructions: &str) -> Reply {
+    let page = dashboard.get("/settings/groups").await;
+    let csrf = form_token(&page.body);
+    dashboard
+        .post(
+            &format!("/jobs/{id}/fix-here"),
+            &format!("instructions={instructions}&csrf={csrf}"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_quick_review_waits_in_notifications_and_fix_here_starts_the_fix() {
+    let dashboard = picked_pr_dashboard();
+    let id = reviewed(&dashboard, "12").await;
+    let items = notifications_as(&dashboard, USER).await["items"].clone();
+    assert_eq!(items[0]["job"], id);
+    assert_eq!(items[0]["kind"], "needs-you");
+
+    let forged = dashboard
+        .post(
+            &format!("/jobs/{id}/fix-here"),
+            "instructions=x&csrf=forged",
+        )
+        .await;
+    assert_eq!(forged.status, StatusCode::FORBIDDEN);
+
+    let reply = post_fix_here(&dashboard, id, "keep+it+small").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let job = dashboard.store.get(id).unwrap().job;
+    assert!(matches!(
+        job.turn(),
+        factory_core::Turn::Agent(factory_core::Task::AddressReview { comments })
+            if comments.contains("Needs tests.") && comments.contains("keep it small")
+    ));
+}
+
+#[tokio::test]
+async fn fix_here_is_refused_for_a_fork_and_for_a_held_pull_request() {
+    let dashboard = picked_pr_dashboard();
+    let fork = reviewed(&dashboard, "15").await;
+    let reply = post_fix_here(&dashboard, fork, "").await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("fork"), "{}", reply.body);
+
+    let review = reviewed(&dashboard, "12").await;
+    post_picked(&dashboard, "one", "12").await;
+    let holder = dashboard.store.list().unwrap().first().unwrap().id;
+    let held = post_fix_here(&dashboard, review, "").await;
+    assert_eq!(held.status, StatusCode::BAD_REQUEST);
+    assert!(
+        held.body.contains(&format!("job #{holder}")),
+        "{}",
+        held.body
+    );
+    assert!(matches!(
+        dashboard.store.get(review).unwrap().job.turn(),
+        factory_core::Turn::User(factory_core::Ask::QuickReview { .. })
+    ));
 }
