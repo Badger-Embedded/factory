@@ -137,6 +137,9 @@
     return { setModelLabel: setModelLabel };
   }
 
+  var renovateForm = document.querySelector(".renovate-agent-form");
+  if (renovateForm) wireAgentFields(renovateForm);
+
   var form = document.querySelector(".pipeline-form");
   if (!form) return;
   var agentFields = wireAgentFields(form);

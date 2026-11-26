@@ -29,7 +29,8 @@ use crate::local_server::{HttpLocalServerProbe, LocalServerProbe, normalize_serv
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTransport};
 use crate::pages::{self, HeaderState, JobLinks, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{
-    Project, ProjectForge, ProjectLabel, Projects, StageAgents, StageEfforts, StageModels,
+    Project, ProjectForge, ProjectLabel, Projects, RenovateAgent, StageAgents, StageEfforts,
+    StageModels,
 };
 use crate::proxy::{StoreUpstreams, Upstream, Upstreams};
 use crate::registry::AgentRegistry;
@@ -372,6 +373,10 @@ fn project_card_routes() -> Router<AppState> {
         .route(
             "/settings/projects/{project}/packages",
             post(save_project_packages),
+        )
+        .route(
+            "/settings/projects/{project}/renovate-agent",
+            post(save_project_renovate_agent),
         )
         .route("/settings/projects/{project}/name", post(save_project_name))
         .route(
@@ -2214,6 +2219,7 @@ fn project_settings(
         default_gates: state.store.settings()?.gates,
         servers,
         collaborators: state.store.collaborators(name)?,
+        renovate_agent: state.store.project_renovate_agent(name)?,
         maintenance,
         forge_problem: project.forge.problem(),
         upstream_problem: unknown_upstream.map(|name| {
@@ -3580,6 +3586,34 @@ struct PackagesForm {
     packages: String,
     #[serde(default)]
     csrf: String,
+}
+
+async fn save_project_renovate_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Result<Redirect, AppError> {
+    visible_project(&state, &headers, &project)?;
+    let form = ProjectForm(pairs.into_iter().collect());
+    require_csrf(
+        &state,
+        &user(&headers),
+        form.get("csrf").unwrap_or_default(),
+    )?;
+    let agent = form.ticked("renovate_override").then(|| RenovateAgent {
+        agent: form.agent("renovate_agent"),
+        model: form.model("renovate"),
+        effort: form.effort("renovate_effort"),
+    });
+    state
+        .store
+        .save_project_renovate_agent(&project, agent.as_ref())?;
+    state.wake.notify_one();
+    Ok(Redirect::to(&format!(
+        "/settings/projects/{}?notice=Saved.",
+        query_escape(&project)
+    )))
 }
 
 async fn save_project_packages(

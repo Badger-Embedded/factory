@@ -7366,7 +7366,11 @@ async fn the_settings_form_has_an_effort_selector_per_stage_preselected_to_the_e
     }
     // With nothing saved, every stage preselects the medium default, so the
     // selected option appears once per stage.
-    assert_eq!(page.body.matches("value=\"medium\" checked").count(), 5);
+    let doc = scraper::Html::parse_document(&page.body);
+    let medium =
+        scraper::Selector::parse(".pipe-panel input[name$=_effort][value=medium][checked]")
+            .unwrap();
+    assert_eq!(doc.select(&medium).count(), 5);
 
     // A saved level preselects in place of the default.
     dashboard
@@ -7649,8 +7653,8 @@ async fn a_collaborator_who_is_not_an_admin_can_pick_local_in_every_stage() {
     assert_eq!(page.status, StatusCode::OK);
     assert_eq!(
         page.body.matches("value=\"local\"").count(),
-        5,
-        "one Local radio per stage",
+        6,
+        "one Local radio per stage and one in the Renovate agent card",
     );
 }
 
@@ -8262,21 +8266,21 @@ async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_selectable
     // Claude radio appears once per stage.
     assert_eq!(
         page.body.matches("value=\"claude\" checked").count(),
-        5,
-        "Claude should be preselected in all five stages",
+        6,
+        "Claude should be preselected in all five stages and the Renovate agent card",
     );
     assert!(page.body.contains("value=\"codex\""));
     assert!(!page.body.contains("value=\"codex\" checked"));
     assert!(!page.body.contains("value=\"codex\" disabled"));
     assert_eq!(
         page.body.matches("value=\"copilot\"").count(),
-        5,
-        "Copilot should be a radio in all five stages",
+        6,
+        "Copilot should be a radio in all five stages and the Renovate agent card",
     );
     assert_eq!(
         page.body.matches("value=\"local\"").count(),
-        5,
-        "Local should be a radio in all five stages",
+        6,
+        "Local should be a radio in all five stages and the Renovate agent card",
     );
     assert!(!page.body.contains("value=\"local\" disabled"));
     assert!(!page.body.contains("value=\"local\" checked"));
@@ -12145,7 +12149,7 @@ async fn each_settings_form_ends_in_a_save_bar_and_the_page_tracks_changes() {
     ] {
         let body = dashboard.get(uri).await.body;
         let bars = if uri == "/settings/projects/maestro" {
-            7
+            8
         } else {
             1
         };
@@ -17876,5 +17880,202 @@ async fn a_github_project_can_name_a_forgejo_upstream() {
             .contains("Checked with no token: o/tool is readable on other."),
         "{}",
         reply.body
+    );
+}
+
+const RENOVATE_ROUTE: &str = "/settings/projects/maestro/renovate-agent";
+
+async fn renovate_csrf(dashboard: &Dashboard) -> String {
+    let page = dashboard.get(PROJECT_PAGE).await;
+    let doc = scraper::Html::parse_document(&page.body);
+    doc.select(&scraper::Selector::parse("form.renovate-agent-form input[name=csrf]").unwrap())
+        .next()
+        .and_then(|input| input.value().attr("value"))
+        .expect("the Renovate agent card carries a csrf token")
+        .to_owned()
+}
+
+async fn renovate_post(dashboard: &Dashboard, fields: &str) -> Reply {
+    let csrf = renovate_csrf(dashboard).await;
+    dashboard
+        .post(RENOVATE_ROUTE, &format!("csrf={csrf}&{fields}"))
+        .await
+}
+
+fn renovate_card_checked(body: &str, selector: &str) -> Vec<String> {
+    let doc = scraper::Html::parse_document(body);
+    let sel = scraper::Selector::parse(&format!("form.renovate-agent-form {selector}")).unwrap();
+    doc.select(&sel)
+        .map(|input| input.value().attr("value").unwrap_or("").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_renovate_agent_card_is_off_and_shows_the_review_stage_by_default() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_efforts(
+            "maestro",
+            &efforts("medium", "medium", "medium", "medium", "high"),
+            &agents("claude", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let body = dashboard.get(PROJECT_PAGE).await.body;
+    assert_eq!(
+        renovate_card_checked(&body, "input[name=renovate_override][checked]"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        renovate_card_checked(&body, "input[name=renovate_agent][checked]"),
+        ["claude"]
+    );
+    assert_eq!(
+        renovate_card_checked(&body, "input[name=renovate_effort][checked]"),
+        ["high"]
+    );
+}
+
+#[tokio::test]
+async fn saving_the_renovate_agent_round_trips_and_turning_it_off_deletes_it() {
+    let dashboard = dashboard();
+    let reply = renovate_post(
+        &dashboard,
+        "renovate_override=on&renovate_agent=codex&renovate=gpt-5&renovate_effort=low",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        dashboard.store.project_renovate_agent("maestro").unwrap(),
+        Some(factory_server::RenovateAgent {
+            agent: "codex".into(),
+            model: Some("gpt-5".into()),
+            effort: "low".into(),
+        })
+    );
+    let body = dashboard.get(PROJECT_PAGE).await.body;
+    assert_eq!(
+        renovate_card_checked(&body, "input[name=renovate_override][checked]"),
+        ["on"]
+    );
+    assert_eq!(
+        renovate_card_checked(&body, "input[name=renovate_agent][checked]"),
+        ["codex"]
+    );
+    assert_eq!(
+        renovate_card_checked(&body, "input[name=renovate][value=gpt-5]"),
+        ["gpt-5"]
+    );
+    assert_eq!(
+        renovate_card_checked(&body, "input[name=renovate_effort][checked]"),
+        ["low"]
+    );
+
+    let reply = renovate_post(&dashboard, "renovate_agent=codex&renovate_effort=low").await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        dashboard.store.project_renovate_agent("maestro").unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_bad_renovate_agent_is_rejected_by_name_and_stores_nothing() {
+    let dashboard = dashboard();
+    for fields in [
+        "renovate_override=on&renovate_agent=gemini&renovate_effort=low",
+        "renovate_override=on&renovate_agent=codex&renovate_effort=max",
+        "renovate_override=on&renovate_agent=local&renovate=&renovate_effort=high",
+    ] {
+        let reply = renovate_post(&dashboard, fields).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{fields}");
+        assert!(reply.body.contains("Renovate"), "{fields}");
+        assert_eq!(
+            dashboard.store.project_renovate_agent("maestro").unwrap(),
+            None,
+            "{fields}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_renovate_agent_route_needs_a_csrf_token() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            RENOVATE_ROUTE,
+            "renovate_override=on&renovate_agent=claude&renovate_effort=low",
+        )
+        .await;
+    assert_ne!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard.store.project_renovate_agent("maestro").unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_cannot_read_or_save_the_renovate_agent() {
+    let dashboard = dashboard();
+    let csrf = renovate_csrf(&dashboard).await;
+    let page = dashboard.get_as(STRANGER, PROJECT_PAGE).await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+    let reply = dashboard
+        .post_as(
+            STRANGER,
+            RENOVATE_ROUTE,
+            &format!("csrf={csrf}&renovate_override=on&renovate_agent=claude&renovate_effort=low"),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        dashboard.store.project_renovate_agent("maestro").unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn the_renovate_agent_and_the_stage_panel_save_independently() {
+    let dashboard = dashboard();
+    let stages = (
+        dashboard.store.project_agents("maestro").unwrap(),
+        dashboard.store.project_efforts("maestro").unwrap(),
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap(),
+    );
+    renovate_post(
+        &dashboard,
+        "renovate_override=on&renovate_agent=codex&renovate=gpt-5&renovate_effort=low",
+    )
+    .await;
+    assert_eq!(
+        stages,
+        (
+            dashboard.store.project_agents("maestro").unwrap(),
+            dashboard.store.project_efforts("maestro").unwrap(),
+            dashboard
+                .store
+                .project_models("maestro", &StageModels::default())
+                .unwrap(),
+        )
+    );
+
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=&spec=&plan=&implement=&review=&\
+             clarify_effort=medium&spec_effort=medium&plan_effort=medium&\
+             implement_effort=medium&review_effort=medium",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        dashboard
+            .store
+            .project_renovate_agent("maestro")
+            .unwrap()
+            .is_some()
     );
 }
