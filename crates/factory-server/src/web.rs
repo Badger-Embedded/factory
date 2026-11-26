@@ -37,9 +37,9 @@ use crate::registry::AgentRegistry;
 use crate::secrets::{ForgeTokenOwner, SecretError, SecretRef, SecretStore, validate_codex_auth};
 use crate::settings::Settings;
 use crate::store::{
-    FACTORY_REQUESTER, JobFile, JobRow, MAX_LOCAL_LOAD_MINUTES, Maintenance, MaintenanceSave,
-    Packaging, PackagingType, PrerequisiteEdit, PrerequisiteView, ProjectGuard, ProjectTotals,
-    Store, StoreError,
+    FACTORY_REQUESTER, GroupsSave, JobFile, JobRow, MAX_LOCAL_LOAD_MINUTES, Maintenance,
+    MaintenanceSave, Packaging, PackagingType, PrerequisiteEdit, PrerequisiteView, ProjectGuard,
+    ProjectTotals, Store, StoreError,
 };
 use crate::usage::PlanUsageCache;
 use crate::workers::WorkerSlots;
@@ -263,15 +263,18 @@ pub fn app_with_forgejo_probe(
             "/settings/projects/{project}/mcp/{server}/check",
             post(check_mcp_server),
         )
-        .merge(local_key_routes())
+        .merge(user_routes())
         .merge(admin_routes(state.clone()))
         .with_state(state)
 }
 
-fn local_key_routes() -> Router<AppState> {
+/// The pages under Settings that belong to the login alone.
+fn user_routes() -> Router<AppState> {
     Router::new()
         .route("/settings/local", get(show_local_key).post(save_local_key))
         .route("/settings/local/clear", post(clear_user_local_key))
+        .route("/settings/groups", get(show_groups).post(save_groups))
+        .route("/settings/groups/projects", post(save_group_members))
 }
 
 fn admin_routes(state: AppState) -> Router<AppState> {
@@ -627,7 +630,8 @@ fn load_board(
             (name, saved.unwrap_or(default))
         })
         .collect();
-    let attention = pages::project_attention(&names, &jobs, &waits, &auto_merges);
+    let groups = state.store.project_groups(login)?;
+    let attention = pages::project_attention(&names, &jobs, &waits, &auto_merges, &groups);
     let (totals, auto_merge, project) = match &selected {
         Some(name) => (
             state.store.project_totals(name)?,
@@ -1808,6 +1812,107 @@ async fn save_notifications(
         .store
         .set_notifications(&user(&headers), form.notifications.is_some())?;
     notifications_page(&state, &headers, Some("Saved."))
+}
+
+fn groups_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    Ok(pages::settings_groups(
+        &login,
+        &settings_nav(state, &login)?,
+        &state.store.project_groups(&login)?,
+        &state.csrf.issue(&login),
+        notice,
+    ))
+}
+
+async fn show_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    groups_page(&state, &headers, None)
+}
+
+/// The value of the form field `name`, or an empty string.
+fn form_value<'a>(form: &'a [(String, String)], name: &str) -> &'a str {
+    form.iter()
+        .find(|(key, _)| key == name)
+        .map_or("", |(_, value)| value.as_str())
+}
+
+/// Saves the login's group names from fields `group-<id>` and `new`. The
+/// names are trimmed. A name longer than the page allows or one that repeats
+/// another, ignoring case, saves nothing and says why.
+async fn save_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Result<Markup, AppError> {
+    let login = user(&headers);
+    require_csrf(&state, &login, form_value(&form, "csrf"))?;
+    let names: Vec<(i64, String)> = form
+        .iter()
+        .filter_map(|(key, value)| {
+            let id = key.strip_prefix("group-")?.parse::<i64>().ok()?;
+            Some((id, value.trim().to_owned()))
+        })
+        .collect();
+    let added = form_value(&form, "new").trim();
+    let saved =
+        state
+            .store
+            .save_project_groups(&login, &names, (!added.is_empty()).then_some(added))?;
+    match saved {
+        GroupsSave::Saved => {}
+        GroupsSave::TooLong(long) => {
+            let notice = format!(
+                "\"{long}\" is longer than {} characters, so nothing was saved.",
+                pages::MAX_GROUP_NAME
+            );
+            return groups_page(&state, &headers, Some(&notice));
+        }
+        GroupsSave::Repeated(repeat) => {
+            let notice = format!("Two groups are named \"{repeat}\", so nothing was saved.");
+            return groups_page(&state, &headers, Some(&notice));
+        }
+    }
+    groups_page(&state, &headers, Some("Saved."))
+}
+
+/// Puts each of the login's projects in the group its `project:<id>` field
+/// names, or in none for an empty value. A field for a project the login does
+/// not collaborate on, or a group that is not the login's, changes nothing.
+async fn save_group_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<Vec<(String, String)>>,
+) -> Result<Markup, AppError> {
+    let login = user(&headers);
+    require_csrf(&state, &login, form_value(&form, "csrf"))?;
+    let projects = project_labels(&state, &login)?;
+    let groups = state.store.project_groups(&login)?;
+    let assignments: Vec<(String, Option<i64>)> = form
+        .iter()
+        .filter_map(|(key, value)| {
+            let project = key.strip_prefix("project:")?;
+            if !projects.iter().any(|label| label.id == project) {
+                return None;
+            }
+            if value.is_empty() {
+                return Some((project.to_owned(), None));
+            }
+            let id = value.parse::<i64>().ok()?;
+            groups
+                .iter()
+                .any(|group| group.id == id)
+                .then(|| (project.to_owned(), Some(id)))
+        })
+        .collect();
+    state.store.set_project_groups(&login, &assignments)?;
+    groups_page(&state, &headers, Some("Saved."))
 }
 
 #[derive(Deserialize)]

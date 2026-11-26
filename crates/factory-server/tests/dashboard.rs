@@ -4334,17 +4334,16 @@ async fn the_picker_shows_its_keys_as_kbd_caps() {
         .unwrap();
     assert_eq!(cap.text().collect::<String>(), "P");
     let footer = doc
-        .select(&sel("#project-picker .picker-panel > div.picker-keys"))
+        .select(&sel(
+            "#project-picker .picker-panel > div.picker-foot > div.picker-keys",
+        ))
         .next()
         .unwrap();
     let caps: Vec<String> = footer
         .select(&sel("kbd"))
         .map(|k| k.text().collect::<String>())
         .collect();
-    assert_eq!(
-        caps,
-        ["↑", "↓", "J", "K", "Enter", "Esc", "I", "N", "Shift", "N"]
-    );
+    assert_eq!(caps, ["J", "K", "I", "N", "⇧N"]);
     assert!(
         footer.value().attr("hidden").is_some(),
         "hidden until the script runs"
@@ -4366,7 +4365,7 @@ async fn the_picker_has_a_search_box_and_a_hidden_empty_message() {
     assert!(empty.value().attr("hidden").is_some());
     assert_eq!(empty.text().collect::<String>(), "No project matches.");
     let rows = doc
-        .select(&scraper::Selector::parse("#picker-list > li").unwrap())
+        .select(&scraper::Selector::parse("#picker-list li[data-id]").unwrap())
         .collect::<Vec<_>>();
     assert_eq!(rows.len(), 2);
     for row in rows {
@@ -4412,7 +4411,7 @@ fn assert_current_project(body: &str, id: &str, shown: &str) {
 fn picker_rows(body: &str) -> Vec<(String, String, Vec<String>)> {
     let doc = scraper::Html::parse_document(body);
     let selector = |css: &str| scraper::Selector::parse(css).unwrap();
-    doc.select(&selector("#picker-list > li"))
+    doc.select(&selector("#picker-list li[data-id]"))
         .map(|row| {
             let badges = row
                 .select(&selector(".badge, .picker-running"))
@@ -4561,6 +4560,359 @@ async fn the_picker_orders_needs_you_then_failed_then_running_then_the_rest() {
     assert_eq!(groups, ["you", "failed", "running", "idle"]);
     assert_eq!(rows[3].2, Vec::<String>::new());
     assert_eq!(rows[2].2, ["running"]);
+}
+
+/// The picker's sections in order: the heading, or `None` for a section
+/// without one, and the identifiers of its rows.
+fn picker_sections(body: &str) -> Vec<(Option<String>, Vec<String>)> {
+    let doc = scraper::Html::parse_document(body);
+    let selector = |css: &str| scraper::Selector::parse(css).unwrap();
+    doc.select(&selector("#picker-list > li.picker-section"))
+        .map(|section| {
+            let heading = section
+                .select(&selector(".picker-heading"))
+                .next()
+                .map(|heading| heading.text().collect::<String>());
+            let rows = section
+                .select(&selector("li[data-id]"))
+                .map(|row| row.value().attr("data-id").unwrap().to_owned())
+                .collect();
+            (heading, rows)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_picker_labels_its_attention_sections_and_leaves_the_rest_unlabelled() {
+    let dashboard = four_projects();
+    let failed = job_in(&dashboard, "b-failed").await;
+    fail_job(&dashboard, failed);
+    let you = job_in(&dashboard, "c-you").await;
+    to_spec_approval(&dashboard, you);
+    job_in(&dashboard, "d-running").await;
+
+    let body = dashboard.get("/?project=a-idle").await.body;
+    assert_eq!(
+        picker_sections(&body),
+        [
+            (Some("Needs you".to_owned()), vec!["c-you".to_owned()]),
+            (Some("Failed".to_owned()), vec!["b-failed".to_owned()]),
+            (Some("Running".to_owned()), vec!["d-running".to_owned()]),
+            (None, vec!["a-idle".to_owned()]),
+        ]
+    );
+    assert!(body.contains("<ul aria-labelledby=\"picker-sec-0\">"));
+}
+
+#[tokio::test]
+async fn the_picker_lists_a_logins_groups_in_name_order_then_other() {
+    let dashboard = four_projects();
+    let you = job_in(&dashboard, "c-you").await;
+    to_spec_approval(&dashboard, you);
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("zeta")).unwrap();
+    store.save_project_groups(USER, &[], Some("Alpha")).unwrap();
+    let groups = store.project_groups(USER).unwrap();
+    let names: Vec<_> = groups.iter().map(|group| group.name.as_str()).collect();
+    assert_eq!(names, ["Alpha", "zeta"]);
+    let (alpha, zeta) = (groups[0].id, groups[1].id);
+    store
+        .set_project_groups(
+            USER,
+            &[
+                ("a-idle".into(), Some(zeta)),
+                ("c-you".into(), Some(zeta)),
+                ("b-failed".into(), Some(alpha)),
+            ],
+        )
+        .unwrap();
+
+    let body = dashboard.get("/?project=a-idle").await.body;
+    assert_eq!(
+        picker_sections(&body),
+        [
+            (Some("Alpha".to_owned()), vec!["b-failed".to_owned()]),
+            (
+                Some("zeta".to_owned()),
+                vec!["c-you".to_owned(), "a-idle".to_owned()]
+            ),
+            (Some("Other".to_owned()), vec!["d-running".to_owned()]),
+        ]
+    );
+    store
+        .add_collaborator("a-idle", "bob@example.com", "alice")
+        .unwrap();
+    let other = dashboard
+        .get_as("bob@example.com", "/?project=a-idle")
+        .await
+        .body;
+    assert_eq!(picker_sections(&other), [(None, vec!["a-idle".to_owned()])]);
+}
+
+/// The form token on a page rendered for `login`.
+fn form_token(body: &str) -> String {
+    body.split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn the_project_groups_page_adds_renames_removes_and_assigns_groups() {
+    let dashboard = four_projects();
+    let page = dashboard.get("/settings/groups").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(
+        page.body
+            .contains("href=\"/settings/groups\" aria-current=\"page\"")
+    );
+    assert!(
+        !page.body.contains("id=\"group-members\""),
+        "no projects form before a group exists"
+    );
+    let csrf = form_token(&page.body);
+
+    let forbidden = dashboard.post("/settings/groups", "new=Home").await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+    assert_eq!(dashboard.store.project_groups(USER).unwrap(), []);
+
+    let saved = dashboard
+        .post("/settings/groups", &format!("csrf={csrf}&new=+Home+"))
+        .await;
+    assert!(saved.body.contains("Saved."));
+    assert!(saved.body.contains("id=\"group-members\""));
+    let home = dashboard.store.project_groups(USER).unwrap()[0].id;
+
+    let repeat = dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{home}=Home&new=home"),
+        )
+        .await;
+    assert!(
+        repeat
+            .body
+            .contains("Two groups are named &quot;home&quot;, so nothing was saved.")
+    );
+    let long = "x".repeat(41);
+    let too_long = dashboard
+        .post("/settings/groups", &format!("csrf={csrf}&new={long}"))
+        .await;
+    assert!(too_long.body.contains("is longer than 40 characters"));
+    assert_eq!(dashboard.store.project_groups(USER).unwrap().len(), 1);
+
+    let assigned = dashboard
+        .post(
+            "/settings/groups/projects",
+            &format!("csrf={csrf}&project%3Aa-idle={home}&project%3Ab-failed=999&project%3Anot-mine={home}"),
+        )
+        .await;
+    assert!(assigned.body.contains("Saved."));
+    assert_eq!(
+        dashboard.store.project_groups(USER).unwrap()[0].projects,
+        ["a-idle"]
+    );
+
+    dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{home}=Hobby"),
+        )
+        .await;
+    let groups = dashboard.store.project_groups(USER).unwrap();
+    assert_eq!(
+        (groups[0].name.as_str(), groups[0].projects.len()),
+        ("Hobby", 1)
+    );
+
+    dashboard
+        .post("/settings/groups", &format!("csrf={csrf}&group-{home}="))
+        .await;
+    assert_eq!(dashboard.store.project_groups(USER).unwrap(), []);
+    let body = dashboard.get("/?project=a-idle").await.body;
+    assert_eq!(
+        picker_sections(&body).len(),
+        1,
+        "no group left, so the list is flat"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_project_drops_it_from_every_group() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    store
+        .set_project_groups(
+            USER,
+            &[("a-idle".into(), Some(home)), ("c-you".into(), Some(home))],
+        )
+        .unwrap();
+    store.remove_project("a-idle").unwrap();
+    assert_eq!(store.project_groups(USER).unwrap()[0].projects, ["c-you"]);
+}
+
+#[tokio::test]
+async fn a_group_id_that_is_not_the_logins_leaves_a_project_where_it_is() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    store
+        .save_project_groups("someone@else", &[], Some("Theirs"))
+        .unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    let theirs = store.project_groups("someone@else").unwrap()[0].id;
+    store
+        .set_project_groups(USER, &[("a-idle".into(), Some(home))])
+        .unwrap();
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+
+    for foreign in [999, theirs] {
+        dashboard
+            .post(
+                "/settings/groups/projects",
+                &format!("csrf={csrf}&project%3Aa-idle={foreign}"),
+            )
+            .await;
+        assert_eq!(store.project_groups(USER).unwrap()[0].projects, ["a-idle"]);
+        assert_eq!(
+            store.project_groups("someone@else").unwrap()[0]
+                .projects
+                .len(),
+            0
+        );
+    }
+    dashboard
+        .post(
+            "/settings/groups/projects",
+            &format!("csrf={csrf}&project%3Aa-idle="),
+        )
+        .await;
+    assert_eq!(store.project_groups(USER).unwrap()[0].projects.len(), 0);
+}
+
+#[tokio::test]
+async fn the_group_routes_reject_a_missing_token_and_ignore_another_logins_group() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    store
+        .save_project_groups("someone@else", &[], Some("Theirs"))
+        .unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    let theirs = store.project_groups("someone@else").unwrap()[0].id;
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+
+    let forbidden = dashboard
+        .post(
+            "/settings/groups/projects",
+            &format!("project%3Aa-idle={home}"),
+        )
+        .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+    assert_eq!(store.project_groups(USER).unwrap()[0].projects.len(), 0);
+
+    dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{theirs}=Mine"),
+        )
+        .await;
+    assert_eq!(
+        store.project_groups("someone@else").unwrap()[0].name,
+        "Theirs"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_group_field_is_checked_as_it_is_saved() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+    let long = "x".repeat(41);
+    dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{home}=Hobby&group-{home}={long}"),
+        )
+        .await;
+    assert_eq!(store.project_groups(USER).unwrap()[0].name, "Hobby");
+}
+
+#[tokio::test]
+async fn the_picker_escapes_group_names_and_its_fragment_lists_the_sections() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    let before = dashboard.get("/fragments/picker?project=a-idle").await.body;
+    store
+        .save_project_groups(USER, &[], Some("<b>Home</b>"))
+        .unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    store
+        .set_project_groups(USER, &[("a-idle".into(), Some(home))])
+        .unwrap();
+
+    let page = dashboard.get("/?project=a-idle").await.body;
+    assert!(page.contains("&lt;b&gt;Home&lt;/b&gt;"));
+    assert!(!page.contains("<b>Home</b>"));
+    let fragment = dashboard.get("/fragments/picker?project=a-idle").await;
+    assert_eq!(fragment.status, StatusCode::OK);
+    assert!(fragment.body.contains("picker-section"));
+    assert!(fragment.body.contains("&lt;b&gt;Home&lt;/b&gt;"));
+    assert_ne!(picker_poll_url(&before), picker_poll_url(&fragment.body));
+}
+
+fn picker_poll_url(body: &str) -> Option<String> {
+    let doc = scraper::Html::parse_fragment(body);
+    let list = doc
+        .select(&scraper::Selector::parse("#picker-list").unwrap())
+        .next()?;
+    let url = list.value().attr("hx-get")?;
+    Some(url.to_owned())
+}
+
+#[tokio::test]
+async fn renaming_a_populated_group_invalidates_a_grouped_poll() {
+    let dashboard = four_projects();
+    let store = &dashboard.store;
+    store.save_project_groups(USER, &[], Some("Home")).unwrap();
+    let home = store.project_groups(USER).unwrap()[0].id;
+    store
+        .set_project_groups(USER, &[("a-idle".into(), Some(home))])
+        .unwrap();
+    let url =
+        picker_poll_url(&dashboard.get("/fragments/picker?project=a-idle").await.body).unwrap();
+    assert_eq!(dashboard.get(&url).await.status, StatusCode::NO_CONTENT);
+
+    let csrf = form_token(&dashboard.get("/settings/groups").await.body);
+    dashboard
+        .post(
+            "/settings/groups",
+            &format!("csrf={csrf}&group-{home}=Hobby"),
+        )
+        .await;
+    let stale = dashboard.get(&url).await;
+    assert_eq!(stale.status, StatusCode::OK);
+    assert!(stale.body.contains(">Hobby<"));
+    assert!(stale.body.contains("hx-swap-oob=\"true\""));
+}
+
+#[tokio::test]
+async fn a_login_that_is_not_an_admin_reaches_the_project_groups_page() {
+    let dashboard = four_projects();
+    dashboard
+        .store
+        .add_collaborator("a-idle", "bob@example.com", "alice")
+        .unwrap();
+    let page = dashboard
+        .get_as("bob@example.com", "/settings/groups")
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("href=\"/settings/groups\""));
 }
 
 #[tokio::test]

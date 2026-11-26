@@ -272,6 +272,17 @@ CREATE TABLE IF NOT EXISTS user_settings (
     notifications INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS project_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    login TEXT NOT NULL,
+    name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_group_members (
+    login TEXT NOT NULL,
+    project TEXT NOT NULL,
+    group_id INTEGER NOT NULL,
+    PRIMARY KEY (login, project)
+);
 CREATE TABLE IF NOT EXISTS user_forge_accounts (
     login TEXT NOT NULL,
     forge TEXT NOT NULL,
@@ -320,6 +331,29 @@ CREATE TABLE IF NOT EXISTS store_boots (
 
 /// The longest model load wait the Local settings accept, in minutes.
 pub const MAX_LOCAL_LOAD_MINUTES: u32 = 60;
+
+/// One of a login's project groups, which sort that login's project picker
+/// into sections. `projects` holds identifiers, and a project is in at most
+/// one of the login's groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGroup {
+    pub id: i64,
+    pub name: String,
+    pub projects: Vec<String>,
+}
+
+/// The longest project group name the Project groups page takes, in characters.
+pub const MAX_GROUP_NAME: usize = 40;
+
+/// What [`Store::save_project_groups`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupsSave {
+    Saved,
+    /// A name longer than [`MAX_GROUP_NAME`] characters. Nothing was saved.
+    TooLong(String),
+    /// A name that repeats another, ignoring case. Nothing was saved.
+    Repeated(String),
+}
 
 /// The Local agent's factory-wide settings. `url` is `None` until an admin
 /// stores a server.
@@ -3291,6 +3325,140 @@ impl Store {
         Ok(())
     }
 
+    /// The project groups `login` made, in name order ignoring case, each
+    /// with the identifiers of its projects. A project removed from the
+    /// factory has no membership left; one the login stopped collaborating on
+    /// keeps its row, and the caller leaves it out by listing only the
+    /// login's projects.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_groups(&self, login: &str) -> Result<Vec<ProjectGroup>, StoreError> {
+        project_groups_in(&self.conn(), login)
+    }
+
+    /// Renames `login`'s groups, removes the ones whose new name is empty
+    /// with their memberships, and adds `added` when it is set. An id that is
+    /// not one of the login's groups changes nothing, and the first name for
+    /// an id counts. A name longer than [`MAX_GROUP_NAME`] characters or one
+    /// that repeats another, ignoring case, saves nothing. The names are
+    /// checked in the transaction that writes them.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error. Nothing is written when it fails.
+    pub fn save_project_groups(
+        &self,
+        login: &str,
+        names: &[(i64, String)],
+        added: Option<&str>,
+    ) -> Result<GroupsSave, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let known = project_groups_in(&tx, login)?;
+        let mut renames: Vec<(i64, &str)> = Vec::new();
+        for (id, name) in names {
+            if known.iter().any(|group| group.id == *id)
+                && !renames.iter().any(|(seen, _)| seen == id)
+            {
+                renames.push((*id, name));
+            }
+        }
+        let mut kept: Vec<&str> = known
+            .iter()
+            .map(|group| {
+                renames
+                    .iter()
+                    .find(|(id, _)| *id == group.id)
+                    .map_or(group.name.as_str(), |(_, name)| *name)
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+        kept.extend(added);
+        if let Some(long) = kept
+            .iter()
+            .find(|name| name.chars().count() > MAX_GROUP_NAME)
+        {
+            return Ok(GroupsSave::TooLong((*long).to_owned()));
+        }
+        let mut seen = HashSet::new();
+        if let Some(repeat) = kept.iter().find(|name| !seen.insert(name.to_lowercase())) {
+            return Ok(GroupsSave::Repeated((*repeat).to_owned()));
+        }
+        for (id, name) in renames {
+            if name.is_empty() {
+                tx.execute(
+                    "DELETE FROM project_group_members WHERE login = ?1 AND group_id = ?2",
+                    params![login, id],
+                )?;
+                tx.execute(
+                    "DELETE FROM project_groups WHERE login = ?1 AND id = ?2",
+                    params![login, id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE project_groups SET name = ?3 WHERE login = ?1 AND id = ?2",
+                    params![login, id, name],
+                )?;
+            }
+        }
+        if let Some(name) = added {
+            tx.execute(
+                "INSERT INTO project_groups (login, name) VALUES (?1, ?2)",
+                params![login, name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(GroupsSave::Saved)
+    }
+
+    /// Puts each project of `assignments` in the group it names, or in no
+    /// group for `None`. A project `login` does not collaborate on, and a
+    /// group id that is not one of `login`'s groups, change nothing. Both are
+    /// checked in the transaction that writes.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error. Nothing is written when it fails.
+    pub fn set_project_groups(
+        &self,
+        login: &str,
+        assignments: &[(String, Option<i64>)],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (project, group) in assignments {
+            let collaborates: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM project_collaborators
+                                WHERE login = ?1 AND project = ?2)",
+                params![login, project],
+                |row| row.get(0),
+            )?;
+            if !collaborates {
+                continue;
+            }
+            match group {
+                None => {
+                    tx.execute(
+                        "DELETE FROM project_group_members WHERE login = ?1 AND project = ?2",
+                        params![login, project],
+                    )?;
+                }
+                Some(group) => {
+                    tx.execute(
+                        "INSERT INTO project_group_members (login, project, group_id)
+                         SELECT ?1, ?2, id FROM project_groups WHERE login = ?1 AND id = ?3
+                         ON CONFLICT (login, project) DO UPDATE SET group_id = excluded.group_id",
+                        params![login, project, group],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The names of the projects `login` collaborates on, in name order.
     ///
     /// # Errors
@@ -3580,6 +3748,7 @@ impl Store {
             "project_forge_accounts",
             "gh_token_copies",
             "project_instances",
+            "project_group_members",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;
@@ -5794,4 +5963,32 @@ fn read_forge_account(
         login,
         id: id.cast_unsigned(),
     }))
+}
+
+fn project_groups_in(conn: &Connection, login: &str) -> Result<Vec<ProjectGroup>, StoreError> {
+    let mut stmt = conn.prepare("SELECT id, name FROM project_groups WHERE login = ?1")?;
+    let mut groups = stmt
+        .query_map([login], |row| {
+            Ok(ProjectGroup {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                projects: Vec::new(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    groups.sort_by_cached_key(|group| (group.name.to_lowercase(), group.id));
+    let mut stmt = conn.prepare(
+        "SELECT group_id, project FROM project_group_members WHERE login = ?1
+         ORDER BY project",
+    )?;
+    let members = stmt.query_map([login], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for member in members {
+        let (id, project) = member?;
+        if let Some(group) = groups.iter_mut().find(|group| group.id == id) {
+            group.projects.push(project);
+        }
+    }
+    Ok(groups)
 }

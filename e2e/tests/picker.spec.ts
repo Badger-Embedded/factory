@@ -37,7 +37,7 @@ test.describe('as a login of its own', () => {
 
     await button(page).click();
     await expect(button(page)).toHaveAttribute('aria-expanded', 'true');
-    await expect(page.locator('#picker-list li')).toHaveCount(2);
+    await expect(page.locator('#picker-list li[data-id]')).toHaveCount(2);
     await expect(page.locator('#picker-list a[aria-current="page"]')).toHaveAttribute('href', `/?project=a${tag}`);
 
     await page.locator(`#picker-list a[href="/?project=b${tag}"]`).click();
@@ -101,9 +101,102 @@ test.describe('as a login of its own', () => {
 
     await page.goto(`/?project=${ids[0]}`);
     await button(page).click();
-    await expect(page.locator('#picker-list li')).toHaveCount(4);
-    const order = await page.locator('#picker-list li').evaluateAll((items) => items.map((item) => item.getAttribute('data-id')));
+    await expect(page.locator('#picker-list li[data-id]')).toHaveCount(4);
+    const order = await page.locator('#picker-list li[data-id]').evaluateAll((items) => items.map((item) => item.getAttribute('data-id')));
     expect(order).toEqual([ids[2], ids[1], ids[3], ids[0]]);
+  });
+
+  test('the list labels its attention sections and a search hides an emptied one', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    for (const name of ['idle', 'you']) projectFor(factory, login, `${name}${tag}`);
+    job(factory, `you${tag}`, 'spec');
+
+    await page.goto(`/?project=idle${tag}`);
+    await button(page).click();
+    const headings = page.locator('.picker-heading:visible');
+    await expect(headings).toHaveText(['Needs you']);
+    await expect(page.getByRole('list', { name: 'Needs you' }).locator('li[data-id]')).toHaveAttribute('data-id', `you${tag}`);
+    await expect(row(page, `idle${tag}`).locator('a[aria-current="page"] svg')).toBeVisible();
+
+    await page.getByLabel('Find a project').fill(`idle${tag}`);
+    await expect(headings).toHaveCount(0);
+    await expect(row(page, `idle${tag}`)).toBeVisible();
+  });
+
+  test('the pointer moves the one highlighted row', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    for (const name of ['a', 'b', 'c']) projectFor(factory, login, `${name}${tag}`);
+
+    await page.goto(`/?project=a${tag}`);
+    await button(page).click();
+    const active = page.locator('#picker-list li[data-id].active');
+    await expect(active).toHaveAttribute('data-id', `a${tag}`);
+    await row(page, `c${tag}`).hover();
+    await expect(active).toHaveCount(1);
+    await expect(active).toHaveAttribute('data-id', `c${tag}`);
+    await page.getByLabel('Find a project').press('ArrowUp');
+    await expect(active).toHaveAttribute('data-id', `b${tag}`);
+    const lit = await page.locator('#picker-list a').evaluateAll((links) =>
+      links.filter((link) => getComputedStyle(link).backgroundColor !== 'rgba(0, 0, 0, 0)').length,
+    );
+    expect(lit).toBe(1);
+  });
+
+  test('groups made on the settings page split the picker into sections', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    for (const name of ['a', 'b', 'c']) projectFor(factory, login, `${name}${tag}`);
+    job(factory, `c${tag}`, 'spec');
+
+    await page.goto(`/?project=a${tag}`);
+    await button(page).click();
+    await page.getByRole('link', { name: 'Edit groups' }).click();
+    await expect(page).toHaveURL(/\/settings\/groups$/);
+    await expect(page.locator('#group-members')).toHaveCount(0);
+    for (const name of ['Work', 'Home']) {
+      await page.getByLabel('Add a group').fill(name);
+      await page.getByRole('button', { name: 'Save groups' }).click();
+      await expect(page.locator('.card.saved')).toHaveText('Saved.');
+    }
+    await page.getByLabel(`b${tag}`, { exact: true }).selectOption({ label: 'Work' });
+    await page.getByLabel(`c${tag}`, { exact: true }).selectOption({ label: 'Work' });
+    await page.getByLabel(`a${tag}`, { exact: true }).selectOption({ label: 'Home' });
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(page.locator('.card.saved')).toHaveText('Saved.');
+
+    await page.goto(`/?project=a${tag}`);
+    await button(page).click();
+    await expect(page.locator('.picker-heading')).toHaveText(['Home', 'Work']);
+    const work = page.getByRole('list', { name: 'Work' }).locator('li[data-id]');
+    await expect(work).toHaveCount(2);
+    await expect(work.first()).toHaveAttribute('data-id', `c${tag}`);
+
+    await page.goto('/settings/groups');
+    await page.getByLabel('Name of Home').fill('');
+    await page.getByLabel('Name of Work').fill('');
+    await page.getByRole('button', { name: 'Save groups' }).click();
+    await page.goto(`/?project=a${tag}`);
+    await button(page).click();
+    await expect(page.locator('.picker-heading')).toHaveText(['Needs you']);
+  });
+
+  test('Enter on the focused Edit groups link follows it', async ({ page, factory }, testInfo) => {
+    const login = uniqueLogin(testInfo.workerIndex);
+    const tag = login.split('@')[0];
+    await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
+    projectFor(factory, login, `a${tag}`);
+    projectFor(factory, login, `b${tag}`);
+
+    await page.goto(`/?project=a${tag}`);
+    await button(page).click();
+    await page.getByRole('link', { name: 'Edit groups' }).focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(/\/settings\/groups$/);
   });
 
   test('a click outside and Esc close the panel', async ({ page, factory }, testInfo) => {
@@ -141,7 +234,7 @@ test.describe('as a login of its own', () => {
     await expect(row(page, `there${tag}`).locator('.badge.you')).toHaveText('1 need you', { timeout: 15_000 });
     await expect(page.locator('.picker-panel')).toBeVisible();
     await expect(button(page)).toHaveAttribute('aria-expanded', 'true');
-    await expect(page.locator('#picker-list li').first()).toHaveAttribute('data-id', `there${tag}`);
+    await expect(page.locator('#picker-list li[data-id]').first()).toHaveAttribute('data-id', `there${tag}`);
   });
 
   test('a project the login does not collaborate on has no row', async ({ page, factory }, testInfo) => {
@@ -153,7 +246,7 @@ test.describe('as a login of its own', () => {
     job(factory, `theirs${tag}`, 'spec');
 
     await page.goto(`/?project=mine${tag}`);
-    await expect(page.locator('#picker-list li')).toHaveCount(1);
+    await expect(page.locator('#picker-list li[data-id]')).toHaveCount(1);
     await expect(row(page, `theirs${tag}`)).toHaveCount(0);
     const response = await page.request.get(`/fragments/picker?project=theirs${tag}`);
     expect(response.status()).toBe(404);
@@ -339,7 +432,7 @@ for (const { width, height } of [
 
     await page.goto(`/?project=${names[20]}`);
     await button(page).click();
-    await expect(page.locator('#picker-list li')).toHaveCount(50);
+    await expect(page.locator('#picker-list li[data-id]')).toHaveCount(50);
 
     const panel = await page.locator('.picker-panel').boundingBox();
     expect(panel).not.toBeNull();
@@ -355,9 +448,9 @@ for (const { width, height } of [
       .evaluateAll((links) => links.map((link) => link.getBoundingClientRect().height));
     expect(Math.max(...heights)).toBeLessThanOrEqual(Math.min(...heights) + 1);
 
-    const long = page.locator('#picker-list li', { hasText: 'long'.repeat(20) });
+    const long = page.locator('#picker-list li[data-id]', { hasText: 'long'.repeat(20) });
     await expect(long.locator('.picker-name')).toHaveAttribute('title', names[0]);
-    await page.locator('#picker-list li').nth(0).locator('a').scrollIntoViewIfNeeded();
+    await page.locator('#picker-list li[data-id]').nth(0).locator('a').scrollIntoViewIfNeeded();
     const sideways = await page.evaluate(() => ({
       scroll: document.documentElement.scrollWidth,
       client: document.documentElement.clientWidth,

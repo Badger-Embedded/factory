@@ -22,7 +22,7 @@
 
   function rows() {
     const list = document.getElementById("picker-list");
-    return list ? Array.from(list.querySelectorAll("li")) : [];
+    return list ? Array.from(list.querySelectorAll("li[data-id]")) : [];
   }
 
   function visibleRows() {
@@ -31,10 +31,11 @@
 
   let activeId = null;
 
-  function highlight(row) {
+  function highlight(row, pointer) {
     activeId = row ? row.dataset.id : null;
     rows().forEach(function (other) { other.classList.toggle("active", other === row); });
     if (row) {
+      if (pointer) return;
       status.textContent = row.dataset.name;
       row.scrollIntoView({ block: "nearest" });
     } else {
@@ -49,6 +50,12 @@
         !row.dataset.name.toLowerCase().includes(query) &&
         !row.dataset.id.toLowerCase().includes(query);
     });
+    const list = document.getElementById("picker-list");
+    if (list) {
+      list.querySelectorAll(".picker-section").forEach(function (section) {
+        section.hidden = !section.querySelector("li[data-id]:not([hidden])");
+      });
+    }
     const shown = visibleRows();
     empty.hidden = shown.length > 0;
     const kept = keepActive === true && shown.find(function (row) { return row.dataset.id === activeId; });
@@ -100,6 +107,10 @@
   }
 
   search.addEventListener("input", function () { applyFilter(false); });
+  panel.addEventListener("mousemove", function (event) {
+    const row = event.target.closest("#picker-list li[data-id]");
+    if (row && !row.classList.contains("active")) highlight(row, true);
+  });
   search.addEventListener("keydown", function (event) {
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -169,7 +180,7 @@
           search.focus();
           return;
         }
-        if (event.key === "Enter" && !(target instanceof Element && target.closest("#picker-list a"))) {
+        if (event.key === "Enter" && !(target instanceof Element && target.closest("#picker-list a, .picker-foot a"))) {
           event.preventDefault();
           openHighlighted();
           return;
