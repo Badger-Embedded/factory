@@ -20,10 +20,10 @@ use crate::forges::Forges;
 use crate::local_server::{LoadError, LocalServerProbe};
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, LocalKeyOwner, LogSink,
-    PackagingRequest, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest,
-    RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action,
-    watch_only_event,
+    APPROVAL, AgentRequest, CHECKOUT_REPAIR, ChecksRequest, Executor, ExistingPr, LocalKeyOwner,
+    LogSink, PackagingRequest, PublishRequest, Published, ReadyAction, Rebase,
+    RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest,
+    ready_action, watch_only_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -105,7 +105,7 @@ fn repair_checkout(branch: &str, current: &str) -> String {
         format!("the branch {current}")
     };
     format!(
-        "The checkout is on {on}, or {branch} points at another commit than HEAD. \
+        "{CHECKOUT_REPAIR} It is on {on}, or {branch} points at another commit than HEAD. \
          Check out {branch} with git checkout {branch}, after you commit or move any \
          work you want to keep, and leave the checks' changes to the branch alone."
     )
@@ -453,23 +453,6 @@ impl PodmanExecutor {
         Ok(Published::Open(existing.number))
     }
 
-    /// Whether the checkout of a picked pull request job is on another branch
-    /// than the job's, left there by the checks. The agent starts in it
-    /// unchanged, because switching branches could refuse over its edits and
-    /// the agent could then never read the repair request.
-    async fn off_job_branch(&self, request: &AgentRequest, workspace: &Path) -> bool {
-        let (Some(_), Some(branch)) = (&request.existing, request.branch.as_deref()) else {
-            return false;
-        };
-        if !workspace.join(".git").exists() {
-            return false;
-        }
-        match self.checkout_state(workspace, branch).await {
-            Ok((current, _, _)) => current != branch,
-            Err(_) => false,
-        }
-    }
-
     async fn prepare_checkout(
         &self,
         request: &AgentRequest,
@@ -633,7 +616,7 @@ impl Executor for PodmanExecutor {
                 Err(reason) => return failed(reason),
             }
         }
-        if !self.off_job_branch(&request, &workspace).await
+        if !request.keep_checkout
             && let Err(reason) = self.prepare_checkout(&request, &workspace).await
         {
             return failed(reason);

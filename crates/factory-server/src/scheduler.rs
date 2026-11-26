@@ -54,6 +54,10 @@ pub fn branch_name(job_id: i64, pr: usize) -> String {
     format!("factory/job-{job_id}-pr-{}", pr + 1)
 }
 
+/// What a failed check report starts with when the checks left the checkout off
+/// the job branch.
+pub const CHECKOUT_REPAIR: &str = "The checkout is not on the job branch.";
+
 struct JobRefs {
     /// The branch of the job's checkout.
     branch: String,
@@ -155,6 +159,10 @@ pub struct AgentRequest {
     /// conflict with the picked pull request's base branch. The merge stays
     /// unfinished in the checkout when it conflicts, for the agent to resolve.
     pub merge_base: bool,
+    /// The run repairs a checkout the checks left off the job branch. The
+    /// executor keeps the checkout as it is, so the agent reads the request
+    /// even when switching branches would be refused over its edits.
+    pub keep_checkout: bool,
     /// The agent session UUID the factory picks. Claude passes it to
     /// `--session-id` and `--resume`; Codex, which names its own session, uses it
     /// only as the key its reported id is stored under.
@@ -1563,6 +1571,8 @@ impl<E: Executor> Scheduler<E> {
                 .then(|| refs.existing(&resolved.forge))
                 .flatten(),
             merge_base: refs.picked.is_some() && matches!(task, factory_core::Task::Rebase { .. }),
+            keep_checkout: refs.picked.is_some()
+                && matches!(task, factory_core::Task::FixChecks { report } if report.starts_with(CHECKOUT_REPAIR)),
             session_id,
             agent_session,
             agent,

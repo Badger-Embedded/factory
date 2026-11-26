@@ -100,6 +100,7 @@ fn request() -> AgentRequest {
         branch: None,
         existing: None,
         merge_base: false,
+        keep_checkout: false,
         session_id: "0b6f5c1e-8d1a-4c3e-9a57-3c1f2a9d7e10".into(),
         agent_session: None,
         agent: factory_core::DEFAULT_AGENT,
@@ -2092,23 +2093,31 @@ async fn a_checkout_off_the_job_branch_is_sent_to_the_agent_and_never_merged_int
     assert!(!tools.calls().contains("merge"), "{}", tools.calls());
 }
 
-#[tokio::test]
-async fn the_repair_agent_starts_in_a_checkout_that_switching_branches_would_refuse() {
-    let tools = picked_tools("develop", "checkout) echo 'would overwrite' >&2; exit 1 ;;");
+async fn picked_agent_run(tools: &Tools, keep_checkout: bool, expect: Expect, prompt: &str) {
     std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work/.git")).unwrap();
     std::fs::write(tools.dir.path().join("on"), "other\n").unwrap();
-    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    podman.base.podman = support::executable(
+        tools.dir.path(),
+        "podman",
+        &format!(
+            "#!/bin/bash\necho \"podman $*\" >> '{}'\nexit 1\n",
+            tools.dir.path().join("podman-calls").display()
+        ),
+    );
     let mut run = request();
     run.repo = "o/r".into();
     run.base = "develop".into();
+    run.expect = expect;
+    run.prompt = prompt.into();
+    run.keep_checkout = keep_checkout;
     run.branch = Some("factory/job-7-pr-1".into());
     run.existing = Some(factory_server::ExistingPr {
         number: 12,
         head_branch: "carol/reboot".into(),
         head_ref: "refs/pull/12/head".into(),
     });
-
-    let report = podman
+    podman
         .run_agent(
             &Settings::default(),
             run,
@@ -2116,11 +2125,28 @@ async fn the_repair_agent_starts_in_a_checkout_that_switching_branches_would_ref
             Box::new(|_| {}),
         )
         .await;
+}
 
-    assert!(
-        !matches!(&report.event, Event::AgentFailed { reason } if reason.contains("prepare the checkout")),
-        "{:?}",
-        report.event
-    );
+fn worker_started_with(tools: &Tools, prompt: &str) -> bool {
+    std::fs::read_to_string(tools.dir.path().join("podman-calls"))
+        .is_ok_and(|calls| calls.contains(prompt))
+}
+
+#[tokio::test]
+async fn the_repair_agent_starts_with_its_prompt_in_a_checkout_that_switching_branches_would_refuse()
+ {
+    let tools = picked_tools("develop", "checkout) echo 'would overwrite' >&2; exit 1 ;;");
+    picked_agent_run(&tools, true, Expect::Commits, "REPAIR-PROMPT").await;
+
     assert!(!tools.calls().contains("checkout"), "{}", tools.calls());
+    assert!(worker_started_with(&tools, "REPAIR-PROMPT"));
+}
+
+#[tokio::test]
+async fn a_review_of_a_picked_pull_request_still_prepares_its_checkout() {
+    let tools = picked_tools("develop", "checkout) echo 'would overwrite' >&2; exit 1 ;;");
+    picked_agent_run(&tools, false, Expect::Review, "REVIEW-PROMPT").await;
+
+    assert!(tools.calls().contains("fetch"), "{}", tools.calls());
+    assert!(!worker_started_with(&tools, "REVIEW-PROMPT"));
 }
