@@ -36,7 +36,7 @@ pub use forgejo::{
     Forgejo, ForgejoVersion, client as forgejo_client,
     reported_version as forgejo_reported_version, version as forgejo_version,
 };
-pub use git::{Git, Remote, RemoteSource};
+pub use git::{Git, PushError, Remote, RemoteSource};
 pub use github::{
     Ci, Comment, FailedCheck, GitHub, HeadCommit, Observation, OpenPr, PrDetails, PrInfo, PrState,
     PrStatus, PullRequest, RebaseCheckbox, RenovatePr, Rerun, actions_job_id, is_renovate_login,
