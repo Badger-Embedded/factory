@@ -453,6 +453,23 @@ impl PodmanExecutor {
         Ok(Published::Open(existing.number))
     }
 
+    /// Whether the checkout of a picked pull request job is on another branch
+    /// than the job's, left there by the checks. The agent starts in it
+    /// unchanged, because switching branches could refuse over its edits and
+    /// the agent could then never read the repair request.
+    async fn off_job_branch(&self, request: &AgentRequest, workspace: &Path) -> bool {
+        let (Some(_), Some(branch)) = (&request.existing, request.branch.as_deref()) else {
+            return false;
+        };
+        if !workspace.join(".git").exists() {
+            return false;
+        }
+        match self.checkout_state(workspace, branch).await {
+            Ok((current, _, _)) => current != branch,
+            Err(_) => false,
+        }
+    }
+
     async fn prepare_checkout(
         &self,
         request: &AgentRequest,
@@ -616,7 +633,9 @@ impl Executor for PodmanExecutor {
                 Err(reason) => return failed(reason),
             }
         }
-        if let Err(reason) = self.prepare_checkout(&request, &workspace).await {
+        if !self.off_job_branch(&request, &workspace).await
+            && let Err(reason) = self.prepare_checkout(&request, &workspace).await
+        {
             return failed(reason);
         }
 

@@ -2091,3 +2091,36 @@ async fn a_checkout_off_the_job_branch_is_sent_to_the_agent_and_never_merged_int
     );
     assert!(!tools.calls().contains("merge"), "{}", tools.calls());
 }
+
+#[tokio::test]
+async fn the_repair_agent_starts_in_a_checkout_that_switching_branches_would_refuse() {
+    let tools = picked_tools("develop", "checkout) echo 'would overwrite' >&2; exit 1 ;;");
+    std::fs::create_dir_all(tools.dir.path().join("data/jobs/7/work/.git")).unwrap();
+    std::fs::write(tools.dir.path().join("on"), "other\n").unwrap();
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut run = request();
+    run.repo = "o/r".into();
+    run.base = "develop".into();
+    run.branch = Some("factory/job-7-pr-1".into());
+    run.existing = Some(factory_server::ExistingPr {
+        number: 12,
+        head_branch: "carol/reboot".into(),
+        head_ref: "refs/pull/12/head".into(),
+    });
+
+    let report = podman
+        .run_agent(
+            &Settings::default(),
+            run,
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+
+    assert!(
+        !matches!(&report.event, Event::AgentFailed { reason } if reason.contains("prepare the checkout")),
+        "{:?}",
+        report.event
+    );
+    assert!(!tools.calls().contains("checkout"), "{}", tools.calls());
+}
