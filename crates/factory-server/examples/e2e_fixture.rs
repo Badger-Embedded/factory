@@ -216,6 +216,7 @@ fn picked(store: &Store, project: &str, number: u64, url: &str) -> Result<i64> {
         number,
         url: url.to_owned(),
         title: "Handle the reboot error".into(),
+        body: String::new(),
         head_branch: "carol/reboot".into(),
         base_branch: "main".into(),
         fork: false,

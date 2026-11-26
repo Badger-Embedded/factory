@@ -26,6 +26,7 @@ fn the_directory_ships_the_review_skills_and_schema() {
         "skills/review/SKILL.md",
         "skills/comment-review/SKILL.md",
         "schemas/review.json",
+        "schemas/quick-review.json",
         "README.md",
     ] {
         assert!(agents.join(file).is_file(), "agents is missing {file}");

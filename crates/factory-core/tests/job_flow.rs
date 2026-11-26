@@ -3780,6 +3780,7 @@ fn picked() -> PickedPr {
         number: 42,
         url: "https://github.com/acme/maestro/pull/42".into(),
         title: "maestrod: add a reboot endpoint".into(),
+        body: String::new(),
         head_branch: "reboot".into(),
         base_branch: "main".into(),
         fork: false,

@@ -113,9 +113,11 @@ fn stage_agent(agents: &StageAgents, expect: Expect) -> Agent {
         Expect::Spec => &agents.spec,
         Expect::Plan => &agents.plan,
         Expect::Commits | Expect::FixCi => &agents.implement,
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
-            &agents.review
-        }
+        Expect::Review
+        | Expect::QuickReview
+        | Expect::FailureAnalysis
+        | Expect::DiffCheck
+        | Expect::PackagingGaps => &agents.review,
     };
     Agent::from_id(id).unwrap_or(DEFAULT_AGENT)
 }
@@ -126,9 +128,11 @@ fn stage_name(expect: Expect) -> &'static str {
         Expect::Spec => "spec",
         Expect::Plan => "plan",
         Expect::Commits | Expect::FixCi => "implement",
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
-            "review"
-        }
+        Expect::Review
+        | Expect::QuickReview
+        | Expect::FailureAnalysis
+        | Expect::DiffCheck
+        | Expect::PackagingGaps => "review",
     }
 }
 
@@ -1606,6 +1610,7 @@ impl<E: Executor> Scheduler<E> {
             Expect::Plan => models.plan,
             Expect::Commits | Expect::FixCi => models.implement,
             Expect::Review
+            | Expect::QuickReview
             | Expect::FailureAnalysis
             | Expect::DiffCheck
             | Expect::PackagingGaps => models.review,
@@ -1617,6 +1622,7 @@ impl<E: Executor> Scheduler<E> {
             Expect::Plan => efforts.plan,
             Expect::Commits | Expect::FixCi => efforts.implement,
             Expect::Review
+            | Expect::QuickReview
             | Expect::FailureAnalysis
             | Expect::DiffCheck
             | Expect::PackagingGaps => efforts.review,
@@ -1756,6 +1762,7 @@ impl<E: Executor> Scheduler<E> {
                 Expect::Plan => settings.stages.plan,
                 Expect::Commits | Expect::FixCi => settings.stages.implement,
                 Expect::Review
+                | Expect::QuickReview
                 | Expect::FailureAnalysis
                 | Expect::DiffCheck
                 | Expect::PackagingGaps => settings.stages.review,

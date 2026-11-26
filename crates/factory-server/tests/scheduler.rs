@@ -1164,7 +1164,9 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
             notes: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
-        Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
+        Expect::Review | Expect::QuickReview => {
+            unreachable!("this job keeps llm review off, so no reviewer runs")
+        }
         Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
             unreachable!("this job is no Renovate job")
         }
@@ -3386,7 +3388,9 @@ fn one_pass(request: &AgentRequest) -> Event {
             notes: None,
         }])),
         Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
-        Expect::Review => unreachable!("this job keeps llm review off, so no reviewer runs"),
+        Expect::Review | Expect::QuickReview => {
+            unreachable!("this job keeps llm review off, so no reviewer runs")
+        }
         Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
             unreachable!("this job is no Renovate job")
         }
@@ -8650,6 +8654,7 @@ fn picked(number: u64) -> factory_core::PickedPr {
         number,
         url: format!("https://github.com/Badger-Embedded/maestro/pull/{number}"),
         title: "Fix the reboot".into(),
+        body: String::new(),
         head_branch: "carol/reboot".into(),
         base_branch: "develop".into(),
         fork: false,

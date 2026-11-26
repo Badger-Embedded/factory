@@ -1088,6 +1088,7 @@ async fn read_picked_pr(
         number,
         url: pr.url,
         title: pr.title,
+        body: pr.body,
         head_branch: pr.head_branch,
         base_branch: pr.base_branch,
         fork: pr.fork,
@@ -1308,9 +1309,11 @@ fn keep_session_settings(
             &mut efforts.implement,
             &agents.implement,
         ),
-        Expect::Review | Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps => {
-            (&mut models.review, &mut efforts.review, &agents.review)
-        }
+        Expect::Review
+        | Expect::QuickReview
+        | Expect::FailureAnalysis
+        | Expect::DiffCheck
+        | Expect::PackagingGaps => (&mut models.review, &mut efforts.review, &agents.review),
     };
     let on_stage_agent = Agent::from_id(stage_agent).unwrap_or(DEFAULT_AGENT) == last.agent;
     if on_stage_agent && !state.slots.has_task(row.id) {
