@@ -102,7 +102,7 @@ test('the picker search filters and opens the match', async ({ page, factory }, 
   const [alpha, alphabet, beta] = [`${id}-alpha`, `${id}-alphabet`, `${id}-beta`];
   await badgeLogin(page, factory, [alpha, alphabet, beta]);
   await page.goto(`/?project=${beta}`);
-  const rows = page.locator('#picker-list li:not([hidden])');
+  const rows = page.locator('#picker-list li[data-id]:not([hidden])');
   const search = page.getByLabel('Find a project');
 
   await page.getByLabel('Project', { exact: true }).click();
@@ -131,7 +131,7 @@ test('broadening or reopening the search highlights the first row', async ({ pag
   await badgeLogin(page, factory, [alpha, alphabet, beta]);
   await page.goto(`/?project=${beta}`);
   const search = page.getByLabel('Find a project');
-  const active = page.locator('#picker-list li.active');
+  const active = page.locator('#picker-list li[data-id].active');
 
   await page.getByLabel('Project', { exact: true }).click();
   await search.fill(`${id}-alphabet`);
@@ -158,13 +158,13 @@ test('opening the picker focuses the search and closing clears it', async ({ pag
   await button.click();
   await expect(search).toBeFocused();
   await search.fill('-o');
-  await expect(page.locator('#picker-list li:not([hidden])')).toHaveCount(1);
+  await expect(page.locator('#picker-list li[data-id]:not([hidden])')).toHaveCount(1);
   await search.press('Escape');
   await expect(button).toBeFocused();
 
   await button.click();
   await expect(search).toHaveValue('');
-  await expect(page.locator('#picker-list li:not([hidden])')).toHaveCount(2);
+  await expect(page.locator('#picker-list li[data-id]:not([hidden])')).toHaveCount(2);
 });
 
 test('a poll keeps the picker search text, focus and filter', async ({ page, factory }, testInfo) => {

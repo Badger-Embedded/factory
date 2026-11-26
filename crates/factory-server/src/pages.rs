@@ -19,7 +19,7 @@ use crate::projects::{StageAgents, StageEfforts, StageModels};
 use crate::settings::Settings;
 use crate::store::{
     CodexPrice, Collaborator, JobEvent, JobFile, JobRow, LogEntry, Maintenance, PackagingType,
-    PrerequisiteView, ProjectTotals,
+    PrerequisiteView, ProjectGroup, ProjectTotals,
 };
 use crate::timeline::timeline;
 use crate::workers::Slot;
@@ -571,6 +571,9 @@ pub struct ProjectAttention {
     pub failed: usize,
     /// Whether any job is in the Agent or Factory lane.
     pub running: bool,
+    /// The login's group the project is in: the group's place in the
+    /// login's group order and its name.
+    pub group: Option<(usize, String)>,
 }
 
 impl ProjectAttention {
@@ -593,12 +596,14 @@ impl ProjectAttention {
 /// to the projects the login collaborates on, so a job of any other project
 /// adds to no count. `labels` come in shown-name order and the sort is stable,
 /// so each group keeps that order. A project missing from `auto_merge` counts
-/// its reviews as needing you.
+/// its reviews as needing you. `groups` are the login's project groups in
+/// their order.
 pub fn project_attention(
     labels: &[ProjectLabel],
     jobs: &[JobRow],
     waits: &HashMap<i64, Wait>,
     auto_merge: &HashMap<String, bool>,
+    groups: &[ProjectGroup],
 ) -> Vec<ProjectAttention> {
     let mut entries: Vec<ProjectAttention> = labels
         .iter()
@@ -607,6 +612,11 @@ pub fn project_attention(
             needs_you: 0,
             failed: 0,
             running: false,
+            group: groups
+                .iter()
+                .enumerate()
+                .find(|(_, group)| group.projects.contains(&label.id))
+                .map(|(at, group)| (at, group.name.clone())),
         })
         .collect();
     let index: HashMap<&str, usize> = labels
@@ -656,13 +666,13 @@ fn project_selector(
                 p.picker-status.visually-hidden role="status" {}
                 (picker(attention, selected, false))
                 p.picker-empty hidden { "No project matches." }
-                div.picker-keys hidden {
-                    span.picker-hint { kbd { "↑" } " " kbd { "↓" } " " kbd { "J" } " " kbd { "K" } " move" }
-                    span.picker-hint { kbd { "Enter" } " open" }
-                    span.picker-hint { kbd { "Esc" } " close" }
-                    span.picker-hint { kbd { "I" } " search" }
-                    span.picker-hint.picker-hint-n { kbd { "N" } " next that needs you" }
-                    span.picker-hint.picker-hint-n { kbd { "Shift" } " " kbd { "N" } " previous" }
+                div.picker-foot {
+                    div.picker-keys hidden {
+                        span.picker-hint { kbd { "J" } " " kbd { "K" } " move" }
+                        span.picker-hint { kbd { "I" } " search" }
+                        span.picker-hint.picker-hint-n { kbd { "N" } " " kbd { "⇧N" } " needs you" }
+                    }
+                    a.picker-groups href="/settings/groups" { "Edit groups" }
                 }
             }
             script { (PreEscaped(PROJECT_PICKER)) }
@@ -704,32 +714,92 @@ fn picker_badge(attention: &[ProjectAttention], selected: &str, oob: bool) -> Ma
     }
 }
 
+/// A run of picker rows under one heading. The flat list's last section,
+/// the projects with nothing to report, has no heading.
+struct PickerSection<'a> {
+    heading: Option<&'a str>,
+    entries: Vec<&'a ProjectAttention>,
+}
+
+/// The picker's sections. With no project in one of the login's groups the
+/// list splits by what each project asks of the reader, in the order
+/// `project_attention` sorts. Otherwise each group is a section in the
+/// login's group order and the projects in no group close the list under
+/// "Other". Either way a section keeps the attention order inside it, and
+/// an empty section is left out.
+fn picker_sections(attention: &[ProjectAttention]) -> Vec<PickerSection<'_>> {
+    if attention.iter().any(|entry| entry.group.is_some()) {
+        let mut groups: Vec<(usize, &str)> = attention
+            .iter()
+            .filter_map(|entry| entry.group.as_ref())
+            .map(|(rank, name)| (*rank, name.as_str()))
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let mut sections: Vec<PickerSection> = groups
+            .into_iter()
+            .map(|(rank, name)| PickerSection {
+                heading: Some(name),
+                entries: attention
+                    .iter()
+                    .filter(|entry| entry.group.as_ref().is_some_and(|(at, _)| *at == rank))
+                    .collect(),
+            })
+            .collect();
+        let rest: Vec<&ProjectAttention> = attention
+            .iter()
+            .filter(|entry| entry.group.is_none())
+            .collect();
+        if !rest.is_empty() {
+            sections.push(PickerSection {
+                heading: Some("Other"),
+                entries: rest,
+            });
+        }
+        return sections;
+    }
+    [
+        ("you", Some("Needs you")),
+        ("failed", Some("Failed")),
+        ("running", Some("Running")),
+        ("idle", None),
+    ]
+    .into_iter()
+    .map(|(kind, heading)| PickerSection {
+        heading,
+        entries: attention
+            .iter()
+            .filter(|entry| entry.kind() == kind)
+            .collect(),
+    })
+    .filter(|section| !section.entries.is_empty())
+    .collect()
+}
+
+/// The mark in front of the selected project's row.
+fn picker_check() -> Markup {
+    html! {
+        svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" {
+            path d="M3.5 8.5l3 3 6-7" {}
+        }
+    }
+}
+
 /// The picker's project list. A poll's copy (`poll`) carries the top bar badge
 /// as an out-of-band swap, and the page's copy leaves it to the top bar. An
 /// empty `selected` is a recovery poll: it marks no row and counts every project.
 /// Only the list polls, so the `<details>` around it keeps its open state.
 pub fn picker(attention: &[ProjectAttention], selected: &str, poll: bool) -> Region {
     let inner = html! {
-        @for entry in attention {
-            @let label = &entry.label;
-            li id={ "picker-opt-" (label.id) } data-attention=(entry.kind()) data-id=(label.id) data-name=(label.shown) {
-                a href={ "/?project=" (crate::web::query_escape(&label.id)) }
-                    aria-current=[(label.id == selected).then_some("page")] {
-                    span.picker-name title=(label.shown) { (label.shown) }
-                    @if entry.needs_you > 0 {
-                        span.badge.you {
-                            (entry.needs_you)
-                            span.visually-hidden { " need you" }
-                        }
-                    }
-                    @if entry.failed > 0 {
-                        span.badge.bad {
-                            (entry.failed)
-                            span.visually-hidden { " failed" }
-                        }
-                    }
-                    @if entry.kind() == "running" {
-                        span.picker-running { span.visually-hidden { "running" } }
+        @for (at, section) in picker_sections(attention).iter().enumerate() {
+            li.picker-section {
+                @if let Some(heading) = section.heading {
+                    div.picker-heading id={ "picker-sec-" (at) } { (heading) }
+                }
+                ul aria-labelledby=[section.heading.map(|_| format!("picker-sec-{at}"))] {
+                    @for entry in &section.entries {
+                        (picker_row(entry, selected))
                     }
                 }
             }
@@ -751,6 +821,37 @@ pub fn picker(attention: &[ProjectAttention], selected: &str, poll: bool) -> Reg
         }
     };
     Region { version, markup }
+}
+
+fn picker_row(entry: &ProjectAttention, selected: &str) -> Markup {
+    let label = &entry.label;
+    let current = label.id == selected;
+    html! {
+        li id={ "picker-opt-" (label.id) } data-attention=(entry.kind()) data-id=(label.id) data-name=(label.shown) {
+            a href={ "/?project=" (crate::web::query_escape(&label.id)) }
+                aria-current=[current.then_some("page")] {
+                span.picker-mark aria-hidden="true" {
+                    @if current { (picker_check()) }
+                }
+                span.picker-name title=(label.shown) { (label.shown) }
+                @if entry.needs_you > 0 {
+                    span.badge.you {
+                        (entry.needs_you)
+                        span.visually-hidden { " need you" }
+                    }
+                }
+                @if entry.failed > 0 {
+                    span.badge.bad {
+                        (entry.failed)
+                        span.visually-hidden { " failed" }
+                    }
+                }
+                @if entry.kind() == "running" {
+                    span.picker-running { span.visually-hidden { "running" } }
+                }
+            }
+        }
+    }
 }
 
 /// A project's block on the settings page: its models, efforts and flags, and
@@ -890,6 +991,8 @@ pub struct HeaderState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsPage {
     Notifications,
+    /// The login's own project groups.
+    ProjectGroups,
     /// The login's own Local API key.
     LocalKey,
     /// A forge's page for the login's own token.
@@ -971,6 +1074,7 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
         nav.settings-nav aria-label="Settings" {
             p.settings-group { "You" }
             (entry("/settings/notifications".into(), "Notifications", &SettingsPage::Notifications))
+            (entry("/settings/groups".into(), "Project groups", &SettingsPage::ProjectGroups))
             (entry("/settings/local".into(), "Local API key", &SettingsPage::LocalKey))
             p.settings-group { "Forges" }
             @for kind in &nav.forges {
@@ -1066,6 +1170,89 @@ pub fn settings_notifications(
         },
     )
 }
+
+/// The per-user Project groups page. The first form names the login's
+/// groups: a field per group, where an empty name removes the group, and one
+/// field that adds a group. The second form puts each of the login's projects
+/// in one group or none, and shows once a group exists.
+pub fn settings_groups(
+    user: &str,
+    nav: &SettingsNav,
+    groups: &[ProjectGroup],
+    csrf: &str,
+    notice: Option<&str>,
+) -> Markup {
+    let group_of = |project: &str| {
+        groups
+            .iter()
+            .find(|group| group.projects.iter().any(|id| id == project))
+            .map(|group| group.id)
+    };
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::ProjectGroups,
+        "Project groups",
+        notice,
+        &html! {
+            h1 { "Project groups" }
+            p.meta {
+                "Groups split the project picker into one section per group, with the projects in no group under Other. "
+                "With no project in a group, the picker sorts projects by what needs you. "
+                "Your groups follow your login to every browser."
+            }
+            form.card.settings-form #group-names method="post" action="/settings/groups" {
+                input type="hidden" name="csrf" value=(csrf);
+                h2 { "Groups" }
+                @if !groups.is_empty() {
+                    ul.group-names {
+                        @for group in groups {
+                            li {
+                                input.wide type="text" name={ "group-" (group.id) } value=(group.name)
+                                    maxlength=(MAX_GROUP_NAME) aria-label={ "Name of " (group.name) }
+                                    autocomplete="off";
+                            }
+                        }
+                    }
+                    p.hint { "Clear a name to remove the group. Its projects move to Other." }
+                }
+                div.field.group-add {
+                    label for="group-new" { "Add a group" }
+                    input #group-new.wide type="text" name="new" maxlength=(MAX_GROUP_NAME)
+                        autocomplete="off" placeholder="Name, such as Home or Work";
+                }
+                (save_bar("Save groups"))
+            }
+            @if !groups.is_empty() {
+                form.card.settings-form #group-members method="post" action="/settings/groups/projects" {
+                    input type="hidden" name="csrf" value=(csrf);
+                    h2 { "Projects" }
+                    @if nav.projects.is_empty() {
+                        p.empty { "You are not a collaborator on any project." }
+                    }
+                    ul.group-members {
+                        @for (at, label) in nav.projects.iter().enumerate() {
+                            @let current = group_of(&label.id);
+                            li {
+                                label for={ "group-of-" (at) } title=(label.shown) { (label.shown) }
+                                select id={ "group-of-" (at) } name={ "project:" (label.id) } {
+                                    option value="" selected[current.is_none()] { "No group" }
+                                    @for group in groups {
+                                        option value=(group.id) selected[current == Some(group.id)] { (group.name) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (save_bar("Save"))
+                }
+            }
+        },
+    )
+}
+
+/// The longest project group name the Project groups page takes, in characters.
+pub const MAX_GROUP_NAME: usize = 40;
 
 pub fn settings_workers(
     user: &str,

@@ -38,8 +38,8 @@ test('onboarding a repository whose checks pass creates the project', async ({ p
 
   await expect(page).toHaveURL(new RegExp(`/\\?project=${name}$`));
   await expect(page.getByLabel('Project', { exact: true })).toContainText(name);
-  await expect(page.locator('#picker-list li')).toHaveCount(1);
-  await expect(page.locator('#picker-list li a')).toHaveAttribute('href', `/?project=${name}`);
+  await expect(page.locator('#picker-list li[data-id]')).toHaveCount(1);
+  await expect(page.locator('#picker-list li[data-id] a')).toHaveAttribute('href', `/?project=${name}`);
   await expect(page.locator('.missing-project-token')).toBeVisible();
   await page.goto(`/settings/projects/${name}`);
   await expect(page.locator('input[name="on"]')).toBeChecked();

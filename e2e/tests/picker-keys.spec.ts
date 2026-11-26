@@ -29,7 +29,7 @@ test.describe('with a desktop pointer', () => {
     await expect(page.locator('.picker-panel')).toBeVisible();
     await expect(page.getByLabel('Find a project')).not.toBeFocused();
     await expect(page.getByLabel('Find a project')).toHaveValue('');
-    await expect(page.locator('#picker-list li').first()).toHaveClass(/active/);
+    await expect(page.locator('#picker-list li[data-id]').first()).toHaveClass(/active/);
     await page.keyboard.press('Escape');
     await expect(page.locator('.picker-panel')).toBeHidden();
     await expect(button(page)).toBeFocused();
@@ -45,7 +45,7 @@ test.describe('with a desktop pointer', () => {
     const { login, ids } = setup(factory, testInfo.workerIndex, { a: null, b: null, c: null });
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
     await page.goto(`/?project=${ids.a}`);
-    const rows = page.locator('#picker-list li');
+    const rows = page.locator('#picker-list li[data-id]');
     const url = page.url();
     await page.keyboard.press('p');
     await page.keyboard.press('k');
@@ -67,8 +67,8 @@ test.describe('with a desktop pointer', () => {
     await page.goto(`/?project=${ids.a}`);
     await page.keyboard.press('p');
     await page.keyboard.press('ArrowDown');
-    await expect(page.locator('#picker-list li').nth(1)).toHaveClass(/active/);
-    const id = await page.locator('#picker-list li').nth(1).getAttribute('data-id');
+    await expect(page.locator('#picker-list li[data-id]').nth(1)).toHaveClass(/active/);
+    const id = await page.locator('#picker-list li[data-id]').nth(1).getAttribute('data-id');
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(new RegExp(`[?&]project=${id}$`));
   });
@@ -84,7 +84,7 @@ test.describe('with a desktop pointer', () => {
     await expect(box).toHaveValue('');
     await page.keyboard.type('jk');
     await expect(box).toHaveValue('jk');
-    await expect(page.locator('#picker-list li:not([hidden])')).toHaveCount(0);
+    await expect(page.locator('#picker-list li[data-id]:not([hidden])')).toHaveCount(0);
   });
 
   test('j, k and i do nothing with the panel closed', async ({ page, factory }, testInfo) => {
@@ -104,13 +104,13 @@ test.describe('with a desktop pointer', () => {
     await page.context().setExtraHTTPHeaders({ 'Tailscale-User-Login': login });
     await page.goto(`/?project=${ids.a}`);
     await page.keyboard.press('p');
-    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', ids.a);
+    await expect(page.locator('#picker-list li[data-id].active')).toHaveAttribute('data-id', ids.a);
     await page.keyboard.press('Escape');
     await expect(page.locator('.picker-panel')).toBeHidden();
     factory.fixture('job', '--project', ids.c, '--stage', 'spec', '--request', 'A spec job');
-    await expect(page.locator('#picker-list li').first()).toHaveAttribute('data-id', ids.c, { timeout: 15_000 });
+    await expect(page.locator('#picker-list li[data-id]').first()).toHaveAttribute('data-id', ids.c, { timeout: 15_000 });
     await page.keyboard.press('p');
-    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', ids.c);
+    await expect(page.locator('#picker-list li[data-id].active')).toHaveAttribute('data-id', ids.c);
     await page.keyboard.press('Enter');
     await expect(page).toHaveURL(new RegExp(`[?&]project=${ids.c}$`));
   });
@@ -124,10 +124,10 @@ test.describe('with a desktop pointer', () => {
       picker.open = true;
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-      const before = document.querySelector('#picker-list li.active')?.getAttribute('data-id');
+      const before = document.querySelector('#picker-list li[data-id].active')?.getAttribute('data-id');
       await new Promise((resolve) => picker.addEventListener('toggle', resolve, { once: true }));
       await new Promise((resolve) => setTimeout(resolve, 50));
-      return { before, after: document.querySelector('#picker-list li.active')?.getAttribute('data-id') };
+      return { before, after: document.querySelector('#picker-list li[data-id].active')?.getAttribute('data-id') };
     });
     expect(moved.before).toBe(ids.b);
     expect(moved.after).toBe(ids.b);
@@ -139,12 +139,12 @@ test.describe('with a desktop pointer', () => {
     await page.goto(`/?project=${ids.a}`);
     await page.keyboard.press('p');
     await page.keyboard.press('j');
-    const active = page.locator('#picker-list li.active');
+    const active = page.locator('#picker-list li[data-id].active');
     const id = await active.getAttribute('data-id');
     factory.fixture('job', '--project', ids.c, '--stage', 'spec', '--request', 'A spec job');
     await expect(page.locator(`#picker-list li[data-id="${ids.c}"]`)).toHaveAttribute('data-attention', /you|failed/, { timeout: 15_000 });
     await expect(page.locator('.picker-panel')).toBeVisible();
-    await expect(page.locator('#picker-list li.active')).toHaveAttribute('data-id', id!);
+    await expect(page.locator('#picker-list li[data-id].active')).toHaveAttribute('data-id', id!);
     await expect(page.getByLabel('Find a project')).not.toBeFocused();
   });
 
@@ -190,8 +190,8 @@ test.describe('with a desktop pointer', () => {
 
     await button(page).click();
     const footer = page.locator('.picker-keys');
-    await expect(footer.locator('kbd')).toHaveText(['↑', '↓', 'J', 'K', 'Enter', 'Esc', 'I', 'N', 'Shift', 'N']);
-    for (const text of ['move', 'open', 'close', 'search', 'next that needs you', 'previous']) {
+    await expect(footer.locator('kbd')).toHaveText(['J', 'K', 'I', 'N', '⇧N']);
+    for (const text of ['move', 'search', 'needs you']) {
       await expect(footer).toContainText(text);
     }
     const style = await footer.locator('kbd').first().evaluate((el) => {
@@ -222,7 +222,7 @@ test.describe('with a desktop pointer', () => {
 
     await page.goto(`/?project=${ids.b}`);
     await button(page).click();
-    await expect(page.locator('.picker-hint-n.dimmed')).toHaveCount(2);
+    await expect(page.locator('.picker-hint-n.dimmed')).toHaveCount(1);
     await expect(page.locator('.picker-hint:not(.picker-hint-n).dimmed')).toHaveCount(0);
 
     factory.fixture('job', '--project', ids.c, '--stage', 'spec', '--request', 'Another spec job');

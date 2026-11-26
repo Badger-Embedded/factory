@@ -272,6 +272,17 @@ CREATE TABLE IF NOT EXISTS user_settings (
     notifications INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS project_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    login TEXT NOT NULL,
+    name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_group_members (
+    login TEXT NOT NULL,
+    project TEXT NOT NULL,
+    group_id INTEGER NOT NULL,
+    PRIMARY KEY (login, project)
+);
 CREATE TABLE IF NOT EXISTS user_forge_accounts (
     login TEXT NOT NULL,
     forge TEXT NOT NULL,
@@ -320,6 +331,16 @@ CREATE TABLE IF NOT EXISTS store_boots (
 
 /// The longest model load wait the Local settings accept, in minutes.
 pub const MAX_LOCAL_LOAD_MINUTES: u32 = 60;
+
+/// One of a login's project groups, which sort that login's project picker
+/// into sections. `projects` holds identifiers, and a project is in at most
+/// one of the login's groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGroup {
+    pub id: i64,
+    pub name: String,
+    pub projects: Vec<String>,
+}
 
 /// The Local agent's factory-wide settings. `url` is `None` until an admin
 /// stores a server.
@@ -3291,6 +3312,119 @@ impl Store {
         Ok(())
     }
 
+    /// The project groups `login` made, in name order, each with the
+    /// identifiers of its projects. A project removed from the factory has
+    /// no membership left; one the login stopped collaborating on keeps its
+    /// row, and the caller leaves it out by listing only the login's projects.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn project_groups(&self, login: &str) -> Result<Vec<ProjectGroup>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM project_groups WHERE login = ?1
+             ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let mut groups = stmt
+            .query_map([login], |row| {
+                Ok(ProjectGroup {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    projects: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = conn.prepare(
+            "SELECT group_id, project FROM project_group_members WHERE login = ?1
+             ORDER BY project",
+        )?;
+        let members = stmt.query_map([login], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for member in members {
+            let (id, project) = member?;
+            if let Some(group) = groups.iter_mut().find(|group| group.id == id) {
+                group.projects.push(project);
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Renames `login`'s groups, removes the ones whose new name is empty
+    /// with their memberships, and adds `added` when it is set. An id that is
+    /// not one of the login's groups changes nothing. The caller checks the
+    /// names are unique.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error. Nothing is written when it fails.
+    pub fn save_project_groups(
+        &self,
+        login: &str,
+        names: &[(i64, String)],
+        added: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (id, name) in names {
+            if name.is_empty() {
+                tx.execute(
+                    "DELETE FROM project_group_members WHERE login = ?1 AND group_id = ?2",
+                    params![login, id],
+                )?;
+                tx.execute(
+                    "DELETE FROM project_groups WHERE login = ?1 AND id = ?2",
+                    params![login, id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE project_groups SET name = ?3 WHERE login = ?1 AND id = ?2",
+                    params![login, id, name],
+                )?;
+            }
+        }
+        if let Some(name) = added {
+            tx.execute(
+                "INSERT INTO project_groups (login, name) VALUES (?1, ?2)",
+                params![login, name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Puts each project of `assignments` in the group it names, or in no
+    /// group for `None`. A group id that is not one of `login`'s groups puts
+    /// the project in no group.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error. Nothing is written when it fails.
+    pub fn set_project_groups(
+        &self,
+        login: &str,
+        assignments: &[(String, Option<i64>)],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (project, group) in assignments {
+            tx.execute(
+                "DELETE FROM project_group_members WHERE login = ?1 AND project = ?2",
+                params![login, project],
+            )?;
+            if let Some(group) = group {
+                tx.execute(
+                    "INSERT INTO project_group_members (login, project, group_id)
+                     SELECT ?1, ?2, id FROM project_groups WHERE login = ?1 AND id = ?3",
+                    params![login, project, group],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The names of the projects `login` collaborates on, in name order.
     ///
     /// # Errors
@@ -3580,6 +3714,7 @@ impl Store {
             "project_forge_accounts",
             "gh_token_copies",
             "project_instances",
+            "project_group_members",
             "secrets",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [name])?;
