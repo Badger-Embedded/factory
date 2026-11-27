@@ -138,7 +138,7 @@ impl AgentBackend for CopilotAgent {
         // keeps its own behaviour while the server loads the model.
         run.local.as_ref().map_or_else(Vec::new, |local| {
             vec![
-                ("COPILOT_OFFLINE", "true".to_owned()),
+                ("COPILOT_TELEMETRY_DISABLED", "true".to_owned()),
                 (
                     "COPILOT_PROVIDER_BASE_URL",
                     format!("{}/v1", local.base_url),

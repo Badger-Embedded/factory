@@ -974,12 +974,17 @@ fn a_local_copilot_run_points_at_the_server_with_no_github_token() {
     let env = env_names(&args);
 
     for expected in [
-        "COPILOT_OFFLINE=true",
+        "COPILOT_TELEMETRY_DISABLED=true",
         "COPILOT_PROVIDER_BASE_URL=http://gfx1201:9931/v1",
         "COPILOT_PROVIDER_TYPE=openai",
     ] {
         assert!(env.contains(&expected), "missing {expected} in {env:?}");
     }
+    assert!(
+        env.iter()
+            .all(|entry| entry.split('=').next() != Some("COPILOT_OFFLINE"))
+    );
+    assert!(args.contains(&"--disable-builtin-mcps".to_owned()));
     assert!(!env.contains(&"COPILOT_GITHUB_TOKEN"));
     assert!(!env.contains(&"COPILOT_PROVIDER_API_KEY"));
     assert_eq!(
