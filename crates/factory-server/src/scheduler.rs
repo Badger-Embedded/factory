@@ -857,21 +857,31 @@ struct WorkerCostGuard {
 }
 
 impl WorkerCostGuard {
-    fn for_request(store: &Arc<Store>, request: &AgentRequest) -> Option<Self> {
+    /// `Ok(None)` for a run that is not on `OpenRouter`. `Err(())` when the job
+    /// left the stage it was dispatched in, so the run must not start.
+    fn for_request(
+        store: &Arc<Store>,
+        request: &AgentRequest,
+        dispatched: &Job,
+    ) -> Result<Option<Self>, ()> {
         let openrouter = request
             .provider
             .as_ref()
             .is_some_and(|provider| provider.target.kind == ProviderKind::OpenRouter);
-        openrouter.then(|| Self::begin(store, request.job_id))
-    }
-
-    fn begin(store: &Arc<Store>, job_id: i64) -> Self {
-        if let Err(err) = store.begin_cost_lookup(job_id) {
-            tracing::error!("job {job_id}: {err}");
+        if !openrouter {
+            return Ok(None);
         }
-        Self {
-            store: Arc::clone(store),
-            job_id,
+        let job_id = request.job_id;
+        match store.begin_cost_lookup_at(job_id, dispatched) {
+            Ok(true) => Ok(Some(Self {
+                store: Arc::clone(store),
+                job_id,
+            })),
+            Ok(false) => Err(()),
+            Err(err) => {
+                tracing::error!("job {job_id}: {err}");
+                Ok(None)
+            }
         }
     }
 }
@@ -1077,13 +1087,7 @@ impl<E: Executor> Scheduler<E> {
                     else {
                         continue;
                     };
-                    let scheduler = Arc::clone(self);
-                    let settings = settings.clone();
-                    let guard = WorkerCostGuard::for_request(&self.store, &request);
-                    self.spawn(row.id, Kind::Worker, async move {
-                        let _guard = guard;
-                        scheduler.agent(&settings, request, skipped, job).await;
-                    });
+                    self.spawn_agent(row.id, &settings, request, skipped, job);
                 }
                 Command::RunChecks { pr } => {
                     self.checks(&row, pr, &job, &project, &settings, workers_free)?;
@@ -2478,6 +2482,27 @@ impl<E: Executor> Scheduler<E> {
             }
             _ => self.apply(job_id, report.event),
         }
+    }
+
+    /// Starts the worker for `job`, unless the job left the stage it was
+    /// dispatched in, such as by a cancel while the request was built.
+    fn spawn_agent(
+        self: &Arc<Self>,
+        id: i64,
+        settings: &Settings,
+        request: AgentRequest,
+        skipped: Vec<SkippedServer>,
+        job: Job,
+    ) {
+        let Ok(guard) = WorkerCostGuard::for_request(&self.store, &request, &job) else {
+            return;
+        };
+        let scheduler = Arc::clone(self);
+        let settings = settings.clone();
+        self.spawn(id, Kind::Worker, async move {
+            let _guard = guard;
+            scheduler.agent(&settings, request, skipped, job).await;
+        });
     }
 
     /// Writes the notices that precede a run's own output, the Local run line

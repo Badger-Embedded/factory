@@ -2587,6 +2587,27 @@ impl Store {
         Ok(())
     }
 
+    /// Like [`Self::begin_cost_lookup`], but only while job `id` is still in
+    /// the stage of `seen`. The check and the insert hold the connection, so a
+    /// cancel cannot land between them. Returns whether it registered.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn begin_cost_lookup_at(&self, id: i64, seen: &Job) -> Result<bool, StoreError> {
+        let conn = self.conn();
+        let now = Self::load(&conn, id)?;
+        if now.job.stage() != seen.stage() {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO cost_lookups (job_id, pending) VALUES (?1, 1)
+             ON CONFLICT (job_id) DO UPDATE SET pending = pending + 1",
+            [id],
+        )?;
+        Ok(true)
+    }
+
     /// Marks that a lookup begun with [`Self::begin_cost_lookup`] is over.
     ///
     /// # Errors

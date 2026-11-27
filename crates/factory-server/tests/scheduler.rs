@@ -10529,3 +10529,16 @@ async fn a_charge_for_a_run_cancelled_before_its_report_stays_on_the_run_step() 
     assert_eq!(cost.stage, "clarifying");
     assert_eq!(cost.usd, Some(0.4));
 }
+
+#[tokio::test]
+async fn a_lookup_is_not_registered_for_a_job_cancelled_since_its_snapshot() {
+    let (store, _executor, _scheduler) = setup(|_| questions());
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    let seen = store.start(id).unwrap().unwrap().job;
+    assert!(store.begin_cost_lookup_at(id, &seen).unwrap());
+    store.end_cost_lookup(id).unwrap();
+
+    store.apply(id, Event::Cancel).unwrap();
+    assert!(!store.begin_cost_lookup_at(id, &seen).unwrap());
+    assert!(!store.cost_lookup_pending(id).unwrap());
+}
