@@ -134,6 +134,7 @@ impl AgentEntry<'_> {
             Agent::Codex => Some("/settings/agents/codex"),
             Agent::Copilot => Some("/settings/agents/copilot"),
             Agent::Local => Some("/settings/agents/local"),
+            Agent::OpenRouter => None,
         }
     }
 
@@ -145,7 +146,7 @@ impl AgentEntry<'_> {
             Agent::Claude => &CLAUDE_MODELS,
             Agent::Codex => &CODEX_MODELS,
             Agent::Copilot => &COPILOT_MODELS,
-            Agent::Local => &[],
+            Agent::Local | Agent::OpenRouter => &[],
         }
     }
 
@@ -173,6 +174,7 @@ impl AgentEntry<'_> {
             Agent::Claude | Agent::Codex | Agent::Copilot | Agent::Local => {
                 Some(settings.worker_image.clone())
             }
+            Agent::OpenRouter => None,
         }
     }
 
@@ -207,6 +209,7 @@ impl AgentEntry<'_> {
             Agent::Codex => self.registry.codex_login.credential(),
             Agent::Copilot => self.copilot_token(),
             Agent::Local => Err("the Local agent has no subscription credential".to_owned()),
+            Agent::OpenRouter => Err("the OpenRouter agent is not available yet".to_owned()),
         }
     }
 

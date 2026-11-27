@@ -86,6 +86,15 @@ test('Local is selectable in every stage and shows its effort levels', async ({ 
   await expect(efforts).toHaveText(['low', 'medium', 'high', 'xhigh', 'max']);
 });
 
+test('OpenRouter is a disabled radio in every stage', async ({ page, project }) => {
+  await page.goto(settingsPath(project, '?stage=spec'));
+  for (const stage of ['clarify', 'spec', 'plan', 'implement', 'review']) {
+    const radio = page.locator(`input[name="${stage}_agent"][value="openrouter"]`);
+    await expect(radio).toHaveCount(1);
+    await expect(radio).toBeDisabled();
+  }
+});
+
 test("changing a stage's agent redraws its model and effort choices", async ({ page, project }) => {
   await page.goto(settingsPath(project, '?stage=spec'));
   const spec = panel(page, 'spec');
@@ -134,7 +143,8 @@ test('the Renovate agent redraws its choices and persists after a reload', async
   await expect(chips).toHaveText(['CLI default', 'gpt-6.1-sol', 'gpt-6.1-codex']);
   await expect(efforts).toHaveText(['minimal', 'low', 'medium', 'high', 'xhigh']);
   await card.getByRole('button', { name: 'gpt-6.1-sol' }).click();
-  await card.getByRole('radio', { name: 'low', exact: true }).check();
+  await efforts.filter({ hasText: /^low$/ }).click();
+  await expect(card.getByRole('radio', { name: 'low', exact: true })).toBeChecked();
   await card.getByRole('button', { name: 'Save Renovate agent' }).click();
   await expect(page.getByText('Saved.')).toBeVisible();
   await expect(page).toHaveURL(new RegExp(`${settingsPath(project)}\\?notice=Saved\\.$`));
