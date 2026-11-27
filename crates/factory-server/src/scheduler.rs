@@ -24,6 +24,7 @@ use crate::accounts::{
 };
 use crate::cost::{codex_cost, format_cost};
 use crate::mcp::{McpServer, McpTransport};
+use crate::openrouter::OPENROUTER_BASE_URL;
 use crate::projects::{Project, Projects, StageAgents};
 use crate::proxy::RunTokens;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
@@ -1647,8 +1648,13 @@ impl<E: Executor> Scheduler<E> {
             }
             (model, effort)
         };
-        let local = if agent == Agent::Local {
-            match self.local_request(row, session, model.as_deref())? {
+        let local = if matches!(agent, Agent::Local | Agent::OpenRouter) {
+            let resolved = if agent == Agent::Local {
+                self.local_request(row, session, model.as_deref())?
+            } else {
+                self.openrouter_request(row, session, model.as_deref())?
+            };
+            match resolved {
                 Ok(local) => Some(local),
                 Err(reason) => {
                     self.open_run_log(row.id, None, stage_note.as_deref())?;
@@ -1791,6 +1797,83 @@ impl<E: Executor> Scheduler<E> {
             setting_cli: chosen,
             session,
         }))
+    }
+
+    /// The `OpenRouter` settings for a run of `session`, read afresh, or the
+    /// reason the run cannot start. It checks the model, then resolves the key,
+    /// then picks the CLI, all before any checkout or container. A session
+    /// resumes on the CLI it started on. A fresh one uses the CLI the job's
+    /// requester chose, or the factory default when they chose none or the
+    /// factory requested the job.
+    fn openrouter_request(
+        &self,
+        row: &JobRow,
+        session: Session,
+        model: Option<&str>,
+    ) -> Result<Result<ProviderRequest, String>, StoreError> {
+        if model.is_none_or(|model| model.trim().is_empty()) {
+            return Ok(Err("no model is set for the OpenRouter agent".to_owned()));
+        }
+        let (key, key_from) = match self.openrouter_key(&row.requested_by)? {
+            Ok(resolved) => resolved,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let default = self.store.openrouter_settings()?.cli;
+        let chosen = if row.requested_by == FACTORY_REQUESTER {
+            default
+        } else {
+            self.store
+                .user_cli(&row.requested_by, Agent::OpenRouter)?
+                .unwrap_or(default)
+        };
+        let cli = self
+            .store
+            .session_provider_cli(row.id, session)?
+            .unwrap_or(chosen);
+        Ok(Ok(ProviderRequest {
+            target: ProviderTarget {
+                kind: ProviderKind::OpenRouter,
+                cli,
+                base_url: OPENROUTER_BASE_URL.to_owned(),
+                key: Some(key),
+            },
+            key_from,
+            setting_cli: chosen,
+            session,
+        }))
+    }
+
+    /// The `OpenRouter` API key a run of a job requested by `requested_by`
+    /// uses: the requester's own stored key, except for a job the factory
+    /// requested, else the factory key. With neither the run fails, and a key
+    /// that cannot be read fails it with no fallback to the other key.
+    fn openrouter_key(
+        &self,
+        requested_by: &str,
+    ) -> Result<Result<(String, KeyOwner), String>, StoreError> {
+        let secrets = &self.mcp.secrets;
+        if requested_by != FACTORY_REQUESTER {
+            match secrets.user_openrouter_key(requested_by) {
+                Ok(Some(key)) if !key.is_empty() => {
+                    return Ok(Ok((key, KeyOwner::Login(requested_by.to_owned()))));
+                }
+                Ok(_) => {}
+                Err(SecretError::Store(err)) => return Err(err),
+                Err(err) => {
+                    return Ok(Err(format!(
+                        "The OpenRouter API key of {requested_by} cannot be read: {err}."
+                    )));
+                }
+            }
+        }
+        match secrets.openrouter_key() {
+            Ok(Some(key)) if !key.is_empty() => Ok(Ok((key, KeyOwner::Factory))),
+            Ok(_) => Ok(Err("no OpenRouter API key is set".to_owned())),
+            Err(SecretError::Store(err)) => Err(err),
+            Err(err) => Ok(Err(format!(
+                "The factory's OpenRouter API key cannot be read: {err}."
+            ))),
+        }
     }
 
     /// The API key a Local run of a job requested by `requested_by` uses. The
@@ -2356,19 +2439,33 @@ impl<E: Executor> Scheduler<E> {
     /// the run uses, never the key. A run that resumes a session on another CLI
     /// than the settings name says so.
     fn note_local_run(&self, job_id: i64, local: &ProviderRequest) {
+        let openrouter = local.target.kind == ProviderKind::OpenRouter;
         let key = match &local.key_from {
+            KeyOwner::Login(login) if openrouter => {
+                format!("the OpenRouter API key of {login}")
+            }
             KeyOwner::Login(login) => format!("the Local API key of {login}"),
             KeyOwner::Factory => "the factory's key".to_owned(),
             KeyOwner::None => "no key".to_owned(),
         };
-        self.note(
-            job_id,
-            &format!(
-                "Local run on {} at {} with {key}.",
-                local.target.cli.display_name(),
-                local.target.base_url
-            ),
-        );
+        if openrouter {
+            self.note(
+                job_id,
+                &format!(
+                    "OpenRouter run on {} with {key}.",
+                    local.target.cli.display_name()
+                ),
+            );
+        } else {
+            self.note(
+                job_id,
+                &format!(
+                    "Local run on {} at {} with {key}.",
+                    local.target.cli.display_name(),
+                    local.target.base_url
+                ),
+            );
+        }
         if local.target.cli != local.setting_cli {
             self.note(
                 job_id,
@@ -2408,6 +2505,19 @@ impl<E: Executor> Scheduler<E> {
                 tracing::error!("job {job_id}: {err}");
             }
             let mut text = "Local run finished, recorded at $0".to_owned();
+            if let Some(usage) = report.token_usage {
+                let _ = write!(
+                    text,
+                    ". {} input tokens, {} output tokens",
+                    usage.input_tokens, usage.output_tokens
+                );
+            }
+            text.push('.');
+            self.note(job_id, &text);
+            return;
+        }
+        if agent == Agent::OpenRouter {
+            let mut text = "OpenRouter run finished".to_owned();
             if let Some(usage) = report.token_usage {
                 let _ = write!(
                     text,

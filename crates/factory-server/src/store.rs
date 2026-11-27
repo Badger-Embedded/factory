@@ -614,7 +614,8 @@ pub struct ProjectTotals {
 /// Selects the `job_costs` rows to show as a cost: a positive total, or a zero
 /// total of a job that ran a worker on Local. Another zero row reads as no cost.
 const SHOWN_COST: &str = "(c.usd > 0 OR EXISTS (
-    SELECT 1 FROM sessions s WHERE s.job_id = c.job_id AND s.local_cli IS NOT NULL))";
+    SELECT 1 FROM sessions s
+    WHERE s.job_id = c.job_id AND s.agent = 'local' AND s.local_cli IS NOT NULL))";
 
 /// One model's Codex prices, in USD per million tokens. The factory estimates a
 /// Codex run's cost from the row for the model it ran, since Codex reports token
@@ -691,6 +692,9 @@ pub enum StoreError {
     /// A stage was submitted on the Local agent with no model. The value is the
     /// stage's name. It is not stored.
     MissingLocalModel(&'static str),
+    /// A stage was submitted on the `OpenRouter` agent with no model. The value
+    /// is the stage's name. It is not stored.
+    MissingOpenRouterModel(&'static str),
     /// The Renovate agent setting was refused. The message says why. It is not
     /// stored.
     InvalidRenovateAgent(String),
@@ -755,6 +759,10 @@ impl fmt::Display for StoreError {
                 f,
                 "The {stage} stage runs on Local, which needs a model. \
                  The local server picks the model from its id."
+            ),
+            StoreError::MissingOpenRouterModel(stage) => write!(
+                f,
+                "The {stage} stage runs on OpenRouter, which needs a model ID."
             ),
             StoreError::InvalidRenovateAgent(reason) => {
                 write!(f, "The Renovate agent setting is invalid: {reason}")
@@ -4205,15 +4213,16 @@ impl Store {
         Ok(())
     }
 
-    /// Checks that every stage on the Local agent has a model, without writing,
-    /// because the local server picks the model from the id in the request. The
+    /// Checks that every stage on Local or `OpenRouter` has a model, without
+    /// writing, because both pick the model from the id in the request. The
     /// save handler calls this before any write, like [`Store::check_efforts`].
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::MissingLocalModel`] for the first stage on Local
+    /// Returns [`StoreError::MissingLocalModel`] or
+    /// [`StoreError::MissingOpenRouterModel`] for the first stage on that agent
     /// whose model is empty.
-    pub fn check_local_models(
+    pub fn check_provider_models(
         models: &StageModels,
         agents: &StageAgents,
     ) -> Result<(), StoreError> {
@@ -4224,10 +4233,13 @@ impl Store {
             ("implement", &models.implement, &agents.implement),
             ("review", &models.review, &agents.review),
         ] {
-            if agent == Agent::Local.id()
-                && model.as_deref().is_none_or(|model| model.trim().is_empty())
-            {
-                return Err(StoreError::MissingLocalModel(stage));
+            if model.as_deref().is_none_or(|model| model.trim().is_empty()) {
+                if agent == Agent::Local.id() {
+                    return Err(StoreError::MissingLocalModel(stage));
+                }
+                if agent == Agent::OpenRouter.id() {
+                    return Err(StoreError::MissingOpenRouterModel(stage));
+                }
             }
         }
         Ok(())
@@ -4401,16 +4413,20 @@ impl Store {
                 agent.effort, agent.agent
             )));
         }
-        if agent.agent == Agent::Local.id()
-            && agent
-                .model
-                .as_deref()
-                .is_none_or(|model| model.trim().is_empty())
+        if agent
+            .model
+            .as_deref()
+            .is_none_or(|model| model.trim().is_empty())
         {
-            return Err(invalid(
-                "Local needs a model, because the local server picks the model from its id"
-                    .to_string(),
-            ));
+            if agent.agent == Agent::Local.id() {
+                return Err(invalid(
+                    "Local needs a model, because the local server picks the model from its id"
+                        .to_string(),
+                ));
+            }
+            if agent.agent == Agent::OpenRouter.id() {
+                return Err(invalid("OpenRouter needs a model ID".to_string()));
+            }
         }
         Ok(())
     }

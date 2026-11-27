@@ -14,9 +14,9 @@ use factory_runner::{Account, GitHub};
 use factory_server::{
     AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, HttpForgejoProbe,
     HttpLocalServerProbe, LocalSecrets, LoginProcess, LoginSpawner, LoginSpec, MASTER_KEY_LEN,
-    McpChecker, ModelsError, OpenRouterApi, OpenRouterModel, OpenRouterModelsFuture,
-    PlanUsageCache, Projects, RepoChecker, RepoReport, SecretStore, Store, USER_HEADER,
-    UnavailableSecrets, WorkerSlots, app_with_forgejo_probe,
+    McpChecker, ModelsError, OpenRouterApi, OpenRouterKeyFuture, OpenRouterModel,
+    OpenRouterModelsFuture, PlanUsageCache, Projects, RepoChecker, RepoReport, SecretStore, Store,
+    USER_HEADER, UnavailableSecrets, WorkerSlots, app_with_forgejo_probe,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -160,6 +160,10 @@ impl OpenRouterApi for FakeOpenRouter {
         self.keys.lock().unwrap().push(key.map(str::to_owned));
         let answer = self.answer.lock().unwrap().clone();
         Box::pin(std::future::ready(answer))
+    }
+
+    fn check_key<'a>(&'a self, _key: &'a str) -> OpenRouterKeyFuture<'a> {
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 

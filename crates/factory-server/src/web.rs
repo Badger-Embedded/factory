@@ -541,6 +541,7 @@ impl IntoResponse for AppError {
                 err @ (StoreError::InvalidEffort(_)
                 | StoreError::InvalidAgent(_)
                 | StoreError::MissingLocalModel(_)
+                | StoreError::MissingOpenRouterModel(_)
                 | StoreError::InvalidRenovateAgent(_)
                 | StoreError::InvalidPrerequisite(_)
                 | StoreError::PrHeld { .. }),
@@ -2510,6 +2511,7 @@ fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError
         .entries()
         .map(|entry| {
             let local = entry.id() == Agent::Local.id();
+            let openrouter = entry.id() == Agent::OpenRouter.id();
             let models: Vec<String> = if local {
                 local_models.clone()
             } else {
@@ -2519,7 +2521,9 @@ fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError
                     .map(|&model| model.to_owned())
                     .collect()
             };
-            let model_hint = if local {
+            let model_hint = if openrouter {
+                "Type an OpenRouter model ID. An OpenRouter stage needs a model.".to_owned()
+            } else if local {
                 match (&local_url, models.is_empty()) {
                     (None, _) => {
                         "No local server is set. A Local stage needs a model ID.".to_owned()
@@ -2557,7 +2561,7 @@ fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError
                 default_effort: entry.default_effort().to_owned(),
                 models,
                 model_hint,
-                model_required: local,
+                model_required: local || openrouter,
             }
         })
         .collect())
@@ -3010,7 +3014,7 @@ async fn save_project_models(
     // checked against the agent its stage is being saved with.
     Store::check_agents(&agents)?;
     Store::check_efforts(&efforts, &agents)?;
-    Store::check_local_models(&models, &agents)?;
+    Store::check_provider_models(&models, &agents)?;
     state.store.save_project_efforts(&name, &efforts, &agents)?;
     state.store.save_project_agents(&name, &agents)?;
     state.store.save_project_models(&name, &models)?;

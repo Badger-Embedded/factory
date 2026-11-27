@@ -24,6 +24,9 @@ pub struct OpenRouterModel {
 pub type OpenRouterModelsFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<OpenRouterModel>, ModelsError>> + Send + 'a>>;
 
+pub type OpenRouterKeyFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ModelsError>> + Send + 'a>>;
+
 /// Talks to `OpenRouter`. A trait so tests can answer without a network.
 pub trait OpenRouterApi: Send + Sync {
     /// Lists the models that support tool calls, sending `key` as a bearer
@@ -34,6 +37,17 @@ pub trait OpenRouterApi: Send + Sync {
     ///
     /// Returns why the list could not be read. The text never holds the key.
     fn models<'a>(&'a self, key: Option<&'a str>) -> OpenRouterModelsFuture<'a>;
+
+    /// Asks `OpenRouter` about `key` with one `GET /api/v1/key`, so a run
+    /// finds a rejected key before its worker starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelsError::Status`] with the HTTP status when `OpenRouter`
+    /// does not accept the key, and [`ModelsError::Connect`] or
+    /// [`ModelsError::Timeout`] when it cannot be reached. The text never holds
+    /// the key.
+    fn check_key<'a>(&'a self, key: &'a str) -> OpenRouterKeyFuture<'a>;
 }
 
 /// The production [`OpenRouterApi`]. It follows no redirect, so the key never
@@ -97,6 +111,24 @@ impl OpenRouterApi for HttpOpenRouterApi {
             }
             let body = response.bytes().await.map_err(|err| transport(&err))?;
             parse_models(&body)
+        })
+    }
+
+    fn check_key<'a>(&'a self, key: &'a str) -> OpenRouterKeyFuture<'a> {
+        Box::pin(async move {
+            let client = self.client.as_ref().ok_or(ModelsError::Connect)?;
+            let response = client
+                .get(format!("{}/v1/key", self.base_url))
+                .bearer_auth(key)
+                .send()
+                .await
+                .map_err(|err| transport(&err))?;
+            let status = response.status();
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(ModelsError::Status(status.as_u16()))
+            }
         })
     }
 }

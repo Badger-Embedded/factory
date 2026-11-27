@@ -7,7 +7,7 @@ hooks:
     prek install
 
 test:
-    cargo test --workspace --locked
+    cargo test --workspace --locked --features factory-server/e2e-fakes
 
 # Run the browser tests in headless Chromium: just e2e tests/board.spec.ts -g "name" runs one
 [positional-arguments]

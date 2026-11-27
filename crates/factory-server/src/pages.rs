@@ -1552,7 +1552,7 @@ pub fn settings_openrouter_agent(
             h1 { "OpenRouter" }
             p.meta {
                 "Holds the factory's OpenRouter API key, the default CLI (Claude Code, Codex or Copilot) \
-                 and the list of models a stage can use. Stages cannot run on OpenRouter yet."
+                 and the list of models a stage can use."
             }
             form.card.settings-form method="post" action="/settings/agents/openrouter" {
                 input type="hidden" name="csrf" value=(csrf);
@@ -2287,8 +2287,8 @@ pub fn settings_openrouter_key(
                 input type="hidden" name="csrf" value=(csrf);
                 h2 { "Your CLI" }
                 p.hint {
-                    "You can save your CLI choice now. OpenRouter jobs are not available yet, so it has no effect until they are. \
-                     A session will keep the CLI it started on."
+                    "The CLI that runs the OpenRouter jobs you request. \
+                     A session keeps the CLI it started on."
                 }
                 div.field {
                     label for="openrouter-cli" { "CLI" }
@@ -2303,10 +2303,9 @@ pub fn settings_openrouter_key(
                 }
                 h2 { "Your OpenRouter key" }
                 p.hint {
-                    "You can save your key now. OpenRouter jobs are not available yet, so nothing uses it until they are. \
-                     Once they run, the factory will send it to OpenRouter for jobs you requested. \
-                     The key will reach the worker, and the agent \
-                     that runs there will be able to read it. Stored encrypted and never shown. \
+                    "The factory sends it to OpenRouter for jobs you requested. \
+                     The key reaches the worker, and the agent \
+                     that runs there can read it. Stored encrypted and never shown. \
                      Create one on the "
                     (external_link("https://openrouter.ai/settings/keys", "OpenRouter keys page", None, None))
                     "."
