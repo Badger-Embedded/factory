@@ -97,6 +97,7 @@ fn failed(reason: String) -> RunReport {
         mcp_unavailable: Vec::new(),
         credential: None,
         token_usage: None,
+        generation_ids: Vec::new(),
         head: None,
     }
 }
@@ -291,7 +292,9 @@ impl PodmanExecutor {
         log: &mut LogSink,
     ) -> Result<(), String> {
         let target = &local.target;
-        let ProviderKind::Local { load_timeout } = target.kind;
+        let ProviderKind::Local { load_timeout } = target.kind else {
+            return Ok(());
+        };
         let started = Instant::now();
         let load =
             self.local_probe
@@ -315,7 +318,7 @@ impl PodmanExecutor {
                 started.elapsed().as_secs()
             )));
         }
-        result.map_err(|error| load_failure(&error, local, model))
+        result.map_err(|error| load_failure(&error, local, model, load_timeout))
     }
 
     /// Checks out the head of the picked pull request into `branch`, and for a
@@ -508,9 +511,13 @@ impl PodmanExecutor {
 
 const LOAD_NOTICE_AFTER: Duration = Duration::from_secs(5);
 
-fn load_failure(error: &LoadError, local: &crate::ProviderRequest, model: &str) -> String {
+fn load_failure(
+    error: &LoadError,
+    local: &crate::ProviderRequest,
+    model: &str,
+    load_timeout: Duration,
+) -> String {
     let target = &local.target;
-    let ProviderKind::Local { load_timeout } = target.kind;
     match error {
         LoadError::Timeout => {
             let minutes = load_timeout.as_secs().div_ceil(60);

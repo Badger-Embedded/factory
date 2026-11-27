@@ -16,7 +16,7 @@ use crate::agent::{
     AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage, write_replacing,
 };
 use crate::outcome::{Expect, event_from_result};
-use crate::stream::{ClaudeStream, StreamItem, parse_line};
+use crate::stream::{ClaudeStream, StreamItem, generation_id, parse_line};
 use crate::worker::{
     AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, ProviderKind,
     STDIO_STARTUP_TIMEOUT_SECS, SessionRun, WorkerConfig, WorkerRun,
@@ -81,8 +81,11 @@ impl AgentBackend for ClaudeAgent {
         "claude"
     }
 
-    fn provider_host_config_dir(&self, _kind: &ProviderKind) -> &'static str {
-        "local-claude"
+    fn provider_host_config_dir(&self, kind: &ProviderKind) -> &'static str {
+        match kind {
+            ProviderKind::Local { .. } => "local-claude",
+            ProviderKind::OpenRouter => "openrouter-claude",
+        }
     }
 
     fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
@@ -97,7 +100,18 @@ impl AgentBackend for ClaudeAgent {
             return Vec::new();
         };
         let model = run.model.clone().unwrap_or_default();
-        let ProviderKind::Local { load_timeout } = local.kind;
+        let ProviderKind::Local { load_timeout } = local.kind else {
+            // OpenRouter answers at once, so the timeouts stay at Claude's own.
+            // The empty `ANTHROPIC_API_KEY` keeps Claude from sending a key of
+            // its own beside the auth token.
+            return vec![
+                ("ANTHROPIC_BASE_URL", local.base_url.clone()),
+                ("ANTHROPIC_API_KEY", String::new()),
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.clone()),
+                ("ANTHROPIC_SMALL_FAST_MODEL", model),
+                ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_owned()),
+            ];
+        };
         let load_ms = load_timeout.as_millis();
         let mut env = vec![
             ("ANTHROPIC_BASE_URL", local.base_url.clone()),
@@ -165,12 +179,11 @@ impl AgentBackend for ClaudeAgent {
             claude.push(model.into());
         }
         claude.push("--effort".into());
-        let default_effort = if run.provider.is_some() {
-            Agent::Local
-        } else {
-            Agent::Claude
-        }
-        .default_effort();
+        let default_effort = run
+            .provider
+            .as_ref()
+            .map_or(Agent::Claude, |provider| provider.kind.agent())
+            .default_effort();
         claude.push(run.effort.as_deref().unwrap_or(default_effort).into());
         // One `http` entry per active MCP server, pointed at the proxy with the
         // run token. A run with no active server adds nothing, so its arguments
@@ -190,13 +203,16 @@ impl AgentBackend for ClaudeAgent {
     fn stream(
         &self,
         expect: Expect,
-        local: bool,
+        provider: Option<ProviderKind>,
         key: Option<&str>,
     ) -> crate::agent::LineParser<'_> {
         let mut stream = ClaudeStream::with_key(key);
         Box::new(move |line| {
-            let items = convert(expect, stream.parse_line(line));
-            if local {
+            let mut items = convert(expect, stream.parse_line(line));
+            if provider == Some(ProviderKind::OpenRouter) {
+                items.extend(generation_id(line).map(AgentItem::Generation));
+            }
+            if provider.is_some() {
                 append_local_token_usage(items, line)
             } else {
                 items

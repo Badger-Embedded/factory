@@ -15,6 +15,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use std::fmt::Write as _;
 
@@ -56,6 +57,8 @@ const CONFIG_TOML: &str = "cli_auth_credentials_store = \"file\"\n";
 /// environment, so it stays out of the arguments and the log.
 const LOCAL_PROVIDER: &str = "local";
 const LOCAL_KEY_ENV: &str = "FACTORY_LOCAL_API_KEY";
+const OPENROUTER_PROVIDER: &str = "openrouter";
+const OPENROUTER_KEY_ENV: &str = "FACTORY_OPENROUTER_API_KEY";
 
 /// Codex's idle timeout on a response stream, 300000 ms unless the provider sets
 /// `stream_idle_timeout_ms`. A Local run raises it to at least the model load
@@ -102,8 +105,11 @@ impl AgentBackend for CodexAgent {
         }
     }
 
-    fn provider_host_config_dir(&self, _kind: &ProviderKind) -> &'static str {
-        "local-codex"
+    fn provider_host_config_dir(&self, kind: &ProviderKind) -> &'static str {
+        match kind {
+            ProviderKind::Local { .. } => "local-codex",
+            ProviderKind::OpenRouter => "openrouter-codex",
+        }
     }
 
     fn config_dir_env(&self) -> &'static str {
@@ -179,8 +185,10 @@ impl AgentBackend for CodexAgent {
         {
             env.push((MCP_TOKEN_ENV, proxy.token.as_str()));
         }
-        if let Some(key) = run.provider.as_ref().and_then(|local| local.key.as_deref()) {
-            env.push((LOCAL_KEY_ENV, key));
+        if let Some(provider) = run.provider.as_ref()
+            && let Some(key) = provider.key.as_deref()
+        {
+            env.push((key_env(provider.kind), key));
         }
         env
     }
@@ -207,25 +215,27 @@ impl AgentBackend for CodexAgent {
             codex.push("--model".into());
             codex.push(model.into());
         }
-        let default_effort = if run.provider.is_some() {
-            Agent::Local
-        } else {
-            Agent::Codex
-        }
-        .default_effort();
+        let default_effort = run
+            .provider
+            .as_ref()
+            .map_or(Agent::Codex, |provider| provider.kind.agent())
+            .default_effort();
         codex.push("-c".into());
         codex.push(format!(
             "model_reasoning_effort={}",
             run.effort.as_deref().unwrap_or(default_effort)
         ));
-        if let Some(local) = run.provider.as_ref() {
+        if let Some(provider) = run.provider.as_ref() {
+            let (id, table) = match provider.kind {
+                ProviderKind::Local { load_timeout } => {
+                    (LOCAL_PROVIDER, local_provider(provider, load_timeout))
+                }
+                ProviderKind::OpenRouter => (OPENROUTER_PROVIDER, openrouter_provider(provider)),
+            };
             codex.push("-c".into());
-            codex.push(format!(
-                "model_providers.{LOCAL_PROVIDER}={}",
-                local_provider(local)
-            ));
+            codex.push(format!("model_providers.{id}={table}"));
             codex.push("-c".into());
-            codex.push(format!("model_provider={LOCAL_PROVIDER}"));
+            codex.push(format!("model_provider={id}"));
         }
         // A remote MCP server is pointed at the proxy. The run token is passed
         // by name, not value, so it stays out of the arguments; the proxy swaps
@@ -270,8 +280,7 @@ impl AgentBackend for CodexAgent {
 /// The inline TOML table for the Local provider: the server's `/v1` URL over the
 /// Responses API, the key's variable when the run has a key, and an idle timeout
 /// that outlasts the model load.
-fn local_provider(local: &ProviderTarget) -> String {
-    let ProviderKind::Local { load_timeout } = local.kind;
+fn local_provider(local: &ProviderTarget, load_timeout: Duration) -> String {
     let idle_ms = load_timeout.as_millis().max(DEFAULT_STREAM_IDLE_MS);
     let mut table = format!(
         "{{ name = \"Local\", base_url = {}, wire_api = \"responses\", stream_idle_timeout_ms = {idle_ms}",
@@ -282,6 +291,23 @@ fn local_provider(local: &ProviderTarget) -> String {
     }
     table.push_str(" }");
     table
+}
+
+/// The inline TOML table for the `OpenRouter` provider: `OpenRouter`'s `/v1` URL
+/// over the Responses API and the key's variable. It sets no idle timeout,
+/// because `OpenRouter` loads no model.
+fn openrouter_provider(target: &ProviderTarget) -> String {
+    format!(
+        "{{ name = \"OpenRouter\", base_url = {}, wire_api = \"responses\", env_key = \"{OPENROUTER_KEY_ENV}\" }}",
+        toml_string(&format!("{}/v1", target.base_url)),
+    )
+}
+
+fn key_env(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Local { .. } => LOCAL_KEY_ENV,
+        ProviderKind::OpenRouter => OPENROUTER_KEY_ENV,
+    }
 }
 
 /// `value` as a TOML basic string, which `-c` parses as the override's value.
