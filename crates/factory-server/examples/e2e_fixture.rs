@@ -519,6 +519,17 @@ fn main() -> Result<()> {
                 store.append_factory_log(job, &format!("{text} {n}"))?;
             }
         }
+        "tool-error" => {
+            let job = one("job")?.parse()?;
+            store.append_log(
+                job,
+                &factory_runner::LogLine::ToolError {
+                    name: one("tool")?.to_owned(),
+                    input: flags.get("input").map(|v| v[0].clone()),
+                    error: one("error")?.to_owned(),
+                },
+            )?;
+        }
         "mcp" => {
             let job = one("job")?.parse()?;
             let (server, tool) = (one("server")?, one("tool")?);

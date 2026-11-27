@@ -1,6 +1,7 @@
 use factory_core::PlanUsage;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// One line of `claude --output-format stream-json`, reduced to what the
 /// factory keeps.
@@ -35,6 +36,14 @@ pub enum LogLine {
     Text(String),
     /// A tool call, with a short summary of its input.
     Tool { name: String, summary: String },
+    /// A tool call whose result was an error. `input` is the call's input as
+    /// JSON, with long strings cut. It is set only for `StructuredOutput`,
+    /// whose rejected input explains the error.
+    ToolError {
+        name: String,
+        input: Option<String>,
+        error: String,
+    },
     /// A line that is not stream-json, such as podman pulling the image.
     Other(String),
 }
@@ -62,7 +71,7 @@ struct Line {
 
 #[derive(Deserialize)]
 struct Message {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "blocks")]
     content: Vec<Block>,
 }
 
@@ -73,12 +82,32 @@ enum Block {
         text: String,
     },
     ToolUse {
+        #[serde(default)]
+        id: Option<String>,
         name: String,
         #[serde(default)]
         input: Value,
     },
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: Value,
+        #[serde(default)]
+        is_error: bool,
+    },
     #[serde(other)]
     Other,
+}
+
+/// A user message's `content` may be a plain string, which holds no block.
+fn blocks<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Block>, D::Error> {
+    match Value::deserialize(deserializer)? {
+        Value::Array(items) => Ok(items
+            .into_iter()
+            .map(|item| serde_json::from_value(item).unwrap_or(Block::Other))
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
 }
 
 const SUMMARY_KEYS: [&str; 6] = [
@@ -90,12 +119,49 @@ const SUMMARY_KEYS: [&str; 6] = [
     "description",
 ];
 const MAX_SUMMARY: usize = 200;
+const MAX_ERROR: usize = 1000;
+const STRUCTURED_OUTPUT: &str = "StructuredOutput";
 
-/// Parses one stdout line. Returns the log lines and, for the final line,
-/// the result. An assistant message can hold several blocks, so one line can
-/// give several log lines.
+/// Parser for one run's stdout. It remembers each tool call until its result
+/// arrives, so a failed result is logged with the tool's name and input.
+#[derive(Debug, Default)]
+pub struct ClaudeStream {
+    calls: HashMap<String, (String, Value)>,
+    key: Option<String>,
+}
+
+/// Parses one stdout line with no memory of earlier lines, so a tool result
+/// is not matched to its call. See [`ClaudeStream::parse_line`].
 #[must_use]
 pub fn parse_line(line: &str) -> Vec<StreamItem> {
+    ClaudeStream::default().parse_line(line)
+}
+
+impl ClaudeStream {
+    /// A parser that replaces `key` in a failed tool call's input and error
+    /// before it cuts them, so a cut cannot leave a prefix of the key.
+    #[must_use]
+    pub fn with_key(key: Option<&str>) -> Self {
+        ClaudeStream {
+            calls: HashMap::new(),
+            key: key.filter(|key| !key.is_empty()).map(str::to_owned),
+        }
+    }
+
+    /// Parses one stdout line. Returns the log lines and, for the final line,
+    /// the result. An assistant message can hold several blocks, so one line
+    /// can give several log lines.
+    #[must_use]
+    pub fn parse_line(&mut self, line: &str) -> Vec<StreamItem> {
+        parse_with(&mut self.calls, self.key.as_deref(), line)
+    }
+}
+
+fn parse_with(
+    calls: &mut HashMap<String, (String, Value)>,
+    key: Option<&str>,
+    line: &str,
+) -> Vec<StreamItem> {
     let line = line.trim();
     if line.is_empty() {
         return Vec::new();
@@ -130,7 +196,7 @@ pub fn parse_line(line: &str) -> Vec<StreamItem> {
     let Ok(parsed) = serde_json::from_value::<Line>(value) else {
         return Vec::new();
     };
-    if parsed.kind != "assistant" {
+    if parsed.kind != "assistant" && parsed.kind != "user" {
         return Vec::new();
     }
     parsed
@@ -139,16 +205,82 @@ pub fn parse_line(line: &str) -> Vec<StreamItem> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|block| match block {
-            Block::Text { text } if !text.trim().is_empty() => {
+            Block::Text { text } if parsed.kind == "assistant" && !text.trim().is_empty() => {
                 Some(StreamItem::Log(LogLine::Text(text)))
             }
-            Block::ToolUse { name, input } => Some(StreamItem::Log(LogLine::Tool {
-                name,
-                summary: summarize(&input),
-            })),
+            Block::ToolUse { id, name, input } if parsed.kind == "assistant" => {
+                let summary = summarize(&input);
+                if let Some(id) = id {
+                    calls.insert(id, (name.clone(), input));
+                }
+                Some(StreamItem::Log(LogLine::Tool { name, summary }))
+            }
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                let call = calls.remove(&tool_use_id);
+                if !is_error {
+                    return None;
+                }
+                let (name, input) = call.unwrap_or_else(|| ("tool".to_owned(), Value::Null));
+                let input = (name == STRUCTURED_OUTPUT).then(|| cut_json(&input, key));
+                Some(StreamItem::Log(LogLine::ToolError {
+                    name,
+                    input,
+                    error: cut(&redact(&result_text(&content), key), MAX_ERROR),
+                }))
+            }
             _ => None,
         })
         .collect()
+}
+
+/// A result's `content` is a string or a list of text blocks.
+fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn cut(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    } else {
+        text.to_owned()
+    }
+}
+
+fn redact(text: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) => text.replace(key, "[redacted]"),
+        None => text.to_owned(),
+    }
+}
+
+fn cut_json(input: &Value, key: Option<&str>) -> String {
+    fn shorten(value: &Value, key: Option<&str>) -> Value {
+        match value {
+            Value::String(text) => Value::String(cut(&redact(text, key), MAX_SUMMARY)),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|item| shorten(item, key)).collect())
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(name, value)| (redact(name, key), shorten(value, key)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_string(&shorten(input, key)).unwrap_or_default()
 }
 
 fn summarize(input: &Value) -> String {

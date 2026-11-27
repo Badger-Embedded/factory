@@ -2108,6 +2108,29 @@ async fn the_job_page_shows_the_log_and_polls_while_the_agent_works() {
 }
 
 #[tokio::test]
+async fn the_job_page_shows_a_failed_tool_call_apart_from_the_agents_text() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .append_log(
+            id,
+            &factory_runner::LogLine::ToolError {
+                name: "StructuredOutput".into(),
+                input: Some(r#"{"outcome":"unsafe"}"#.into()),
+                error: "must have required property 'summary'".into(),
+            },
+        )
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(body.contains("log-tool-error"));
+    assert!(body.contains("StructuredOutput failed: must have required property"));
+    assert!(body.contains("input: {&quot;outcome&quot;:&quot;unsafe&quot;}"));
+}
+
+#[tokio::test]
 async fn the_job_page_loads_its_update_script_but_the_board_does_not() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;

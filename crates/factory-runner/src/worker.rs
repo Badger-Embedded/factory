@@ -451,18 +451,18 @@ pub async fn run(
 
     let redactor = Redactor::new(run.local.as_ref().and_then(|local| local.key.as_deref()));
     let mut collected = Collected::default();
+    let mut parse = backend.stream(
+        run.expect,
+        run.local.is_some(),
+        run.local.as_ref().and_then(|local| local.key.as_deref()),
+    );
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(started) = started.take() {
                 started();
             }
-            let items = if run.local.is_some() {
-                backend.parse_local(run.expect, &line)
-            } else {
-                backend.parse(run.expect, &line)
-            };
-            for item in items {
+            for item in parse(&line) {
                 let item = redactor.item(item);
                 // A Local run says nothing about the subscription's plan usage,
                 // whatever the CLI reports.
@@ -549,6 +549,11 @@ impl Redactor {
                 LogLine::Tool { name, summary } => LogLine::Tool {
                     name: self.apply(&name),
                     summary: self.apply(&summary),
+                },
+                LogLine::ToolError { name, input, error } => LogLine::ToolError {
+                    name: self.apply(&name),
+                    input: input.map(|input| self.apply(&input)),
+                    error: self.apply(&error),
                 },
                 LogLine::Other(text) => LogLine::Other(self.apply(&text)),
             }),
