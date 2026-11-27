@@ -134,7 +134,7 @@ impl AgentEntry<'_> {
             Agent::Codex => Some("/settings/agents/codex"),
             Agent::Copilot => Some("/settings/agents/copilot"),
             Agent::Local => Some("/settings/agents/local"),
-            Agent::OpenRouter => None,
+            Agent::OpenRouter => Some("/settings/agents/openrouter"),
         }
     }
 

@@ -194,7 +194,7 @@ fn the_openrouter_entry_is_listed_but_cannot_run_yet() {
     let entry = registry.entry(Agent::OpenRouter);
     assert_eq!(entry.display_name(), "OpenRouter");
     assert!(!entry.available());
-    assert_eq!(entry.settings_url(), None);
+    assert_eq!(entry.settings_url(), Some("/settings/agents/openrouter"));
     assert_eq!(entry.model_suggestions(), [] as [&str; 0]);
     assert_eq!(entry.host_config_dir(), None);
     let settings = Settings {

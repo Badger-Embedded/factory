@@ -16,6 +16,7 @@ use crate::forgejo_instances::ForgejoInstance;
 use crate::mcp::{
     self, McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
 };
+use crate::openrouter::OpenRouterModel;
 use crate::projects::{
     Project, ProjectForge, ProjectLabel, RenovateAgent, StageAgents, StageEfforts, StageModels,
 };
@@ -335,6 +336,17 @@ CREATE TABLE IF NOT EXISTS local_models (
     id TEXT PRIMARY KEY,
     position INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS openrouter_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cli TEXT NOT NULL DEFAULT 'codex',
+    models_fetched_at INTEGER,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS openrouter_models (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS store_boots (
     id INTEGER PRIMARY KEY AUTOINCREMENT
 );
@@ -387,6 +399,24 @@ impl Default for LocalSettings {
             load_timeout_minutes: 10,
             models_fetched_at: None,
             models_url: None,
+        }
+    }
+}
+
+/// The `OpenRouter` agent's factory-wide settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRouterSettings {
+    /// The factory default CLI.
+    pub cli: Cli,
+    /// When the stored model list was fetched, in Unix seconds.
+    pub models_fetched_at: Option<i64>,
+}
+
+impl Default for OpenRouterSettings {
+    fn default() -> Self {
+        OpenRouterSettings {
+            cli: Cli::Codex,
+            models_fetched_at: None,
         }
     }
 }
@@ -3000,6 +3030,93 @@ impl Store {
         tx.execute(
             "INSERT INTO local_settings (id, models_fetched_at) VALUES (1, ?1)
              ON CONFLICT (id) DO UPDATE SET models_fetched_at = ?1, models_url = url",
+            [fetched_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The `OpenRouter` agent's settings, the defaults when none are stored.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn openrouter_settings(&self) -> Result<OpenRouterSettings, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT cli, models_fetched_at FROM openrouter_settings WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?;
+        Ok(
+            row.map_or_else(OpenRouterSettings::default, |(cli, fetched)| {
+                OpenRouterSettings {
+                    cli: Cli::from_id(&cli).unwrap_or(Cli::Codex),
+                    models_fetched_at: fetched,
+                }
+            }),
+        )
+    }
+
+    /// Stores the factory default CLI of the `OpenRouter` agent. The stored model
+    /// list stays.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn save_openrouter_settings(&self, cli: Cli) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO openrouter_settings (id, cli) VALUES (1, ?1)
+             ON CONFLICT (id) DO UPDATE SET cli = ?1, updated_at = CURRENT_TIMESTAMP",
+            [cli.id()],
+        )?;
+        Ok(())
+    }
+
+    /// The models `OpenRouter` listed at the last successful fetch, in its order.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn openrouter_models(&self) -> Result<Vec<OpenRouterModel>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, name FROM openrouter_models ORDER BY position")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(OpenRouterModel {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Replaces the stored model list with `models` and records `fetched_at`, in
+    /// Unix seconds. A failed fetch must not call this, so the earlier list
+    /// stays.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn replace_openrouter_models(
+        &self,
+        models: &[OpenRouterModel],
+        fetched_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM openrouter_models", [])?;
+        for (position, model) in (0_i64..).zip(models) {
+            tx.execute(
+                "INSERT OR IGNORE INTO openrouter_models (id, name, position)
+                 VALUES (?1, ?2, ?3)",
+                params![model.id, model.name, position],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO openrouter_settings (id, models_fetched_at) VALUES (1, ?1)
+             ON CONFLICT (id) DO UPDATE SET models_fetched_at = ?1",
             [fetched_at],
         )?;
         tx.commit()?;

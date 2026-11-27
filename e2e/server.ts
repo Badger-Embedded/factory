@@ -1,6 +1,7 @@
 import { ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,8 +15,18 @@ export const OUTSIDER = 'nobody@e2e.test';
 export const PHONE_USER = 'talhahavadar.phone@e2e.test';
 export const SHARED_PROJECT = 'maestro';
 
+/** The OpenRouter model list the server reads: tests change `models` and read `auth`. */
+export interface OpenRouterStub {
+  models: Array<{ id: string; name?: string; supported_parameters?: string[] }>;
+  /** The Authorization header of each request, in order. */
+  auth: Array<string | undefined>;
+  /** When set, the stub answers with this HTTP status and no list. */
+  status?: number;
+}
+
 export interface Factory {
   url: string;
+  openrouter: OpenRouterStub;
   db: string;
   /** Holds `ca.pem`, `cert.pem` and `key.pem`; the server trusts `ca.pem` for MCP and Forgejo servers. */
   tls: string;
@@ -66,6 +77,25 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     throw error;
   }
 
+  const openrouter: OpenRouterStub = { models: [], auth: [] };
+  const openrouterServer = http.createServer((req, res) => {
+    if (req.method !== 'GET' || req.url !== '/v1/models') {
+      res.statusCode = 404;
+      res.end('{}');
+      return;
+    }
+    openrouter.auth.push(req.headers.authorization);
+    if (openrouter.status) {
+      res.statusCode = openrouter.status;
+      res.end('{}');
+      return;
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: openrouter.models }));
+  });
+  await new Promise<void>((done) => openrouterServer.listen(0, '127.0.0.1', done));
+  const openrouterUrl = `http://127.0.0.1:${(openrouterServer.address() as net.AddressInfo).port}`;
+
   const port = await freePort();
   const proxyPort = await freePort();
   const imports = path.join(dir, 'projects');
@@ -84,6 +114,7 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     FACTORY_PODMAN: path.join(__dirname, 'fakes', 'podman'),
     FACTORY_MCP_CA_FILE: path.join(tls, 'ca.pem'),
     FACTORY_FORGEJO_CA_FILE: path.join(tls, 'ca.pem'),
+    FACTORY_OPENROUTER_API_URL: openrouterUrl,
   };
   delete env.FACTORY_WORKERS;
   delete env.GH_TOKEN;
@@ -103,6 +134,7 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
     }
+    openrouterServer.close();
     await exited;
     fs.rmSync(dir, { recursive: true, force: true });
   };
@@ -113,5 +145,5 @@ export async function startFactory(): Promise<{ factory: Factory; stop(): Promis
     await cleanup();
     throw error;
   }
-  return { factory: { url, db, tls, fixture }, stop: cleanup };
+  return { factory: { url, db, tls, fixture, openrouter }, stop: cleanup };
 }

@@ -12561,10 +12561,8 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
     let local = body.find(r#"href="/settings/agents/local""#).unwrap();
     assert!(body.find("Copilot").unwrap() < local);
 
-    assert!(!body.contains("/settings/agents/openrouter"));
-    let open_router = body.find("OpenRouter").unwrap();
+    let open_router = body.find(r#"href="/settings/agents/openrouter""#).unwrap();
     assert!(local < open_router);
-    assert!(body[open_router..].contains("Not available yet"));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;

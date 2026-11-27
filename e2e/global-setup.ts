@@ -5,7 +5,7 @@ import { repoRoot } from './server';
 export default function globalSetup(): void {
   execFileSync(
     'cargo',
-    ['build', '--locked', '-p', 'factory-server', '--bin', 'factory-server', '--example', 'e2e_fixture'],
+    ['build', '--locked', '-p', 'factory-server', '--features', 'e2e-fakes', '--bin', 'factory-server', '--example', 'e2e_fixture'],
     { cwd: repoRoot, stdio: 'inherit' },
   );
 }

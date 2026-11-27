@@ -29,6 +29,7 @@ use crate::forges::Forges;
 use crate::github::RepoReport;
 use crate::local_server::{HttpLocalServerProbe, LocalServerProbe, normalize_server_url};
 use crate::mcp::{McpError, McpProjectSettings, McpServer, McpStages, McpTransport};
+use crate::openrouter::{HttpOpenRouterApi, OpenRouterApi};
 use crate::pages::{self, HeaderState, JobLinks, ProjectSettings, ServerSettings, Workers};
 use crate::projects::{
     Project, ProjectForge, ProjectLabel, Projects, RenovateAgent, StageAgents, StageEfforts,
@@ -77,6 +78,8 @@ struct AppState {
     forgejo_probe: Arc<dyn ForgejoProbe>,
     local_probe: Arc<dyn LocalServerProbe>,
     local_lock: Arc<tokio::sync::Mutex<()>>,
+    openrouter_api: Arc<dyn OpenRouterApi>,
+    openrouter_lock: Arc<tokio::sync::Mutex<()>>,
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
     onboarding: Arc<tokio::sync::Mutex<()>>,
@@ -137,6 +140,7 @@ pub fn app(
         checker,
         Arc::new(HttpForgejoProbe::new(&[])),
         Arc::new(HttpLocalServerProbe::new()),
+        Arc::new(HttpOpenRouterApi::new()),
         registry,
         device_login,
         copilot_login,
@@ -145,8 +149,8 @@ pub fn app(
 }
 
 /// As [`app`], reading the version of a Forgejo server through `forgejo_probe`
-/// when an admin registers one, and the models of the Local server through
-/// `local_probe`.
+/// when an admin registers one, the models of the Local server through
+/// `local_probe`, and the `OpenRouter` models through `openrouter_api`.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -164,6 +168,7 @@ pub fn app_with_forgejo_probe(
     checker: Arc<dyn McpChecker>,
     forgejo_probe: Arc<dyn ForgejoProbe>,
     local_probe: Arc<dyn LocalServerProbe>,
+    openrouter_api: Arc<dyn OpenRouterApi>,
     registry: Arc<AgentRegistry>,
     device_login: Arc<DeviceLogin>,
     copilot_login: Arc<DeviceLogin>,
@@ -182,6 +187,8 @@ pub fn app_with_forgejo_probe(
         forgejo_probe,
         local_probe,
         local_lock: Arc::new(tokio::sync::Mutex::new(())),
+        openrouter_api,
+        openrouter_lock: Arc::new(tokio::sync::Mutex::new(())),
         registry,
         device_login,
         onboarding: Arc::new(tokio::sync::Mutex::new(())),
@@ -297,6 +304,18 @@ fn admin_routes(state: AppState) -> Router<AppState> {
         .route("/settings/agents/local", get(show_local).post(save_local))
         .route("/settings/agents/local/clear-key", post(clear_local_key))
         .route("/settings/agents/local/refresh", post(refresh_local_models))
+        .route(
+            "/settings/agents/openrouter",
+            get(show_openrouter).post(save_openrouter),
+        )
+        .route(
+            "/settings/agents/openrouter/clear-key",
+            post(clear_openrouter_key),
+        )
+        .route(
+            "/settings/agents/openrouter/refresh",
+            post(refresh_openrouter_models),
+        )
         .route("/settings/agents/claude", get(show_claude))
         .route("/settings/agents/claude/token", post(save_claude_token))
         .route(
@@ -4990,6 +5009,154 @@ async fn clear_local_key(
     let _one_local_change_at_a_time = state.local_lock.lock().await;
     state.secrets.clear_local_key()?;
     local_page(&state, &headers, None, Some("Cleared."))
+}
+
+struct OpenRouterDraft {
+    cli: Cli,
+}
+
+fn openrouter_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    draft: Option<&OpenRouterDraft>,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    let settings = state.store.openrouter_settings()?;
+    let models = state.store.openrouter_models()?;
+    let (key_stored, key_unreadable) = match state.secrets.openrouter_key() {
+        Ok(key) => (key.is_some(), false),
+        Err(_) => (true, true),
+    };
+    let notice = match notice {
+        None if key_unreadable => Some(KEY_UNREADABLE),
+        other => other,
+    };
+    Ok(pages::settings_openrouter_agent(
+        &login,
+        &settings_nav(state, &login)?,
+        &pages::OpenRouterAgentView {
+            settings: &settings,
+            model_count: models.len(),
+            key_stored,
+            secrets_available: state.secrets.available(),
+            cli: draft.map_or(settings.cli, |draft| draft.cli),
+            csrf: &state.csrf.issue(&login),
+        },
+        notice,
+    ))
+}
+
+async fn show_openrouter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    openrouter_page(&state, &headers, None, None)
+}
+
+#[derive(Deserialize)]
+struct OpenRouterForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    cli: String,
+}
+
+/// Reads the model list with the factory key, when one is stored, and replaces
+/// the stored list on success. The notice says what happened; a failure keeps
+/// the earlier list.
+async fn fetch_openrouter_models(state: &AppState) -> Result<String, AppError> {
+    let Ok(key) = state.secrets.openrouter_key() else {
+        return Ok(format!(
+            "The model list was not updated: {KEY_UNREADABLE} The earlier list stays."
+        ));
+    };
+    match state.openrouter_api.models(key.as_deref()).await {
+        Ok(models)
+            if key.as_deref().is_some_and(|key| {
+                models
+                    .iter()
+                    .any(|model| model.id.contains(key) || model.name.contains(key))
+            }) =>
+        {
+            Ok(
+                "The model list was not updated: OpenRouter returned the key in a model. \
+                The earlier list stays."
+                    .to_owned(),
+            )
+        }
+        Ok(models) => {
+            state.store.replace_openrouter_models(&models, now_secs())?;
+            Ok(format!(
+                "OpenRouter lists {} models that support tools.",
+                models.len()
+            ))
+        }
+        Err(err) => Ok(format!(
+            "The model list was not updated: {err}. The earlier list stays."
+        )),
+    }
+}
+
+async fn save_openrouter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<OpenRouterForm>,
+) -> Result<Response, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let _one_change_at_a_time = state.openrouter_lock.lock().await;
+    let Some(cli) = Cli::from_id(&form.cli) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            openrouter_page(&state, &headers, None, Some("Choose one of the CLIs."))?,
+        )
+            .into_response());
+    };
+    let key = form.key.trim();
+    if !key.is_empty() && !state.secrets.available() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            openrouter_page(
+                &state,
+                &headers,
+                Some(&OpenRouterDraft { cli }),
+                Some("The master key is missing, so a key cannot be saved here."),
+            )?,
+        )
+            .into_response());
+    }
+    state.store.save_openrouter_settings(cli)?;
+    if !key.is_empty() {
+        state.secrets.set_openrouter_key(key)?;
+    }
+    let notice = format!("Saved. {}", fetch_openrouter_models(&state).await?);
+    Ok(openrouter_page(&state, &headers, None, Some(&notice))?.into_response())
+}
+
+async fn refresh_openrouter_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalCsrfForm>,
+) -> Result<Markup, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let _one_change_at_a_time = state.openrouter_lock.lock().await;
+    let notice = fetch_openrouter_models(&state).await?;
+    openrouter_page(&state, &headers, None, Some(&notice))
+}
+
+/// Removes the factory key. It works without the master key, so a key stranded
+/// by a lost key can still be removed.
+async fn clear_openrouter_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalCsrfForm>,
+) -> Result<Markup, AppError> {
+    require_csrf(&state, &user(&headers), &form.csrf)?;
+    let _one_change_at_a_time = state.openrouter_lock.lock().await;
+    state.secrets.clear_openrouter_key()?;
+    openrouter_page(&state, &headers, None, Some("Cleared."))
 }
 
 async fn show_codex(State(state): State<AppState>, headers: HeaderMap) -> Result<Markup, AppError> {

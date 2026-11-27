@@ -6,11 +6,11 @@ use std::sync::Arc;
 use factory_runner::{ForgeKind, Git, GitHub, GitLab, WorkerConfig};
 use factory_server::{
     Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, GlabRepos,
-    HttpForgejoProbe, HttpLocalServerProbe, HttpMcpChecker, LocalSecrets, LoginSpec, McpChecker,
-    McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin, Projects, ProxyEvent,
-    ProxyEventFn, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams, UnavailableSecrets,
-    Upstreams, WorkerSlots, app_with_forgejo_probe, import_tomls, master_key_from_env,
-    parse_admins, proxy_app_with_roots,
+    HttpForgejoProbe, HttpLocalServerProbe, HttpMcpChecker, HttpOpenRouterApi, LocalSecrets,
+    LoginSpec, McpChecker, McpRuntime, McpWarnings, PlanUsageCache, PodmanExecutor, PodmanLogin,
+    Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler, SecretStore, Store, StoreUpstreams,
+    UnavailableSecrets, Upstreams, WorkerSlots, app_with_forgejo_probe, import_tomls,
+    master_key_from_env, parse_admins, proxy_app_with_roots,
 };
 use tokio::sync::Notify;
 
@@ -295,6 +295,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // The per-project MCP connection check uses a real HTTP client that follows
     // no redirect and bounds the wait, the same way the proxy's client does.
     let checker: Arc<dyn McpChecker> = Arc::new(HttpMcpChecker::with_roots(mcp_roots));
+    let openrouter_api = openrouter_api();
 
     let device_login = codex_device_login(&secrets, worker_network.clone(), &data_dir);
     let copilot_login = copilot_device_login(&secrets, worker_network.clone(), &data_dir);
@@ -315,6 +316,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             checker,
             Arc::new(forgejo_probe),
             Arc::new(HttpLocalServerProbe::new()),
+            Arc::new(openrouter_api),
             agents,
             device_login,
             copilot_login,
@@ -326,4 +328,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .await?;
     Ok(())
+}
+
+#[cfg(all(feature = "e2e-fakes", not(debug_assertions)))]
+compile_error!("the e2e-fakes feature is for debug builds only");
+
+#[cfg(feature = "e2e-fakes")]
+fn openrouter_api() -> HttpOpenRouterApi {
+    env::var("FACTORY_OPENROUTER_API_URL").map_or_else(
+        |_| HttpOpenRouterApi::new(),
+        |url| HttpOpenRouterApi::with_base_url(&url),
+    )
+}
+
+#[cfg(not(feature = "e2e-fakes"))]
+fn openrouter_api() -> HttpOpenRouterApi {
+    HttpOpenRouterApi::new()
 }

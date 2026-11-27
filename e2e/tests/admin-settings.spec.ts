@@ -18,6 +18,9 @@
 // - Local: save a server, the CLI and a key, list the models the stub server
 //   serves, refresh them and remove the key: "Local stores the server, a key and
 //   the model list"
+// - OpenRouter: save a key and the CLI, list the tool-capable models the stub
+//   serves, refresh them, show a failed refresh and remove the key:
+//   "OpenRouter stores a key, the CLI and the model list"
 // - MCP servers: add a server, edit it, add and remove header-name rows, and
 //   delete the server: "MCP servers: add, edit with header rows, and delete"
 // - A login that is not an admin gets "This page is for factory admins.":
@@ -398,6 +401,51 @@ test.describe('without JavaScript', () => {
   });
 });
 
+test('OpenRouter stores a key, the CLI and the model list', async ({ page, own }) => {
+  own.openrouter.models = [
+    { id: 'anthropic/claude-sonnet-4.5', name: 'Claude Sonnet 4.5', supported_parameters: ['tools'] },
+    { id: 'meta/no-tools', name: 'No Tools', supported_parameters: ['temperature'] },
+  ];
+  await page.goto('/settings/agents/openrouter');
+  await expect(page.getByLabel('Codex')).toBeChecked();
+  await expect(page.getByText('No models are stored.')).toBeVisible();
+
+  await page.getByLabel('Factory API key (optional)').fill('sk-or-e2e');
+  await page.getByLabel('Claude Code').check();
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText('Saved. OpenRouter lists 1 models that support tools.')).toBeVisible();
+  await expect(page.locator('#openrouter-model-count')).toHaveText(
+    '1 models that support tools are stored.',
+  );
+  await expect(page.locator('body')).not.toContainText('sk-or-e2e');
+  expect(own.openrouter.auth).toEqual(['Bearer sk-or-e2e']);
+
+  await page.goto('/settings/agents/openrouter');
+  await expect(page.getByLabel('Claude Code')).toBeChecked();
+  await expect(page.getByLabel('Factory API key (optional)')).toHaveAttribute(
+    'placeholder',
+    'set',
+  );
+
+  own.openrouter.models.push({ id: 'openai/gpt-5', name: 'GPT-5', supported_parameters: ['tools'] });
+  await page.getByRole('button', { name: 'Refresh models' }).click();
+  await expect(page.locator('#openrouter-model-count')).toHaveText(
+    '2 models that support tools are stored.',
+  );
+
+  own.openrouter.status = 500;
+  await page.getByRole('button', { name: 'Refresh models' }).click();
+  await expect(page.getByText('the server answered HTTP 500')).toBeVisible();
+  await expect(page.locator('#openrouter-model-count')).toHaveText(
+    '2 models that support tools are stored.',
+  );
+  own.openrouter.status = undefined;
+
+  await page.getByRole('button', { name: 'Remove key' }).click();
+  await expect(page.getByText('Cleared.', { exact: true })).toBeVisible();
+  await expect(page.getByText('No key is stored.')).toBeVisible();
+});
+
 test('a login that is not an admin is turned away from the factory-wide settings', async ({
   page,
 }) => {
@@ -411,6 +459,7 @@ test('a login that is not an admin is turned away from the factory-wide settings
     '/settings/agents/codex',
     '/settings/agents/copilot',
     '/settings/agents/local',
+    '/settings/agents/openrouter',
     '/settings/mcp',
   ]) {
     const response = await page.goto(path);
