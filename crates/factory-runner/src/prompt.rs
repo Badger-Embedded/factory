@@ -110,13 +110,16 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
             let _ = write!(
                 text,
                 "Follow the repository's {} and CONTRIBUTING.md, tests included. Commit \
-                 your work on the current branch. Do not push or open a pull request. The \
-                 factory does that with the title and description you return, so write them \
-                 the way CONTRIBUTING.md asks.",
+                 your work on the current branch. Do not push or open a pull request.",
                 style(agent).rules_doc
             );
             if picked {
                 text.push_str(PICKED_NOTE);
+            } else {
+                text.push_str(
+                    " The factory does that with the title and description you return, so \
+                     write them the way CONTRIBUTING.md asks.",
+                );
             }
             text
         }
@@ -168,6 +171,13 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
         Task::CheckDiff { diff, body } => return diff_prompt(diff, body, agent),
         Task::FindGaps { context } => return gaps_prompt(context, agent),
     };
+    if picked && matches!(expect, Expect::Commits | Expect::FixCi) {
+        text.push_str(if matches!(agent, PromptTarget::Agent(Agent::Codex)) {
+            PICKED_RETURN_NOTE_STRICT
+        } else {
+            PICKED_RETURN_NOTE
+        });
+    }
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
     let _ = write!(
@@ -181,14 +191,60 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
 }
 
 const PICKED_NOTE: &str = " The branch holds an existing pull request. Add commits on top \
-     of it. Do not rewrite, drop or amend a commit that was already there, and do not rebase. \
-     The title and description of the pull request stay as they are, so what you return for them \
-     is not used.";
+     of it. Do not rewrite, drop or amend a commit that was already there, and do not rebase.";
+
+const PICKED_RETURN_NOTE: &str = "\n\nThe pull request's title and description stay as they are, \
+     so you may leave `pull_request` out of the structured output.";
+
+const PICKED_RETURN_NOTE_STRICT: &str = "\n\nThe pull request's title and description stay as \
+     they are, so return `\"pull_request\": null`.";
 
 fn end_prompt(text: &mut String, agent: PromptTarget, expect: Expect) {
+    if let Some(fields) = output_fields(expect) {
+        text.push_str("\n\n");
+        text.push_str(&fields);
+    }
     text.push_str("\n\n");
     text.push_str(NIX_PARAGRAPH);
     append_schema(text, agent, expect);
+}
+
+fn output_fields(expect: Expect) -> Option<String> {
+    let schema = expect.schema();
+    let required: Vec<&str> = schema["required"]
+        .as_array()?
+        .iter()
+        .filter_map(|name| name.as_str())
+        .collect();
+    if required == ["outcome"] {
+        return None;
+    }
+    let optional: Vec<&str> = schema["properties"]
+        .as_object()
+        .map(|properties| {
+            properties
+                .keys()
+                .map(String::as_str)
+                .filter(|name| !required.contains(name))
+                .collect()
+        })
+        .unwrap_or_default();
+    let list = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut text = format!(
+        "The structured output must have these required top-level fields, each its own \
+         field: {}. Do not put one field's content inside another.",
+        list(&required)
+    );
+    if !optional.is_empty() {
+        let _ = write!(text, " These fields are optional: {}.", list(&optional));
+    }
+    Some(text)
 }
 
 const NIX_PARAGRAPH: &str = "Nix is installed in this environment, with flakes enabled. When a tool or \
@@ -235,12 +291,29 @@ fn diff_prompt(diff: &str, body: &str, agent: PromptTarget) -> String {
          {body}\n\n\
          Its diff:\n\n{diff}\n\n\
          Decide whether the diff is safe to merge without a person reading it. The diff is \
-         safe when it changes only dependency or packaging version files. Any other change \
-         is unsafe, such as source code, CI workflows, scripts or configuration that does \
-         more than pin a version. Do not change any files and do not push.\n\n\
-         End with outcome \"safe\" or \"unsafe\", a reason that names the files that decide \
-         it, and a short summary of the update. When the diff shows the upstream versions \
-         or refs the update moves between, give them as \"from\" and \"to\"."
+         safe when every change only moves a version, in any file, and nothing in the new \
+         version breaks this project. A version move is a version number, tag, ref, commit \
+         SHA or digest pin, with its lockfile or checksum lines. The kind of file does not \
+         decide: workflows, Dockerfiles, scripts and configuration are fine when only a \
+         version moves. Any other change is unsafe, such as edited source code, an added or \
+         removed step, or a changed command, trigger, permission, option or setting. A diff \
+         with any such change is always unsafe, even when it also moves versions, and \
+         compatibility never makes it safe.\n\n\
+         For a pure version bump, compatibility decides. Read the release notes in the \
+         description. For each breaking change they list, check the repository for use of \
+         what it changes, for example whether a workflow has a trigger the change affects. \
+         If the project is not affected, the update is safe. If it is affected, or you \
+         cannot tell, the update is unsafe. When the description lists no breaking \
+         change, a pure version bump is safe, a major bump included. Decide this yourself: \
+         do not answer unsafe only so that a person can confirm something you can read in \
+         the repository or the diff. Do not change any files and do not push.\n\n\
+         End with outcome \"safe\" or \"unsafe\", a reason and a short summary of the \
+         update. For safe, the reason names the files and, when the release notes list \
+         breaking changes, says why each does not affect the project. For unsafe, the \
+         reason names the change that is not a version move. When a breaking change \
+         stops the update, it names that change and where the project uses it, or, when \
+         you cannot tell, what you could not determine. When the diff shows the upstream versions or refs the \
+         update moves between, give them as \"from\" and \"to\"."
     );
     end_prompt(&mut text, agent, Expect::DiffCheck);
     text

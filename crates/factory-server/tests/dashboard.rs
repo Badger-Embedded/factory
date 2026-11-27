@@ -2108,6 +2108,29 @@ async fn the_job_page_shows_the_log_and_polls_while_the_agent_works() {
 }
 
 #[tokio::test]
+async fn the_job_page_shows_a_failed_tool_call_apart_from_the_agents_text() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    dashboard
+        .store
+        .append_log(
+            id,
+            &factory_runner::LogLine::ToolError {
+                name: "StructuredOutput".into(),
+                input: Some(r#"{"outcome":"unsafe"}"#.into()),
+                error: "must have required property 'summary'".into(),
+            },
+        )
+        .unwrap();
+
+    let body = dashboard.get(&format!("/jobs/{id}")).await.body;
+    assert!(body.contains("log-tool-error"));
+    assert!(body.contains("StructuredOutput failed: must have required property"));
+    assert!(body.contains("input: {&quot;outcome&quot;:&quot;unsafe&quot;}"));
+}
+
+#[tokio::test]
 async fn the_job_page_loads_its_update_script_but_the_board_does_not() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
@@ -2420,7 +2443,7 @@ async fn watching_ci(dashboard: &Dashboard) -> i64 {
     dashboard.apply(id, Event::Approve);
     dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 7 });
     id
@@ -2638,7 +2661,7 @@ async fn a_pull_request_in_review_waits_for_the_user() {
         }])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(page.body.contains("factory working"));
@@ -2675,7 +2698,7 @@ fn to_review_turn(dashboard: &Dashboard, id: i64) {
     dashboard.apply(id, Event::Approve);
     dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 15 });
     dashboard.apply(id, start_review());
@@ -2733,7 +2756,7 @@ async fn the_job_page_lists_every_pass_and_the_cap_reason() {
             },
         );
         if n < MAX_REVIEW_ROUNDS {
-            dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+            dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
             dashboard.apply(id, Event::ChecksPassed);
             dashboard.apply(id, Event::Published { number: 15 });
             dashboard.apply(id, start_review());
@@ -4496,7 +4519,10 @@ async fn picker_counts_equal_the_board_section_counts() {
     dashboard.apply(review, Event::Approve);
     dashboard.apply(review, Event::Agent(AgentResult::Plan(plan_of_one())));
     dashboard.apply(review, Event::Approve);
-    dashboard.apply(review, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(
+        review,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     dashboard.apply(review, Event::ChecksPassed);
     dashboard.apply(review, Event::Published { number: 3 });
     let failed = dashboard.new_job().await;
@@ -6425,7 +6451,7 @@ async fn a_cleaned_merged_job_page_and_its_attachments_still_render() {
     dashboard.apply(id, Event::Approve);
     dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 7 });
     dashboard.apply(id, Event::Merged);
@@ -6741,7 +6767,10 @@ async fn at_publish_gate(dashboard: &Dashboard) -> i64 {
             notes: None,
         }])),
     );
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(description())));
+    dashboard.apply(
+        id,
+        Event::Agent(AgentResult::CommitsReady(Some(description()))),
+    );
     dashboard.apply(id, Event::ChecksPassed);
     id
 }
@@ -6876,7 +6905,7 @@ async fn every_stage_and_turn_lands_in_exactly_one_lane() {
         (Event::Agent(AgentResult::Plan(plan_of_one())), "inbox-you"),
         (Event::Approve, "inbox-running"),
         (
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             "inbox-running",
         ),
         (Event::ChecksPassed, "inbox-running"),
@@ -6888,7 +6917,7 @@ async fn every_stage_and_turn_lands_in_exactly_one_lane() {
             "inbox-running",
         ),
         (
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             "inbox-running",
         ),
         (Event::ChecksPassed, "inbox-running"),
@@ -6937,7 +6966,7 @@ async fn a_pull_request_in_review_moves_to_factory_with_auto_merge() {
     dashboard.apply(id, Event::Approve);
     dashboard.apply(id, Event::Agent(AgentResult::Plan(plan_of_one())));
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 3 });
     assert_lane(&dashboard, id, "inbox-you").await;
@@ -7245,7 +7274,7 @@ async fn the_board_offers_no_approve_for_questions_review_or_other_lanes() {
     dashboard.apply(id, Event::Approve);
     dashboard.apply(id, plan_one());
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 15 });
     let index = dashboard.get("/").await;
@@ -7303,7 +7332,7 @@ fn merge(dashboard: &Dashboard, id: i64) {
         Event::Agent(AgentResult::Plan(vec![planned("maestrod: reboot", None)])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 15 });
     dashboard.apply(id, Event::Merged);
@@ -9218,11 +9247,11 @@ async fn each_planned_pull_request_has_its_own_group() {
     );
     dashboard.apply(id, Event::Approve);
     dashboard.store.add_cost(id, 1.25, false).unwrap();
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 81 });
     dashboard.apply(id, Event::CiFailed { log: "red".into() });
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 81 });
     dashboard.apply(id, Event::Merged);
@@ -9260,7 +9289,7 @@ async fn a_skipped_pull_request_says_so_on_the_job_page() {
         ])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::NothingToPublish);
 
@@ -9348,12 +9377,12 @@ async fn failed_out_of_rounds(dashboard: &Dashboard) -> i64 {
         Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 7 });
     for _ in 1..MAX_FAILED_ROUNDS {
         dashboard.apply(id, Event::CiFailed { log: "fail".into() });
-        dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+        dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
         dashboard.apply(id, Event::ChecksPassed);
         dashboard.apply(id, Event::Published { number: 7 });
     }
@@ -9447,7 +9476,7 @@ async fn a_job_whose_checks_could_not_run_links_to_the_project_settings() {
         Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     for _ in 0..5 {
         dashboard.apply(
             id,
@@ -9512,7 +9541,7 @@ async fn failed_without_retry(dashboard: &Dashboard) -> i64 {
         Event::Agent(AgentResult::Plan(vec![planned("only", None)])),
     );
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 7 });
     dashboard.apply(id, Event::ClosedUnmerged);
@@ -13719,7 +13748,7 @@ fn to_plan_approval(dashboard: &Dashboard, id: i64) {
 fn to_review(dashboard: &Dashboard, id: i64) {
     to_plan_approval(dashboard, id);
     dashboard.apply(id, Event::Approve);
-    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(ready())));
+    dashboard.apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     dashboard.apply(id, Event::ChecksPassed);
     dashboard.apply(id, Event::Published { number: 15 });
 }
@@ -19133,12 +19162,12 @@ async fn the_review_card_offers_fix_elsewhere_for_a_fork_and_the_job_page_links_
     post_fix_elsewhere(&dashboard, fork, "").await;
     dashboard.apply(
         fork,
-        Event::Agent(factory_core::AgentResult::CommitsReady(
+        Event::Agent(factory_core::AgentResult::CommitsReady(Some(
             factory_core::PrDescription {
                 title: "maestro: fix".into(),
                 body: "Fixes.".into(),
             },
-        )),
+        ))),
     );
     dashboard.apply(fork, Event::ChecksPassed);
     dashboard.apply(fork, Event::Published { number: 77 });

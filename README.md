@@ -57,6 +57,8 @@ The access each account needs on the repository:
 | Renovate triage: list pull requests, read status, logs and diffs, comment | Read |
 | Renovate triage: rerun failed CI, approve and merge | Write |
 
+A Renovate pull request is safe when every change only moves a version, in any file, and no breaking change listed in its release notes affects the project or has unclear applicability. Any other change is unsafe.
+
 With only Read, Renovate triage still works: it skips the reruns and goes straight to the failure analysis, comments, and leaves a safe pull request as ready to merge even with auto-merge on. Granting Write takes effect on the next head commit, with no restart.
 
 ## Forgejo servers

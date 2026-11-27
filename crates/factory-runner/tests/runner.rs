@@ -111,6 +111,210 @@ fn assistant_text_and_tool_calls_become_log_lines() {
     );
 }
 
+fn tool_use(id: &str, name: &str, input: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+    )
+}
+
+fn tool_result(id: &str, content: &str, is_error: bool) -> String {
+    format!(
+        r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":{content},"is_error":{is_error}}}]}}}}"#
+    )
+}
+
+fn error_lines(items: Vec<StreamItem>) -> Vec<LogLine> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            StreamItem::Log(line @ LogLine::ToolError { .. }) => Some(line),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_rejected_structured_output_call_logs_its_input_and_error() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let _ = stream.parse_line(&tool_use(
+        "toolu_1",
+        "StructuredOutput",
+        r#"{"outcome":"unsafe","reason":"CI workflow"}"#,
+    ));
+    let items = stream.parse_line(&tool_result(
+        "toolu_1",
+        r#""must have required property 'summary'""#,
+        true,
+    ));
+    assert_eq!(
+        error_lines(items),
+        [LogLine::ToolError {
+            name: "StructuredOutput".into(),
+            input: Some(r#"{"outcome":"unsafe","reason":"CI workflow"}"#.into()),
+            error: "must have required property 'summary'".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_successful_tool_result_adds_no_log_line() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let _ = stream.parse_line(&tool_use(
+        "toolu_1",
+        "StructuredOutput",
+        r#"{"outcome":"x"}"#,
+    ));
+    assert_eq!(
+        stream.parse_line(&tool_result("toolu_1", r#""ok""#, false)),
+        vec![]
+    );
+}
+
+#[test]
+fn a_failed_bash_result_logs_the_error_without_the_input() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let _ = stream.parse_line(&tool_use("toolu_2", "Bash", r#"{"command":"false"}"#));
+    let items = stream.parse_line(&tool_result(
+        "toolu_2",
+        r#"[{"type":"text","text":"exit 1"},{"type":"text","text":"boom"}]"#,
+        true,
+    ));
+    assert_eq!(
+        error_lines(items),
+        [LogLine::ToolError {
+            name: "Bash".into(),
+            input: None,
+            error: "exit 1\nboom".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_long_string_in_a_rejected_input_is_cut_and_every_key_stays() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let long = "x".repeat(500);
+    let _ = stream.parse_line(&tool_use(
+        "toolu_3",
+        "StructuredOutput",
+        &format!(r#"{{"spec":"{long}","title":"t"}}"#),
+    ));
+    let items = stream.parse_line(&tool_result("toolu_3", r#""bad""#, true));
+    let lines = error_lines(items);
+    let [
+        LogLine::ToolError {
+            input: Some(input), ..
+        },
+    ] = lines.as_slice()
+    else {
+        panic!("expected one tool error");
+    };
+    assert!(input.contains(&format!("{}…", "x".repeat(200))));
+    assert!(!input.contains(&"x".repeat(201)));
+    assert!(input.contains(r#""title":"t""#));
+}
+
+#[test]
+fn a_key_that_straddles_a_cutoff_is_redacted_before_the_cut() {
+    let key = "sk-\"secret\"-key";
+    let mut stream = factory_runner::ClaudeStream::with_key(Some(key));
+    let value = format!("{}{key}tail", "x".repeat(195));
+    let input = serde_json::json!({ "reason": value, key: "v" }).to_string();
+    let _ = stream.parse_line(&tool_use("t1", "StructuredOutput", &input));
+    let error = serde_json::to_string(&format!("{}{key}", "e".repeat(990))).unwrap();
+    let items = stream.parse_line(&tool_result("t1", &error, true));
+    let lines = error_lines(items);
+    let [
+        LogLine::ToolError {
+            input: Some(input),
+            error,
+            ..
+        },
+    ] = lines.as_slice()
+    else {
+        panic!("expected one tool error");
+    };
+    for text in [input, error] {
+        assert!(!text.contains("sk-"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+    assert!(error.ends_with("[redacted]"), "{error}");
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap();
+    assert!(parsed["reason"].as_str().unwrap().ends_with("[reda…"));
+}
+
+#[tokio::test]
+async fn a_quote_only_local_key_leaves_the_logged_input_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!(
+            "{}\n{}\n",
+            tool_use("t1", "StructuredOutput", r#"{"reason":"say \"hi\""}"#),
+            tool_result("t1", r#""bad""#, true)
+        ),
+    )
+    .unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, "", 0),
+        ..WorkerConfig::default()
+    };
+    let worker = local_claude_run(dir.path(), Some("\""));
+    let mut log = Vec::new();
+    run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    let input = log
+        .iter()
+        .find_map(|line| match line {
+            LogLine::ToolError { input, .. } => input.clone(),
+            _ => None,
+        })
+        .expect("a tool error with its input");
+    let parsed: serde_json::Value = serde_json::from_str(&input).unwrap();
+    assert_eq!(parsed["reason"], "say [redacted]hi[redacted]");
+}
+
+#[tokio::test]
+async fn a_local_key_in_a_failed_tool_call_is_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!(
+            "{}\n{}\n",
+            tool_use("t1", "StructuredOutput", r#"{"reason":"key sk-secret"}"#),
+            tool_result("t1", r#""bad sk-secret""#, true)
+        ),
+    )
+    .unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, "", 0),
+        ..WorkerConfig::default()
+    };
+    let worker = local_claude_run(dir.path(), Some("sk-secret"));
+    let mut log = Vec::new();
+    run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    let shown = format!("{log:?}");
+    assert!(shown.contains("bad [redacted]"), "{shown}");
+    assert!(shown.contains("key [redacted]"), "{shown}");
+    assert!(!shown.contains("sk-secret"), "{shown}");
+}
+
 #[test]
 fn other_messages_give_no_log_lines_and_plain_text_is_kept() {
     assert_eq!(
@@ -528,7 +732,7 @@ fn structured_outputs_become_agent_results() {
                 "title": "maestrod: add a reboot endpoint",
                 "body": "## Why\n\nThe device page needs it."
             }}),
-            AgentResult::CommitsReady(ready()),
+            AgentResult::CommitsReady(Some(ready())),
         ),
     ];
     for (expect, output, want) in cases {
@@ -555,11 +759,6 @@ fn incomplete_outputs_fail_the_run() {
         (Expect::Spec, json!({"outcome": "spec"})),
         (Expect::Spec, json!({"outcome": "spec", "spec": "  "})),
         (Expect::Spec, json!({"spec": "no outcome"})),
-        (Expect::Commits, json!({"outcome": "commits_ready"})),
-        (
-            Expect::Commits,
-            json!({"outcome": "commits_ready", "pull_request": {"title": "x", "body": " "}}),
-        ),
     ] {
         let event = event_from_result(expect, &result(Some(output.clone())));
         assert!(
@@ -569,6 +768,30 @@ fn incomplete_outputs_fail_the_run() {
     }
     let reason = failure_reason(event_from_result(Expect::Spec, &result(None)));
     assert!(reason.contains("without structured output"), "{reason}");
+}
+
+#[test]
+fn commits_ready_without_a_pull_request_title_and_body_is_accepted() {
+    for expect in [Expect::Commits, Expect::FixCi] {
+        for output in [
+            json!({"outcome": "commits_ready"}),
+            json!({"outcome": "commits_ready", "pull_request": null}),
+            json!({"outcome": "commits_ready", "pull_request": {"title": "", "body": "Why."}}),
+            json!({"outcome": "commits_ready", "pull_request": {"title": "x", "body": " "}}),
+        ] {
+            let expected = Event::Agent(AgentResult::CommitsReady(None));
+            assert_eq!(
+                event_from_result(expect, &result(Some(output.clone()))),
+                expected,
+                "{output}"
+            );
+            assert_eq!(
+                factory_runner::event_from_output(expect, Some(output.clone())),
+                expected,
+                "{output}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1511,7 +1734,7 @@ fn the_plan_prompt_holds_the_spec_text() {
 fn the_implement_prompt_holds_the_spec_and_its_planned_pull_request() {
     let mut job = approved_job(Job::new("Add a reboot button", Gates::default()));
     job.apply(Event::Approve).unwrap();
-    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+    job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
         .unwrap();
     let first = run_prompt_for_pr(&job, 0);
     assert!(first.contains("Add a reboot button"));
@@ -1637,7 +1860,7 @@ fn watching(number: u64) -> Job {
     let mut job = approved_job(Job::new("Add a reboot button", Gates::default()));
     for event in [
         Event::Approve,
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Event::ChecksPassed,
         Event::Published { number },
     ] {
@@ -1756,6 +1979,62 @@ fn the_quick_review_prompt_holds_the_pull_request_and_the_focus() {
     assert!(text.contains("5 means it is safe to merge"));
     assert!(text.contains("1 means do not merge"));
     assert!(text.contains("do not push"));
+}
+
+#[test]
+fn the_diff_check_prompt_names_its_required_and_optional_fields() {
+    let check = Task::CheckDiff {
+        diff: "+v = 1".into(),
+        body: "Bumps serde".into(),
+    };
+    let text = prompt(&check, Expect::DiffCheck, Agent::Claude);
+    for name in ["`outcome`", "`reason`", "`summary`"] {
+        assert!(text.contains(name), "{name} missing: {text}");
+    }
+    assert!(text.contains("required top-level fields"));
+    assert!(text.contains("These fields are optional: `from`, `to`."));
+}
+
+#[test]
+fn a_prompt_names_every_field_its_schema_requires() {
+    let job = quick_job("");
+    let check = Task::CheckDiff {
+        diff: "+v = 1".into(),
+        body: "Bumps serde".into(),
+    };
+    let analyze = Task::AnalyzeFailure { log: "boom".into() };
+    let gaps = gaps_task();
+    for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
+        let texts = [
+            (Expect::DiffCheck, prompt(&check, Expect::DiffCheck, agent)),
+            (
+                Expect::FailureAnalysis,
+                prompt(&analyze, Expect::FailureAnalysis, agent),
+            ),
+            (
+                Expect::PackagingGaps,
+                prompt(&gaps, Expect::PackagingGaps, agent),
+            ),
+            (
+                Expect::QuickReview,
+                job_prompt(&job, &Task::QuickReview, Expect::QuickReview, agent, &[]),
+            ),
+        ];
+        for (expect, text) in texts {
+            let listed = text
+                .split("each its own field: ")
+                .nth(1)
+                .and_then(|rest| rest.split(". Do not").next())
+                .unwrap_or_else(|| panic!("the {agent:?} prompt for {expect:?} has no field list"));
+            for name in expect.schema()["required"].as_array().unwrap() {
+                let name = name.as_str().unwrap();
+                assert!(
+                    listed.contains(&format!("`{name}`")),
+                    "the {agent:?} prompt for {expect:?} does not list `{name}` as required"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -2038,7 +2317,7 @@ fn changes_then_fix(job: &mut Job, feedback: &str) {
         feedback: feedback.into(),
     })
     .unwrap();
-    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+    job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
         .unwrap();
     job.apply(Event::ChecksPassed).unwrap();
     job.apply(Event::Published { number: 7 }).unwrap();
@@ -2074,7 +2353,7 @@ fn a_later_review_pass_carries_the_answers_given_since_the_last_pass() {
     .unwrap();
     job.apply(Event::Answer(vec!["yes, keep the spec".into()]))
         .unwrap();
-    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+    job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
         .unwrap();
     job.apply(Event::ChecksPassed).unwrap();
     job.apply(Event::Published { number: 7 }).unwrap();
@@ -2239,6 +2518,10 @@ fn the_renovate_schemas_require_a_reason_and_forbid_questions() {
     for key in ["from", "to"] {
         assert_eq!(diff["properties"][key]["type"], "string");
     }
+    let rule = diff["properties"]["outcome"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(rule.contains("any file") && !rule.contains("dependency or packaging"));
 
     let strict = Expect::DiffCheck.strict_schema();
     assert_eq!(strict["required"].as_array().unwrap().len(), 5);
@@ -2351,8 +2634,28 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
         log: "test foo failed".into(),
     };
     let check = Task::CheckDiff {
-        diff: "+version = 1.2.3".into(),
-        body: "Bumps serde".into(),
+        diff: "--- a/.github/workflows/build-wormholes.yml\n\
+               +++ b/.github/workflows/build-wormholes.yml\n\
+               @@ -1,12 +1,12 @@\n \
+               name: build-wormholes\n \
+               on: [push, pull_request]\n \
+               jobs:\n \
+               \x20 build:\n \
+               \x20   runs-on: ubuntu-latest\n \
+               \x20   steps:\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make build\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make test\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make package"
+            .into(),
+        body: "Update actions/checkout action to v7. v7.0.0 breaking change: fork checkouts \
+               are blocked for pull_request_target and workflow_run."
+            .into(),
     };
     for agent in [Agent::Claude, Agent::Codex] {
         let text = prompt(&analyze, Expect::FailureAnalysis, agent);
@@ -2362,8 +2665,21 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
         assert!(!text.contains("Moon Skywalker"));
 
         let text = prompt(&check, Expect::DiffCheck, agent);
-        assert!(text.contains("+version = 1.2.3") && text.contains("Bumps serde"));
-        assert!(text.contains("changes only dependency or packaging version files"));
+        assert_eq!(
+            text.matches("+      - uses: actions/checkout@v7").count(),
+            3
+        );
+        assert!(text.contains("\n on: [push, pull_request]\n"));
+        assert!(!text.contains("\n+on:") && !text.contains("\n-on:"));
+        assert!(text.contains("build-wormholes.yml"));
+        assert!(text.contains("pull_request_target and workflow_run"));
+        assert!(text.contains("check the repository for use of"));
+        assert!(text.contains("always unsafe"));
+        assert!(text.contains("every change only moves a version, in any file"));
+        assert!(text.contains("release notes") && text.contains("breaking change"));
+        assert!(text.contains("you cannot tell, the update is unsafe"));
+        assert!(!text.contains("dependency or packaging version files"));
+        assert!(!text.contains("CI workflows"));
         assert!(text.contains("\"safe\"") && text.contains("\"unsafe\""));
         assert!(text.contains("Do not change any files"));
         assert!(!text.contains("Moon Skywalker"));
@@ -2502,4 +2818,129 @@ fn a_symlink_in_the_claude_config_dir_is_replaced_not_followed() {
             .unwrap()
             .contains("playwright-mcp")
     );
+}
+
+const PICKED_RETURN_SENTENCE: &str = "The pull request's title and description stay as they are";
+
+const LEAVE_OUT: &str = "you may leave `pull_request` out";
+
+fn picked_review_and_fix_job() -> Job {
+    let job = quick_job("");
+    Job::pull_request(
+        job.request(),
+        Gates::default(),
+        PickedPr {
+            mode: PrMode::ReviewAndFix,
+            fork: false,
+            ..job.picked_pr().unwrap().clone()
+        },
+    )
+}
+
+fn stacked_job() -> Job {
+    let mut job = quick_job("");
+    job.apply(Event::Start).unwrap();
+    job.apply(Event::QuickReviewed {
+        score: 3,
+        review: "Fix the locking.".into(),
+        head: "abc".into(),
+    })
+    .unwrap();
+    job.apply(Event::FixElsewhere {
+        instructions: String::new(),
+    })
+    .unwrap();
+    assert!(job.stacked_on().is_some());
+    job
+}
+
+fn commit_tasks() -> Vec<(Task, Expect)> {
+    vec![
+        (Task::Implement { pr: planned("x") }, Expect::Commits),
+        (
+            Task::Answer {
+                questions: vec![Question { text: "Q?".into() }],
+                answers: vec!["A".into()],
+            },
+            Expect::Commits,
+        ),
+        (
+            Task::Revise {
+                feedback: "x".into(),
+            },
+            Expect::Commits,
+        ),
+        (
+            Task::FixChecks {
+                report: "boom".into(),
+            },
+            Expect::Commits,
+        ),
+        (Task::FixCi { log: "boom".into() }, Expect::FixCi),
+        (
+            Task::AddressReview {
+                comments: "nit".into(),
+            },
+            Expect::Commits,
+        ),
+        (
+            Task::Rebase {
+                base: "main".into(),
+            },
+            Expect::Commits,
+        ),
+        (Task::MergeHead, Expect::Commits),
+    ]
+}
+
+#[test]
+fn a_picked_job_tells_every_commit_task_the_pull_request_may_be_left_out() {
+    let picked = picked_review_and_fix_job();
+    let request = approved_job(Job::new("Add a reboot button", Gates::default()));
+    for (task, expect) in commit_tasks() {
+        let text = job_prompt(&picked, &task, expect, Agent::Claude, &[]);
+        assert_eq!(text.matches(PICKED_RETURN_SENTENCE).count(), 1, "{task:?}");
+        assert!(text.contains(LEAVE_OUT), "{task:?}: {text}");
+        let text = job_prompt(&request, &task, expect, Agent::Claude, &[]);
+        assert!(!text.contains(PICKED_RETURN_SENTENCE), "{task:?}: {text}");
+        assert!(!text.contains(LEAVE_OUT), "{task:?}: {text}");
+    }
+}
+
+#[test]
+fn a_picked_implement_prompt_does_not_promise_the_title_and_description_are_used() {
+    let picked = picked_review_and_fix_job();
+    let task = Task::Implement { pr: planned("x") };
+    let text = job_prompt(&picked, &task, Expect::Commits, Agent::Claude, &[]);
+    assert!(text.contains("Do not push or open a pull request."));
+    assert!(!text.contains("the title and description you return"));
+    let request = approved_job(Job::new("Add a reboot button", Gates::default()));
+    let text = job_prompt(&request, &task, Expect::Commits, Agent::Claude, &[]);
+    assert!(text.contains("the title and description you return"));
+}
+
+#[test]
+fn hosted_codex_is_told_to_return_null_for_the_pull_request() {
+    let picked = picked_review_and_fix_job();
+    for (task, expect) in commit_tasks() {
+        let text = job_prompt(&picked, &task, expect, Agent::Codex, &[]);
+        assert!(text.contains(PICKED_RETURN_SENTENCE), "{task:?}");
+        assert!(text.contains("\"pull_request\": null"), "{task:?}: {text}");
+        assert!(!text.contains(LEAVE_OUT), "{task:?}: {text}");
+    }
+}
+
+#[test]
+fn a_stacked_job_keeps_asking_for_a_title_and_description() {
+    let stacked = stacked_job();
+    for (task, expect) in commit_tasks() {
+        let text = job_prompt(&stacked, &task, expect, Agent::Claude, &[]);
+        assert!(!text.contains(PICKED_RETURN_SENTENCE), "{task:?}: {text}");
+        assert!(!text.contains(LEAVE_OUT), "{task:?}: {text}");
+    }
+    let address = Task::AddressReview {
+        comments: "nit".into(),
+    };
+    let text = job_prompt(&stacked, &address, Expect::Commits, Agent::Claude, &[]);
+    assert!(text.contains("write the title and description you return for the fixes"));
 }

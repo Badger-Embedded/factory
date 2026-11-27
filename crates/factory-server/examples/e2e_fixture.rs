@@ -77,7 +77,7 @@ fn events_for(stage: &str) -> Result<Vec<Event>> {
     let to_watching = [
         to_implementing.clone(),
         vec![
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             Event::ChecksPassed,
             Event::Published { number: 12 },
         ],
@@ -120,7 +120,7 @@ fn events_for(stage: &str) -> Result<Vec<Event>> {
         ],
         "checks-error" => [
             to_implementing,
-            vec![Event::Agent(AgentResult::CommitsReady(ready()))],
+            vec![Event::Agent(AgentResult::CommitsReady(Some(ready())))],
             (0..5)
                 .map(|_| Event::ChecksError {
                     error: "bash: just: command not found".into(),
@@ -232,7 +232,7 @@ fn picked(store: &Store, project: &str, number: u64, url: &str) -> Result<i64> {
             other => other,
         })
         .chain([
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             Event::ChecksPassed,
             Event::Published { number },
             Event::MergeLeftToUser,
@@ -297,7 +297,7 @@ fn reviewed(
             Event::FixElsewhere {
                 instructions: String::new(),
             },
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             Event::ChecksPassed,
             Event::Published { number },
         ] {
@@ -518,6 +518,17 @@ fn main() -> Result<()> {
             for n in 1..=count {
                 store.append_factory_log(job, &format!("{text} {n}"))?;
             }
+        }
+        "tool-error" => {
+            let job = one("job")?.parse()?;
+            store.append_log(
+                job,
+                &factory_runner::LogLine::ToolError {
+                    name: one("tool")?.to_owned(),
+                    input: flags.get("input").map(|v| v[0].clone()),
+                    error: one("error")?.to_owned(),
+                },
+            )?;
         }
         "mcp" => {
             let job = one("job")?.parse()?;

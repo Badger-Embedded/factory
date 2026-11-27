@@ -517,10 +517,10 @@ fn commits_outcome(body: &str) -> String {
 }
 
 fn commits_event(body: &str) -> Event {
-    Event::Agent(AgentResult::CommitsReady(PrDescription {
+    Event::Agent(AgentResult::CommitsReady(Some(PrDescription {
         title: "Add reboot".into(),
         body: body.into(),
-    }))
+    })))
 }
 
 const SUMMARY: &str = "The work is done.\n\n- Added the page.\n- Added a test.";
@@ -531,6 +531,25 @@ fn prose_before_a_fenced_outcome_resolves_the_result() {
         let text = format!("{SUMMARY}\n\n{fence}\n{}\n```", commits_outcome("Why."));
         let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
         assert_eq!(result.event, commits_event("Why."), "{fence}");
+    }
+}
+
+#[test]
+fn a_final_message_without_a_pull_request_title_and_body_resolves_commits_ready() {
+    for bare in [
+        r#"{"outcome":"commits_ready"}"#,
+        r#"{"outcome":"commits_ready","pull_request":null}"#,
+        r#"{"outcome":"commits_ready","pull_request":{"title":"","body":"Why."}}"#,
+        r#"{"outcome":"commits_ready","pull_request":{"title":"x","body":""}}"#,
+    ] {
+        for text in [bare.to_owned(), format!("```json\n{bare}\n```")] {
+            let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
+            assert_eq!(
+                result.event,
+                Event::Agent(AgentResult::CommitsReady(None)),
+                "{text}"
+            );
+        }
     }
 }
 

@@ -4948,6 +4948,13 @@ impl Store {
             LogLine::Text(text) => ("text", text.clone()),
             LogLine::Tool { name, summary } if summary.is_empty() => ("tool", name.clone()),
             LogLine::Tool { name, summary } => ("tool", format!("{name}: {summary}")),
+            LogLine::ToolError { name, input, error } => {
+                let mut text = format!("{name} failed: {error}");
+                if let Some(input) = input {
+                    text = format!("{text}\ninput: {input}");
+                }
+                ("tool-error", text)
+            }
             LogLine::Other(text) => ("other", text.clone()),
         };
         self.append_log_entry(job_id, kind, &text)

@@ -1178,8 +1178,39 @@ fn advance_pull_request(fixture: &Fixture, file: &str, content: &str) {
     git(&upstream, &["checkout", "-q", "main"]);
 }
 
+fn bare(remote: &Fixture, args: &[&str]) -> String {
+    let bare = remote.root.path().join("remotes/owner/repo.git");
+    let mut all = vec!["--git-dir", bare.to_str().unwrap()];
+    all.extend_from_slice(args);
+    git(remote.root.path(), &all)
+}
+
+fn assert_rebased_onto_the_head(work: &Path) {
+    assert_eq!(
+        git(
+            work,
+            &[
+                "log",
+                "--merges",
+                "--format=%H",
+                "refs/factory/pr-5/head..HEAD"
+            ]
+        ),
+        ""
+    );
+    git(
+        work,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            "refs/factory/pr-5/head",
+            "HEAD",
+        ],
+    );
+}
+
 #[tokio::test]
-async fn a_moved_pull_request_head_merges_into_the_checkout() {
+async fn a_moved_pull_request_head_rebases_the_local_commits_onto_it() {
     let remote = Fixture::new();
     let head = open_pull_request(&remote, "main");
     let work = remote.work();
@@ -1188,13 +1219,404 @@ async fn a_moved_pull_request_head_merges_into_the_checkout() {
     commit(&work, "agent-file", "agent fix");
     advance_pull_request(&remote, "theirs", "their fix");
 
-    let merged = git_
-        .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+    let clean = git_
+        .take_pr_head(&work, &|| Ok(remote.remote()), head, 5)
         .await
         .unwrap();
-    assert!(merged);
+    assert!(clean);
+    assert_rebased_onto_the_head(&work);
     assert!(work.join("theirs").exists());
     assert!(work.join("agent-file").exists());
+    assert_eq!(
+        git(&work, &["log", "-1", "--format=%s%n%an"]),
+        "agent fix\ntest"
+    );
+    assert_eq!(
+        git(&work, &["rev-parse", "HEAD~1"]),
+        bare(&remote, &["rev-parse", "refs/pull/5/head"])
+    );
+}
+
+#[tokio::test]
+async fn prepare_rebases_the_local_commits_onto_a_moved_head() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    advance_pull_request(&remote, "theirs", "their fix");
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert_rebased_onto_the_head(&work);
+    assert!(work.join("theirs").exists());
+    assert!(work.join("agent-file").exists());
+}
+
+#[tokio::test]
+async fn a_rebased_branch_pushes_fast_forward_after_a_rejected_push() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    bare(
+        &remote,
+        &["update-ref", "refs/heads/pr-branch", "refs/pull/5/head"],
+    );
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "fix", "agent fix");
+
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    commit(&upstream, "theirs", "foreign commit");
+    let bare_path = remote.root.path().join("remotes/owner/repo.git");
+    for target in ["pr-branch", "pr-branch:refs/pull/5/head"] {
+        git(
+            &upstream,
+            &["push", "-q", bare_path.to_str().unwrap(), target],
+        );
+    }
+    let foreign = bare(&remote, &["rev-parse", "pr-branch"]);
+
+    let source = || Ok(remote.remote());
+    let push = || git_.push_fast_forward(&work, &source, "pr-branch", "pr-branch", &|| {});
+    assert!(matches!(
+        push().await,
+        Err(factory_runner::PushError::Rejected(_))
+    ));
+    assert!(
+        git_.take_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+            .await
+            .unwrap()
+    );
+    push().await.unwrap();
+    assert_eq!(
+        remote.remote_log("pr-branch"),
+        "agent fix\nforeign commit\npr commit\nfirst"
+    );
+    assert_eq!(
+        bare(&remote, &["log", "--merges", "--format=%H", "pr-branch"]),
+        ""
+    );
+    assert_eq!(bare(&remote, &["rev-parse", "pr-branch~1"]), foreign);
+}
+
+#[tokio::test]
+async fn an_unpushed_merge_commit_makes_the_factory_merge_the_head() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    let upstream = remote.upstream();
+    commit(&upstream, "base-file", "base commit");
+    git(&upstream, &["push", "-q", "origin", "main"]);
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert!(git_.merge_base(&work, "main").await.unwrap());
+    let base_tip = git(&work, &["rev-parse", "origin/main"]);
+
+    advance_pull_request(&remote, "theirs", "their fix");
+    assert!(
+        git_.take_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+            .await
+            .unwrap()
+    );
+    git(
+        &work,
+        &["merge-base", "--is-ancestor", "origin/main", "HEAD"],
+    );
+    assert_eq!(git(&work, &["rev-parse", "origin/main"]), base_tip);
+    let parents = git(&work, &["rev-list", "--parents", "-n1", "HEAD"]);
+    let parents: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(parents.len(), 3);
+    assert_eq!(
+        parents[2],
+        git(&work, &["rev-parse", "refs/factory/pr-5/head"])
+    );
+}
+
+#[tokio::test]
+async fn a_copy_of_a_commit_the_pull_request_holds_is_not_replayed() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "fix", "agent fix");
+    let copy = git(&work, &["rev-parse", "HEAD"]);
+
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    git(&upstream, &["fetch", "-q", work.to_str().unwrap(), &copy]);
+    git(&upstream, &["cherry-pick", &copy]);
+    git(
+        &upstream,
+        &["commit", "--amend", "-q", "-m", "reworded fix"],
+    );
+    commit(&upstream, "theirs", "their fix");
+    let bare_path = remote.root.path().join("remotes/owner/repo.git");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            bare_path.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    git(&upstream, &["checkout", "-q", "main"]);
+
+    assert!(
+        git_.take_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        git(&work, &["rev-list", "refs/factory/pr-5/head..HEAD"]),
+        ""
+    );
+}
+
+/// Replaces the pull request's head with a commit that is not a descendant of
+/// the old one, as a force push by its owner does.
+fn rewrite_pull_request(fixture: &Fixture) {
+    let upstream = fixture.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    git(&upstream, &["reset", "-q", "--hard", "main"]);
+    commit(&upstream, "rewritten", "rewritten commit");
+    let bare_path = fixture.root.path().join("remotes/owner/repo.git");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            "--force",
+            bare_path.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    git(&upstream, &["checkout", "-q", "main"]);
+}
+
+/// Force-pushes a replacement for the commits after the first one on the
+/// pull request, as the owner does when they amend their latest commit.
+fn rewrite_pull_request_keeping_the_first_commit(fixture: &Fixture) {
+    let upstream = fixture.upstream();
+    git(&upstream, &["fetch", "-q", "origin"]);
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    git(&upstream, &["reset", "-q", "--hard", "HEAD^"]);
+    commit(&upstream, "theirs-amended", "their amended fix");
+    let bare_path = fixture.root.path().join("remotes/owner/repo.git");
+    git(
+        &upstream,
+        &[
+            "push",
+            "-q",
+            "--force",
+            bare_path.to_str().unwrap(),
+            "pr-branch:refs/pull/5/head",
+        ],
+    );
+    git(&upstream, &["checkout", "-q", "main"]);
+}
+
+fn assert_merged_the_head(work: &Path) {
+    let parents = git(work, &["rev-list", "--parents", "-n1", "HEAD"]);
+    let parents: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(parents.len(), 3, "{parents:?}");
+    assert_eq!(
+        parents[2],
+        git(work, &["rev-parse", "refs/factory/pr-5/head"])
+    );
+}
+
+#[tokio::test]
+async fn a_rewritten_pull_request_is_merged_when_the_publish_takes_its_head() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    rewrite_pull_request(&remote);
+
+    assert!(
+        git_.take_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+            .await
+            .unwrap()
+    );
+    assert_merged_the_head(&work);
+}
+
+#[tokio::test]
+async fn a_rewritten_pull_request_is_merged_when_prepare_takes_its_head() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    rewrite_pull_request(&remote);
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert_merged_the_head(&work);
+}
+
+#[tokio::test]
+async fn a_retry_after_a_fetch_that_did_not_update_the_branch_still_merges_a_rewritten_head() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    rewrite_pull_request(&remote);
+    let url = format!(
+        "file://{}",
+        remote.root.path().join("remotes/owner/repo.git").display()
+    );
+    git(
+        &work,
+        &[
+            "fetch",
+            "-q",
+            &url,
+            "+refs/pull/5/head:refs/factory/pr-5/head",
+        ],
+    );
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert_merged_the_head(&work);
+}
+
+#[tokio::test]
+async fn a_restart_after_a_fast_forward_still_merges_a_head_rewritten_from_the_new_one() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    advance_pull_request(&remote, "theirs", "their fix");
+    // The branch fast-forwarded to the new head, but the factory stopped
+    // before it recorded the head as taken.
+    let url = format!(
+        "file://{}",
+        remote.root.path().join("remotes/owner/repo.git").display()
+    );
+    git(
+        &work,
+        &[
+            "fetch",
+            "-q",
+            &url,
+            "+refs/pull/5/head:refs/factory/pr-5/head",
+        ],
+    );
+    git(
+        &work,
+        &["merge", "-q", "--ff-only", "refs/factory/pr-5/head"],
+    );
+    commit(&work, "agent-file", "agent fix");
+
+    rewrite_pull_request_keeping_the_first_commit(&remote);
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert_merged_the_head(&work);
+}
+
+#[tokio::test]
+async fn a_rewound_pull_request_does_not_move_the_taken_head_back() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    advance_pull_request(&remote, "theirs", "their fix");
+    prepare_pr(&remote, &git_, "main", head).await;
+    let theirs = git(&work, &["rev-parse", "HEAD"]);
+    commit(&work, "agent-file", "agent fix");
+
+    let upstream = remote.upstream();
+    git(&upstream, &["checkout", "-q", "pr-branch"]);
+    git(&upstream, &["reset", "-q", "--hard", "HEAD^"]);
+    let bare_path = remote.root.path().join("remotes/owner/repo.git");
+    let push = |upstream: &Path| {
+        git(
+            upstream,
+            &[
+                "push",
+                "-q",
+                "--force",
+                bare_path.to_str().unwrap(),
+                "pr-branch:refs/pull/5/head",
+            ],
+        )
+    };
+    push(&upstream);
+    prepare_pr(&remote, &git_, "main", head).await;
+
+    commit(&upstream, "theirs-amended", "their amended fix");
+    push(&upstream);
+    git(&upstream, &["checkout", "-q", "main"]);
+    prepare_pr(&remote, &git_, "main", head).await;
+
+    assert_merged_the_head(&work);
+    assert_eq!(git(&work, &["rev-parse", "HEAD~1^"]).trim(), theirs.trim());
+}
+
+#[tokio::test]
+async fn a_checkout_without_a_taken_head_merges_instead_of_rebasing() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "agent-file", "agent fix");
+    git(&work, &["update-ref", "-d", "refs/factory/pr-5/taken"]);
+    git(&work, &["update-ref", "-d", "refs/factory/pr-5/head"]);
+    advance_pull_request(&remote, "theirs", "their fix");
+
+    prepare_pr(&remote, &git_, "main", head).await;
+    assert_merged_the_head(&work);
+}
+
+#[tokio::test]
+async fn an_unfinished_rebase_is_aborted_back_to_the_branch() {
+    let remote = Fixture::new();
+    let head = open_pull_request(&remote, "main");
+    let work = remote.work();
+    let git_ = Git::default();
+    prepare_pr(&remote, &git_, "main", head).await;
+    commit(&work, "pr-file", "agent edit");
+    let tip = git(&work, &["rev-parse", "HEAD"]);
+    advance_pull_request(&remote, "pr-file", "their edit");
+    git(
+        &work,
+        &[
+            "fetch",
+            "-q",
+            &format!(
+                "file://{}",
+                remote.root.path().join("remotes/owner/repo.git").display()
+            ),
+            "+refs/pull/5/head:refs/factory/pr-5/head",
+        ],
+    );
+    let status = std::process::Command::new("git")
+        .args(["rebase", "refs/factory/pr-5/head"])
+        .current_dir(&work)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(work.join(".git/rebase-merge").exists());
+
+    git_.abort_rebase(&work).await.unwrap();
+    assert!(!work.join(".git/rebase-merge").exists());
+    assert_eq!(git(&work, &["branch", "--show-current"]), "pr-branch");
+    assert_eq!(git(&work, &["rev-parse", "HEAD"]), tip);
 }
 
 #[tokio::test]
@@ -1208,11 +1630,17 @@ async fn a_moved_pull_request_head_that_conflicts_stays_unfinished_and_survives_
     advance_pull_request(&remote, "pr-file", "their edit");
 
     let merged = git_
-        .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+        .take_pr_head(&work, &|| Ok(remote.remote()), head, 5)
         .await
         .unwrap();
     assert!(!merged);
-    assert!(work.join(".git/MERGE_HEAD").exists());
+    assert!(!work.join(".git/rebase-merge").exists());
+    assert!(!work.join(".git/rebase-apply").exists());
+    assert_eq!(
+        git(&work, &["rev-parse", "MERGE_HEAD"]),
+        git(&work, &["rev-parse", "refs/factory/pr-5/head"])
+    );
+    assert!(git(&work, &["status", "--porcelain"]).contains("UU pr-file"));
 
     prepare_pr(&remote, &git_, "main", head).await;
     assert!(work.join(".git/MERGE_HEAD").exists());
@@ -1230,7 +1658,7 @@ async fn a_head_that_moves_again_leaves_the_conflict_against_the_latest_head() {
     advance_pull_request(&remote, "pr-file", "their edit");
     assert!(
         !git_
-            .merge_pr_head(&work, &|| Ok(remote.remote()), head, 5)
+            .take_pr_head(&work, &|| Ok(remote.remote()), head, 5)
             .await
             .unwrap()
     );

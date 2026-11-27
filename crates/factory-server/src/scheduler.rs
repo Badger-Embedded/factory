@@ -40,8 +40,8 @@ const POLL: Duration = Duration::from_secs(5);
 pub const RENOVATE_DISCOVERY: Duration = Duration::from_mins(5);
 
 /// The review text of the approval of a safe Renovate update.
-pub const APPROVAL: &str = "Every check passed and the diff changes only dependency or packaging \
-                        version files.";
+pub const APPROVAL: &str = "Every check passed, the diff only moves versions, and no breaking \
+                        change in the new version affects this project.";
 
 /// A finished job is deleted once it is this many days old, counted from
 /// `created_at`.

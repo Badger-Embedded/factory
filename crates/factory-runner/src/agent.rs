@@ -60,6 +60,9 @@ pub struct PromptStyle {
     pub schema_in_prompt: Option<&'static str>,
 }
 
+/// A parser for one run's stdout lines.
+pub type LineParser<'a> = Box<dyn FnMut(&str) -> Vec<AgentItem> + Send + 'a>;
+
 /// What everything agent-specific hides behind, so the worker names no one
 /// agent. The Claude implementation is [`ClaudeAgent`].
 pub trait AgentBackend: Sync {
@@ -135,6 +138,20 @@ pub trait AgentBackend: Sync {
     /// Parses one stdout line of a Local run. The default is [`parse`](Self::parse).
     fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         self.parse(expect, line)
+    }
+
+    /// A parser for one run's stdout, line by line. A backend whose output
+    /// needs state across lines, such as Claude matching a tool result to its
+    /// call, overrides it. The default is [`parse`](Self::parse), or
+    /// [`parse_local`](Self::parse_local) for a Local run.
+    fn stream(&self, expect: Expect, local: bool, _key: Option<&str>) -> LineParser<'_> {
+        Box::new(move |line| {
+            if local {
+                self.parse_local(expect, line)
+            } else {
+                self.parse(expect, line)
+            }
+        })
     }
 
     /// The command and its arguments after the image: the whole agent

@@ -765,6 +765,7 @@ button:hover { filter: brightness(0.96); }
 .log-at { color: var(--muted); flex: none; }
 .log-text { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
 .log-tool .log-text { color: var(--agent); }
+.log-tool-error .log-text { color: var(--bad); }
 .log-factory .log-text { color: var(--muted); font-style: italic; }
 .log-other .log-text { color: var(--muted); }
 

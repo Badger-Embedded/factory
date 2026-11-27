@@ -446,6 +446,34 @@ fn a_null_optional_field_resolves_the_same_as_an_absent_one() {
 }
 
 #[test]
+fn a_commits_ready_message_without_a_pull_request_title_and_body_resolves_the_result() {
+    let codex = backend(Agent::Codex).unwrap();
+    for text in [
+        r#"{"outcome":"commits_ready"}"#,
+        r#"{"outcome":"commits_ready","pull_request":null}"#,
+        r#"{"outcome":"commits_ready","pull_request":{"title":"","body":"Why."}}"#,
+        r#"{"outcome":"commits_ready","pull_request":{"title":"x","body":""}}"#,
+    ] {
+        let line =
+            serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":text}})
+                .to_string();
+        let result = codex
+            .parse(Expect::Commits, &line)
+            .into_iter()
+            .find_map(|item| match item {
+                AgentItem::Result(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            result.event,
+            Event::Agent(AgentResult::CommitsReady(None)),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn the_parser_reads_a_spec_run_into_logs_a_thread_id_usage_and_a_result() {
     let codex = backend(Agent::Codex).unwrap();
     let text = fs::read_to_string(fixture("codex-spec-run.jsonl")).unwrap();

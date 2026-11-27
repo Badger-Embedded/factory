@@ -834,7 +834,7 @@ fn merge_from_spec(store: &Store, id: i64) {
             Event::Approve,
             Event::Agent(AgentResult::Plan(vec![planned_pr("a")])),
             Event::Approve,
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             Event::ChecksPassed,
             Event::Published { number: 3 },
             Event::Merged,
@@ -1198,7 +1198,7 @@ async fn answers_continue_the_session_and_each_later_stage_gets_its_own() {
             description: None,
             notes: None,
         }])),
-        Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
+        Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Expect::Review | Expect::QuickReview => {
             unreachable!("this job keeps llm review off, so no reviewer runs")
         }
@@ -1359,7 +1359,8 @@ async fn a_job_has_a_task_until_its_stop_has_finished() {
 
 #[tokio::test]
 async fn a_factory_task_counts_as_a_task_for_its_job() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let slots = scheduler.slots();
     let id = to_commits_ready(&store, &executor, &scheduler).await;
@@ -1892,7 +1893,7 @@ fn a_job_with_two_pull_requests_counts_as_merged_once() {
         Event::Approve,
         Event::Agent(AgentResult::Plan(vec![planned_pr("a"), planned_pr("b")])),
         Event::Approve,
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Event::ChecksPassed,
         Event::Published { number: 3 },
         Event::Merged,
@@ -1903,7 +1904,7 @@ fn a_job_with_two_pull_requests_counts_as_merged_once() {
     assert_eq!(store.project_totals("maestro").unwrap().jobs_merged, 0);
 
     for event in [
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Event::ChecksPassed,
         Event::Published { number: 4 },
         Event::Merged,
@@ -2081,7 +2082,8 @@ async fn step(scheduler: &Arc<Scheduler<FakeExecutor>>) {
 
 #[tokio::test]
 async fn commits_go_through_checks_and_publish_to_a_watched_pull_request() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     assert_eq!(
@@ -2119,7 +2121,8 @@ async fn commits_go_through_checks_and_publish_to_a_watched_pull_request() {
 
 #[tokio::test]
 async fn failed_checks_go_back_to_the_agent() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     executor
         .checks
@@ -2138,7 +2141,8 @@ async fn failed_checks_go_back_to_the_agent() {
 
 #[tokio::test]
 async fn a_project_without_checks_publishes_unchecked() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let id = store.create("bare", "alice", "x").unwrap();
     let projects: Projects = [(
         "bare".to_owned(),
@@ -2177,7 +2181,7 @@ async fn a_project_without_checks_publishes_unchecked() {
             notes: None,
         }])),
         Event::Approve,
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     ] {
         store.apply(id, event).unwrap();
     }
@@ -2192,7 +2196,7 @@ async fn a_project_without_checks_publishes_unchecked() {
 #[tokio::test]
 async fn an_edited_checks_command_applies_to_a_job_created_before_the_edit() {
     let store = Arc::new(Store::open_in_memory().unwrap());
-    let executor = FakeExecutor::new(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let executor = FakeExecutor::new(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let scheduler = Scheduler::new(
         Arc::clone(&store),
         Arc::new(Projects::from_store(Arc::clone(&store))),
@@ -2227,7 +2231,7 @@ async fn an_edited_checks_command_applies_to_a_job_created_before_the_edit() {
                 notes: None,
             }])),
             Event::Approve,
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         ] {
             store.apply(id, event).unwrap();
         }
@@ -2318,7 +2322,8 @@ async fn a_project_on_an_unknown_forge_fails_its_job_and_leaves_the_others_runni
 
 #[tokio::test]
 async fn a_failed_publish_waits_before_it_is_tried_again() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
     executor
@@ -2373,7 +2378,8 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
 
 #[tokio::test]
 async fn a_project_that_moves_to_an_unknown_forge_stops_a_job_in_a_factory_turn() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
     assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
@@ -2420,7 +2426,8 @@ async fn a_project_that_moves_to_an_unknown_forge_stops_a_job_in_a_factory_turn(
 
 #[tokio::test]
 async fn a_pull_request_merged_before_the_push_moves_the_job_on() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
     assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
@@ -2444,7 +2451,8 @@ async fn a_pull_request_merged_before_the_push_moves_the_job_on() {
 
 #[tokio::test]
 async fn a_branch_with_nothing_to_publish_skips_the_pull_request() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
     assert_eq!(store.get(id).unwrap().job.stage(), &Stage::PrOpen { pr: 0 });
@@ -2469,7 +2477,8 @@ async fn a_branch_with_nothing_to_publish_skips_the_pull_request() {
 
 #[tokio::test]
 async fn review_comments_reach_the_agent_once() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
@@ -2507,7 +2516,8 @@ async fn review_comments_reach_the_agent_once() {
 
 #[tokio::test]
 async fn an_open_pull_request_is_watched_once_per_interval() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let _id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
@@ -2522,7 +2532,8 @@ async fn an_open_pull_request_is_watched_once_per_interval() {
 
 #[tokio::test]
 async fn auto_merge_reaches_the_executor_and_a_factory_merge_is_logged() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     store
         .save_settings(&Settings {
             poll_seconds: 0,
@@ -2562,7 +2573,8 @@ async fn auto_merge_reaches_the_executor_and_a_factory_merge_is_logged() {
 
 #[tokio::test]
 async fn a_conflict_sends_the_agent_to_rebase_on_the_pull_request_branch() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
@@ -2595,7 +2607,8 @@ async fn a_conflict_sends_the_agent_to_rebase_on_the_pull_request_branch() {
 
 #[tokio::test]
 async fn the_publish_gate_holds_the_push_until_the_user_approves() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     store
         .save_settings(&Settings {
             poll_seconds: 0,
@@ -2677,7 +2690,8 @@ fn green(executor: &FakeExecutor, event: Event) {
 
 #[tokio::test]
 async fn ignored_commenters_are_explained_in_the_log_once_each() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_watching(&store, &executor, &scheduler).await;
     for _ in 0..2 {
@@ -2736,7 +2750,8 @@ fn a_job_that_may_not_merge_leaves_the_merge_to_the_user_once_review_settles() {
 
 #[tokio::test]
 async fn the_watch_carries_the_review_flag_and_the_head_review_state() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     store.save_project_settings("maestro", false, true).unwrap();
     to_watching(&store, &executor, &scheduler).await;
@@ -2751,7 +2766,7 @@ async fn the_watch_carries_the_review_flag_and_the_head_review_state() {
 async fn an_approved_review_lets_an_auto_merge_go_through() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Review => Event::ReviewApproved,
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -2805,7 +2820,7 @@ async fn an_approved_review_lets_an_auto_merge_go_through() {
 async fn with_auto_merge_off_the_review_runs_and_the_factory_does_not_merge() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Review => Event::ReviewApproved,
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", false, true).unwrap();
@@ -2845,7 +2860,7 @@ async fn requested_changes_go_to_the_implement_session_and_review_again() {
         Expect::Review => Event::ReviewChanges {
             feedback: "src/main.rs:10: handle the error".into(),
         },
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -2901,7 +2916,7 @@ async fn a_reviewer_failure_stops_the_job_for_the_user_without_merging() {
         Expect::Review => Event::ReviewFailed {
             reason: "the reviewer run ended without structured output".into(),
         },
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -2944,7 +2959,7 @@ async fn a_stopped_review_fails_when_its_pull_request_is_closed() {
         Expect::Review => Event::ReviewFailed {
             reason: "the reviewer run ended without structured output".into(),
         },
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -3043,7 +3058,7 @@ async fn the_review_cap_sends_the_job_to_the_user() {
         Expect::Review => Event::ReviewChanges {
             feedback: "one more thing".into(),
         },
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -3192,7 +3207,7 @@ mod purge {
                             notes: None,
                         }])),
                         Event::Approve,
-                        Event::Agent(AgentResult::CommitsReady(ready())),
+                        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
                         Event::ChecksPassed,
                         Event::Published { number: 3 },
                         Event::Merged,
@@ -3497,7 +3512,7 @@ fn one_pass(request: &AgentRequest) -> Event {
             description: None,
             notes: None,
         }])),
-        Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(ready())),
+        Expect::Commits | Expect::FixCi => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Expect::Review | Expect::QuickReview => {
             unreachable!("this job keeps llm review off, so no reviewer runs")
         }
@@ -3693,7 +3708,8 @@ async fn spec_and_plan_revisions_use_their_stage_model() {
 
 #[tokio::test]
 async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_model() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     store
         .save_project_models("maestro", &models("c", "s", "p", "i"))
@@ -3852,7 +3868,8 @@ async fn an_effort_change_reaches_the_next_run() {
 
 #[tokio::test]
 async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_effort() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     store
         .save_project_efforts(
@@ -3911,7 +3928,7 @@ async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_effort() {
 async fn the_review_run_uses_the_review_effort() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Review => Event::ReviewApproved,
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -3976,7 +3993,8 @@ async fn check_fixes_ci_fixes_and_review_runs_pass_the_implement_agent() {
     // The check fix, CI fix and review-comment runs map to the implement stage,
     // like the model and effort. Each passes the implement agent, which is
     // Claude, the one available agent.
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     executor
@@ -4098,7 +4116,7 @@ fn to_implement(store: &Store) -> i64 {
 async fn a_resumed_implement_session_keeps_its_model_and_effort_when_the_stage_moves_to_copilot() {
     let (store, executor, scheduler) = setup(|request| {
         if request.prompt.contains("answered") {
-            Event::Agent(AgentResult::CommitsReady(ready()))
+            Event::Agent(AgentResult::CommitsReady(Some(ready())))
         } else {
             questions()
         }
@@ -4362,7 +4380,7 @@ fn rerun_responder(request: &AgentRequest) -> Event {
         Expect::FixCi => Event::Agent(AgentResult::RerunCi {
             reason: "the failure was a network timeout".into(),
         }),
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     }
 }
 
@@ -4444,7 +4462,8 @@ async fn the_watch_after_a_rerun_waits_for_the_poll_interval() {
 
 #[tokio::test]
 async fn retrying_a_failed_job_watches_the_pull_request_again() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     store.apply(id, Event::ChecksPassed).unwrap();
@@ -4454,7 +4473,7 @@ async fn retrying_a_failed_job_watches_the_pull_request_again() {
             .apply(id, Event::CiFailed { log: "fail".into() })
             .unwrap();
         store
-            .apply(id, Event::Agent(AgentResult::CommitsReady(ready())))
+            .apply(id, Event::Agent(AgentResult::CommitsReady(Some(ready()))))
             .unwrap();
         store.apply(id, Event::ChecksPassed).unwrap();
         store.apply(id, Event::Published { number: 50 }).unwrap();
@@ -4521,7 +4540,7 @@ async fn a_run_with_no_active_server_carries_no_mcp_config() {
 async fn mcp_servers_reach_only_the_runs_of_their_checked_stages() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Review => Event::ReviewApproved,
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -4838,7 +4857,7 @@ async fn a_stdio_run_carries_the_base_arguments_then_the_projects_and_no_token()
 async fn a_stdio_server_enabled_for_implement_alone_reaches_only_the_implement_run() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Review => Event::ReviewApproved,
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     register_stdio(&store, "pw", "playwright-mcp", &["--no-sandbox"]);
@@ -5783,7 +5802,7 @@ async fn a_fix_job_ignores_the_renovate_agent() {
 async fn a_request_job_review_ignores_the_renovate_agent() {
     let (store, executor, scheduler) = setup(|request| match request.expect {
         Expect::Review => Event::ReviewApproved,
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     store.save_project_settings("maestro", true, true).unwrap();
@@ -6966,7 +6985,8 @@ fn failing_checks(executor: &FakeExecutor, times: usize) {
 
 #[tokio::test]
 async fn checks_that_cannot_run_fail_the_job_after_five_runs() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     failing_checks(&executor, 10);
@@ -6993,7 +7013,8 @@ async fn checks_that_cannot_run_fail_the_job_after_five_runs() {
 
 #[tokio::test]
 async fn a_restart_keeps_the_count_of_checks_that_could_not_run() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     failing_checks(&executor, 5);
@@ -7097,7 +7118,7 @@ async fn fixing_setup_in(
         Event::Approve,
         Event::Agent(AgentResult::Plan(vec![planned_pr("a")])),
         Event::Approve,
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Event::ChecksPassed,
         Event::Published { number: 30 },
     ] {
@@ -7618,7 +7639,8 @@ fn the_requesters_token_runs_the_job_only_with_the_switch_on_and_a_token() {
 
 #[tokio::test]
 async fn the_publish_log_names_the_account_and_whose_it_is() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     onboard_maestro(&store, true);
     save_user_token(&store, "alice", "alice-token");
     let id = to_commits_ready(&store, &executor, &scheduler).await;
@@ -7648,7 +7670,8 @@ async fn the_publish_log_names_the_account_and_whose_it_is() {
 
 #[tokio::test]
 async fn the_publish_log_names_the_project_account_for_a_job_on_it() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
     step(&scheduler).await;
@@ -7668,7 +7691,8 @@ async fn the_publish_log_names_the_project_account_for_a_job_on_it() {
 
 #[tokio::test]
 async fn comments_from_the_running_account_and_the_project_account_are_ignored() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     onboard_maestro(&store, true);
     save_user_token(&store, "alice", "alice-token");
@@ -7714,7 +7738,8 @@ async fn a_job_with_no_project_token_fails_with_where_to_save_one_and_calls_no_f
 
 #[tokio::test]
 async fn a_rejected_token_fails_the_job_and_retry_runs_with_the_replacement() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     onboard_maestro(&store, true);
     save_user_token(&store, "alice", "alice-token");
     let id = to_commits_ready(&store, &executor, &scheduler).await;
@@ -7795,7 +7820,7 @@ async fn a_claim_left_by_a_deleted_fix_does_not_block_the_fix_that_reuses_its_id
         Event::Approve,
         Event::Agent(AgentResult::Plan(vec![planned_pr("a")])),
         Event::Approve,
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Event::ChecksPassed,
         Event::Published { number: 31 },
         Event::Merged,
@@ -7811,7 +7836,8 @@ async fn a_claim_left_by_a_deleted_fix_does_not_block_the_fix_that_reuses_its_id
 
 #[tokio::test]
 async fn a_refused_token_during_a_watch_fails_the_job_but_other_errors_retry() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
     step(&scheduler).await;
@@ -7843,7 +7869,8 @@ async fn a_refused_token_during_a_watch_fails_the_job_but_other_errors_retry() {
 
 #[tokio::test]
 async fn a_missing_project_token_on_a_factory_step_fails_the_job() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     onboard_maestro(&store, true);
     quick_polls(&store);
     let id = to_commits_ready(&store, &executor, &scheduler).await;
@@ -8138,7 +8165,7 @@ fn to_verifying(store: &Store, project: &str, text: &str) -> i64 {
             notes: None,
         }])),
         Event::Approve,
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     ] {
         store.apply(id, event).unwrap();
     }
@@ -8819,7 +8846,7 @@ async fn a_review_and_fix_first_pass_records_the_checkout_head_with_its_verdict(
         Expect::Review => Event::ReviewChanges {
             feedback: "Handle the error.".into(),
         },
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&store);
     *executor.checkout_head.lock().unwrap() = Some("h1".into());
@@ -8864,8 +8891,43 @@ async fn a_review_and_fix_first_pass_records_the_checkout_head_with_its_verdict(
 }
 
 #[tokio::test]
+async fn a_review_and_fix_fix_without_a_pull_request_description_still_pushes() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewChanges {
+            feedback: "Handle the error.".into(),
+        },
+        _ => factory_runner::event_from_output(
+            request.expect,
+            Some(serde_json::json!({"outcome": "commits_ready"})),
+        ),
+    });
+    quick_polls(&store);
+    let mut pick = picked(12);
+    pick.mode = factory_core::PrMode::ReviewAndFix;
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // review
+    executor.release(1);
+    step(&scheduler).await; // fix
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Verifying { pr: 0 }
+    );
+    step(&scheduler).await; // checks
+    step(&scheduler).await; // publish
+
+    let published = executor.published.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert!(published[0].existing.is_some());
+}
+
+#[tokio::test]
 async fn a_picked_pull_request_job_works_in_its_head_branch_and_never_opens_a_pull_request() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = picked_to_published(&store, &executor, &scheduler).await;
 
@@ -8887,7 +8949,8 @@ async fn a_picked_pull_request_job_works_in_its_head_branch_and_never_opens_a_pu
 
 #[tokio::test]
 async fn a_picked_pull_request_job_never_asks_the_executor_to_merge() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     store.save_project_settings("maestro", true, false).unwrap();
     let id = picked_to_published(&store, &executor, &scheduler).await;
@@ -8903,7 +8966,8 @@ async fn a_picked_pull_request_job_never_asks_the_executor_to_merge() {
 
 #[tokio::test]
 async fn a_conflict_on_a_picked_pull_request_asks_for_a_merge_not_a_rebase() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     let id = picked_to_published(&store, &executor, &scheduler).await;
     green(
@@ -8924,7 +8988,8 @@ async fn a_conflict_on_a_picked_pull_request_asks_for_a_merge_not_a_rebase() {
 
 #[tokio::test]
 async fn a_clean_merge_of_a_moved_head_reruns_the_checks_before_the_push() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     executor
         .publishes
@@ -8950,7 +9015,8 @@ async fn a_clean_merge_of_a_moved_head_reruns_the_checks_before_the_push() {
 
 #[tokio::test]
 async fn a_conflicting_moved_head_goes_to_the_agent_to_merge() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     executor
         .publishes
@@ -8973,7 +9039,8 @@ async fn a_conflicting_moved_head_goes_to_the_agent_to_merge() {
 
 #[tokio::test]
 async fn a_publish_that_stops_fails_the_job_with_the_reason_and_retry_publishes_again() {
-    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     quick_polls(&store);
     executor
         .publishes
@@ -9003,7 +9070,7 @@ async fn a_checkout_repair_keeps_the_checkout_after_the_agent_asks_a_question() 
         if request.keep_checkout && !seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
             questions()
         } else {
-            Event::Agent(AgentResult::CommitsReady(ready()))
+            Event::Agent(AgentResult::CommitsReady(Some(ready())))
         }
     });
     quick_polls(&store);
@@ -9058,7 +9125,7 @@ fn review_setup() -> (Arc<Store>, Arc<FakeExecutor>, Arc<Scheduler<FakeExecutor>
         Expect::Review => Event::ReviewChanges {
             feedback: "Handle the error.".into(),
         },
-        _ => Event::Agent(AgentResult::CommitsReady(ready())),
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
     });
     quick_polls(&setup.0);
     *setup.1.checkout_head.lock().unwrap() = Some("h1".into());

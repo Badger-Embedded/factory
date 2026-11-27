@@ -386,6 +386,26 @@ test('the log keeps its scroll position when a poll swaps it', async ({ page, fa
   await expect.poll(() => log.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(4);
 });
 
+test('a failed tool call shows its error and input in the log', async ({ page, factory, project }) => {
+  const id = newJob(factory, project, 'implementing');
+  factory.fixture(
+    'tool-error',
+    '--job',
+    id,
+    '--tool',
+    'StructuredOutput',
+    '--error',
+    "must have required property 'summary'",
+    '--input',
+    '{"outcome":"unsafe"}',
+  );
+  await page.goto(`/jobs/${id}`);
+
+  const line = page.locator('#job-log li.log-tool-error');
+  await expect(line).toContainText("StructuredOutput failed: must have required property 'summary'");
+  await expect(line).toContainText('input: {"outcome":"unsafe"}');
+});
+
 test('a reviewed job shows its review pass', async ({ page, factory, project }) => {
   const id = newJob(factory, project, 'reviewed');
   await page.goto(`/jobs/${id}`);
