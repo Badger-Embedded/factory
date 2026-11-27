@@ -596,7 +596,8 @@ pub enum IgnoredCommenter {
 pub struct WatchReport {
     /// `None` while CI runs and nobody commented.
     pub event: Option<Event>,
-    /// The new comment watermark, when `event` delivers comments.
+    /// The new comment watermark: when `event` delivers comments, or the seed
+    /// of a merge-wait watch that found none, with no event.
     pub seen_until: Option<String>,
     /// The executor merged the pull request because it was ready and
     /// auto-merge is on.
@@ -2493,6 +2494,10 @@ impl<E: Executor> Scheduler<E> {
                     ..
                 } = report
                 else {
+                    if let Some(seen) = &report.seen_until {
+                        let seeded = self.store.seed_pr_watermark(job_id, pr, seen);
+                        self.report(job_id, seeded);
+                    }
                     return;
                 };
                 if merged_by_factory {

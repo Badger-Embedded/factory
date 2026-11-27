@@ -4896,6 +4896,26 @@ impl Store {
             .optional()?)
     }
 
+    /// Sets the watermark of pull request `pr` to `seen_until` unless the job
+    /// has one, so a seed never moves back a watermark a delivery wrote.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn seed_pr_watermark(
+        &self,
+        job_id: i64,
+        pr: usize,
+        seen_until: &str,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO pr_watermarks (job_id, pr, seen_until) VALUES (?1, ?2, ?3)
+             ON CONFLICT (job_id, pr) DO NOTHING",
+            params![job_id, i64::try_from(pr).unwrap_or(i64::MAX), seen_until],
+        )?;
+        Ok(())
+    }
+
     /// Applies `event` to job `job_id` and records `seen_until` as the
     /// watermark of pull request `pr`, in one transaction.
     ///
