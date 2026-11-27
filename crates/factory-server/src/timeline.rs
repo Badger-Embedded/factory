@@ -107,8 +107,14 @@ fn build(job: &Job, events: &[JobEvent]) -> Timeline {
         if let Some(step) = current.and_then(|i: usize| steps.get_mut(i)) {
             note(step, event);
         }
-        let at = event.at.as_str();
         let entered = stage_order(&event.stage, event.pr, prs);
+        if event.event == "cost" {
+            if let (Some(usd), Some(step)) = (event.usd, entered.and_then(|i| steps.get_mut(i))) {
+                step.usd += usd;
+            }
+            continue;
+        }
+        let at = event.at.as_str();
         if entered != active {
             if let Some(step) = active.and_then(|i| steps.get_mut(i)) {
                 step.seconds += elapsed(step.visit.as_deref(), at);
@@ -121,9 +127,6 @@ fn build(job: &Job, events: &[JobEvent]) -> Timeline {
         }
         if entered.is_some() {
             current = entered;
-        }
-        if let (Some(usd), Some(step)) = (event.usd, current.and_then(|i| steps.get_mut(i))) {
-            step.usd += usd;
         }
     }
     if !matches!(job.stage(), Stage::Failed { .. } | Stage::Cancelled) {

@@ -15,17 +15,96 @@ use factory_runner::{
 };
 use factory_server::{
     AccountSource, Accounts, AgentRegistry, AgentRequest, ChecksRequest, ClaudeToken, CodexLogin,
-    CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GhRepos,
+    CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GenerationError, GhRepos,
     HttpLocalServerProbe, HttpOpenRouterApi, IgnoredCommenter, JobFile, LocalSecrets, LogSink,
-    MASTER_KEY_LEN, McpProjectSettings, McpRuntime, McpStages, McpTransport, McpWarnings, Owner,
-    PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project, ProjectForge, Projects,
-    PublishRequest, Published, ReadyAction, Rebase, RenovateAgent, RenovateWatchRequest,
-    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
-    StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, UpstreamCredential,
-    WatchReport, WatchRequest, WorkerSlots, credential_failure, format_cost, ready_action,
-    waiting_event,
+    MASTER_KEY_LEN, McpProjectSettings, McpRuntime, McpStages, McpTransport, McpWarnings,
+    ModelsError, OpenRouterApi, OpenRouterCosts, OpenRouterGenerationFuture, OpenRouterKeyFuture,
+    OpenRouterModelsFuture, Owner, PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project,
+    ProjectForge, Projects, PublishRequest, Published, ReadyAction, Rebase, RenovateAgent,
+    RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink,
+    Settings, StageAgents, StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets,
+    UpstreamCredential, WatchReport, WatchRequest, WorkerSlots, credential_failure, format_cost,
+    ready_action, waiting_event,
 };
 use tokio::sync::{Notify, Semaphore};
+
+/// Answers a generation lookup from a table. An id with no entry is not known
+/// yet, as `OpenRouter` answers right after a run.
+#[derive(Default)]
+struct FakeGenerations {
+    costs: Mutex<Vec<(String, f64)>>,
+    keys: Mutex<Vec<String>>,
+    /// Lookups wait for a permit while this is set.
+    gate: Mutex<Option<Arc<Semaphore>>>,
+    /// An id whose lookup never answers.
+    hangs: Mutex<Option<String>>,
+}
+
+impl OpenRouterApi for FakeGenerations {
+    fn models<'a>(&'a self, _key: Option<&'a str>) -> OpenRouterModelsFuture<'a> {
+        Box::pin(async { Err(ModelsError::Connect) })
+    }
+
+    fn check_key<'a>(&'a self, _key: &'a str) -> OpenRouterKeyFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn generation<'a>(&'a self, id: &'a str, key: &'a str) -> OpenRouterGenerationFuture<'a> {
+        Box::pin(async move {
+            self.keys.lock().unwrap().push(key.to_owned());
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            if self.hangs.lock().unwrap().as_deref() == Some(id) {
+                std::future::pending::<()>().await;
+            }
+            self.costs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, cost)| *cost)
+                .ok_or(GenerationError::NotReady)
+        })
+    }
+}
+
+fn fake_costs(table: &[(&str, f64)]) -> (OpenRouterCosts, Arc<FakeGenerations>) {
+    let api = Arc::new(FakeGenerations::default());
+    *api.costs.lock().unwrap() = table
+        .iter()
+        .map(|(id, cost)| ((*id).to_owned(), *cost))
+        .collect();
+    let costs = OpenRouterCosts::with_limits(
+        Arc::clone(&api) as Arc<dyn OpenRouterApi>,
+        vec![Duration::from_millis(1); 3],
+        Duration::from_secs(30),
+    );
+    (costs, api)
+}
+
+fn no_costs() -> OpenRouterCosts {
+    fake_costs(&[]).0
+}
+
+async fn openrouter_finished(store: &Store, id: i64, count: usize) -> Vec<String> {
+    for _ in 0..500 {
+        let lines = finished_lines_with(store, id, "OpenRouter run finished");
+        if lines.len() >= count {
+            return lines;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the OpenRouter cost lookup logged nothing");
+}
+
+fn finished_lines_with(store: &Store, id: i64, prefix: &str) -> Vec<String> {
+    log_texts(store, id)
+        .into_iter()
+        .filter(|text| text.starts_with(prefix))
+        .collect()
+}
 
 fn ready() -> PrDescription {
     PrDescription {
@@ -46,6 +125,9 @@ struct FakeExecutor {
     /// The token usage each run reports instead of a dollar cost, the way a
     /// Codex run does. A run with none queued reports no usage, as Claude does.
     token_usages: Mutex<VecDeque<TokenUsage>>,
+    /// The generation ids each run's output shows, the way an `OpenRouter` run's
+    /// does. A run with none shows no id.
+    generations: Mutex<VecDeque<Vec<String>>>,
     /// The MCP servers each run reports as not connected in its init line.
     unavailable: Mutex<VecDeque<Vec<McpUnavailable>>>,
     tool_calls: Mutex<VecDeque<Vec<String>>>,
@@ -131,6 +213,7 @@ impl FakeExecutor {
             requests: Mutex::new(Vec::new()),
             costs: Mutex::new(VecDeque::new()),
             token_usages: Mutex::new(VecDeque::new()),
+            generations: Mutex::new(VecDeque::new()),
             unavailable: Mutex::new(VecDeque::new()),
             tool_calls: Mutex::new(VecDeque::new()),
             sessions: Mutex::new(VecDeque::new()),
@@ -208,6 +291,13 @@ impl FakeExecutor {
         self.sessions.lock().unwrap().push_back(id.to_owned());
     }
 
+    fn report_generations(&self, ids: &[&str]) {
+        self.generations
+            .lock()
+            .unwrap()
+            .push_back(ids.iter().map(|id| (*id).to_owned()).collect());
+    }
+
     fn requests(&self) -> Vec<AgentRequest> {
         self.requests.lock().unwrap().clone()
     }
@@ -283,7 +373,12 @@ impl Executor for FakeExecutor {
                 .unwrap_or_default(),
             credential: None,
             token_usage,
-            generation_ids: Vec::new(),
+            generation_ids: self
+                .generations
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default(),
             head: self.checkout_head.lock().unwrap().clone(),
         }
     }
@@ -705,6 +800,7 @@ fn setup_in(
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     (store, executor, scheduler)
 }
@@ -760,6 +856,7 @@ fn setup_mcp(
         PathBuf::new(),
         runtime,
         accounts(&store),
+        no_costs(),
     );
     (store, executor, scheduler, tokens)
 }
@@ -1160,6 +1257,7 @@ async fn a_project_onboarded_while_running_is_picked_up() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
 
     let id = store
@@ -2169,6 +2267,7 @@ async fn a_project_without_checks_publishes_unchecked() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     drop(scheduler);
     for event in [
@@ -2208,6 +2307,7 @@ async fn an_edited_checks_command_applies_to_a_job_created_before_the_edit() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     store
         .create_project(
@@ -2304,6 +2404,7 @@ async fn a_project_on_an_unknown_forge_fails_its_job_and_leaves_the_others_runni
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     drop(scheduler);
     let odd = store.create("odd", "alice", "x").unwrap();
@@ -2370,6 +2471,7 @@ async fn a_failed_publish_waits_before_it_is_tried_again() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     step(&fresh).await;
     assert_eq!(executor.published.lock().unwrap().len(), 2);
@@ -2409,6 +2511,7 @@ async fn a_project_that_moves_to_an_unknown_forge_stops_a_job_in_a_factory_turn(
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
 
     step(&odd).await;
@@ -3114,6 +3217,7 @@ mod purge {
             data.path().to_owned(),
             mcp_runtime(&store).0,
             accounts(&store),
+            no_costs(),
         );
         let db = rusqlite::Connection::open(&path).unwrap();
         Fixture {
@@ -3608,6 +3712,7 @@ async fn a_project_does_not_use_the_models_of_another() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     store
         .save_project_models("maestro", &models("maestro-c", "", "", ""))
@@ -4324,6 +4429,7 @@ async fn a_job_from_before_fresh_sessions_resumes_its_planning_session() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     let id = store
         .create("maestro", "alice", "Add a reboot button")
@@ -4676,10 +4782,7 @@ async fn an_init_line_failure_records_one_warning_and_the_run_goes_on() {
     );
     // The run did not fail: it reached the clarify questions, so the warning is
     // only a note.
-    assert!(matches!(
-        store.get(id).unwrap().job.stage(),
-        Stage::Clarifying
-    ));
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Clarifying);
 }
 
 #[tokio::test]
@@ -4769,6 +4872,7 @@ fn setup_two_projects(
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     (store, executor, scheduler)
 }
@@ -5096,6 +5200,7 @@ async fn an_edited_queued_job_runs_clarify_with_the_new_text_and_attachments() {
         data.path().to_owned(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
 
     let id = store
@@ -6057,6 +6162,7 @@ async fn discovery_makes_one_job_per_renovate_pull_request() {
             PathBuf::new(),
             mcp_runtime(store).0,
             accounts(store),
+            no_costs(),
         )
     };
 
@@ -6139,6 +6245,7 @@ async fn salsa_discovery_skips_a_project_with_renovate_on_and_no_author() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         Accounts::new(Arc::clone(&store), secrets as Arc<dyn SecretStore>, forges),
+        no_costs(),
     );
 
     step(&scheduler).await;
@@ -6214,6 +6321,7 @@ async fn salsa_discovery_lists_by_the_renovate_account_and_github_by_none() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts,
+        no_costs(),
     );
     secrets
         .put_forge_token(
@@ -6312,6 +6420,7 @@ fn forgejo_discovery(
         PathBuf::new(),
         mcp_runtime(&store).0,
         Accounts::new(Arc::clone(&store), secrets as Arc<dyn SecretStore>, forges),
+        no_costs(),
     );
     (store, executor, scheduler)
 }
@@ -7049,6 +7158,7 @@ async fn a_restart_keeps_the_count_of_checks_that_could_not_run() {
         PathBuf::new(),
         mcp_runtime(&store).0,
         accounts(&store),
+        no_costs(),
     );
     step(&fresh).await;
     step(&fresh).await;
@@ -8226,6 +8336,18 @@ fn setup_local(
     Arc<Scheduler<FakeExecutor>>,
     Arc<LocalSecrets>,
 ) {
+    setup_local_with(respond, no_costs())
+}
+
+fn setup_local_with(
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+    costs: OpenRouterCosts,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    Arc<LocalSecrets>,
+) {
     let store = Arc::new(Store::open_in_memory().unwrap());
     let secrets = Arc::new(LocalSecrets::new(&[1; MASTER_KEY_LEN], Arc::clone(&store)));
     let executor = FakeExecutor::new(respond);
@@ -8258,6 +8380,7 @@ fn setup_local(
         PathBuf::new(),
         runtime,
         accounts(&store),
+        costs,
     );
     store
         .save_local_settings(Some(LOCAL_URL), factory_core::Cli::Codex, 10)
@@ -8843,7 +8966,19 @@ fn setup_openrouter(
     Arc<Scheduler<FakeExecutor>>,
     Arc<LocalSecrets>,
 ) {
-    let (store, executor, scheduler, secrets) = setup_local(respond);
+    setup_openrouter_with(respond, no_costs())
+}
+
+fn setup_openrouter_with(
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+    costs: OpenRouterCosts,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    Arc<LocalSecrets>,
+) {
+    let (store, executor, scheduler, secrets) = setup_local_with(respond, costs);
     store
         .save_project_agents(
             "maestro",
@@ -9151,24 +9286,6 @@ async fn one_job_runs_a_local_stage_and_an_openrouter_stage_each_with_its_own_li
     let log = log_texts(&store, id);
     assert!(log.iter().any(|text| text.starts_with("Local run on")));
     assert!(log.iter().any(|text| text.starts_with("OpenRouter run on")));
-}
-
-#[tokio::test]
-async fn an_openrouter_run_adds_no_cost_row() {
-    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
-    secrets.set_openrouter_key("factory-key").unwrap();
-    executor.costs.lock().unwrap().push_back(Some(4.2));
-    executor.release(1);
-    let id = store.create("maestro", "alice", "Add a button").unwrap();
-    step(&scheduler).await;
-
-    assert_eq!(store.recorded_cost(id).unwrap(), None);
-    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
-    assert!(
-        log_texts(&store, id)
-            .iter()
-            .any(|text| text.starts_with("OpenRouter run finished"))
-    );
 }
 
 #[tokio::test]
@@ -10224,4 +10341,204 @@ async fn conflict_on_stack(
         &Stage::CiAndReview { pr: 0 }
     );
     rebase
+}
+
+fn clarify_after_answer(request: &AgentRequest) -> Event {
+    if request.prompt.contains("answered") {
+        Event::Agent(AgentResult::Clarified)
+    } else {
+        questions()
+    }
+}
+
+#[tokio::test]
+async fn an_openrouter_run_records_the_cost_openrouter_charged() {
+    let (costs, api) = fake_costs(&[("gen-1", 0.10), ("gen-2", 0.25), ("gen-3", 0.5)]);
+    let (store, executor, scheduler, secrets) = setup_openrouter_with(clarify_after_answer, costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1", "gen-2"]);
+    // The dollar figure the CLI reports and the token counts are ignored.
+    executor.costs.lock().unwrap().push_back(Some(9.0));
+    executor
+        .token_usages
+        .lock()
+        .unwrap()
+        .push_back(codex_usage());
+    executor.release(2);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let lines = openrouter_finished(&store, id, 1).await;
+    assert_eq!(
+        lines[0],
+        "OpenRouter run finished, $0.35 charged by OpenRouter. 1000 input tokens, 500 output \
+         tokens."
+    );
+    assert!((store.cost_usd(id).unwrap() - 0.35).abs() < 1e-9);
+    assert!((store.project_totals("maestro").unwrap().usd - 0.35).abs() < 1e-9);
+    assert!(!store.has_estimated_cost(id).unwrap());
+    assert!(
+        api.keys
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|key| key == "factory-key")
+    );
+
+    // The resumed run counts only its own generation.
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    executor.report_generations(&["gen-3"]);
+    step(&scheduler).await;
+    openrouter_finished(&store, id, 2).await;
+    assert!((store.cost_usd(id).unwrap() - 0.85).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn an_openrouter_run_with_an_unreadable_generation_adds_no_cost_and_still_applies_its_event()
+{
+    let (costs, _) = fake_costs(&[("gen-1", 0.10)]);
+    let (store, executor, scheduler, secrets) = setup_openrouter_with(|_| questions(), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1", "gen-missing"]);
+    executor
+        .token_usages
+        .lock()
+        .unwrap()
+        .push_back(codex_usage());
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let lines = openrouter_finished(&store, id, 1).await;
+    assert_eq!(
+        lines[0],
+        "OpenRouter run finished. The cost could not be read from OpenRouter and is not \
+         counted. 1000 input tokens, 500 output tokens."
+    );
+    assert_eq!(store.recorded_cost(id).unwrap(), None);
+    assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
+    assert_eq!(store.get(id).unwrap().job.stage(), &Stage::Clarifying);
+}
+
+#[tokio::test]
+async fn an_openrouter_run_that_shows_no_generation_id_adds_no_cost() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let lines = openrouter_finished(&store, id, 1).await;
+    assert_eq!(
+        lines[0],
+        "OpenRouter run finished. The cost could not be read from OpenRouter and is not counted."
+    );
+    assert_eq!(store.recorded_cost(id).unwrap(), None);
+}
+
+#[tokio::test]
+async fn an_openrouter_generation_that_cost_nothing_records_a_zero_row() {
+    let (costs, _) = fake_costs(&[("gen-free", 0.0)]);
+    let (store, executor, scheduler, secrets) = setup_openrouter_with(|_| questions(), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-free"]);
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let lines = openrouter_finished(&store, id, 1).await;
+    assert_eq!(
+        lines[0],
+        "OpenRouter run finished, $0.00 charged by OpenRouter."
+    );
+    assert_eq!(store.recorded_cost(id).unwrap(), Some(0.0));
+}
+
+#[tokio::test]
+async fn a_lookup_that_ends_after_the_job_moved_on_files_its_cost_under_the_run_step() {
+    let (costs, api) = fake_costs(&[("gen-1", 0.4)]);
+    let gate = Arc::new(Semaphore::new(0));
+    *api.gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let (store, executor, scheduler, secrets) =
+        setup_openrouter_with(|_| Event::Agent(AgentResult::Clarified), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1"]);
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_ne!(store.get(id).unwrap().job.stage(), &Stage::Clarifying);
+    assert!(store.cost_lookup_pending(id).unwrap());
+    gate.add_permits(10);
+    openrouter_finished(&store, id, 1).await;
+
+    assert!(!store.cost_lookup_pending(id).unwrap());
+    let cost = store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event == "cost")
+        .expect("the cost entry");
+    assert_eq!(cost.stage, "clarifying");
+    assert_eq!(cost.usd, Some(0.4));
+}
+
+#[tokio::test]
+async fn a_lookup_that_runs_out_of_time_records_no_partial_cost() {
+    let api = Arc::new(FakeGenerations::default());
+    *api.costs.lock().unwrap() = vec![("gen-1".to_owned(), 0.1)];
+    *api.hangs.lock().unwrap() = Some("gen-2".to_owned());
+    let costs = OpenRouterCosts::with_limits(
+        Arc::clone(&api) as Arc<dyn OpenRouterApi>,
+        vec![Duration::from_millis(1); 3],
+        Duration::from_millis(100),
+    );
+    let (store, executor, scheduler, secrets) = setup_openrouter_with(|_| questions(), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1", "gen-2"]);
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let lines = openrouter_finished(&store, id, 1).await;
+    assert!(lines[0].contains("could not be read from OpenRouter"));
+    assert_eq!(store.recorded_cost(id).unwrap(), None);
+    assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
+    assert!(!store.cost_lookup_pending(id).unwrap());
+}
+
+#[tokio::test]
+async fn a_charge_for_a_run_cancelled_before_its_report_stays_on_the_run_step() {
+    let (costs, _api) = fake_costs(&[("gen-1", 0.4)]);
+    let (store, executor, scheduler, secrets) = setup_openrouter_with(|_| questions(), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1"]);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    scheduler.tick().await.unwrap();
+    store.apply(id, Event::Cancel).unwrap();
+    assert!(store.cost_lookup_pending(id).unwrap());
+    executor.release(1);
+    openrouter_finished(&store, id, 1).await;
+
+    let cost = store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event == "cost")
+        .expect("the cost entry");
+    assert_eq!(cost.stage, "clarifying");
+    assert_eq!(cost.usd, Some(0.4));
+}
+
+#[tokio::test]
+async fn a_lookup_is_not_registered_for_a_job_cancelled_since_its_snapshot() {
+    let (store, _executor, _scheduler) = setup(|_| questions());
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    let seen = store.start(id).unwrap().unwrap().job;
+    assert!(store.begin_cost_lookup_at(id, &seen).unwrap());
+    store.end_cost_lookup(id).unwrap();
+
+    store.apply(id, Event::Cancel).unwrap();
+    assert!(!store.begin_cost_lookup_at(id, &seen).unwrap());
+    assert!(!store.cost_lookup_pending(id).unwrap());
 }

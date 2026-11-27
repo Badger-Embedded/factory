@@ -24,7 +24,7 @@ use crate::accounts::{
 };
 use crate::cost::{codex_cost, format_cost};
 use crate::mcp::{McpServer, McpTransport};
-use crate::openrouter::OPENROUTER_BASE_URL;
+use crate::openrouter::{OPENROUTER_BASE_URL, OpenRouterCosts};
 use crate::projects::{Project, Projects, StageAgents};
 use crate::proxy::RunTokens;
 use crate::secrets::{SecretError, SecretRef, SecretStore};
@@ -847,6 +847,54 @@ impl Drop for TokenGuard {
     }
 }
 
+/// Counts an `OpenRouter` worker as a pending cost lookup from its dispatch
+/// until it ends or is aborted, so a job page that renders in between keeps
+/// polling. The lookup the worker starts counts on its own, so the page never
+/// sees a gap between the two.
+struct WorkerCostGuard {
+    store: Arc<Store>,
+    job_id: i64,
+}
+
+impl WorkerCostGuard {
+    /// `Ok(None)` for a run that is not on `OpenRouter`. `Err(())` when the job
+    /// left the stage it was dispatched in or the store failed, so the run does
+    /// not start and the next pass retries.
+    fn for_request(
+        store: &Arc<Store>,
+        request: &AgentRequest,
+        dispatched: &Job,
+    ) -> Result<Option<Self>, ()> {
+        let openrouter = request
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider.target.kind == ProviderKind::OpenRouter);
+        if !openrouter {
+            return Ok(None);
+        }
+        let job_id = request.job_id;
+        match store.begin_cost_lookup_at(job_id, dispatched) {
+            Ok(true) => Ok(Some(Self {
+                store: Arc::clone(store),
+                job_id,
+            })),
+            Ok(false) => Err(()),
+            Err(err) => {
+                tracing::error!("job {job_id}: {err}");
+                Err(())
+            }
+        }
+    }
+}
+
+impl Drop for WorkerCostGuard {
+    fn drop(&mut self) {
+        if let Err(err) = self.store.end_cost_lookup(self.job_id) {
+            tracing::error!("job {}: {err}", self.job_id);
+        }
+    }
+}
+
 /// The server and tool of an agent's `mcp__<server>__<tool>` tool name when the
 /// server is one of the run's stdio servers. Server names hold no underscore, so
 /// the first `__` after the prefix ends the server.
@@ -894,6 +942,8 @@ pub struct Scheduler<E> {
     not_before: Mutex<HashMap<i64, Instant>>,
     slots: Arc<WorkerSlots>,
     mcp: McpRuntime,
+    /// Reads what an `OpenRouter` run was charged, after the run.
+    costs: Arc<OpenRouterCosts>,
     /// When each project's Renovate pull requests were last listed.
     discovered: Mutex<HashMap<String, Instant>>,
     /// The (job, login) pairs whose ignored comments the job's log already
@@ -922,7 +972,19 @@ fn rerun_request(
     }
 }
 
+fn openrouter_key_of(request: &AgentRequest) -> Option<String> {
+    request
+        .provider
+        .as_ref()
+        .filter(|provider| provider.target.kind == ProviderKind::OpenRouter)
+        .and_then(|provider| provider.target.key.clone())
+}
+
 impl<E: Executor> Scheduler<E> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the scheduler wires each long-lived dependency it shares with its tasks"
+    )]
     pub fn new(
         store: Arc<Store>,
         projects: Arc<Projects>,
@@ -931,6 +993,7 @@ impl<E: Executor> Scheduler<E> {
         data_dir: PathBuf,
         mcp: McpRuntime,
         accounts: Accounts,
+        costs: OpenRouterCosts,
     ) -> Arc<Self> {
         Arc::new(Scheduler {
             store,
@@ -942,6 +1005,7 @@ impl<E: Executor> Scheduler<E> {
             not_before: Mutex::new(HashMap::new()),
             slots: Arc::new(WorkerSlots::new()),
             mcp,
+            costs: Arc::new(costs),
             discovered: Mutex::new(HashMap::new()),
             ignored_noted: Mutex::new(HashSet::new()),
         })
@@ -1024,11 +1088,7 @@ impl<E: Executor> Scheduler<E> {
                     else {
                         continue;
                     };
-                    let scheduler = Arc::clone(self);
-                    let settings = settings.clone();
-                    self.spawn(row.id, Kind::Worker, async move {
-                        scheduler.agent(&settings, request, skipped).await;
-                    });
+                    self.spawn_agent(row.id, &settings, request, skipped, job);
                 }
                 Command::RunChecks { pr } => {
                     self.checks(&row, pr, &job, &project, &settings, workers_free)?;
@@ -2303,7 +2363,13 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    async fn agent(&self, settings: &Settings, request: AgentRequest, skipped: Vec<SkippedServer>) {
+    async fn agent(
+        &self,
+        settings: &Settings,
+        request: AgentRequest,
+        skipped: Vec<SkippedServer>,
+        dispatched: Job,
+    ) {
         let job_id = request.job_id;
         // The run's proxy token is revoked when this guard drops: at the end of
         // the run, or when a cancel aborts and drops this future.
@@ -2370,27 +2436,28 @@ impl<E: Executor> Scheduler<E> {
         let session_uuid = request.session_id.clone();
         let cost_session = request.session_id.clone();
         let session: SessionSink = Box::new(move |id| {
-            if let Err(err) = session_store.set_agent_session(&session_uuid, &id) {
-                tracing::error!("job {job_id}: {err}");
-            }
+            session_store
+                .set_agent_session(&session_uuid, &id)
+                .unwrap_or_else(|err| tracing::error!("job {job_id}: {err}"));
         });
         // The model the run passed, kept before the request moves into the run,
         // so a Codex run can look up its price by it afterwards.
-        let model = request.model.clone();
-        let agent = request.agent;
+        let (model, agent) = (request.model.clone(), request.agent);
+        let openrouter_key = openrouter_key_of(&request);
         let report = self
             .executor
             .run_agent(settings, request, sink, session)
             .await;
-        // Each active server the agent read as not connected in the run's init
-        // line gets its warning, deduped against a proxy warning for the same
-        // server already recorded during the run.
-        for unavailable in &report.mcp_unavailable {
-            self.mcp
-                .warnings
-                .record(job_id, &unavailable.server, &unavailable.reason);
-        }
-        self.record_run_cost(job_id, &cost_session, agent, model.as_deref(), &report);
+        self.record_unavailable_servers(job_id, &report);
+        self.record_run_cost(
+            job_id,
+            &cost_session,
+            agent,
+            model.as_deref(),
+            &report,
+            openrouter_key,
+            dispatched,
+        );
         match report.head {
             Some(head) if matches!(report.event, Event::QuickReviewed { .. }) => {
                 let Event::QuickReviewed { score, review, .. } = report.event else {
@@ -2416,6 +2483,27 @@ impl<E: Executor> Scheduler<E> {
             }
             _ => self.apply(job_id, report.event),
         }
+    }
+
+    /// Starts the worker for `job`, unless the job left the stage it was
+    /// dispatched in, such as by a cancel while the request was built.
+    fn spawn_agent(
+        self: &Arc<Self>,
+        id: i64,
+        settings: &Settings,
+        request: AgentRequest,
+        skipped: Vec<SkippedServer>,
+        job: Job,
+    ) {
+        let Ok(guard) = WorkerCostGuard::for_request(&self.store, &request, &job) else {
+            return;
+        };
+        let scheduler = Arc::clone(self);
+        let settings = settings.clone();
+        self.spawn(id, Kind::Worker, async move {
+            let _guard = guard;
+            scheduler.agent(&settings, request, skipped, job).await;
+        });
     }
 
     /// Writes the notices that precede a run's own output, the Local run line
@@ -2479,6 +2567,76 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
+    /// Each active server the agent read as not connected in the run's init
+    /// line gets its warning, deduped against a proxy warning for the same
+    /// server already recorded during the run.
+    fn record_unavailable_servers(&self, job_id: i64, report: &RunReport) {
+        for unavailable in &report.mcp_unavailable {
+            self.mcp
+                .warnings
+                .record(job_id, &unavailable.server, &unavailable.reason);
+        }
+    }
+
+    /// Reads what `OpenRouter` charged for the generations `report` shows with
+    /// `key`, in the background so the run's next step never waits for it, and
+    /// records the sum. When the cost cannot be read, the run adds no cost and
+    /// the log says so.
+    fn record_openrouter_cost(
+        &self,
+        job_id: i64,
+        report: &RunReport,
+        key: Option<String>,
+        at: Job,
+    ) {
+        let tokens = report.token_usage.map(|usage| {
+            format!(
+                "{} input tokens, {} output tokens",
+                usage.input_tokens, usage.output_tokens
+            )
+        });
+        if let Err(err) = self.store.begin_cost_lookup(job_id) {
+            tracing::error!("job {job_id}: {err}");
+        }
+        let store = Arc::clone(&self.store);
+        let costs = Arc::clone(&self.costs);
+        let ids = report.generation_ids.clone();
+        tokio::spawn(async move {
+            let total = match &key {
+                Some(key) => costs.total(key, &ids).await,
+                None => None,
+            };
+            let recorded = total.map_or(Ok(None), |total| {
+                store
+                    .add_fetched_cost(job_id, total, &at)
+                    .map(|()| Some(total))
+            });
+            let mut text = match recorded {
+                Ok(Some(total)) => format!(
+                    "OpenRouter run finished, {} charged by OpenRouter",
+                    format_cost(total)
+                ),
+                Ok(None) => "OpenRouter run finished. The cost could not be read from \
+                             OpenRouter and is not counted"
+                    .to_owned(),
+                Err(err) => {
+                    tracing::error!("job {job_id}: {err}");
+                    "OpenRouter run finished. The cost could not be recorded".to_owned()
+                }
+            };
+            if let Some(tokens) = tokens {
+                let _ = write!(text, ". {tokens}");
+            }
+            text.push('.');
+            if let Err(err) = store.append_factory_log(job_id, &text) {
+                tracing::error!("job {job_id}: {err}");
+            }
+            if let Err(err) = store.end_cost_lookup(job_id) {
+                tracing::error!("job {job_id}: {err}");
+            }
+        });
+    }
+
     /// Records the cost of a finished agent run and notes it on the job log. A
     /// run that reports a dollar figure, such as Claude's, reports the total of
     /// the session whose factory UUID is `session`, so the run records the
@@ -2488,7 +2646,13 @@ impl<E: Executor> Scheduler<E> {
     /// toward the job and project totals and is marked estimated, and with no row
     /// for the model, or no model at all, the run adds no cost and the log names
     /// the model. The token counts go to the log either way. A Copilot run adds
-    /// no cost at all.
+    /// no cost at all. An `OpenRouter` run records what `OpenRouter` charged for
+    /// the generations its output showed, read with `openrouter_key` in the
+    /// background, so the run's next step never waits for it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the run's report, key and dispatch snapshot are each needed"
+    )]
     fn record_run_cost(
         &self,
         job_id: i64,
@@ -2496,6 +2660,8 @@ impl<E: Executor> Scheduler<E> {
         agent: Agent,
         model: Option<&str>,
         report: &RunReport,
+        openrouter_key: Option<String>,
+        dispatched: Job,
     ) {
         if agent == Agent::Local {
             // A local model has no price. The run adds a row of zero, so the job
@@ -2517,16 +2683,7 @@ impl<E: Executor> Scheduler<E> {
             return;
         }
         if agent == Agent::OpenRouter {
-            let mut text = "OpenRouter run finished".to_owned();
-            if let Some(usage) = report.token_usage {
-                let _ = write!(
-                    text,
-                    ". {} input tokens, {} output tokens",
-                    usage.input_tokens, usage.output_tokens
-                );
-            }
-            text.push('.');
-            self.note(job_id, &text);
+            self.record_openrouter_cost(job_id, report, openrouter_key, dispatched);
             return;
         }
         if agent == Agent::Copilot {

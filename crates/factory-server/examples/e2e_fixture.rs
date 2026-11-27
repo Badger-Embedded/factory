@@ -405,7 +405,13 @@ fn cost(store: &Store, flags: &HashMap<String, Vec<String>>) -> Result<()> {
         Ok(flags.get(name).ok_or(format!("--{name} is required"))?[0].as_str())
     };
     let job = one("job")?.parse()?;
-    store.add_cost(job, one("usd")?.parse()?, false)?;
+    let usd = one("usd")?.parse()?;
+    if flags.contains_key("fetched") {
+        let at = store.get(job)?.job;
+        store.add_fetched_cost(job, usd, &at)?;
+    } else {
+        store.add_cost(job, usd, false)?;
+    }
     if let Ok(cli) = one("local-cli") {
         let cli = Cli::from_id(cli).ok_or("unknown --local-cli")?;
         store.session_uuid(job, Session::Planning, Agent::Local)?;
@@ -511,6 +517,14 @@ fn main() -> Result<()> {
         ),
         "apply" => apply(&store, &flags)?,
         "cost" => cost(&store, &flags)?,
+        "cost-lookup" => {
+            let job = one("job")?.parse()?;
+            match one("state")?.as_str() {
+                "begin" => store.begin_cost_lookup(job)?,
+                "end" => store.end_cost_lookup(job)?,
+                _ => return Err("--state is begin or end".into()),
+            }
+        }
         "log" => {
             let job = one("job")?.parse()?;
             let text = one("text")?;
