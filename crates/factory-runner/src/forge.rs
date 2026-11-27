@@ -299,6 +299,17 @@ pub trait Forge: Send + Sync {
         repo: &'a str,
     ) -> BoxFuture<'a, Result<Access, String>>;
 
+    /// What the user `login` may do in `repo`, read as `account`. `None`
+    /// when the forge does not tell `account`: Forgejo answers only a
+    /// repository admin. A login the forge does not know reads as
+    /// [`Access::Read`], since it has no access beyond what the public has.
+    fn user_access<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        login: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Access>, String>>;
+
     /// Whether `account` may merge pull request `number`. `access` is what
     /// the account may do in `repo`, read just before.
     fn may_merge<'a>(

@@ -1187,6 +1187,23 @@ pub enum Session {
     Renovate(u32),
 }
 
+/// What a watch of a job's pull request reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrWatch {
+    /// Everything: a merge, a close, a conflict, failed CI, new review
+    /// comments, and green CI, which merges, starts a review or leaves the
+    /// merge to the user.
+    Full,
+    /// Only a merge or close by someone else. Set while the review has
+    /// stopped and waits for the user, so the job moves on when the user
+    /// merges the pull request and fails when they close it, but never
+    /// merges or restarts the reviewer on its own.
+    MergeOrClose,
+    /// A merge, a close, or new review comments. Set while the merge is left
+    /// to the user, so a comment posted before the merge goes to the agent.
+    MergeCloseOrComments,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     RunAgent {
@@ -1208,13 +1225,7 @@ pub enum Command {
     WatchPr {
         pr: usize,
         number: u64,
-        /// Report only a merge or close by someone else, and take no other
-        /// action: do not merge, start a review, or send CI failures and
-        /// comments to the agent. Set while the review has stopped and waits
-        /// for the user, so the job moves on when the user merges the pull
-        /// request on GitHub and fails when they close it, but never merges or
-        /// restarts the reviewer on its own.
-        watch_only: bool,
+        watch: PrWatch,
     },
     /// Rerun the failed CI runs of the pull request. The factory logs
     /// `reason`.
@@ -1833,7 +1844,7 @@ impl Job {
                 self.plan[*pr].number.map(|number| Command::WatchPr {
                     pr: *pr,
                     number,
-                    watch_only: false,
+                    watch: PrWatch::Full,
                 })
             }
             // The review stopped and waits for the user. Keep watching the
@@ -1844,7 +1855,7 @@ impl Job {
                 self.plan[*pr].number.map(|number| Command::WatchPr {
                     pr: *pr,
                     number,
-                    watch_only: true,
+                    watch: PrWatch::MergeOrClose,
                 })
             }
             (
@@ -1863,7 +1874,7 @@ impl Job {
                 self.plan[*pr].number.map(|number| Command::WatchPr {
                     pr: *pr,
                     number,
-                    watch_only: true,
+                    watch: PrWatch::MergeCloseOrComments,
                 })
             }
             (_, Stage::Renovate) => self.renovate_command(),
@@ -2345,7 +2356,11 @@ impl Job {
             (S::CiAndReview { pr }, Turn::RerunCi { .. }, E::CiRerun) => {
                 (S::CiAndReview { pr: *pr }, Turn::Factory)
             }
-            (S::CiAndReview { pr }, Turn::Factory, E::ReviewComments { comments }) => (
+            (
+                S::CiAndReview { pr },
+                Turn::Factory | Turn::User(Ask::MergeLeftToUser),
+                E::ReviewComments { comments },
+            ) => (
                 S::CiAndReview { pr: *pr },
                 Turn::Agent(Task::AddressReview { comments }),
             ),

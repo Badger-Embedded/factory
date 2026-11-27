@@ -1859,6 +1859,51 @@ impl Forge for GitHub {
         })
     }
 
+    fn user_access<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        login: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Access>, String>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Permission {
+                permission: String,
+            }
+            // A bot such as `dependabot[bot]` or a name that is not a login
+            // is no collaborator, and it never reaches the API path. An
+            // Enterprise Managed User login carries `_<shortcode>`.
+            if login.is_empty()
+                || !login
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Ok(Some(Access::Read));
+            }
+            let out = match self
+                .api_get(
+                    account,
+                    &format!("repos/{repo}/collaborators/{login}/permission"),
+                    &["--hostname", "github.com"],
+                )
+                .await
+            {
+                Ok(out) => out,
+                Err(err) if is_not_found(&err) => return Ok(Some(Access::Read)),
+                Err(err) => return Err(err),
+            };
+            let json: Permission = serde_json::from_str(&out).map_err(|_| {
+                "gh api collaborators permission returned unexpected output".to_owned()
+            })?;
+            // GitHub maps maintain to write and triage to read.
+            Ok(Some(match json.permission.as_str() {
+                "admin" => Access::Admin,
+                "write" => Access::Write,
+                _ => Access::Read,
+            }))
+        })
+    }
+
     fn may_merge<'a>(
         &'a self,
         _account: &'a Account,

@@ -1,9 +1,9 @@
 use factory_core::{
     AgentResult, Ask, BranchSummary, Command, CommentKind, CommentState, DiffVerdict, Event,
     FixOutcome, Gates, Job, JobKind, MAX_FAILED_ROUNDS, MAX_REVIEW_ROUNDS, PickedPr, PlannedPr,
-    PrDescription, PrDiff, PrMode, Question, Rejected, RenovateAccess, RenovateCi, RenovateWait,
-    RetryLimits, RetryTarget, ReviewPass, ReviewState, ReviewStop, Session, Stage, Task, Turn,
-    Verdict,
+    PrDescription, PrDiff, PrMode, PrWatch, Question, Rejected, RenovateAccess, RenovateCi,
+    RenovateWait, RetryLimits, RetryTarget, ReviewPass, ReviewState, ReviewStop, Session, Stage,
+    Task, Turn, Verdict,
 };
 
 fn ready() -> PrDescription {
@@ -133,7 +133,7 @@ fn request_ends_merged_after_every_planned_pull_request_merges() {
             Some(Command::WatchPr {
                 pr: index,
                 number,
-                watch_only: false,
+                watch: PrWatch::Full,
             })
         );
         apply(&mut job, Event::Merged);
@@ -1237,7 +1237,7 @@ fn a_rerun_request_counts_a_round_and_returns_to_watching() {
         Some(Command::WatchPr {
             pr: 0,
             number: 7,
-            watch_only: false,
+            watch: PrWatch::Full,
         })
     );
 }
@@ -1316,7 +1316,7 @@ fn a_retry_resumes_a_job_that_ran_out_of_ci_rounds() {
         Some(Command::WatchPr {
             pr: 0,
             number: 7,
-            watch_only: false,
+            watch: PrWatch::Full,
         })
     );
 }
@@ -1651,7 +1651,7 @@ fn a_legacy_failed_job_retries_at_its_highest_numbered_pull_request() {
         Some(Command::WatchPr {
             pr: 1,
             number: 11,
-            watch_only: false,
+            watch: PrWatch::Full,
         })
     );
 }
@@ -1684,7 +1684,7 @@ fn a_legacy_agent_failure_mid_rebase_retries_at_its_pull_request() {
         Some(Command::WatchPr {
             pr: 0,
             number: 75,
-            watch_only: false,
+            watch: PrWatch::Full,
         })
     );
 }
@@ -1815,7 +1815,7 @@ fn an_approved_review_records_the_pass_and_returns_to_watching() {
         Some(Command::WatchPr {
             pr: 0,
             number: 7,
-            watch_only: false,
+            watch: PrWatch::Full,
         })
     );
 
@@ -1935,7 +1935,7 @@ fn the_review_cap_stops_the_job_without_merging() {
         Some(Command::WatchPr {
             pr: 0,
             number: 7,
-            watch_only: true,
+            watch: PrWatch::MergeOrClose,
         })
     );
     assert_eq!(job.reviews().len(), MAX_REVIEW_ROUNDS as usize);
@@ -1992,7 +1992,7 @@ fn the_reviewer_does_not_rerun_on_the_head_it_asked_to_change() {
         Some(Command::WatchPr {
             pr: 0,
             number: 7,
-            watch_only: true,
+            watch: PrWatch::MergeOrClose,
         })
     );
 
@@ -2067,7 +2067,7 @@ fn a_reviewer_failure_stops_the_job_without_merging() {
         Some(Command::WatchPr {
             pr: 0,
             number: 7,
-            watch_only: true,
+            watch: PrWatch::MergeOrClose,
         })
     );
 
@@ -2098,7 +2098,7 @@ fn a_stopped_review_watches_until_the_next_pull_request() {
         Some(Command::WatchPr {
             pr: 0,
             number: 11,
-            watch_only: true,
+            watch: PrWatch::MergeOrClose,
         })
     );
 
@@ -2122,7 +2122,7 @@ fn a_stopped_review_fails_when_the_pull_request_is_closed() {
         Some(Command::WatchPr {
             pr: 0,
             number: 7,
-            watch_only: true,
+            watch: PrWatch::MergeOrClose,
         })
     );
 
@@ -4137,7 +4137,7 @@ fn green_ci_after_approval_leaves_the_merge_to_the_user_and_keeps_watching() {
         Some(Command::WatchPr {
             pr: 0,
             number: 42,
-            watch_only: false
+            watch: PrWatch::Full
         })
     );
 
@@ -4148,10 +4148,47 @@ fn green_ci_after_approval_leaves_the_merge_to_the_user_and_keeps_watching() {
         Some(Command::WatchPr {
             pr: 0,
             number: 42,
-            watch_only: true
+            watch: PrWatch::MergeCloseOrComments
         })
     );
     assert!(!job.is_finished());
+}
+
+#[test]
+fn a_comment_while_the_merge_waits_goes_to_the_agent_and_reviews_again() {
+    let mut job = picked_watching();
+    apply(&mut job, Event::StartReview { head: "abc".into() });
+    apply(&mut job, Event::ReviewApproved);
+    apply(&mut job, Event::MergeLeftToUser);
+    apply(
+        &mut job,
+        Event::ReviewComments {
+            comments: "alice:\nrename it".into(),
+        },
+    );
+    assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
+    assert_eq!(
+        job.turn(),
+        &Turn::Agent(Task::AddressReview {
+            comments: "alice:\nrename it".into()
+        })
+    );
+
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 42 });
+    assert_eq!(job.review_state(), ReviewState::Pending);
+    assert_eq!(
+        job.next_command(),
+        Some(Command::WatchPr {
+            pr: 0,
+            number: 42,
+            watch: PrWatch::Full
+        })
+    );
 }
 
 #[test]
@@ -4596,7 +4633,7 @@ fn review_and_fix_approving_on_the_first_pass_pushes_nothing() {
         Some(Command::WatchPr {
             pr: 0,
             number: 42,
-            watch_only: true
+            watch: PrWatch::MergeCloseOrComments
         })
     );
 }

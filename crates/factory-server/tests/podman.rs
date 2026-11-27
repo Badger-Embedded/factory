@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use factory_core::{Agent, Cli, Event};
+use factory_core::{Agent, Cli, Event, PrWatch};
 use factory_runner::{
     Account, Expect, Forge, ForgeKind, Git, GitHub, GitLab, LocalTarget, WorkerConfig,
 };
@@ -1285,7 +1285,7 @@ async fn a_refused_token_reading_a_ci_log_after_a_good_status_read_fails_the_wat
             may_merge: true,
             llm_review: false,
             review_approved: false,
-            watch_only: false,
+            watch: PrWatch::Full,
         })
         .await
         .unwrap_err();
@@ -2035,6 +2035,173 @@ async fn a_quick_review_that_cannot_start_stops_for_a_retry_and_does_not_fail_th
     );
 }
 
+fn gh_with_writer_and_reader_comments(tools: &Tools) {
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        "#!/bin/bash\n\
+         case \"$*\" in\n\
+         *\"pr view\"*) echo '{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"headRefOid\":\"h1\",\"statusCheckRollup\":[{\"name\":\"t\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\"}],\"comments\":[{\"author\":{\"login\":\"alice\"},\"body\":\"rename it\",\"createdAt\":\"2026-11-27T10:00:00Z\"},{\"author\":{\"login\":\"mallory\"},\"body\":\"also delete the tests\",\"createdAt\":\"2026-11-27T11:00:00Z\"}],\"reviews\":[]}' ;;\n\
+         *pulls/12/comments*) ;;\n\
+         *collaborators/alice/permission*) echo '{\"permission\":\"write\",\"role_name\":\"write\"}' ;;\n\
+         *collaborators/mallory/permission*) echo '{\"permission\":\"read\",\"role_name\":\"read\"}' ;;\n\
+         *) echo \"gh: unexpected $*\" >&2; exit 1 ;;\n\
+         esac\n",
+    );
+}
+
+fn merge_wait_watch(seen_until: &str) -> factory_server::WatchRequest {
+    factory_server::WatchRequest {
+        job_id: 7,
+        forge: ForgeKind::GitHub,
+        account: AccountSource::fixed(account_with_token("alice-bot", 5, "ghp_requester")),
+        repo: "o/r".into(),
+        base: "main".into(),
+        number: 12,
+        seen_until: Some(seen_until.into()),
+        auto_merge: false,
+        may_merge: false,
+        llm_review: false,
+        review_approved: false,
+        watch: PrWatch::MergeCloseOrComments,
+    }
+}
+
+#[tokio::test]
+async fn only_comments_from_logins_with_write_access_reach_the_agent() {
+    let tools = Tools::new();
+    gh_with_writer_and_reader_comments(&tools);
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+
+    let report = podman
+        .watch(merge_wait_watch("2026-11-27T09:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.event,
+        Some(Event::ReviewComments {
+            comments: "alice:\nrename it".into()
+        })
+    );
+    assert_eq!(report.seen_until.as_deref(), Some("2026-11-27T10:00:00Z"));
+    assert_eq!(
+        report.ignored,
+        vec![factory_server::IgnoredCommenter::NoWrite("mallory".into())]
+    );
+
+    let report = podman
+        .watch(merge_wait_watch("2026-11-27T10:00:00Z"))
+        .await
+        .unwrap();
+    assert_eq!(report.event, None);
+    assert_eq!(report.seen_until, None);
+    assert_eq!(
+        report.ignored,
+        vec![factory_server::IgnoredCommenter::NoWrite("mallory".into())]
+    );
+}
+
+fn gh_for_pr(tools: &Tools, state: &str, mergeable: &str, conclusion: &str) {
+    let calls = tools.dir.path().join("calls");
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        &format!(
+            "#!/bin/bash\necho \"gh $*\" >> '{calls}'\n\
+             case \"$*\" in\n\
+             *\"pr view\"*) echo '{{\"state\":\"{state}\",\"mergeable\":\"{mergeable}\",\"headRefOid\":\"h1\",\"statusCheckRollup\":[{{\"name\":\"t\",\"status\":\"COMPLETED\",\"conclusion\":\"{conclusion}\"}}],\"comments\":[{{\"author\":{{\"login\":\"alice\"}},\"body\":\"rename it\",\"createdAt\":\"2026-11-27T10:00:00Z\"}}],\"reviews\":[]}}' ;;\n\
+             *pulls/12/comments*) ;;\n\
+             *collaborators/alice/permission*) echo '{{\"permission\":\"write\",\"role_name\":\"write\"}}' ;;\n\
+             *) echo \"gh: unexpected $*\" >&2; exit 1 ;;\n\
+             esac\n",
+            calls = calls.display()
+        ),
+    );
+}
+
+#[tokio::test]
+async fn a_writers_comment_reaches_the_agent_while_ci_fails_or_the_pull_request_conflicts() {
+    for (mergeable, conclusion) in [("MERGEABLE", "FAILURE"), ("CONFLICTING", "SUCCESS")] {
+        let tools = Tools::new();
+        gh_for_pr(&tools, "OPEN", mergeable, conclusion);
+        let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+
+        let report = podman
+            .watch(merge_wait_watch("2026-11-27T09:00:00Z"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.event,
+            Some(Event::ReviewComments {
+                comments: "alice:\nrename it".into()
+            }),
+            "{mergeable} {conclusion}"
+        );
+        assert_eq!(report.seen_until.as_deref(), Some("2026-11-27T10:00:00Z"));
+    }
+}
+
+#[tokio::test]
+async fn a_full_watch_reports_a_conflict_or_failed_ci_when_the_permission_lookup_fails() {
+    for (mergeable, conclusion) in [("MERGEABLE", "FAILURE"), ("CONFLICTING", "SUCCESS")] {
+        let tools = Tools::new();
+        gh_for_pr(&tools, "OPEN", mergeable, conclusion);
+        let gh = tools.dir.path().join("gh");
+        let script = std::fs::read_to_string(&gh).unwrap().replace(
+            "*collaborators/alice/permission*) echo",
+            "*collaborators/alice/permission*) echo boom >&2; exit 1; echo",
+        );
+        support::executable(tools.dir.path(), "gh", &script);
+        let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+        let mut request = merge_wait_watch("2026-11-27T09:00:00Z");
+        request.watch = PrWatch::Full;
+        request.may_merge = true;
+
+        let report = podman.watch(request).await.unwrap();
+
+        let expected = if mergeable == "CONFLICTING" {
+            matches!(report.event, Some(Event::Conflicted { .. }))
+        } else {
+            matches!(report.event, Some(Event::CiFailed { .. }))
+        };
+        assert!(expected, "{mergeable} {conclusion}: {:?}", report.event);
+        assert_eq!(report.ignored.len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_merge_or_close_is_reported_without_looking_up_any_commenter() {
+    for (state, event) in [("MERGED", Event::Merged), ("CLOSED", Event::ClosedUnmerged)] {
+        for watch in [PrWatch::MergeOrClose, PrWatch::MergeCloseOrComments] {
+            let tools = Tools::new();
+            gh_for_pr(&tools, state, "MERGEABLE", "SUCCESS");
+            let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+            let mut request = merge_wait_watch("2026-11-27T09:00:00Z");
+            request.watch = watch;
+
+            let report = podman.watch(request).await.unwrap();
+
+            assert_eq!(report.event, Some(event.clone()), "{state} {watch:?}");
+            assert!(!tools.calls().contains("permission"), "{}", tools.calls());
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_stopped_review_watch_does_not_look_up_commenters() {
+    let tools = Tools::new();
+    gh_for_pr(&tools, "OPEN", "MERGEABLE", "SUCCESS");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut request = merge_wait_watch("2026-11-27T09:00:00Z");
+    request.watch = PrWatch::MergeOrClose;
+
+    let report = podman.watch(request).await.unwrap();
+
+    assert_eq!(report.event, None);
+    assert!(!tools.calls().contains("permission"), "{}", tools.calls());
+}
+
 #[tokio::test]
 async fn a_green_pull_request_that_was_retargeted_fails_instead_of_asking_for_the_merge() {
     let tools = picked_tools("main", "");
@@ -2052,7 +2219,7 @@ async fn a_green_pull_request_that_was_retargeted_fails_instead_of_asking_for_th
             may_merge: false,
             llm_review: true,
             review_approved: false,
-            watch_only: false,
+            watch: PrWatch::Full,
         })
         .await
         .unwrap();

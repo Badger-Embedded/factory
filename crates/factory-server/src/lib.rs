@@ -68,11 +68,11 @@ pub use proxy::{
 };
 pub use registry::{AgentEntry, AgentRegistry};
 pub use scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, FINISHED_JOB_DAYS, LocalKeyOwner,
-    LocalRequest, LogSink, McpRuntime, PackagingRequest, PublishRequest, Published, PushLog,
-    RENOVATE_DISCOVERY, ReadyAction, Rebase, RenovateWatchRequest, RerunRequest, Scheduler,
-    SessionSink, SummaryRequest, WatchReport, WatchRequest, branch_name, ready_action,
-    watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, FINISHED_JOB_DAYS,
+    IgnoredCommenter, LocalKeyOwner, LocalRequest, LogSink, McpRuntime, PackagingRequest,
+    PublishRequest, Published, PushLog, RENOVATE_DISCOVERY, ReadyAction, Rebase,
+    RenovateWatchRequest, RerunRequest, Scheduler, SessionSink, SummaryRequest, WatchReport,
+    WatchRequest, branch_name, ready_action, waiting_event,
 };
 pub use secrets::{
     ClaudeToken, CodexAuthError, ForgeTokenOwner, LOCAL_BACKEND, LocalSecrets, MASTER_KEY_LEN,

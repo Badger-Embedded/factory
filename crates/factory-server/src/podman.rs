@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use factory_core::{
-    Agent, Cli, Event, FileText, PackagingContext, PrDiff, RenovateAccess, RenovateCi,
+    Agent, Cli, Event, FileText, PackagingContext, PrDiff, PrWatch, RenovateAccess, RenovateCi,
 };
 use factory_runner::{
     Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LocalTarget, LogLine,
-    NOT_PERMITTED, Observation, PrState, PushError, RebaseCheckbox, Remote, RemoteSource,
+    NOT_PERMITTED, Observation, PrState, PrStatus, PushError, RebaseCheckbox, Remote, RemoteSource,
     RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend_for, observe,
     place_files, place_images, remove_container, run, run_checks, show_files, show_images,
 };
@@ -20,10 +20,10 @@ use crate::forges::Forges;
 use crate::local_server::{LoadError, LocalServerProbe};
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, LocalKeyOwner, LogSink,
-    PackagingRequest, PublishRequest, Published, ReadyAction, Rebase, RenovateWatchRequest,
-    RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest, ready_action,
-    watch_only_event,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, IgnoredCommenter, LocalKeyOwner,
+    LogSink, PackagingRequest, PublishRequest, Published, ReadyAction, Rebase,
+    RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest,
+    ready_action, waiting_event,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -871,7 +871,7 @@ impl Executor for PodmanExecutor {
     async fn watch(&self, request: WatchRequest) -> Result<WatchReport, String> {
         let forge = self.forges.forge(&request.forge);
         let reader = request.account.resolve()?;
-        let status = blame(
+        let mut status = blame(
             &reader.owner,
             forge
                 .status(
@@ -882,18 +882,12 @@ impl Executor for PodmanExecutor {
                 )
                 .await,
         )?;
-        let observation = observe(&status, request.seen_until.as_deref());
-        // The review stopped and waits for the user. Report only a merge or
-        // close by someone else; take no other action and leave the watermark
-        // where it is, so comments posted meanwhile are picked up once the job
-        // goes back to watching normally.
-        if request.watch_only {
-            return Ok(WatchReport {
-                event: watch_only_event(&observation),
-                seen_until: None,
-                merged_by_factory: false,
-            });
+        if request.watch != PrWatch::Full {
+            return waiting_watch(forge.as_ref(), &reader, &request, status).await;
         }
+        let ignored =
+            keep_writers_unless_failing(forge.as_ref(), &reader, &request, &mut status).await?;
+        let observation = observe(&status, request.seen_until.as_deref());
         if matches!(observation, Observation::Ready)
             && !request.may_merge
             && let Some(reason) = self.retarget_reason(&request).await?
@@ -902,6 +896,7 @@ impl Executor for PodmanExecutor {
                 event: Some(Event::FactoryFailed { reason }),
                 seen_until: None,
                 merged_by_factory: false,
+                ignored,
             });
         }
         let mut merged_by_factory = false;
@@ -968,6 +963,7 @@ impl Executor for PodmanExecutor {
             event,
             seen_until,
             merged_by_factory,
+            ignored,
         })
     }
 
@@ -1404,6 +1400,111 @@ fn version_field(line: &str) -> Option<(String, String)> {
     let key = key.trim();
     let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
     (VERSION_KEYS.contains(&key) && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
+}
+
+/// Reports a merge or close before any commenter lookup. Under
+/// [`PrWatch::MergeCloseOrComments`], eligible comments then outrank a
+/// conflict or failed CI.
+async fn waiting_watch(
+    forge: &dyn Forge,
+    reader: &Operation,
+    request: &WatchRequest,
+    mut status: PrStatus,
+) -> Result<WatchReport, String> {
+    let mut ignored = Vec::new();
+    if request.watch == PrWatch::MergeCloseOrComments {
+        ignored = keep_writers(forge, reader, request, &mut status).await?;
+        status.conflicting = false;
+        status.ci = Ci::Pending;
+    }
+    let observation = observe(&status, request.seen_until.as_deref());
+    Ok(waiting_report(request.watch, observation, ignored))
+}
+
+/// The report of a watch while the job waits for the user: only what
+/// [`waiting_event`] allows. It carries the new watermark only when it
+/// delivers comments, so comments the job does not take now are picked up
+/// once it goes back to watching normally.
+fn waiting_report(
+    watch: PrWatch,
+    observation: Observation,
+    ignored: Vec<IgnoredCommenter>,
+) -> WatchReport {
+    let event = waiting_event(watch, &observation);
+    let seen_until = match (&event, observation) {
+        (Some(Event::ReviewComments { .. }), Observation::Comments { seen_until, .. }) => {
+            Some(seen_until)
+        }
+        _ => None,
+    };
+    WatchReport {
+        event,
+        seen_until,
+        merged_by_factory: false,
+        ignored,
+    }
+}
+
+async fn keep_writers_unless_failing(
+    forge: &dyn Forge,
+    reader: &Operation,
+    request: &WatchRequest,
+    status: &mut PrStatus,
+) -> Result<Vec<IgnoredCommenter>, String> {
+    if status.conflicting || matches!(status.ci, Ci::Failed(_)) {
+        return Ok(Vec::new());
+    }
+    keep_writers(forge, reader, request, status).await
+}
+
+/// Drops from `status` the comments of every login that has no write access
+/// to the watched repository, so a passer-by cannot steer the agent, and
+/// returns those logins. A merged or closed pull request has no lookups. Only the authors of comments newer than the
+/// watermark are looked up, on
+/// every watch, so a login whose access was taken away counts at once. A
+/// login whose access the forge will not tell the account counts as one
+/// without write access.
+async fn keep_writers(
+    forge: &dyn Forge,
+    reader: &Operation,
+    request: &WatchRequest,
+    status: &mut PrStatus,
+) -> Result<Vec<IgnoredCommenter>, String> {
+    if status.state != PrState::Open {
+        return Ok(Vec::new());
+    }
+    let seen_until = request.seen_until.as_deref();
+    let mut logins: Vec<&str> = status
+        .comments
+        .iter()
+        .filter(|comment| seen_until.is_none_or(|seen| comment.at.as_str() > seen))
+        .map(|comment| comment.author.as_str())
+        .collect();
+    logins.sort_unstable();
+    logins.dedup();
+    let mut ignored = Vec::new();
+    for login in logins {
+        let access = blame(
+            &reader.owner,
+            forge
+                .user_access(&reader.account, &request.repo, login)
+                .await,
+        )?;
+        match access {
+            Some(Access::Write | Access::Admin) => {}
+            Some(Access::Read | Access::NotVisible) => {
+                ignored.push(IgnoredCommenter::NoWrite(login.to_owned()));
+            }
+            None => ignored.push(IgnoredCommenter::Unknown(login.to_owned())),
+        }
+    }
+    status.comments.retain(|comment| {
+        !ignored.iter().any(|commenter| {
+            let (IgnoredCommenter::NoWrite(login) | IgnoredCommenter::Unknown(login)) = commenter;
+            *login == comment.author
+        })
+    });
+    Ok(ignored)
 }
 
 /// Fails with [`NOT_PERMITTED`] unless the account of `operation` has Write
