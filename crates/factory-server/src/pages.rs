@@ -1100,6 +1100,8 @@ pub enum SettingsPage {
     ProjectGroups,
     /// The login's own Local API key.
     LocalKey,
+    /// The login's own `OpenRouter` API key and CLI.
+    OpenRouterKey,
     /// A forge's page for the login's own token.
     Forge(ForgeKind),
     Workers,
@@ -1181,6 +1183,7 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
             (entry("/settings/notifications".into(), "Notifications", &SettingsPage::Notifications))
             (entry("/settings/groups".into(), "Project groups", &SettingsPage::ProjectGroups))
             (entry("/settings/local".into(), "Local", &SettingsPage::LocalKey))
+            (entry("/settings/openrouter".into(), "OpenRouter", &SettingsPage::OpenRouterKey))
             p.settings-group { "Forges" }
             @for kind in &nav.forges {
                 (entry(
@@ -2249,6 +2252,85 @@ pub fn settings_local_key(
                 }
                 div.danger-zone {
                     button.danger formaction="/settings/local/clear" formnovalidate { "Clear key" }
+                }
+            }
+        },
+    )
+}
+
+/// The login's own `OpenRouter` page: its CLI choice and its API key. The key is
+/// never rendered: the field has no value, an empty save keeps it and Clear
+/// removes it. The page says nothing about the factory key.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per part of the page"
+)]
+pub fn settings_openrouter_key(
+    user: &str,
+    nav: &SettingsNav,
+    cli_choice: Option<factory_core::Cli>,
+    default_cli: factory_core::Cli,
+    key_set: bool,
+    secrets_available: bool,
+    csrf: &str,
+    notice: Option<&str>,
+) -> Markup {
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::OpenRouterKey,
+        "OpenRouter",
+        notice,
+        &html! {
+            h1 { "OpenRouter" }
+            form.card.settings-form method="post" action="/settings/openrouter" {
+                input type="hidden" name="csrf" value=(csrf);
+                h2 { "Your CLI" }
+                p.hint {
+                    "You can save your CLI choice now. OpenRouter jobs are not available yet, so it has no effect until they are. \
+                     A session will keep the CLI it started on."
+                }
+                div.field {
+                    label for="openrouter-cli" { "CLI" }
+                    select #openrouter-cli name="cli" {
+                        option value="default" selected[cli_choice.is_none()] {
+                            "Factory default (" (default_cli.display_name()) ")"
+                        }
+                        @for cli in factory_core::Cli::ALL {
+                            option value=(cli.id()) selected[Some(cli) == cli_choice] { (cli.display_name()) }
+                        }
+                    }
+                }
+                h2 { "Your OpenRouter key" }
+                p.hint {
+                    "You can save your key now. OpenRouter jobs are not available yet, so nothing uses it until they are. \
+                     Once they run, the factory will send it to OpenRouter for jobs you requested. \
+                     The key will reach the worker, and the agent \
+                     that runs there will be able to read it. Stored encrypted and never shown. \
+                     Create one on the "
+                    (external_link("https://openrouter.ai/settings/keys", "OpenRouter keys page", None, None))
+                    "."
+                }
+                @if !secrets_available {
+                    p.hint.bad { "The master key is missing, so a key cannot be saved here. Clear still works." }
+                }
+                div.field {
+                    label for="openrouter-user-key" { "Key" }
+                    input #openrouter-user-key.wide type="password" name="key"
+                        autocomplete="off" spellcheck="false"
+                        placeholder=(if key_set { "set" } else { "not set" })
+                        disabled[!secrets_available];
+                    p.hint {
+                        @if key_set { "A key is stored. " } @else { "No key is stored. " }
+                        "Paste a new one to replace it. An empty field keeps it."
+                    }
+                }
+                div.save-bar {
+                    span.save-bar-note { "No unsaved changes." }
+                    button.primary { "Save" }
+                }
+                div.danger-zone {
+                    button.danger formaction="/settings/openrouter/clear" formnovalidate { "Clear key" }
                 }
             }
         },
