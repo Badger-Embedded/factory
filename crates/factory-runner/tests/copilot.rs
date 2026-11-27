@@ -980,7 +980,10 @@ fn a_local_copilot_run_points_at_the_server_with_no_github_token() {
     ] {
         assert!(env.contains(&expected), "missing {expected} in {env:?}");
     }
-    assert!(!env.contains(&"COPILOT_OFFLINE"));
+    assert!(
+        env.iter()
+            .all(|entry| entry.split('=').next() != Some("COPILOT_OFFLINE"))
+    );
     assert!(args.contains(&"--disable-builtin-mcps".to_owned()));
     assert!(!env.contains(&"COPILOT_GITHUB_TOKEN"));
     assert!(!env.contains(&"COPILOT_PROVIDER_API_KEY"));
