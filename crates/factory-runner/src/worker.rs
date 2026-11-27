@@ -490,7 +490,7 @@ pub async fn run(
                 started();
             }
             for item in parse(&line) {
-                if redactor.leaks(&item) {
+                if redactor.generation_contains_key(&item) {
                     continue;
                 }
                 let item = redactor.item(item);
@@ -569,9 +569,7 @@ impl Redactor {
         }
     }
 
-    /// Whether `item` is a generation id that holds the key, which is dropped
-    /// instead of kept as a lookup id.
-    fn leaks(&self, item: &AgentItem) -> bool {
+    fn generation_contains_key(&self, item: &AgentItem) -> bool {
         let AgentItem::Generation(id) = item else {
             return false;
         };
