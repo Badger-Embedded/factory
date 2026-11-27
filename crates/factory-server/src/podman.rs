@@ -1404,10 +1404,10 @@ fn version_field(line: &str) -> Option<(String, String)> {
 
 /// Reports a merge or close before any commenter lookup. Under
 /// [`PrWatch::MergeCloseOrComments`], eligible comments then outrank a
-/// conflict or failed CI. With no watermark on an open pull request that has
-/// comments, it delivers nothing and looks up no one. It reports the newest
-/// comment time as the watermark, so only comments posted after the wait began
-/// reach the agent.
+/// conflict or failed CI. With no watermark on an open pull request, it
+/// delivers nothing and looks up no one. It reports the newest comment time as
+/// the watermark, or an empty one when there are no comments, so only comments
+/// posted after the wait began reach the agent.
 async fn waiting_watch(
     forge: &dyn Forge,
     reader: &Operation,
@@ -1416,13 +1416,13 @@ async fn waiting_watch(
 ) -> Result<WatchReport, String> {
     let mut ignored = Vec::new();
     if request.watch == PrWatch::MergeCloseOrComments {
-        if request.seen_until.is_none()
-            && status.state == PrState::Open
-            && let Some(newest) = status.comments.iter().map(|c| c.at.as_str()).max()
-        {
+        if request.seen_until.is_none() && status.state == PrState::Open {
+            // An empty baseline sorts before every comment time, so a first
+            // comment after an empty poll is delivered.
+            let newest = status.comments.iter().map(|c| c.at.as_str()).max();
             return Ok(WatchReport {
                 event: None,
-                seen_until: Some(newest.to_owned()),
+                seen_until: Some(newest.unwrap_or_default().to_owned()),
                 merged_by_factory: false,
                 ignored,
             });

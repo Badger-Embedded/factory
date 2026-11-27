@@ -2210,7 +2210,7 @@ async fn a_merge_wait_without_a_watermark_seeds_it_from_the_newest_comment() {
 }
 
 #[tokio::test]
-async fn a_merge_wait_without_a_watermark_or_comments_seeds_nothing() {
+async fn a_merge_wait_without_a_watermark_or_comments_seeds_an_empty_baseline() {
     let tools = Tools::new();
     gh_for_pr(&tools, "OPEN", "MERGEABLE", "SUCCESS");
     let gh = tools.dir.path().join("gh");
@@ -2226,7 +2226,18 @@ async fn a_merge_wait_without_a_watermark_or_comments_seeds_nothing() {
     let report = podman.watch(request).await.unwrap();
 
     assert_eq!(report.event, None);
-    assert_eq!(report.seen_until, None);
+    assert_eq!(report.seen_until.as_deref(), Some(""));
+
+    gh_with_writer_and_reader_comments(&tools);
+    let mut request = merge_wait_watch("");
+    request.seen_until = report.seen_until;
+    let report = podman.watch(request).await.unwrap();
+    assert_eq!(
+        report.event,
+        Some(Event::ReviewComments {
+            comments: "alice:\nrename it".into()
+        })
+    );
 }
 
 #[tokio::test]

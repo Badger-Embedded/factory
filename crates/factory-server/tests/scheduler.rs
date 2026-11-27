@@ -8955,13 +8955,24 @@ fn seed_report(seen_until: &str) -> WatchReport {
 }
 
 #[tokio::test]
-async fn a_merge_wait_seed_keeps_old_comments_out_and_later_ones_in() {
-    let (store, executor, scheduler) =
-        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
+async fn a_first_pass_approval_keeps_old_comments_out_of_the_merge_wait() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewApproved,
+        _ => Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    });
     quick_polls(&store);
-    let id = picked_to_published(&store, &executor, &scheduler).await;
-    green(&executor, Event::MergeLeftToUser);
-    step(&scheduler).await;
+    let mut pick = picked(12);
+    pick.mode = factory_core::PrMode::ReviewAndFix;
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // the first-pass review approves
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::MergeLeftToUser)
+    ));
     assert_eq!(store.pr_watermark(id, 0).unwrap(), None);
 
     executor
