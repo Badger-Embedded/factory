@@ -2357,12 +2357,22 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
     let check = Task::CheckDiff {
         diff: "--- a/.github/workflows/build-wormholes.yml\n\
                +++ b/.github/workflows/build-wormholes.yml\n\
+               @@ -1,12 +1,12 @@\n \
+               name: build-wormholes\n \
+               on: [push, pull_request]\n \
+               jobs:\n \
+               \x20 build:\n \
+               \x20   runs-on: ubuntu-latest\n \
+               \x20   steps:\n\
                -      - uses: actions/checkout@v6\n\
-               +      - uses: actions/checkout@v7\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make build\n\
                -      - uses: actions/checkout@v6\n\
-               +      - uses: actions/checkout@v7\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make test\n\
                -      - uses: actions/checkout@v6\n\
-               +      - uses: actions/checkout@v7"
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make package"
             .into(),
         body: "Update actions/checkout action to v7. v7.0.0 breaking change: fork checkouts \
                are blocked for pull_request_target and workflow_run."
@@ -2380,6 +2390,8 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
             text.matches("+      - uses: actions/checkout@v7").count(),
             3
         );
+        assert!(text.contains("\n on: [push, pull_request]\n"));
+        assert!(!text.contains("+on:") && !text.contains("-on:"));
         assert!(text.contains("build-wormholes.yml"));
         assert!(text.contains("pull_request_target and workflow_run"));
         assert!(text.contains("check the repository for use of"));
