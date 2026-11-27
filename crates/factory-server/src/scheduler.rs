@@ -1042,8 +1042,9 @@ impl<E: Executor> Scheduler<E> {
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
+                    let job = job.clone();
                     self.spawn(row.id, Kind::Worker, async move {
-                        scheduler.agent(&settings, request, skipped).await;
+                        scheduler.agent(&settings, request, skipped, job).await;
                     });
                 }
                 Command::RunChecks { pr } => {
@@ -2319,7 +2320,13 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
-    async fn agent(&self, settings: &Settings, request: AgentRequest, skipped: Vec<SkippedServer>) {
+    async fn agent(
+        &self,
+        settings: &Settings,
+        request: AgentRequest,
+        skipped: Vec<SkippedServer>,
+        dispatched: Job,
+    ) {
         let job_id = request.job_id;
         // The run's proxy token is revoked when this guard drops: at the end of
         // the run, or when a cancel aborts and drops this future.
@@ -2394,7 +2401,6 @@ impl<E: Executor> Scheduler<E> {
         // so a Codex run can look up its price by it afterwards.
         let (model, agent) = (request.model.clone(), request.agent);
         let openrouter_key = openrouter_key_of(&request);
-        let dispatched = self.store.get(job_id).ok().map(|row| row.job);
         let report = self
             .executor
             .run_agent(settings, request, sink, session)
@@ -2591,7 +2597,7 @@ impl<E: Executor> Scheduler<E> {
         model: Option<&str>,
         report: &RunReport,
         openrouter_key: Option<String>,
-        dispatched: Option<Job>,
+        dispatched: Job,
     ) {
         if agent == Agent::Local {
             // A local model has no price. The run adds a row of zero, so the job
@@ -2613,9 +2619,7 @@ impl<E: Executor> Scheduler<E> {
             return;
         }
         if agent == Agent::OpenRouter {
-            if let Some(at) = dispatched {
-                self.record_openrouter_cost(job_id, report, openrouter_key, at);
-            }
+            self.record_openrouter_cost(job_id, report, openrouter_key, dispatched);
             return;
         }
         if agent == Agent::Copilot {

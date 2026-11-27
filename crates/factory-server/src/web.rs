@@ -1385,10 +1385,10 @@ fn keep_session_settings(
 }
 
 fn load_job(state: &AppState, login: &str, id: i64) -> Result<JobData, AppError> {
-    // Read before the log and the cost, so a lookup that ends later has
-    // already written them when this reads no pending lookup.
-    let cost_pending = state.store.cost_lookup_pending(id)?;
     let row = state.store.get(id)?;
+    // Read after the job and before the log and the cost: a lookup begins
+    // before the job ends, and it writes both before it ends.
+    let cost_pending = state.store.cost_lookup_pending(id)?;
     let project = state.projects.lookup(&row.project)?;
     let settings = state.store.settings()?;
     let logs = state.store.logs(id, LOG_LINES)?;

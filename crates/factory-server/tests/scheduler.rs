@@ -10515,13 +10515,6 @@ async fn a_charge_for_a_run_cancelled_before_its_report_stays_on_the_run_step() 
     executor.report_generations(&["gen-1"]);
     let id = store.create("maestro", "alice", "Add a button").unwrap();
     scheduler.tick().await.unwrap();
-    for _ in 0..200 {
-        if store.get(id).unwrap().job.stage() == &Stage::Clarifying {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
     store.apply(id, Event::Cancel).unwrap();
     executor.release(1);
     openrouter_finished(&store, id, 1).await;
