@@ -101,7 +101,7 @@ test('OpenRouter is selectable in every stage, shows its effort levels and needs
   await expect(spec.locator('[data-effort-seg] label')).toHaveText(['low', 'medium', 'high', 'xhigh']);
   await expect(spec.locator('.model-chips .chip')).toHaveCount(0);
   await expect(node(page, 'spec').locator('[data-model-label]')).toHaveText('Model required');
-  await expect(spec.locator('[data-model-hint]')).toContainText('Type an OpenRouter model ID');
+  await expect(spec.locator('[data-model-hint]')).toContainText('No OpenRouter model list is stored. Type a model id.');
 
   await page.getByRole('button', { name: `Save ${project}` }).click();
   await expect(page.getByText('The spec stage runs on OpenRouter, which needs a model ID.')).toBeVisible();

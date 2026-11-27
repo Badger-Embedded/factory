@@ -1204,6 +1204,10 @@ form.card { padding: var(--space-24); margin-bottom: var(--space-24); }
 .pipeline-js .model-chips { display: flex; }
 .chip { border: var(--border-width) solid var(--border); border-radius: var(--radius-pill); background: var(--surface); color: var(--text); padding: 3px var(--space-10); font-size: var(--font-size-sm); }
 .chip:hover { border-color: var(--accent); color: var(--accent); }
+.model-results { list-style: none; margin: var(--space-6) 0 0; padding: 0; border: var(--border-width) solid var(--border); border-radius: var(--radius-md); background: var(--surface); max-height: 16rem; overflow-y: auto; }
+.model-results[hidden] { display: none; }
+.model-results li { padding: var(--space-6) var(--space-10); font-size: var(--font-size-sm); cursor: pointer; }
+.model-results li:hover, .model-results li[aria-selected="true"] { color: var(--accent); text-decoration: underline; }
 .seg { display: inline-flex; border: var(--border-width) solid var(--border); border-radius: var(--radius-md); overflow: hidden; }
 .seg label { display: block; position: relative; margin: 0; font-weight: normal; }
 .seg input { position: absolute; opacity: 0; width: 1px; height: 1px; }
