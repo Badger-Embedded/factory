@@ -555,11 +555,6 @@ fn incomplete_outputs_fail_the_run() {
         (Expect::Spec, json!({"outcome": "spec"})),
         (Expect::Spec, json!({"outcome": "spec", "spec": "  "})),
         (Expect::Spec, json!({"spec": "no outcome"})),
-        (Expect::Commits, json!({"outcome": "commits_ready"})),
-        (
-            Expect::Commits,
-            json!({"outcome": "commits_ready", "pull_request": {"title": "x", "body": " "}}),
-        ),
     ] {
         let event = event_from_result(expect, &result(Some(output.clone())));
         assert!(
@@ -569,6 +564,30 @@ fn incomplete_outputs_fail_the_run() {
     }
     let reason = failure_reason(event_from_result(Expect::Spec, &result(None)));
     assert!(reason.contains("without structured output"), "{reason}");
+}
+
+#[test]
+fn commits_ready_without_a_pull_request_title_and_body_is_accepted() {
+    for expect in [Expect::Commits, Expect::FixCi] {
+        for output in [
+            json!({"outcome": "commits_ready"}),
+            json!({"outcome": "commits_ready", "pull_request": null}),
+            json!({"outcome": "commits_ready", "pull_request": {"title": "", "body": "Why."}}),
+            json!({"outcome": "commits_ready", "pull_request": {"title": "x", "body": " "}}),
+        ] {
+            let expected = Event::Agent(AgentResult::CommitsReady(None));
+            assert_eq!(
+                event_from_result(expect, &result(Some(output.clone()))),
+                expected,
+                "{output}"
+            );
+            assert_eq!(
+                factory_runner::event_from_output(expect, Some(output.clone())),
+                expected,
+                "{output}"
+            );
+        }
+    }
 }
 
 #[test]

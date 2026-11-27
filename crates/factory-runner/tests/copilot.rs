@@ -535,6 +535,25 @@ fn prose_before_a_fenced_outcome_resolves_the_result() {
 }
 
 #[test]
+fn a_final_message_without_a_pull_request_title_and_body_resolves_commits_ready() {
+    for bare in [
+        r#"{"outcome":"commits_ready"}"#,
+        r#"{"outcome":"commits_ready","pull_request":null}"#,
+        r#"{"outcome":"commits_ready","pull_request":{"title":"","body":"Why."}}"#,
+        r#"{"outcome":"commits_ready","pull_request":{"title":"x","body":""}}"#,
+    ] {
+        for text in [bare.to_owned(), format!("```json\n{bare}\n```")] {
+            let result = last_result(&parse(Expect::Commits, &assistant_message(&text)));
+            assert_eq!(
+                result.event,
+                Event::Agent(AgentResult::CommitsReady(None)),
+                "{text}"
+            );
+        }
+    }
+}
+
+#[test]
 fn backticks_in_a_json_string_do_not_end_the_block() {
     let body = "Run:\n```sh\njust lint\n```";
     let json = commits_outcome(body);
