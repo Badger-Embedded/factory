@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let to_watching = [
         to_implementing.clone(),
         vec![
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             Event::ChecksPassed,
             Event::Published { number: 12 },
         ],
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         to_watching.clone(),
         vec![
             Event::Merged,
-            Event::Agent(AgentResult::CommitsReady(ready())),
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
             Event::ChecksPassed,
             Event::Published { number: 13 },
             Event::Merged,

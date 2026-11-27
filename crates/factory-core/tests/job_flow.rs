@@ -56,7 +56,10 @@ fn implementing(titles: &[&str]) -> Job {
 /// A job whose first pull request is open as #`number` and being watched.
 fn watching(number: u64) -> Job {
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number });
     job
@@ -68,7 +71,7 @@ fn watching(number: u64) -> Job {
 fn fail_ci_until_out_of_rounds(job: &mut Job, number: u64) {
     for _ in 1..MAX_FAILED_ROUNDS {
         apply(job, Event::CiFailed { log: "fail".into() });
-        apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(job, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
         apply(job, Event::ChecksPassed);
         apply(job, Event::Published { number });
     }
@@ -115,7 +118,10 @@ fn request_ends_merged_after_every_planned_pull_request_merges() {
                 pr: plan[index].clone(),
             },
         );
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         assert_eq!(job.plan()[index].description, Some(ready()));
         assert_eq!(job.next_command(), Some(Command::RunChecks { pr: index }));
         apply(&mut job, Event::ChecksPassed);
@@ -260,7 +266,10 @@ fn an_empty_plan_is_rejected() {
 #[test]
 fn failed_checks_go_back_to_the_agent_and_rerun() {
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(
         &mut job,
         Event::ChecksFailed {
@@ -274,7 +283,10 @@ fn failed_checks_go_back_to_the_agent_and_rerun() {
             report: "clippy: unused variable".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     assert_eq!(job.next_command(), Some(Command::RunChecks { pr: 0 }));
 }
 
@@ -295,7 +307,10 @@ fn ci_failures_and_review_comments_are_fixed_and_pushed_to_the_same_pull_request
             log: "test failed".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
     apply(&mut job, Event::Published { number: 7 });
@@ -313,7 +328,10 @@ fn ci_failures_and_review_comments_are_fixed_and_pushed_to_the_same_pull_request
             comments: "rename this".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
 }
 
@@ -327,7 +345,10 @@ fn too_many_failed_rounds_fail_the_job() {
                 log: format!("round {round}"),
             },
         );
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(&mut job, Event::ChecksPassed);
         apply(&mut job, Event::Published { number: 7 });
     }
@@ -346,7 +367,10 @@ fn too_many_failed_rounds_fail_the_job() {
 fn failed_rounds_start_over_for_the_next_pull_request() {
     let mut job = implementing(&["first", "second"]);
     for _ in 1..MAX_FAILED_ROUNDS {
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(
             &mut job,
             Event::ChecksFailed {
@@ -354,12 +378,18 @@ fn failed_rounds_start_over_for_the_next_pull_request() {
             },
         );
     }
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 1 });
     apply(&mut job, Event::Merged);
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(
         &mut job,
         Event::ChecksFailed {
@@ -372,7 +402,10 @@ fn failed_rounds_start_over_for_the_next_pull_request() {
 #[test]
 fn a_duplicate_event_is_rejected_and_leaves_the_job_unchanged() {
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     let before = job.clone();
 
@@ -386,7 +419,10 @@ fn a_duplicate_event_is_rejected_and_leaves_the_job_unchanged() {
 #[test]
 fn merge_is_rejected_before_the_pull_request_exists() {
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     assert!(job.apply(Event::Merged).is_err());
     apply(&mut job, Event::ChecksPassed);
     assert!(job.apply(Event::Merged).is_err());
@@ -395,12 +431,18 @@ fn merge_is_rejected_before_the_pull_request_exists() {
 #[test]
 fn a_pull_request_with_nothing_to_publish_is_skipped() {
     let mut job = implementing(&["first", "second", "third"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     apply(&mut job, Event::Merged);
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.next_command(), Some(Command::Publish { pr: 1 }));
     apply(&mut job, Event::NothingToPublish);
@@ -419,7 +461,10 @@ fn a_pull_request_with_nothing_to_publish_is_skipped() {
 #[test]
 fn skipping_the_last_pull_request_finishes_the_job() {
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::NothingToPublish);
     assert!(job.is_skipped(0));
@@ -436,7 +481,10 @@ fn nothing_to_publish_on_an_open_pull_request_fails_the_job() {
             comments: "nit".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.stage(), &Stage::PrOpen { pr: 0 });
 
@@ -452,7 +500,10 @@ fn nothing_to_publish_on_an_open_pull_request_fails_the_job() {
 #[test]
 fn nothing_to_publish_outside_pr_open_is_rejected() {
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     let before = job.clone();
     assert!(job.apply(Event::NothingToPublish).is_err());
     assert_eq!(job, before);
@@ -461,7 +512,10 @@ fn nothing_to_publish_outside_pr_open_is_rejected() {
 #[test]
 fn merging_while_the_agent_fixes_review_comments_moves_on() {
     let mut job = implementing(&["first", "second"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 3 });
     apply(
@@ -538,12 +592,18 @@ fn a_factory_failure_keeps_the_failed_rounds_already_counted() {
     let mut job = watching(7);
     for _ in 2..MAX_FAILED_ROUNDS {
         apply(&mut job, Event::CiFailed { log: "fail".into() });
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(&mut job, Event::ChecksPassed);
         apply(&mut job, Event::Published { number: 7 });
     }
     apply(&mut job, Event::CiFailed { log: "fail".into() });
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     fail_factory_step(&mut job);
@@ -675,7 +735,10 @@ fn a_conflict_sends_the_agent_to_rebase_and_counts_as_a_failed_round() {
             base: "main".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     assert_eq!(job.next_command(), Some(Command::RunChecks { pr: 0 }));
 
     let mut job = watching(7);
@@ -686,7 +749,10 @@ fn a_conflict_sends_the_agent_to_rebase_and_counts_as_a_failed_round() {
                 base: "main".into(),
             },
         );
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(&mut job, Event::ChecksPassed);
         apply(&mut job, Event::Published { number: 7 });
     }
@@ -812,7 +878,10 @@ fn a_job_with_every_gate_off_runs_to_merged_without_approval() {
         &mut job,
         Event::Agent(AgentResult::Plan(vec![planned("only")])),
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 3 });
     apply(&mut job, Event::Merged);
@@ -870,7 +939,10 @@ fn at_publish_gate(titles: &[&str]) -> Job {
     apply(&mut job, Event::Agent(AgentResult::Spec("spec".into())));
     let plan = titles.iter().map(|t| planned(t)).collect();
     apply(&mut job, Event::Agent(AgentResult::Plan(plan)));
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     job
 }
@@ -910,7 +982,10 @@ fn publish_gate_off_pushes_right_after_the_checks() {
         &mut job,
         Event::Agent(AgentResult::Plan(vec![planned("only")])),
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
 }
@@ -933,7 +1008,10 @@ fn requested_changes_revise_the_session_and_return_to_the_gate() {
         },
     );
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     assert_eq!(job.next_command(), Some(Command::RunChecks { pr: 0 }));
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(
@@ -954,7 +1032,10 @@ fn revisions_at_the_publish_gate_do_not_count_as_failed_rounds() {
                 feedback: "again".into(),
             },
         );
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(&mut job, Event::ChecksPassed);
     }
     assert_eq!(
@@ -975,7 +1056,10 @@ fn only_the_first_publish_of_a_pull_request_is_gated() {
             comments: "rename it".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.stage(), &Stage::PrOpen { pr: 0 });
     assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
@@ -989,7 +1073,10 @@ fn each_pull_request_of_a_plan_stops_at_the_gate() {
     apply(&mut job, Event::Published { number: 41 });
     apply(&mut job, Event::Merged);
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.stage(), &Stage::Verifying { pr: 1 });
     assert_eq!(job.next_command(), Some(Command::Summarize { pr: 1 }));
@@ -1007,7 +1094,10 @@ fn the_gate_takes_no_approval_before_checks_pass_and_no_summary_after() {
         Event::Agent(AgentResult::Plan(vec![planned("only")])),
     );
     assert!(job.apply(Event::Approve).is_err());
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     assert!(job.apply(Event::Summarized(summary())).is_err());
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Summarized(summary()));
@@ -1173,7 +1263,10 @@ fn the_fifth_failed_round_fails_the_job_when_it_is_a_rerun() {
             base: "main".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     apply(
@@ -1232,7 +1325,10 @@ fn a_retry_resumes_a_job_that_ran_out_of_ci_rounds() {
 fn a_retry_resumes_a_job_that_ran_out_of_check_rounds() {
     let mut job = implementing(&["only"]);
     for _ in 0..MAX_FAILED_ROUNDS {
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(
             &mut job,
             Event::ChecksFailed {
@@ -1308,7 +1404,10 @@ fn a_retried_agent_run_keeps_the_failed_rounds() {
     let mut job = watching(7);
     for _ in 1..MAX_FAILED_ROUNDS - 1 {
         apply(&mut job, Event::CiFailed { log: "fail".into() });
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(&mut job, Event::ChecksPassed);
         apply(&mut job, Event::Published { number: 7 });
     }
@@ -1333,7 +1432,10 @@ fn a_retried_agent_run_keeps_the_failed_rounds() {
             base: "main".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     apply(
@@ -1523,11 +1625,17 @@ fn without_retry_target(job: &Job) -> Job {
 #[test]
 fn a_legacy_failed_job_retries_at_its_highest_numbered_pull_request() {
     let mut job = implementing(&["first", "second"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 10 });
     apply(&mut job, Event::Merged);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 11 });
     fail_ci_until_out_of_rounds(&mut job, 11);
@@ -1584,7 +1692,10 @@ fn a_legacy_agent_failure_mid_rebase_retries_at_its_pull_request() {
 #[test]
 fn a_legacy_agent_failure_on_an_unopened_pull_request_moves_past_the_merged_one() {
     let mut job = implementing(&["first", "second"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 74 });
     apply(&mut job, Event::Merged);
@@ -1633,7 +1744,10 @@ fn a_legacy_failure_with_another_reason_is_not_retryable() {
 fn a_legacy_failed_job_with_no_pull_request_number_is_not_retryable() {
     let mut job = implementing(&["only"]);
     for _ in 0..MAX_FAILED_ROUNDS {
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(
             &mut job,
             Event::ChecksFailed {
@@ -1660,7 +1774,7 @@ fn review_changes_round(job: &mut Job, number: u64) {
             feedback: "tighten the error path".into(),
         },
     );
-    apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(job, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     apply(job, Event::ChecksPassed);
     apply(job, Event::Published { number });
 }
@@ -1668,7 +1782,7 @@ fn review_changes_round(job: &mut Job, number: u64) {
 /// Runs one failed-CI round on the watched pull request `number`.
 fn ci_fail_round(job: &mut Job, number: u64) {
     apply(job, Event::CiFailed { log: "fail".into() });
-    apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(job, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     apply(job, Event::ChecksPassed);
     apply(job, Event::Published { number });
 }
@@ -1739,7 +1853,10 @@ fn requested_changes_go_to_the_implement_session_and_re_review_after_the_push() 
         }]
     );
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     assert_eq!(job.review_state(), ReviewState::Pending);
@@ -1839,7 +1956,7 @@ fn changes_without_a_commit(job: &mut Job, head: &str) {
             feedback: "read the old variable as a fallback".into(),
         },
     );
-    apply(job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(job, Event::Agent(AgentResult::CommitsReady(Some(ready()))));
     apply(job, Event::ChecksPassed);
     apply(job, Event::Published { number: 7 });
 }
@@ -1905,7 +2022,10 @@ fn the_reviewer_reruns_on_the_same_head_after_a_new_answer() {
         }])),
     );
     apply(&mut job, Event::Answer(vec!["yes".into()]));
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
 
@@ -1960,7 +2080,10 @@ fn a_reviewer_failure_stops_the_job_without_merging() {
 #[test]
 fn a_stopped_review_watches_until_the_next_pull_request() {
     let mut job = implementing(&["first", "second"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 11 });
     apply(&mut job, start_review());
@@ -2076,7 +2199,10 @@ fn a_retry_at_the_review_cap_addresses_the_last_feedback_with_fresh_rounds() {
     // The review rounds are cleared, so the pull request gets five fresh ones.
     assert_eq!(review_rounds(&job), 0);
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     for _ in 1..MAX_REVIEW_ROUNDS {
@@ -2098,7 +2224,10 @@ fn a_stopped_review_with_no_pull_request_number_cannot_retry() {
     // Reach ci-and-review without the pull request ever being opened, then
     // stop the review. The watch and the retry both need a number.
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     apply(&mut job, start_review());
@@ -2216,7 +2345,10 @@ fn the_review_cap_and_the_failed_round_cap_are_independent() {
 #[test]
 fn the_review_cap_starts_over_for_the_next_pull_request() {
     let mut job = implementing(&["first", "second"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 1 });
     for _ in 1..MAX_REVIEW_ROUNDS {
@@ -2226,7 +2358,10 @@ fn the_review_cap_starts_over_for_the_next_pull_request() {
     assert_eq!(job.stage(), &Stage::Implementing { pr: 1 });
 
     // The second pull request gets its own five review rounds.
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 2 });
     for _ in 1..MAX_REVIEW_ROUNDS {
@@ -3631,7 +3766,10 @@ fn a_renovate_job_stored_before_fix_jobs_loads_with_no_fix() {
 
 fn verifying() -> Job {
     let mut job = implementing(&["only"]);
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     job
 }
 
@@ -3674,12 +3812,18 @@ fn checks_errors_that_are_not_in_a_row_do_not_add_up() {
             report: "lint".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 7 });
     apply(&mut job, Event::CiFailed { log: "x".into() });
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
     assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
 }
@@ -3694,7 +3838,10 @@ fn checks_errors_and_failed_rounds_are_counted_apart() {
                 report: "lint".into(),
             },
         );
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
     }
     checks_error(&mut job, MAX_FAILED_ROUNDS - 1);
     assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
@@ -3720,7 +3867,10 @@ fn checks_errors_leave_the_failed_rounds_alone() {
                 report: "lint".into(),
             },
         );
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
     }
     assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
 }
@@ -3750,7 +3900,10 @@ fn too_many_failed_check_rounds_are_not_a_checks_that_could_not_run_failure() {
                 report: "lint".into(),
             },
         );
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
     }
     apply(
         &mut job,
@@ -3807,7 +3960,10 @@ fn picked_committed(gates: Gates) -> Job {
     if gates.plan {
         apply(&mut job, Event::Approve);
     }
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     job
 }
 
@@ -3881,7 +4037,10 @@ fn the_publish_gate_stops_the_first_push_to_a_picked_pull_request() {
     apply(&mut job, Event::Published { number: 42 });
 
     apply(&mut job, Event::CiFailed { log: "fail".into() });
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
 }
@@ -3890,7 +4049,10 @@ fn the_publish_gate_stops_the_first_push_to_a_picked_pull_request() {
 fn a_moved_head_reruns_the_checks_or_asks_the_agent_to_merge() {
     let mut clean = picked_watching();
     apply(&mut clean, Event::CiFailed { log: "fail".into() });
-    apply(&mut clean, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut clean,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut clean, Event::ChecksPassed);
     apply(&mut clean, Event::HeadMoved { conflicted: false });
     assert_eq!(clean.next_command(), Some(Command::RunChecks { pr: 0 }));
@@ -3914,7 +4076,10 @@ fn the_review_cap_still_applies_after_a_merge_head_turn() {
             feedback: "tighten".into(),
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::HeadMoved { conflicted: true });
     assert_eq!(job.turn(), &Turn::Agent(Task::MergeHead));
@@ -3925,7 +4090,10 @@ fn the_review_cap_still_applies_after_a_merge_head_turn() {
         }])),
     );
     apply(&mut job, Event::Answer(vec!["theirs".into()]));
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 42 });
 
@@ -4214,7 +4382,10 @@ fn fixing_here_sends_the_review_and_instructions_then_runs_the_loop() {
         })
     );
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
     apply(&mut job, Event::Published { number: 42 });
@@ -4245,7 +4416,10 @@ fn the_publish_gate_stops_the_first_push_of_a_fix() {
             held: false,
         },
     );
-    apply(&mut gated, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut gated,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut gated, Event::ChecksPassed);
     assert_eq!(
         gated.turn(),
@@ -4265,7 +4439,10 @@ fn the_review_loop_after_a_quick_review_stops_at_the_round_cap() {
         },
     );
     for round in 0..MAX_REVIEW_ROUNDS {
-        apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+        apply(
+            &mut job,
+            Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+        );
         apply(&mut job, Event::ChecksPassed);
         apply(&mut job, Event::Published { number: 42 });
         apply(
@@ -4312,7 +4489,10 @@ fn fixing_elsewhere_opens_a_new_pull_request_and_never_merges_it() {
     assert_eq!(job.stacked_on().map(|picked| picked.number), Some(42));
     assert_eq!(job.reviewed_head(), Some("abc123"));
 
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     assert_eq!(job.next_command(), Some(Command::Publish { pr: 0 }));
     apply(&mut job, Event::Published { number: 77 });
@@ -4332,7 +4512,10 @@ fn closing_the_stacked_pull_request_fails_the_job() {
     let mut job = quick(false);
     quick_reviewed(&mut job);
     apply(&mut job, fix_elsewhere(""));
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 77 });
     apply(&mut job, Event::ClosedUnmerged);
@@ -4367,7 +4550,10 @@ fn the_publish_gate_stops_the_first_push_of_a_stacked_pull_request() {
     apply(&mut gated, Event::Start);
     quick_reviewed(&mut gated);
     apply(&mut gated, fix_elsewhere(""));
-    apply(&mut gated, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut gated,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut gated, Event::ChecksPassed);
     assert_eq!(
         gated.turn(),
@@ -4380,7 +4566,10 @@ fn a_stacked_branch_with_no_commits_fails_the_job() {
     let mut job = quick(false);
     quick_reviewed(&mut job);
     apply(&mut job, fix_elsewhere(""));
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::NothingToPublish);
     assert!(matches!(job.stage(), Stage::Failed { .. }));
@@ -4450,7 +4639,10 @@ fn a_failed_quick_review_retries_the_quick_review_and_a_failed_loop_pass_the_loo
             held: false,
         },
     );
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 42 });
     apply(&mut job, Event::StartReview { head: "abc".into() });
@@ -4485,7 +4677,7 @@ fn a_commit_result_cannot_move_a_reviewer_onto_the_publish_path() {
         let mut job = review_job(mode, false);
         let before = job.clone();
         assert!(
-            job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+            job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
                 .is_err()
         );
         assert_eq!(job, before);
@@ -4566,7 +4758,10 @@ fn an_unchanged_head_after_the_first_pass_stops_instead_of_reviewing_again() {
         },
     );
     assert_eq!(job.reviews()[0].head.as_deref(), Some("abc"));
-    apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
+    );
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 42 });
     apply(&mut job, Event::StartReview { head: "abc".into() });
@@ -4577,4 +4772,92 @@ fn an_unchanged_head_after_the_first_pass_stops_instead_of_reviewing_again() {
             ..
         })
     ));
+}
+
+fn assert_fails_without_description(job: &Job) {
+    let Stage::Failed { reason, retry, .. } = job.stage() else {
+        panic!("expected a failed job, got {:?}", job.stage());
+    };
+    assert!(reason.contains("title and description"), "{reason}");
+    assert!(matches!(retry, Some(RetryTarget::Agent { .. })));
+}
+
+#[test]
+fn a_picked_job_accepts_commits_ready_without_a_description() {
+    let mut job = review_job(PrMode::ReviewAndFix, false);
+    apply(
+        &mut job,
+        Event::ReviewChanges {
+            feedback: "rename it".into(),
+        },
+    );
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(None)));
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+    assert_eq!(job.plan()[0].description, None);
+}
+
+#[test]
+fn a_later_run_without_a_description_keeps_the_earlier_one() {
+    let mut job = watching(7);
+    apply(&mut job, Event::CiFailed { log: "fail".into() });
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(None)));
+    assert_eq!(job.stage(), &Stage::Verifying { pr: 0 });
+    assert_eq!(job.plan()[0].description, Some(ready()));
+
+    let other = PrDescription {
+        title: "other".into(),
+        body: "other body".into(),
+    };
+    apply(&mut job, Event::ChecksPassed);
+    apply(&mut job, Event::Published { number: 7 });
+    apply(&mut job, Event::CiFailed { log: "fail".into() });
+    apply(
+        &mut job,
+        Event::Agent(AgentResult::CommitsReady(Some(other.clone()))),
+    );
+    assert_eq!(job.plan()[0].description, Some(other));
+}
+
+#[test]
+fn a_first_implement_run_without_a_description_fails_with_retry() {
+    let mut job = implementing(&["only"]);
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(None)));
+    assert_fails_without_description(&job);
+}
+
+#[test]
+fn a_stacked_fix_without_a_description_fails_with_retry() {
+    let mut job = quick(false);
+    quick_reviewed(&mut job);
+    apply(&mut job, fix_elsewhere(""));
+    apply(&mut job, Event::Agent(AgentResult::CommitsReady(None)));
+    assert_fails_without_description(&job);
+}
+
+#[test]
+fn a_review_run_never_accepts_commits_ready() {
+    let mut job = quick(false);
+    let before = job.clone();
+    assert!(
+        job.apply(Event::Agent(AgentResult::CommitsReady(None)))
+            .is_err()
+    );
+    assert!(
+        job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
+            .is_err()
+    );
+    assert_eq!(job, before);
+}
+
+#[test]
+fn a_stored_commits_ready_event_with_a_description_still_loads() {
+    let event: Event =
+        serde_json::from_str(r#"{"Agent":{"CommitsReady":{"title":"t","body":"b"}}}"#).unwrap();
+    assert_eq!(
+        event,
+        Event::Agent(AgentResult::CommitsReady(Some(PrDescription {
+            title: "t".into(),
+            body: "b".into(),
+        })))
+    );
 }

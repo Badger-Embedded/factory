@@ -528,7 +528,7 @@ fn structured_outputs_become_agent_results() {
                 "title": "maestrod: add a reboot endpoint",
                 "body": "## Why\n\nThe device page needs it."
             }}),
-            AgentResult::CommitsReady(ready()),
+            AgentResult::CommitsReady(Some(ready())),
         ),
     ];
     for (expect, output, want) in cases {
@@ -1511,7 +1511,7 @@ fn the_plan_prompt_holds_the_spec_text() {
 fn the_implement_prompt_holds_the_spec_and_its_planned_pull_request() {
     let mut job = approved_job(Job::new("Add a reboot button", Gates::default()));
     job.apply(Event::Approve).unwrap();
-    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+    job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
         .unwrap();
     let first = run_prompt_for_pr(&job, 0);
     assert!(first.contains("Add a reboot button"));
@@ -1637,7 +1637,7 @@ fn watching(number: u64) -> Job {
     let mut job = approved_job(Job::new("Add a reboot button", Gates::default()));
     for event in [
         Event::Approve,
-        Event::Agent(AgentResult::CommitsReady(ready())),
+        Event::Agent(AgentResult::CommitsReady(Some(ready()))),
         Event::ChecksPassed,
         Event::Published { number },
     ] {
@@ -2038,7 +2038,7 @@ fn changes_then_fix(job: &mut Job, feedback: &str) {
         feedback: feedback.into(),
     })
     .unwrap();
-    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+    job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
         .unwrap();
     job.apply(Event::ChecksPassed).unwrap();
     job.apply(Event::Published { number: 7 }).unwrap();
@@ -2074,7 +2074,7 @@ fn a_later_review_pass_carries_the_answers_given_since_the_last_pass() {
     .unwrap();
     job.apply(Event::Answer(vec!["yes, keep the spec".into()]))
         .unwrap();
-    job.apply(Event::Agent(AgentResult::CommitsReady(ready())))
+    job.apply(Event::Agent(AgentResult::CommitsReady(Some(ready()))))
         .unwrap();
     job.apply(Event::ChecksPassed).unwrap();
     job.apply(Event::Published { number: 7 }).unwrap();
