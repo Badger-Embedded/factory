@@ -6,7 +6,7 @@ mod harness;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use factory_core::Cli;
+use factory_core::{Agent, Cli};
 use harness::{Harness, Reply, harness, harness_unavailable};
 
 const PAGE: &str = "/settings/local";
@@ -72,7 +72,7 @@ async fn a_login_who_is_not_an_admin_sees_the_server_as_text() {
     assert_eq!(none.status, StatusCode::OK);
     assert!(none.body.contains("no local server is set"));
     assert!(none.body.contains(r#"href="/settings/local""#));
-    assert!(none.body.contains("Local API key"));
+    assert!(none.body.contains("<h1>Local</h1>"));
     assert!(none.body.contains("the agent that runs there can read it"));
 
     harness
@@ -82,9 +82,8 @@ async fn a_login_who_is_not_an_admin_sees_the_server_as_text() {
     harness.secrets.set_local_key(FACTORY_KEY).unwrap();
     let page = as_login(&harness, BOB, None).await;
     assert!(page.body.contains("http://gfx1201:9931"));
-    assert!(page.body.contains("Claude Code"));
+    assert!(page.body.contains("Factory default (Claude Code)"));
     assert!(!page.body.contains(r#"name="url""#));
-    assert!(!page.body.contains(r#"name="cli""#));
     assert!(!page.body.contains(FACTORY_KEY));
     assert!(!page.body.to_lowercase().contains("factory key"));
     assert!(!page.body.to_lowercase().contains("factory's"));
@@ -130,6 +129,55 @@ async fn the_key_is_write_only_kept_by_an_empty_save_and_cleared() {
     let cleared = clear(&harness, BOB).await;
     assert!(cleared.body.contains(r#"placeholder="not set""#));
     assert!(harness.secrets.user_local_key(BOB).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_login_picks_its_cli_without_a_master_key_and_only_for_itself() {
+    let harness = harness_unavailable();
+    let token = csrf(&as_login(&harness, BOB, None).await.body);
+    let picked = as_login(
+        &harness,
+        BOB,
+        Some((PAGE, &format!("csrf={token}&server=&key=&cli=claude"))),
+    )
+    .await;
+    assert!(picked.body.contains("Saved."));
+    assert_eq!(
+        harness.store.user_cli(BOB, Agent::Local).unwrap(),
+        Some(Cli::ClaudeCode)
+    );
+    assert!(picked.body.contains(r#"value="claude" selected"#));
+    assert_eq!(
+        harness
+            .store
+            .user_cli("carol@example.com", Agent::Local)
+            .unwrap(),
+        None
+    );
+
+    let key_only = save(&harness, BOB, "").await;
+    assert!(key_only.body.contains("Saved."));
+    assert_eq!(
+        harness.store.user_cli(BOB, Agent::Local).unwrap(),
+        Some(Cli::ClaudeCode)
+    );
+
+    let reset = as_login(
+        &harness,
+        BOB,
+        Some((PAGE, &format!("csrf={token}&server=&key=&cli=default"))),
+    )
+    .await;
+    assert!(reset.body.contains("Saved."));
+    assert_eq!(harness.store.user_cli(BOB, Agent::Local).unwrap(), None);
+
+    let bad = as_login(
+        &harness,
+        BOB,
+        Some((PAGE, &format!("csrf={token}&server=&key=&cli=nope"))),
+    )
+    .await;
+    assert!(bad.body.contains("Unknown CLI."));
 }
 
 #[tokio::test]

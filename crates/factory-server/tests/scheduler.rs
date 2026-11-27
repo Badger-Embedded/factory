@@ -8561,8 +8561,65 @@ async fn a_local_session_resumes_on_its_cli_and_a_new_one_uses_the_setting() {
     assert_eq!(
         notes,
         ["This session started on Codex, so it stays on Codex. \
-             The Local settings name Copilot now, which new sessions use."]
+             The requester's choice is Copilot now, which new sessions use."]
     );
+}
+
+#[tokio::test]
+async fn a_local_run_uses_the_cli_the_requester_chose() {
+    use factory_core::Cli::{ClaudeCode, Codex};
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .set_user_cli("alice", Agent::Local, Some(factory_core::Cli::ClaudeCode))
+        .unwrap();
+    executor.release(6);
+    let alice = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    store.create("maestro", "bob", "Another button").unwrap();
+    step(&scheduler).await;
+    store
+        .set_user_cli("factory", Agent::Local, Some(factory_core::Cli::Copilot))
+        .unwrap();
+    store
+        .create("maestro", "factory", "A third button")
+        .unwrap();
+    step(&scheduler).await;
+    store
+        .apply(alice, Event::Answer(vec!["rpi5".into()]))
+        .unwrap();
+    step(&scheduler).await;
+
+    let clis: Vec<_> = executor
+        .requests()
+        .iter()
+        .filter(|request| request.agent == Agent::Local)
+        .map(|request| local_of(request).target.cli)
+        .collect();
+    assert_eq!(clis, [ClaudeCode, Codex, Codex, ClaudeCode]);
+}
+
+#[tokio::test]
+async fn a_retry_keeps_the_requesters_cli_whatever_another_login_chose() {
+    let (store, executor, scheduler, _) = setup_local(|_| questions());
+    store
+        .set_user_cli("alice", Agent::Local, Some(factory_core::Cli::ClaudeCode))
+        .unwrap();
+    store
+        .set_user_cli("bob", Agent::Local, Some(factory_core::Cli::Copilot))
+        .unwrap();
+    *executor.prestart_failures.lock().unwrap() = 1;
+    executor.release(2);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let clis: Vec<_> = executor
+        .requests()
+        .iter()
+        .map(|request| local_of(request).target.cli)
+        .collect();
+    assert_eq!(clis, [factory_core::Cli::ClaudeCode; 2]);
 }
 
 #[tokio::test]

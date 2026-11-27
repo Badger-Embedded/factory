@@ -1180,7 +1180,7 @@ fn settings_sidebar(nav: &SettingsNav, current: &SettingsPage) -> Markup {
             p.settings-group { "You" }
             (entry("/settings/notifications".into(), "Notifications", &SettingsPage::Notifications))
             (entry("/settings/groups".into(), "Project groups", &SettingsPage::ProjectGroups))
-            (entry("/settings/local".into(), "Local API key", &SettingsPage::LocalKey))
+            (entry("/settings/local".into(), "Local", &SettingsPage::LocalKey))
             p.settings-group { "Forges" }
             @for kind in &nav.forges {
                 (entry(
@@ -1537,7 +1537,7 @@ pub fn settings_local_agent(
             h1 { "Local" }
             p.meta {
                 "Runs a stage on a model served by an OpenAI-compatible server, such as a llama.cpp \
-                 server. One CLI drives every Local run. A change applies from the next run."
+                 server. The CLI below is the factory default. A login can pick its own on its Local page, and a job runs on the CLI of the login that requested it. A change applies from the next run."
             }
             form.card.settings-form method="post" action="/settings/agents/local" {
                 input type="hidden" name="csrf" value=(csrf);
@@ -1570,7 +1570,7 @@ pub fn settings_local_agent(
                             option value=(cli.id()) selected[cli == view.cli] { (cli.display_name()) }
                         }
                     }
-                    p.hint { "The CLI that drives the model in the worker. A session keeps the CLI it started on." }
+                    p.hint { "The factory default CLI. A session keeps the CLI it started on." }
                 }
                 div.field {
                     label for="local-timeout" { "Model load timeout (minutes)" }
@@ -2090,14 +2090,20 @@ pub fn settings_forge(
     )
 }
 
-/// The login's own Local API key page. The server URL and the CLI show as
-/// text, so the login knows which server the key is for. The key is never
-/// rendered: the field has no value, an empty save keeps it and Clear removes
-/// it. The page says nothing about the factory key.
+/// The login's own Local page: its CLI choice and its API key. The server URL
+/// shows as text, so the login knows which server the key is for. The key is
+/// never rendered: the field has no value, an empty save keeps it and Clear
+/// removes it. The page says nothing about the factory key.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per part of the page"
+)]
 pub fn settings_local_key(
     user: &str,
     nav: &SettingsNav,
-    server: Option<(&str, factory_core::Cli)>,
+    server: Option<&str>,
+    cli_choice: Option<factory_core::Cli>,
+    default_cli: factory_core::Cli,
     key_set: bool,
     secrets_available: bool,
     csrf: &str,
@@ -2107,22 +2113,36 @@ pub fn settings_local_key(
         user,
         nav,
         &SettingsPage::LocalKey,
-        "Local API key",
+        "Local",
         notice,
         &html! {
-            h1 { "Local API key" }
+            h1 { "Local" }
             form.card.settings-form method="post" action="/settings/local" {
                 input type="hidden" name="csrf" value=(csrf);
-                input type="hidden" name="server" value=(server.map_or("", |(url, _)| url));
+                input type="hidden" name="server" value=(server.unwrap_or(""));
+                h2 { "Your CLI" }
+                p.hint {
+                    "The CLI your Local jobs run on. A session keeps the CLI it started on."
+                }
+                div.field {
+                    label for="local-cli" { "CLI" }
+                    select #local-cli name="cli" {
+                        option value="default" selected[cli_choice.is_none()] {
+                            "Factory default (" (default_cli.display_name()) ")"
+                        }
+                        @for cli in factory_core::Cli::ALL {
+                            option value=(cli.id()) selected[Some(cli) == cli_choice] { (cli.display_name()) }
+                        }
+                    }
+                }
                 h2 { "Your key for the local server" }
                 p.hint {
                     "The factory sends this key to the local server for jobs you requested. \
                      The key reaches the worker, and the agent \
                      that runs there can read it. Stored encrypted and never shown."
                 }
-                @if let Some((url, cli)) = server {
+                @if let Some(url) = server {
                     p #local-server { "Server: " code { (url) } }
-                    p #local-cli { "CLI: " (cli.display_name()) }
                 } @else {
                     p #local-server { "no local server is set" }
                 }
@@ -2142,7 +2162,7 @@ pub fn settings_local_key(
                 }
                 div.save-bar {
                     span.save-bar-note { "No unsaved changes." }
-                    button.primary disabled[!secrets_available] { "Save key" }
+                    button.primary { "Save" }
                 }
                 div.danger-zone {
                     button.danger formaction="/settings/local/clear" formnovalidate { "Clear key" }

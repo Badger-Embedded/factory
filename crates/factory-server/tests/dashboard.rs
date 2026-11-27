@@ -2830,6 +2830,29 @@ async fn a_stopped_review_offers_a_retry_that_moves_the_job_on() {
 }
 
 #[tokio::test]
+async fn a_retry_by_another_login_keeps_the_requester() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    to_review_turn(&dashboard, id);
+    dashboard.apply(
+        id,
+        Event::ReviewFailed {
+            reason: "the reviewer run timed out".into(),
+        },
+    );
+    dashboard
+        .store
+        .add_collaborator("maestro", "bob@example.com", "test")
+        .unwrap();
+
+    let reply = dashboard
+        .post_as("bob@example.com", &format!("/jobs/{id}/retry"), "")
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(dashboard.store.get(id).unwrap().requested_by, USER);
+}
+
+#[tokio::test]
 async fn a_renovate_job_shows_on_the_board_and_its_page_and_retries_from_it() {
     let dashboard = dashboard();
     let url = "https://github.com/Badger-Embedded/maestro/pull/7";
@@ -12482,9 +12505,8 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
     assert!(body.contains("Copilot"));
     assert!(body.contains(r#"href="/settings/agents/copilot""#));
 
-    let local = body.find(">Local</a>").unwrap();
+    let local = body.find(r#"href="/settings/agents/local""#).unwrap();
     assert!(body.find("Copilot").unwrap() < local);
-    assert!(body.contains(r#"href="/settings/agents/local""#));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;
