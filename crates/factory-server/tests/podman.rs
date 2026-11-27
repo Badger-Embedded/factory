@@ -1850,6 +1850,13 @@ fn picked_tools(forge_base: &str, git_arms: &str) -> Tools {
 }
 
 async fn publish_with(tools: &Tools, checks: bool) -> factory_server::Published {
+    try_publish_with(tools, checks).await.unwrap()
+}
+
+async fn try_publish_with(
+    tools: &Tools,
+    checks: bool,
+) -> Result<factory_server::Published, String> {
     let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
     podman
         .publish(factory_server::PublishRequest {
@@ -1873,7 +1880,6 @@ async fn publish_with(tools: &Tools, checks: bool) -> factory_server::Published 
             pushed: factory_server::PushLog::new(|_| {}),
         })
         .await
-        .unwrap()
 }
 
 async fn publish_picked(forge_base: &str, git_arms: &str) -> factory_server::Published {
@@ -1899,7 +1905,6 @@ async fn a_commit_the_checks_have_not_passed_on_is_never_pushed_after_a_restart(
         unrecorded,
         factory_server::Published::HeadMoved { conflicted: false }
     ));
-    // The merge commit was created, but the checks passed on an older commit.
     std::fs::write(job.join("checked-head"), "older").unwrap();
     let merged = publish_with(&tools, true).await;
     assert!(matches!(
@@ -2058,30 +2063,105 @@ async fn a_green_pull_request_that_was_retargeted_fails_instead_of_asking_for_th
     );
 }
 
+const REJECTED_PUSH_THEN_DIVERGED: &str = "push) echo '! [rejected] moved' >&2; exit 1 ;;\n\
+     merge-base) [ \"$3\" = abc123 ] ;;\n\
+     merge) exit 1 ;;";
+
 #[tokio::test]
-async fn a_rejected_push_to_a_picked_pull_request_merges_the_new_head_and_leaves_the_checks_to_rerun()
+async fn a_rejected_push_to_a_picked_pull_request_rebases_onto_the_new_head_and_leaves_the_checks_to_rerun()
  {
-    let published =
-        publish_picked("develop", "push) echo '! [rejected] moved' >&2; exit 1 ;;").await;
+    let tools = picked_tools("develop", REJECTED_PUSH_THEN_DIVERGED);
+    let published = publish_with(&tools, false).await;
     assert!(matches!(
         published,
         factory_server::Published::HeadMoved { conflicted: false }
     ));
+    let calls = tools.calls();
+    assert!(calls.contains("git rebase"), "{calls}");
+    assert!(!calls.contains("git merge --no-edit"), "{calls}");
 }
 
 #[tokio::test]
-async fn a_rejected_push_whose_merge_conflicts_hands_the_conflict_to_the_agent() {
-    let published = publish_picked(
+async fn a_rebased_tip_the_checks_did_not_run_on_is_not_pushed() {
+    let tools = picked_tools(
         "develop",
         "push) echo '! [rejected] moved' >&2; exit 1 ;;\n\
+         merge-base) [ \"$3\" = abc123 ] ;;\n\
+         merge) exit 1 ;;\n\
+         rebase) echo rebased > \"$(dirname \"$0\")/tip\" ;;",
+    );
+    let job = tools.dir.path().join("data/jobs/7");
+    std::fs::write(job.join("checked-head"), "abc123").unwrap();
+
+    assert!(matches!(
+        publish_with(&tools, true).await,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    assert_eq!(pushes(&tools), 1);
+    assert!(tools.calls().contains("git rebase"), "{}", tools.calls());
+
+    assert!(matches!(
+        publish_with(&tools, true).await,
+        factory_server::Published::HeadMoved { conflicted: false }
+    ));
+    assert_eq!(pushes(&tools), 1);
+}
+
+#[tokio::test]
+async fn a_restart_during_a_rebase_aborts_it_before_the_checks_are_compared_or_a_push() {
+    let tools = picked_tools("develop", "");
+    let job = tools.dir.path().join("data/jobs/7");
+    std::fs::write(job.join("checked-head"), "abc123").unwrap();
+    std::fs::create_dir_all(job.join("work/.git/rebase-merge")).unwrap();
+
+    assert!(matches!(
+        publish_with(&tools, true).await,
+        factory_server::Published::Open(12)
+    ));
+    let calls = tools.calls();
+    let abort = calls.find("git rebase --abort").expect(&calls);
+    assert!(calls[abort..].contains(" push "), "{calls}");
+}
+
+#[tokio::test]
+async fn a_rebase_that_fails_without_a_conflict_is_aborted_and_not_merged_instead() {
+    let tools = picked_tools(
+        "develop",
+        "push) echo '! [rejected] moved' >&2; exit 1 ;;\n\
+         merge-base) [ \"$3\" = abc123 ] ;;\n\
+         merge) exit 1 ;;\n\
+         rebase) d=\"$(dirname \"$0\")/data/jobs/7/work/.git/rebase-merge\"; \\\n\
+         if [ \"$2\" = --abort ]; then rmdir \"$d\"; else mkdir -p \"$d\"; echo 'signing failed' >&2; exit 1; fi ;;",
+    );
+    let err = try_publish_with(&tools, false).await.expect_err("fails");
+    assert!(err.contains("signing failed"), "{err}");
+    assert!(tools.calls().contains("git rebase --abort"));
+    assert!(
+        !tools.calls().contains("git merge --no-edit"),
+        "{}",
+        tools.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_push_whose_rebase_and_merge_conflict_hands_the_merge_to_the_agent() {
+    let tools = picked_tools(
+        "develop",
+        "push) echo '! [rejected] moved' >&2; exit 1 ;;\n\
+         merge-base) [ \"$3\" = abc123 ] ;;\n\
+         rebase) d=\"$(dirname \"$0\")/data/jobs/7/work/.git/rebase-merge\"; \\\n\
+         if [ \"$2\" = --abort ]; then rmdir \"$d\"; else mkdir -p \"$d\"; exit 1; fi ;;\n\
          merge) exit 1 ;;\n\
          diff) echo README ;;",
-    )
-    .await;
+    );
+    let published = publish_with(&tools, false).await;
     assert!(matches!(
         published,
         factory_server::Published::HeadMoved { conflicted: true }
     ));
+    let calls = tools.calls();
+    let abort = calls.find("git rebase --abort").expect(&calls);
+    assert!(calls[abort..].contains("git merge --no-edit"), "{calls}");
 }
 
 #[tokio::test]

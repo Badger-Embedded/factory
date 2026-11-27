@@ -141,7 +141,11 @@ impl Git {
     /// also exists for a fork's pull request. It is fetched into
     /// `refs/factory/pr-<number>/head`, a namespace no branch name can reach. A new local branch starts there. An
     /// existing one keeps its commits: it fast-forwards to a head that moved,
-    /// or takes the new head in with a merge commit. A merge that conflicts is
+    /// or replays its unpushed commits onto the new head with a rebase, so the
+    /// pull request's own commits keep their ids and the push stays a
+    /// fast-forward. When the rebase conflicts, or an unpushed commit is a merge
+    /// commit, or the pull request's history was rewritten, the head is merged
+    /// instead, and a merge that conflicts is
     /// aborted and returned as an error. A merge of the base that an earlier
     /// run left conflicted stays as it is when its branch is checked out, it
     /// already holds the pull request's head and it merges the fetched base,
@@ -168,14 +172,11 @@ impl Git {
         self.set_identity(work, &remote).await?;
         self.fetch_base(work, &remote, base).await?;
         let tracking = format!("refs/factory/pr-{number}/head");
+        self.record_taken_head(work, &tracking, &format!("refs/heads/{branch}"))
+            .await?;
         let remote = remote_source()?;
         self.fetch_ref(work, &remote, head_ref, &tracking).await?;
-        if ["rebase-merge", "rebase-apply"]
-            .iter()
-            .any(|dir| work.join(".git").join(dir).exists())
-        {
-            self.run(work, &["rebase", "--abort"], None).await?;
-        }
+        self.abort_rebase(work).await?;
         let mut leave_conflict = false;
         if work.join(".git/MERGE_HEAD").exists() {
             let current = self.run(work, &["branch", "--show-current"], None).await?;
@@ -223,36 +224,19 @@ impl Git {
             .await
             .is_err()
         {
-            return self
-                .run(work, &["checkout", "-b", branch, &tracking], None)
-                .await
-                .map(|_| ());
+            self.run(work, &["checkout", "-b", branch, &tracking], None)
+                .await?;
+            return self.mark_head_taken(work, &tracking).await;
         }
         self.run(work, &["checkout", branch], None).await?;
-        if self
-            .run(
-                work,
-                &["merge-base", "--is-ancestor", &tracking, "HEAD"],
-                None,
-            )
+        let on_conflict = if leave_conflict {
+            OnConflict::Leave
+        } else {
+            OnConflict::Abort
+        };
+        self.take_head(work, &tracking, on_conflict)
             .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        let fast_forward = self
-            .run(work, &["merge", "--ff-only", &tracking], None)
-            .await;
-        if fast_forward.is_ok() {
-            return Ok(());
-        }
-        if leave_conflict {
-            return self
-                .merge_leaving_conflicts(work, &tracking)
-                .await
-                .map(|_| ());
-        }
-        self.merge_or_abort(work, &tracking).await
+            .map(|_| ())
     }
 
     /// Merges `origin/<base>` into the checked-out branch with a merge commit,
@@ -267,16 +251,20 @@ impl Git {
             .await
     }
 
-    /// Fetches the pull request's head again and merges it into the
-    /// checked-out branch with a merge commit, for a push the remote refused
-    /// because someone pushed first. On a conflict the merge stays unfinished
-    /// in the checkout, for the agent to resolve, and `Ok(false)` comes back.
+    /// Fetches the pull request's head again and rebases the checked-out
+    /// branch's unpushed commits onto it, for a push the remote refused because
+    /// someone pushed first. The factory never rewrites a commit the pull
+    /// request holds and never force-pushes. When the rebase conflicts, it is
+    /// aborted and the head is merged instead. The head is also merged when an
+    /// unpushed commit is a merge commit, since a rebase would replay the base
+    /// branch's commits, and when the pull request's history was rewritten. A merge conflict stays unfinished in the checkout, for
+    /// the agent to resolve, and `Ok(false)` comes back.
     ///
     /// # Errors
     ///
     /// Returns git's message when the fetch fails or the merge fails for
     /// another reason.
-    pub async fn merge_pr_head(
+    pub async fn take_pr_head(
         &self,
         work: &Path,
         remote_source: &RemoteSource<'_>,
@@ -284,9 +272,72 @@ impl Git {
         number: u64,
     ) -> Result<bool, String> {
         let tracking = format!("refs/factory/pr-{number}/head");
+        self.record_taken_head(work, &tracking, "HEAD").await?;
         let remote = remote_source()?;
         self.fetch_ref(work, &remote, head_ref, &tracking).await?;
-        self.merge_leaving_conflicts(work, &tracking).await
+        self.take_head(work, &tracking, OnConflict::Leave).await
+    }
+
+    /// Aborts a rebase that a crash or restart left unfinished, which puts the
+    /// branch back at its commits from before the rebase. Does nothing when no
+    /// rebase is in progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns git's message when the abort fails.
+    pub async fn abort_rebase(&self, work: &Path) -> Result<(), String> {
+        if rebase_in_progress(work) {
+            self.run(work, &["rebase", "--abort"], None).await?;
+        }
+        Ok(())
+    }
+
+    /// The ref that holds the last pull request head the branch contains. It
+    /// is separate from the fetched head, which a fetch overwrites before the
+    /// branch takes the new head in, so a retry after a restart still sees it.
+    fn taken_ref(tracking: &str) -> String {
+        format!("{}/taken", tracking.trim_end_matches("/head"))
+    }
+
+    /// Runs before a fetch replaces `tracking`. The head fetched last time may
+    /// have reached the branch without being recorded, for example when the
+    /// factory stopped after a fast-forward, or in a checkout from before the
+    /// `taken` ref existed. When `tip` contains it, it becomes the taken head.
+    async fn record_taken_head(
+        &self,
+        work: &Path,
+        tracking: &str,
+        tip: &str,
+    ) -> Result<(), String> {
+        let Some(fetched) = self.rev(work, tracking).await else {
+            return Ok(());
+        };
+        let contained = self
+            .run(work, &["merge-base", "--is-ancestor", &fetched, tip], None)
+            .await
+            .is_ok();
+        if contained {
+            self.mark_head_taken(work, tracking).await?;
+        }
+        Ok(())
+    }
+
+    /// A head that is an ancestor of the recorded one, as after the pull
+    /// request was rewound, does not replace it.
+    async fn mark_head_taken(&self, work: &Path, tracking: &str) -> Result<(), String> {
+        let taken = Self::taken_ref(tracking);
+        if let Some(old) = self.rev(work, &taken).await {
+            let behind = self
+                .run(work, &["merge-base", "--is-ancestor", tracking, &old], None)
+                .await
+                .is_ok();
+            if behind {
+                return Ok(());
+            }
+        }
+        self.run(work, &["update-ref", &taken, tracking], None)
+            .await
+            .map(|_| ())
     }
 
     /// The commit the checkout is at.
@@ -328,6 +379,95 @@ impl Git {
             Err(_) if self.head(work).await.is_ok() => Ok(String::new()),
             Err(err) => Err(err),
         }
+    }
+
+    /// Brings `tracking` into the checked-out branch and records it as taken
+    /// once the branch contains it. Returns `Ok(false)` only for a merge
+    /// conflict left in the checkout.
+    async fn take_head(
+        &self,
+        work: &Path,
+        tracking: &str,
+        on_conflict: OnConflict,
+    ) -> Result<bool, String> {
+        let taken = self.bring_in_head(work, tracking, on_conflict).await?;
+        if taken {
+            self.mark_head_taken(work, tracking).await?;
+        }
+        Ok(taken)
+    }
+
+    /// A taken head that is not an ancestor of `tracking` means the pull
+    /// request's history was rewritten, so the old commits in the branch are
+    /// not the factory's to replay and the head is merged. So is a branch with
+    /// no taken head, since nothing shows which of its commits the pull request
+    /// holds.
+    async fn bring_in_head(
+        &self,
+        work: &Path,
+        tracking: &str,
+        on_conflict: OnConflict,
+    ) -> Result<bool, String> {
+        let contained = self
+            .run(
+                work,
+                &["merge-base", "--is-ancestor", tracking, "HEAD"],
+                None,
+            )
+            .await
+            .is_ok();
+        if contained {
+            return Ok(true);
+        }
+        if self
+            .run(work, &["merge", "--ff-only", tracking], None)
+            .await
+            .is_ok()
+        {
+            return Ok(true);
+        }
+        let rewritten = match self.rev(work, &Self::taken_ref(tracking)).await {
+            Some(old) => self
+                .run(work, &["merge-base", "--is-ancestor", &old, tracking], None)
+                .await
+                .is_err(),
+            None => true,
+        };
+        let range = format!("{tracking}..HEAD");
+        let merges = self
+            .run(work, &["rev-list", "--merges", &range], None)
+            .await?;
+        if merges.trim().is_empty() && !rewritten {
+            let rebased = self
+                .run(
+                    work,
+                    &["rebase", "--no-autosquash", "--no-update-refs", tracking],
+                    None,
+                )
+                .await;
+            let Err(err) = rebased else {
+                return Ok(true);
+            };
+            let conflicted = self
+                .run(work, &["diff", "--name-only", "--diff-filter=U"], None)
+                .await
+                .is_ok_and(|out| !out.trim().is_empty());
+            self.abort_rebase(work).await?;
+            if !conflicted {
+                return Err(err);
+            }
+        }
+        match on_conflict {
+            OnConflict::Leave => self.merge_leaving_conflicts(work, tracking).await,
+            OnConflict::Abort => self.merge_or_abort(work, tracking).await.map(|()| true),
+        }
+    }
+
+    async fn rev(&self, work: &Path, name: &str) -> Option<String> {
+        self.run(work, &["rev-parse", name], None)
+            .await
+            .ok()
+            .map(|out| out.trim().to_owned())
     }
 
     async fn merge_leaving_conflicts(&self, work: &Path, target: &str) -> Result<bool, String> {
@@ -844,4 +984,16 @@ fn credits_ai(line: &str) -> bool {
     (line.starts_with("co-authored-by:") && (line.contains("claude") || line.contains("anthropic")))
         || line.contains("generated with [claude")
         || line.contains("generated with claude")
+}
+
+#[derive(Clone, Copy)]
+enum OnConflict {
+    Leave,
+    Abort,
+}
+
+fn rebase_in_progress(work: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|dir| work.join(".git").join(dir).exists())
 }

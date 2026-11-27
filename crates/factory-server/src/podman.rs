@@ -363,9 +363,12 @@ impl PodmanExecutor {
     /// Pushes the branch's new commits to the picked pull request's own branch
     /// without force, and touches nothing else on the pull request: no title,
     /// no description, no merge. A push that the remote refuses because
-    /// someone pushed meanwhile brings their commits into the checkout with a
-    /// merge, so the factory neither drops nor overwrites them, and the job runs the checks on the merged branch, or hands a
-    /// conflict to the agent, before it pushes again.
+    /// someone pushed meanwhile brings their commits into the checkout. The
+    /// factory rebases its unpushed commits onto them, so it neither drops nor
+    /// rewrites their commits, and merges instead when the rebase conflicts or
+    /// an unpushed commit is a merge commit, or the pull request's history was
+    /// rewritten. A rebase that a restart interrupted is aborted first. The job runs the checks on the
+    /// new tip, or hands a merge conflict to the agent, before it pushes again.
     async fn publish_existing(
         &self,
         request: &PublishRequest,
@@ -399,6 +402,7 @@ impl PodmanExecutor {
             }
         }
         let workspace = self.job_dir(request.job_id).join("work");
+        self.git.abort_rebase(&workspace).await?;
         if workspace.join(".git/MERGE_HEAD").exists() {
             return Ok(Published::HeadMoved { conflicted: true });
         }
@@ -440,13 +444,13 @@ impl PodmanExecutor {
             if current != request.branch {
                 return Ok(Published::Stopped(format!(
                     "the checkout is on {current:?}, not on {}, so the new head of the \
-                     pull request cannot be merged into the branch that is pushed",
+                     pull request cannot be brought into the branch that is pushed",
                     request.branch
                 )));
             }
             let merged = self
                 .git
-                .merge_pr_head(&workspace, &remote, &existing.head_ref, existing.number)
+                .take_pr_head(&workspace, &remote, &existing.head_ref, existing.number)
                 .await?;
             return Ok(Published::HeadMoved {
                 conflicted: !merged,
