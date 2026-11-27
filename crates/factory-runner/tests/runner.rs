@@ -2239,6 +2239,10 @@ fn the_renovate_schemas_require_a_reason_and_forbid_questions() {
     for key in ["from", "to"] {
         assert_eq!(diff["properties"][key]["type"], "string");
     }
+    let rule = diff["properties"]["outcome"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(rule.contains("any file") && !rule.contains("dependency or packaging"));
 
     let strict = Expect::DiffCheck.strict_schema();
     assert_eq!(strict["required"].as_array().unwrap().len(), 5);
@@ -2351,8 +2355,28 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
         log: "test foo failed".into(),
     };
     let check = Task::CheckDiff {
-        diff: "+version = 1.2.3".into(),
-        body: "Bumps serde".into(),
+        diff: "--- a/.github/workflows/build-wormholes.yml\n\
+               +++ b/.github/workflows/build-wormholes.yml\n\
+               @@ -1,12 +1,12 @@\n \
+               name: build-wormholes\n \
+               on: [push, pull_request]\n \
+               jobs:\n \
+               \x20 build:\n \
+               \x20   runs-on: ubuntu-latest\n \
+               \x20   steps:\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make build\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make test\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n \
+               \x20     - run: make package"
+            .into(),
+        body: "Update actions/checkout action to v7. v7.0.0 breaking change: fork checkouts \
+               are blocked for pull_request_target and workflow_run."
+            .into(),
     };
     for agent in [Agent::Claude, Agent::Codex] {
         let text = prompt(&analyze, Expect::FailureAnalysis, agent);
@@ -2362,8 +2386,21 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
         assert!(!text.contains("Moon Skywalker"));
 
         let text = prompt(&check, Expect::DiffCheck, agent);
-        assert!(text.contains("+version = 1.2.3") && text.contains("Bumps serde"));
-        assert!(text.contains("changes only dependency or packaging version files"));
+        assert_eq!(
+            text.matches("+      - uses: actions/checkout@v7").count(),
+            3
+        );
+        assert!(text.contains("\n on: [push, pull_request]\n"));
+        assert!(!text.contains("\n+on:") && !text.contains("\n-on:"));
+        assert!(text.contains("build-wormholes.yml"));
+        assert!(text.contains("pull_request_target and workflow_run"));
+        assert!(text.contains("check the repository for use of"));
+        assert!(text.contains("always unsafe"));
+        assert!(text.contains("every change only moves a version, in any file"));
+        assert!(text.contains("release notes") && text.contains("breaking change"));
+        assert!(text.contains("you cannot tell, the update is unsafe"));
+        assert!(!text.contains("dependency or packaging version files"));
+        assert!(!text.contains("CI workflows"));
         assert!(text.contains("\"safe\"") && text.contains("\"unsafe\""));
         assert!(text.contains("Do not change any files"));
         assert!(!text.contains("Moon Skywalker"));

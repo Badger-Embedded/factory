@@ -213,11 +213,11 @@ impl Expect {
                     "outcome": {
                         "type": "string",
                         "enum": self.outcomes(),
-                        "description": "safe when the diff changes only dependency or packaging version files, unsafe otherwise."
+                        "description": "safe when every change only moves a version, in any file, and no breaking change in the new version affects the project. unsafe for any other change, even mixed with version moves, or when a breaking change affects the project or the effect is unclear."
                     },
                     "reason": {
                         "type": "string",
-                        "description": "Why, naming the files that decide it."
+                        "description": "For safe, the files and why each listed breaking change does not affect the project. For unsafe, the change that is not a version move, or the breaking change and where the project uses it, or what could not be determined."
                     },
                     "summary": {
                         "type": "string",
