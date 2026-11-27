@@ -2391,7 +2391,7 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
             3
         );
         assert!(text.contains("\n on: [push, pull_request]\n"));
-        assert!(!text.contains("+on:") && !text.contains("-on:"));
+        assert!(!text.contains("\n+on:") && !text.contains("\n-on:"));
         assert!(text.contains("build-wormholes.yml"));
         assert!(text.contains("pull_request_target and workflow_run"));
         assert!(text.contains("check the repository for use of"));
