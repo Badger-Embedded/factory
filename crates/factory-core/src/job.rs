@@ -821,8 +821,9 @@ fn unsafe_texts(reason: &str) -> (String, String) {
     (
         format!("The diff check found the update unsafe to merge: {reason}"),
         format!(
-            "The factory does not merge this update, because its diff does more than change \
-             dependency or packaging version files.\n\n{reason}"
+            "The factory does not merge this update, because the diff check found it \
+             unsafe. Either the diff changes more than versions, or a breaking change in the \
+             new version affects this project.\n\n{reason}"
         ),
     )
 }
@@ -1153,9 +1154,9 @@ pub enum Task {
     AnalyzeFailure {
         log: String,
     },
-    /// Decide whether a Renovate pull request's diff changes only dependency
-    /// or packaging version files. The factory passes the diff and the
-    /// description.
+    /// Decide whether a Renovate pull request's diff only moves versions, in
+    /// any file, and whether a breaking change in the release notes affects
+    /// the project. The factory passes the diff and the description.
     CheckDiff {
         diff: String,
         body: String,

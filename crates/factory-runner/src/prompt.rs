@@ -235,12 +235,27 @@ fn diff_prompt(diff: &str, body: &str, agent: PromptTarget) -> String {
          {body}\n\n\
          Its diff:\n\n{diff}\n\n\
          Decide whether the diff is safe to merge without a person reading it. The diff is \
-         safe when it changes only dependency or packaging version files. Any other change \
-         is unsafe, such as source code, CI workflows, scripts or configuration that does \
-         more than pin a version. Do not change any files and do not push.\n\n\
-         End with outcome \"safe\" or \"unsafe\", a reason that names the files that decide \
-         it, and a short summary of the update. When the diff shows the upstream versions \
-         or refs the update moves between, give them as \"from\" and \"to\"."
+         safe when every change only moves a version, in any file, and nothing in the new \
+         version breaks this project. A version move is a version number, tag, ref, commit \
+         SHA or digest pin, with its lockfile or checksum lines. The kind of file does not \
+         decide: workflows, Dockerfiles, scripts and configuration are fine when only a \
+         version moves. Any other change is unsafe, such as edited source code, an added or \
+         removed step, or a changed command, trigger, permission, option or setting. A diff \
+         that mixes version moves with such a change is unsafe.\n\n\
+         To decide whether the new version breaks this project, read the release notes in \
+         the description. For each breaking change they list, check the repository for use \
+         of what it changes, for example whether a workflow has a trigger the change \
+         affects. If the project is not affected, the update is safe. If it is affected, or \
+         you cannot tell, the update is unsafe. When the description lists no breaking \
+         change, a pure version bump is safe, a major bump included. Decide this yourself: \
+         do not answer unsafe only so that a person can confirm something you can read in \
+         the repository or the diff. Do not change any files and do not push.\n\n\
+         End with outcome \"safe\" or \"unsafe\", a reason and a short summary of the \
+         update. For safe, the reason names the files and, when the release notes list \
+         breaking changes, says why each does not affect the project. For unsafe, the \
+         reason names the change that is not a version move, or the breaking change and \
+         where the project uses it. When the diff shows the upstream versions or refs the \
+         update moves between, give them as \"from\" and \"to\"."
     );
     end_prompt(&mut text, agent, Expect::DiffCheck);
     text

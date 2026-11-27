@@ -2239,6 +2239,10 @@ fn the_renovate_schemas_require_a_reason_and_forbid_questions() {
     for key in ["from", "to"] {
         assert_eq!(diff["properties"][key]["type"], "string");
     }
+    let rule = diff["properties"]["outcome"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(rule.contains("any file") && !rule.contains("dependency or packaging"));
 
     let strict = Expect::DiffCheck.strict_schema();
     assert_eq!(strict["required"].as_array().unwrap().len(), 5);
@@ -2363,7 +2367,11 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
 
         let text = prompt(&check, Expect::DiffCheck, agent);
         assert!(text.contains("+version = 1.2.3") && text.contains("Bumps serde"));
-        assert!(text.contains("changes only dependency or packaging version files"));
+        assert!(text.contains("every change only moves a version, in any file"));
+        assert!(text.contains("release notes") && text.contains("breaking change"));
+        assert!(text.contains("you cannot tell, the update is unsafe"));
+        assert!(!text.contains("dependency or packaging version files"));
+        assert!(!text.contains("CI workflows"));
         assert!(text.contains("\"safe\"") && text.contains("\"unsafe\""));
         assert!(text.contains("Do not change any files"));
         assert!(!text.contains("Moon Skywalker"));
