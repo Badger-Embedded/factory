@@ -16,7 +16,7 @@ use crate::agent::{
     AgentBackend, AgentItem, Credential, PromptStyle, RunResult, TokenUsage, write_replacing,
 };
 use crate::outcome::{Expect, event_from_result};
-use crate::stream::{StreamItem, parse_line};
+use crate::stream::{ClaudeStream, StreamItem, parse_line};
 use crate::worker::{
     AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, STDIO_STARTUP_TIMEOUT_SECS, SessionRun,
     WorkerConfig, WorkerRun,
@@ -186,61 +186,86 @@ impl AgentBackend for ClaudeAgent {
         claude.into_iter().map(OsString::from).collect()
     }
 
-    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
-        let mut items = self.parse(expect, line);
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim())
-            && value.get("type").and_then(serde_json::Value::as_str) == Some("result")
-            && let Some(usage) = value.get("usage").filter(|usage| usage.is_object())
-        {
-            let count = |key: &str| {
-                usage
-                    .get(key)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-            };
-            let counted = ["input_tokens", "cache_read_input_tokens", "output_tokens"]
-                .iter()
-                .any(|key| usage.get(*key).is_some_and(serde_json::Value::is_u64));
-            if !counted {
-                return items;
+    fn stream(
+        &self,
+        expect: Expect,
+        local: bool,
+        key: Option<&str>,
+    ) -> crate::agent::LineParser<'_> {
+        let mut stream = ClaudeStream::with_key(key);
+        Box::new(move |line| {
+            let items = convert(expect, stream.parse_line(line));
+            if local {
+                append_local_token_usage(items, line)
+            } else {
+                items
             }
-            items.push(AgentItem::UsageTotal(TokenUsage {
-                input_tokens: count("input_tokens"),
-                cached_input_tokens: count("cache_read_input_tokens"),
-                output_tokens: count("output_tokens"),
-                reasoning_output_tokens: 0,
-            }));
-        }
-        items
+        })
+    }
+
+    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+        let items = self.parse(expect, line);
+        append_local_token_usage(items, line)
     }
 
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
-        parse_line(line)
-            .into_iter()
-            .flat_map(|item| match item {
-                StreamItem::Log(line) => vec![AgentItem::Log(line)],
-                StreamItem::PlanUsage(usage) => vec![AgentItem::PlanUsage(usage)],
-                StreamItem::Result(message) => vec![AgentItem::Result(RunResult {
-                    event: event_from_result(expect, &message),
-                    session_id: message.session_id.clone(),
-                    cost_usd: message.total_cost_usd,
-                })],
-                StreamItem::Init(servers) => servers
-                    .into_iter()
-                    .filter(|server| server.status != "connected")
-                    .map(|server| {
-                        AgentItem::Unavailable(McpUnavailable {
-                            reason: format!(
-                                "the agent reported it as {}",
-                                status_label(&server.status)
-                            ),
-                            server: server.name,
-                        })
-                    })
-                    .collect(),
-            })
-            .collect()
+        convert(expect, parse_line(line))
     }
+}
+
+fn append_local_token_usage(mut items: Vec<AgentItem>, line: &str) -> Vec<AgentItem> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim())
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("result")
+        && let Some(usage) = value.get("usage").filter(|usage| usage.is_object())
+    {
+        let count = |key: &str| {
+            usage
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let counted = ["input_tokens", "cache_read_input_tokens", "output_tokens"]
+            .iter()
+            .any(|key| usage.get(*key).is_some_and(serde_json::Value::is_u64));
+        if !counted {
+            return items;
+        }
+        items.push(AgentItem::UsageTotal(TokenUsage {
+            input_tokens: count("input_tokens"),
+            cached_input_tokens: count("cache_read_input_tokens"),
+            output_tokens: count("output_tokens"),
+            reasoning_output_tokens: 0,
+        }));
+    }
+    items
+}
+
+fn convert(expect: Expect, items: Vec<StreamItem>) -> Vec<AgentItem> {
+    items
+        .into_iter()
+        .flat_map(|item| match item {
+            StreamItem::Log(line) => vec![AgentItem::Log(line)],
+            StreamItem::PlanUsage(usage) => vec![AgentItem::PlanUsage(usage)],
+            StreamItem::Result(message) => vec![AgentItem::Result(RunResult {
+                event: event_from_result(expect, &message),
+                session_id: message.session_id.clone(),
+                cost_usd: message.total_cost_usd,
+            })],
+            StreamItem::Init(servers) => servers
+                .into_iter()
+                .filter(|server| server.status != "connected")
+                .map(|server| {
+                    AgentItem::Unavailable(McpUnavailable {
+                        reason: format!(
+                            "the agent reported it as {}",
+                            status_label(&server.status)
+                        ),
+                        server: server.name,
+                    })
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// The JSON for `claude --settings`. A run with a stdio server raises Claude's

@@ -111,6 +111,210 @@ fn assistant_text_and_tool_calls_become_log_lines() {
     );
 }
 
+fn tool_use(id: &str, name: &str, input: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+    )
+}
+
+fn tool_result(id: &str, content: &str, is_error: bool) -> String {
+    format!(
+        r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":{content},"is_error":{is_error}}}]}}}}"#
+    )
+}
+
+fn error_lines(items: Vec<StreamItem>) -> Vec<LogLine> {
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            StreamItem::Log(line @ LogLine::ToolError { .. }) => Some(line),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_rejected_structured_output_call_logs_its_input_and_error() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let _ = stream.parse_line(&tool_use(
+        "toolu_1",
+        "StructuredOutput",
+        r#"{"outcome":"unsafe","reason":"CI workflow"}"#,
+    ));
+    let items = stream.parse_line(&tool_result(
+        "toolu_1",
+        r#""must have required property 'summary'""#,
+        true,
+    ));
+    assert_eq!(
+        error_lines(items),
+        [LogLine::ToolError {
+            name: "StructuredOutput".into(),
+            input: Some(r#"{"outcome":"unsafe","reason":"CI workflow"}"#.into()),
+            error: "must have required property 'summary'".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_successful_tool_result_adds_no_log_line() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let _ = stream.parse_line(&tool_use(
+        "toolu_1",
+        "StructuredOutput",
+        r#"{"outcome":"x"}"#,
+    ));
+    assert_eq!(
+        stream.parse_line(&tool_result("toolu_1", r#""ok""#, false)),
+        vec![]
+    );
+}
+
+#[test]
+fn a_failed_bash_result_logs_the_error_without_the_input() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let _ = stream.parse_line(&tool_use("toolu_2", "Bash", r#"{"command":"false"}"#));
+    let items = stream.parse_line(&tool_result(
+        "toolu_2",
+        r#"[{"type":"text","text":"exit 1"},{"type":"text","text":"boom"}]"#,
+        true,
+    ));
+    assert_eq!(
+        error_lines(items),
+        [LogLine::ToolError {
+            name: "Bash".into(),
+            input: None,
+            error: "exit 1\nboom".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_long_string_in_a_rejected_input_is_cut_and_every_key_stays() {
+    let mut stream = factory_runner::ClaudeStream::default();
+    let long = "x".repeat(500);
+    let _ = stream.parse_line(&tool_use(
+        "toolu_3",
+        "StructuredOutput",
+        &format!(r#"{{"spec":"{long}","title":"t"}}"#),
+    ));
+    let items = stream.parse_line(&tool_result("toolu_3", r#""bad""#, true));
+    let lines = error_lines(items);
+    let [
+        LogLine::ToolError {
+            input: Some(input), ..
+        },
+    ] = lines.as_slice()
+    else {
+        panic!("expected one tool error");
+    };
+    assert!(input.contains(&format!("{}…", "x".repeat(200))));
+    assert!(!input.contains(&"x".repeat(201)));
+    assert!(input.contains(r#""title":"t""#));
+}
+
+#[test]
+fn a_key_that_straddles_a_cutoff_is_redacted_before_the_cut() {
+    let key = "sk-\"secret\"-key";
+    let mut stream = factory_runner::ClaudeStream::with_key(Some(key));
+    let value = format!("{}{key}tail", "x".repeat(195));
+    let input = serde_json::json!({ "reason": value, key: "v" }).to_string();
+    let _ = stream.parse_line(&tool_use("t1", "StructuredOutput", &input));
+    let error = serde_json::to_string(&format!("{}{key}", "e".repeat(990))).unwrap();
+    let items = stream.parse_line(&tool_result("t1", &error, true));
+    let lines = error_lines(items);
+    let [
+        LogLine::ToolError {
+            input: Some(input),
+            error,
+            ..
+        },
+    ] = lines.as_slice()
+    else {
+        panic!("expected one tool error");
+    };
+    for text in [input, error] {
+        assert!(!text.contains("sk-"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+    assert!(error.ends_with("[redacted]"), "{error}");
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap();
+    assert!(parsed["reason"].as_str().unwrap().ends_with("[reda…"));
+}
+
+#[tokio::test]
+async fn a_quote_only_local_key_leaves_the_logged_input_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!(
+            "{}\n{}\n",
+            tool_use("t1", "StructuredOutput", r#"{"reason":"say \"hi\""}"#),
+            tool_result("t1", r#""bad""#, true)
+        ),
+    )
+    .unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, "", 0),
+        ..WorkerConfig::default()
+    };
+    let worker = local_claude_run(dir.path(), Some("\""));
+    let mut log = Vec::new();
+    run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    let input = log
+        .iter()
+        .find_map(|line| match line {
+            LogLine::ToolError { input, .. } => input.clone(),
+            _ => None,
+        })
+        .expect("a tool error with its input");
+    let parsed: serde_json::Value = serde_json::from_str(&input).unwrap();
+    assert_eq!(parsed["reason"], "say [redacted]hi[redacted]");
+}
+
+#[tokio::test]
+async fn a_local_key_in_a_failed_tool_call_is_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!(
+            "{}\n{}\n",
+            tool_use("t1", "StructuredOutput", r#"{"reason":"key sk-secret"}"#),
+            tool_result("t1", r#""bad sk-secret""#, true)
+        ),
+    )
+    .unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, "", 0),
+        ..WorkerConfig::default()
+    };
+    let worker = local_claude_run(dir.path(), Some("sk-secret"));
+    let mut log = Vec::new();
+    run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    let shown = format!("{log:?}");
+    assert!(shown.contains("bad [redacted]"), "{shown}");
+    assert!(shown.contains("key [redacted]"), "{shown}");
+    assert!(!shown.contains("sk-secret"), "{shown}");
+}
+
 #[test]
 fn other_messages_give_no_log_lines_and_plain_text_is_kept() {
     assert_eq!(
