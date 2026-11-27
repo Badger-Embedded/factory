@@ -124,10 +124,16 @@ const STRUCTURED_OUTPUT: &str = "StructuredOutput";
 
 /// Parser for one run's stdout. It remembers each tool call until its result
 /// arrives, so a failed result is logged with the tool's name and input.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ClaudeStream {
     calls: HashMap<String, (String, Value)>,
     key: Option<String>,
+}
+
+impl std::fmt::Debug for ClaudeStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeStream").finish_non_exhaustive()
+    }
 }
 
 /// Parses one stdout line with no memory of earlier lines, so a tool result

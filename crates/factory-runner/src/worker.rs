@@ -552,7 +552,9 @@ impl Redactor {
                 },
                 LogLine::ToolError { name, input, error } => LogLine::ToolError {
                     name: self.apply(&name),
-                    input: input.map(|input| self.apply(&input)),
+                    // The parser already redacted the decoded strings; a second pass over
+                    // the JSON text could replace its delimiters.
+                    input,
                     error: self.apply(&error),
                 },
                 LogLine::Other(text) => LogLine::Other(self.apply(&text)),

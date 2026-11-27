@@ -243,6 +243,45 @@ fn a_key_that_straddles_a_cutoff_is_redacted_before_the_cut() {
 }
 
 #[tokio::test]
+async fn a_quote_only_local_key_leaves_the_logged_input_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!(
+            "{}\n{}\n",
+            tool_use("t1", "StructuredOutput", r#"{"reason":"say \"hi\""}"#),
+            tool_result("t1", r#""bad""#, true)
+        ),
+    )
+    .unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, "", 0),
+        ..WorkerConfig::default()
+    };
+    let worker = local_claude_run(dir.path(), Some("\""));
+    let mut log = Vec::new();
+    run(
+        &config,
+        &worker,
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    let input = log
+        .iter()
+        .find_map(|line| match line {
+            LogLine::ToolError { input, .. } => input.clone(),
+            _ => None,
+        })
+        .expect("a tool error with its input");
+    let parsed: serde_json::Value = serde_json::from_str(&input).unwrap();
+    assert_eq!(parsed["reason"], "say [redacted]hi[redacted]");
+}
+
+#[tokio::test]
 async fn a_local_key_in_a_failed_tool_call_is_redacted() {
     let dir = tempfile::tempdir().unwrap();
     let stdout = dir.path().join("stdout");
