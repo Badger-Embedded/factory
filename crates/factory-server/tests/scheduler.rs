@@ -10516,6 +10516,7 @@ async fn a_charge_for_a_run_cancelled_before_its_report_stays_on_the_run_step() 
     let id = store.create("maestro", "alice", "Add a button").unwrap();
     scheduler.tick().await.unwrap();
     store.apply(id, Event::Cancel).unwrap();
+    assert!(store.cost_lookup_pending(id).unwrap());
     executor.release(1);
     openrouter_finished(&store, id, 1).await;
 

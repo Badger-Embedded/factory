@@ -847,6 +847,43 @@ impl Drop for TokenGuard {
     }
 }
 
+/// Counts an `OpenRouter` worker as a pending cost lookup from its dispatch
+/// until it ends or is aborted, so a job page that renders in between keeps
+/// polling. The lookup the worker starts counts on its own, so the page never
+/// sees a gap between the two.
+struct WorkerCostGuard {
+    store: Arc<Store>,
+    job_id: i64,
+}
+
+impl WorkerCostGuard {
+    fn for_request(store: &Arc<Store>, request: &AgentRequest) -> Option<Self> {
+        let openrouter = request
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider.target.kind == ProviderKind::OpenRouter);
+        openrouter.then(|| Self::begin(store, request.job_id))
+    }
+
+    fn begin(store: &Arc<Store>, job_id: i64) -> Self {
+        if let Err(err) = store.begin_cost_lookup(job_id) {
+            tracing::error!("job {job_id}: {err}");
+        }
+        Self {
+            store: Arc::clone(store),
+            job_id,
+        }
+    }
+}
+
+impl Drop for WorkerCostGuard {
+    fn drop(&mut self) {
+        if let Err(err) = self.store.end_cost_lookup(self.job_id) {
+            tracing::error!("job {}: {err}", self.job_id);
+        }
+    }
+}
+
 /// The server and tool of an agent's `mcp__<server>__<tool>` tool name when the
 /// server is one of the run's stdio servers. Server names hold no underscore, so
 /// the first `__` after the prefix ends the server.
@@ -1042,8 +1079,9 @@ impl<E: Executor> Scheduler<E> {
                     };
                     let scheduler = Arc::clone(self);
                     let settings = settings.clone();
-                    let job = job.clone();
+                    let guard = WorkerCostGuard::for_request(&self.store, &request);
                     self.spawn(row.id, Kind::Worker, async move {
+                        let _guard = guard;
                         scheduler.agent(&settings, request, skipped, job).await;
                     });
                 }
