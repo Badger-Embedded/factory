@@ -34,6 +34,10 @@ use tokio::sync::{Notify, Semaphore};
 struct FakeGenerations {
     costs: Mutex<Vec<(String, f64)>>,
     keys: Mutex<Vec<String>>,
+    /// Lookups wait for a permit while this is set.
+    gate: Mutex<Option<Arc<Semaphore>>>,
+    /// An id whose lookup never answers.
+    hangs: Mutex<Option<String>>,
 }
 
 impl OpenRouterApi for FakeGenerations {
@@ -48,6 +52,13 @@ impl OpenRouterApi for FakeGenerations {
     fn generation<'a>(&'a self, id: &'a str, key: &'a str) -> OpenRouterGenerationFuture<'a> {
         Box::pin(async move {
             self.keys.lock().unwrap().push(key.to_owned());
+            let gate = self.gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            if self.hangs.lock().unwrap().as_deref() == Some(id) {
+                std::future::pending::<()>().await;
+            }
             self.costs
                 .lock()
                 .unwrap()
@@ -59,27 +70,24 @@ impl OpenRouterApi for FakeGenerations {
     }
 }
 
-/// Lookups that answer from `table` and ask again after a millisecond.
 fn fake_costs(table: &[(&str, f64)]) -> (OpenRouterCosts, Arc<FakeGenerations>) {
     let api = Arc::new(FakeGenerations::default());
     *api.costs.lock().unwrap() = table
         .iter()
         .map(|(id, cost)| ((*id).to_owned(), *cost))
         .collect();
-    let costs = OpenRouterCosts::with_delays(
+    let costs = OpenRouterCosts::with_limits(
         Arc::clone(&api) as Arc<dyn OpenRouterApi>,
         vec![Duration::from_millis(1); 3],
+        Duration::from_secs(30),
     );
     (costs, api)
 }
 
-/// Lookups that find nothing.
 fn no_costs() -> OpenRouterCosts {
     fake_costs(&[]).0
 }
 
-/// Waits for the background cost lookup of an `OpenRouter` run to log its
-/// outcome, and returns that line.
 async fn openrouter_finished(store: &Store, id: i64, count: usize) -> Vec<String> {
     for _ in 0..500 {
         let lines = finished_lines_with(store, id, "OpenRouter run finished");
@@ -283,7 +291,6 @@ impl FakeExecutor {
         self.sessions.lock().unwrap().push_back(id.to_owned());
     }
 
-    /// Makes the next run's output show the generation ids `ids`.
     fn report_generations(&self, ids: &[&str]) {
         self.generations
             .lock()
@@ -10445,4 +10452,57 @@ async fn an_openrouter_generation_that_cost_nothing_records_a_zero_row() {
         "OpenRouter run finished, $0.00 charged by OpenRouter."
     );
     assert_eq!(store.recorded_cost(id).unwrap(), Some(0.0));
+}
+
+#[tokio::test]
+async fn a_lookup_that_ends_after_the_job_moved_on_files_its_cost_under_the_run_step() {
+    let (costs, api) = fake_costs(&[("gen-1", 0.4)]);
+    let gate = Arc::new(Semaphore::new(0));
+    *api.gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let (store, executor, scheduler, secrets) =
+        setup_openrouter_with(|_| Event::Agent(AgentResult::Clarified), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1"]);
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_ne!(store.get(id).unwrap().job.stage(), &Stage::Clarifying);
+    assert!(store.cost_lookup_pending(id).unwrap());
+    gate.add_permits(10);
+    openrouter_finished(&store, id, 1).await;
+
+    assert!(!store.cost_lookup_pending(id).unwrap());
+    let cost = store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event == "cost")
+        .expect("the cost entry");
+    assert_eq!(cost.stage, "clarifying");
+    assert_eq!(cost.usd, Some(0.4));
+}
+
+#[tokio::test]
+async fn a_lookup_that_runs_out_of_time_records_no_partial_cost() {
+    let api = Arc::new(FakeGenerations::default());
+    *api.costs.lock().unwrap() = vec![("gen-1".to_owned(), 0.1)];
+    *api.hangs.lock().unwrap() = Some("gen-2".to_owned());
+    let costs = OpenRouterCosts::with_limits(
+        Arc::clone(&api) as Arc<dyn OpenRouterApi>,
+        vec![Duration::from_millis(1); 3],
+        Duration::from_millis(100),
+    );
+    let (store, executor, scheduler, secrets) = setup_openrouter_with(|_| questions(), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1", "gen-2"]);
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    let lines = openrouter_finished(&store, id, 1).await;
+    assert!(lines[0].contains("could not be read from OpenRouter"));
+    assert_eq!(store.recorded_cost(id).unwrap(), None);
+    assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
+    assert!(!store.cost_lookup_pending(id).unwrap());
 }

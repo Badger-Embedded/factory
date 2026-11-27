@@ -1040,3 +1040,14 @@ test('a recorded Local run shows $0.00 and a subscription run with no cost shows
   await expect(cost(local)).toHaveText('$0.00');
   await expect(cost(subscription)).toHaveText('–');
 });
+
+test('a finished job keeps polling until its pending OpenRouter cost arrives', async ({ page, factory, project }) => {
+  const id = newJob(factory, project, 'failed');
+  factory.fixture('cost-lookup', '--job', id, '--state', 'begin');
+  await page.goto(`/jobs/${id}`);
+  await expect(page.locator('#job-cost')).toHaveText('–');
+
+  factory.fixture('cost', '--job', id, '--usd', '0.42', '--fetched', 'true');
+  factory.fixture('cost-lookup', '--job', id, '--state', 'end');
+  await expect(page.locator('#job-cost')).toHaveText('$0.42');
+});

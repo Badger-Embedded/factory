@@ -100,30 +100,52 @@ pub trait OpenRouterApi: Send + Sync {
 pub struct OpenRouterCosts {
     api: Arc<dyn OpenRouterApi>,
     delays: Vec<Duration>,
+    deadline: Duration,
 }
 
 impl OpenRouterCosts {
-    /// Asks again after 2, 4, 8, 16 and 30 seconds, so a generation that
-    /// `OpenRouter` has not stored yet is waited for about a minute.
+    /// Asks again after 2, 4, 8, 16 and 30 seconds, and gives up after 90
+    /// seconds in all, requests included.
     #[must_use]
     pub fn new(api: Arc<dyn OpenRouterApi>) -> Self {
-        Self::with_delays(api, [2, 4, 8, 16, 30].map(Duration::from_secs).to_vec())
+        Self::with_limits(
+            api,
+            [2, 4, 8, 16, 30].map(Duration::from_secs).to_vec(),
+            Duration::from_secs(90),
+        )
     }
 
-    /// As [`Self::new`], with the waits between the rounds of asking given.
+    /// As [`Self::new`], with the waits between the rounds of asking and the
+    /// time the whole lookup may take given.
     #[must_use]
-    pub fn with_delays(api: Arc<dyn OpenRouterApi>, delays: Vec<Duration>) -> Self {
-        OpenRouterCosts { api, delays }
+    pub fn with_limits(
+        api: Arc<dyn OpenRouterApi>,
+        delays: Vec<Duration>,
+        deadline: Duration,
+    ) -> Self {
+        OpenRouterCosts {
+            api,
+            delays,
+            deadline,
+        }
     }
 
     /// The sum of the costs of the generations `ids`, read with `key`. Each
     /// round asks only for the ids still unread. `None` when an id stays
-    /// unread after the last round, `OpenRouter` refuses the key, or `ids` is
-    /// empty.
+    /// unread after the last round or the deadline, `OpenRouter` refuses the
+    /// key, or `ids` is empty. A lookup that runs out of time returns no
+    /// partial sum.
     pub async fn total(&self, key: &str, ids: &[String]) -> Option<f64> {
         if ids.is_empty() {
             return None;
         }
+        tokio::time::timeout(self.deadline, self.read(key, ids))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn read(&self, key: &str, ids: &[String]) -> Option<f64> {
         let mut costs: Vec<Option<f64>> = vec![None; ids.len()];
         for round in 0..=self.delays.len() {
             for (id, slot) in ids.iter().zip(&mut costs) {

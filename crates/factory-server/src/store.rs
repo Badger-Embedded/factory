@@ -139,7 +139,12 @@ CREATE TABLE IF NOT EXISTS job_files (
 );
 CREATE TABLE IF NOT EXISTS job_costs (
     job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
-    usd REAL NOT NULL
+    usd REAL NOT NULL,
+    fetched INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS cost_lookups (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
+    pending INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS project_totals (
     project TEXT PRIMARY KEY,
@@ -611,12 +616,13 @@ pub struct ProjectTotals {
     pub jobs_merged: i64,
 }
 
-/// Selects the `job_costs` rows to show as a cost: a positive total, or a zero
-/// total of a job that ran a worker on Local or `OpenRouter`, whose cost is
-/// known to be nothing, such as a `:free` model. Another zero row reads as no cost.
-const SHOWN_COST: &str = "(c.usd > 0 OR EXISTS (
+/// Selects the `job_costs` rows to show as a cost: a positive total, a zero
+/// total `OpenRouter` charged and the factory read back, such as a `:free`
+/// model, or a zero total of a job that ran a worker on Local. Another zero row
+/// reads as no cost.
+const SHOWN_COST: &str = "(c.usd > 0 OR c.fetched = 1 OR EXISTS (
     SELECT 1 FROM sessions s
-    WHERE s.job_id = c.job_id AND s.agent IN ('local', 'openrouter') AND s.local_cli IS NOT NULL))";
+    WHERE s.job_id = c.job_id AND s.agent = 'local' AND s.local_cli IS NOT NULL))";
 
 /// One model's Codex prices, in USD per million tokens. The factory estimates a
 /// Codex run's cost from the row for the model it ran, since Codex reports token
@@ -1084,6 +1090,7 @@ impl Store {
                 [],
             )?;
         }
+        Self::migrate_job_costs_fetched(&conn)?;
         conn.execute("INSERT INTO store_boots DEFAULT VALUES", [])?;
         let epoch = u64::try_from(conn.last_insert_rowid()).unwrap_or(0);
         Ok(Store {
@@ -1129,6 +1136,21 @@ impl Store {
     /// its own. SQLite cannot change a constraint in place, so a table without
     /// the column is rebuilt with every row on `github`. A fresh database
     /// already has the column from SCHEMA, so this skips it.
+    fn migrate_job_costs_fetched(conn: &Connection) -> Result<(), StoreError> {
+        let has_fetched: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('job_costs') WHERE name = 'fetched'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_fetched == 0 {
+            conn.execute(
+                "ALTER TABLE job_costs ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     fn migrate_project_forge(conn: &Connection) -> Result<(), StoreError> {
         let has_forge: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'forge'",
@@ -1954,6 +1976,7 @@ impl Store {
             "job_images",
             "job_files",
             "job_costs",
+            "cost_lookups",
             "job_events",
             "pr_watermarks",
             "logs",
@@ -2528,8 +2551,81 @@ impl Store {
     pub fn add_cost(&self, id: i64, usd: f64, estimated: bool) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        Self::add_cost_in(&tx, id, usd, estimated)?;
+        Self::add_cost_in(&tx, id, usd, estimated, None)?;
         Ok(tx.commit()?)
+    }
+
+    /// Adds `usd`, the cost `OpenRouter` charged for a run, to job `id`. The
+    /// `cost` entry is filed under the stage and turn of `at`, the job as the
+    /// run left it, because the job may have moved on by the time `OpenRouter`
+    /// answers. A zero shows as `$0.00`, since `OpenRouter` confirmed it.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`StoreError::NotFound`] when there is no job `id`, and on
+    /// a database error.
+    pub fn add_fetched_cost(&self, id: i64, usd: f64, at: &Job) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        Self::add_cost_in(&tx, id, usd, false, Some(at))?;
+        tx.execute("UPDATE job_costs SET fetched = 1 WHERE job_id = ?1", [id])?;
+        Ok(tx.commit()?)
+    }
+
+    /// Marks that a cost lookup for job `id` is running, so an open job page
+    /// keeps polling after the job ends.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn begin_cost_lookup(&self, id: i64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO cost_lookups (job_id, pending) VALUES (?1, 1)
+             ON CONFLICT (job_id) DO UPDATE SET pending = pending + 1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Marks that a lookup begun with [`Self::begin_cost_lookup`] is over.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn end_cost_lookup(&self, id: i64) -> Result<(), StoreError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE cost_lookups SET pending = pending - 1 WHERE job_id = ?1",
+            [id],
+        )?;
+        conn.execute("DELETE FROM cost_lookups WHERE pending <= 0", [])?;
+        Ok(())
+    }
+
+    /// Whether a cost lookup for job `id` is running.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn cost_lookup_pending(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row("SELECT 1 FROM cost_lookups WHERE job_id = ?1", [id], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some())
+    }
+
+    /// Forgets every running lookup. The factory calls it at start, when no
+    /// lookup of an earlier process can still run.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn clear_cost_lookups(&self) -> Result<(), StoreError> {
+        self.conn().execute("DELETE FROM cost_lookups", [])?;
+        Ok(())
     }
 
     /// Adds the cost of one run to job `id` when the agent reports `total`,
@@ -2562,7 +2658,7 @@ impl Store {
             "UPDATE sessions SET cost_usd = ?2 WHERE uuid = ?1",
             params![uuid, total],
         )?;
-        Self::add_cost_in(&tx, id, usd, false)?;
+        Self::add_cost_in(&tx, id, usd, false, None)?;
         tx.commit()?;
         Ok(usd)
     }
@@ -2572,6 +2668,7 @@ impl Store {
         id: i64,
         usd: f64,
         estimated: bool,
+        at: Option<&Job>,
     ) -> Result<(), StoreError> {
         let closed = tx
             .query_row(
@@ -2585,7 +2682,15 @@ impl Store {
             return Ok(());
         }
         let row = Self::load(tx, id)?;
-        Self::record_cost(tx, id, "cost", &row.job, None, Some(usd), estimated)?;
+        Self::record_cost(
+            tx,
+            id,
+            "cost",
+            at.unwrap_or(&row.job),
+            None,
+            Some(usd),
+            estimated,
+        )?;
         tx.execute(
             "INSERT INTO job_costs (job_id, usd) VALUES (?1, ?2)
              ON CONFLICT (job_id) DO UPDATE SET usd = usd + excluded.usd",

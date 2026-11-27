@@ -4704,6 +4704,7 @@ pub fn job(
     auto_merge: bool,
     links: &JobLinks,
     prerequisites: &[PrerequisiteView],
+    cost_pending: bool,
 ) -> Markup {
     let job = &row.job;
     let repo_url = Links::of(project);
@@ -4714,7 +4715,7 @@ pub fn job(
         &format!("Job #{id}"),
         &html! {},
         &html! {
-            (job_poll(false, id, job))
+            (job_poll(false, id, job, cost_pending))
             (job_header(id, row, label, links, repo_url, cost_usd, estimated))
             @if let Some(problem) = project.and_then(|project| project.forge.problem()) {
                 div.card.failed { (problem) }
@@ -4771,11 +4772,12 @@ pub fn job_fragment(
     auto_merge: bool,
     links: &JobLinks,
     prerequisites: &[PrerequisiteView],
+    cost_pending: bool,
 ) -> Markup {
     let job = &row.job;
     let repo_url = Links::of(project);
     html! {
-        @if terminal(job) { (job_poll(true, row.id, job)) }
+        @if terminal(job) { (job_poll(true, row.id, job, cost_pending)) }
         (cost_badge(true, cost_usd, any_estimated(events)))
         (timeline_region(true, job, events, models, efforts))
         (status_region(true, row.id, label, job, settings, auto_merge, links, prerequisites))
@@ -4789,7 +4791,8 @@ pub fn job_fragment(
 }
 
 /// Merged, failed and cancelled jobs do not change again, so their page and
-/// its fragments carry no polling attribute.
+/// its fragments carry no polling attribute, unless an `OpenRouter` cost lookup
+/// is still running and will add a cost and a log line.
 fn terminal(job: &Job) -> bool {
     matches!(
         job.stage(),
@@ -4800,10 +4803,11 @@ fn terminal(job: &Job) -> bool {
 /// The hidden element that polls the job fragment. A running job polls every
 /// `POLL_TRIGGER` and lets htmx apply the out-of-band swaps the response
 /// carries; `hx-swap="none"` keeps it from swapping the response into itself.
-/// A terminal job gets a bare element with no polling attribute, so the loop
-/// stops both on first load and when a running page reaches a terminal stage.
-fn job_poll(oob: bool, id: i64, job: &Job) -> Markup {
-    let polling = !terminal(job);
+/// A terminal job with no lookup running gets a bare element with no polling
+/// attribute, so the loop stops both on first load and when a running page
+/// reaches a terminal stage.
+fn job_poll(oob: bool, id: i64, job: &Job, cost_pending: bool) -> Markup {
+    let polling = !terminal(job) || cost_pending;
     html! {
         div #job-poll hx-swap-oob=[oob.then_some("true")]
             hx-get=[polling.then(|| format!("/jobs/{id}/fragment"))]

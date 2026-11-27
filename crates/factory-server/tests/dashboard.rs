@@ -1706,7 +1706,11 @@ async fn an_openrouter_job_shows_what_openrouter_charged_with_no_estimate_mark()
         .store
         .record_session_provider_cli(id, Session::Planning, Cli::ClaudeCode)
         .unwrap();
-    dashboard.store.add_cost(id, 0.10 + 0.25, false).unwrap();
+    let at = dashboard.store.get(id).unwrap().job;
+    dashboard
+        .store
+        .add_fetched_cost(id, 0.10 + 0.25, &at)
+        .unwrap();
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(
@@ -1717,10 +1721,71 @@ async fn an_openrouter_job_shows_what_openrouter_charged_with_no_estimate_mark()
 }
 
 #[tokio::test]
-async fn an_openrouter_job_whose_generations_were_free_shows_zero_dollars() {
+async fn a_started_openrouter_session_leaves_a_subscription_zero_cost_as_a_dash() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     dashboard.store.add_cost(id, 0.0, false).unwrap();
+    dashboard
+        .store
+        .session_uuid(id, Session::Planning, Agent::OpenRouter)
+        .unwrap();
+    dashboard
+        .store
+        .record_session_provider_cli(id, Session::Planning, Cli::Codex)
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\" id=\"job-cost\">–</span>")
+    );
+}
+
+#[tokio::test]
+async fn a_late_openrouter_cost_stays_on_its_step_and_does_not_move_the_job_back() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    let at = dashboard.store.get(id).unwrap().job;
+    dashboard.apply(id, Event::Agent(AgentResult::Clarified));
+    dashboard.store.add_fetched_cost(id, 0.4, &at).unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    let clarifying = timeline_step(&page.body, "clarifying");
+    assert!(clarifying.contains("$0.40"));
+    assert!(!clarifying.contains("class=\"current\""));
+    assert!(timeline_step(&page.body, "spec").contains("class=\"current\""));
+}
+
+#[tokio::test]
+async fn a_finished_job_keeps_polling_while_a_cost_lookup_is_pending() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Cancel);
+    let path = format!("/jobs/{id}");
+    assert!(!dashboard.get(&path).await.body.contains("hx-trigger"));
+
+    dashboard.store.begin_cost_lookup(id).unwrap();
+    let page = dashboard.get(&path).await;
+    assert!(
+        page.body
+            .contains(&format!("hx-get=\"/jobs/{id}/fragment\""))
+    );
+    let fragment = dashboard.get(&format!("{path}/fragment")).await;
+    assert!(fragment.body.contains("id=\"job-poll\""));
+    assert!(fragment.body.contains("hx-trigger"));
+
+    dashboard.store.end_cost_lookup(id).unwrap();
+    let fragment = dashboard.get(&format!("{path}/fragment")).await;
+    assert!(!fragment.body.contains("hx-trigger"));
+}
+
+#[tokio::test]
+async fn an_openrouter_job_whose_generations_were_free_shows_zero_dollars() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    let at = dashboard.store.get(id).unwrap().job;
+    dashboard.store.add_fetched_cost(id, 0.0, &at).unwrap();
     dashboard
         .store
         .session_uuid(id, Session::Planning, Agent::OpenRouter)

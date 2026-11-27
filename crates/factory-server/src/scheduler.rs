@@ -924,8 +924,6 @@ fn rerun_request(
     }
 }
 
-/// The key an `OpenRouter` run pays with, kept before the request moves into
-/// the run so the cost lookup afterwards can use it.
 fn openrouter_key_of(request: &AgentRequest) -> Option<String> {
     request
         .provider
@@ -2515,6 +2513,13 @@ impl<E: Executor> Scheduler<E> {
                 usage.input_tokens, usage.output_tokens
             )
         });
+        // The job as the run leaves it, before the run's result moves it on.
+        let Ok(at) = self.store.get(job_id).map(|row| row.job) else {
+            return;
+        };
+        if let Err(err) = self.store.begin_cost_lookup(job_id) {
+            tracing::error!("job {job_id}: {err}");
+        }
         let store = Arc::clone(&self.store);
         let costs = Arc::clone(&self.costs);
         let ids = report.generation_ids.clone();
@@ -2523,26 +2528,32 @@ impl<E: Executor> Scheduler<E> {
                 Some(key) => costs.total(key, &ids).await,
                 None => None,
             };
-            let mut text = match total {
-                Some(total) => match store.add_cost(job_id, total, false) {
-                    Ok(()) => format!(
-                        "OpenRouter run finished, {} charged by OpenRouter",
-                        format_cost(total)
-                    ),
-                    Err(err) => {
-                        tracing::error!("job {job_id}: {err}");
-                        return;
-                    }
-                },
-                None => "OpenRouter run finished. The cost could not be read from \
-                         OpenRouter and is not counted"
+            let recorded = total.map_or(Ok(None), |total| {
+                store
+                    .add_fetched_cost(job_id, total, &at)
+                    .map(|()| Some(total))
+            });
+            let mut text = match recorded {
+                Ok(Some(total)) => format!(
+                    "OpenRouter run finished, {} charged by OpenRouter",
+                    format_cost(total)
+                ),
+                Ok(None) => "OpenRouter run finished. The cost could not be read from \
+                             OpenRouter and is not counted"
                     .to_owned(),
+                Err(err) => {
+                    tracing::error!("job {job_id}: {err}");
+                    "OpenRouter run finished. The cost could not be recorded".to_owned()
+                }
             };
             if let Some(tokens) = tokens {
                 let _ = write!(text, ". {tokens}");
             }
             text.push('.');
             if let Err(err) = store.append_factory_log(job_id, &text) {
+                tracing::error!("job {job_id}: {err}");
+            }
+            if let Err(err) = store.end_cost_lookup(job_id) {
                 tracing::error!("job {job_id}: {err}");
             }
         });

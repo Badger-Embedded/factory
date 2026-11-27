@@ -273,6 +273,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local_probe: Arc::new(HttpLocalServerProbe::new()),
             openrouter: Arc::clone(&openrouter_api),
         };
+        if let Err(err) = store.clear_cost_lookups() {
+            tracing::error!("clearing cost lookups: {err}");
+        }
         let scheduler = Scheduler::new(
             Arc::clone(&store),
             Arc::clone(&projects),

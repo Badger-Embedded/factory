@@ -1334,6 +1334,7 @@ struct JobData {
     logs: Vec<crate::store::LogEntry>,
     events: Vec<crate::store::JobEvent>,
     cost_usd: Option<f64>,
+    cost_pending: bool,
     models: StageModels,
     efforts: StageEfforts,
     auto_merge: bool,
@@ -1390,6 +1391,7 @@ fn load_job(state: &AppState, login: &str, id: i64) -> Result<JobData, AppError>
     let logs = state.store.logs(id, LOG_LINES)?;
     let events = state.store.events(id)?;
     let cost_usd = state.store.recorded_cost(id)?;
+    let cost_pending = state.store.cost_lookup_pending(id)?;
     let defaults = project
         .as_ref()
         .map(|project| project.models.clone())
@@ -1410,6 +1412,7 @@ fn load_job(state: &AppState, login: &str, id: i64) -> Result<JobData, AppError>
         logs,
         events,
         cost_usd,
+        cost_pending,
         models,
         efforts,
         auto_merge,
@@ -1498,6 +1501,7 @@ async fn show_job(
         data.auto_merge,
         &data.links,
         &data.prerequisites,
+        data.cost_pending,
     ))
 }
 
@@ -1525,6 +1529,7 @@ async fn job_fragment(
         data.auto_merge,
         &data.links,
         &data.prerequisites,
+        data.cost_pending,
     ))
 }
 
