@@ -157,7 +157,7 @@ impl Expect {
             Expect::Commits | Expect::FixCi => {
                 properties["pull_request"] = json!({
                     "type": "object",
-                    "description": "With outcome commits_ready: the pull request's title and description, following the repository's CONTRIBUTING.md. Required when the factory opens the pull request from this run. Leave it out when the prompt says the pull request's title and description stay as they are.",
+                    "description": "With outcome commits_ready: the pull request's title and description, following the repository's CONTRIBUTING.md. Required when the factory opens the pull request from this run. When the prompt says the pull request's title and description stay as they are, leave it out, or set it to null when the schema requires the key.",
                     "properties": {
                         "title": { "type": "string" },
                         "body": { "type": "string" }
