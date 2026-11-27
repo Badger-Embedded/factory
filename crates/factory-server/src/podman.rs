@@ -878,11 +878,12 @@ impl Executor for PodmanExecutor {
                 )
                 .await,
         )?;
-        let ignored = keep_writers(forge.as_ref(), &reader, &request, &mut status).await?;
-        let observation = observe(&status, request.seen_until.as_deref());
         if request.watch != PrWatch::Full {
-            return Ok(waiting_report(request.watch, observation, ignored));
+            return waiting_watch(forge.as_ref(), &reader, &request, status).await;
         }
+        let ignored =
+            keep_writers_unless_failing(forge.as_ref(), &reader, &request, &mut status).await?;
+        let observation = observe(&status, request.seen_until.as_deref());
         if matches!(observation, Observation::Ready)
             && !request.may_merge
             && let Some(reason) = self.retarget_reason(&request).await?
@@ -1397,6 +1398,25 @@ fn version_field(line: &str) -> Option<(String, String)> {
     (VERSION_KEYS.contains(&key) && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
 }
 
+/// Reports a merge or close before any commenter lookup. Under
+/// [`PrWatch::MergeCloseOrComments`], eligible comments then outrank a
+/// conflict or failed CI.
+async fn waiting_watch(
+    forge: &dyn Forge,
+    reader: &Operation,
+    request: &WatchRequest,
+    mut status: PrStatus,
+) -> Result<WatchReport, String> {
+    let mut ignored = Vec::new();
+    if request.watch == PrWatch::MergeCloseOrComments {
+        ignored = keep_writers(forge, reader, request, &mut status).await?;
+        status.conflicting = false;
+        status.ci = Ci::Pending;
+    }
+    let observation = observe(&status, request.seen_until.as_deref());
+    Ok(waiting_report(request.watch, observation, ignored))
+}
+
 /// The report of a watch while the job waits for the user: only what
 /// [`waiting_event`] allows. It carries the new watermark only when it
 /// delivers comments, so comments the job does not take now are picked up
@@ -1421,9 +1441,21 @@ fn waiting_report(
     }
 }
 
+async fn keep_writers_unless_failing(
+    forge: &dyn Forge,
+    reader: &Operation,
+    request: &WatchRequest,
+    status: &mut PrStatus,
+) -> Result<Vec<IgnoredCommenter>, String> {
+    if status.conflicting || matches!(status.ci, Ci::Failed(_)) {
+        return Ok(Vec::new());
+    }
+    keep_writers(forge, reader, request, status).await
+}
+
 /// Drops from `status` the comments of every login that has no write access
 /// to the watched repository, so a passer-by cannot steer the agent, and
-/// returns those logins. Only the authors of comments newer than the
+/// returns those logins. A merged or closed pull request has no lookups. Only the authors of comments newer than the
 /// watermark are looked up, on
 /// every watch, so a login whose access was taken away counts at once. A
 /// login whose access the forge will not tell the account counts as one
@@ -1434,6 +1466,9 @@ async fn keep_writers(
     request: &WatchRequest,
     status: &mut PrStatus,
 ) -> Result<Vec<IgnoredCommenter>, String> {
+    if status.state != PrState::Open {
+        return Ok(Vec::new());
+    }
     let seen_until = request.seen_until.as_deref();
     let mut logins: Vec<&str> = status
         .comments
