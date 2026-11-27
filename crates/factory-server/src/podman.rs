@@ -1420,6 +1420,26 @@ async fn waiting_watch(
 /// [`waiting_event`] allows. It carries the new watermark only when it
 /// delivers comments, so comments the job does not take now are picked up
 /// once it goes back to watching normally.
+/// The report of a watch that only waits for a merge or close, and for
+/// comments when `watch` is [`PrWatch::MergeCloseOrComments`]. A merge or
+/// close is reported before any commenter is looked up, and comments outrank
+/// a conflict or failed CI, which a waiting watch discards.
+async fn waiting_watch(
+    forge: &dyn Forge,
+    reader: &Operation,
+    request: &WatchRequest,
+    mut status: PrStatus,
+) -> Result<WatchReport, String> {
+    let mut ignored = Vec::new();
+    if request.watch == PrWatch::MergeCloseOrComments {
+        ignored = keep_writers(forge, reader, request, &mut status).await?;
+        status.conflicting = false;
+        status.ci = Ci::Pending;
+    }
+    let observation = observe(&status, request.seen_until.as_deref());
+    Ok(waiting_report(request.watch, observation, ignored))
+}
+
 fn waiting_report(
     watch: PrWatch,
     observation: Observation,
