@@ -1371,6 +1371,7 @@ async fn user_access_reads_the_permission_of_another_login() {
   repos/o/r/collaborators/keeper/permission) echo '{"permission":"write","role_name":"maintain"}' ;;
   repos/o/r/collaborators/triager/permission) echo '{"permission":"read","role_name":"triage"}' ;;
   repos/o/r/collaborators/passerby/permission) echo '{"permission":"none","role_name":"none"}' ;;
+  repos/o/r/collaborators/octo_acme/permission) echo '{"permission":"write","role_name":"write"}' ;;
   repos/o/r/collaborators/ghost/permission) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
   *) echo "gh: boom $2" >&2; exit 1 ;;
 esac"#,
@@ -1390,7 +1391,7 @@ esac"#,
     assert_eq!(access("triager").await, Ok(Some(Access::Read)));
     assert_eq!(access("passerby").await, Ok(Some(Access::Read)));
     assert_eq!(access("ghost").await, Ok(Some(Access::Read)));
-    // A bot login never reaches the API, so the catch-all error is not hit.
+    assert_eq!(access("octo_acme").await, Ok(Some(Access::Write)));
     assert_eq!(access("dependabot[bot]").await, Ok(Some(Access::Read)));
     assert_eq!(access("../x").await, Ok(Some(Access::Read)));
     assert!(access("other").await.is_err());

@@ -2138,6 +2138,34 @@ async fn a_writers_comment_reaches_the_agent_while_ci_fails_or_the_pull_request_
 }
 
 #[tokio::test]
+async fn a_full_watch_reports_a_conflict_or_failed_ci_when_the_permission_lookup_fails() {
+    for (mergeable, conclusion) in [("MERGEABLE", "FAILURE"), ("CONFLICTING", "SUCCESS")] {
+        let tools = Tools::new();
+        gh_for_pr(&tools, "OPEN", mergeable, conclusion);
+        let gh = tools.dir.path().join("gh");
+        let script = std::fs::read_to_string(&gh).unwrap().replace(
+            "*collaborators/alice/permission*) echo",
+            "*collaborators/alice/permission*) echo boom >&2; exit 1; echo",
+        );
+        support::executable(tools.dir.path(), "gh", &script);
+        let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+        let mut request = merge_wait_watch("2026-11-27T09:00:00Z");
+        request.watch = PrWatch::Full;
+        request.may_merge = true;
+
+        let report = podman.watch(request).await.unwrap();
+
+        let expected = if mergeable == "CONFLICTING" {
+            matches!(report.event, Some(Event::Conflicted { .. }))
+        } else {
+            matches!(report.event, Some(Event::CiFailed { .. }))
+        };
+        assert!(expected, "{mergeable} {conclusion}: {:?}", report.event);
+        assert_eq!(report.ignored.len(), 0);
+    }
+}
+
+#[tokio::test]
 async fn a_merge_or_close_is_reported_without_looking_up_any_commenter() {
     for (state, event) in [("MERGED", Event::Merged), ("CLOSED", Event::ClosedUnmerged)] {
         for watch in [PrWatch::MergeOrClose, PrWatch::MergeCloseOrComments] {

@@ -881,7 +881,8 @@ impl Executor for PodmanExecutor {
         if request.watch != PrWatch::Full {
             return waiting_watch(forge.as_ref(), &reader, &request, status).await;
         }
-        let ignored = keep_writers(forge.as_ref(), &reader, &request, &mut status).await?;
+        let ignored =
+            keep_writers_if_not_outranked(forge.as_ref(), &reader, &request, &mut status).await?;
         let observation = observe(&status, request.seen_until.as_deref());
         if matches!(observation, Observation::Ready)
             && !request.may_merge
@@ -1438,6 +1439,21 @@ fn waiting_report(
         merged_by_factory: false,
         ignored,
     }
+}
+
+/// [`keep_writers`] for a full watch, where a conflict or failed CI outranks
+/// comments and does not depend on who wrote them, so it is reported without
+/// a commenter lookup.
+async fn keep_writers_if_not_outranked(
+    forge: &dyn Forge,
+    reader: &Operation,
+    request: &WatchRequest,
+    status: &mut PrStatus,
+) -> Result<Vec<IgnoredCommenter>, String> {
+    if status.conflicting || matches!(status.ci, Ci::Failed(_)) {
+        return Ok(Vec::new());
+    }
+    keep_writers(forge, reader, request, status).await
 }
 
 /// Drops from `status` the comments of every login that has no write access

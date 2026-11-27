@@ -1871,11 +1871,12 @@ impl Forge for GitHub {
                 permission: String,
             }
             // A bot such as `dependabot[bot]` or a name that is not a login
-            // is no collaborator, and it never reaches the API path.
+            // is no collaborator, and it never reaches the API path. An
+            // Enterprise Managed User login carries `_<shortcode>`.
             if login.is_empty()
                 || !login
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             {
                 return Ok(Some(Access::Read));
             }
