@@ -1745,8 +1745,9 @@ impl<E: Executor> Scheduler<E> {
     /// The Local settings for a run of `session`, read afresh so a change
     /// applies from the next run, or the reason the run cannot start. It checks
     /// the server and the model before any checkout or container. A session
-    /// resumes on the CLI it started on, and a fresh one uses the CLI the
-    /// settings name now.
+    /// resumes on the CLI it started on. A fresh one uses the CLI the job's
+    /// requester chose, or the factory default when they chose none or the
+    /// factory requested the job.
     fn local_request(
         &self,
         row: &JobRow,
@@ -1764,10 +1765,17 @@ impl<E: Executor> Scheduler<E> {
             Ok(resolved) => resolved,
             Err(reason) => return Ok(Err(reason)),
         };
+        let chosen = if row.requested_by == FACTORY_REQUESTER {
+            settings.cli
+        } else {
+            self.store
+                .user_cli(&row.requested_by, Agent::Local)?
+                .unwrap_or(settings.cli)
+        };
         let cli = self
             .store
             .session_provider_cli(row.id, session)?
-            .unwrap_or(settings.cli);
+            .unwrap_or(chosen);
         Ok(Ok(ProviderRequest {
             target: ProviderTarget {
                 kind: ProviderKind::Local {
@@ -1780,7 +1788,7 @@ impl<E: Executor> Scheduler<E> {
                 key,
             },
             key_from,
-            setting_cli: settings.cli,
+            setting_cli: chosen,
             session,
         }))
     }
@@ -2365,8 +2373,8 @@ impl<E: Executor> Scheduler<E> {
             self.note(
                 job_id,
                 &format!(
-                    "This session started on {from}, so it stays on {from}. The Local settings \
-                     name {to} now, which new sessions use.",
+                    "This session started on {from}, so it stays on {from}. The requester's \
+                     choice is {to} now, which new sessions use.",
                     from = local.target.cli.display_name(),
                     to = local.setting_cli.display_name(),
                 ),

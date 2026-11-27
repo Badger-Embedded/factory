@@ -324,6 +324,13 @@ CREATE TABLE IF NOT EXISTS local_settings (
     models_url TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS user_agent_cli (
+    login TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    cli TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (login, agent)
+);
 CREATE TABLE IF NOT EXISTS local_models (
     id TEXT PRIMARY KEY,
     position INTEGER NOT NULL
@@ -2883,6 +2890,52 @@ impl Store {
                 models_url,
             },
         ))
+    }
+
+    /// The CLI `login` chose for `agent`, or `None` for the factory default.
+    /// An id this build does not know reads as the factory default.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn user_cli(&self, login: &str, agent: Agent) -> Result<Option<Cli>, StoreError> {
+        let id = self
+            .conn()
+            .query_row(
+                "SELECT cli FROM user_agent_cli WHERE login = ?1 AND agent = ?2",
+                params![login, agent.id()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(id.and_then(|id| Cli::from_id(&id)))
+    }
+
+    /// Stores the CLI `login` chose for `agent`. `None` removes the choice, so
+    /// the factory default applies.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a database error.
+    pub fn set_user_cli(
+        &self,
+        login: &str,
+        agent: Agent,
+        cli: Option<Cli>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn();
+        match cli {
+            Some(cli) => conn.execute(
+                "INSERT INTO user_agent_cli (login, agent, cli) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (login, agent) DO UPDATE SET cli = ?3,
+                     updated_at = CURRENT_TIMESTAMP",
+                params![login, agent.id(), cli.id()],
+            )?,
+            None => conn.execute(
+                "DELETE FROM user_agent_cli WHERE login = ?1 AND agent = ?2",
+                params![login, agent.id()],
+            )?,
+        };
+        Ok(())
     }
 
     /// Stores the Local server, the CLI and the model load timeout. The URL is

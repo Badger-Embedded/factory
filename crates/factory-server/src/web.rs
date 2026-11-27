@@ -4757,7 +4757,9 @@ fn local_key_page(
     Ok(pages::settings_local_key(
         &login,
         &settings_nav(state, &login)?,
-        settings.url.as_deref().map(|url| (url, settings.cli)),
+        settings.url.as_deref(),
+        state.store.user_cli(&login, Agent::Local)?,
+        settings.cli,
         key_set,
         state.secrets.available(),
         &state.csrf.issue(&login),
@@ -4781,9 +4783,20 @@ struct LocalKeyForm {
     server: String,
     #[serde(default)]
     key: String,
+    /// `default`, or the id of a CLI.
+    #[serde(default)]
+    cli: String,
 }
 
-/// Stores the login's own Local API key. An empty field keeps the stored key.
+/// What a save does with the login's CLI choice. A post without the field,
+/// such as one from an older tab, keeps the stored choice.
+enum Choice {
+    Keep,
+    Set(Option<Cli>),
+}
+
+/// Stores the login's CLI choice and its own Local API key. An empty field
+/// keeps the stored key. The CLI choice saves without the master key.
 async fn save_local_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4791,14 +4804,22 @@ async fn save_local_key(
 ) -> Result<Markup, AppError> {
     let login = user(&headers);
     require_csrf(&state, &login, &form.csrf)?;
-    if !state.secrets.available() {
+    let cli = match form.cli.as_str() {
+        "" => Choice::Keep,
+        "default" => Choice::Set(None),
+        id => match Cli::from_id(id) {
+            Some(cli) => Choice::Set(Some(cli)),
+            None => return local_key_page(&state, &headers, Some("Unknown CLI.")),
+        },
+    };
+    let key = form.key.trim();
+    if !key.is_empty() && !state.secrets.available() {
         return local_key_page(
             &state,
             &headers,
             Some("The master key is missing, so the key was not saved."),
         );
     }
-    let key = form.key.trim();
     let _one_local_change_at_a_time = state.local_lock.lock().await;
     let current = state.store.local_settings()?.url.unwrap_or_default();
     if !key.is_empty() && form.server != current {
@@ -4809,6 +4830,9 @@ async fn save_local_key(
                 "The server changed while the page was open, so the key was not saved. Check the server below and save again.",
             ),
         );
+    }
+    if let Choice::Set(cli) = cli {
+        state.store.set_user_cli(&login, Agent::Local, cli)?;
     }
     if !key.is_empty() {
         state.secrets.set_user_local_key(&login, key)?;
