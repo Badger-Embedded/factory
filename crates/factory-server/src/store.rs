@@ -612,10 +612,11 @@ pub struct ProjectTotals {
 }
 
 /// Selects the `job_costs` rows to show as a cost: a positive total, or a zero
-/// total of a job that ran a worker on Local. Another zero row reads as no cost.
+/// total of a job that ran a worker on Local or `OpenRouter`, whose cost is
+/// known to be nothing, such as a `:free` model. Another zero row reads as no cost.
 const SHOWN_COST: &str = "(c.usd > 0 OR EXISTS (
     SELECT 1 FROM sessions s
-    WHERE s.job_id = c.job_id AND s.agent = 'local' AND s.local_cli IS NOT NULL))";
+    WHERE s.job_id = c.job_id AND s.agent IN ('local', 'openrouter') AND s.local_cli IS NOT NULL))";
 
 /// One model's Codex prices, in USD per million tokens. The factory estimates a
 /// Codex run's cost from the row for the model it ran, since Codex reports token

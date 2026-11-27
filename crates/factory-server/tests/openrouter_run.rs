@@ -12,10 +12,11 @@ use factory_runner::{
     WorkerConfig,
 };
 use factory_server::{
-    AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
-    HttpLocalServerProbe, KeyOwner, LocalSecrets, MASTER_KEY_LEN, ModelsError, OpenRouterApi,
-    OpenRouterKeyFuture, OpenRouterModelsFuture, PlanUsageCache, PodmanExecutor, ProviderRequest,
-    SecretStore, Settings, Store,
+    AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges,
+    GenerationError, GhRepos, HttpLocalServerProbe, KeyOwner, LocalSecrets, MASTER_KEY_LEN,
+    ModelsError, OpenRouterApi, OpenRouterGenerationFuture, OpenRouterKeyFuture,
+    OpenRouterModelsFuture, PlanUsageCache, PodmanExecutor, ProviderRequest, SecretStore, Settings,
+    Store,
 };
 
 mod support;
@@ -35,6 +36,10 @@ impl OpenRouterApi for FakeApi {
     fn check_key<'a>(&'a self, key: &'a str) -> OpenRouterKeyFuture<'a> {
         self.seen.lock().unwrap().push(key.to_owned());
         Box::pin(std::future::ready(self.answer.clone()))
+    }
+
+    fn generation<'a>(&'a self, _id: &'a str, _key: &'a str) -> OpenRouterGenerationFuture<'a> {
+        Box::pin(std::future::ready(Err(GenerationError::NotReady)))
     }
 }
 

@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::local_server::ModelsError;
@@ -27,6 +28,40 @@ pub type OpenRouterModelsFuture<'a> =
 pub type OpenRouterKeyFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), ModelsError>> + Send + 'a>>;
 
+pub type OpenRouterGenerationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<f64, GenerationError>> + Send + 'a>>;
+
+/// Why a generation's cost could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationError {
+    /// `OpenRouter` does not know the generation yet, or its answer holds no
+    /// cost yet. It can show up a moment after the run ends.
+    NotReady,
+    /// The request failed.
+    Failed(ModelsError),
+}
+
+impl GenerationError {
+    /// Whether asking again later can help. A 401 or 403 means `OpenRouter`
+    /// refuses the key, which waiting does not change.
+    #[must_use]
+    pub fn retryable(&self) -> bool {
+        !matches!(
+            self,
+            GenerationError::Failed(ModelsError::Status(401 | 403))
+        )
+    }
+}
+
+impl std::fmt::Display for GenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GenerationError::NotReady => f.write_str("OpenRouter has no cost for it yet"),
+            GenerationError::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
 /// Talks to `OpenRouter`. A trait so tests can answer without a network.
 pub trait OpenRouterApi: Send + Sync {
     /// Lists the models that support tool calls, sending `key` as a bearer
@@ -48,6 +83,68 @@ pub trait OpenRouterApi: Send + Sync {
     /// [`ModelsError::Timeout`] when it cannot be reached. The text never holds
     /// the key.
     fn check_key<'a>(&'a self, key: &'a str) -> OpenRouterKeyFuture<'a>;
+
+    /// Reads what `OpenRouter` charged for generation `id` in USD, with one
+    /// `GET /api/v1/generation?id=<id>` using `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::NotReady`] for a 404 or an answer with no
+    /// `data.total_cost`, which can hold right after a run, and
+    /// [`GenerationError::Failed`] for any other failure. The text never holds
+    /// the key.
+    fn generation<'a>(&'a self, id: &'a str, key: &'a str) -> OpenRouterGenerationFuture<'a>;
+}
+
+/// Reads what a run was charged from the generations its output showed.
+pub struct OpenRouterCosts {
+    api: Arc<dyn OpenRouterApi>,
+    delays: Vec<Duration>,
+}
+
+impl OpenRouterCosts {
+    /// Asks again after 2, 4, 8, 16 and 30 seconds, so a generation that
+    /// `OpenRouter` has not stored yet is waited for about a minute.
+    #[must_use]
+    pub fn new(api: Arc<dyn OpenRouterApi>) -> Self {
+        Self::with_delays(api, [2, 4, 8, 16, 30].map(Duration::from_secs).to_vec())
+    }
+
+    /// As [`Self::new`], with the waits between the rounds of asking given.
+    #[must_use]
+    pub fn with_delays(api: Arc<dyn OpenRouterApi>, delays: Vec<Duration>) -> Self {
+        OpenRouterCosts { api, delays }
+    }
+
+    /// The sum of the costs of the generations `ids`, read with `key`. Each
+    /// round asks only for the ids still unread. `None` when an id stays
+    /// unread after the last round, `OpenRouter` refuses the key, or `ids` is
+    /// empty.
+    pub async fn total(&self, key: &str, ids: &[String]) -> Option<f64> {
+        if ids.is_empty() {
+            return None;
+        }
+        let mut costs: Vec<Option<f64>> = vec![None; ids.len()];
+        for round in 0..=self.delays.len() {
+            for (id, slot) in ids.iter().zip(&mut costs) {
+                if slot.is_some() {
+                    continue;
+                }
+                match self.api.generation(id, key).await {
+                    Ok(cost) => *slot = Some(cost),
+                    Err(error) if !error.retryable() => return None,
+                    Err(_) => {}
+                }
+            }
+            if costs.iter().all(Option::is_some) {
+                break;
+            }
+            if let Some(delay) = self.delays.get(round) {
+                tokio::time::sleep(*delay).await;
+            }
+        }
+        costs.into_iter().sum()
+    }
 }
 
 /// The production [`OpenRouterApi`]. It follows no redirect, so the key never
@@ -131,6 +228,50 @@ impl OpenRouterApi for HttpOpenRouterApi {
             }
         })
     }
+
+    fn generation<'a>(&'a self, id: &'a str, key: &'a str) -> OpenRouterGenerationFuture<'a> {
+        Box::pin(async move {
+            let client = self
+                .client
+                .as_ref()
+                .ok_or(GenerationError::Failed(ModelsError::Connect))?;
+            let response = client
+                .get(format!("{}/v1/generation", self.base_url))
+                .query(&[("id", id)])
+                .bearer_auth(key)
+                .send()
+                .await
+                .map_err(|err| GenerationError::Failed(transport(&err)))?;
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(GenerationError::NotReady);
+            }
+            if !status.is_success() {
+                return Err(GenerationError::Failed(ModelsError::Status(
+                    status.as_u16(),
+                )));
+            }
+            let body = response
+                .bytes()
+                .await
+                .map_err(|err| GenerationError::Failed(transport(&err)))?;
+            parse_generation_cost(&body)
+        })
+    }
+}
+
+/// The `data.total_cost` of a generation answer.
+///
+/// # Errors
+///
+/// Returns [`GenerationError::NotReady`] when the body holds no non-negative
+/// cost.
+pub fn parse_generation_cost(body: &[u8]) -> Result<f64, GenerationError> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("data")?.get("total_cost")?.as_f64())
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .ok_or(GenerationError::NotReady)
 }
 
 /// The models of an `OpenRouter` list that support tools, in its order. A model

@@ -1695,7 +1695,29 @@ async fn a_job_that_only_ran_on_local_shows_zero_dollars_with_no_estimate_mark()
 }
 
 #[tokio::test]
-async fn a_started_openrouter_session_leaves_a_subscription_zero_cost_as_a_dash() {
+async fn an_openrouter_job_shows_what_openrouter_charged_with_no_estimate_mark() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard
+        .store
+        .session_uuid(id, Session::Planning, Agent::OpenRouter)
+        .unwrap();
+    dashboard
+        .store
+        .record_session_provider_cli(id, Session::Planning, Cli::ClaudeCode)
+        .unwrap();
+    dashboard.store.add_cost(id, 0.10 + 0.25, false).unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\" id=\"job-cost\">$0.35</span>")
+    );
+    assert!(!page.body.contains("≈"));
+}
+
+#[tokio::test]
+async fn an_openrouter_job_whose_generations_were_free_shows_zero_dollars() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
     dashboard.store.add_cost(id, 0.0, false).unwrap();
@@ -1711,8 +1733,11 @@ async fn a_started_openrouter_session_leaves_a_subscription_zero_cost_as_a_dash(
     let page = dashboard.get(&format!("/jobs/{id}")).await;
     assert!(
         page.body
-            .contains("<span class=\"badge cost\" id=\"job-cost\">–</span>")
+            .contains("<span class=\"badge cost\" id=\"job-cost\">$0.00</span>")
     );
+    let index = dashboard.get("/").await;
+    assert!(index.body.contains("<span class=\"cost\">$0.00</span>"));
+    assert!(!page.body.contains("≈"));
 }
 
 #[tokio::test]

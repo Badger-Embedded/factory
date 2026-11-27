@@ -12,11 +12,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_runner::{Account, GitHub};
 use factory_server::{
-    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, HttpForgejoProbe,
+    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GenerationError, HttpForgejoProbe,
     HttpLocalServerProbe, LocalSecrets, LoginProcess, LoginSpawner, LoginSpec, MASTER_KEY_LEN,
-    McpChecker, ModelsError, OpenRouterApi, OpenRouterKeyFuture, OpenRouterModel,
-    OpenRouterModelsFuture, PlanUsageCache, Projects, RepoChecker, RepoReport, SecretStore, Store,
-    USER_HEADER, UnavailableSecrets, WorkerSlots, app_with_forgejo_probe,
+    McpChecker, ModelsError, OpenRouterApi, OpenRouterGenerationFuture, OpenRouterKeyFuture,
+    OpenRouterModel, OpenRouterModelsFuture, PlanUsageCache, Projects, RepoChecker, RepoReport,
+    SecretStore, Store, USER_HEADER, UnavailableSecrets, WorkerSlots, app_with_forgejo_probe,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -164,6 +164,10 @@ impl OpenRouterApi for FakeOpenRouter {
 
     fn check_key<'a>(&'a self, _key: &'a str) -> OpenRouterKeyFuture<'a> {
         Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn generation<'a>(&'a self, _id: &'a str, _key: &'a str) -> OpenRouterGenerationFuture<'a> {
+        Box::pin(std::future::ready(Err(GenerationError::NotReady)))
     }
 }
 

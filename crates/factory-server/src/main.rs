@@ -7,10 +7,10 @@ use factory_runner::{ForgeKind, Git, GitHub, GitLab, WorkerConfig};
 use factory_server::{
     Accounts, AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, GhRepos, GlabRepos,
     HttpForgejoProbe, HttpLocalServerProbe, HttpMcpChecker, HttpOpenRouterApi, LocalSecrets,
-    LoginSpec, McpChecker, McpRuntime, McpWarnings, OpenRouterApi, PlanUsageCache, PodmanExecutor,
-    PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler, SecretStore, Store,
-    StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots, app_with_forgejo_probe,
-    import_tomls, master_key_from_env, parse_admins, proxy_app_with_roots,
+    LoginSpec, McpChecker, McpRuntime, McpWarnings, OpenRouterApi, OpenRouterCosts, PlanUsageCache,
+    PodmanExecutor, PodmanLogin, Projects, ProxyEvent, ProxyEventFn, RunTokens, Scheduler,
+    SecretStore, Store, StoreUpstreams, UnavailableSecrets, Upstreams, WorkerSlots,
+    app_with_forgejo_probe, import_tomls, master_key_from_env, parse_admins, proxy_app_with_roots,
 };
 use tokio::sync::Notify;
 
@@ -286,6 +286,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 warnings: Arc::clone(&mcp_warnings),
             },
             Accounts::new(Arc::clone(&store), Arc::clone(&secrets), forges.clone()),
+            OpenRouterCosts::new(Arc::clone(&openrouter_api)),
         );
         slots = scheduler.slots();
         tokio::spawn(scheduler.run());
