@@ -2355,8 +2355,18 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
         log: "test foo failed".into(),
     };
     let check = Task::CheckDiff {
-        diff: "+version = 1.2.3".into(),
-        body: "Bumps serde".into(),
+        diff: "--- a/.github/workflows/build-wormholes.yml\n\
+               +++ b/.github/workflows/build-wormholes.yml\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7\n\
+               -      - uses: actions/checkout@v6\n\
+               +      - uses: actions/checkout@v7"
+            .into(),
+        body: "Update actions/checkout action to v7. v7.0.0 breaking change: fork checkouts \
+               are blocked for pull_request_target and workflow_run."
+            .into(),
     };
     for agent in [Agent::Claude, Agent::Codex] {
         let text = prompt(&analyze, Expect::FailureAnalysis, agent);
@@ -2366,7 +2376,14 @@ fn the_renovate_prompts_carry_their_input_and_keep_the_worker_read_only() {
         assert!(!text.contains("Moon Skywalker"));
 
         let text = prompt(&check, Expect::DiffCheck, agent);
-        assert!(text.contains("+version = 1.2.3") && text.contains("Bumps serde"));
+        assert_eq!(
+            text.matches("+      - uses: actions/checkout@v7").count(),
+            3
+        );
+        assert!(text.contains("build-wormholes.yml"));
+        assert!(text.contains("pull_request_target and workflow_run"));
+        assert!(text.contains("check the repository for use of"));
+        assert!(text.contains("always unsafe"));
         assert!(text.contains("every change only moves a version, in any file"));
         assert!(text.contains("release notes") && text.contains("breaking change"));
         assert!(text.contains("you cannot tell, the update is unsafe"));

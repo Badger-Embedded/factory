@@ -2916,13 +2916,17 @@ fn an_unsafe_verdict_posts_one_comment_and_never_merges() {
         &mut job,
         Event::Agent(AgentResult::DiffVerdict(Box::new(DiffVerdict {
             safe: false,
-            reason: "it edits a workflow".into(),
+            reason: "v7 blocks fork checkouts and I could not tell whether the triggers allow them"
+                .into(),
             summary: "bump".into(),
             from: None,
             to: None,
         }))),
     );
-    assert!(post_comment(&mut job).contains("it edits a workflow"));
+    let body = post_comment(&mut job);
+    assert!(body.contains("I could not tell whether the triggers allow them"));
+    assert!(!body.contains("dependency or packaging version files"));
+    assert!(!body.contains("affects this project"));
     waits(&job, RenovateWait::Unsafe);
     assert!(!job.can_retry());
     assert!(matches!(

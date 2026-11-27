@@ -822,8 +822,8 @@ fn unsafe_texts(reason: &str) -> (String, String) {
         format!("The diff check found the update unsafe to merge: {reason}"),
         format!(
             "The factory does not merge this update, because the diff check found it \
-             unsafe. Either the diff changes more than versions, or a breaking change in the \
-             new version affects this project.\n\n{reason}"
+             unsafe. The diff changes more than versions, or a breaking change in the new \
+             version may affect this project.\n\n{reason}"
         ),
     )
 }
