@@ -858,7 +858,8 @@ struct WorkerCostGuard {
 
 impl WorkerCostGuard {
     /// `Ok(None)` for a run that is not on `OpenRouter`. `Err(())` when the job
-    /// left the stage it was dispatched in, so the run must not start.
+    /// left the stage it was dispatched in or the store failed, so the run does
+    /// not start and the next pass retries.
     fn for_request(
         store: &Arc<Store>,
         request: &AgentRequest,
@@ -880,7 +881,7 @@ impl WorkerCostGuard {
             Ok(false) => Err(()),
             Err(err) => {
                 tracing::error!("job {job_id}: {err}");
-                Ok(None)
+                Err(())
             }
         }
     }

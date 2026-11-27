@@ -19364,3 +19364,26 @@ async fn the_review_card_offers_fix_elsewhere_for_a_fork_and_the_job_page_links_
     assert!(page.body.contains("stacked-pr"), "{}", page.body);
     assert!(page.body.contains("/pull/77"), "{}", page.body);
 }
+
+#[tokio::test]
+async fn a_cancelled_job_page_polls_until_the_registered_charge_arrives() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.apply(id, Event::Start);
+    let at = dashboard.store.get(id).unwrap().job;
+    assert!(dashboard.store.begin_cost_lookup_at(id, &at).unwrap());
+    dashboard.apply(id, Event::Cancel);
+
+    let path = format!("/jobs/{id}");
+    let page = dashboard.get(&path).await;
+    assert!(
+        page.body
+            .contains(&format!("hx-get=\"/jobs/{id}/fragment\""))
+    );
+
+    dashboard.store.add_fetched_cost(id, 0.4, &at).unwrap();
+    dashboard.store.end_cost_lookup(id).unwrap();
+    let fragment = dashboard.get(&format!("{path}/fragment")).await;
+    assert!(fragment.body.contains("$0.40"));
+    assert!(!fragment.body.contains("hx-trigger"));
+}
