@@ -65,6 +65,8 @@ A factory admin registers each Forgejo server, such as a self-hosted one or Code
 
 Each login saves a personal access token for a server on its page in the Forges group, `/settings/forges/<name>`. The token needs the scopes `read:user`, `write:repository` and `write:issue`. A project on a registered server can be onboarded from the wizard, where each server is a Forge option and the repository is `owner/name`, and can run request jobs, Renovate jobs and packaging. Forgejo has no fixed Renovate account, so set the Renovate account in the project's Maintenance card before you turn Renovate on. A packaging project can name a Forgejo server as its upstream forge.
 
+Forgejo tells only a repository or instance admin what access another user has. To take pull request comments from other people, the token must belong to an admin of the repository. With a Write-only token the factory cannot check a commenter, so it ignores their comments.
+
 ## Deploy to moon
 
 ```sh

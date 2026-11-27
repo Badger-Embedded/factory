@@ -2030,9 +2030,7 @@ async fn a_quick_review_that_cannot_start_stops_for_a_retry_and_does_not_fail_th
     );
 }
 
-/// A `gh` for a green pull request with a comment from `alice`, who can
-/// write, and a later one from `mallory`, who can only read.
-fn commenters_gh(tools: &Tools) {
+fn gh_with_writer_and_reader_comments(tools: &Tools) {
     support::executable(
         tools.dir.path(),
         "gh",
@@ -2067,7 +2065,7 @@ fn merge_wait_watch(seen_until: &str) -> factory_server::WatchRequest {
 #[tokio::test]
 async fn only_comments_from_logins_with_write_access_reach_the_agent() {
     let tools = Tools::new();
-    commenters_gh(&tools);
+    gh_with_writer_and_reader_comments(&tools);
     let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
 
     let report = podman
@@ -2086,8 +2084,6 @@ async fn only_comments_from_logins_with_write_access_reach_the_agent() {
         vec![factory_server::IgnoredCommenter::NoWrite("mallory".into())]
     );
 
-    // With alice's comment taken, mallory's alone wakes nothing, and the
-    // watermark stays where it is.
     let report = podman
         .watch(merge_wait_watch("2026-11-27T10:00:00Z"))
         .await
@@ -2098,6 +2094,79 @@ async fn only_comments_from_logins_with_write_access_reach_the_agent() {
         report.ignored,
         vec![factory_server::IgnoredCommenter::NoWrite("mallory".into())]
     );
+}
+
+fn gh_for_pr(tools: &Tools, state: &str, mergeable: &str, conclusion: &str) {
+    let calls = tools.dir.path().join("calls");
+    support::executable(
+        tools.dir.path(),
+        "gh",
+        &format!(
+            "#!/bin/bash\necho \"gh $*\" >> '{calls}'\n\
+             case \"$*\" in\n\
+             *\"pr view\"*) echo '{{\"state\":\"{state}\",\"mergeable\":\"{mergeable}\",\"headRefOid\":\"h1\",\"statusCheckRollup\":[{{\"name\":\"t\",\"status\":\"COMPLETED\",\"conclusion\":\"{conclusion}\"}}],\"comments\":[{{\"author\":{{\"login\":\"alice\"}},\"body\":\"rename it\",\"createdAt\":\"2026-11-27T10:00:00Z\"}}],\"reviews\":[]}}' ;;\n\
+             *pulls/12/comments*) ;;\n\
+             *collaborators/alice/permission*) echo '{{\"permission\":\"write\",\"role_name\":\"write\"}}' ;;\n\
+             *) echo \"gh: unexpected $*\" >&2; exit 1 ;;\n\
+             esac\n",
+            calls = calls.display()
+        ),
+    );
+}
+
+#[tokio::test]
+async fn a_writers_comment_reaches_the_agent_while_ci_fails_or_the_pull_request_conflicts() {
+    for (mergeable, conclusion) in [("MERGEABLE", "FAILURE"), ("CONFLICTING", "SUCCESS")] {
+        let tools = Tools::new();
+        gh_for_pr(&tools, "OPEN", mergeable, conclusion);
+        let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+
+        let report = podman
+            .watch(merge_wait_watch("2026-11-27T09:00:00Z"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.event,
+            Some(Event::ReviewComments {
+                comments: "alice:\nrename it".into()
+            }),
+            "{mergeable} {conclusion}"
+        );
+        assert_eq!(report.seen_until.as_deref(), Some("2026-11-27T10:00:00Z"));
+    }
+}
+
+#[tokio::test]
+async fn a_merge_or_close_is_reported_without_looking_up_any_commenter() {
+    for (state, event) in [("MERGED", Event::Merged), ("CLOSED", Event::ClosedUnmerged)] {
+        for watch in [PrWatch::MergeOrClose, PrWatch::MergeCloseOrComments] {
+            let tools = Tools::new();
+            gh_for_pr(&tools, state, "MERGEABLE", "SUCCESS");
+            let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+            let mut request = merge_wait_watch("2026-11-27T09:00:00Z");
+            request.watch = watch;
+
+            let report = podman.watch(request).await.unwrap();
+
+            assert_eq!(report.event, Some(event.clone()), "{state} {watch:?}");
+            assert!(!tools.calls().contains("permission"), "{}", tools.calls());
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_stopped_review_watch_does_not_look_up_commenters() {
+    let tools = Tools::new();
+    gh_for_pr(&tools, "OPEN", "MERGEABLE", "SUCCESS");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut request = merge_wait_watch("2026-11-27T09:00:00Z");
+    request.watch = PrWatch::MergeOrClose;
+
+    let report = podman.watch(request).await.unwrap();
+
+    assert_eq!(report.event, None);
+    assert!(!tools.calls().contains("permission"), "{}", tools.calls());
 }
 
 #[tokio::test]
