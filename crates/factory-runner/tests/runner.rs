@@ -1759,6 +1759,62 @@ fn the_quick_review_prompt_holds_the_pull_request_and_the_focus() {
 }
 
 #[test]
+fn the_diff_check_prompt_names_its_required_and_optional_fields() {
+    let check = Task::CheckDiff {
+        diff: "+v = 1".into(),
+        body: "Bumps serde".into(),
+    };
+    let text = prompt(&check, Expect::DiffCheck, Agent::Claude);
+    for name in ["`outcome`", "`reason`", "`summary`"] {
+        assert!(text.contains(name), "{name} missing: {text}");
+    }
+    assert!(text.contains("required top-level fields"));
+    assert!(text.contains("These fields are optional: `from`, `to`."));
+}
+
+#[test]
+fn a_prompt_names_every_field_its_schema_requires() {
+    let job = quick_job("");
+    let check = Task::CheckDiff {
+        diff: "+v = 1".into(),
+        body: "Bumps serde".into(),
+    };
+    let analyze = Task::AnalyzeFailure { log: "boom".into() };
+    let gaps = gaps_task();
+    for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
+        let texts = [
+            (Expect::DiffCheck, prompt(&check, Expect::DiffCheck, agent)),
+            (
+                Expect::FailureAnalysis,
+                prompt(&analyze, Expect::FailureAnalysis, agent),
+            ),
+            (
+                Expect::PackagingGaps,
+                prompt(&gaps, Expect::PackagingGaps, agent),
+            ),
+            (
+                Expect::QuickReview,
+                job_prompt(&job, &Task::QuickReview, Expect::QuickReview, agent, &[]),
+            ),
+        ];
+        for (expect, text) in texts {
+            let listed = text
+                .split("each its own field: ")
+                .nth(1)
+                .and_then(|rest| rest.split(". Do not").next())
+                .unwrap_or_else(|| panic!("the {agent:?} prompt for {expect:?} has no field list"));
+            for name in expect.schema()["required"].as_array().unwrap() {
+                let name = name.as_str().unwrap();
+                assert!(
+                    listed.contains(&format!("`{name}`")),
+                    "the {agent:?} prompt for {expect:?} does not list `{name}` as required"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn the_quick_review_prompt_quotes_a_base_branch_that_needs_it() {
     let mut picked = quick_job("").picked_pr().unwrap().clone();
     picked.base_branch = "rel'$(x)".into();
