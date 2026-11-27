@@ -8809,6 +8809,40 @@ async fn a_review_and_fix_first_pass_records_the_checkout_head_with_its_verdict(
 }
 
 #[tokio::test]
+async fn a_review_and_fix_fix_without_a_pull_request_description_still_pushes() {
+    let (store, executor, scheduler) = setup(|request| match request.expect {
+        Expect::Review => Event::ReviewChanges {
+            feedback: "Handle the error.".into(),
+        },
+        _ => factory_runner::event_from_output(
+            request.expect,
+            Some(serde_json::json!({"outcome": "commits_ready"})),
+        ),
+    });
+    quick_polls(&store);
+    let mut pick = picked(12);
+    pick.mode = factory_core::PrMode::ReviewAndFix;
+    let id = store
+        .create_pull_request_job("maestro", "alice", "", &[], pick)
+        .unwrap();
+    store.apply(id, Event::Start).unwrap();
+    executor.release(1);
+    step(&scheduler).await; // review
+    executor.release(1);
+    step(&scheduler).await; // fix
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::Verifying { pr: 0 }
+    );
+    step(&scheduler).await; // checks
+    step(&scheduler).await; // publish
+
+    let published = executor.published.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert!(published[0].existing.is_some());
+}
+
+#[tokio::test]
 async fn a_picked_pull_request_job_works_in_its_head_branch_and_never_opens_a_pull_request() {
     let (store, executor, scheduler) =
         setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));

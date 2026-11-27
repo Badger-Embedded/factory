@@ -157,7 +157,7 @@ impl Expect {
             Expect::Commits | Expect::FixCi => {
                 properties["pull_request"] = json!({
                     "type": "object",
-                    "description": "With outcome commits_ready: the pull request's title and description, following the repository's CONTRIBUTING.md.",
+                    "description": "With outcome commits_ready: the pull request's title and description, following the repository's CONTRIBUTING.md. Required when the factory opens the pull request from this run. Leave it out when the prompt says the pull request's title and description stay as they are.",
                     "properties": {
                         "title": { "type": "string" },
                         "body": { "type": "string" }
@@ -542,37 +542,39 @@ fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, St
 
     let reason = output.reason.filter(|reason| !reason.trim().is_empty());
     match (expect, output.outcome.as_str()) {
-        (Expect::FailureAnalysis, outcome @ ("transient" | "caused_by_update")) => {
-            match reason {
-                Some(reason) => Ok(AgentResult::FailureVerdict {
-                    transient: outcome == "transient",
-                    reason,
-                }),
-                None => Err(format!(
-                    "the agent ended with outcome {outcome} but gave no reason"
-                )),
-            }
-        }
+        (Expect::FailureAnalysis, outcome @ ("transient" | "caused_by_update")) => match reason {
+            Some(reason) => Ok(AgentResult::FailureVerdict {
+                transient: outcome == "transient",
+                reason,
+            }),
+            None => Err(format!(
+                "the agent ended with outcome {outcome} but gave no reason"
+            )),
+        },
         (Expect::DiffCheck, outcome @ ("safe" | "unsafe")) => {
             let summary = output.summary.filter(|summary| !summary.trim().is_empty());
             match (reason, summary) {
-                (Some(reason), Some(summary)) => Ok(AgentResult::DiffVerdict(Box::new(DiffVerdict {
-                    safe: outcome == "safe",
-                    reason,
-                    summary,
-                    from: output.from.filter(|from| !from.trim().is_empty()),
-                    to: output.to.filter(|to| !to.trim().is_empty()),
-                }))),
+                (Some(reason), Some(summary)) => {
+                    Ok(AgentResult::DiffVerdict(Box::new(DiffVerdict {
+                        safe: outcome == "safe",
+                        reason,
+                        summary,
+                        from: output.from.filter(|from| !from.trim().is_empty()),
+                        to: output.to.filter(|to| !to.trim().is_empty()),
+                    })))
+                }
                 _ => Err(format!(
                     "the agent ended with outcome {outcome} but gave no reason or no summary"
                 )),
             }
         }
         (Expect::PackagingGaps, "gaps") => gaps_result(output.gaps),
-        (Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps, other) => Err(format!(
-            "the agent ended with outcome {other:?}, expected one of {:?}",
-            expect.outcomes()
-        )),
+        (Expect::FailureAnalysis | Expect::DiffCheck | Expect::PackagingGaps, other) => {
+            Err(format!(
+                "the agent ended with outcome {other:?}, expected one of {:?}",
+                expect.outcomes()
+            ))
+        }
         (_, "questions") => {
             let questions = output.questions.unwrap_or_default();
             if questions.is_empty() {
@@ -608,10 +610,7 @@ fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, St
             Some(pr) if !pr.title.trim().is_empty() && !pr.body.trim().is_empty() => {
                 Ok(AgentResult::CommitsReady(Some(pr)))
             }
-            _ => Err(
-                "the agent ended with outcome commits_ready but wrote no pull request title and description"
-                    .into(),
-            ),
+            _ => Ok(AgentResult::CommitsReady(None)),
         },
         (Expect::FixCi, "rerun_ci") => match reason {
             Some(reason) => Ok(AgentResult::RerunCi { reason }),
