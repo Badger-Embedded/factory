@@ -2819,3 +2819,128 @@ fn a_symlink_in_the_claude_config_dir_is_replaced_not_followed() {
             .contains("playwright-mcp")
     );
 }
+
+const PICKED_RETURN_SENTENCE: &str = "The pull request's title and description stay as they are";
+
+const LEAVE_OUT: &str = "you may leave `pull_request` out";
+
+fn picked_review_and_fix_job() -> Job {
+    let job = quick_job("");
+    Job::pull_request(
+        job.request(),
+        Gates::default(),
+        PickedPr {
+            mode: PrMode::ReviewAndFix,
+            fork: false,
+            ..job.picked_pr().unwrap().clone()
+        },
+    )
+}
+
+fn stacked_job() -> Job {
+    let mut job = quick_job("");
+    job.apply(Event::Start).unwrap();
+    job.apply(Event::QuickReviewed {
+        score: 3,
+        review: "Fix the locking.".into(),
+        head: "abc".into(),
+    })
+    .unwrap();
+    job.apply(Event::FixElsewhere {
+        instructions: String::new(),
+    })
+    .unwrap();
+    assert!(job.stacked_on().is_some());
+    job
+}
+
+fn commit_tasks() -> Vec<(Task, Expect)> {
+    vec![
+        (Task::Implement { pr: planned("x") }, Expect::Commits),
+        (
+            Task::Answer {
+                questions: vec![Question { text: "Q?".into() }],
+                answers: vec!["A".into()],
+            },
+            Expect::Commits,
+        ),
+        (
+            Task::Revise {
+                feedback: "x".into(),
+            },
+            Expect::Commits,
+        ),
+        (
+            Task::FixChecks {
+                report: "boom".into(),
+            },
+            Expect::Commits,
+        ),
+        (Task::FixCi { log: "boom".into() }, Expect::FixCi),
+        (
+            Task::AddressReview {
+                comments: "nit".into(),
+            },
+            Expect::Commits,
+        ),
+        (
+            Task::Rebase {
+                base: "main".into(),
+            },
+            Expect::Commits,
+        ),
+        (Task::MergeHead, Expect::Commits),
+    ]
+}
+
+#[test]
+fn a_picked_job_tells_every_commit_task_the_pull_request_may_be_left_out() {
+    let picked = picked_review_and_fix_job();
+    let request = approved_job(Job::new("Add a reboot button", Gates::default()));
+    for (task, expect) in commit_tasks() {
+        let text = job_prompt(&picked, &task, expect, Agent::Claude, &[]);
+        assert_eq!(text.matches(PICKED_RETURN_SENTENCE).count(), 1, "{task:?}");
+        assert!(text.contains(LEAVE_OUT), "{task:?}: {text}");
+        let text = job_prompt(&request, &task, expect, Agent::Claude, &[]);
+        assert!(!text.contains(PICKED_RETURN_SENTENCE), "{task:?}: {text}");
+        assert!(!text.contains(LEAVE_OUT), "{task:?}: {text}");
+    }
+}
+
+#[test]
+fn a_picked_implement_prompt_does_not_promise_the_title_and_description_are_used() {
+    let picked = picked_review_and_fix_job();
+    let task = Task::Implement { pr: planned("x") };
+    let text = job_prompt(&picked, &task, Expect::Commits, Agent::Claude, &[]);
+    assert!(text.contains("Do not push or open a pull request."));
+    assert!(!text.contains("the title and description you return"));
+    let request = approved_job(Job::new("Add a reboot button", Gates::default()));
+    let text = job_prompt(&request, &task, Expect::Commits, Agent::Claude, &[]);
+    assert!(text.contains("the title and description you return"));
+}
+
+#[test]
+fn hosted_codex_is_told_to_return_null_for_the_pull_request() {
+    let picked = picked_review_and_fix_job();
+    for (task, expect) in commit_tasks() {
+        let text = job_prompt(&picked, &task, expect, Agent::Codex, &[]);
+        assert!(text.contains(PICKED_RETURN_SENTENCE), "{task:?}");
+        assert!(text.contains("\"pull_request\": null"), "{task:?}: {text}");
+        assert!(!text.contains(LEAVE_OUT), "{task:?}: {text}");
+    }
+}
+
+#[test]
+fn a_stacked_job_keeps_asking_for_a_title_and_description() {
+    let stacked = stacked_job();
+    for (task, expect) in commit_tasks() {
+        let text = job_prompt(&stacked, &task, expect, Agent::Claude, &[]);
+        assert!(!text.contains(PICKED_RETURN_SENTENCE), "{task:?}: {text}");
+        assert!(!text.contains(LEAVE_OUT), "{task:?}: {text}");
+    }
+    let address = Task::AddressReview {
+        comments: "nit".into(),
+    };
+    let text = job_prompt(&stacked, &address, Expect::Commits, Agent::Claude, &[]);
+    assert!(text.contains("write the title and description you return for the fixes"));
+}

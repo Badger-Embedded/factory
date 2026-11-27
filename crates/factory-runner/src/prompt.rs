@@ -110,13 +110,16 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
             let _ = write!(
                 text,
                 "Follow the repository's {} and CONTRIBUTING.md, tests included. Commit \
-                 your work on the current branch. Do not push or open a pull request. The \
-                 factory does that with the title and description you return, so write them \
-                 the way CONTRIBUTING.md asks.",
+                 your work on the current branch. Do not push or open a pull request.",
                 style(agent).rules_doc
             );
             if picked {
                 text.push_str(PICKED_NOTE);
+            } else {
+                text.push_str(
+                    " The factory does that with the title and description you return, so \
+                     write them the way CONTRIBUTING.md asks.",
+                );
             }
             text
         }
@@ -168,6 +171,13 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
         Task::CheckDiff { diff, body } => return diff_prompt(diff, body, agent),
         Task::FindGaps { context } => return gaps_prompt(context, agent),
     };
+    if picked && matches!(expect, Expect::Commits | Expect::FixCi) {
+        text.push_str(if matches!(agent, PromptTarget::Agent(Agent::Codex)) {
+            PICKED_RETURN_NOTE_STRICT
+        } else {
+            PICKED_RETURN_NOTE
+        });
+    }
     let outcomes = expect.outcomes();
     let (questions, done) = (outcomes[0], outcomes[1]);
     let _ = write!(
@@ -181,9 +191,13 @@ fn prompt_for(task: &Task, expect: Expect, agent: PromptTarget, picked: bool) ->
 }
 
 const PICKED_NOTE: &str = " The branch holds an existing pull request. Add commits on top \
-     of it. Do not rewrite, drop or amend a commit that was already there, and do not rebase. \
-     The title and description of the pull request stay as they are, so what you return for them \
-     is not used.";
+     of it. Do not rewrite, drop or amend a commit that was already there, and do not rebase.";
+
+const PICKED_RETURN_NOTE: &str = "\n\nThe pull request's title and description stay as they are, \
+     so you may leave `pull_request` out of the structured output.";
+
+const PICKED_RETURN_NOTE_STRICT: &str = "\n\nThe pull request's title and description stay as \
+     they are, so return `\"pull_request\": null`.";
 
 fn end_prompt(text: &mut String, agent: PromptTarget, expect: Expect) {
     if let Some(fields) = output_fields(expect) {
