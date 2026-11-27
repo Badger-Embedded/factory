@@ -107,8 +107,6 @@
       setExpanded(stage, !!(spec && spec.search), matches.length > 0);
     }
 
-    // The input is the combobox of the results list while the agent has a
-    // search, and uses the native datalist otherwise.
     function setExpanded(stage, searchable, open) {
       var results = form.querySelector('[data-model-results="' + stage + '"]');
       var input = form.querySelector('[data-model-input="' + stage + '"]');
@@ -147,7 +145,7 @@
       var input = form.querySelector('[data-model-input="' + stage + '"]');
       if (!spec || !chips || !input) return;
       var previous = AGENT_MODELS[chips.dataset.agent];
-      var datalist = form.querySelector("#" + input.getAttribute("list"));
+      var datalist = form.querySelector("#model-suggestions-" + stage);
       var hint = form.querySelector('[data-model-hint="' + stage + '"]');
       chips.dataset.agent = agent.value;
       chips.textContent = "";

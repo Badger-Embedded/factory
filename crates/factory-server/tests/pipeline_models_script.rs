@@ -92,8 +92,8 @@ function stage(name, agent, model) {
   }
   const chips = form.appendChild(new El("div", { "data-model-chips": name, "data-agent": agent }));
   for (const m of [""].concat(AGENTS[agent].models)) chips.appendChild(new El("button", { "data-model": m, "data-model-for": name }));
-  const input = form.appendChild(new El("input", { type: "text", name, list: "list-" + name, value: model, "data-model-input": name }));
-  const list = form.appendChild(new El("datalist", { id: "list-" + name }));
+  const input = form.appendChild(new El("input", { type: "text", name, list: "model-suggestions-" + name, value: model, "data-model-input": name }));
+  const list = form.appendChild(new El("datalist", { id: "model-suggestions-" + name }));
   const results = form.appendChild(new El("ul", { "data-model-results": name }));
   results.hidden = true;
   const hint = form.appendChild(new El("p", { "data-model-hint": name }));

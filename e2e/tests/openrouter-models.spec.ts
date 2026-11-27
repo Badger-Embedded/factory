@@ -132,4 +132,5 @@ test('arrowing past the visible rows scrolls the active result into view and Esc
   await spec.getByRole('radio', { name: 'Claude' }).check();
   await expect(field).toHaveAttribute('list', 'model-suggestions-spec');
   await expect(field).not.toHaveAttribute('role', /.*/);
+  await expect(spec.locator('#model-suggestions-spec option')).toHaveCount(4);
 });
