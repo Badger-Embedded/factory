@@ -2173,12 +2173,17 @@ async fn a_full_watch_reports_a_conflict_or_failed_ci_when_the_permission_lookup
 #[tokio::test]
 async fn a_merge_or_close_is_reported_without_looking_up_any_commenter() {
     for (state, event) in [("MERGED", Event::Merged), ("CLOSED", Event::ClosedUnmerged)] {
-        for watch in [PrWatch::MergeOrClose, PrWatch::MergeCloseOrComments] {
+        for (watch, seen_until) in [
+            (PrWatch::MergeOrClose, Some("2026-11-27T09:00:00Z")),
+            (PrWatch::MergeCloseOrComments, Some("2026-11-27T09:00:00Z")),
+            (PrWatch::MergeCloseOrComments, None),
+        ] {
             let tools = Tools::new();
             gh_for_pr(&tools, state, "MERGEABLE", "SUCCESS");
             let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
             let mut request = merge_wait_watch("2026-11-27T09:00:00Z");
             request.watch = watch;
+            request.seen_until = seen_until.map(Into::into);
 
             let report = podman.watch(request).await.unwrap();
 
@@ -2186,6 +2191,42 @@ async fn a_merge_or_close_is_reported_without_looking_up_any_commenter() {
             assert!(!tools.calls().contains("permission"), "{}", tools.calls());
         }
     }
+}
+
+#[tokio::test]
+async fn a_merge_wait_without_a_watermark_seeds_it_from_the_newest_comment() {
+    let tools = Tools::new();
+    gh_for_pr(&tools, "OPEN", "MERGEABLE", "SUCCESS");
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut request = merge_wait_watch("");
+    request.seen_until = None;
+
+    let report = podman.watch(request).await.unwrap();
+
+    assert_eq!(report.event, None);
+    assert_eq!(report.seen_until.as_deref(), Some("2026-11-27T10:00:00Z"));
+    assert_eq!(report.ignored, Vec::new());
+    assert!(!tools.calls().contains("permission"), "{}", tools.calls());
+}
+
+#[tokio::test]
+async fn a_merge_wait_without_a_watermark_or_comments_seeds_nothing() {
+    let tools = Tools::new();
+    gh_for_pr(&tools, "OPEN", "MERGEABLE", "SUCCESS");
+    let gh = tools.dir.path().join("gh");
+    let script = std::fs::read_to_string(&gh).unwrap();
+    let start = script.find("\"comments\":[").unwrap();
+    let end = script.find(",\"reviews\"").unwrap();
+    let script = format!("{}\"comments\":[]{}", &script[..start], &script[end..]);
+    support::executable(tools.dir.path(), "gh", &script);
+    let podman = tools.executor(Arc::new(Store::open_in_memory().unwrap()));
+    let mut request = merge_wait_watch("");
+    request.seen_until = None;
+
+    let report = podman.watch(request).await.unwrap();
+
+    assert_eq!(report.event, None);
+    assert_eq!(report.seen_until, None);
 }
 
 #[tokio::test]

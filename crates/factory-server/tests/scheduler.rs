@@ -8947,6 +8947,98 @@ async fn a_picked_pull_request_job_works_in_its_head_branch_and_never_opens_a_pu
     );
 }
 
+fn seed_report(seen_until: &str) -> WatchReport {
+    WatchReport {
+        seen_until: Some(seen_until.into()),
+        ..WatchReport::default()
+    }
+}
+
+#[tokio::test]
+async fn a_merge_wait_seed_keeps_old_comments_out_and_later_ones_in() {
+    let (store, executor, scheduler) =
+        setup(|_| Event::Agent(AgentResult::CommitsReady(Some(ready()))));
+    quick_polls(&store);
+    let id = picked_to_published(&store, &executor, &scheduler).await;
+    green(&executor, Event::MergeLeftToUser);
+    step(&scheduler).await;
+    assert_eq!(store.pr_watermark(id, 0).unwrap(), None);
+
+    executor
+        .watches
+        .lock()
+        .unwrap()
+        .push_back(Ok(seed_report("2026-11-27T10:00:00Z")));
+    step(&scheduler).await;
+    assert_eq!(
+        store.pr_watermark(id, 0).unwrap().as_deref(),
+        Some("2026-11-27T10:00:00Z")
+    );
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::User(Ask::MergeLeftToUser)
+    ));
+
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        ignored: vec![IgnoredCommenter::NoWrite("mallory".into())],
+        ..WatchReport::default()
+    }));
+    step(&scheduler).await;
+    assert!(
+        log_texts(&store, id)
+            .iter()
+            .any(|text| text.contains("Ignoring comments on #12 from mallory")),
+        "{:?}",
+        log_texts(&store, id)
+    );
+
+    executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+        event: Some(Event::ReviewComments {
+            comments: "alice:\nrename it".into(),
+        }),
+        seen_until: Some("2026-11-27T10:30:00Z".into()),
+        ..WatchReport::default()
+    }));
+    step(&scheduler).await;
+    assert_eq!(
+        executor
+            .watched
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .seen_until
+            .as_deref(),
+        Some("2026-11-27T10:00:00Z")
+    );
+    assert!(matches!(
+        store.get(id).unwrap().job.turn(),
+        Turn::Agent(factory_core::Task::AddressReview { .. })
+    ));
+    assert_eq!(
+        store.pr_watermark(id, 0).unwrap().as_deref(),
+        Some("2026-11-27T10:30:00Z")
+    );
+}
+
+#[tokio::test]
+async fn a_merge_wait_seed_never_moves_back_a_watermark() {
+    let store = Store::open_in_memory().unwrap();
+    let id = store
+        .create_pull_request_job("maestro", "alice", "x", &[], picked(12))
+        .unwrap();
+    store
+        .seed_pr_watermark(id, 0, "2026-11-27T10:30:00Z")
+        .unwrap();
+    store
+        .seed_pr_watermark(id, 0, "2026-11-27T10:00:00Z")
+        .unwrap();
+    assert_eq!(
+        store.pr_watermark(id, 0).unwrap().as_deref(),
+        Some("2026-11-27T10:30:00Z")
+    );
+}
+
 #[tokio::test]
 async fn a_picked_pull_request_job_never_asks_the_executor_to_merge() {
     let (store, executor, scheduler) =

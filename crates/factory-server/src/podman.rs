@@ -1404,7 +1404,10 @@ fn version_field(line: &str) -> Option<(String, String)> {
 
 /// Reports a merge or close before any commenter lookup. Under
 /// [`PrWatch::MergeCloseOrComments`], eligible comments then outrank a
-/// conflict or failed CI.
+/// conflict or failed CI. With no watermark on an open pull request that has
+/// comments, it delivers nothing and looks up no one. It reports the newest
+/// comment time as the watermark, so only comments posted after the wait began
+/// reach the agent.
 async fn waiting_watch(
     forge: &dyn Forge,
     reader: &Operation,
@@ -1413,6 +1416,17 @@ async fn waiting_watch(
 ) -> Result<WatchReport, String> {
     let mut ignored = Vec::new();
     if request.watch == PrWatch::MergeCloseOrComments {
+        if request.seen_until.is_none()
+            && status.state == PrState::Open
+            && let Some(newest) = status.comments.iter().map(|c| c.at.as_str()).max()
+        {
+            return Ok(WatchReport {
+                event: None,
+                seen_until: Some(newest.to_owned()),
+                merged_by_factory: false,
+                ignored,
+            });
+        }
         ignored = keep_writers(forge, reader, request, &mut status).await?;
         status.conflicting = false;
         status.ci = Ci::Pending;
@@ -1423,8 +1437,8 @@ async fn waiting_watch(
 
 /// The report of a watch while the job waits for the user: only what
 /// [`waiting_event`] allows. It carries the new watermark only when it
-/// delivers comments, so comments the job does not take now are picked up
-/// once it goes back to watching normally.
+/// delivers comments (see [`waiting_watch`] for the seed), so comments the job
+/// does not take now are picked up once it goes back to watching normally.
 fn waiting_report(
     watch: PrWatch,
     observation: Observation,
@@ -1459,11 +1473,11 @@ async fn keep_writers_unless_failing(
 
 /// Drops from `status` the comments of every login that has no write access
 /// to the watched repository, so a passer-by cannot steer the agent, and
-/// returns those logins. A merged or closed pull request has no lookups. Only the authors of comments newer than the
-/// watermark are looked up, on
-/// every watch, so a login whose access was taken away counts at once. A
-/// login whose access the forge will not tell the account counts as one
-/// without write access.
+/// returns those logins. A merged or closed pull request has no lookups. Only
+/// the authors of comments newer than the watermark are looked up, on every
+/// watch, so a login whose access was taken away counts at once. A login whose
+/// access the forge will not tell the account counts as one without write
+/// access.
 async fn keep_writers(
     forge: &dyn Forge,
     reader: &Operation,
