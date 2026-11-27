@@ -2513,6 +2513,12 @@ fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError
     let local_url = local.url;
     let models_url = local.models_url;
     let local_models = state.store.local_models()?;
+    let openrouter_models: Vec<(String, String)> = state
+        .store
+        .openrouter_models()?
+        .into_iter()
+        .map(|model| (model.id, model.name))
+        .collect();
     Ok(state
         .registry
         .entries()
@@ -2528,8 +2534,10 @@ fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError
                     .map(|&model| model.to_owned())
                     .collect()
             };
-            let model_hint = if openrouter {
-                "Type an OpenRouter model ID. An OpenRouter stage needs a model.".to_owned()
+            let model_hint = if openrouter && openrouter_models.is_empty() {
+                "No OpenRouter model list is stored. Type a model id.".to_owned()
+            } else if openrouter {
+                format!("Search {} OpenRouter models.", openrouter_models.len())
             } else if local {
                 match (&local_url, models.is_empty()) {
                     (None, _) => {
@@ -2569,6 +2577,7 @@ fn agent_choices(state: &AppState) -> Result<Vec<pages::AgentChoice>, StoreError
                 models,
                 model_hint,
                 model_required: local || openrouter,
+                model_search: openrouter.then(|| openrouter_models.clone()),
             }
         })
         .collect())

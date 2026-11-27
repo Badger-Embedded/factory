@@ -31,7 +31,7 @@ use factory_core::{
     RenovateAccess, RenovateCi, RetryLimits, Session,
 };
 use factory_runner::ForgeKind;
-use factory_server::Store;
+use factory_server::{OpenRouterModel, Store};
 
 const ADMIN: &str = "admin@e2e.test";
 const COLLABORATOR: &str = "alice@e2e.test";
@@ -313,6 +313,22 @@ fn seed_local(store: &Store, url: &str, models: Option<&Vec<String>>) -> Result<
     Ok(())
 }
 
+fn seed_openrouter_models(store: &Store, models: Option<&Vec<String>>) -> Result<()> {
+    let models: Vec<OpenRouterModel> = models
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|model| {
+            let (id, name) = model.split_once('|').unwrap_or((model, model));
+            OpenRouterModel {
+                id: id.to_owned(),
+                name: name.to_owned(),
+            }
+        })
+        .collect();
+    store.replace_openrouter_models(&models, 0)?;
+    Ok(())
+}
+
 fn seed(store: &Store) -> Result<()> {
     store.create_project(
         SHARED_PROJECT,
@@ -452,6 +468,7 @@ fn main() -> Result<()> {
     let store = Store::open(&db)?;
     match command.as_str() {
         "seed" => seed(&store)?,
+        "openrouter-models" => seed_openrouter_models(&store, flags.get("model"))?,
         "local-models" => seed_local(&store, one("url")?, flags.get("model"))?,
         "project" => {
             let name = one("name")?;

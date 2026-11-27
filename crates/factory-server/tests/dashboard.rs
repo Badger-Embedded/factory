@@ -8032,6 +8032,64 @@ async fn a_local_stage_offers_the_stored_models_and_names_the_server() {
 }
 
 #[tokio::test]
+async fn an_openrouter_stage_is_a_search_over_the_stored_models_with_no_chips() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .replace_openrouter_models(
+            &[
+                factory_server::OpenRouterModel {
+                    id: "openai/gpt-5".to_owned(),
+                    name: "OpenAI: GPT-5".to_owned(),
+                },
+                factory_server::OpenRouterModel {
+                    id: "x-ai/grok-4".to_owned(),
+                    name: "xAI: Grok 4".to_owned(),
+                },
+            ],
+            1,
+        )
+        .unwrap();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("openrouter", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    let start = page.body.find("data-panel=\"clarify\"").unwrap();
+    let rest = &page.body[start..];
+    let panel = &rest[..rest.find("data-model-hint").unwrap() + 200];
+    assert!(!panel.contains("data-model=\""), "no chip, no CLI default");
+    assert!(!panel.contains("<option"));
+    assert!(panel.contains("data-model-results=\"clarify\""));
+    assert!(panel.contains("Search 2 OpenRouter models."));
+    assert!(
+        page.body
+            .contains("&quot;search&quot;:[[&quot;openai/gpt-5&quot;")
+    );
+    assert!(page.body.contains("Model required"));
+}
+
+#[tokio::test]
+async fn an_openrouter_stage_without_a_stored_list_says_to_type_an_id() {
+    let dashboard = dashboard();
+    dashboard
+        .store
+        .save_project_agents(
+            "maestro",
+            &agents("openrouter", "claude", "claude", "claude", "claude"),
+        )
+        .unwrap();
+    let page = dashboard.get("/settings/projects/maestro").await;
+    assert!(
+        page.body
+            .contains("No OpenRouter model list is stored. Type a model id.")
+    );
+}
+
+#[tokio::test]
 async fn a_local_stage_without_a_stored_list_offers_no_chips() {
     let dashboard = dashboard();
     dashboard

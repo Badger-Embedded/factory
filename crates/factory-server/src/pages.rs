@@ -1061,6 +1061,9 @@ pub struct AgentChoice {
     /// Whether a stage on this agent needs a model, so the panel offers no
     /// "CLI default" chip.
     pub model_required: bool,
+    /// For an agent whose model field is a search, the stored models as id and
+    /// name. The field then draws no chip per model.
+    pub model_search: Option<Vec<(String, String)>>,
 }
 
 /// One server's block inside a project's form: whether the project runs it, the
@@ -3643,6 +3646,7 @@ fn agent_data(agents: &[AgentChoice]) -> (String, String) {
             "models": choice.models,
             "hint": choice.model_hint,
             "required": choice.model_required,
+            "search": choice.model_search,
         })
     });
     (efforts, models)
@@ -3796,6 +3800,7 @@ fn agent_fields(
     let choice = project.agents.iter().find(|choice| choice.id == agent);
     let suggestions: &[String] = choice.map_or(&[], |choice| &choice.models);
     let model_required = choice.is_some_and(|choice| choice.model_required);
+    let searchable = choice.is_some_and(|choice| choice.model_search.is_some());
     let model_hint = choice.map_or_else(
         || {
             format!(
@@ -3831,11 +3836,19 @@ fn agent_fields(
                     button.chip type="button" data-model=(suggestion) data-model-for=(key) { (suggestion) }
                 }
             }
-            input id={ (project.name) "-" (key) } type="text" name=(key) list={ "model-suggestions-" (key) }
+            input id={ (project.name) "-" (key) } type="text" name=(key)
+                list=[(!searchable).then(|| format!("model-suggestions-{key}"))]
+                role=[searchable.then_some("combobox")]
+                aria-autocomplete=[searchable.then_some("list")]
+                aria-controls=[searchable.then(|| format!("model-results-{key}"))]
+                aria-expanded=[searchable.then_some("false")]
+                autocomplete=[searchable.then_some("off")]
                 placeholder=(if model_required { "Model ID" } else { "CLI default" }) value=(model) data-model-input=(key);
             datalist id={ "model-suggestions-" (key) } {
                 @for suggestion in suggestions { option value=(suggestion) {} }
             }
+            ul.model-results id={ "model-results-" (key) } role="listbox" aria-label="Matches"
+                data-model-results=(key) hidden {}
             p.hint data-model-hint=(key) { (model_hint) }
         }
         div.field {

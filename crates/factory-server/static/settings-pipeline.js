@@ -1,7 +1,8 @@
 // The pipeline on a project's settings page. Selecting a stage, a gate or
 // merge shows its panel without a reload and updates the `?stage=` value in
 // the address and the form's action, so a save comes back to the same panel.
-// The model buttons fill the stage's model field, "Use the default" sets a
+// The model buttons fill the stage's model field, and an agent with a model
+// search lists the stored models that match what is typed. "Use the default" sets a
 // gate back to the factory default, and the nodes follow the fields as they
 // change. Without this script each node is a link that reloads the page with
 // its panel open, and the buttons stay hidden.
@@ -71,6 +72,74 @@
       setEffortLabel(stage, selected);
     }
 
+    var MAX_RESULTS = 20;
+
+    function showResults(stage) {
+      var results = form.querySelector('[data-model-results="' + stage + '"]');
+      var input = form.querySelector('[data-model-input="' + stage + '"]');
+      if (!results || !input) return;
+      var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
+      var spec = agent && AGENT_MODELS[agent.value];
+      var query = input.value.trim().toLowerCase();
+      results.textContent = "";
+      results.removeAttribute("data-active");
+      input.removeAttribute("aria-activedescendant");
+      var matches = [];
+      if (spec && spec.search && query !== "") {
+        for (var i = 0; i < spec.search.length && matches.length < MAX_RESULTS; i++) {
+          var model = spec.search[i];
+          if (
+            model[0].toLowerCase().indexOf(query) >= 0 ||
+            model[1].toLowerCase().indexOf(query) >= 0
+          ) {
+            matches.push(model);
+          }
+        }
+      }
+      matches.forEach(function (model, index) {
+        var item = document.createElement("li");
+        item.id = "model-result-" + stage + "-" + index;
+        item.setAttribute("role", "option");
+        item.dataset.modelResult = model[0];
+        item.textContent = model[1] && model[1] !== model[0] ? model[0] + " (" + model[1] + ")" : model[0];
+        results.appendChild(item);
+      });
+      setExpanded(stage, !!(spec && spec.search), matches.length > 0);
+    }
+
+    // The input is the combobox of the results list while the agent has a
+    // search, and uses the native datalist otherwise.
+    function setExpanded(stage, searchable, open) {
+      var results = form.querySelector('[data-model-results="' + stage + '"]');
+      var input = form.querySelector('[data-model-input="' + stage + '"]');
+      results.hidden = !open;
+      input.removeAttribute("aria-activedescendant");
+      if (searchable) {
+        input.setAttribute("role", "combobox");
+        input.setAttribute("aria-autocomplete", "list");
+        input.setAttribute("aria-controls", results.id);
+        input.setAttribute("aria-expanded", open ? "true" : "false");
+        input.removeAttribute("list");
+        input.setAttribute("autocomplete", "off");
+      } else {
+        input.removeAttribute("role");
+        input.removeAttribute("aria-autocomplete");
+        input.removeAttribute("aria-controls");
+        input.removeAttribute("aria-expanded");
+        input.removeAttribute("autocomplete");
+        input.setAttribute("list", "model-suggestions-" + stage);
+      }
+    }
+
+    function pickResult(stage, id) {
+      var input = form.querySelector('[data-model-input="' + stage + '"]');
+      input.value = id;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      var results = form.querySelector('[data-model-results="' + stage + '"]');
+      results.textContent = "";
+      setExpanded(stage, true, false);
+    }
+
     function redrawModels(stage) {
       var agent = form.querySelector('input[name="' + stage + '_agent"]:checked');
       var spec = agent && AGENT_MODELS[agent.value];
@@ -103,15 +172,23 @@
         hint.textContent = spec.hint;
       }
       input.placeholder = spec.required ? "Model ID" : "CLI default";
+      showResults(stage);
       var value = input.value.trim();
       setModelLabel(stage);
-      if (value !== "" && previous && previous.models.indexOf(value) >= 0) {
+      var offered = previous ? previous.models.concat((previous.search || []).map(function (m) { return m[0]; })) : [];
+      if (value !== "" && offered.indexOf(value) >= 0) {
         input.value = "";
         input.dispatchEvent(new Event("input", { bubbles: true }));
       }
     }
 
     form.addEventListener("click", function (event) {
+      var result = event.target.closest("[data-model-result]");
+      if (result) {
+        var results = result.closest("[data-model-results]");
+        pickResult(results.dataset.modelResults, result.dataset.modelResult);
+        return;
+      }
       var chip = event.target.closest("[data-model-for]");
       if (!chip) return;
       var input = form.querySelector('[data-model-input="' + chip.dataset.modelFor + '"]');
@@ -120,7 +197,35 @@
     });
 
     form.addEventListener("input", function (event) {
-      if (event.target.dataset.modelInput) setModelLabel(event.target.dataset.modelInput);
+      var stage = event.target.dataset.modelInput;
+      if (!stage) return;
+      setModelLabel(stage);
+      showResults(stage);
+    });
+
+    form.addEventListener("keydown", function (event) {
+      var stage = event.target.dataset && event.target.dataset.modelInput;
+      var results = stage && form.querySelector('[data-model-results="' + stage + '"]');
+      if (!results || results.hidden) return;
+      var items = results.children;
+      var active = Number(results.dataset.active === undefined ? -1 : results.dataset.active);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        active = event.key === "ArrowDown" ? Math.min(active + 1, items.length - 1) : Math.max(active - 1, 0);
+        results.dataset.active = String(active);
+        Array.prototype.forEach.call(items, function (item, i) {
+          if (i === active) item.setAttribute("aria-selected", "true");
+          else item.removeAttribute("aria-selected");
+        });
+        event.target.setAttribute("aria-activedescendant", items[active].id);
+        items[active].scrollIntoView({ block: "nearest" });
+        event.preventDefault();
+      } else if (event.key === "Enter" && active >= 0) {
+        event.preventDefault();
+        pickResult(stage, items[active].dataset.modelResult);
+      } else if (event.key === "Escape") {
+        results.removeAttribute("data-active");
+        setExpanded(stage, true, false);
+      }
     });
 
     form.addEventListener("change", function (event) {
