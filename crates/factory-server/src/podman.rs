@@ -9,10 +9,11 @@ use factory_core::{
     Agent, Cli, Event, FileText, PackagingContext, PrDiff, PrWatch, RenovateAccess, RenovateCi,
 };
 use factory_runner::{
-    Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LocalTarget, LogLine,
-    NOT_PERMITTED, Observation, PrState, PrStatus, PushError, RebaseCheckbox, Remote, RemoteSource,
-    RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig, WorkerRun, backend_for, observe,
-    place_files, place_images, remove_container, run, run_checks, show_files, show_images,
+    Access, BranchSummary, Ci, Credential, Forge, ForgeKind, Git, HeadCommit, LogLine,
+    NOT_PERMITTED, Observation, PrState, PrStatus, ProviderKind, ProviderTarget, PushError,
+    RebaseCheckbox, Remote, RemoteSource, RenovatePr, Rerun, RunReport, SessionRun, WorkerConfig,
+    WorkerRun, backend_for, observe, place_files, place_images, remove_container, run, run_checks,
+    show_files, show_images,
 };
 
 use crate::accounts::{AccountSource, Operation, blame, credential_reason};
@@ -20,7 +21,7 @@ use crate::forges::Forges;
 use crate::local_server::{LoadError, LocalServerProbe};
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
-    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, IgnoredCommenter, LocalKeyOwner,
+    APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, IgnoredCommenter, KeyOwner,
     LogSink, PackagingRequest, PublishRequest, Published, ReadyAction, Rebase,
     RenovateWatchRequest, RerunRequest, SessionSink, SummaryRequest, WatchReport, WatchRequest,
     ready_action, waiting_event,
@@ -127,11 +128,11 @@ impl PodmanExecutor {
     /// The session starts on its CLI once the worker has printed its first line,
     /// so a podman that fails to start the container records
     /// nothing.
-    fn record_local_cli(&self, job_id: i64, local: Option<&crate::LocalRequest>) {
+    fn record_provider_cli(&self, job_id: i64, local: Option<&crate::ProviderRequest>) {
         if let Some(local) = local
             && let Err(err) =
                 self.store
-                    .record_session_local_cli(job_id, local.session, local.target.cli)
+                    .record_session_provider_cli(job_id, local.session, local.target.cli)
         {
             tracing::warn!("could not record the session's CLI: {err}");
         }
@@ -201,7 +202,7 @@ impl PodmanExecutor {
         let placed = place_files(workspace, &files)
             .map_err(|err| format!("could not place the files: {err}"))?;
         prompt = show_files(&prompt, &placed);
-        self.warn_missing_agents_md(cli, request.local.is_some(), workspace, request.job_id);
+        self.warn_missing_agents_md(cli, request.provider.is_some(), workspace, request.job_id);
         Ok(prompt)
     }
 
@@ -285,18 +286,16 @@ impl PodmanExecutor {
     /// starts on a loaded model. The run holds its worker slot meanwhile.
     async fn wait_for_local_model(
         &self,
-        local: &crate::LocalRequest,
+        local: &crate::ProviderRequest,
         model: &str,
         log: &mut LogSink,
     ) -> Result<(), String> {
         let target = &local.target;
+        let ProviderKind::Local { load_timeout } = target.kind;
         let started = Instant::now();
-        let load = self.local_probe.load(
-            &target.base_url,
-            model,
-            target.key.as_deref(),
-            target.load_timeout,
-        );
+        let load =
+            self.local_probe
+                .load(&target.base_url, model, target.key.as_deref(), load_timeout);
         tokio::pin!(load);
         let mut noticed = false;
         let result = tokio::select! {
@@ -509,11 +508,12 @@ impl PodmanExecutor {
 
 const LOAD_NOTICE_AFTER: Duration = Duration::from_secs(5);
 
-fn load_failure(error: &LoadError, local: &crate::LocalRequest, model: &str) -> String {
+fn load_failure(error: &LoadError, local: &crate::ProviderRequest, model: &str) -> String {
     let target = &local.target;
+    let ProviderKind::Local { load_timeout } = target.kind;
     match error {
         LoadError::Timeout => {
-            let minutes = target.load_timeout.as_secs().div_ceil(60);
+            let minutes = load_timeout.as_secs().div_ceil(60);
             let unit = if minutes == 1 { "minute" } else { "minutes" };
             format!("The local server did not answer for `{model}` within {minutes} {unit}.")
         }
@@ -524,14 +524,14 @@ fn load_failure(error: &LoadError, local: &crate::LocalRequest, model: &str) -> 
         LoadError::Status {
             status: 401 | 403, ..
         } => match &local.key_from {
-            LocalKeyOwner::Login(login) => format!(
+            KeyOwner::Login(login) => format!(
                 "The local server rejected the Local API key of {login}. Replace it on \
                  /settings/local."
             ),
-            LocalKeyOwner::Factory => "The local server rejected the factory's Local API key. \
+            KeyOwner::Factory => "The local server rejected the factory's Local API key. \
                  Replace it on /settings/agents/local."
                 .to_owned(),
-            LocalKeyOwner::None => "The local server asks for an API key and none is set. Set \
+            KeyOwner::None => "The local server asks for an API key and none is set. Set \
                  one on /settings/local, or the factory's on /settings/agents/local."
                 .to_owned(),
         },
@@ -550,7 +550,7 @@ fn load_failure(error: &LoadError, local: &crate::LocalRequest, model: &str) -> 
 fn credential_and_cli(
     entry: &AgentEntry<'_>,
     agent: Agent,
-    local: Option<&LocalTarget>,
+    local: Option<&ProviderTarget>,
 ) -> Result<(String, Cli), String> {
     match local {
         Some(local) => Ok((String::new(), local.cli)),
@@ -575,7 +575,7 @@ impl Executor for PodmanExecutor {
         let agent = request.agent;
         let expect = request.expect;
         let entry = self.registry.entry(agent);
-        let request_local = request.local.clone();
+        let request_local = request.provider.clone();
         let local = request_local.clone().map(|local| local.target);
         let (mut token, cli) = match credential_and_cli(&entry, agent, local.as_ref()) {
             Ok(found) => found,
@@ -601,8 +601,8 @@ impl Executor for PodmanExecutor {
         let workspace = job_dir.join("work");
         // A Local run keeps its own config directory, so its written config and
         // session files never mix with a subscription run of the same CLI.
-        let config_dir = job_dir.join(if local.is_some() {
-            backend.local_host_config_dir()
+        let config_dir = job_dir.join(if let Some(provider) = &local {
+            backend.provider_host_config_dir(&provider.kind)
         } else {
             backend.host_config_dir()
         });
@@ -710,9 +710,9 @@ impl Executor for PodmanExecutor {
             effort: request.effort,
             mcp: request.mcp,
             packages: request.packages,
-            local,
+            provider: local,
         };
-        let is_local = worker.local.is_some();
+        let is_local = worker.provider.is_some();
         let report = run(
             &config,
             &worker,
@@ -724,7 +724,7 @@ impl Executor for PodmanExecutor {
                 }
             },
             |id: &str| session(id.to_owned()),
-            || self.record_local_cli(request.job_id, request_local.as_ref()),
+            || self.record_provider_cli(request.job_id, request_local.as_ref()),
         )
         .await;
         if let Some(path) = &credential_file {

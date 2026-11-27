@@ -15,12 +15,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use factory_core::{Agent, Cli, Event};
 use factory_runner::{
-    Account, Expect, ForgeKind, Git, GitHub, LocalTarget, LogLine, RunReport, WorkerConfig,
+    Account, Expect, ForgeKind, Git, GitHub, LogLine, ProviderKind, ProviderTarget, RunReport,
+    WorkerConfig,
 };
 use factory_server::{
     AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
-    HttpLocalServerProbe, LocalKeyOwner, LocalRequest, LocalSecrets, MASTER_KEY_LEN,
-    PlanUsageCache, PodmanExecutor, SecretStore, Settings, Store,
+    HttpLocalServerProbe, KeyOwner, LocalSecrets, MASTER_KEY_LEN, PlanUsageCache, PodmanExecutor,
+    ProviderRequest, SecretStore, Settings, Store,
 };
 use tokio::sync::Notify;
 
@@ -195,12 +196,7 @@ impl Fixture {
     }
 }
 
-fn request(
-    url: &str,
-    key: Option<&str>,
-    key_from: LocalKeyOwner,
-    timeout: Duration,
-) -> AgentRequest {
+fn request(url: &str, key: Option<&str>, key_from: KeyOwner, timeout: Duration) -> AgentRequest {
     AgentRequest {
         job_id: 7,
         forge: ForgeKind::GitHub,
@@ -225,12 +221,14 @@ fn request(
         effort: None,
         mcp: None,
         packages: Vec::new(),
-        local: Some(LocalRequest {
-            target: LocalTarget {
+        provider: Some(ProviderRequest {
+            target: ProviderTarget {
+                kind: ProviderKind::Local {
+                    load_timeout: timeout,
+                },
                 cli: Cli::Codex,
                 base_url: url.into(),
                 key: key.map(str::to_owned),
-                load_timeout: timeout,
             },
             key_from,
             setting_cli: Cli::Codex,
@@ -254,7 +252,7 @@ async fn an_immediate_answer_starts_the_worker_and_logs_nothing() {
     let server = stub(Answer::Ok, Duration::ZERO).await;
     let fixture = Fixture::new();
     let (_, lines) = fixture
-        .run(request(&server.url, None, LocalKeyOwner::None, SHORT))
+        .run(request(&server.url, None, KeyOwner::None, SHORT))
         .await;
 
     assert_eq!(
@@ -284,7 +282,7 @@ async fn a_slow_load_logs_the_wait_and_starts_the_worker_only_after_the_answer()
         .run(request(
             &server.url,
             Some(KEY),
-            LocalKeyOwner::Factory,
+            KeyOwner::Factory,
             Duration::from_secs(60),
         ))
         .await;
@@ -312,7 +310,7 @@ async fn a_server_that_never_answers_fails_the_run_before_any_container() {
     let (reason, _) = run(request(
         &server.url,
         None,
-        LocalKeyOwner::None,
+        KeyOwner::None,
         Duration::from_secs(1),
     ))
     .await;
@@ -329,7 +327,7 @@ async fn an_unreachable_server_fails_the_run() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://{}", listener.local_addr().unwrap())
     };
-    let (reason, _) = run(request(&url, None, LocalKeyOwner::None, SHORT)).await;
+    let (reason, _) = run(request(&url, None, KeyOwner::None, SHORT)).await;
 
     assert_eq!(
         reason,
@@ -345,7 +343,7 @@ async fn a_401_names_whose_key_the_server_rejected_and_never_shows_a_key() {
     );
     let server = stub(denied.clone(), Duration::ZERO).await;
 
-    let (reason, _) = run(request(&server.url, None, LocalKeyOwner::None, SHORT)).await;
+    let (reason, _) = run(request(&server.url, None, KeyOwner::None, SHORT)).await;
     assert!(
         reason.starts_with("The local server asks for an API key and none is set."),
         "{reason}"
@@ -355,7 +353,7 @@ async fn a_401_names_whose_key_the_server_rejected_and_never_shows_a_key() {
     let (reason, _) = run(request(
         &server.url,
         Some(KEY),
-        LocalKeyOwner::Login("alice".into()),
+        KeyOwner::Login("alice".into()),
         SHORT,
     ))
     .await;
@@ -365,13 +363,7 @@ async fn a_401_names_whose_key_the_server_rejected_and_never_shows_a_key() {
     );
     assert!(reason.contains("/settings/local"), "{reason}");
 
-    let (reason, _) = run(request(
-        &server.url,
-        Some(KEY),
-        LocalKeyOwner::Factory,
-        SHORT,
-    ))
-    .await;
+    let (reason, _) = run(request(&server.url, Some(KEY), KeyOwner::Factory, SHORT)).await;
     assert!(
         reason.starts_with("The local server rejected the factory's Local API key."),
         "{reason}"
@@ -400,7 +392,7 @@ async fn another_status_gives_the_status_and_the_servers_message() {
         Duration::ZERO,
     )
     .await;
-    let (reason, _) = run(request(&server.url, None, LocalKeyOwner::None, SHORT)).await;
+    let (reason, _) = run(request(&server.url, None, KeyOwner::None, SHORT)).await;
 
     assert_eq!(
         reason,
@@ -415,12 +407,7 @@ async fn a_pending_load_holds_back_the_checkout_and_the_worker_until_a_2xx() {
     let fixture = Arc::new(Fixture::new());
     let run = tokio::spawn({
         let fixture = Arc::clone(&fixture);
-        let request = request(
-            &server.url,
-            None,
-            LocalKeyOwner::None,
-            Duration::from_secs(60),
-        );
+        let request = request(&server.url, None, KeyOwner::None, Duration::from_secs(60));
         async move { fixture.run(request).await }
     });
 
@@ -444,7 +431,7 @@ async fn a_timed_out_load_starts_no_worker_and_the_job_offers_retry() {
         .run(request(
             &server.url,
             None,
-            LocalKeyOwner::None,
+            KeyOwner::None,
             Duration::from_secs(1),
         ))
         .await;
@@ -470,7 +457,7 @@ async fn a_late_error_answer_logs_the_seconds_waited() {
     let (_, lines) = run(request(
         &server.url,
         None,
-        LocalKeyOwner::None,
+        KeyOwner::None,
         Duration::from_secs(60),
     ))
     .await;
@@ -494,13 +481,7 @@ async fn a_key_the_server_echoes_across_the_cut_leaves_no_prefix() {
         Duration::ZERO,
     )
     .await;
-    let (reason, _) = run(request(
-        &server.url,
-        Some(KEY),
-        LocalKeyOwner::Factory,
-        SHORT,
-    ))
-    .await;
+    let (reason, _) = run(request(&server.url, Some(KEY), KeyOwner::Factory, SHORT)).await;
 
     assert!(
         reason.starts_with("The local server answered HTTP 400: xxx"),
@@ -517,7 +498,7 @@ async fn a_rejection_with_a_stalled_body_fails_at_once() {
         run(request(
             &server.url,
             Some(KEY),
-            LocalKeyOwner::Factory,
+            KeyOwner::Factory,
             Duration::from_secs(60),
         )),
     )
@@ -541,7 +522,7 @@ async fn an_error_with_a_stalled_body_keeps_its_status_and_does_not_wait_for_the
         run(request(
             &server.url,
             None,
-            LocalKeyOwner::None,
+            KeyOwner::None,
             Duration::from_secs(60),
         )),
     )

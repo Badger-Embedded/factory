@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use factory_core::{Agent, AgentResult, Cli, Event};
 use factory_runner::{
-    AgentItem, Expect, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry, RunResult,
-    SessionRun, TokenUsage, WorkerConfig, WorkerRun, backend, run,
+    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, ProviderKind, ProviderTarget,
+    RunResult, SessionRun, TokenUsage, WorkerConfig, WorkerRun, backend, run,
 };
 use serde_json::Value;
 
@@ -35,7 +35,7 @@ fn codex_run(dir: &Path, session: SessionRun) -> WorkerRun {
         effort: None,
         mcp: None,
         packages: Vec::new(),
-        local: None,
+        provider: None,
     }
 }
 
@@ -347,7 +347,7 @@ fn a_claude_run_is_unchanged_by_the_codex_backend() {
             }],
         }),
         packages: Vec::new(),
-        local: None,
+        provider: None,
     };
     let args = strings(&factory_runner::podman_args(&WorkerConfig::default(), &run));
 
@@ -776,11 +776,13 @@ fn local_codex_run(dir: &Path, key: Option<&str>) -> WorkerRun {
     run.agent = Agent::Local;
     run.token = String::new();
     run.model = Some("unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M".into());
-    run.local = Some(LocalTarget {
+    run.provider = Some(ProviderTarget {
+        kind: ProviderKind::Local {
+            load_timeout: Duration::from_mins(10),
+        },
         cli: Cli::Codex,
         base_url: "http://gfx1201:9931".into(),
         key: key.map(str::to_owned),
-        load_timeout: Duration::from_mins(10),
     });
     run
 }
@@ -849,7 +851,7 @@ fn only_a_local_codex_prompt_carries_the_schema() {
     let local = factory_runner::prompt(
         &task,
         Expect::Spec,
-        factory_runner::PromptTarget::Local(Cli::Codex),
+        factory_runner::PromptTarget::Provider(Cli::Codex),
     );
 
     assert!(!chatgpt.contains("This agent has no structured-output mode"));
@@ -875,7 +877,7 @@ fn a_local_codex_final_message_may_end_with_a_fenced_block() {
 
     for text in [bare.to_owned(), fenced.clone()] {
         let result = codex
-            .parse_local(Expect::Spec, &message(&text))
+            .parse_provider(Expect::Spec, &message(&text))
             .into_iter()
             .find_map(|item| match item {
                 AgentItem::Result(result) => Some(result),

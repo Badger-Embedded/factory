@@ -197,27 +197,28 @@ pub struct WorkerRun {
     /// The project's nixpkgs packages. A non-empty list runs the agent inside
     /// `nix shell` with them on `PATH`; an empty one changes nothing.
     pub packages: Vec<String>,
-    /// The local server this run talks to instead of an agent's subscription.
+    /// The server this run talks to instead of an agent's subscription.
     /// `None` runs the agent on its own login. With a target the run starts
-    /// `local.cli`, carries no subscription credential and reads no credential
+    /// `provider.cli`, carries no subscription credential and reads no credential
     /// file back.
-    pub local: Option<LocalTarget>,
+    pub provider: Option<ProviderTarget>,
 }
 
 impl WorkerRun {
-    /// The CLI that runs this stage: the Local target's, else the agent's own.
+    /// The CLI that runs this stage: the provider target's, else the agent's own.
     #[must_use]
     pub fn cli(&self) -> Option<Cli> {
-        self.local
+        self.provider
             .as_ref()
-            .map(|local| local.cli)
+            .map(|provider| provider.cli)
             .or_else(|| self.agent.cli())
     }
 }
 
-/// The OpenAI-compatible server a Local run uses and the CLI that drives it.
+/// The OpenAI-compatible server a provider run uses and the CLI that drives it.
 #[derive(Clone, PartialEq, Eq)]
-pub struct LocalTarget {
+pub struct ProviderTarget {
+    pub kind: ProviderKind,
     /// The CLI that runs the model.
     pub cli: Cli,
     /// The server's base URL, with no trailing slash and no `/v1`.
@@ -225,18 +226,26 @@ pub struct LocalTarget {
     /// The API key the run resolved, when there is one. It reaches the worker
     /// only as `--env <name>` with the value in podman's own environment.
     pub key: Option<String>,
-    /// How long the server may take to load a model. The run raises the CLI's
-    /// request timeout to at least this.
-    pub load_timeout: Duration,
 }
 
-impl std::fmt::Debug for LocalTarget {
+/// The provider a [`ProviderTarget`] points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// The Local agent's server.
+    Local {
+        /// How long the server may take to load a model. The run raises the
+        /// CLI's request timeout to at least this.
+        load_timeout: Duration,
+    },
+}
+
+impl std::fmt::Debug for ProviderTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalTarget")
+        f.debug_struct("ProviderTarget")
+            .field("kind", &self.kind)
             .field("cli", &self.cli)
             .field("base_url", &self.base_url)
             .field("key", &self.key.as_ref().map(|_| "<redacted>"))
-            .field("load_timeout", &self.load_timeout)
             .finish()
     }
 }
@@ -312,13 +321,13 @@ pub fn podman_args(config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
     // file credential, such as Codex's `auth.json`, is in the mounted config
     // directory instead, so it needs no `--env`. The config directory env
     // points the agent at its mounted config directory.
-    if run.local.is_none()
+    if run.provider.is_none()
         && let Credential::Env(name) = backend.credential()
     {
         args.push("--env".into());
         args.push(name.into());
     }
-    for (name, value) in backend.local_env(run) {
+    for (name, value) in backend.provider_env(run) {
         args.push("--env".into());
         args.push(format!("{name}={value}").into());
     }
@@ -403,7 +412,7 @@ pub async fn run(
     }
     // A Local run has no subscription, so a backend's note about its cost
     // does not apply; the factory writes the Local cost line itself.
-    if run.local.is_none() {
+    if run.provider.is_none() {
         for line in backend.start_log() {
             log(line);
         }
@@ -414,7 +423,7 @@ pub async fn run(
     // environment and the `--env <name>` pass-through, not as an argument, so it
     // is absent from the process list. A file credential is in the mounted
     // config directory, so nothing is set here for it.
-    if run.local.is_none()
+    if run.provider.is_none()
         && let Credential::Env(name) = backend.credential()
     {
         command.env(name, &run.token);
@@ -449,12 +458,12 @@ pub async fn run(
         text
     });
 
-    let redactor = Redactor::new(run.local.as_ref().and_then(|local| local.key.as_deref()));
+    let redactor = Redactor::new(run.provider.as_ref().and_then(|local| local.key.as_deref()));
     let mut collected = Collected::default();
     let mut parse = backend.stream(
         run.expect,
-        run.local.is_some(),
-        run.local.as_ref().and_then(|local| local.key.as_deref()),
+        run.provider.is_some(),
+        run.provider.as_ref().and_then(|local| local.key.as_deref()),
     );
     if let Some(stdout) = child.stdout.take() {
         let mut lines = BufReader::new(stdout).lines();
@@ -466,7 +475,7 @@ pub async fn run(
                 let item = redactor.item(item);
                 // A Local run says nothing about the subscription's plan usage,
                 // whatever the CLI reports.
-                if run.local.is_some() && matches!(item, AgentItem::PlanUsage(_)) {
+                if run.provider.is_some() && matches!(item, AgentItem::PlanUsage(_)) {
                     continue;
                 }
                 collected.absorb(item, &mut log, &mut usage, &mut session);
@@ -480,7 +489,7 @@ pub async fn run(
     // the executor can keep a login the agent refreshed. The file may be gone,
     // which reads as `None`.
     let credential = match backend.credential() {
-        Credential::File(name) if run.local.is_none() => {
+        Credential::File(name) if run.provider.is_none() => {
             fs::read_to_string(run.config_dir.join(name)).ok()
         }
         _ => None,

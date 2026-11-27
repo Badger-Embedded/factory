@@ -26,7 +26,8 @@ use crate::final_json::message_result;
 use crate::outcome::{Expect, failed_event};
 use crate::stream::LogLine;
 use crate::worker::{
-    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, SessionRun, WorkerConfig, WorkerRun,
+    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, ProviderKind, SessionRun, WorkerConfig,
+    WorkerRun,
 };
 
 /// The Copilot config directory inside the worker, mounted from the job's
@@ -127,16 +128,16 @@ impl AgentBackend for CopilotAgent {
         {
             env.push((MCP_TOKEN_ENV, proxy.token.as_str()));
         }
-        if let Some(key) = run.local.as_ref().and_then(|local| local.key.as_deref()) {
+        if let Some(key) = run.provider.as_ref().and_then(|local| local.key.as_deref()) {
             env.push((LOCAL_KEY_ENV, key));
         }
         env
     }
 
-    fn local_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
+    fn provider_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
         // Copilot documents no request timeout for a custom provider, so it
         // keeps its own behaviour while the server loads the model.
-        run.local.as_ref().map_or_else(Vec::new, |local| {
+        run.provider.as_ref().map_or_else(Vec::new, |local| {
             vec![
                 ("COPILOT_TELEMETRY_DISABLED", "true".to_owned()),
                 (
@@ -148,7 +149,7 @@ impl AgentBackend for CopilotAgent {
         })
     }
 
-    fn local_host_config_dir(&self) -> &'static str {
+    fn provider_host_config_dir(&self, _kind: &ProviderKind) -> &'static str {
         "local-copilot"
     }
 
@@ -181,7 +182,7 @@ impl AgentBackend for CopilotAgent {
             copilot.push(model.into());
         }
         copilot.push("--effort".into());
-        let default_effort = if run.local.is_some() {
+        let default_effort = if run.provider.is_some() {
             Agent::Local
         } else {
             Agent::Copilot
@@ -212,7 +213,7 @@ impl AgentBackend for CopilotAgent {
         parse_copilot(expect, line)
     }
 
-    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+    fn parse_provider(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         let mut items = parse_copilot(expect, line);
         if let Ok(value) = serde_json::from_str::<Value>(line.trim())
             && value.get("type").and_then(Value::as_str) == Some("session.usage_checkpoint")

@@ -51,7 +51,7 @@ pub use outcome::{Expect, event_from_output, event_from_result, failed_event};
 pub use prompt::{PromptTarget, job_prompt, prompt};
 pub use stream::{ClaudeStream, LogLine, McpServerStatus, ResultMessage, StreamItem, parse_line};
 pub use worker::{
-    LocalTarget, McpConfig, McpProxy, McpServerEntry, McpUnavailable, RunReport,
+    McpConfig, McpProxy, McpServerEntry, McpUnavailable, ProviderKind, ProviderTarget, RunReport,
     STDIO_STARTUP_TIMEOUT_SECS, SessionRun, WorkerConfig, WorkerRun, podman_args, remove_container,
     run,
 };

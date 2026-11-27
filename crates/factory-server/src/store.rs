@@ -4781,7 +4781,7 @@ impl Store {
     /// # Errors
     ///
     /// Fails on a database error.
-    pub fn session_local_cli(
+    pub fn session_provider_cli(
         &self,
         job_id: i64,
         session: Session,
@@ -4805,7 +4805,7 @@ impl Store {
     /// # Errors
     ///
     /// Fails on a database error.
-    pub fn record_session_local_cli(
+    pub fn record_session_provider_cli(
         &self,
         job_id: i64,
         session: Session,

@@ -12,8 +12,9 @@ use factory_core::{
     ReviewState, Session, Stage,
 };
 use factory_runner::{
-    Expect, ForgeKind, HeadCommit, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry,
-    NOT_PERMITTED, Observation, PromptTarget, RenovatePr, Rerun, RunReport, job_prompt,
+    Expect, ForgeKind, HeadCommit, LogLine, McpConfig, McpProxy, McpServerEntry, NOT_PERMITTED,
+    Observation, PromptTarget, ProviderKind, ProviderTarget, RenovatePr, Rerun, RunReport,
+    job_prompt,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -226,7 +227,7 @@ pub struct AgentRequest {
     pub packages: Vec<String>,
     /// The local server and the CLI that drives it, set exactly when `agent` is
     /// [`Agent::Local`].
-    pub local: Option<LocalRequest>,
+    pub provider: Option<ProviderRequest>,
 }
 
 /// A pull request that already exists, which a job adds commits to.
@@ -242,12 +243,12 @@ pub struct ExistingPr {
 
 /// What a Local run needs beyond an agent run's own fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalRequest {
+pub struct ProviderRequest {
     /// The server, the CLI and the key the run resolved. Its `Debug` hides the
     /// key.
-    pub target: LocalTarget,
+    pub target: ProviderTarget,
     /// Whose key `target.key` is, for the job log.
-    pub key_from: LocalKeyOwner,
+    pub key_from: KeyOwner,
     /// The CLI the Local settings name now. It differs from `target.cli` when
     /// the run resumes a session that started on another CLI.
     pub setting_cli: Cli,
@@ -258,7 +259,7 @@ pub struct LocalRequest {
 
 /// Whose API key a Local run uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalKeyOwner {
+pub enum KeyOwner {
     /// The stored key of the login that requested the job.
     Login(String),
     /// The factory-wide key.
@@ -1695,7 +1696,7 @@ impl<E: Executor> Scheduler<E> {
                 task,
                 expect,
                 local.as_ref().map_or(PromptTarget::Agent(agent), |local| {
-                    PromptTarget::Local(local.target.cli)
+                    PromptTarget::Provider(local.target.cli)
                 }),
                 &mcp_servers,
             ),
@@ -1703,7 +1704,7 @@ impl<E: Executor> Scheduler<E> {
             effort: Some(effort),
             mcp: selection.config,
             packages: self.store.project_packages(&row.project)?,
-            local,
+            provider: local,
         };
         Ok(Some((request, selection.skipped)))
     }
@@ -1751,7 +1752,7 @@ impl<E: Executor> Scheduler<E> {
         row: &JobRow,
         session: Session,
         model: Option<&str>,
-    ) -> Result<Result<LocalRequest, String>, StoreError> {
+    ) -> Result<Result<ProviderRequest, String>, StoreError> {
         let settings = self.store.local_settings()?;
         let Some(base_url) = settings.url.clone() else {
             return Ok(Err("no local server is set".to_owned()));
@@ -1765,14 +1766,18 @@ impl<E: Executor> Scheduler<E> {
         };
         let cli = self
             .store
-            .session_local_cli(row.id, session)?
+            .session_provider_cli(row.id, session)?
             .unwrap_or(settings.cli);
-        Ok(Ok(LocalRequest {
-            target: LocalTarget {
+        Ok(Ok(ProviderRequest {
+            target: ProviderTarget {
+                kind: ProviderKind::Local {
+                    load_timeout: Duration::from_secs(
+                        u64::from(settings.load_timeout_minutes) * 60,
+                    ),
+                },
                 cli,
                 base_url,
                 key,
-                load_timeout: Duration::from_secs(u64::from(settings.load_timeout_minutes) * 60),
             },
             key_from,
             setting_cli: settings.cli,
@@ -1787,15 +1792,12 @@ impl<E: Executor> Scheduler<E> {
     fn local_key(
         &self,
         requested_by: &str,
-    ) -> Result<Result<(Option<String>, LocalKeyOwner), String>, StoreError> {
+    ) -> Result<Result<(Option<String>, KeyOwner), String>, StoreError> {
         let secrets = &self.mcp.secrets;
         if requested_by != FACTORY_REQUESTER {
             match secrets.user_local_key(requested_by) {
                 Ok(Some(key)) if !key.is_empty() => {
-                    return Ok(Ok((
-                        Some(key),
-                        LocalKeyOwner::Login(requested_by.to_owned()),
-                    )));
+                    return Ok(Ok((Some(key), KeyOwner::Login(requested_by.to_owned()))));
                 }
                 Ok(_) => {}
                 Err(SecretError::Store(err)) => return Err(err),
@@ -1807,8 +1809,8 @@ impl<E: Executor> Scheduler<E> {
             }
         }
         match secrets.local_key() {
-            Ok(Some(key)) if !key.is_empty() => Ok(Ok((Some(key), LocalKeyOwner::Factory))),
-            Ok(_) => Ok(Ok((None, LocalKeyOwner::None))),
+            Ok(Some(key)) if !key.is_empty() => Ok(Ok((Some(key), KeyOwner::Factory))),
+            Ok(_) => Ok(Ok((None, KeyOwner::None))),
             Err(SecretError::Store(err)) => Err(err),
             Err(err) => Ok(Err(format!(
                 "The factory's Local API key cannot be read: {err}."
@@ -2330,7 +2332,7 @@ impl<E: Executor> Scheduler<E> {
     fn open_run_log(
         &self,
         job_id: i64,
-        local: Option<&LocalRequest>,
+        local: Option<&ProviderRequest>,
         stage_note: Option<&str>,
     ) -> Result<(), StoreError> {
         if let Some(local) = local {
@@ -2345,11 +2347,11 @@ impl<E: Executor> Scheduler<E> {
     /// Writes the line that opens a Local run: the CLI, the server and whose key
     /// the run uses, never the key. A run that resumes a session on another CLI
     /// than the settings name says so.
-    fn note_local_run(&self, job_id: i64, local: &LocalRequest) {
+    fn note_local_run(&self, job_id: i64, local: &ProviderRequest) {
         let key = match &local.key_from {
-            LocalKeyOwner::Login(login) => format!("the Local API key of {login}"),
-            LocalKeyOwner::Factory => "the factory's key".to_owned(),
-            LocalKeyOwner::None => "no key".to_owned(),
+            KeyOwner::Login(login) => format!("the Local API key of {login}"),
+            KeyOwner::Factory => "the factory's key".to_owned(),
+            KeyOwner::None => "no key".to_owned(),
         };
         self.note(
             job_id,

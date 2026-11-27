@@ -18,8 +18,8 @@ use crate::agent::{
 use crate::outcome::{Expect, event_from_result};
 use crate::stream::{ClaudeStream, StreamItem, parse_line};
 use crate::worker::{
-    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, STDIO_STARTUP_TIMEOUT_SECS, SessionRun,
-    WorkerConfig, WorkerRun,
+    AGENTS_DIR, McpConfig, McpServerEntry, McpUnavailable, ProviderKind,
+    STDIO_STARTUP_TIMEOUT_SECS, SessionRun, WorkerConfig, WorkerRun,
 };
 
 /// The Claude Code config directory inside the worker, mounted from the job's
@@ -81,23 +81,24 @@ impl AgentBackend for ClaudeAgent {
         "claude"
     }
 
-    fn local_host_config_dir(&self) -> &'static str {
+    fn provider_host_config_dir(&self, _kind: &ProviderKind) -> &'static str {
         "local-claude"
     }
 
     fn secret_env<'a>(&self, run: &'a WorkerRun) -> Vec<(&'static str, &'a str)> {
-        match run.local.as_ref().and_then(|local| local.key.as_deref()) {
+        match run.provider.as_ref().and_then(|local| local.key.as_deref()) {
             Some(key) => vec![(LOCAL_KEY_ENV, key)],
             None => Vec::new(),
         }
     }
 
-    fn local_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
-        let Some(local) = run.local.as_ref() else {
+    fn provider_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
+        let Some(local) = run.provider.as_ref() else {
             return Vec::new();
         };
         let model = run.model.clone().unwrap_or_default();
-        let load_ms = local.load_timeout.as_millis();
+        let ProviderKind::Local { load_timeout } = local.kind;
+        let load_ms = load_timeout.as_millis();
         let mut env = vec![
             ("ANTHROPIC_BASE_URL", local.base_url.clone()),
             ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.clone()),
@@ -164,7 +165,7 @@ impl AgentBackend for ClaudeAgent {
             claude.push(model.into());
         }
         claude.push("--effort".into());
-        let default_effort = if run.local.is_some() {
+        let default_effort = if run.provider.is_some() {
             Agent::Local
         } else {
             Agent::Claude
@@ -203,7 +204,7 @@ impl AgentBackend for ClaudeAgent {
         })
     }
 
-    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+    fn parse_provider(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         let items = self.parse(expect, line);
         append_local_token_usage(items, line)
     }

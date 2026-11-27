@@ -14,13 +14,13 @@ use std::time::Duration;
 
 use factory_core::{Agent, Cli, Event, PrWatch};
 use factory_runner::{
-    Account, Expect, Forge, ForgeKind, Git, GitHub, GitLab, LocalTarget, WorkerConfig,
+    Account, Expect, Forge, ForgeKind, Git, GitHub, GitLab, ProviderKind, ProviderTarget,
+    WorkerConfig,
 };
 use factory_server::{
     AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
-    LoadFuture, LocalKeyOwner, LocalRequest, LocalSecrets, LocalServerProbe, MASTER_KEY_LEN,
-    ModelsFuture, Operation, Owner, PlanUsageCache, PodmanExecutor, Rebase, SecretStore, Settings,
-    Store,
+    KeyOwner, LoadFuture, LocalSecrets, LocalServerProbe, MASTER_KEY_LEN, ModelsFuture, Operation,
+    Owner, PlanUsageCache, PodmanExecutor, ProviderRequest, Rebase, SecretStore, Settings, Store,
 };
 
 mod support;
@@ -110,7 +110,7 @@ fn request() -> AgentRequest {
         effort: None,
         mcp: None,
         packages: Vec::new(),
-        local: None,
+        provider: None,
     }
 }
 
@@ -118,14 +118,16 @@ fn local_request(cli: Cli) -> AgentRequest {
     AgentRequest {
         agent: Agent::Local,
         model: Some("gemma".into()),
-        local: Some(LocalRequest {
-            target: LocalTarget {
+        provider: Some(ProviderRequest {
+            target: ProviderTarget {
+                kind: ProviderKind::Local {
+                    load_timeout: Duration::from_secs(600),
+                },
                 cli,
                 base_url: "http://gfx1201:9931".into(),
                 key: None,
-                load_timeout: Duration::from_secs(600),
             },
-            key_from: LocalKeyOwner::None,
+            key_from: KeyOwner::None,
             setting_cli: cli,
             session: factory_core::Session::Planning,
         }),
@@ -1715,7 +1717,7 @@ async fn local_launch(
         )
         .await;
     let recorded = store
-        .session_local_cli(id, factory_core::Session::Planning)
+        .session_provider_cli(id, factory_core::Session::Planning)
         .unwrap();
     (recorded, report, store)
 }

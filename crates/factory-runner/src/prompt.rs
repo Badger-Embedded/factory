@@ -13,7 +13,7 @@ use crate::outcome::Expect;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptTarget {
     Agent(Agent),
-    Local(Cli),
+    Provider(Cli),
 }
 
 impl From<Agent> for PromptTarget {
@@ -29,9 +29,9 @@ fn style(target: PromptTarget) -> PromptStyle {
             .and_then(backend_for)
             .expect("the run's CLI has a worker backend")
             .prompt_style(),
-        PromptTarget::Local(cli) => backend_for(cli)
+        PromptTarget::Provider(cli) => backend_for(cli)
             .expect("the run's CLI has a worker backend")
-            .local_prompt_style(),
+            .provider_prompt_style(),
     }
 }
 
