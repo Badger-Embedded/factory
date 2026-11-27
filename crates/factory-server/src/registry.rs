@@ -171,9 +171,10 @@ impl AgentEntry<'_> {
         match self.agent {
             // One worker image carries the agents that have a backend, so they
             // run in the `worker_image` setting edited on the Workers page.
-            Agent::Claude | Agent::Codex | Agent::Copilot | Agent::Local | Agent::OpenRouter => {
+            Agent::Claude | Agent::Codex | Agent::Copilot | Agent::Local => {
                 Some(settings.worker_image.clone())
             }
+            Agent::OpenRouter => None,
         }
     }
 

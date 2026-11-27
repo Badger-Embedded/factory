@@ -197,6 +197,11 @@ fn the_openrouter_entry_is_listed_but_cannot_run_yet() {
     assert_eq!(entry.settings_url(), None);
     assert_eq!(entry.model_suggestions(), [] as [&str; 0]);
     assert_eq!(entry.host_config_dir(), None);
+    let settings = Settings {
+        worker_image: "localhost/factory-worker:latest".into(),
+        ..Settings::default()
+    };
+    assert_eq!(entry.image(&settings), None);
     assert_eq!(
         entry.credential(),
         Err("the OpenRouter agent is not available yet".to_owned())

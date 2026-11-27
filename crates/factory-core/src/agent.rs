@@ -139,8 +139,8 @@ impl Agent {
         }
     }
 
-    /// Whether a stage can select the agent. `OpenRouter` ships listed but not
-    /// selectable until its run lands.
+    /// Whether a stage can select the agent. An unavailable agent is listed but
+    /// a stage cannot select it.
     #[must_use]
     #[allow(clippy::match_same_arms)]
     pub fn available(self) -> bool {

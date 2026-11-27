@@ -8242,6 +8242,54 @@ fn an_unknown_agent_is_rejected_and_not_stored() {
 }
 
 #[test]
+fn an_unavailable_agent_is_rejected_and_not_stored() {
+    let store = Store::open_in_memory().unwrap();
+    let submitted = agents("claude", "openrouter", "claude", "claude", "claude");
+    let err = store
+        .save_project_agents("maestro", &submitted)
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidAgent(id) if id == "openrouter"),
+        "{err:?}"
+    );
+    assert_eq!(
+        store.project_agents("maestro").unwrap(),
+        StageAgents::default()
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_stage_submission_is_rejected_and_stores_nothing() {
+    let dashboard = dashboard();
+    let reply = dashboard
+        .post(
+            "/settings/projects/maestro",
+            "clarify=opus&spec=some%2Fmodel&plan=&implement=&review=&\
+             clarify_effort=medium&spec_effort=high&plan_effort=medium&\
+             implement_effort=medium&review_effort=medium&\
+             clarify_agent=claude&spec_agent=openrouter&plan_agent=claude&\
+             implement_agent=claude&review_agent=claude",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap(),
+        StageModels::default()
+    );
+    assert_eq!(
+        dashboard.store.project_efforts("maestro").unwrap(),
+        StageEfforts::default()
+    );
+    assert_eq!(
+        dashboard.store.project_agents("maestro").unwrap(),
+        StageAgents::default()
+    );
+}
+
+#[test]
 fn codex_is_accepted_for_every_stage() {
     let store = Store::open_in_memory().unwrap();
     let submitted = agents("codex", "codex", "codex", "codex", "codex");
@@ -12513,7 +12561,6 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
     let local = body.find(r#"href="/settings/agents/local""#).unwrap();
     assert!(body.find("Copilot").unwrap() < local);
 
-    // OpenRouter follows Local as text with no link until its page lands.
     assert!(!body.contains("/settings/agents/openrouter"));
     let open_router = body.find("OpenRouter").unwrap();
     assert!(local < open_router);
@@ -18401,6 +18448,7 @@ async fn a_bad_renovate_agent_is_rejected_by_name_and_stores_nothing() {
     let dashboard = dashboard();
     for fields in [
         "renovate_override=on&renovate_agent=gemini&renovate_effort=low",
+        "renovate_override=on&renovate_agent=openrouter&renovate=some%2Fmodel&renovate_effort=high",
         "renovate_override=on&renovate_agent=codex&renovate_effort=max",
         "renovate_override=on&renovate_agent=local&renovate=&renovate_effort=high",
     ] {
