@@ -2,7 +2,7 @@
 //!
 //! The factory runs every stage with an agent. Claude Code, Codex and Copilot
 //! run. Local runs one of those CLIs against an OpenAI-compatible server.
-//! OpenRouter is listed but cannot run yet.
+//! `OpenRouter` is listed but cannot run yet.
 //! Each agent has a stable id that the server stores per stage, a display name
 //! for the dashboard, and a flag for whether a stage can select it. A stage
 //! with no saved agent runs on [`DEFAULT_AGENT`].
@@ -27,7 +27,7 @@ pub enum Agent {
     /// A model on a local OpenAI-compatible server. The CLI that drives it is a
     /// runtime setting, so the agent has no fixed [`Cli`].
     Local,
-    /// A model on OpenRouter. Like [`Agent::Local`], it has no fixed [`Cli`].
+    /// A model on `OpenRouter`. Like [`Agent::Local`], it has no fixed [`Cli`].
     OpenRouter,
 }
 
@@ -100,7 +100,7 @@ const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 /// From the pinned Copilot CLI, which lists the same levels as Claude.
 const COPILOT_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// The effort levels the Local and OpenRouter agents accept, lowest first: the levels all
+/// The effort levels the Local and `OpenRouter` agents accept, lowest first: the levels all
 /// three CLIs take.
 const LOCAL_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
@@ -139,7 +139,7 @@ impl Agent {
         }
     }
 
-    /// Whether a stage can select the agent. OpenRouter ships listed but not
+    /// Whether a stage can select the agent. `OpenRouter` ships listed but not
     /// selectable until its run lands.
     #[must_use]
     #[allow(clippy::match_same_arms)]
@@ -153,7 +153,7 @@ impl Agent {
         }
     }
 
-    /// The CLI that drives this agent in a worker, or `None` for Local and OpenRouter,
+    /// The CLI that drives this agent in a worker, or `None` for Local and `OpenRouter`,
     /// whose CLI is a setting. A caller that needs the rules file uses
     /// [`Cli::rules_doc`] on the CLI of the run.
     #[must_use]
