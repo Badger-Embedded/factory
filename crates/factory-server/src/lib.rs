@@ -16,6 +16,7 @@ mod gitlab;
 mod local_server;
 mod localtime;
 mod mcp;
+mod openrouter;
 mod packages;
 mod pages;
 mod podman;
@@ -57,6 +58,10 @@ pub use local_server::{
 pub use mcp::{
     McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
 };
+pub use openrouter::{
+    HttpOpenRouterApi, OPENROUTER_BASE_URL, OpenRouterApi, OpenRouterModel, OpenRouterModelsFuture,
+    parse_models,
+};
 pub use podman::PodmanExecutor;
 pub use projects::{
     ImportError, Project, ProjectForge, Projects, RenovateAgent, StageAgents, StageEfforts,
@@ -82,8 +87,8 @@ pub use secrets::{
 pub use settings::Settings;
 pub use store::{
     Claim, CodexPrice, Collaborator, FACTORY_REQUESTER, GapJob, GroupsSave, JobEvent, JobFile,
-    JobRow, LocalSettings, LogEntry, Maintenance, MaintenanceSave, Packaging, PackagingType,
-    PrerequisiteEdit, ProjectGuard, ProjectTotals, Snapshot, Store, StoreError,
+    JobRow, LocalSettings, LogEntry, Maintenance, MaintenanceSave, OpenRouterSettings, Packaging,
+    PackagingType, PrerequisiteEdit, ProjectGuard, ProjectTotals, Snapshot, Store, StoreError,
 };
 pub use usage::PlanUsageCache;
 pub use warnings::McpWarnings;

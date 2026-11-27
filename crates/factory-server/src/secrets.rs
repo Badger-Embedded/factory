@@ -311,6 +311,31 @@ pub trait SecretStore: Send + Sync {
     /// Fails on a storage error.
     fn clear_local_key(&self) -> Result<(), SecretError>;
 
+    /// The factory's `OpenRouter` API key, or `None` when none is set. It lives
+    /// in its own reserved row, apart from the Local key.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable, when the stored value does not
+    /// decrypt, or on a storage error.
+    fn openrouter_key(&self) -> Result<Option<String>, SecretError>;
+
+    /// Stores `value` as the factory's `OpenRouter` API key, replacing any key
+    /// already there. The store keeps the bytes as given.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn set_openrouter_key(&self, value: &str) -> Result<(), SecretError>;
+
+    /// Deletes the factory's `OpenRouter` API key. Clearing a key that is not
+    /// there is fine, and it works without the master key.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error.
+    fn clear_openrouter_key(&self) -> Result<(), SecretError>;
+
     /// The Local API key `login` stored for themselves, or `None` when there
     /// is none. It sits in a row of its own per login and its ciphertext is
     /// bound to that login.
@@ -440,6 +465,12 @@ const LOCAL_KEY_REF: SecretRef<'static> = SecretRef {
     project: "",
     server: "",
     header: "local-key",
+};
+
+const OPENROUTER_KEY_REF: SecretRef<'static> = SecretRef {
+    project: "",
+    server: "",
+    header: "openrouter-key",
 };
 
 fn user_local_key_header(login: &str) -> String {
@@ -611,6 +642,25 @@ impl SecretStore for LocalSecrets {
 
     fn clear_local_key(&self) -> Result<(), SecretError> {
         self.store.delete_secret(LOCAL_KEY_REF)?;
+        Ok(())
+    }
+
+    fn openrouter_key(&self) -> Result<Option<String>, SecretError> {
+        let Some((backend, stored)) = self.store.get_secret(OPENROUTER_KEY_REF)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open(&backend, &stored, OPENROUTER_KEY_AAD)?))
+    }
+
+    fn set_openrouter_key(&self, value: &str) -> Result<(), SecretError> {
+        let stored = self.seal(OPENROUTER_KEY_AAD, value)?;
+        self.store
+            .put_secret(OPENROUTER_KEY_REF, LOCAL_BACKEND, &stored)?;
+        Ok(())
+    }
+
+    fn clear_openrouter_key(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(OPENROUTER_KEY_REF)?;
         Ok(())
     }
 
@@ -849,6 +899,22 @@ impl SecretStore for UnavailableSecrets {
         Ok(())
     }
 
+    fn openrouter_key(&self) -> Result<Option<String>, SecretError> {
+        match self.store.get_secret(OPENROUTER_KEY_REF)? {
+            None => Ok(None),
+            Some(_) => Err(SecretError::Unavailable),
+        }
+    }
+
+    fn set_openrouter_key(&self, _value: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn clear_openrouter_key(&self) -> Result<(), SecretError> {
+        self.store.delete_secret(OPENROUTER_KEY_REF)?;
+        Ok(())
+    }
+
     fn user_local_key(&self, login: &str) -> Result<Option<String>, SecretError> {
         let header = user_local_key_header(login);
         match self.store.get_secret(SecretRef {
@@ -1016,6 +1082,8 @@ const CODEX_AUTH_AAD: &[u8] = b"factory:codex-auth:v1";
 const COPILOT_TOKEN_AAD: &[u8] = b"factory:copilot-token:v1";
 
 const LOCAL_KEY_AAD: &[u8] = b"factory:local-key:v1";
+
+const OPENROUTER_KEY_AAD: &[u8] = b"factory:openrouter-key:v1";
 
 /// The tag a personal Local API key's associated data starts with, followed by
 /// the length-framed login.

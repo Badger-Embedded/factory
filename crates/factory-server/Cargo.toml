@@ -7,6 +7,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Lets the browser tests point the OpenRouter model list at a stub. Never in a release build.
+e2e-fakes = []
+
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.23.1"

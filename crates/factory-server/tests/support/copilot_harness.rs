@@ -12,9 +12,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use factory_runner::{Account, GitHub};
 use factory_server::{
-    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, LocalSecrets, LoginProcess,
-    LoginSpawner, LoginSpec, MASTER_KEY_LEN, McpChecker, PlanUsageCache, Projects, RepoChecker,
-    RepoReport, SecretStore, Store, USER_HEADER, UnavailableSecrets, WorkerSlots, app,
+    AgentRegistry, ClaudeToken, CodexLogin, DeviceLogin, Forges, HttpForgejoProbe,
+    HttpLocalServerProbe, LocalSecrets, LoginProcess, LoginSpawner, LoginSpec, MASTER_KEY_LEN,
+    McpChecker, ModelsError, OpenRouterApi, OpenRouterModel, OpenRouterModelsFuture,
+    PlanUsageCache, Projects, RepoChecker, RepoReport, SecretStore, Store, USER_HEADER,
+    UnavailableSecrets, WorkerSlots, app_with_forgejo_probe,
 };
 use http_body_util::BodyExt;
 use tokio::sync::Notify;
@@ -137,6 +139,30 @@ impl LoginProcess for FakeProcess {
     }
 }
 
+/// An `OpenRouter` that answers from a script and records the key of each
+/// request.
+pub struct FakeOpenRouter {
+    pub answer: Mutex<Result<Vec<OpenRouterModel>, ModelsError>>,
+    pub keys: Mutex<Vec<Option<String>>>,
+}
+
+impl Default for FakeOpenRouter {
+    fn default() -> Self {
+        FakeOpenRouter {
+            answer: Mutex::new(Ok(Vec::new())),
+            keys: Mutex::default(),
+        }
+    }
+}
+
+impl OpenRouterApi for FakeOpenRouter {
+    fn models<'a>(&'a self, key: Option<&'a str>) -> OpenRouterModelsFuture<'a> {
+        self.keys.lock().unwrap().push(key.map(str::to_owned));
+        let answer = self.answer.lock().unwrap().clone();
+        Box::pin(std::future::ready(answer))
+    }
+}
+
 pub struct NoRepos;
 
 impl RepoChecker for NoRepos {
@@ -167,6 +193,7 @@ pub struct Harness {
     pub store: Arc<Store>,
     pub secrets: Arc<dyn SecretStore>,
     pub spawner: Arc<FakeSpawner>,
+    pub openrouter: Arc<FakeOpenRouter>,
     pub data: tempfile::TempDir,
 }
 
@@ -206,7 +233,8 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
         data.path().join("codex-login"),
         timeout,
     ));
-    let router = app(
+    let openrouter = Arc::new(FakeOpenRouter::default());
+    let router = app_with_forgejo_probe(
         Arc::clone(store),
         Arc::new(Projects::from_store(Arc::clone(store))),
         Arc::new(Notify::new()),
@@ -216,6 +244,9 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
         Arc::new(WorkerSlots::new()),
         Arc::clone(&secrets),
         Arc::new(NoChecker) as Arc<dyn McpChecker>,
+        Arc::new(HttpForgejoProbe::new(&[])),
+        Arc::new(HttpLocalServerProbe::new()),
+        Arc::clone(&openrouter) as Arc<dyn OpenRouterApi>,
         registry,
         codex_login,
         Arc::new(DeviceLogin::for_spec_with_timeout(
@@ -232,6 +263,7 @@ fn harness_with(store: &Arc<Store>, secrets: Arc<dyn SecretStore>, timeout: Dura
         store: Arc::clone(store),
         secrets,
         spawner,
+        openrouter,
         data,
     }
 }

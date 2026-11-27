@@ -601,6 +601,43 @@ fn local_key_round_trips_and_clears_without_the_master_key() {
 }
 
 #[test]
+fn openrouter_key_has_its_own_row_and_associated_data() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+
+    assert!(secrets.openrouter_key().expect("read empty").is_none());
+    secrets.set_openrouter_key("sk-first").expect("set");
+    secrets.set_openrouter_key("sk-second").expect("replace");
+    assert_eq!(
+        secrets.openrouter_key().expect("read").as_deref(),
+        Some("sk-second"),
+    );
+    assert!(secrets.local_key().expect("local row").is_none());
+    let (backend, raw) = store
+        .get_secret(at("", "", "openrouter-key"))
+        .expect("raw row")
+        .expect("row exists");
+    assert!(!contains(&raw, b"sk-second"));
+
+    store
+        .put_secret(at("", "", "local-key"), &backend, &raw)
+        .expect("copy");
+    assert!(secrets.local_key().is_err());
+
+    let unavailable = UnavailableSecrets::new(Arc::clone(&store));
+    assert!(matches!(
+        unavailable.openrouter_key(),
+        Err(SecretError::Unavailable)
+    ));
+    assert!(matches!(
+        unavailable.set_openrouter_key("sk-x"),
+        Err(SecretError::Unavailable),
+    ));
+    unavailable.clear_openrouter_key().expect("clear");
+    assert!(secrets.openrouter_key().expect("read cleared").is_none());
+}
+
+#[test]
 fn user_local_keys_are_per_login_and_bound_to_their_row() {
     let store = store();
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));

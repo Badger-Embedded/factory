@@ -13,7 +13,7 @@ test:
 [positional-arguments]
 e2e *args:
     cd e2e && npm ci --prefer-offline
-    cargo build --locked -p factory-server --bin factory-server --example e2e_fixture
+    cargo build --locked -p factory-server --features e2e-fakes --bin factory-server --example e2e_fixture
     cd e2e && npx playwright test "$@"
 
 # Check that committed changes since BASE come with tests (CI runs this on PRs)

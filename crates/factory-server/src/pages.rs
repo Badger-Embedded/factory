@@ -1520,6 +1520,91 @@ pub struct LocalAgentView<'a> {
     pub csrf: &'a str,
 }
 
+/// What the `OpenRouter` agent page shows: the stored settings, how many models
+/// are stored, and whether a factory key is stored.
+pub struct OpenRouterAgentView<'a> {
+    pub settings: &'a crate::OpenRouterSettings,
+    pub model_count: usize,
+    pub key_stored: bool,
+    pub secrets_available: bool,
+    /// The CLI radio's choice: the stored one, or what a refused save submitted.
+    pub cli: factory_core::Cli,
+    pub csrf: &'a str,
+}
+
+pub fn settings_openrouter_agent(
+    user: &str,
+    nav: &SettingsNav,
+    view: &OpenRouterAgentView<'_>,
+    notice: Option<&str>,
+) -> Markup {
+    let csrf = view.csrf;
+    settings_page(
+        user,
+        nav,
+        &SettingsPage::Agent("openrouter".to_owned()),
+        "OpenRouter",
+        notice,
+        &html! {
+            h1 { "OpenRouter" }
+            p.meta {
+                "Holds the factory's OpenRouter API key, the default CLI (Claude Code, Codex or Copilot) \
+                 and the list of models a stage can use. Stages cannot run on OpenRouter yet."
+            }
+            form.card.settings-form method="post" action="/settings/agents/openrouter" {
+                input type="hidden" name="csrf" value=(csrf);
+                div.field {
+                    label for="openrouter-key" { "Factory API key (optional)" }
+                    input #openrouter-key.wide type="password" name="key"
+                        autocomplete="off" spellcheck="false"
+                        placeholder=(if view.key_stored { "set" } else { "not set" })
+                        disabled[!view.secrets_available];
+                    p.hint {
+                        @if view.key_stored { "A key is stored. " } @else { "No key is stored. " }
+                        "Type a new key to replace it. An empty field keeps it. Stored encrypted and never shown. \
+                         A job whose requester stored a key of their own uses that one. \
+                         The key reaches the worker, and the agent that runs there can read it. Create a key on "
+                        (external_link("https://openrouter.ai/keys", "openrouter.ai/keys", None, None))
+                        "."
+                    }
+                    @if !view.secrets_available {
+                        p.hint.bad { "The master key is missing, so a key cannot be saved here. Remove still works." }
+                    }
+                }
+                fieldset.field {
+                    legend { "CLI" }
+                    @for cli in factory_core::Cli::ALL {
+                        label.radio {
+                            input type="radio" name="cli" value=(cli.id()) checked[cli == view.cli];
+                            " " (cli.display_name())
+                        }
+                    }
+                    p.hint { "The factory default CLI. A session keeps the CLI it started on." }
+                }
+                (save_bar("Save"))
+                div.danger-zone {
+                    button.danger formaction="/settings/agents/openrouter/clear-key" formnovalidate { "Remove key" }
+                }
+            }
+            div.card #openrouter-models {
+                h2 { "Models" }
+                @if view.model_count == 0 {
+                    p.meta { "No models are stored." }
+                } @else {
+                    p.meta #openrouter-model-count { (view.model_count) " models that support tools are stored." }
+                }
+                @if let Some(at) = view.settings.models_fetched_at {
+                    p.meta { "Fetched " (crate::localtime::unix(at)) "." }
+                }
+                form method="post" action="/settings/agents/openrouter/refresh" {
+                    input type="hidden" name="csrf" value=(csrf);
+                    button { "Refresh models" }
+                }
+            }
+        },
+    )
+}
+
 pub fn settings_local_agent(
     user: &str,
     nav: &SettingsNav,
