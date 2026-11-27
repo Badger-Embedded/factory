@@ -332,9 +332,27 @@ Each CLI ran against the llama.cpp server at `http://gfx1201:9931` with `unsloth
 
 | CLI | Version | Settings that pointed it at the server | Result |
 | --- | --- | --- | --- |
-| Copilot | 1.0.114, the pinned one | `COPILOT_OFFLINE=true`, `COPILOT_PROVIDER_BASE_URL=<url>/v1`, `COPILOT_PROVIDER_TYPE=openai`, `--model <id>`, no GitHub token, `COPILOT_PROVIDER_API_KEY` for a key | Works. The model created the file with the `create` tool, ran a shell command and ended with the JSON. Cold start: 35 s for the whole run, 32 s of it before the first answer. |
+| Copilot | 1.0.114, the pinned one | `COPILOT_TELEMETRY_DISABLED=true`, `COPILOT_PROVIDER_BASE_URL=<url>/v1`, `COPILOT_PROVIDER_TYPE=openai`, `--model <id>`, no GitHub token, `COPILOT_PROVIDER_API_KEY` for a key | Works with `COPILOT_OFFLINE=true`, which was set for this run and is not set any more (see "Copilot without offline mode"). The model created the file with the `create` tool, ran a shell command and ended with the JSON. Cold start: 35 s for the whole run, 32 s of it before the first answer. |
 | Claude Code | 2.1.330 | `ANTHROPIC_BASE_URL=<url>`, `ANTHROPIC_AUTH_TOKEN=<key or placeholder>`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL` set to the model, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `--model <id>`, `--json-schema` | Works. The model wrote the file with the `Write` tool and returned `structured_output`. Cold start: 48 s. The result line reported `total_cost_usd: 0.049`, a figure from Claude Code's own price table, so the factory ignores the reported cost of a Local run. |
 | Codex | 0.165.0, the pinned one | `-c 'model_providers.local={ name = "Local", base_url = "<url>/v1", wire_api = "responses" }'`, `-c model_provider=local`, `--model <id>`, no `auth.json`; `env_key = "FACTORY_LOCAL_API_KEY"` in the provider for a key | Works without `--output-schema`. Cold start: 43 s. With `--output-schema` the model answered with the JSON at once and ran no tool, so the file was never created and the run still exited 0. Without the flag, and with the schema written in the prompt, the model ran its shell commands and ended with the JSON. |
+
+### Copilot without offline mode
+
+A Local Copilot run does not set `COPILOT_OFFLINE`, so Copilot keeps its web tools. `copilot help environment` says offline mode disables "GitHub authentication, telemetry, web tools, GitHub MCP server, and auto-update". Each of the other four is covered another way:
+
+| What offline mode disabled | What covers it without the variable |
+| --- | --- |
+| GitHub authentication | `COPILOT_PROVIDER_BASE_URL` is set, and the help says GitHub authentication is not required with it. The worker still gets no GitHub token. |
+| GitHub MCP server | Every Copilot run passes `--disable-builtin-mcps`. |
+| Auto-update | The worker image sets `COPILOT_AUTO_UPDATE=false`. |
+| Telemetry | The run sets `COPILOT_TELEMETRY_DISABLED=true`, documented as disabling "Copilot-owned GitHub and Entra authentication telemetry". |
+| Web tools | They stay on. |
+
+Tested with Copilot 1.0.114 against `http://gfx1201:9931` with `unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M`, `COPILOT_PROVIDER_BASE_URL=<url>/v1`, `COPILOT_PROVIDER_TYPE=openai`, `COPILOT_TELEMETRY_DISABLED=true`, `--disable-builtin-mcps`, no GitHub token and no `COPILOT_OFFLINE`:
+
+- The CLI started and finished each run with exit code 0, in about 10 s with the model loaded.
+- `web_fetch` works without a GitHub login: a call for `https://example.com` returned the page. It refuses a URL that resolves to a loopback, private or link-local address (`WebFetchBlockedUrlError`), so it cannot reach the llama.cpp server itself.
+- `semantic_code_search`, the only other web tool the CLI listed, fails without a token with HTTP 401 "Requires authentication". It is unavailable on a Local run. The run still finishes and the model reports the error.
 
 Other facts:
 
