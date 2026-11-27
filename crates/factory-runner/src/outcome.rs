@@ -606,7 +606,7 @@ fn agent_output(expect: Expect, output: Option<Value>) -> Result<AgentResult, St
         )),
         (Expect::Commits | Expect::FixCi, "commits_ready") => match output.pull_request {
             Some(pr) if !pr.title.trim().is_empty() && !pr.body.trim().is_empty() => {
-                Ok(AgentResult::CommitsReady(pr))
+                Ok(AgentResult::CommitsReady(Some(pr)))
             }
             _ => Err(
                 "the agent ended with outcome commits_ready but wrote no pull request title and description"

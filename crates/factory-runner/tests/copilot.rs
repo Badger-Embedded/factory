@@ -517,10 +517,10 @@ fn commits_outcome(body: &str) -> String {
 }
 
 fn commits_event(body: &str) -> Event {
-    Event::Agent(AgentResult::CommitsReady(PrDescription {
+    Event::Agent(AgentResult::CommitsReady(Some(PrDescription {
         title: "Add reboot".into(),
         body: body.into(),
-    }))
+    })))
 }
 
 const SUMMARY: &str = "The work is done.\n\n- Added the page.\n- Added a test.";

@@ -1277,7 +1277,8 @@ pub enum AgentResult {
     Clarified,
     Spec(String),
     Plan(Vec<PlannedPr>),
-    CommitsReady(PrDescription),
+    /// `None` means the agent returned no title and description.
+    CommitsReady(Option<PrDescription>),
     /// The agent has nothing to commit and wants CI to run again, for
     /// example after a flaky failure. `reason` says why.
     RerunCi {
@@ -2248,7 +2249,23 @@ impl Job {
                 E::Agent(AgentResult::CommitsReady(description)),
             ) if !matches!(task, Task::Review | Task::QuickReview) => {
                 let pr = *pr;
-                self.plan[pr].description = Some(description);
+                match description {
+                    Some(description) => self.plan[pr].description = Some(description),
+                    None if (self.picked_pr().is_some() && self.stacked_on().is_none())
+                        || self.plan[pr].description.is_some() => {}
+                    None => {
+                        return Ok((
+                            Self::failed(
+                                "the agent ended with outcome commits_ready but wrote no pull request title and description",
+                                Some(RetryTarget::Agent {
+                                    stage: Box::new(self.stage.clone()),
+                                    task: Box::new(task.clone()),
+                                }),
+                            ),
+                            Turn::Done,
+                        ));
+                    }
+                }
                 (S::Verifying { pr }, Turn::Factory)
             }
 

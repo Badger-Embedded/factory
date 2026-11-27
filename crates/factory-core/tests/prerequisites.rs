@@ -30,10 +30,12 @@ fn failed(retryable: bool) -> Job {
     job.apply(Event::Agent(AgentResult::Plan(vec![pr])))
         .unwrap();
     job.apply(Event::Approve).unwrap();
-    job.apply(Event::Agent(AgentResult::CommitsReady(PrDescription {
-        title: "add it".into(),
-        body: "body".into(),
-    })))
+    job.apply(Event::Agent(AgentResult::CommitsReady(Some(
+        PrDescription {
+            title: "add it".into(),
+            body: "body".into(),
+        },
+    ))))
     .unwrap();
     job.apply(Event::ChecksPassed).unwrap();
     job.apply(Event::Published { number: 9 }).unwrap();
