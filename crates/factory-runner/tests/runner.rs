@@ -1798,11 +1798,16 @@ fn a_prompt_names_every_field_its_schema_requires() {
             ),
         ];
         for (expect, text) in texts {
+            let listed = text
+                .split("each its own field: ")
+                .nth(1)
+                .and_then(|rest| rest.split(". Do not").next())
+                .unwrap_or_else(|| panic!("the {agent:?} prompt for {expect:?} has no field list"));
             for name in expect.schema()["required"].as_array().unwrap() {
                 let name = name.as_str().unwrap();
                 assert!(
-                    text.contains(&format!("`{name}`")),
-                    "the {agent:?} prompt for {expect:?} does not name `{name}`"
+                    listed.contains(&format!("`{name}`")),
+                    "the {agent:?} prompt for {expect:?} does not list `{name}` as required"
                 );
             }
         }

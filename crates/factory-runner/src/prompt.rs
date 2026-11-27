@@ -195,8 +195,6 @@ fn end_prompt(text: &mut String, agent: PromptTarget, expect: Expect) {
     append_schema(text, agent, expect);
 }
 
-/// Names the top-level fields of a schema that requires more than `outcome`.
-/// The names come from the schema, so the prompt cannot drift from it.
 fn output_fields(expect: Expect) -> Option<String> {
     let schema = expect.schema();
     let required: Vec<&str> = schema["required"]
