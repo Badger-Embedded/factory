@@ -620,11 +620,12 @@ async fn an_openrouter_claude_run_reports_each_generation_id_once_and_redacts_it
     fs::write(
         &stdout,
         format!(
-            "{}\n{}\n{}\n{}\nthe key is {OPENROUTER_KEY}\n",
+            "{}\n{}\n{}\n{}\n{}\nthe key is {OPENROUTER_KEY}\n",
             assistant("gen-1", "m", "a"),
             assistant("gen-1", "m", "b"),
             assistant("synthetic-id", "<synthetic>", "c"),
             assistant("gen-2", "m", "d"),
+            assistant(&format!("gen-{OPENROUTER_KEY}"), "m", "e"),
         ),
     )
     .unwrap();
@@ -644,6 +645,7 @@ async fn an_openrouter_claude_run_reports_each_generation_id_once_and_redacts_it
     )
     .await;
     assert_eq!(report.generation_ids, ["gen-1", "gen-2"]);
+    assert!(!format!("{report:?}").contains(OPENROUTER_KEY));
     let shown = format!("{log:?} {:?}", report.event);
     assert!(!shown.contains(OPENROUTER_KEY), "{shown}");
     assert!(shown.contains("[redacted]"));

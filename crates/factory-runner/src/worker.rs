@@ -490,6 +490,9 @@ pub async fn run(
                 started();
             }
             for item in parse(&line) {
+                if redactor.leaks(&item) {
+                    continue;
+                }
                 let item = redactor.item(item);
                 // A Local run says nothing about the subscription's plan usage,
                 // whatever the CLI reports.
@@ -564,6 +567,18 @@ impl Redactor {
             Some(escaped) => text.replace(escaped.as_str(), "[redacted]"),
             None => text,
         }
+    }
+
+    /// Whether `item` is a generation id that holds the key, which is dropped
+    /// instead of kept as a lookup id.
+    fn leaks(&self, item: &AgentItem) -> bool {
+        let AgentItem::Generation(id) = item else {
+            return false;
+        };
+        [self.key.as_deref(), self.escaped.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|key| id.contains(key))
     }
 
     fn item(&self, item: AgentItem) -> AgentItem {

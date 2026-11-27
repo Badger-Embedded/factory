@@ -303,7 +303,6 @@ fn openrouter_provider(target: &ProviderTarget) -> String {
     )
 }
 
-/// The variable that carries the provider's key into the worker.
 fn key_env(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Local { .. } => LOCAL_KEY_ENV,

@@ -318,7 +318,7 @@ impl PodmanExecutor {
                 started.elapsed().as_secs()
             )));
         }
-        result.map_err(|error| load_failure(&error, local, model))
+        result.map_err(|error| load_failure(&error, local, model, load_timeout))
     }
 
     /// Checks out the head of the picked pull request into `branch`, and for a
@@ -511,13 +511,13 @@ impl PodmanExecutor {
 
 const LOAD_NOTICE_AFTER: Duration = Duration::from_secs(5);
 
-fn load_failure(error: &LoadError, local: &crate::ProviderRequest, model: &str) -> String {
+fn load_failure(
+    error: &LoadError,
+    local: &crate::ProviderRequest,
+    model: &str,
+    load_timeout: Duration,
+) -> String {
     let target = &local.target;
-    // Only a Local run waits for a model load; an OpenRouter run never gets here.
-    let load_timeout = match target.kind {
-        ProviderKind::Local { load_timeout } => load_timeout,
-        ProviderKind::OpenRouter => Duration::ZERO,
-    };
     match error {
         LoadError::Timeout => {
             let minutes = load_timeout.as_secs().div_ceil(60);
