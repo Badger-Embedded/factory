@@ -449,7 +449,7 @@ No OpenRouter key was available, so each CLI ran with the settings above against
 
 - `openrouter_request` checks the model, then resolves the key, then picks the CLI, and applies `AgentFailed` on a failure before any checkout, as `local_request` does. The Renovate agent reuses it.
 - The key check runs in the executor before the worker starts: 401 or 403 and an unreachable host each fail the run and keep Retry.
-- The session records its CLI in `sessions.local_cli` on the worker's first line, and a resumed session keeps it. `SHOWN_COST` shows a zero total as `$0.00` for a job with a session on Local or OpenRouter, so a fetched cost of $0 reads `$0.00`. A zero total of any other job stays a dash.
+- The session records its CLI in `sessions.local_cli` on the worker's first line, and a resumed session keeps it. `SHOWN_COST` shows a zero total as `$0.00` for a job with a Local session or a cost OpenRouter confirmed (`fetched`), so a fetched cost of $0 reads `$0.00`. Any other zero total stays a dash, even when an OpenRouter session started.
 
 ### Recording the cost OpenRouter charged
 

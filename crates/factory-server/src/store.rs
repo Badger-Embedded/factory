@@ -1132,10 +1132,6 @@ impl Store {
         Ok(())
     }
 
-    /// `forge` joined `projects` after the table shipped with `repo` unique on
-    /// its own. SQLite cannot change a constraint in place, so a table without
-    /// the column is rebuilt with every row on `github`. A fresh database
-    /// already has the column from SCHEMA, so this skips it.
     fn migrate_job_costs_fetched(conn: &Connection) -> Result<(), StoreError> {
         let has_fetched: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('job_costs') WHERE name = 'fetched'",
@@ -1151,6 +1147,10 @@ impl Store {
         Ok(())
     }
 
+    /// `forge` joined `projects` after the table shipped with `repo` unique on
+    /// its own. SQLite cannot change a constraint in place, so a table without
+    /// the column is rebuilt with every row on `github`. A fresh database
+    /// already has the column from SCHEMA, so this skips it.
     fn migrate_project_forge(conn: &Connection) -> Result<(), StoreError> {
         let has_forge: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'forge'",
@@ -2926,8 +2926,9 @@ impl Store {
     }
 
     /// The API cost of job `id` in USD, or `None` when the job has no cost row.
-    /// A zero row counts only for a job that started a Local worker, so it
-    /// shows `$0.00`. Any other zero row reads as no cost.
+    /// A zero row counts only for a job that started a Local worker or
+    /// whose `OpenRouter` lookup confirmed it, so it shows `$0.00`. Any other zero
+    /// row reads as no cost.
     ///
     /// # Errors
     ///

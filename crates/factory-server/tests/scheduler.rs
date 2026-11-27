@@ -10506,3 +10506,32 @@ async fn a_lookup_that_runs_out_of_time_records_no_partial_cost() {
     assert_eq!(store.project_totals("maestro").unwrap().usd, 0.0);
     assert!(!store.cost_lookup_pending(id).unwrap());
 }
+
+#[tokio::test]
+async fn a_charge_for_a_run_cancelled_before_its_report_stays_on_the_run_step() {
+    let (costs, _api) = fake_costs(&[("gen-1", 0.4)]);
+    let (store, executor, scheduler, secrets) = setup_openrouter_with(|_| questions(), costs);
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.report_generations(&["gen-1"]);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    scheduler.tick().await.unwrap();
+    for _ in 0..200 {
+        if store.get(id).unwrap().job.stage() == &Stage::Clarifying {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    store.apply(id, Event::Cancel).unwrap();
+    executor.release(1);
+    openrouter_finished(&store, id, 1).await;
+
+    let cost = store
+        .events(id)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.event == "cost")
+        .expect("the cost entry");
+    assert_eq!(cost.stage, "clarifying");
+    assert_eq!(cost.usd, Some(0.4));
+}

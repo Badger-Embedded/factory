@@ -2386,26 +2386,20 @@ impl<E: Executor> Scheduler<E> {
         let session_uuid = request.session_id.clone();
         let cost_session = request.session_id.clone();
         let session: SessionSink = Box::new(move |id| {
-            if let Err(err) = session_store.set_agent_session(&session_uuid, &id) {
-                tracing::error!("job {job_id}: {err}");
-            }
+            session_store
+                .set_agent_session(&session_uuid, &id)
+                .unwrap_or_else(|err| tracing::error!("job {job_id}: {err}"));
         });
         // The model the run passed, kept before the request moves into the run,
         // so a Codex run can look up its price by it afterwards.
         let (model, agent) = (request.model.clone(), request.agent);
         let openrouter_key = openrouter_key_of(&request);
+        let dispatched = self.store.get(job_id).ok().map(|row| row.job);
         let report = self
             .executor
             .run_agent(settings, request, sink, session)
             .await;
-        // Each active server the agent read as not connected in the run's init
-        // line gets its warning, deduped against a proxy warning for the same
-        // server already recorded during the run.
-        for unavailable in &report.mcp_unavailable {
-            self.mcp
-                .warnings
-                .record(job_id, &unavailable.server, &unavailable.reason);
-        }
+        self.record_unavailable_servers(job_id, &report);
         self.record_run_cost(
             job_id,
             &cost_session,
@@ -2413,6 +2407,7 @@ impl<E: Executor> Scheduler<E> {
             model.as_deref(),
             &report,
             openrouter_key,
+            dispatched,
         );
         match report.head {
             Some(head) if matches!(report.event, Event::QuickReviewed { .. }) => {
@@ -2502,21 +2497,34 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
+    /// Each active server the agent read as not connected in the run's init
+    /// line gets its warning, deduped against a proxy warning for the same
+    /// server already recorded during the run.
+    fn record_unavailable_servers(&self, job_id: i64, report: &RunReport) {
+        for unavailable in &report.mcp_unavailable {
+            self.mcp
+                .warnings
+                .record(job_id, &unavailable.server, &unavailable.reason);
+        }
+    }
+
     /// Reads what `OpenRouter` charged for the generations `report` shows with
     /// `key`, in the background so the run's next step never waits for it, and
     /// records the sum. When the cost cannot be read, the run adds no cost and
     /// the log says so.
-    fn record_openrouter_cost(&self, job_id: i64, report: &RunReport, key: Option<String>) {
+    fn record_openrouter_cost(
+        &self,
+        job_id: i64,
+        report: &RunReport,
+        key: Option<String>,
+        at: Job,
+    ) {
         let tokens = report.token_usage.map(|usage| {
             format!(
                 "{} input tokens, {} output tokens",
                 usage.input_tokens, usage.output_tokens
             )
         });
-        // The job as the run leaves it, before the run's result moves it on.
-        let Ok(at) = self.store.get(job_id).map(|row| row.job) else {
-            return;
-        };
         if let Err(err) = self.store.begin_cost_lookup(job_id) {
             tracing::error!("job {job_id}: {err}");
         }
@@ -2571,6 +2579,10 @@ impl<E: Executor> Scheduler<E> {
     /// no cost at all. An `OpenRouter` run records what `OpenRouter` charged for
     /// the generations its output showed, read with `openrouter_key` in the
     /// background, so the run's next step never waits for it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the run's report, key and dispatch snapshot are each needed"
+    )]
     fn record_run_cost(
         &self,
         job_id: i64,
@@ -2579,6 +2591,7 @@ impl<E: Executor> Scheduler<E> {
         model: Option<&str>,
         report: &RunReport,
         openrouter_key: Option<String>,
+        dispatched: Option<Job>,
     ) {
         if agent == Agent::Local {
             // A local model has no price. The run adds a row of zero, so the job
@@ -2600,7 +2613,9 @@ impl<E: Executor> Scheduler<E> {
             return;
         }
         if agent == Agent::OpenRouter {
-            self.record_openrouter_cost(job_id, report, openrouter_key);
+            if let Some(at) = dispatched {
+                self.record_openrouter_cost(job_id, report, openrouter_key, at);
+            }
             return;
         }
         if agent == Agent::Copilot {
