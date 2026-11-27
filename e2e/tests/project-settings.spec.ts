@@ -143,6 +143,7 @@ test('the Renovate agent redraws its choices and persists after a reload', async
   await expect(chips).toHaveText(['CLI default', 'gpt-6.1-sol', 'gpt-6.1-codex']);
   await expect(efforts).toHaveText(['minimal', 'low', 'medium', 'high', 'xhigh']);
   await card.getByRole('button', { name: 'gpt-6.1-sol' }).click();
+  await efforts.first().evaluate((el) => el.scrollIntoView({ block: 'center' }));
   await card.getByRole('radio', { name: 'low', exact: true }).check();
   await card.getByRole('button', { name: 'Save Renovate agent' }).click();
   await expect(page.getByText('Saved.')).toBeVisible();
