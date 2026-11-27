@@ -4002,8 +4002,6 @@ fn a_comment_while_the_merge_waits_goes_to_the_agent_and_reviews_again() {
         })
     );
 
-    // The fix is pushed, which clears the approval, so the reviewer reads the
-    // new head before the merge is left to the user again.
     apply(&mut job, Event::Agent(AgentResult::CommitsReady(ready())));
     apply(&mut job, Event::ChecksPassed);
     apply(&mut job, Event::Published { number: 42 });

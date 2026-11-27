@@ -2919,10 +2919,6 @@ async fn a_reviewer_failure_stops_the_job_for_the_user_without_merging() {
     ));
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
 
-    // The factory keeps watching the pull request, but the watch is passive:
-    // it carries `PrWatch::MergeOrClose`, so the executor reports only a
-    // merge or close and never merges or restarts the reviewer, even though
-    // auto-merge is on.
     step(&scheduler).await;
     let watched = executor.watched.lock().unwrap().last().unwrap().clone();
     assert_eq!(watched.watch, PrWatch::MergeOrClose);
