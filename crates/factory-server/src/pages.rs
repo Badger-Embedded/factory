@@ -1561,9 +1561,7 @@ pub fn settings_openrouter_agent(
                         disabled[!view.secrets_available];
                     p.hint {
                         @if view.key_stored { "A key is stored. " } @else { "No key is stored. " }
-                        "Type a new key to replace it. An empty field keeps it. Stored encrypted and never shown. \
-                         A job whose requester stored a key of their own uses that one. \
-                         The key reaches the worker, and the agent that runs there can read it. Create a key on "
+                        "Type a new key to replace it. An empty field keeps it. Stored encrypted and never shown. Create a key on "
                         (external_link("https://openrouter.ai/keys", "openrouter.ai/keys", None, None))
                         "."
                     }

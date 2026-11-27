@@ -303,10 +303,16 @@ async fn a_malformed_list_keeps_the_earlier_list_and_fetch_time() {
         .openrouter_settings()
         .unwrap()
         .models_fetched_at;
-    *harness.openrouter.answer.lock().unwrap() =
-        parse_models(br#"{"data":[{"id":"x","supported_parameters":"tools"}]}"#);
-    let reply = post_token(&harness, "/settings/agents/openrouter/refresh").await;
-    assert!(reply.body.contains("The earlier list stays."));
+    for body in [
+        r#"{"data":[{"id":"x","supported_parameters":"tools"}]}"#,
+        r#"{"data":[{"id":"x","supported_parameters":null}]}"#,
+        r#"{"data":[{"id":"x","supported_parameters":[42]}]}"#,
+        r#"{"data":[{"id":"x","supported_parameters":["tools",null]}]}"#,
+    ] {
+        *harness.openrouter.answer.lock().unwrap() = parse_models(body.as_bytes());
+        let reply = post_token(&harness, "/settings/agents/openrouter/refresh").await;
+        assert!(reply.body.contains("The earlier list stays."), "{body}");
+    }
     assert_eq!(
         harness.store.openrouter_models().unwrap(),
         [model("a/b", "A B")]

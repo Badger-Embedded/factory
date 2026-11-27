@@ -8,7 +8,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Lets the browser tests point the OpenRouter model list at a stub. Never in a release build.
+# Lets the browser tests point the OpenRouter model list at a stub. A release build fails to compile with it.
 e2e-fakes = []
 
 [dependencies]

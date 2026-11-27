@@ -330,6 +330,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(all(feature = "e2e-fakes", not(debug_assertions)))]
+compile_error!("the e2e-fakes feature is for debug builds only");
+
 #[cfg(feature = "e2e-fakes")]
 fn openrouter_api() -> HttpOpenRouterApi {
     env::var("FACTORY_OPENROUTER_API_URL").map_or_else(

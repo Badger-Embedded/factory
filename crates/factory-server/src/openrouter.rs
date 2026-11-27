@@ -122,9 +122,14 @@ pub fn parse_models(body: &[u8]) -> Result<Vec<OpenRouterModel>, ModelsError> {
             .and_then(serde_json::Value::as_str)
             .ok_or(ModelsError::NotAModelList)?;
         let tools = match entry.get("supported_parameters") {
-            None | Some(serde_json::Value::Null) => false,
+            None => false,
             Some(serde_json::Value::Array(parameters)) => {
-                parameters.iter().any(|p| p.as_str() == Some("tools"))
+                let mut tools = false;
+                for parameter in parameters {
+                    let name = parameter.as_str().ok_or(ModelsError::NotAModelList)?;
+                    tools |= name == "tools";
+                }
+                tools
             }
             Some(_) => return Err(ModelsError::NotAModelList),
         };
