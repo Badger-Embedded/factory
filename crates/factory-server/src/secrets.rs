@@ -362,6 +362,32 @@ pub trait SecretStore: Send + Sync {
     /// Fails on a storage error.
     fn clear_user_local_key(&self, login: &str) -> Result<(), SecretError>;
 
+    /// The `OpenRouter` API key `login` stored for itself, or `None` when there
+    /// is none. It sits in a row of its own per login, apart from the Local
+    /// key, and its ciphertext is bound to that login.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable, when the stored value does not
+    /// decrypt, or on a storage error.
+    fn user_openrouter_key(&self, login: &str) -> Result<Option<String>, SecretError>;
+
+    /// Stores `key` as the `OpenRouter` API key of `login`, replacing any key
+    /// already there.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store is unavailable or on a storage error.
+    fn set_user_openrouter_key(&self, login: &str, key: &str) -> Result<(), SecretError>;
+
+    /// Deletes the `OpenRouter` API key of `login`. Clearing a key that is not
+    /// there is fine, and it works without the master key.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a storage error.
+    fn clear_user_openrouter_key(&self, login: &str) -> Result<(), SecretError>;
+
     /// Stores `value` as the forge token of `owner`, together with the
     /// `account` it belongs to, in one transaction. It replaces any token
     /// already there.
@@ -482,6 +508,19 @@ fn user_local_key_header(login: &str) -> String {
 /// row.
 fn user_local_key_aad(login: &str) -> Vec<u8> {
     let mut aad = USER_LOCAL_KEY_AAD.to_vec();
+    aad.extend_from_slice(&(login.len() as u64).to_le_bytes());
+    aad.extend_from_slice(login.as_bytes());
+    aad
+}
+
+fn user_openrouter_key_header(login: &str) -> String {
+    format!("openrouter-key-user:{login}")
+}
+
+/// The associated data of `login`'s `OpenRouter` API key, framed like
+/// [`user_local_key_aad`].
+fn user_openrouter_key_aad(login: &str) -> Vec<u8> {
+    let mut aad = USER_OPENROUTER_KEY_AAD.to_vec();
     aad.extend_from_slice(&(login.len() as u64).to_le_bytes());
     aad.extend_from_slice(login.as_bytes());
     aad
@@ -698,6 +737,48 @@ impl SecretStore for LocalSecrets {
 
     fn clear_user_local_key(&self, login: &str) -> Result<(), SecretError> {
         let header = user_local_key_header(login);
+        self.store.delete_secret(SecretRef {
+            project: "",
+            server: "",
+            header: &header,
+        })?;
+        Ok(())
+    }
+
+    fn user_openrouter_key(&self, login: &str) -> Result<Option<String>, SecretError> {
+        let header = user_openrouter_key_header(login);
+        let at = SecretRef {
+            project: "",
+            server: "",
+            header: &header,
+        };
+        let Some((backend, stored)) = self.store.get_secret(at)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open(
+            &backend,
+            &stored,
+            &user_openrouter_key_aad(login),
+        )?))
+    }
+
+    fn set_user_openrouter_key(&self, login: &str, key: &str) -> Result<(), SecretError> {
+        let stored = self.seal(&user_openrouter_key_aad(login), key)?;
+        let header = user_openrouter_key_header(login);
+        self.store.put_secret(
+            SecretRef {
+                project: "",
+                server: "",
+                header: &header,
+            },
+            LOCAL_BACKEND,
+            &stored,
+        )?;
+        Ok(())
+    }
+
+    fn clear_user_openrouter_key(&self, login: &str) -> Result<(), SecretError> {
+        let header = user_openrouter_key_header(login);
         self.store.delete_secret(SecretRef {
             project: "",
             server: "",
@@ -941,6 +1022,32 @@ impl SecretStore for UnavailableSecrets {
         Ok(())
     }
 
+    fn user_openrouter_key(&self, login: &str) -> Result<Option<String>, SecretError> {
+        let header = user_openrouter_key_header(login);
+        match self.store.get_secret(SecretRef {
+            project: "",
+            server: "",
+            header: &header,
+        })? {
+            None => Ok(None),
+            Some(_) => Err(SecretError::Unavailable),
+        }
+    }
+
+    fn set_user_openrouter_key(&self, _login: &str, _key: &str) -> Result<(), SecretError> {
+        Err(SecretError::Unavailable)
+    }
+
+    fn clear_user_openrouter_key(&self, login: &str) -> Result<(), SecretError> {
+        let header = user_openrouter_key_header(login);
+        self.store.delete_secret(SecretRef {
+            project: "",
+            server: "",
+            header: &header,
+        })?;
+        Ok(())
+    }
+
     fn put_forge_token(
         &self,
         _owner: ForgeTokenOwner<'_>,
@@ -1088,6 +1195,10 @@ const OPENROUTER_KEY_AAD: &[u8] = b"factory:openrouter-key:v1";
 /// The tag a personal Local API key's associated data starts with, followed by
 /// the length-framed login.
 const USER_LOCAL_KEY_AAD: &[u8] = b"factory:local-key-user:v1";
+
+/// The tag a personal `OpenRouter` API key's associated data starts with,
+/// followed by the length-framed login.
+const USER_OPENROUTER_KEY_AAD: &[u8] = b"factory:openrouter-key-user:v1";
 
 /// The fixed tag every forge token's associated data starts with, followed by
 /// the length-framed owner kind, key and forge. Like the other tags it reads

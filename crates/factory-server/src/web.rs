@@ -286,6 +286,14 @@ fn user_routes() -> Router<AppState> {
     Router::new()
         .route("/settings/local", get(show_local_key).post(save_local_key))
         .route("/settings/local/clear", post(clear_user_local_key))
+        .route(
+            "/settings/openrouter",
+            get(show_openrouter_key).post(save_openrouter_key),
+        )
+        .route(
+            "/settings/openrouter/clear",
+            post(clear_user_openrouter_key),
+        )
         .route("/settings/groups", get(show_groups).post(save_groups))
         .route("/settings/groups/projects", post(save_group_members))
 }
@@ -4869,6 +4877,97 @@ async fn clear_user_local_key(
     require_csrf(&state, &login, &form.csrf)?;
     state.secrets.clear_user_local_key(&login)?;
     local_key_page(&state, &headers, Some("Cleared."))
+}
+
+fn openrouter_key_page(
+    state: &AppState,
+    headers: &HeaderMap,
+    notice: Option<&str>,
+) -> Result<Markup, AppError> {
+    let login = user(headers);
+    let (key_set, unreadable) = match state.secrets.user_openrouter_key(&login) {
+        Ok(key) => (key.is_some(), false),
+        Err(SecretError::Store(err)) => return Err(err.into()),
+        Err(_) => (true, true),
+    };
+    let notice = match notice {
+        None if unreadable => Some(KEY_UNREADABLE),
+        other => other,
+    };
+    Ok(pages::settings_openrouter_key(
+        &login,
+        &settings_nav(state, &login)?,
+        state.store.user_cli(&login, Agent::OpenRouter)?,
+        state.store.openrouter_settings()?.cli,
+        key_set,
+        state.secrets.available(),
+        &state.csrf.issue(&login),
+        notice,
+    ))
+}
+
+async fn show_openrouter_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Markup, AppError> {
+    openrouter_key_page(&state, &headers, None)
+}
+
+#[derive(Deserialize)]
+struct OpenRouterKeyForm {
+    #[serde(default)]
+    csrf: String,
+    #[serde(default)]
+    key: String,
+    /// `default`, or the id of a CLI. Absent keeps the stored choice.
+    #[serde(default)]
+    cli: String,
+}
+
+/// Stores the login's CLI choice and its own `OpenRouter` API key. An empty
+/// field keeps the stored key. The CLI choice saves without the master key.
+async fn save_openrouter_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<OpenRouterKeyForm>,
+) -> Result<Markup, AppError> {
+    let login = user(&headers);
+    require_csrf(&state, &login, &form.csrf)?;
+    let cli = match form.cli.as_str() {
+        "" => Choice::Keep,
+        "default" => Choice::Set(None),
+        id => match Cli::from_id(id) {
+            Some(cli) => Choice::Set(Some(cli)),
+            None => return openrouter_key_page(&state, &headers, Some("Unknown CLI.")),
+        },
+    };
+    let key = form.key.trim();
+    if !key.is_empty() && !state.secrets.available() {
+        return openrouter_key_page(
+            &state,
+            &headers,
+            Some("The master key is missing, so the key was not saved."),
+        );
+    }
+    if let Choice::Set(cli) = cli {
+        state.store.set_user_cli(&login, Agent::OpenRouter, cli)?;
+    }
+    if !key.is_empty() {
+        state.secrets.set_user_openrouter_key(&login, key)?;
+    }
+    openrouter_key_page(&state, &headers, Some("Saved."))
+}
+
+/// Removes the login's key. It works without the master key.
+async fn clear_user_openrouter_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LocalCsrfForm>,
+) -> Result<Markup, AppError> {
+    let login = user(&headers);
+    require_csrf(&state, &login, &form.csrf)?;
+    state.secrets.clear_user_openrouter_key(&login)?;
+    openrouter_key_page(&state, &headers, Some("Cleared."))
 }
 
 const KEY_UNREADABLE: &str = "The stored key cannot be read. Save it again or clear it.";

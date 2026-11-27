@@ -677,6 +677,61 @@ fn user_local_keys_are_per_login_and_bound_to_their_row() {
 }
 
 #[test]
+fn user_openrouter_keys_are_per_login_and_apart_from_the_local_keys() {
+    let store = store();
+    let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
+    secrets
+        .set_user_openrouter_key("alice", "sk-alice")
+        .expect("set");
+    secrets
+        .set_user_openrouter_key("bob", "sk-bob")
+        .expect("set");
+    secrets
+        .set_user_local_key("alice", "sk-local")
+        .expect("set");
+    assert_eq!(
+        secrets.user_openrouter_key("alice").unwrap().as_deref(),
+        Some("sk-alice")
+    );
+    assert_eq!(
+        secrets.user_local_key("alice").unwrap().as_deref(),
+        Some("sk-local")
+    );
+    assert!(secrets.user_openrouter_key("carol").unwrap().is_none());
+    assert!(secrets.openrouter_key().unwrap().is_none());
+
+    let (backend, bytes) = store
+        .get_secret(at("", "", "openrouter-key-user:alice"))
+        .unwrap()
+        .expect("row");
+    assert!(!contains(&bytes, b"sk-alice"));
+    store
+        .put_secret(at("", "", "openrouter-key-user:bob"), &backend, &bytes)
+        .unwrap();
+    assert!(secrets.user_openrouter_key("bob").is_err());
+
+    store
+        .put_secret(at("", "", "local-key-user:alice"), &backend, &bytes)
+        .unwrap();
+    assert!(secrets.user_local_key("alice").is_err());
+
+    let unavailable = UnavailableSecrets::new(Arc::clone(&store));
+    assert!(matches!(
+        unavailable.user_openrouter_key("alice"),
+        Err(SecretError::Unavailable)
+    ));
+    assert!(matches!(
+        unavailable.set_user_openrouter_key("alice", "x"),
+        Err(SecretError::Unavailable)
+    ));
+    unavailable
+        .clear_user_openrouter_key("alice")
+        .expect("clear");
+    assert!(secrets.user_openrouter_key("alice").unwrap().is_none());
+    assert!(secrets.user_openrouter_key("bob").is_err());
+}
+
+#[test]
 fn copilot_token_row_holds_no_plaintext() {
     let store = store();
     let secrets = LocalSecrets::new(&key(1), Arc::clone(&store));
