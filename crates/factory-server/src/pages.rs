@@ -5542,7 +5542,8 @@ fn merge_left_card(job: &Job) -> Markup {
             p.status-detail {
                 "CI is green and nothing waits for the agent. The factory never merges a \
                  pull request picked in the request form, so the merge is left to you. \
-                 Merge it on the forge and the job ends."
+                 Merge it on the forge and the job ends. A comment on the pull request \
+                 from someone with write access goes to the agent first."
             }
             @if let Some(picked) = job.picked_pr() {
                 p { (external_link(&picked.url, format!("Pull request #{}", picked.number), None, None)) }

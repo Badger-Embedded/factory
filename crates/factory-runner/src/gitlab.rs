@@ -341,6 +341,18 @@ pub fn project(repo: &str) -> String {
     format!("projects/{}", encode(repo))
 }
 
+/// The access a GitLab access level gives: Developer is Write, Maintainer
+/// and Owner are Admin.
+fn level_access(level: u32) -> Access {
+    if level >= MAINTAINER {
+        Access::Admin
+    } else if level >= DEVELOPER {
+        Access::Write
+    } else {
+        Access::Read
+    }
+}
+
 #[must_use]
 pub fn is_not_found(err: &str) -> bool {
     err.contains("HTTP 404")
@@ -1250,13 +1262,38 @@ impl Forge for GitLab {
             .map(|level| level.access_level)
             .max()
             .unwrap_or(0);
-            Ok(if level >= MAINTAINER {
-                Access::Admin
-            } else if level >= DEVELOPER {
-                Access::Write
-            } else {
-                Access::Read
-            })
+            Ok(level_access(level))
+        })
+    }
+
+    fn user_access<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        login: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Access>, String>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Member {
+                access_level: u32,
+            }
+            let users: Vec<UserJson> = self
+                .get_json(account, "users", &[("username", login)])
+                .await?;
+            let Some(user) = users
+                .into_iter()
+                .find(|user| user.username.eq_ignore_ascii_case(login))
+            else {
+                return Ok(Some(Access::Read));
+            };
+            // `members/all` counts inherited and invited membership, and
+            // gives the highest level the user holds.
+            let endpoint = format!("{}/members/all/{}", project(repo), user.id);
+            match self.get_json::<Member>(account, &endpoint, &[]).await {
+                Ok(member) => Ok(Some(level_access(member.access_level))),
+                Err(err) if is_not_found(&err) => Ok(Some(Access::Read)),
+                Err(err) => Err(err),
+            }
         })
     }
 

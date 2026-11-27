@@ -1361,6 +1361,42 @@ esac"#,
 }
 
 #[tokio::test]
+async fn user_access_reads_the_permission_of_another_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = script(
+        dir.path(),
+        "gh",
+        r#"case "$2" in
+  repos/o/r/collaborators/boss/permission) echo '{"permission":"admin","role_name":"admin"}' ;;
+  repos/o/r/collaborators/keeper/permission) echo '{"permission":"write","role_name":"maintain"}' ;;
+  repos/o/r/collaborators/triager/permission) echo '{"permission":"read","role_name":"triage"}' ;;
+  repos/o/r/collaborators/passerby/permission) echo '{"permission":"none","role_name":"none"}' ;;
+  repos/o/r/collaborators/ghost/permission) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  *) echo "gh: boom $2" >&2; exit 1 ;;
+esac"#,
+    );
+    let github = GitHub {
+        gh,
+        ..GitHub::default()
+    };
+    let account = account();
+    let access = |login: &'static str| {
+        let github = &github;
+        let account = &account;
+        async move { github.user_access(account, "o/r", login).await }
+    };
+    assert_eq!(access("boss").await, Ok(Some(Access::Admin)));
+    assert_eq!(access("keeper").await, Ok(Some(Access::Write)));
+    assert_eq!(access("triager").await, Ok(Some(Access::Read)));
+    assert_eq!(access("passerby").await, Ok(Some(Access::Read)));
+    assert_eq!(access("ghost").await, Ok(Some(Access::Read)));
+    // A bot login never reaches the API, so the catch-all error is not hit.
+    assert_eq!(access("dependabot[bot]").await, Ok(Some(Access::Read)));
+    assert_eq!(access("../x").await, Ok(Some(Access::Read)));
+    assert!(access("other").await.is_err());
+}
+
+#[tokio::test]
 async fn lookup_account_reads_the_account_the_token_runs_as() {
     let dir = tempfile::tempdir().unwrap();
     let gh = script(

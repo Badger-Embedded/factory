@@ -395,6 +395,40 @@ async fn access_follows_the_permissions_of_the_repository() {
 }
 
 #[tokio::test]
+async fn user_access_reads_the_permission_and_cannot_tell_without_admin() {
+    let stub = serve(|seen| match seen.path.as_str() {
+        "/repos/owner/name/collaborators/boss/permission" => {
+            ok(&json!({"permission": "owner", "role_name": "owner"}))
+        }
+        "/repos/owner/name/collaborators/dev/permission" => {
+            ok(&json!({"permission": "write", "role_name": "write"}))
+        }
+        "/repos/owner/name/collaborators/fan/permission" => {
+            ok(&json!({"permission": "read", "role_name": "read"}))
+        }
+        "/repos/owner/name/collaborators/ghost/permission" => rep(404, ""),
+        "/repos/owner/name/collaborators/hidden/permission" => rep(
+            403,
+            r#"{"message":"Only admins can query all permissions"}"#,
+        ),
+        _ => rep(500, ""),
+    })
+    .await;
+    let account = account(&stub.forge);
+    let access = |login: &'static str| {
+        let forge = &stub.forge;
+        let account = &account;
+        async move { forge.user_access(account, REPO, login).await }
+    };
+    assert_eq!(access("boss").await, Ok(Some(Access::Admin)));
+    assert_eq!(access("dev").await, Ok(Some(Access::Write)));
+    assert_eq!(access("fan").await, Ok(Some(Access::Read)));
+    assert_eq!(access("ghost").await, Ok(Some(Access::Read)));
+    assert_eq!(access("hidden").await, Ok(None));
+    assert!(access("broken").await.is_err());
+}
+
+#[tokio::test]
 async fn may_merge_reads_the_base_branch_of_the_pull_request() {
     let stub = serve(|seen| match seen.path.as_str() {
         "/repos/owner/name/pulls/3" => {

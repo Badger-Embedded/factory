@@ -215,6 +215,41 @@ esac"#,
 }
 
 #[tokio::test]
+async fn user_access_reads_the_membership_of_another_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let (glab, log) = fake_glab(
+        dir.path(),
+        r#"case "$4" in
+  users) case "$*" in
+    *username=dev*) echo '[{"id":5,"username":"dev"}]' ;;
+    *username=rep*) echo '[{"id":6,"username":"rep"}]' ;;
+    *username=out*) echo '[{"id":7,"username":"out"}]' ;;
+    *) echo '[]' ;;
+  esac ;;
+  projects/o%2Fr/members/all/5) echo '{"id":5,"username":"dev","access_level":30}' ;;
+  projects/o%2Fr/members/all/6) echo '{"id":6,"username":"rep","access_level":20}' ;;
+  projects/o%2Fr/members/all/7) echo "glab: 404 Not found (HTTP 404)" >&2; exit 1 ;;
+  *) echo "glab: boom" >&2; exit 1 ;;
+esac"#,
+    );
+    let account = account();
+    let access = |login: &'static str| {
+        let glab = &glab;
+        let account = &account;
+        async move { glab.user_access(account, "o/r", login).await }
+    };
+    assert_eq!(access("dev").await, Ok(Some(Access::Write)));
+    assert_eq!(access("rep").await, Ok(Some(Access::Read)));
+    assert_eq!(access("out").await, Ok(Some(Access::Read)));
+    assert_eq!(access("nobody").await, Ok(Some(Access::Read)));
+    assert!(
+        calls(&log)
+            .iter()
+            .any(|call| call.contains("users") && call.contains("username=dev"))
+    );
+}
+
+#[tokio::test]
 async fn may_merge_asks_the_merge_request_and_never_for_read() {
     let dir = tempfile::tempdir().unwrap();
     let (glab, log) = fake_glab(

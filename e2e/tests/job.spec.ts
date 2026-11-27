@@ -731,6 +731,7 @@ test('a request on a picked pull request waits for the user to merge it', async 
   const card = status(page).locator('.card.needs-you');
   await expect(card.getByRole('heading', { name: 'Merge the pull request' })).toBeVisible();
   await expect(card).toContainText('the merge is left to you');
+  await expect(card).toContainText('from someone with write access goes to the agent first');
   const link = card.getByRole('link', { name: 'Pull request #12' });
   await expect(link).toHaveAttribute('href', url);
   await expect(link).toHaveAttribute('target', '_blank');

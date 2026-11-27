@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use factory_core::{
     Agent, BranchSummary, Cli, Command, DEFAULT_AGENT, Event, ExistingGap, FixLink, FixOutcome,
-    FixState, Gap, Job, MAX_FAILED_ROUNDS, PackagingContext, PrDescription, RetryLimits,
+    FixState, Gap, Job, MAX_FAILED_ROUNDS, PackagingContext, PrDescription, PrWatch, RetryLimits,
     ReviewState, Session, Stage,
 };
 use factory_runner::{
@@ -398,11 +398,10 @@ pub struct WatchRequest {
     /// The reviewer has approved the current head. A ready pull request then
     /// merges or waits for the user without another review pass.
     pub review_approved: bool,
-    /// Report only a merge or close by someone else, and take no other action.
-    /// Set while the review has stopped and waits for the user: the watch does
-    /// not merge, start a review, or send CI failures and comments to the
-    /// agent, and it leaves the comment watermark where it is.
-    pub watch_only: bool,
+    /// What the watch reports. Anything but [`PrWatch::Full`] means the job
+    /// waits for the user: the watch does not merge or start a review, and
+    /// it moves the comment watermark only when it delivers comments.
+    pub watch: PrWatch,
 }
 
 /// What the factory does with a pull request once its checks are green. The
@@ -448,18 +447,24 @@ pub fn ready_action(
     }
 }
 
-/// The event a watch reports while the review has stopped and waits for the
-/// user. It reacts only to a merge or close by someone else: the job moves on
-/// when the user merges the pull request on GitHub, and fails when they close
-/// it. Every other observation (green, CI failed, conflict, new comments,
-/// nothing) returns `None`, so the watch takes no action and never merges or
+/// The event a watch reports while the job waits for the user. A merge or
+/// close by someone else always counts: the job moves on when the user merges
+/// the pull request, and fails when they close it. New comments count under
+/// [`PrWatch::MergeCloseOrComments`], so a comment posted while the merge is
+/// left to the user goes to the agent. Every other observation (green, CI
+/// failed, conflict, nothing) returns `None`, so the watch never merges or
 /// restarts the reviewer on its own. Pure, so the wiring is testable without
-/// podman or GitHub.
+/// podman or a forge.
 #[must_use]
-pub fn watch_only_event(observation: &Observation) -> Option<Event> {
+pub fn waiting_event(watch: PrWatch, observation: &Observation) -> Option<Event> {
     match observation {
         Observation::Merged => Some(Event::Merged),
         Observation::Closed => Some(Event::ClosedUnmerged),
+        Observation::Comments { text, .. } if watch == PrWatch::MergeCloseOrComments => {
+            Some(Event::ReviewComments {
+                comments: text.clone(),
+            })
+        }
         Observation::Conflicted
         | Observation::CiFailed(_)
         | Observation::Comments { .. }
@@ -576,8 +581,18 @@ pub struct RerunRequest {
     pub renovate: bool,
 }
 
-/// What a look at a pull request found.
+/// A login whose pull request comments a watch left out, so they never reach
+/// the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IgnoredCommenter {
+    /// The forge says the login has no write access to the repository.
+    NoWrite(String),
+    /// The forge would not tell the job's account what the login may do.
+    Unknown(String),
+}
+
+/// What a look at a pull request found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchReport {
     /// `None` while CI runs and nobody commented.
     pub event: Option<Event>,
@@ -586,6 +601,9 @@ pub struct WatchReport {
     /// The executor merged the pull request because it was ready and
     /// auto-merge is on.
     pub merged_by_factory: bool,
+    /// The commenters whose new comments the watch left out, because only
+    /// comments from logins with write access reach the agent.
+    pub ignored: Vec<IgnoredCommenter>,
 }
 
 pub type LogSink = Box<dyn FnMut(LogLine) + Send>;
@@ -875,6 +893,9 @@ pub struct Scheduler<E> {
     mcp: McpRuntime,
     /// When each project's Renovate pull requests were last listed.
     discovered: Mutex<HashMap<String, Instant>>,
+    /// The (job, login) pairs whose ignored comments the job's log already
+    /// explains, so each is noted once while the factory runs.
+    ignored_noted: Mutex<HashSet<(i64, String)>>,
 }
 
 fn quick_review_marker(session: &str) -> String {
@@ -919,6 +940,7 @@ impl<E: Executor> Scheduler<E> {
             slots: Arc::new(WorkerSlots::new()),
             mcp,
             discovered: Mutex::new(HashMap::new()),
+            ignored_noted: Mutex::new(HashSet::new()),
         })
     }
 
@@ -2143,9 +2165,10 @@ impl<E: Executor> Scheduler<E> {
     /// LLM-review flags and whether the current head is already reviewed, so
     /// the executor can review before merge, merge, or wait. Reading the flags
     /// here means a settings change reaches a job in flight at its next watch.
-    /// A `watch_only` command marks a watch for a stopped review: the executor
-    /// then reports only a merge or close and takes no other action, so the
-    /// flags above do not apply.
+    /// A command whose `watch` is not [`PrWatch::Full`] marks a watch while
+    /// the job waits for the user: the executor then reports only what
+    /// [`waiting_event`] allows and takes no other action, so the flags above
+    /// do not apply.
     fn watch_pr(
         self: &Arc<Self>,
         row: &JobRow,
@@ -2155,12 +2178,7 @@ impl<E: Executor> Scheduler<E> {
         settings: &Settings,
         command: &Command,
     ) -> Result<(), StoreError> {
-        let &Command::WatchPr {
-            pr,
-            number,
-            watch_only,
-        } = command
-        else {
+        let &Command::WatchPr { pr, number, watch } = command else {
             return Ok(());
         };
         let refs = job_refs(row.id, job, project, pr);
@@ -2181,7 +2199,7 @@ impl<E: Executor> Scheduler<E> {
                     .store
                     .project_llm_review(&row.project, project.llm_review)?,
             review_approved: job.review_state() == ReviewState::Approved,
-            watch_only,
+            watch,
         };
         let scheduler = Arc::clone(self);
         let settings = settings.clone();
@@ -2463,13 +2481,20 @@ impl<E: Executor> Scheduler<E> {
     async fn watch(&self, settings: &Settings, pr: usize, request: WatchRequest) {
         let job_id = request.job_id;
         let number = request.number;
+        let repo = request.repo.clone();
         self.wait(settings, job_id);
         match self.executor.watch(request).await {
-            Ok(WatchReport {
-                event: Some(event),
-                seen_until,
-                merged_by_factory,
-            }) => {
+            Ok(report) => {
+                self.note_ignored(job_id, number, &repo, &report.ignored);
+                let WatchReport {
+                    event: Some(event),
+                    seen_until,
+                    merged_by_factory,
+                    ..
+                } = report
+                else {
+                    return;
+                };
                 if merged_by_factory {
                     self.note(
                         job_id,
@@ -2488,8 +2513,34 @@ impl<E: Executor> Scheduler<E> {
                 };
                 self.report(job_id, result.map(|_| ()));
             }
-            Ok(WatchReport { event: None, .. }) => {}
             Err(err) => self.retry_later(settings, job_id, &err),
+        }
+    }
+
+    /// Notes in the job's log why the comments of each ignored login do not
+    /// reach the agent, once per job and login.
+    fn note_ignored(&self, job_id: i64, number: u64, repo: &str, ignored: &[IgnoredCommenter]) {
+        for commenter in ignored {
+            let (IgnoredCommenter::NoWrite(login) | IgnoredCommenter::Unknown(login)) = commenter;
+            let first = self
+                .ignored_noted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert((job_id, login.clone()));
+            if !first {
+                continue;
+            }
+            let text = match commenter {
+                IgnoredCommenter::NoWrite(_) => format!(
+                    "Ignoring comments on #{number} from {login}, who has no write access to {repo}."
+                ),
+                IgnoredCommenter::Unknown(_) => format!(
+                    "Ignoring comments on #{number} from {login}: the forge does not tell the \
+                     job's account whether {login} has write access to {repo}. Forgejo tells \
+                     only a repository admin."
+                ),
+            };
+            self.note(job_id, &text);
         }
     }
 

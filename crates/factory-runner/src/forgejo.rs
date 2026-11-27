@@ -1423,6 +1423,37 @@ impl Forge for Forgejo {
         })
     }
 
+    fn user_access<'a>(
+        &'a self,
+        account: &'a Account,
+        repo: &'a str,
+        login: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Access>, String>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Permission {
+                permission: String,
+            }
+            let path = format!(
+                "{}/collaborators/{}/permission",
+                repo_path(repo)?,
+                encode_path(login)
+            );
+            match self.get::<Permission>(account, &path, &[]).await {
+                Ok(json) => Ok(Some(match json.permission.as_str() {
+                    "owner" | "admin" => Access::Admin,
+                    "write" => Access::Write,
+                    _ => Access::Read,
+                })),
+                // Forgejo answers only an instance or repository admin, or a
+                // user asking about themselves.
+                Err(err) if err.status == Some(403) => Ok(None),
+                Err(err) if err.status == Some(404) => Ok(Some(Access::Read)),
+                Err(err) => Err(err.text),
+            }
+        })
+    }
+
     fn may_merge<'a>(
         &'a self,
         account: &'a Account,

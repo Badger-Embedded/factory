@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use factory_core::{
     Agent, AgentResult, Ask, BranchSummary, Event, FixOutcome, Gates, MAX_FAILED_ROUNDS,
-    MAX_REVIEW_ROUNDS, PackagingContext, PrDescription, Question, RenovateCi, RenovateWait,
-    ReviewState, Stage, Turn, Wait,
+    MAX_REVIEW_ROUNDS, PackagingContext, PrDescription, PrWatch, Question, RenovateCi,
+    RenovateWait, ReviewState, Stage, Turn, Wait,
 };
 use factory_runner::{
     Account, Expect, ForgeAccount, ForgeKind, Git, GitHub, HeadCommit, LogLine, McpServerEntry,
@@ -16,13 +16,13 @@ use factory_runner::{
 use factory_server::{
     AccountSource, Accounts, AgentRegistry, AgentRequest, ChecksRequest, ClaudeToken, CodexLogin,
     CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GhRepos,
-    HttpLocalServerProbe, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN, McpProjectSettings,
-    McpRuntime, McpStages, McpTransport, McpWarnings, Owner, PlanUsageCache, PodmanExecutor,
-    PrerequisiteEdit, Project, ProjectForge, Projects, PublishRequest, Published, ReadyAction,
-    Rebase, RenovateAgent, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler, SecretRef,
-    SecretStore, SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store,
+    HttpLocalServerProbe, IgnoredCommenter, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN,
+    McpProjectSettings, McpRuntime, McpStages, McpTransport, McpWarnings, Owner, PlanUsageCache,
+    PodmanExecutor, PrerequisiteEdit, Project, ProjectForge, Projects, PublishRequest, Published,
+    ReadyAction, Rebase, RenovateAgent, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler,
+    SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store,
     SummaryRequest, UnavailableSecrets, UpstreamCredential, WatchReport, WatchRequest, WorkerSlots,
-    credential_failure, format_cost, ready_action, watch_only_event,
+    credential_failure, format_cost, ready_action, waiting_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -338,6 +338,7 @@ impl Executor for FakeExecutor {
                 event: None,
                 seen_until: None,
                 merged_by_factory: false,
+                ignored: Vec::new(),
             }))
     }
 
@@ -2106,6 +2107,7 @@ async fn commits_go_through_checks_and_publish_to_a_watched_pull_request() {
         event: Some(Event::Merged),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
     step(&scheduler).await;
     assert_eq!(executor.watched.lock().unwrap()[0].number, 12);
@@ -2478,6 +2480,7 @@ async fn review_comments_reach_the_agent_once() {
         }),
         seen_until: Some("2026-11-19T12:05:00Z".into()),
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
 
     step(&scheduler).await;
@@ -2534,6 +2537,7 @@ async fn auto_merge_reaches_the_executor_and_a_factory_merge_is_logged() {
         event: Some(Event::Merged),
         seen_until: None,
         merged_by_factory: true,
+        ignored: Vec::new(),
     }));
 
     step(&scheduler).await;
@@ -2569,6 +2573,7 @@ async fn a_conflict_sends_the_agent_to_rebase_on_the_pull_request_branch() {
         }),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
 
     step(&scheduler).await;
@@ -2666,7 +2671,39 @@ fn green(executor: &FakeExecutor, event: Event) {
         event: Some(event),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
+}
+
+#[tokio::test]
+async fn ignored_commenters_are_explained_in_the_log_once_each() {
+    let (store, executor, scheduler) = setup(|_| Event::Agent(AgentResult::CommitsReady(ready())));
+    quick_polls(&store);
+    let id = to_watching(&store, &executor, &scheduler).await;
+    for _ in 0..2 {
+        executor.watches.lock().unwrap().push_back(Ok(WatchReport {
+            ignored: vec![
+                IgnoredCommenter::NoWrite("mallory".into()),
+                IgnoredCommenter::Unknown("eve".into()),
+            ],
+            ..WatchReport::default()
+        }));
+        step(&scheduler).await;
+    }
+    let logs = log_texts(&store, id);
+    let mallory: Vec<_> = logs
+        .iter()
+        .filter(|text| text.contains("mallory"))
+        .collect();
+    assert_eq!(mallory.len(), 1, "{logs:?}");
+    assert!(mallory[0].contains("no write access"), "{}", mallory[0]);
+    let eve: Vec<_> = logs.iter().filter(|text| text.contains("eve")).collect();
+    assert_eq!(eve.len(), 1, "{logs:?}");
+    assert!(eve[0].contains("repository admin"), "{}", eve[0]);
+    assert_eq!(
+        store.get(id).unwrap().job.stage(),
+        &Stage::CiAndReview { pr: 0 }
+    );
 }
 
 #[test]
@@ -2883,11 +2920,12 @@ async fn a_reviewer_failure_stops_the_job_for_the_user_without_merging() {
     assert_eq!(job.stage(), &Stage::CiAndReview { pr: 0 });
 
     // The factory keeps watching the pull request, but the watch is passive:
-    // it carries `watch_only`, so the executor reports only a merge or close
-    // and never merges or restarts the reviewer, even though auto-merge is on.
+    // it carries `PrWatch::MergeOrClose`, so the executor reports only a
+    // merge or close and never merges or restarts the reviewer, even though
+    // auto-merge is on.
     step(&scheduler).await;
     let watched = executor.watched.lock().unwrap().last().unwrap().clone();
-    assert!(watched.watch_only);
+    assert_eq!(watched.watch, PrWatch::MergeOrClose);
     assert!(watched.auto_merge);
     assert!(matches!(
         store.get(id).unwrap().job.turn(),
@@ -2927,6 +2965,7 @@ async fn a_stopped_review_fails_when_its_pull_request_is_closed() {
         event: Some(Event::ClosedUnmerged),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
     step(&scheduler).await;
     assert!(matches!(
@@ -2937,28 +2976,69 @@ async fn a_stopped_review_fails_when_its_pull_request_is_closed() {
 }
 
 #[test]
-fn watch_only_reports_only_a_merge_or_close() {
+fn a_stopped_review_watch_reports_only_a_merge_or_close() {
     // A merge or close by the user is the only thing a stopped-review watch
     // acts on.
-    assert_eq!(watch_only_event(&Observation::Merged), Some(Event::Merged));
+    let watch = PrWatch::MergeOrClose;
     assert_eq!(
-        watch_only_event(&Observation::Closed),
+        waiting_event(watch, &Observation::Merged),
+        Some(Event::Merged)
+    );
+    assert_eq!(
+        waiting_event(watch, &Observation::Closed),
         Some(Event::ClosedUnmerged)
     );
     // Everything else leaves the job in review-stopped. In particular a ready
     // pull request reports nothing, whatever auto-merge says, because the
     // watch never reaches `ready_action`.
-    assert_eq!(watch_only_event(&Observation::Ready), None);
-    assert_eq!(watch_only_event(&Observation::Conflicted), None);
-    assert_eq!(watch_only_event(&Observation::CiFailed(Vec::new())), None);
+    assert_eq!(waiting_event(watch, &Observation::Ready), None);
+    assert_eq!(waiting_event(watch, &Observation::Conflicted), None);
     assert_eq!(
-        watch_only_event(&Observation::Comments {
-            text: "please fix".into(),
-            seen_until: "2026-11-20T00:00:00Z".into(),
-        }),
+        waiting_event(watch, &Observation::CiFailed(Vec::new())),
         None
     );
-    assert_eq!(watch_only_event(&Observation::Nothing), None);
+    assert_eq!(
+        waiting_event(
+            watch,
+            &Observation::Comments {
+                text: "please fix".into(),
+                seen_until: "2026-11-20T00:00:00Z".into(),
+            }
+        ),
+        None
+    );
+    assert_eq!(waiting_event(watch, &Observation::Nothing), None);
+}
+
+#[test]
+fn a_merge_wait_watch_also_sends_new_comments_to_the_agent() {
+    let watch = PrWatch::MergeCloseOrComments;
+    assert_eq!(
+        waiting_event(watch, &Observation::Merged),
+        Some(Event::Merged)
+    );
+    assert_eq!(
+        waiting_event(watch, &Observation::Closed),
+        Some(Event::ClosedUnmerged)
+    );
+    assert_eq!(
+        waiting_event(
+            watch,
+            &Observation::Comments {
+                text: "alice:\nplease fix".into(),
+                seen_until: "2026-11-20T00:00:00Z".into(),
+            }
+        ),
+        Some(Event::ReviewComments {
+            comments: "alice:\nplease fix".into()
+        })
+    );
+    assert_eq!(waiting_event(watch, &Observation::Ready), None);
+    assert_eq!(
+        waiting_event(watch, &Observation::CiFailed(Vec::new())),
+        None
+    );
+    assert_eq!(waiting_event(watch, &Observation::Nothing), None);
 }
 
 #[tokio::test]
@@ -3650,6 +3730,7 @@ async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_model() {
             event: Some(event),
             seen_until: None,
             merged_by_factory: false,
+            ignored: Vec::new(),
         }));
         step(&scheduler).await;
         executor.release(1);
@@ -3812,6 +3893,7 @@ async fn check_fixes_ci_fixes_and_review_runs_use_the_implement_effort() {
             event: Some(event),
             seen_until: None,
             merged_by_factory: false,
+            ignored: Vec::new(),
         }));
         step(&scheduler).await;
         executor.release(1);
@@ -3928,6 +4010,7 @@ async fn check_fixes_ci_fixes_and_review_runs_pass_the_implement_agent() {
             event: Some(event),
             seen_until: None,
             merged_by_factory: false,
+            ignored: Vec::new(),
         }));
         step(&scheduler).await;
         executor.release(1);
@@ -4270,6 +4353,7 @@ async fn to_rerun(
         }),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
     step(scheduler).await;
     executor.release(1);
@@ -8765,6 +8849,7 @@ async fn a_review_and_fix_first_pass_records_the_checkout_head_with_its_verdict(
         event: Some(Event::StartReview { head: "h1".into() }),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
     step(&scheduler).await; // watch
     assert!(matches!(
@@ -9324,6 +9409,7 @@ async fn fixing_a_quick_review_loops_never_merges_and_stops_at_the_round_cap() {
             }),
             seen_until: None,
             merged_by_factory: false,
+            ignored: Vec::new(),
         }));
         step(&scheduler).await; // watch
         executor.release(1);
@@ -9451,6 +9537,7 @@ async fn stacked_review(fork: bool) -> (i64, AgentRequest) {
         event: Some(Event::StartReview { head: "h2".into() }),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
     step(&scheduler).await; // watch
     executor.release(1);
@@ -9541,6 +9628,7 @@ async fn conflict_on_stack(
         event: Some(Event::Conflicted { base: base.into() }),
         seen_until: None,
         merged_by_factory: false,
+        ignored: Vec::new(),
     }));
     step(&scheduler).await; // watch
     executor.release(1);
