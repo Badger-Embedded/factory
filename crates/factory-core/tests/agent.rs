@@ -17,13 +17,22 @@ fn the_ids_and_names_are_the_ones_the_dashboard_stores_and_shows() {
     assert_eq!(Agent::Copilot.display_name(), "Copilot");
     assert_eq!(Agent::Local.id(), "local");
     assert_eq!(Agent::Local.display_name(), "Local");
+    assert_eq!(Agent::OpenRouter.id(), "openrouter");
+    assert_eq!(Agent::OpenRouter.display_name(), "OpenRouter");
+    assert_eq!(Agent::from_id("openrouter"), Ok(Agent::OpenRouter));
 }
 
 #[test]
 fn all_lists_the_agents_in_dashboard_order() {
     assert_eq!(
         Agent::ALL,
-        [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Local]
+        [
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Copilot,
+            Agent::Local,
+            Agent::OpenRouter
+        ]
     );
 }
 
@@ -51,6 +60,18 @@ fn every_agent_can_run() {
     assert!(Agent::Codex.available());
     assert!(Agent::Copilot.available());
     assert!(Agent::Local.available());
+}
+
+#[test]
+fn openrouter_is_listed_but_not_available_and_shares_local_efforts() {
+    assert!(!Agent::OpenRouter.available());
+    assert_eq!(Agent::OpenRouter.cli(), None);
+    assert_eq!(
+        Agent::OpenRouter.efforts(),
+        ["low", "medium", "high", "xhigh"]
+    );
+    assert_eq!(Agent::OpenRouter.default_effort(), "medium");
+    assert!(!Agent::OpenRouter.accepts_effort("max"));
 }
 
 #[test]

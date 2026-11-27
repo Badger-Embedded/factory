@@ -86,6 +86,15 @@ test('Local is selectable in every stage and shows its effort levels', async ({ 
   await expect(efforts).toHaveText(['low', 'medium', 'high', 'xhigh', 'max']);
 });
 
+test('OpenRouter is a disabled radio in every stage', async ({ page, project }) => {
+  await page.goto(settingsPath(project, '?stage=spec'));
+  for (const stage of ['clarify', 'spec', 'plan', 'implement', 'review']) {
+    const radio = page.locator(`input[name="${stage}_agent"][value="openrouter"]`);
+    await expect(radio).toHaveCount(1);
+    await expect(radio).toBeDisabled();
+  }
+});
+
 test("changing a stage's agent redraws its model and effort choices", async ({ page, project }) => {
   await page.goto(settingsPath(project, '?stage=spec'));
   const spec = panel(page, 'spec');

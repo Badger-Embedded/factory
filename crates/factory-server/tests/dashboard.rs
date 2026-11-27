@@ -8690,6 +8690,11 @@ async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_selectable
         "Local should be a radio in all five stages and the Renovate agent card",
     );
     assert!(!page.body.contains("value=\"local\" disabled"));
+    assert_eq!(
+        page.body.matches("value=\"openrouter\" disabled").count(),
+        6,
+        "OpenRouter should be a disabled radio in all five stages and the Renovate agent card",
+    );
     assert!(!page.body.contains("value=\"local\" checked"));
     assert!(!page.body.contains("value=\"copilot\" checked"));
     assert!(!page.body.contains("value=\"copilot\" disabled"));
@@ -12507,6 +12512,12 @@ async fn the_sidebar_groups_agents_and_links_each_one() {
 
     let local = body.find(r#"href="/settings/agents/local""#).unwrap();
     assert!(body.find("Copilot").unwrap() < local);
+
+    // OpenRouter follows Local as text with no link until its page lands.
+    assert!(!body.contains("/settings/agents/openrouter"));
+    let open_router = body.find("OpenRouter").unwrap();
+    assert!(local < open_router);
+    assert!(body[open_router..].contains("Not available yet"));
 
     // The Claude agent page marks its own sidebar entry.
     let body = dashboard.get("/settings/agents/claude").await.body;

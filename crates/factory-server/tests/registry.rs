@@ -39,7 +39,7 @@ fn registry_with_token(token: Option<&str>) -> AgentRegistry {
 fn the_registry_lists_the_agents_in_order() {
     let registry = registry_with_token(None);
     let ids: Vec<&str> = registry.entries().map(|entry| entry.id()).collect();
-    assert_eq!(ids, ["claude", "codex", "copilot", "local"]);
+    assert_eq!(ids, ["claude", "codex", "copilot", "local", "openrouter"]);
 }
 
 #[test]
@@ -186,4 +186,19 @@ fn the_local_entry_points_at_its_page_and_offers_no_models_yet() {
     assert_eq!(entry.model_suggestions(), [] as [&str; 0]);
     assert_eq!(entry.host_config_dir(), None);
     assert!(entry.credential().is_err());
+}
+
+#[test]
+fn the_openrouter_entry_is_listed_but_cannot_run_yet() {
+    let registry = registry_with_token(None);
+    let entry = registry.entry(Agent::OpenRouter);
+    assert_eq!(entry.display_name(), "OpenRouter");
+    assert!(!entry.available());
+    assert_eq!(entry.settings_url(), None);
+    assert_eq!(entry.model_suggestions(), [] as [&str; 0]);
+    assert_eq!(entry.host_config_dir(), None);
+    assert_eq!(
+        entry.credential(),
+        Err("the OpenRouter agent is not available yet".to_owned())
+    );
 }
