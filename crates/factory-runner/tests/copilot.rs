@@ -1010,6 +1010,105 @@ fn a_local_copilot_key_goes_by_name_only() {
     );
 }
 
+const OPENROUTER_KEY: &str = "sk-or-v1-0123456789";
+
+fn openrouter_copilot_run(dir: &Path) -> WorkerRun {
+    let mut run = local_copilot_run(dir, Some(OPENROUTER_KEY));
+    run.agent = Agent::OpenRouter;
+    run.model = Some("openai/gpt-5".into());
+    run.provider = Some(ProviderTarget {
+        kind: ProviderKind::OpenRouter,
+        cli: Cli::Copilot,
+        base_url: "https://openrouter.ai/api".into(),
+        key: Some(OPENROUTER_KEY.into()),
+    });
+    run
+}
+
+#[test]
+fn an_openrouter_copilot_run_sets_the_provider_with_no_offline_mode_and_the_key_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = openrouter_copilot_run(dir.path());
+    let args = copilot_args(&run);
+    let env = env_names(&args);
+
+    for expected in [
+        "COPILOT_TELEMETRY_DISABLED=true",
+        "COPILOT_PROVIDER_BASE_URL=https://openrouter.ai/api/v1",
+        "COPILOT_PROVIDER_TYPE=openai",
+        "COPILOT_PROVIDER_API_KEY",
+    ] {
+        assert!(env.contains(&expected), "missing {expected} in {env:?}");
+    }
+    assert!(
+        env.iter()
+            .all(|entry| entry.split('=').next() != Some("COPILOT_OFFLINE"))
+    );
+    assert!(!env.contains(&"COPILOT_GITHUB_TOKEN"));
+    assert!(args.contains(&"--disable-builtin-mcps".to_owned()));
+    assert!(args.iter().all(|arg| !arg.contains(OPENROUTER_KEY)));
+    assert_eq!(value_after(&args, "--model"), "openai/gpt-5");
+    assert_eq!(value_after(&args, "--effort"), "medium");
+    assert_eq!(
+        backend(Agent::Copilot).unwrap().secret_env(&run),
+        [("COPILOT_PROVIDER_API_KEY", OPENROUTER_KEY)]
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_copilot_run_reports_each_api_call_id_once_and_redacts_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let message = |id: &str| {
+        format!(
+            r#"{{"type":"assistant.message","data":{{"messageId":"m","content":"{OPENROUTER_KEY}","toolRequests":[],"apiCallId":"{id}"}}}}"#
+        )
+    };
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!(
+            "{}\n{}\n{}\n",
+            message("gen-1"),
+            message("gen-1"),
+            message("gen-2")
+        ),
+    )
+    .unwrap();
+    let podman = support::executable(
+        dir.path(),
+        "podman",
+        &format!("#!/bin/bash\ncat '{}'\n", stdout.display()),
+    );
+    let config = WorkerConfig {
+        podman,
+        ..WorkerConfig::default()
+    };
+
+    let mut log = Vec::new();
+    let report = run(
+        &config,
+        &openrouter_copilot_run(dir.path()),
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    assert_eq!(report.generation_ids, ["gen-1", "gen-2"]);
+    assert!(!format!("{log:?}").contains(OPENROUTER_KEY));
+
+    let local = run(
+        &config,
+        &local_copilot_run(dir.path(), None),
+        |_| {},
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    assert_eq!(local.generation_ids, [] as [std::string::String; 0]);
+}
+
 #[tokio::test]
 async fn a_local_copilot_run_logs_no_cost_note_and_sets_no_github_token() {
     let dir = tempfile::tempdir().unwrap();

@@ -144,9 +144,14 @@ pub trait AgentBackend: Sync {
     /// needs state across lines, such as Claude matching a tool result to its
     /// call, overrides it. The default is [`parse`](Self::parse), or
     /// [`parse_provider`](Self::parse_provider) for a Local run.
-    fn stream(&self, expect: Expect, local: bool, _key: Option<&str>) -> LineParser<'_> {
+    fn stream(
+        &self,
+        expect: Expect,
+        provider: Option<ProviderKind>,
+        _key: Option<&str>,
+    ) -> LineParser<'_> {
         Box::new(move |line| {
-            if local {
+            if provider.is_some() {
                 self.parse_provider(expect, line)
             } else {
                 self.parse(expect, line)
@@ -195,6 +200,9 @@ pub enum AgentItem {
     UsageTotal(TokenUsage),
     /// The run's final result, resolved from the agent's structured output.
     Result(RunResult),
+    /// An `OpenRouter` generation id the run's output showed. The run keeps each
+    /// id once, in order.
+    Generation(String),
     /// The agent failed a turn or hit a fatal stream error without a final
     /// result. The run uses this only when no [`Result`](AgentItem::Result)
     /// arrived, so a final message still wins, matching the spec.

@@ -829,6 +829,69 @@ fn a_local_codex_key_goes_by_name_only() {
     );
 }
 
+const OPENROUTER_KEY: &str = "sk-or-v1-0123456789";
+
+fn openrouter_codex_run(dir: &Path) -> WorkerRun {
+    let mut run = local_codex_run(dir, Some(OPENROUTER_KEY));
+    run.agent = Agent::OpenRouter;
+    run.model = Some("openai/gpt-5".into());
+    run.provider = Some(ProviderTarget {
+        kind: ProviderKind::OpenRouter,
+        cli: Cli::Codex,
+        base_url: "https://openrouter.ai/api".into(),
+        key: Some(OPENROUTER_KEY.into()),
+    });
+    run
+}
+
+#[test]
+fn an_openrouter_codex_run_names_the_provider_and_passes_the_key_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = openrouter_codex_run(dir.path());
+    let args = codex_args(&run);
+
+    let provider = args
+        .iter()
+        .find(|arg| arg.starts_with("model_providers.openrouter="))
+        .unwrap();
+    assert!(provider.contains(r#"name = "OpenRouter""#));
+    assert!(provider.contains(r#"base_url = "https://openrouter.ai/api/v1""#));
+    assert!(provider.contains(r#"wire_api = "responses""#));
+    assert!(provider.contains(r#"env_key = "FACTORY_OPENROUTER_API_KEY""#));
+    assert!(args.contains(&"model_provider=openrouter".to_owned()));
+    assert_eq!(value_after(&args, "--model"), "openai/gpt-5");
+    assert!(args.contains(&"model_reasoning_effort=medium".to_owned()));
+    assert!(!args.contains(&"--output-schema".to_owned()));
+    assert_eq!(
+        env_names(&args),
+        ["CODEX_HOME=/codex", "FACTORY_OPENROUTER_API_KEY"]
+    );
+    assert!(args.iter().all(|arg| !arg.contains(OPENROUTER_KEY)));
+    assert_eq!(
+        backend(Agent::Codex).unwrap().secret_env(&run),
+        [("FACTORY_OPENROUTER_API_KEY", OPENROUTER_KEY)]
+    );
+}
+
+#[test]
+fn an_openrouter_codex_run_writes_no_auth_json_and_shows_no_generation_id() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("codex")).unwrap();
+    let codex = backend(Agent::Codex).unwrap();
+    codex.prepare(&openrouter_codex_run(dir.path())).unwrap();
+    assert!(!dir.path().join("codex/auth.json").exists());
+    assert!(!dir.path().join("codex/output-schema.json").exists());
+
+    // Codex's stdout carries the thread id and usage, not the response id.
+    let completed = r#"{"type":"turn.completed","usage":{"input_tokens":3,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}"#;
+    let mut parse = codex.stream(Expect::Spec, Some(ProviderKind::OpenRouter), None);
+    assert!(
+        parse(completed)
+            .iter()
+            .all(|item| !matches!(item, AgentItem::Generation(_)))
+    );
+}
+
 #[test]
 fn a_local_codex_run_writes_no_login_setting_and_no_output_schema() {
     let dir = tempfile::tempdir().unwrap();

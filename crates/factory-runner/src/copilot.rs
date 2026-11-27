@@ -149,8 +149,11 @@ impl AgentBackend for CopilotAgent {
         })
     }
 
-    fn provider_host_config_dir(&self, _kind: &ProviderKind) -> &'static str {
-        "local-copilot"
+    fn provider_host_config_dir(&self, kind: &ProviderKind) -> &'static str {
+        match kind {
+            ProviderKind::Local { .. } => "local-copilot",
+            ProviderKind::OpenRouter => "openrouter-copilot",
+        }
     }
 
     fn command(&self, _config: &WorkerConfig, run: &WorkerRun) -> Vec<OsString> {
@@ -182,12 +185,11 @@ impl AgentBackend for CopilotAgent {
             copilot.push(model.into());
         }
         copilot.push("--effort".into());
-        let default_effort = if run.provider.is_some() {
-            Agent::Local
-        } else {
-            Agent::Copilot
-        }
-        .default_effort();
+        let default_effort = run
+            .provider
+            .as_ref()
+            .map_or(Agent::Copilot, |provider| provider.kind.agent())
+            .default_effort();
         copilot.push(run.effort.as_deref().unwrap_or(default_effort).into());
         if let Some(mcp) = run.mcp.as_ref().filter(|mcp| !mcp.servers.is_empty()) {
             copilot.push("--additional-mcp-config".into());
@@ -207,6 +209,24 @@ impl AgentBackend for CopilotAgent {
 
     fn start_log(&self) -> Vec<LogLine> {
         vec![LogLine::Other(COST_NOTE.to_owned())]
+    }
+
+    fn stream(
+        &self,
+        expect: Expect,
+        provider: Option<ProviderKind>,
+        _key: Option<&str>,
+    ) -> crate::agent::LineParser<'_> {
+        Box::new(move |line| {
+            let mut items = match provider {
+                Some(_) => self.parse_provider(expect, line),
+                None => self.parse(expect, line),
+            };
+            if provider == Some(ProviderKind::OpenRouter) {
+                items.extend(generation_id(line).map(AgentItem::Generation));
+            }
+            items
+        })
     }
 
     fn parse(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
@@ -304,6 +324,18 @@ fn parse_copilot(expect: Expect, line: &str) -> Vec<AgentItem> {
         Some("result") => parse_result(expect, &value),
         _ => Vec::new(),
     }
+}
+
+/// The `apiCallId` of an `assistant.message`, which on `OpenRouter` is the id of
+/// the chat completion and so the generation its cost is read by.
+fn generation_id(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(line.trim()).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("assistant.message") {
+        return None;
+    }
+    string_at(value.get("data"), "apiCallId")
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 /// A server the agent reports as failed, such as a stdio command that would not

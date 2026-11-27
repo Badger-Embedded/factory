@@ -97,6 +97,7 @@ fn failed(reason: String) -> RunReport {
         mcp_unavailable: Vec::new(),
         credential: None,
         token_usage: None,
+        generation_ids: Vec::new(),
         head: None,
     }
 }
@@ -291,7 +292,9 @@ impl PodmanExecutor {
         log: &mut LogSink,
     ) -> Result<(), String> {
         let target = &local.target;
-        let ProviderKind::Local { load_timeout } = target.kind;
+        let ProviderKind::Local { load_timeout } = target.kind else {
+            return Ok(());
+        };
         let started = Instant::now();
         let load =
             self.local_probe
@@ -510,7 +513,11 @@ const LOAD_NOTICE_AFTER: Duration = Duration::from_secs(5);
 
 fn load_failure(error: &LoadError, local: &crate::ProviderRequest, model: &str) -> String {
     let target = &local.target;
-    let ProviderKind::Local { load_timeout } = target.kind;
+    // Only a Local run waits for a model load; an OpenRouter run never gets here.
+    let load_timeout = match target.kind {
+        ProviderKind::Local { load_timeout } => load_timeout,
+        ProviderKind::OpenRouter => Duration::ZERO,
+    };
     match error {
         LoadError::Timeout => {
             let minutes = load_timeout.as_secs().div_ceil(60);

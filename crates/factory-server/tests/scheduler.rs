@@ -239,6 +239,7 @@ impl Executor for FakeExecutor {
                     mcp_unavailable: Vec::new(),
                     credential: None,
                     token_usage: None,
+                    generation_ids: Vec::new(),
                     head: None,
                 };
             }
@@ -281,6 +282,7 @@ impl Executor for FakeExecutor {
                 .unwrap_or_default(),
             credential: None,
             token_usage,
+            generation_ids: Vec::new(),
             head: self.checkout_head.lock().unwrap().clone(),
         }
     }

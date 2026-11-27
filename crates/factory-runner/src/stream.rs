@@ -163,6 +163,27 @@ impl ClaudeStream {
     }
 }
 
+/// The `message.id` of an `assistant` line, which on `OpenRouter` is the
+/// generation id its cost is read by. One message spans several lines with the
+/// same id, so the caller keeps each once. Claude Code's own synthetic messages
+/// carry no generation and give nothing.
+#[must_use]
+pub fn generation_id(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(line.trim()).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message")?;
+    if message.get("model").and_then(Value::as_str) == Some("<synthetic>") {
+        return None;
+    }
+    message
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 fn parse_with(
     calls: &mut HashMap<String, (String, Value)>,
     key: Option<&str>,

@@ -540,6 +540,126 @@ async fn a_local_run_redacts_its_key_from_stdout_and_stderr() {
     assert!(shown.contains("[redacted]"));
 }
 
+const OPENROUTER_KEY: &str = "sk-or-v1-0123456789";
+
+fn openrouter_claude_run(dir: &Path) -> WorkerRun {
+    let mut run = local_claude_run(dir, Some(OPENROUTER_KEY));
+    run.agent = Agent::OpenRouter;
+    run.model = Some("anthropic/claude-sonnet-4".into());
+    run.provider = Some(ProviderTarget {
+        kind: ProviderKind::OpenRouter,
+        cli: Cli::ClaudeCode,
+        base_url: "https://openrouter.ai/api".into(),
+        key: Some(OPENROUTER_KEY.into()),
+    });
+    run
+}
+
+#[test]
+fn an_openrouter_claude_run_sets_the_url_the_empty_api_key_and_the_key_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = openrouter_claude_run(dir.path());
+    let args = strings(&podman_args(&WorkerConfig::default(), &run));
+    let env = env_args(&args);
+
+    for expected in [
+        "ANTHROPIC_BASE_URL=https://openrouter.ai/api",
+        "ANTHROPIC_API_KEY=",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL=anthropic/claude-sonnet-4",
+        "ANTHROPIC_SMALL_FAST_MODEL=anthropic/claude-sonnet-4",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+        "ANTHROPIC_AUTH_TOKEN",
+    ] {
+        assert!(env.contains(&expected), "missing {expected} in {env:?}");
+    }
+    assert!(!env.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+    assert!(env.iter().all(|entry| !entry.contains("TIMEOUT")));
+    assert!(args.iter().all(|arg| !arg.contains(OPENROUTER_KEY)));
+    assert_eq!(value_after(&args, "--model"), "anthropic/claude-sonnet-4");
+    assert_eq!(value_after(&args, "--effort"), "medium");
+    assert_eq!(
+        backend(Agent::Claude).unwrap().secret_env(&run),
+        [("ANTHROPIC_AUTH_TOKEN", OPENROUTER_KEY)]
+    );
+}
+
+#[test]
+fn an_openrouter_run_keeps_a_config_directory_per_cli() {
+    let dirs = |kind: &ProviderKind| {
+        [Cli::ClaudeCode, Cli::Codex, Cli::Copilot].map(|cli| {
+            factory_runner::backend_for(cli)
+                .unwrap()
+                .provider_host_config_dir(kind)
+        })
+    };
+    assert_eq!(
+        dirs(&ProviderKind::OpenRouter),
+        [
+            "openrouter-claude",
+            "openrouter-codex",
+            "openrouter-copilot"
+        ]
+    );
+    assert_eq!(
+        dirs(&ProviderKind::Local {
+            load_timeout: Duration::from_mins(1)
+        }),
+        ["local-claude", "local-codex", "local-copilot"]
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_claude_run_reports_each_generation_id_once_and_redacts_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let assistant = |id: &str, model: &str, text: &str| {
+        format!(
+            r#"{{"type":"assistant","message":{{"id":"{id}","model":"{model}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    };
+    let stdout = dir.path().join("stdout");
+    fs::write(
+        &stdout,
+        format!(
+            "{}\n{}\n{}\n{}\nthe key is {OPENROUTER_KEY}\n",
+            assistant("gen-1", "m", "a"),
+            assistant("gen-1", "m", "b"),
+            assistant("synthetic-id", "<synthetic>", "c"),
+            assistant("gen-2", "m", "d"),
+        ),
+    )
+    .unwrap();
+    let config = WorkerConfig {
+        podman: fake_podman(dir.path(), &stdout, &format!("401 {OPENROUTER_KEY}"), 1),
+        ..WorkerConfig::default()
+    };
+
+    let mut log = Vec::new();
+    let report = run(
+        &config,
+        &openrouter_claude_run(dir.path()),
+        |line| log.push(line),
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    assert_eq!(report.generation_ids, ["gen-1", "gen-2"]);
+    let shown = format!("{log:?} {:?}", report.event);
+    assert!(!shown.contains(OPENROUTER_KEY), "{shown}");
+    assert!(shown.contains("[redacted]"));
+
+    let local = run(
+        &config,
+        &local_claude_run(dir.path(), None),
+        |_| {},
+        |_| {},
+        |_| {},
+        || {},
+    )
+    .await;
+    assert_eq!(local.generation_ids, [] as [std::string::String; 0]);
+}
+
 #[test]
 fn a_local_claude_result_reports_its_token_counts() {
     let line = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","total_cost_usd":0.049,"usage":{"input_tokens":120,"cache_read_input_tokens":30,"output_tokens":45}}"#;

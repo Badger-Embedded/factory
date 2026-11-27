@@ -237,6 +237,19 @@ pub enum ProviderKind {
         /// CLI's request timeout to at least this.
         load_timeout: Duration,
     },
+    /// `OpenRouter`. The run needs a key and waits for no model load.
+    OpenRouter,
+}
+
+impl ProviderKind {
+    /// The agent this provider belongs to, which sets the run's default effort.
+    #[must_use]
+    pub fn agent(self) -> Agent {
+        match self {
+            ProviderKind::Local { .. } => Agent::Local,
+            ProviderKind::OpenRouter => Agent::OpenRouter,
+        }
+    }
 }
 
 impl std::fmt::Debug for ProviderTarget {
@@ -270,6 +283,10 @@ pub struct RunReport {
     /// the executor turns into an estimated cost. `None` for a run that reports
     /// a dollar cost instead, such as Claude's.
     pub token_usage: Option<TokenUsage>,
+    /// The `OpenRouter` generation ids the run's output showed, in order and
+    /// without repeats. The server reads each generation's cost from `OpenRouter`.
+    /// Empty for a run that is not on `OpenRouter`.
+    pub generation_ids: Vec<String>,
     /// The commit the checkout was at when a review run of a picked pull
     /// request started, which the executor sets and the worker leaves `None`.
     pub head: Option<String>,
@@ -394,6 +411,7 @@ pub async fn run(
         mcp_unavailable: Vec::new(),
         credential: None,
         token_usage: None,
+        generation_ids: Vec::new(),
         head: None,
     };
     let Some(backend) = run.cli().and_then(backend_for) else {
@@ -462,7 +480,7 @@ pub async fn run(
     let mut collected = Collected::default();
     let mut parse = backend.stream(
         run.expect,
-        run.provider.is_some(),
+        run.provider.as_ref().map(|provider| provider.kind),
         run.provider.as_ref().and_then(|local| local.key.as_deref()),
     );
     if let Some(stdout) = child.stdout.take() {
@@ -612,6 +630,7 @@ struct Collected {
     /// The token usage summed over the run's turns. Empty for Claude, which
     /// reports a dollar cost instead.
     token_usage: Option<TokenUsage>,
+    generation_ids: Vec<String>,
     /// A turn failure or fatal stream error, used only when no result arrives,
     /// so a final agent message still decides the run.
     failure: Option<Event>,
@@ -642,6 +661,11 @@ impl Collected {
             AgentItem::Usage(turn) => {
                 self.token_usage = Some(self.token_usage.unwrap_or_default().plus(turn));
             }
+            AgentItem::Generation(id) => {
+                if !self.generation_ids.contains(&id) {
+                    self.generation_ids.push(id);
+                }
+            }
             AgentItem::Failure(event) => self.failure = Some(event),
         }
     }
@@ -664,6 +688,7 @@ impl Collected {
                 mcp_unavailable: self.mcp_unavailable,
                 credential,
                 token_usage: self.token_usage,
+                generation_ids: self.generation_ids,
                 head: None,
             };
         }
@@ -684,6 +709,7 @@ impl Collected {
             mcp_unavailable: self.mcp_unavailable,
             credential,
             token_usage: self.token_usage,
+            generation_ids: self.generation_ids,
             head: None,
         }
     }
