@@ -1,8 +1,8 @@
 //! The agents a stage can run on.
 //!
 //! The factory runs every stage with an agent. Claude Code, Codex and Copilot
-//! run. Local runs one of those CLIs against an OpenAI-compatible server.
-//! `OpenRouter` is listed but cannot run yet.
+//! run. Local runs one of those CLIs against an OpenAI-compatible server, and
+//! `OpenRouter` runs one of them against `OpenRouter`.
 //! Each agent has a stable id that the server stores per stage, a display name
 //! for the dashboard, and a flag for whether a stage can select it. A stage
 //! with no saved agent runs on [`DEFAULT_AGENT`].
@@ -149,7 +149,7 @@ impl Agent {
             Agent::Codex => true,
             Agent::Copilot => true,
             Agent::Local => true,
-            Agent::OpenRouter => false,
+            Agent::OpenRouter => true,
         }
     }
 

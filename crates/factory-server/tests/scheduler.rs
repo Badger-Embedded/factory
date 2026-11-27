@@ -16,13 +16,14 @@ use factory_runner::{
 use factory_server::{
     AccountSource, Accounts, AgentRegistry, AgentRequest, ChecksRequest, ClaudeToken, CodexLogin,
     CodexPrice, Executor, FACTORY_REQUESTER, ForgeTokenOwner, Forges, GhRepos,
-    HttpLocalServerProbe, IgnoredCommenter, JobFile, LocalSecrets, LogSink, MASTER_KEY_LEN,
-    McpProjectSettings, McpRuntime, McpStages, McpTransport, McpWarnings, Owner, PlanUsageCache,
-    PodmanExecutor, PrerequisiteEdit, Project, ProjectForge, Projects, PublishRequest, Published,
-    ReadyAction, Rebase, RenovateAgent, RenovateWatchRequest, RerunRequest, RunTokens, Scheduler,
-    SecretRef, SecretStore, SessionSink, Settings, StageAgents, StageEfforts, StageModels, Store,
-    SummaryRequest, UnavailableSecrets, UpstreamCredential, WatchReport, WatchRequest, WorkerSlots,
-    credential_failure, format_cost, ready_action, waiting_event,
+    HttpLocalServerProbe, HttpOpenRouterApi, IgnoredCommenter, JobFile, LocalSecrets, LogSink,
+    MASTER_KEY_LEN, McpProjectSettings, McpRuntime, McpStages, McpTransport, McpWarnings, Owner,
+    PlanUsageCache, PodmanExecutor, PrerequisiteEdit, Project, ProjectForge, Projects,
+    PublishRequest, Published, ReadyAction, Rebase, RenovateAgent, RenovateWatchRequest,
+    RerunRequest, RunTokens, Scheduler, SecretRef, SecretStore, SessionSink, Settings, StageAgents,
+    StageEfforts, StageModels, Store, SummaryRequest, UnavailableSecrets, UpstreamCredential,
+    WatchReport, WatchRequest, WorkerSlots, credential_failure, format_cost, ready_action,
+    waiting_event,
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -7993,6 +7994,7 @@ fn fake_gh(dir: &std::path::Path) -> (Arc<PodmanExecutor>, PathBuf) {
         store,
         plan_usage: Arc::new(PlanUsageCache::new()),
         local_probe: Arc::new(HttpLocalServerProbe::new()),
+        openrouter: Arc::new(HttpOpenRouterApi::new()),
     };
     (Arc::new(podman), calls)
 }
@@ -8828,6 +8830,344 @@ async fn a_session_started_on_claude_stays_on_claude_after_its_stage_moves_to_lo
         log_texts(&store, id)
             .iter()
             .any(|text| text.starts_with("This session started on Claude"))
+    );
+}
+
+/// Like [`setup_local`], with the clarify stage on `OpenRouter`, whose factory
+/// default CLI is Codex.
+fn setup_openrouter(
+    respond: impl Fn(&AgentRequest) -> Event + Send + Sync + 'static,
+) -> (
+    Arc<Store>,
+    Arc<FakeExecutor>,
+    Arc<Scheduler<FakeExecutor>>,
+    Arc<LocalSecrets>,
+) {
+    let (store, executor, scheduler, secrets) = setup_local(respond);
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                clarify: "openrouter".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    store
+        .save_openrouter_settings(factory_core::Cli::Codex)
+        .unwrap();
+    (store, executor, scheduler, secrets)
+}
+
+#[tokio::test]
+async fn an_openrouter_run_uses_the_requesters_key_else_the_factory_key() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    secrets
+        .set_user_openrouter_key("alice", "alice-key")
+        .unwrap();
+    // A Local key does not pay for an OpenRouter run.
+    secrets.set_user_local_key("bob", "bob-local-key").unwrap();
+    executor.release(3);
+    for requester in ["alice", "bob", FACTORY_REQUESTER] {
+        store.create("maestro", requester, "Add a button").unwrap();
+        step(&scheduler).await;
+    }
+
+    let requests = executor.requests();
+    let target = |index: usize| local_of(&requests[index]).target.clone();
+    assert_eq!(requests[0].agent, Agent::OpenRouter);
+    assert_eq!(target(0).key.as_deref(), Some("alice-key"));
+    assert_eq!(
+        local_of(&requests[0]).key_from,
+        factory_server::KeyOwner::Login("alice".into())
+    );
+    assert_eq!(target(1).key.as_deref(), Some("factory-key"));
+    assert_eq!(
+        local_of(&requests[1]).key_from,
+        factory_server::KeyOwner::Factory
+    );
+    assert_eq!(target(2).key.as_deref(), Some("factory-key"));
+    assert_eq!(target(0).kind, factory_runner::ProviderKind::OpenRouter);
+    assert_eq!(target(0).base_url, "https://openrouter.ai/api");
+    assert_eq!(model_of(&requests[0]), "gemma");
+}
+
+#[tokio::test]
+async fn a_factory_requested_openrouter_run_ignores_a_personal_key_of_that_name() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    secrets
+        .set_user_openrouter_key(FACTORY_REQUESTER, "personal")
+        .unwrap();
+    executor.release(1);
+    store
+        .create("maestro", FACTORY_REQUESTER, "Update a dependency")
+        .unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(
+        local_of(&executor.requests()[0]).target.key.as_deref(),
+        Some("factory-key")
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_run_with_no_key_fails_before_any_run_and_keeps_retry() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(executor.requests().len(), 0);
+    assert_eq!(failure_reason(&store, id), "no OpenRouter API key is set");
+
+    secrets.set_openrouter_key("factory-key").unwrap();
+    store.apply(id, Event::Retry).unwrap();
+    executor.release(1);
+    step(&scheduler).await;
+    assert_eq!(executor.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn an_openrouter_run_with_no_model_fails_before_any_run() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    store
+        .save_project_models("maestro", &StageModels::default())
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(executor.requests().len(), 0);
+    assert_eq!(
+        failure_reason(&store, id),
+        "no model is set for the OpenRouter agent"
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_key_that_cannot_be_read_fails_the_run_without_falling_back() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    store
+        .put_secret(
+            SecretRef {
+                project: "",
+                server: "",
+                header: "openrouter-key-user:alice",
+            },
+            "openrouter",
+            b"not-a-ciphertext",
+        )
+        .unwrap();
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(executor.requests().len(), 0);
+    let reason = failure_reason(&store, id);
+    assert!(reason.contains("The OpenRouter API key of alice cannot be read"));
+    assert!(!reason.contains("factory-key"));
+}
+
+#[tokio::test]
+async fn an_openrouter_run_opens_its_log_with_the_cli_and_whose_key() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    secrets
+        .set_user_openrouter_key("alice", "alice-key")
+        .unwrap();
+    executor.release(2);
+    let alice = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    let bob = store.create("maestro", "bob", "Another button").unwrap();
+    step(&scheduler).await;
+
+    let log = log_texts(&store, alice);
+    let at = log
+        .iter()
+        .position(|text| text.starts_with("OpenRouter run on"))
+        .expect("the OpenRouter run line");
+    assert_eq!(
+        log[at],
+        "OpenRouter run on Codex with the OpenRouter API key of alice."
+    );
+    assert!(log[at + 1].starts_with("Agent run started"));
+    assert!(
+        log_texts(&store, bob)
+            .contains(&"OpenRouter run on Codex with the factory's key.".to_owned())
+    );
+    for id in [alice, bob] {
+        assert!(
+            log_texts(&store, id)
+                .iter()
+                .all(|text| !text.contains("alice-key") && !text.contains("factory-key"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_openrouter_run_uses_the_cli_the_requester_chose() {
+    use factory_core::Cli::{ClaudeCode, Codex, Copilot};
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    store
+        .set_user_cli("alice", Agent::OpenRouter, Some(ClaudeCode))
+        .unwrap();
+    // A Local choice does not apply to an OpenRouter run.
+    store
+        .set_user_cli("bob", Agent::Local, Some(Copilot))
+        .unwrap();
+    store
+        .set_user_cli(FACTORY_REQUESTER, Agent::OpenRouter, Some(ClaudeCode))
+        .unwrap();
+    executor.release(4);
+    for requester in ["alice", "bob", FACTORY_REQUESTER] {
+        store.create("maestro", requester, "Add a button").unwrap();
+        step(&scheduler).await;
+    }
+
+    let clis = |executor: &FakeExecutor| -> Vec<_> {
+        executor
+            .requests()
+            .iter()
+            .map(|request| local_of(request).target.cli)
+            .collect()
+    };
+    assert_eq!(clis(&executor), [ClaudeCode, Codex, Codex]);
+
+    store.save_openrouter_settings(Copilot).unwrap();
+    store.create("maestro", "carol", "A third button").unwrap();
+    step(&scheduler).await;
+    assert_eq!(clis(&executor)[3], Copilot);
+}
+
+#[tokio::test]
+async fn an_openrouter_retry_by_another_login_keeps_the_requesters_cli() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    store
+        .set_user_cli(
+            "alice",
+            Agent::OpenRouter,
+            Some(factory_core::Cli::ClaudeCode),
+        )
+        .unwrap();
+    store
+        .set_user_cli("bob", Agent::OpenRouter, Some(factory_core::Cli::Copilot))
+        .unwrap();
+    *executor.prestart_failures.lock().unwrap() = 1;
+    executor.release(2);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Retry).unwrap();
+    step(&scheduler).await;
+
+    let clis: Vec<_> = executor
+        .requests()
+        .iter()
+        .map(|request| local_of(request).target.cli)
+        .collect();
+    assert_eq!(clis, [factory_core::Cli::ClaudeCode; 2]);
+}
+
+#[tokio::test]
+async fn an_openrouter_session_resumes_on_its_cli_and_the_log_says_so() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|request| {
+        if request.prompt.contains("answered") {
+            Event::Agent(AgentResult::Clarified)
+        } else {
+            questions()
+        }
+    });
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.release(3);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    assert_eq!(
+        store
+            .session_provider_cli(id, factory_core::Session::Planning)
+            .unwrap(),
+        Some(factory_core::Cli::Codex)
+    );
+
+    store
+        .set_user_cli("alice", Agent::OpenRouter, Some(factory_core::Cli::Copilot))
+        .unwrap();
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(local_of(&requests[1]).target.cli, factory_core::Cli::Codex);
+    assert_eq!(
+        local_of(&requests[1]).setting_cli,
+        factory_core::Cli::Copilot
+    );
+    let notes: Vec<String> = log_texts(&store, id)
+        .into_iter()
+        .filter(|text| text.contains("stays on Codex"))
+        .collect();
+    assert_eq!(
+        notes,
+        ["This session started on Codex, so it stays on Codex. \
+             The requester's choice is Copilot now, which new sessions use."]
+    );
+}
+
+#[tokio::test]
+async fn one_job_runs_a_local_stage_and_an_openrouter_stage_each_with_its_own_line() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|request| {
+        if request.prompt.contains("answered") {
+            Event::Agent(AgentResult::Clarified)
+        } else {
+            questions()
+        }
+    });
+    secrets.set_openrouter_key("factory-key").unwrap();
+    store
+        .save_project_agents(
+            "maestro",
+            &StageAgents {
+                clarify: "local".into(),
+                spec: "openrouter".into(),
+                ..StageAgents::default()
+            },
+        )
+        .unwrap();
+    executor.release(4);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+    store.apply(id, Event::Answer(vec!["rpi5".into()])).unwrap();
+    step(&scheduler).await;
+    step(&scheduler).await;
+
+    let requests = executor.requests();
+    assert_eq!(requests[0].agent, Agent::Local);
+    let last = requests.last().unwrap();
+    assert_eq!(last.agent, Agent::OpenRouter);
+    assert_eq!(
+        local_of(last).target.kind,
+        factory_runner::ProviderKind::OpenRouter
+    );
+    let log = log_texts(&store, id);
+    assert!(log.iter().any(|text| text.starts_with("Local run on")));
+    assert!(log.iter().any(|text| text.starts_with("OpenRouter run on")));
+}
+
+#[tokio::test]
+async fn an_openrouter_run_adds_no_cost_row() {
+    let (store, executor, scheduler, secrets) = setup_openrouter(|_| questions());
+    secrets.set_openrouter_key("factory-key").unwrap();
+    executor.costs.lock().unwrap().push_back(Some(4.2));
+    executor.release(1);
+    let id = store.create("maestro", "alice", "Add a button").unwrap();
+    step(&scheduler).await;
+
+    assert_eq!(store.recorded_cost(id).unwrap(), None);
+    assert_eq!(store.cost_usd(id).unwrap(), 0.0);
+    assert!(
+        log_texts(&store, id)
+            .iter()
+            .any(|text| text.starts_with("OpenRouter run finished"))
     );
 }
 

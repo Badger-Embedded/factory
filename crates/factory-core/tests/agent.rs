@@ -60,11 +60,11 @@ fn every_agent_can_run() {
     assert!(Agent::Codex.available());
     assert!(Agent::Copilot.available());
     assert!(Agent::Local.available());
+    assert!(Agent::OpenRouter.available());
 }
 
 #[test]
-fn openrouter_is_listed_but_not_available_and_shares_local_efforts() {
-    assert!(!Agent::OpenRouter.available());
+fn openrouter_shares_local_efforts() {
     assert_eq!(Agent::OpenRouter.cli(), None);
     assert_eq!(
         Agent::OpenRouter.efforts(),

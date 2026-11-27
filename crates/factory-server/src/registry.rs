@@ -171,10 +171,9 @@ impl AgentEntry<'_> {
         match self.agent {
             // One worker image carries the agents that have a backend, so they
             // run in the `worker_image` setting edited on the Workers page.
-            Agent::Claude | Agent::Codex | Agent::Copilot | Agent::Local => {
+            Agent::Claude | Agent::Codex | Agent::Copilot | Agent::Local | Agent::OpenRouter => {
                 Some(settings.worker_image.clone())
             }
-            Agent::OpenRouter => None,
         }
     }
 
@@ -209,7 +208,9 @@ impl AgentEntry<'_> {
             Agent::Codex => self.registry.codex_login.credential(),
             Agent::Copilot => self.copilot_token(),
             Agent::Local => Err("the Local agent has no subscription credential".to_owned()),
-            Agent::OpenRouter => Err("the OpenRouter agent is not available yet".to_owned()),
+            Agent::OpenRouter => {
+                Err("the OpenRouter agent has no subscription credential".to_owned())
+            }
         }
     }
 

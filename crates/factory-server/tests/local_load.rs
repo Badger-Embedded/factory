@@ -20,8 +20,8 @@ use factory_runner::{
 };
 use factory_server::{
     AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
-    HttpLocalServerProbe, KeyOwner, LocalSecrets, MASTER_KEY_LEN, PlanUsageCache, PodmanExecutor,
-    ProviderRequest, SecretStore, Settings, Store,
+    HttpLocalServerProbe, HttpOpenRouterApi, KeyOwner, LocalSecrets, MASTER_KEY_LEN,
+    PlanUsageCache, PodmanExecutor, ProviderRequest, SecretStore, Settings, Store,
 };
 use tokio::sync::Notify;
 
@@ -172,6 +172,7 @@ impl Fixture {
             store: Arc::clone(&self.store),
             plan_usage: Arc::new(PlanUsageCache::new()),
             local_probe: Arc::new(HttpLocalServerProbe::new()),
+            openrouter: Arc::new(HttpOpenRouterApi::new()),
         }
     }
 

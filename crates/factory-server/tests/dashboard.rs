@@ -1695,6 +1695,27 @@ async fn a_job_that_only_ran_on_local_shows_zero_dollars_with_no_estimate_mark()
 }
 
 #[tokio::test]
+async fn a_started_openrouter_session_leaves_a_subscription_zero_cost_as_a_dash() {
+    let dashboard = dashboard();
+    let id = dashboard.new_job().await;
+    dashboard.store.add_cost(id, 0.0, false).unwrap();
+    dashboard
+        .store
+        .session_uuid(id, Session::Planning, Agent::OpenRouter)
+        .unwrap();
+    dashboard
+        .store
+        .record_session_provider_cli(id, Session::Planning, Cli::Codex)
+        .unwrap();
+
+    let page = dashboard.get(&format!("/jobs/{id}")).await;
+    assert!(
+        page.body
+            .contains("<span class=\"badge cost\" id=\"job-cost\">–</span>")
+    );
+}
+
+#[tokio::test]
 async fn a_cancelled_job_still_shows_its_cost() {
     let dashboard = dashboard();
     let id = dashboard.new_job().await;
@@ -8242,36 +8263,34 @@ fn an_unknown_agent_is_rejected_and_not_stored() {
 }
 
 #[test]
-fn an_unavailable_agent_is_rejected_and_not_stored() {
+fn an_openrouter_stage_is_stored() {
     let store = Store::open_in_memory().unwrap();
     let submitted = agents("claude", "openrouter", "claude", "claude", "claude");
-    let err = store
-        .save_project_agents("maestro", &submitted)
-        .unwrap_err();
-    assert!(
-        matches!(&err, StoreError::InvalidAgent(id) if id == "openrouter"),
-        "{err:?}"
-    );
-    assert_eq!(
-        store.project_agents("maestro").unwrap(),
-        StageAgents::default()
-    );
+    store.save_project_agents("maestro", &submitted).unwrap();
+    assert_eq!(store.project_agents("maestro").unwrap(), submitted);
 }
 
 #[tokio::test]
-async fn an_openrouter_stage_submission_is_rejected_and_stores_nothing() {
+async fn an_openrouter_stage_submission_needs_a_model_and_stores_nothing_without() {
     let dashboard = dashboard();
-    let reply = dashboard
-        .post(
-            "/settings/projects/maestro",
-            "clarify=opus&spec=some%2Fmodel&plan=&implement=&review=&\
-             clarify_effort=medium&spec_effort=high&plan_effort=medium&\
+    let form = |model: &str| {
+        format!(
+            "clarify=opus&spec={model}&plan=&implement=&review=&\
+             clarify_effort=medium&spec_effort=xhigh&plan_effort=medium&\
              implement_effort=medium&review_effort=medium&\
              clarify_agent=claude&spec_agent=openrouter&plan_agent=claude&\
-             implement_agent=claude&review_agent=claude",
+             implement_agent=claude&review_agent=claude"
         )
+    };
+    let reply = dashboard
+        .post("/settings/projects/maestro", &form(""))
         .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply
+            .body
+            .contains("The spec stage runs on OpenRouter, which needs a model ID.")
+    );
     assert_eq!(
         dashboard
             .store
@@ -8287,48 +8306,23 @@ async fn an_openrouter_stage_submission_is_rejected_and_stores_nothing() {
         dashboard.store.project_agents("maestro").unwrap(),
         StageAgents::default()
     );
-}
 
-#[test]
-fn codex_is_accepted_for_every_stage() {
-    let store = Store::open_in_memory().unwrap();
-    let submitted = agents("codex", "codex", "codex", "codex", "codex");
-    store.save_project_agents("maestro", &submitted).unwrap();
-    assert_eq!(store.project_agents("maestro").unwrap(), submitted);
-}
-
-#[test]
-fn local_is_accepted_for_a_stage() {
-    let store = Store::open_in_memory().unwrap();
-    let submitted = agents("local", "claude", "claude", "claude", "claude");
-    store.save_project_agents("maestro", &submitted).unwrap();
-    assert_eq!(store.project_agents("maestro").unwrap(), submitted);
-}
-
-#[test]
-fn local_efforts_run_low_through_xhigh_and_reject_max_and_minimal() {
-    let store = Store::open_in_memory().unwrap();
-    let local = agents("local", "local", "local", "local", "local");
-    store
-        .save_project_efforts(
-            "maestro",
-            &efforts("low", "medium", "high", "xhigh", "low"),
-            &local,
-        )
-        .unwrap();
-    for level in ["max", "minimal"] {
-        let err = store
-            .save_project_efforts(
-                "maestro",
-                &efforts("low", "low", "low", level, "low"),
-                &local,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(&err, StoreError::InvalidEffort(found) if found == level),
-            "{err:?}"
-        );
-    }
+    let reply = dashboard
+        .post("/settings/projects/maestro", &form("some%2Fmodel%3Afree"))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        dashboard.store.project_agents("maestro").unwrap(),
+        agents("claude", "openrouter", "claude", "claude", "claude")
+    );
+    assert_eq!(
+        dashboard
+            .store
+            .project_models("maestro", &StageModels::default())
+            .unwrap()
+            .spec,
+        Some("some/model:free".into())
+    );
 }
 
 #[tokio::test]
@@ -8739,10 +8733,12 @@ async fn the_settings_form_has_an_agent_selector_per_stage_with_codex_selectable
     );
     assert!(!page.body.contains("value=\"local\" disabled"));
     assert_eq!(
-        page.body.matches("value=\"openrouter\" disabled").count(),
+        page.body.matches("value=\"openrouter\"").count(),
         6,
-        "OpenRouter should be a disabled radio in all five stages and the Renovate agent card",
+        "OpenRouter should be a radio in all five stages and the Renovate agent card",
     );
+    assert!(!page.body.contains("value=\"openrouter\" disabled"));
+    assert!(!page.body.contains("value=\"openrouter\" checked"));
     assert!(!page.body.contains("value=\"local\" checked"));
     assert!(!page.body.contains("value=\"copilot\" checked"));
     assert!(!page.body.contains("value=\"copilot\" disabled"));
@@ -18446,7 +18442,8 @@ async fn a_bad_renovate_agent_is_rejected_by_name_and_stores_nothing() {
     let dashboard = dashboard();
     for fields in [
         "renovate_override=on&renovate_agent=gemini&renovate_effort=low",
-        "renovate_override=on&renovate_agent=openrouter&renovate=some%2Fmodel&renovate_effort=high",
+        "renovate_override=on&renovate_agent=openrouter&renovate=&renovate_effort=high",
+        "renovate_override=on&renovate_agent=openrouter&renovate=some%2Fmodel&renovate_effort=max",
         "renovate_override=on&renovate_agent=codex&renovate_effort=max",
         "renovate_override=on&renovate_agent=local&renovate=&renovate_effort=high",
     ] {
@@ -18459,6 +18456,25 @@ async fn a_bad_renovate_agent_is_rejected_by_name_and_stores_nothing() {
             "{fields}"
         );
     }
+}
+
+#[tokio::test]
+async fn the_renovate_agent_can_run_on_openrouter_with_a_model() {
+    let dashboard = dashboard();
+    let reply = renovate_post(
+        &dashboard,
+        "renovate_override=on&renovate_agent=openrouter&renovate=some%2Fmodel&renovate_effort=xhigh",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let saved = dashboard
+        .store
+        .project_renovate_agent("maestro")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.agent, "openrouter");
+    assert_eq!(saved.model.as_deref(), Some("some/model"));
+    assert_eq!(saved.effort, "xhigh");
 }
 
 #[tokio::test]

@@ -59,8 +59,8 @@ pub use mcp::{
     McpError, McpProjectSettings, McpServer, McpStages, McpTool, McpToolState, McpTransport,
 };
 pub use openrouter::{
-    HttpOpenRouterApi, OPENROUTER_BASE_URL, OpenRouterApi, OpenRouterModel, OpenRouterModelsFuture,
-    parse_models,
+    HttpOpenRouterApi, OPENROUTER_BASE_URL, OpenRouterApi, OpenRouterKeyFuture, OpenRouterModel,
+    OpenRouterModelsFuture, parse_models,
 };
 pub use podman::PodmanExecutor;
 pub use projects::{

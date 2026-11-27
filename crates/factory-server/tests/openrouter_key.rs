@@ -70,10 +70,7 @@ async fn a_login_who_is_not_an_admin_opens_the_page_and_never_sees_the_factory_k
     assert!(page.body.contains("Factory default (Claude Code)"));
     assert!(page.body.contains(r#"placeholder="not set""#));
     assert!(page.body.contains(r#"rel="noopener noreferrer""#));
-    assert!(
-        page.body
-            .contains("the agent that runs there will be able to read it")
-    );
+    assert!(page.body.contains("the agent that runs there can read it"));
     assert!(!page.body.contains(FACTORY_KEY));
     assert!(!page.body.to_lowercase().contains("factory key"));
     assert!(!page.body.to_lowercase().contains("factory's"));

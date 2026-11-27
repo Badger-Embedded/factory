@@ -86,13 +86,33 @@ test('Local is selectable in every stage and shows its effort levels', async ({ 
   await expect(efforts).toHaveText(['low', 'medium', 'high', 'xhigh', 'max']);
 });
 
-test('OpenRouter is a disabled radio in every stage', async ({ page, project }) => {
+test('OpenRouter is selectable in every stage, shows its effort levels and needs a model ID', async ({
+  page,
+  project,
+}) => {
   await page.goto(settingsPath(project, '?stage=spec'));
   for (const stage of ['clarify', 'spec', 'plan', 'implement', 'review']) {
     const radio = page.locator(`input[name="${stage}_agent"][value="openrouter"]`);
     await expect(radio).toHaveCount(1);
-    await expect(radio).toBeDisabled();
+    await expect(radio).toBeEnabled();
   }
+  const spec = panel(page, 'spec');
+  await spec.getByRole('radio', { name: 'OpenRouter' }).check();
+  await expect(spec.locator('[data-effort-seg] label')).toHaveText(['low', 'medium', 'high', 'xhigh']);
+  await expect(spec.locator('.model-chips .chip')).toHaveCount(0);
+  await expect(node(page, 'spec').locator('[data-model-label]')).toHaveText('Model required');
+  await expect(spec.locator('[data-model-hint]')).toContainText('Type an OpenRouter model ID');
+
+  await page.getByRole('button', { name: `Save ${project}` }).click();
+  await expect(page.getByText('The spec stage runs on OpenRouter, which needs a model ID.')).toBeVisible();
+
+  await page.goto(settingsPath(project, '?stage=spec'));
+  await panel(page, 'spec').getByRole('radio', { name: 'OpenRouter' }).check();
+  await panel(page, 'spec').getByLabel('Model').fill('openai/gpt-5:nitro');
+  await page.getByRole('button', { name: `Save ${project}` }).click();
+  await page.goto(settingsPath(project, '?stage=spec'));
+  await expect(page.locator('input[name="spec_agent"][value="openrouter"]')).toBeChecked();
+  await expect(panel(page, 'spec').getByLabel('Model')).toHaveValue('openai/gpt-5:nitro');
 });
 
 test("changing a stage's agent redraws its model and effort choices", async ({ page, project }) => {

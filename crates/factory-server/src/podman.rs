@@ -18,7 +18,8 @@ use factory_runner::{
 
 use crate::accounts::{AccountSource, Operation, blame, credential_reason};
 use crate::forges::Forges;
-use crate::local_server::{LoadError, LocalServerProbe};
+use crate::local_server::{LoadError, LocalServerProbe, ModelsError};
+use crate::openrouter::OpenRouterApi;
 use crate::registry::{AgentEntry, AgentRegistry};
 use crate::scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, IgnoredCommenter, KeyOwner,
@@ -59,6 +60,8 @@ pub struct PodmanExecutor {
     pub plan_usage: Arc<PlanUsageCache>,
     /// Waits for the local server to load the model of a Local run.
     pub local_probe: Arc<dyn LocalServerProbe>,
+    /// Checks the key of an `OpenRouter` run before its worker starts.
+    pub openrouter: Arc<dyn OpenRouterApi>,
 }
 
 /// Writes a credential file, such as Codex's `auth.json`, with mode 0600 so
@@ -283,6 +286,29 @@ fn job_images(job_dir: &Path) -> Vec<PathBuf> {
 }
 
 impl PodmanExecutor {
+    /// Checks the key of an `OpenRouter` run with one request, so a rejected
+    /// key or an unreachable host fails the run before any checkout. Nothing
+    /// waits for a model to load.
+    async fn check_openrouter_key(&self, run: &crate::ProviderRequest) -> Result<(), String> {
+        let key = run.target.key.as_deref().unwrap_or_default();
+        match self.openrouter.check_key(key).await {
+            Ok(()) => Ok(()),
+            Err(ModelsError::Status(401 | 403)) => Err(match &run.key_from {
+                KeyOwner::Login(login) => format!(
+                    "OpenRouter rejected the OpenRouter API key of {login}. Replace it on \
+                     /settings/openrouter."
+                ),
+                _ => "OpenRouter rejected the factory's OpenRouter API key. Replace it on \
+                      /settings/agents/openrouter."
+                    .to_owned(),
+            }),
+            Err(ModelsError::Connect | ModelsError::Timeout) => {
+                Err("The factory cannot reach OpenRouter.".to_owned())
+            }
+            Err(error) => Err(format!("OpenRouter answered the key check badly: {error}.")),
+        }
+    }
+
     /// Sends the model load request and waits for its answer, so the worker
     /// starts on a loaded model. The run holds its worker slot meanwhile.
     async fn wait_for_local_model(
@@ -588,16 +614,20 @@ impl Executor for PodmanExecutor {
             Ok(found) => found,
             Err(reason) => return failed_for(expect, reason),
         };
-        if let Some(local) = &request_local
-            && let Err(reason) = self
-                .wait_for_local_model(
+        if let Some(local) = &request_local {
+            let ready = if local.target.kind == ProviderKind::OpenRouter {
+                self.check_openrouter_key(local).await
+            } else {
+                self.wait_for_local_model(
                     local,
                     request.model.as_deref().unwrap_or_default(),
                     &mut log,
                 )
                 .await
-        {
-            return failed_for(expect, reason);
+            };
+            if let Err(reason) = ready {
+                return failed_for(expect, reason);
+            }
         }
         let backend = backend_for(cli).expect("the run's CLI has a worker backend");
         let image = entry

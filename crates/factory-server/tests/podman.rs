@@ -19,8 +19,9 @@ use factory_runner::{
 };
 use factory_server::{
     AccountSource, AgentRegistry, AgentRequest, ClaudeToken, CodexLogin, Executor, Forges, GhRepos,
-    KeyOwner, LoadFuture, LocalSecrets, LocalServerProbe, MASTER_KEY_LEN, ModelsFuture, Operation,
-    Owner, PlanUsageCache, PodmanExecutor, ProviderRequest, Rebase, SecretStore, Settings, Store,
+    HttpOpenRouterApi, KeyOwner, LoadFuture, LocalSecrets, LocalServerProbe, MASTER_KEY_LEN,
+    ModelsFuture, Operation, Owner, PlanUsageCache, PodmanExecutor, ProviderRequest, Rebase,
+    SecretStore, Settings, Store,
 };
 
 mod support;
@@ -87,6 +88,7 @@ fn executor(registry: Arc<AgentRegistry>, data_dir: PathBuf, store: Arc<Store>) 
         store,
         plan_usage: Arc::new(PlanUsageCache::new()),
         local_probe: Arc::new(LoadedModel),
+        openrouter: Arc::new(HttpOpenRouterApi::new()),
     }
 }
 

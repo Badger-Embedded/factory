@@ -189,11 +189,11 @@ fn the_local_entry_points_at_its_page_and_offers_no_models_yet() {
 }
 
 #[test]
-fn the_openrouter_entry_is_listed_but_cannot_run_yet() {
+fn the_openrouter_entry_runs_with_no_subscription_credential() {
     let registry = registry_with_token(None);
     let entry = registry.entry(Agent::OpenRouter);
     assert_eq!(entry.display_name(), "OpenRouter");
-    assert!(!entry.available());
+    assert!(entry.available());
     assert_eq!(entry.settings_url(), Some("/settings/agents/openrouter"));
     assert_eq!(entry.model_suggestions(), [] as [&str; 0]);
     assert_eq!(entry.host_config_dir(), None);
@@ -201,9 +201,12 @@ fn the_openrouter_entry_is_listed_but_cannot_run_yet() {
         worker_image: "localhost/factory-worker:latest".into(),
         ..Settings::default()
     };
-    assert_eq!(entry.image(&settings), None);
+    assert_eq!(
+        entry.image(&settings),
+        Some("localhost/factory-worker:latest".to_owned())
+    );
     assert_eq!(
         entry.credential(),
-        Err("the OpenRouter agent is not available yet".to_owned())
+        Err("the OpenRouter agent has no subscription credential".to_owned())
     );
 }
