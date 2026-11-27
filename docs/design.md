@@ -475,7 +475,26 @@ With OpenRouter selected, a stage's model field, and the Renovate agent card's, 
 - A zero shows as `$0.00` only when `fetched` is set, that is, OpenRouter confirmed a free run, or when a Local session has a CLI. A plain zero from a subscription run in the same job stays a dash, even when an OpenRouter session started and its lookup failed.
 - The scheduler also counts an OpenRouter worker in `cost_lookups` from its dispatch until it ends or a cancel aborts it, so a page rendered after a cancel keeps polling for the charge. The registration checks, under the store lock, that the job is still in the stage the dispatch saw, and a job cancelled since then starts no worker. `begin_cost_lookup` writes the job to the `cost_lookups` table before the task spawns and `end_cost_lookup` removes it when the task ends. The job page polls its fragment while the job is live or has a row there, so a failed or merged job still shows a late charge and log line without a reload. The table lives in SQLite because the browser tests change state from a second process. `main` clears it before the scheduler starts, since a restart ends every task.
 
-Criterion 21, one run per CLI against OpenRouter with a real key, is not met by this pull request.
+### Runs on moon
+
+Criterion 21 asks for one run per CLI against OpenRouter with a real key. The implementer had no key, so the requester runs the three jobs on moon and closes the criterion, as for Local's criterion 27. The table below is empty until they report. If they close the criterion on their word without details, this section says so, as the Local one does.
+
+Procedure for the operator:
+
+1. Store a key in Settings → Agents → OpenRouter and press "Refresh models". Note the CLI versions in the deployed worker image (`claude --version`, `codex --version`, `copilot --version`).
+2. Create a test project with auto-merge off and its implement stage set to OpenRouter with a tool-capable model from the list.
+3. For each CLI in turn (Claude Code, Codex, then Copilot), pick it in Settings → OpenRouter and run a fresh request that asks for one small file.
+4. Watch the job log. A commit or merge is not required.
+
+Record in the PR's Verification section and here, per CLI:
+
+| CLI | Job | CLI version | Model | Cost line in the log | Cost recorded |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | not run yet | not run yet | not run yet | not run yet | not run yet |
+| Codex | not run yet | not run yet | not run yet | not run yet | not run yet |
+| Copilot | not run yet | not run yet | not run yet | not run yet | not run yet |
+
+A Codex run is expected to log that the cost could not be read, because its output carries no generation id. Claude Code and Copilot should log the charged amount. A different result for any CLI is a finding to write down here.
 
 ## Layout
 
