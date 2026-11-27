@@ -29,7 +29,8 @@ use crate::final_json;
 use crate::outcome::{Expect, event_from_output, failed_event};
 use crate::stream::LogLine;
 use crate::worker::{
-    LocalTarget, McpServerEntry, STDIO_STARTUP_TIMEOUT_SECS, SessionRun, WorkerConfig, WorkerRun,
+    McpServerEntry, ProviderKind, ProviderTarget, STDIO_STARTUP_TIMEOUT_SECS, SessionRun,
+    WorkerConfig, WorkerRun,
 };
 
 /// The Codex config directory inside the worker, mounted from the job's `codex`
@@ -94,14 +95,14 @@ impl AgentBackend for CodexAgent {
         }
     }
 
-    fn local_prompt_style(&self) -> PromptStyle {
+    fn provider_prompt_style(&self) -> PromptStyle {
         PromptStyle {
             schema_in_prompt: Some(SCHEMA_IN_PROMPT),
             ..self.prompt_style()
         }
     }
 
-    fn local_host_config_dir(&self) -> &'static str {
+    fn provider_host_config_dir(&self, _kind: &ProviderKind) -> &'static str {
         "local-codex"
     }
 
@@ -132,7 +133,7 @@ impl AgentBackend for CodexAgent {
     fn prepare(&self, run: &WorkerRun) -> std::io::Result<()> {
         // A Local run has no login, so it writes no credential store line and no
         // output schema: the model gets the schema in its prompt instead.
-        let local = run.local.is_some();
+        let local = run.provider.is_some();
         let mut config = if local {
             String::new()
         } else {
@@ -178,7 +179,7 @@ impl AgentBackend for CodexAgent {
         {
             env.push((MCP_TOKEN_ENV, proxy.token.as_str()));
         }
-        if let Some(key) = run.local.as_ref().and_then(|local| local.key.as_deref()) {
+        if let Some(key) = run.provider.as_ref().and_then(|local| local.key.as_deref()) {
             env.push((LOCAL_KEY_ENV, key));
         }
         env
@@ -198,7 +199,7 @@ impl AgentBackend for CodexAgent {
         // bypassed permissions, so Codex runs without its own approvals or
         // sandbox.
         codex.push("--dangerously-bypass-approvals-and-sandbox".into());
-        if run.local.is_none() {
+        if run.provider.is_none() {
             codex.push("--output-schema".into());
             codex.push(schema);
         }
@@ -206,7 +207,7 @@ impl AgentBackend for CodexAgent {
             codex.push("--model".into());
             codex.push(model.into());
         }
-        let default_effort = if run.local.is_some() {
+        let default_effort = if run.provider.is_some() {
             Agent::Local
         } else {
             Agent::Codex
@@ -217,7 +218,7 @@ impl AgentBackend for CodexAgent {
             "model_reasoning_effort={}",
             run.effort.as_deref().unwrap_or(default_effort)
         ));
-        if let Some(local) = run.local.as_ref() {
+        if let Some(local) = run.provider.as_ref() {
             codex.push("-c".into());
             codex.push(format!(
                 "model_providers.{LOCAL_PROVIDER}={}",
@@ -261,7 +262,7 @@ impl AgentBackend for CodexAgent {
         parse_codex(expect, line, message_result)
     }
 
-    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+    fn parse_provider(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         parse_codex(expect, line, final_json::message_result)
     }
 }
@@ -269,8 +270,9 @@ impl AgentBackend for CodexAgent {
 /// The inline TOML table for the Local provider: the server's `/v1` URL over the
 /// Responses API, the key's variable when the run has a key, and an idle timeout
 /// that outlasts the model load.
-fn local_provider(local: &LocalTarget) -> String {
-    let idle_ms = local.load_timeout.as_millis().max(DEFAULT_STREAM_IDLE_MS);
+fn local_provider(local: &ProviderTarget) -> String {
+    let ProviderKind::Local { load_timeout } = local.kind;
+    let idle_ms = load_timeout.as_millis().max(DEFAULT_STREAM_IDLE_MS);
     let mut table = format!(
         "{{ name = \"Local\", base_url = {}, wire_api = \"responses\", stream_idle_timeout_ms = {idle_ms}",
         toml_string(&format!("{}/v1", local.base_url)),

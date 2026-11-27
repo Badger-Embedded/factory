@@ -409,7 +409,7 @@ fn cost(store: &Store, flags: &HashMap<String, Vec<String>>) -> Result<()> {
     if let Ok(cli) = one("local-cli") {
         let cli = Cli::from_id(cli).ok_or("unknown --local-cli")?;
         store.session_uuid(job, Session::Planning, Agent::Local)?;
-        store.record_session_local_cli(job, Session::Planning, cli)?;
+        store.record_session_provider_cli(job, Session::Planning, cli)?;
     }
     Ok(())
 }

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use factory_core::{Agent, AgentResult, Cli, Event, PrDescription};
 use factory_runner::{
-    AgentItem, Expect, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry, McpUnavailable,
-    RunResult, SessionRun, WorkerConfig, WorkerRun, backend, run,
+    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, McpUnavailable, ProviderKind,
+    ProviderTarget, RunResult, SessionRun, WorkerConfig, WorkerRun, backend, run,
 };
 
 const SESSION: &str = "d3c2f38c-6c9e-4528-9666-a9c3d7aff405";
@@ -37,7 +37,7 @@ fn copilot_run(dir: &Path, session: SessionRun) -> WorkerRun {
         effort: None,
         mcp: None,
         packages: Vec::new(),
-        local: None,
+        provider: None,
     }
 }
 
@@ -958,11 +958,13 @@ fn local_copilot_run(dir: &Path, key: Option<&str>) -> WorkerRun {
     run.agent = Agent::Local;
     run.token = String::new();
     run.model = Some("unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M".into());
-    run.local = Some(LocalTarget {
+    run.provider = Some(ProviderTarget {
+        kind: ProviderKind::Local {
+            load_timeout: Duration::from_mins(10),
+        },
         cli: Cli::Copilot,
         base_url: "http://gfx1201:9931".into(),
         key: key.map(str::to_owned),
-        load_timeout: Duration::from_mins(10),
     });
     run
 }

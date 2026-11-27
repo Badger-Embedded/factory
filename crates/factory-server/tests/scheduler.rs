@@ -222,7 +222,7 @@ impl Executor for FakeExecutor {
     ) -> RunReport {
         self.requests.lock().unwrap().push(request.clone());
         self.gate.acquire().await.unwrap().forget();
-        if let Some(local) = &request.local {
+        if let Some(local) = &request.provider {
             let failing = {
                 let mut left = self.prestart_failures.lock().unwrap();
                 let failing = *left > 0;
@@ -244,7 +244,7 @@ impl Executor for FakeExecutor {
             }
             if let Some(store) = self.local_store.lock().unwrap().as_ref() {
                 store
-                    .record_session_local_cli(request.job_id, local.session, local.target.cli)
+                    .record_session_provider_cli(request.job_id, local.session, local.target.cli)
                     .unwrap();
             }
         }
@@ -8288,8 +8288,8 @@ fn local_stage(stage: &str) -> StageAgents {
     agents
 }
 
-fn local_of(request: &AgentRequest) -> &factory_server::LocalRequest {
-    request.local.as_ref().expect("a Local request")
+fn local_of(request: &AgentRequest) -> &factory_server::ProviderRequest {
+    request.provider.as_ref().expect("a Local request")
 }
 
 fn failure_reason(store: &Store, id: i64) -> String {
@@ -8315,12 +8315,12 @@ async fn a_local_run_uses_the_requesters_key_else_the_factory_key() {
     assert_eq!(key(0).as_deref(), Some("alice-key"));
     assert_eq!(
         local_of(&requests[0]).key_from,
-        factory_server::LocalKeyOwner::Login("alice".into())
+        factory_server::KeyOwner::Login("alice".into())
     );
     assert_eq!(key(1).as_deref(), Some("factory-key"));
     assert_eq!(
         local_of(&requests[1]).key_from,
-        factory_server::LocalKeyOwner::Factory
+        factory_server::KeyOwner::Factory
     );
     // A job the factory requested never uses a personal key, even when the
     // factory's own login stored one.
@@ -8352,10 +8352,7 @@ async fn a_local_run_with_no_key_anywhere_sends_none() {
 
     let request = &executor.requests()[0];
     assert_eq!(local_of(request).target.key, None);
-    assert_eq!(
-        local_of(request).key_from,
-        factory_server::LocalKeyOwner::None
-    );
+    assert_eq!(local_of(request).key_from, factory_server::KeyOwner::None);
     let log = log_texts(&store, id);
     assert!(log.contains(&format!("Local run on Codex at {LOCAL_URL} with no key.")));
 }
@@ -8489,7 +8486,12 @@ async fn a_local_run_carries_the_settings_and_a_prompt_for_its_cli() {
     let local = local_of(request);
     assert_eq!(local.target.cli, factory_core::Cli::ClaudeCode);
     assert_eq!(local.target.base_url, LOCAL_URL);
-    assert_eq!(local.target.load_timeout, Duration::from_mins(7));
+    assert_eq!(
+        local.target.kind,
+        factory_runner::ProviderKind::Local {
+            load_timeout: Duration::from_mins(7)
+        }
+    );
     assert!(!request.prompt.contains("\"properties\""));
 }
 
@@ -8572,7 +8574,7 @@ async fn a_failure_before_the_worker_starts_leaves_the_session_without_a_cli() {
     step(&scheduler).await;
     assert_eq!(
         store
-            .session_local_cli(id, factory_core::Session::Planning)
+            .session_provider_cli(id, factory_core::Session::Planning)
             .unwrap(),
         None
     );
@@ -8595,7 +8597,7 @@ async fn a_failure_before_the_worker_starts_leaves_the_session_without_a_cli() {
     );
     assert_eq!(
         store
-            .session_local_cli(id, factory_core::Session::Planning)
+            .session_provider_cli(id, factory_core::Session::Planning)
             .unwrap(),
         Some(factory_core::Cli::Copilot)
     );
@@ -8667,7 +8669,7 @@ async fn a_local_codex_prompt_carries_the_schema_and_a_subscription_codex_prompt
     let subscription = executor.requests().pop().unwrap();
 
     assert_eq!(subscription.agent, Agent::Codex);
-    assert!(subscription.local.is_none());
+    assert!(subscription.provider.is_none());
     assert!(codex.prompt.contains("\"properties\""));
     assert!(!subscription.prompt.contains("\"properties\""));
 }
@@ -8762,7 +8764,7 @@ async fn a_session_started_on_claude_stays_on_claude_after_its_stage_moves_to_lo
 
     let requests = executor.requests();
     assert_eq!(requests[1].agent, Agent::Claude);
-    assert!(requests[1].local.is_none());
+    assert!(requests[1].provider.is_none());
     assert!(
         log_texts(&store, id)
             .iter()

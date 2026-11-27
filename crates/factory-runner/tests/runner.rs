@@ -9,10 +9,10 @@ use factory_core::{
     PlannedPr, PrDescription, PrMode, Question, Stage, Task, UsageWindow,
 };
 use factory_runner::{
-    AgentItem, Expect, LocalTarget, LogLine, McpConfig, McpProxy, McpServerEntry, McpServerStatus,
-    McpUnavailable, PlacedFile, ResultMessage, SessionRun, StreamItem, WorkerConfig, WorkerRun,
-    backend, event_from_result, job_prompt, parse_line, place_files, place_images, podman_args,
-    prompt, remove_container, run, show_files, show_images,
+    AgentItem, Expect, LogLine, McpConfig, McpProxy, McpServerEntry, McpServerStatus,
+    McpUnavailable, PlacedFile, ProviderKind, ProviderTarget, ResultMessage, SessionRun,
+    StreamItem, WorkerConfig, WorkerRun, backend, event_from_result, job_prompt, parse_line,
+    place_files, place_images, podman_args, prompt, remove_container, run, show_files, show_images,
 };
 use serde_json::{Value, json};
 
@@ -58,7 +58,7 @@ fn worker_run(dir: &Path, session: SessionRun) -> WorkerRun {
         effort: None,
         mcp: None,
         packages: Vec::new(),
-        local: None,
+        provider: None,
     }
 }
 
@@ -418,11 +418,13 @@ fn local_claude_run(dir: &Path, key: Option<&str>) -> WorkerRun {
     run.agent = Agent::Local;
     run.token = String::new();
     run.model = Some("unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M".into());
-    run.local = Some(LocalTarget {
+    run.provider = Some(ProviderTarget {
+        kind: ProviderKind::Local {
+            load_timeout: Duration::from_mins(15),
+        },
         cli: Cli::ClaudeCode,
         base_url: "http://gfx1201:9931".into(),
         key: key.map(str::to_owned),
-        load_timeout: Duration::from_mins(15),
     });
     run
 }
@@ -549,14 +551,14 @@ fn a_local_claude_result_reports_its_token_counts() {
         })
     };
     assert_eq!(
-        total(claude.parse_local(Expect::Spec, line)),
+        total(claude.parse_provider(Expect::Spec, line)),
         Some((120, 45))
     );
     assert_eq!(total(claude.parse(Expect::Spec, line)), None);
 
     let null =
         r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","usage":null}"#;
-    assert_eq!(total(claude.parse_local(Expect::Spec, null)), None);
+    assert_eq!(total(claude.parse_provider(Expect::Spec, null)), None);
 }
 
 #[tokio::test]

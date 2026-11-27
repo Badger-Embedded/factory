@@ -1681,7 +1681,7 @@ async fn a_job_that_only_ran_on_local_shows_zero_dollars_with_no_estimate_mark()
         .unwrap();
     dashboard
         .store
-        .record_session_local_cli(id, Session::Planning, Cli::Codex)
+        .record_session_provider_cli(id, Session::Planning, Cli::Codex)
         .unwrap();
 
     let page = dashboard.get(&format!("/jobs/{id}")).await;
@@ -8329,17 +8329,17 @@ fn a_local_session_records_its_cli_once() {
         .session_uuid(id, Session::Planning, Agent::Local)
         .unwrap();
     assert_eq!(
-        store.session_local_cli(id, Session::Planning).unwrap(),
+        store.session_provider_cli(id, Session::Planning).unwrap(),
         None
     );
     store
-        .record_session_local_cli(id, Session::Planning, Cli::Codex)
+        .record_session_provider_cli(id, Session::Planning, Cli::Codex)
         .unwrap();
     store
-        .record_session_local_cli(id, Session::Planning, Cli::Copilot)
+        .record_session_provider_cli(id, Session::Planning, Cli::Copilot)
         .unwrap();
     assert_eq!(
-        store.session_local_cli(id, Session::Planning).unwrap(),
+        store.session_provider_cli(id, Session::Planning).unwrap(),
         Some(Cli::Codex)
     );
 }
@@ -8385,7 +8385,10 @@ fn a_database_from_before_the_local_cli_column_opens_and_keeps_its_sessions() {
         .session_uuid(1, Session::Planning, Agent::Claude)
         .unwrap();
     assert_eq!(agent, Agent::Codex);
-    assert_eq!(store.session_local_cli(1, Session::Planning).unwrap(), None);
+    assert_eq!(
+        store.session_provider_cli(1, Session::Planning).unwrap(),
+        None
+    );
 }
 
 #[test]

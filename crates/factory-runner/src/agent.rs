@@ -6,7 +6,7 @@
 //! and config-directory environment variables, the session-resume check, and
 //! the parser that turns the agent's stdout into the items the worker consumes.
 //! Claude Code, Codex and Copilot each have a backend. A Local run uses the
-//! backend of the CLI the factory is set to, see [`LocalTarget`](crate::worker::LocalTarget).
+//! backend of the CLI the factory is set to, see [`ProviderTarget`](crate::worker::ProviderTarget).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -18,7 +18,7 @@ use crate::codex::CodexAgent;
 use crate::copilot::CopilotAgent;
 use crate::outcome::Expect;
 use crate::stream::LogLine;
-use crate::worker::{McpUnavailable, SessionRun, WorkerConfig, WorkerRun};
+use crate::worker::{McpUnavailable, ProviderKind, SessionRun, WorkerConfig, WorkerRun};
 
 /// How a backend takes its subscription credential. Claude reads a token from
 /// an environment variable; Codex reads its `auth.json` from a file in its
@@ -117,7 +117,7 @@ pub trait AgentBackend: Sync {
     /// server URL. The default is none, which is what a run on the agent's own
     /// login passes. The key never goes here; [`secret_env`](Self::secret_env)
     /// carries it by name.
-    fn local_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
+    fn provider_env(&self, run: &WorkerRun) -> Vec<(&'static str, String)> {
         let _ = run;
         Vec::new()
     }
@@ -125,7 +125,7 @@ pub trait AgentBackend: Sync {
     /// The wording a Local run's prompt carries. It is the backend's own unless
     /// the Local run needs something else, such as Codex asking for the schema
     /// in the prompt because it passes no `--output-schema`.
-    fn local_prompt_style(&self) -> PromptStyle {
+    fn provider_prompt_style(&self) -> PromptStyle {
         self.prompt_style()
     }
 
@@ -133,21 +133,21 @@ pub trait AgentBackend: Sync {
     /// differs from [`host_config_dir`](Self::host_config_dir), so a Local run
     /// shares no session file or written config with a subscription run of the
     /// same CLI in the same job.
-    fn local_host_config_dir(&self) -> &'static str;
+    fn provider_host_config_dir(&self, kind: &ProviderKind) -> &'static str;
 
     /// Parses one stdout line of a Local run. The default is [`parse`](Self::parse).
-    fn parse_local(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
+    fn parse_provider(&self, expect: Expect, line: &str) -> Vec<AgentItem> {
         self.parse(expect, line)
     }
 
     /// A parser for one run's stdout, line by line. A backend whose output
     /// needs state across lines, such as Claude matching a tool result to its
     /// call, overrides it. The default is [`parse`](Self::parse), or
-    /// [`parse_local`](Self::parse_local) for a Local run.
+    /// [`parse_provider`](Self::parse_provider) for a Local run.
     fn stream(&self, expect: Expect, local: bool, _key: Option<&str>) -> LineParser<'_> {
         Box::new(move |line| {
             if local {
-                self.parse_local(expect, line)
+                self.parse_provider(expect, line)
             } else {
                 self.parse(expect, line)
             }

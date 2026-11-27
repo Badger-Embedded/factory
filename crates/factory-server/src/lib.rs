@@ -69,7 +69,7 @@ pub use proxy::{
 pub use registry::{AgentEntry, AgentRegistry};
 pub use scheduler::{
     APPROVAL, AgentRequest, ChecksRequest, Executor, ExistingPr, FINISHED_JOB_DAYS,
-    IgnoredCommenter, LocalKeyOwner, LocalRequest, LogSink, McpRuntime, PackagingRequest,
+    IgnoredCommenter, KeyOwner, LogSink, McpRuntime, PackagingRequest, ProviderRequest,
     PublishRequest, Published, PushLog, RENOVATE_DISCOVERY, ReadyAction, Rebase,
     RenovateWatchRequest, RerunRequest, Scheduler, SessionSink, SummaryRequest, WatchReport,
     WatchRequest, branch_name, ready_action, waiting_event,
